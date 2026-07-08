@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["squelch-core", "squelch-mcp", "squelch-tui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+regex = "1"
+async-trait = "0.1"

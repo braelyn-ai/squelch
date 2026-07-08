@@ -1,0 +1,194 @@
+//! Core domain types. Types that cross the MCP boundary derive serde.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+pub type AccountId = i64;
+
+/// MCP-visible triage tier. There is deliberately NO `Sealed` variant here:
+/// sealed messages are excluded structurally, never surfaced as a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    PastDue,
+    Deadline,
+    Signal,
+    Noise,
+}
+
+impl Tier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Tier::PastDue => "past_due",
+            Tier::Deadline => "deadline",
+            Tier::Signal => "signal",
+            Tier::Noise => "noise",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Tier> {
+        match s {
+            "past_due" => Some(Tier::PastDue),
+            "deadline" => Some(Tier::Deadline),
+            "signal" => Some(Tier::Signal),
+            "noise" => Some(Tier::Noise),
+            _ => None,
+        }
+    }
+}
+
+/// Internal-only classification. NEVER crosses the MCP boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sensitivity {
+    Normal,
+    Sealed,
+}
+
+impl Sensitivity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Sensitivity::Normal => "normal",
+            Sensitivity::Sealed => "sealed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Sensitivity {
+        match s {
+            "sealed" => Sensitivity::Sealed,
+            _ => Sensitivity::Normal,
+        }
+    }
+}
+
+/// The kind of auth-related content that caused a message to be sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedKind {
+    Otp,
+    PasswordReset,
+    MagicLink,
+    LoginAlert,
+    Verification,
+}
+
+impl SealedKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SealedKind::Otp => "otp",
+            SealedKind::PasswordReset => "password_reset",
+            SealedKind::MagicLink => "magic_link",
+            SealedKind::LoginAlert => "login_alert",
+            SealedKind::Verification => "verification",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SealedKind> {
+        match s {
+            "otp" => Some(SealedKind::Otp),
+            "password_reset" => Some(SealedKind::PasswordReset),
+            "magic_link" => Some(SealedKind::MagicLink),
+            "login_alert" => Some(SealedKind::LoginAlert),
+            "verification" => Some(SealedKind::Verification),
+            _ => None,
+        }
+    }
+}
+
+/// What squelch decides to do with a message at the surfacing layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    Surface,
+    Squelch,
+    Filtered,
+}
+
+impl Disposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Disposition::Surface => "surface",
+            Disposition::Squelch => "squelch",
+            Disposition::Filtered => "filtered",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Disposition> {
+        match s {
+            "surface" => Some(Disposition::Surface),
+            "squelch" => Some(Disposition::Squelch),
+            "filtered" => Some(Disposition::Filtered),
+            _ => None,
+        }
+    }
+}
+
+/// A ranked inbox update. MCP-visible; sealed rows are never represented here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Update {
+    pub id: i64,
+    pub thread_id: String,
+    pub tier: Tier,
+    pub importance: u8,
+    pub sender: String,
+    pub one_line: String,
+    pub reason: String,
+    pub deadline: Option<DateTime<Utc>>,
+    pub matched_rule: Option<i64>,
+}
+
+/// A single sanitized message body (HTML flattened to text).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SanitizedMessage {
+    pub id: i64,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub content: String,
+}
+
+/// A full thread as exposed over MCP. Sealed threads are NotFound, never this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadView {
+    pub thread_id: String,
+    pub subject: String,
+    pub messages: Vec<SanitizedMessage>,
+}
+
+/// A local rule that biases how a sender is dispositioned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SenderRule {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub match_pattern: String,
+    pub want_text: String,
+    pub disposition: Disposition,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An extracted bill/deadline. Bypasses the squelch threshold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Deadline {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub message_id: i64,
+    pub kind: String,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    pub due_at: DateTime<Utc>,
+    pub past_due: bool,
+    pub source: String,
+}
+
+/// Input record for upserting a fetched message into the store.
+#[derive(Debug, Clone)]
+pub struct NewMessage {
+    pub account_id: AccountId,
+    pub gmail_msg_id: String,
+    pub thread_id: String,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+    pub received_at: DateTime<Utc>,
+    pub snippet: String,
+    pub body: String,
+    pub is_sent: bool,
+}
