@@ -1,11 +1,18 @@
 [workspace]
 resolver = "3"
-members = ["squelch-core", "squelch-mcp", "squelch-tui"]
+members = ["squelch-core", "squelch-mcp", "squelch-tui", "squelch-api", "squelchd"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+
+# Release builds target the headless Linux (Hetzner) box: thin LTO trims size
+# and speeds hot paths without the full-LTO link-time blowup, and stripping
+# symbols shrinks the shipped binary. Dev/test builds are unaffected.
+[profile.release]
+lto = "thin"
+strip = "symbols"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -24,8 +31,7 @@ toml = "0.8"
 tiny_http = "0.12"
 webbrowser = "1"
 url = "2"
-async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
-async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 mail-parser = "0.11"
 futures = "0.3"
 base64 = "0.22"

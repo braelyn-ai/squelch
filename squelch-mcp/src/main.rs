@@ -5,21 +5,16 @@
 //! `--http [addr]` (or setting `SQUELCH_MCP_HTTP`) serves the MCP Streamable HTTP
 //! transport instead. The endpoint is mounted at `/mcp`.
 
-mod server;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
 use squelch_core::store::SqliteStore;
+use squelch_mcp::server::SquelchServer;
+use squelch_mcp::{MCP_PATH, streamable_http_service};
 use tokio_util::sync::CancellationToken;
-
-use crate::server::SquelchServer;
 
 /// Default bind address for HTTP mode. Loopback ONLY: a reverse proxy
 /// (e.g. `tailscale serve`) is expected to front this listener. We never
@@ -27,8 +22,9 @@ use crate::server::SquelchServer;
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8848";
 
 /// Path the Streamable HTTP transport is mounted at. Clients connect to
-/// `http://<addr>/mcp`.
-const HTTP_MCP_PATH: &str = "/mcp";
+/// `http://<addr>/mcp`. Sourced from the lib so the bin and `squelchd serve`
+/// agree.
+const HTTP_MCP_PATH: &str = MCP_PATH;
 
 /// How the server talks to clients. Selected once, in `main`.
 enum Transport {
@@ -139,16 +135,12 @@ async fn main() -> anyhow::Result<()> {
 /// A fresh [`SquelchServer`] is handed to each session via the service factory
 /// (it is cheap to clone — it only wraps an `Arc<SqliteStore>`).
 async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
-    // Build one server up front so a construction error surfaces before we bind,
-    // then clone it per session inside the factory.
-    let template = build_server()?;
+    let store = Arc::new(SqliteStore::open(db_path())?);
 
     let shutdown = CancellationToken::new();
-    let service = StreamableHttpService::new(
-        move || Ok(template.clone()),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default().with_cancellation_token(shutdown.child_token()),
-    );
+    // Construction errors surface before we bind. The service is built through
+    // the shared lib fn so the agent door is identical to `squelchd serve`.
+    let service = streamable_http_service(store, &account_email(), shutdown.child_token())?;
 
     let router = axum::Router::new().nest_service(HTTP_MCP_PATH, service);
     let listener = tokio::net::TcpListener::bind(addr).await?;

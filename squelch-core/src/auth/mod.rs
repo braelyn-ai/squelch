@@ -1,19 +1,28 @@
 //! Installed-app (Desktop) OAuth 2.0 for Gmail.
 //!
 //! The flow, end to end:
-//! 1. Build the Google consent URL with PKCE and the single
-//!    `gmail.readonly` scope, targeting a loopback redirect on an ephemeral
-//!    `127.0.0.1` port.
-//! 2. Print the URL and best-effort open the browser.
+//! 1. Build the Google consent URL with PKCE and the requested scopes,
+//!    targeting a loopback redirect on a `127.0.0.1` port (ephemeral by
+//!    default, fixed in headless mode).
+//! 2. Print the URL and (unless headless) best-effort open the browser.
 //! 3. Block on a one-shot loopback HTTP listener for Google's redirect, pull
 //!    the `code`, and verify the `state` matches our CSRF token.
 //! 4. Exchange the code (+ PKCE verifier) for access + refresh tokens.
 //!
-//! SECURITY: the only scope ever requested is [`GMAIL_READONLY_SCOPE`]. We never
-//! log the code, tokens, or the client secret.
+//! TWO-DOOR: [`AuthScopes::Read`] requests only [`GMAIL_READONLY_SCOPE`] (sync +
+//! triage). [`AuthScopes::Write`] requests [`WRITE_SCOPES`] (`gmail.modify` +
+//! `gmail.send`) for the human-door action credential. Which one is minted is an
+//! explicit caller choice; they never overlap.
+//!
+//! HEADLESS: with [`AuthFlowOptions::headless`] the browser is NOT auto-opened
+//! and the loopback listener binds a FIXED port ([`DEFAULT_HEADLESS_PORT`]) so a
+//! remote box can complete consent over an SSH tunnel:
+//! `ssh -L 8847:127.0.0.1:8847 baddiebox`, then open the printed URL locally.
+//!
+//! SECURITY: we never log the code, tokens, or the client secret.
 
-use crate::config::{GMAIL_READONLY_SCOPE, OAuthClientConfig};
-use crate::credentials::StoredToken;
+use crate::config::{GMAIL_READONLY_SCOPE, OAuthClientConfig, WRITE_SCOPES};
+use crate::credentials::{CredentialKind, StoredToken};
 use crate::error::{CoreError, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -26,16 +35,89 @@ use std::net::TcpListener;
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(crate) const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
+/// Fixed loopback port used in `--headless` mode so it can be SSH-forwarded.
+pub const DEFAULT_HEADLESS_PORT: u16 = 8847;
+
+/// Which scope set (and therefore which credential kind) to authorize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScopes {
+    /// `gmail.readonly` — the Read credential.
+    Read,
+    /// `gmail.modify` + `gmail.send` — the Write credential.
+    Write,
+}
+
+impl AuthScopes {
+    /// The OAuth scope strings for this set.
+    pub fn scopes(self) -> Vec<String> {
+        match self {
+            AuthScopes::Read => vec![GMAIL_READONLY_SCOPE.to_string()],
+            AuthScopes::Write => WRITE_SCOPES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The credential kind this scope set maps to.
+    pub fn kind(self) -> CredentialKind {
+        match self {
+            AuthScopes::Read => CredentialKind::Read,
+            AuthScopes::Write => CredentialKind::Write,
+        }
+    }
+
+    /// Human-readable label for prompts.
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthScopes::Read => "read-only Gmail (gmail.readonly)",
+            AuthScopes::Write => "Gmail modify + send (gmail.modify, gmail.send)",
+        }
+    }
+}
+
+/// Options controlling the interactive flow.
+#[derive(Debug, Clone)]
+pub struct AuthFlowOptions {
+    /// Which scope set to request.
+    pub scopes: AuthScopes,
+    /// Headless: don't auto-open a browser; bind a fixed, SSH-forwardable port.
+    pub headless: bool,
+    /// Fixed loopback port for headless mode. Defaults to
+    /// [`DEFAULT_HEADLESS_PORT`]. Ignored (ephemeral port) when not headless.
+    pub port: u16,
+}
+
+impl Default for AuthFlowOptions {
+    fn default() -> Self {
+        Self {
+            scopes: AuthScopes::Read,
+            headless: false,
+            port: DEFAULT_HEADLESS_PORT,
+        }
+    }
+}
+
 fn map_oauth_err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> CoreError + '_ {
     move |e| CoreError::Credential(format!("{ctx}: {e}"))
 }
 
-/// Run the full interactive authorization flow and return the resulting token.
-/// Blocks the current thread while waiting for the browser redirect.
+/// Back-compat: run the interactive read-only flow with an ephemeral port and a
+/// browser auto-open. Equivalent to `run_auth_flow(client, &AuthFlowOptions::default())`.
 pub fn run_installed_app_flow(client: &OAuthClientConfig) -> Result<StoredToken> {
-    // Bind an ephemeral loopback port FIRST so the redirect_uri is exact.
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| CoreError::Credential(format!("binding loopback listener: {e}")))?;
+    run_auth_flow(client, &AuthFlowOptions::default())
+}
+
+/// Run the full interactive authorization flow with explicit options and return
+/// the resulting token. Blocks the current thread while waiting for the browser
+/// redirect.
+pub fn run_auth_flow(client: &OAuthClientConfig, opts: &AuthFlowOptions) -> Result<StoredToken> {
+    // Headless -> a FIXED port that can be SSH-forwarded; otherwise ephemeral.
+    let bind_addr = if opts.headless {
+        format!("127.0.0.1:{}", opts.port)
+    } else {
+        "127.0.0.1:0".to_string()
+    };
+    let listener = TcpListener::bind(&bind_addr).map_err(|e| {
+        CoreError::Credential(format!("binding loopback listener on {bind_addr}: {e}"))
+    })?;
     let port = listener
         .local_addr()
         .map_err(|e| CoreError::Credential(format!("reading listener addr: {e}")))?
@@ -56,21 +138,40 @@ pub fn run_installed_app_flow(client: &OAuthClientConfig) -> Result<StoredToken>
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (auth_url, csrf_token) = oauth
-        .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new(GMAIL_READONLY_SCOPE.to_string()))
+    let mut req = oauth.authorize_url(CsrfToken::new_random);
+    for scope in opts.scopes.scopes() {
+        req = req.add_scope(Scope::new(scope));
+    }
+    let (auth_url, csrf_token) = req
         // Ask for a refresh token and force consent so we reliably get one.
         .add_extra_param("access_type", "offline")
         .add_extra_param("prompt", "consent")
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    println!("\nOpen this URL in your browser to authorize squelch (read-only Gmail):\n");
-    println!("{auth_url}\n");
-    if webbrowser::open(auth_url.as_str()).is_err() {
-        println!("(could not auto-open a browser; copy the URL above manually)");
+    if opts.headless {
+        println!(
+            "\n=== squelch headless authorization ({}) ===",
+            opts.scopes.label()
+        );
+        println!(
+            "\nThis box is headless. Forward the loopback port to your laptop, e.g.:\n\
+             \n    ssh -L {port}:127.0.0.1:{port} <this-host>\n\
+             \nthen open this URL in your LOCAL browser:\n"
+        );
+        println!("{auth_url}\n");
+        println!("Waiting for the OAuth redirect on {redirect_uri} (via your tunnel) ...");
+    } else {
+        println!(
+            "\nOpen this URL in your browser to authorize squelch ({}):\n",
+            opts.scopes.label()
+        );
+        println!("{auth_url}\n");
+        if webbrowser::open(auth_url.as_str()).is_err() {
+            println!("(could not auto-open a browser; copy the URL above manually)");
+        }
+        println!("Waiting for the OAuth redirect on {redirect_uri} ...");
     }
-    println!("Waiting for the OAuth redirect on {redirect_uri} ...");
 
     let code = wait_for_code(&listener, csrf_token.secret())?;
 

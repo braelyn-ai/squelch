@@ -10,10 +10,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
-use crate::store::{SealedMessage, Store, SyncState, TriagedMessage};
+use crate::store::{NewAuditEntry, SealedBody, SealedMessage, Store, SyncState, TriagedMessage};
 use crate::types::{
-    AccountId, Deadline, Disposition, NewMessage, SanitizedMessage, SenderRule, Sensitivity,
-    ThreadView, Tier, Update,
+    AccountId, AuditEntry, Deadline, Disposition, NewMessage, SanitizedMessage, SearchHit,
+    SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -62,6 +62,51 @@ impl SqliteStore {
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    /// HUMAN-DOOR ACTION SUPPORT (squelch-api only): resolve a local message id
+    /// to the Gmail ids + headers an action needs (archive/label/send).
+    ///
+    /// SECURITY: this INTENTIONALLY excludes `sensitivity = 'sealed'` rows in
+    /// SQL, so an action can never target a sealed message (NotFound is returned
+    /// for a missing OR sealed message, keeping the two indistinguishable). It is
+    /// read-only and is never called by sync/triage/MCP. It does not touch bodies.
+    pub fn action_message_ref(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<crate::store::ActionMessageRef> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT m.id, m.gmail_msg_id, m.thread_id, m.from_addr, m.from_name, m.subject
+                 FROM messages m
+                 JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1 AND m.id = ?2 AND t.sensitivity != 'sealed'",
+                params![account_id, message_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (id, gmail_msg_id, thread_id, from_addr, from_name, subject) =
+            row.ok_or(CoreError::NotFound)?;
+        Ok(crate::store::ActionMessageRef {
+            id,
+            account_id,
+            gmail_msg_id,
+            thread_id,
+            from_addr,
+            from_name,
+            subject,
+        })
     }
 
     /// Test/local helper: write a triage row for a message. Real triage is
@@ -511,7 +556,7 @@ impl Store for SqliteStore {
             .optional()?;
         Ok(row.map(|(uv, lu)| SyncState {
             uidvalidity: uv as u32,
-            last_uid: lu as u32,
+            last_uid: lu as u64,
         }))
     }
 
@@ -574,6 +619,203 @@ impl Store for SqliteStore {
             });
         }
         Ok(out)
+    }
+
+    fn search(
+        &self,
+        account_id: AccountId,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>> {
+        let conn = self.lock()?;
+        // SECURITY: join triage and exclude sealed rows in SQL, exactly like
+        // ranked_updates. A message with no triage row is treated as non-sealed
+        // (LEFT JOIN) so freshly-ingested-but-untriaged mail is still findable,
+        // but a sealed classification always hides the row.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
+                    m.received_at, m.snippet
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.rowid
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND messages_fts MATCH ?2
+             ORDER BY rank
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![account_id, query, limit as i64, offset as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, thread_id, from_addr, from_name, subject, received_at, snippet) = row?;
+            out.push(SearchHit {
+                id,
+                thread_id,
+                from_addr,
+                from_name,
+                subject,
+                received_at: parse_dt(&received_at)?,
+                snippet,
+            });
+        }
+        Ok(out)
+    }
+
+    fn delete_sender_rule(&self, account_id: AccountId, id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "DELETE FROM sender_rules WHERE account_id=?1 AND id=?2",
+            params![account_id, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn sealed_body(&self, account_id: AccountId, message_id: i64) -> Result<SealedBody> {
+        // HUMAN-DOOR-ONLY. Returns NotFound for a missing OR non-sealed message.
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT m.id, m.account_id, m.thread_id, m.from_addr, m.from_name,
+                        m.subject, m.received_at, t.sealed_kind, m.body
+                 FROM messages m
+                 JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1 AND m.id = ?2 AND t.sensitivity = 'sealed'",
+                params![account_id, message_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (id, acct, thread_id, from_addr, from_name, subject, received_at, sealed_kind, body) =
+            row.ok_or(CoreError::NotFound)?;
+        Ok(SealedBody {
+            id,
+            account_id: acct,
+            thread_id,
+            from_addr,
+            from_name,
+            subject,
+            received_at: parse_dt(&received_at)?,
+            sealed_kind,
+            body,
+        })
+    }
+
+    fn append_audit(&self, account_id: AccountId, entry: &NewAuditEntry) -> Result<i64> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO audit_log(account_id, ts, actor, action, target, detail)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                account_id,
+                Utc::now().to_rfc3339(),
+                entry.actor,
+                entry.action,
+                entry.target,
+                entry.detail,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, ts, actor, action, target, detail
+             FROM audit_log WHERE account_id=?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, acct, ts, actor, action, target, detail) = row?;
+            out.push(AuditEntry {
+                id,
+                account_id: acct,
+                ts: parse_dt(&ts)?,
+                actor,
+                action,
+                target,
+                detail,
+            });
+        }
+        Ok(out)
+    }
+
+    fn stats(&self, account_id: AccountId) -> Result<StoreStats> {
+        let conn = self.lock()?;
+
+        let mut tier_counts = std::collections::BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT tier, COUNT(*) FROM triage
+                 WHERE account_id=?1 AND sensitivity != 'sealed'
+                 GROUP BY tier",
+            )?;
+            let rows = stmt.query_map(params![account_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (tier, n) = row?;
+                tier_counts.insert(tier, n);
+            }
+        }
+        let total: i64 = tier_counts.values().sum();
+
+        let sealed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM triage WHERE account_id=?1 AND sensitivity='sealed'",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+
+        let last_history_id: Option<i64> = conn
+            .query_row(
+                "SELECT last_uid FROM sync_state WHERE account_id=?1 AND mailbox='history'",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        Ok(StoreStats {
+            tier_counts,
+            total,
+            sealed,
+            last_history_id: last_history_id.map(|v| v as u64),
+        })
     }
 }
 
@@ -698,6 +940,95 @@ mod tests {
 
         let ds = store.deadlines(acct, Some(30)).unwrap();
         assert!(ds.is_empty(), "sealed-source deadline must be hidden");
+    }
+
+    #[test]
+    fn search_excludes_sealed_and_delete_rule_works() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut normal = sample_msg(acct, "g1", "t1");
+        normal.subject = "verification steps".to_string();
+        normal.body = "how to verify your account".to_string();
+        let n = store.upsert_message(&normal).unwrap();
+        store
+            .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        let mut sealed = sample_msg(acct, "g2", "t2");
+        sealed.subject = "verification code".to_string();
+        sealed.body = "code 999".to_string();
+        let s = store.upsert_message(&sealed).unwrap();
+        store
+            .set_triage(
+                s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None,
+            )
+            .unwrap();
+
+        let hits = store.search(acct, "verification", 10, 0).unwrap();
+        assert_eq!(hits.len(), 1, "sealed row must be excluded from search");
+        assert_eq!(hits[0].thread_id, "t1");
+
+        // delete_sender_rule
+        let rid = store
+            .set_sender_rule(acct, "*@x.com", "no", Disposition::Squelch)
+            .unwrap();
+        assert!(store.delete_sender_rule(acct, rid).unwrap());
+        assert!(!store.delete_sender_rule(acct, rid).unwrap());
+        assert!(store.list_sender_rules(acct).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sealed_body_reveal_audit_and_stats() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut sealed = sample_msg(acct, "g1", "t1");
+        sealed.body = "secret 123456".to_string();
+        let s = store.upsert_message(&sealed).unwrap();
+        store
+            .set_triage(
+                s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None,
+            )
+            .unwrap();
+
+        let mut normal = sample_msg(acct, "g2", "t2");
+        normal.thread_id = "t2".to_string();
+        let nid = store.upsert_message(&normal).unwrap();
+        store
+            .set_triage(nid, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        // sealed_body returns only for the sealed message.
+        let body = store.sealed_body(acct, s).unwrap();
+        assert_eq!(body.body, "secret 123456");
+        assert!(matches!(
+            store.sealed_body(acct, nid).unwrap_err(),
+            CoreError::NotFound
+        ));
+
+        // audit append + list
+        let aid = store
+            .append_audit(
+                acct,
+                &crate::store::NewAuditEntry {
+                    actor: "human".into(),
+                    action: "reveal_sealed".into(),
+                    target: Some(s.to_string()),
+                    detail: None,
+                },
+            )
+            .unwrap();
+        assert!(aid > 0);
+        let audit = store.list_audit(acct, 10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, "reveal_sealed");
+
+        // stats: 1 signal (t2), 1 sealed.
+        let stats = store.stats(acct).unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.tier_counts.get("signal").copied(), Some(1));
+        assert_eq!(stats.sealed, 1);
     }
 
     #[test]

@@ -1,0 +1,40 @@
+[package]
+name = "squelch-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squelch-api"
+path = "src/bin/squelch-api.rs"
+
+[dependencies]
+squelch-core = { path = "../squelch-core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+# Full-feature axum for JSON extractors, query, path, and routing. Tracks the
+# same axum 0.8 line squelch-mcp pins.
+axum = { version = "0.8" }
+tower = "0.5"
+tokio-util = "0.7"
+# Constant-time bearer-token comparison. Already in the workspace lock graph.
+subtle = "2"
+# Gmail write ops: HTTP client (rustls, no native-tls) mirroring the read
+# engine, base64url for send payloads, regex for the outbound secret guard.
+reqwest = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Implementing a stub CredentialStore in write-client tests.
+async-trait = { workspace = true }

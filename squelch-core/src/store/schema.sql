@@ -76,9 +76,12 @@ CREATE TABLE IF NOT EXISTS deadlines (
 
 CREATE INDEX IF NOT EXISTS idx_deadlines_due ON deadlines(account_id, due_at);
 
--- Per-mailbox IMAP sync cursor. UIDVALIDITY guards the (uidvalidity, last_uid)
--- pair: if the server's UIDVALIDITY changes the stored last_uid is meaningless
--- and the sync engine resets the row for that mailbox.
+-- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
+-- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
+-- last_uid holds the account's historyId (a u64 that fits in SQLite's i64
+-- INTEGER). Column names are retained from the IMAP era to avoid a migration
+-- (the schema applies fresh on open; dev dbs must be deleted to pick up shape
+-- changes).
 CREATE TABLE IF NOT EXISTS sync_state (
     account_id  INTEGER NOT NULL,
     mailbox     TEXT NOT NULL,
@@ -96,3 +99,19 @@ CREATE TABLE IF NOT EXISTS wake_budget (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
+
+-- Audit log for the HUMAN DOOR (squelch-api /client/*). Every sealed-body
+-- reveal (and, later, every write action) appends a row here BEFORE returning.
+-- This table is human-door-only; it is never read or written by MCP, sync, or
+-- triage. account_id scopes rows to an account like every other owned table.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    ts         TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    target     TEXT,
+    detail     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_account_ts ON audit_log(account_id, ts);

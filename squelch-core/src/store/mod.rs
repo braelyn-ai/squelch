@@ -13,16 +13,23 @@ pub use sqlite::SqliteStore;
 use crate::error::Result;
 use crate::triage::DeadlineHit;
 use crate::types::{
-    AccountId, Deadline, Disposition, NewMessage, SealedKind, SenderRule, Sensitivity, ThreadView,
-    Tier, Update,
+    AccountId, AuditEntry, Deadline, Disposition, NewMessage, SealedKind, SearchHit, SenderRule,
+    Sensitivity, StoreStats, ThreadView, Tier, Update,
 };
 use chrono::{DateTime, Utc};
 
-/// The IMAP sync cursor for one (account, mailbox). Persisted in `sync_state`.
+/// The Gmail sync cursor for one (account, mailbox-ish key). Persisted in
+/// `sync_state`.
+///
+/// For the Gmail REST engine the only row is keyed `mailbox = 'history'`:
+/// `uidvalidity` is unused (0) and `last_uid` holds the account's `historyId`
+/// (a monotonically increasing u64 from `users.getProfile` / `history.list`).
+/// The field names are retained from the IMAP era to avoid a schema migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncState {
     pub uidvalidity: u32,
-    pub last_uid: u32,
+    /// IMAP UID cursor OR (Gmail engine) the `historyId`.
+    pub last_uid: u64,
 }
 
 /// A fully-triaged message ready to be committed in a single transaction.
@@ -47,6 +54,52 @@ pub struct TriagedMessage {
     /// `model_used IS NULL` so the Stage-2 queue predicate
     /// (`model_used IS NULL AND sensitivity = 'normal'`) picks it up.
     pub confident: bool,
+}
+
+/// The full body of a single sealed message. HUMAN-DOOR-ONLY: returned solely
+/// by [`Store::sealed_body`], which is reachable only from the squelch-api
+/// per-message reveal endpoint (never MCP, sync, or triage). Every reveal is
+/// audited by the caller before this value leaves the process.
+#[derive(Debug, Clone)]
+pub struct SealedBody {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub thread_id: String,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+    pub received_at: DateTime<Utc>,
+    pub sealed_kind: Option<String>,
+    pub body: String,
+}
+
+/// The Gmail ids + header source fields an action endpoint needs to act on a
+/// message. HUMAN-DOOR-ONLY: produced solely by
+/// [`SqliteStore::action_message_ref`](sqlite::SqliteStore::action_message_ref),
+/// which excludes sealed rows in SQL so an action can never target sealed mail.
+/// Carries no message body.
+#[derive(Debug, Clone)]
+pub struct ActionMessageRef {
+    /// Local message id.
+    pub id: i64,
+    pub account_id: AccountId,
+    /// The Gmail-side message id (`users.messages.{id}`), used for modify/get.
+    pub gmail_msg_id: String,
+    /// The Gmail-side thread id, used as `threadId` when sending a reply.
+    pub thread_id: String,
+    /// Original sender — the default reply recipient.
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+}
+
+/// A row to append to the human-door audit log.
+#[derive(Debug, Clone)]
+pub struct NewAuditEntry {
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// A locally-stored sealed message, exposed ONLY to the TUI. This type never
@@ -114,10 +167,10 @@ pub trait Store: Send + Sync {
     /// "people I know" signal the sync engine feeds to Stage-1).
     fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool>;
 
-    /// Read the IMAP sync cursor for a mailbox, if one has been persisted.
+    /// Read the sync cursor for a mailbox key, if one has been persisted.
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>>;
 
-    /// Upsert the IMAP sync cursor for a mailbox.
+    /// Upsert the sync cursor for a mailbox key.
     fn set_sync_state(
         &self,
         account_id: AccountId,
@@ -128,4 +181,39 @@ pub trait Store: Send + Sync {
     /// LOCAL-ONLY (TUI): list sealed messages. This is the ONLY method that
     /// exposes sealed content and must never be reachable from MCP.
     fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>>;
+
+    // ---------------------------------------------------------------------
+    // HUMAN-DOOR additions (squelch-api /client/*). These MUST NOT be called
+    // from MCP, sync, or triage. `search` still excludes sealed rows; the
+    // sealed_* / audit methods are the human door's privileged surface.
+    // ---------------------------------------------------------------------
+
+    /// FTS5 keyword search over non-sealed messages. `limit`/`offset` paginate.
+    /// SECURITY: sealed rows are excluded in SQL, exactly like `ranked_updates`.
+    fn search(
+        &self,
+        account_id: AccountId,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>>;
+
+    /// Delete a sender rule by id (scoped to `account_id`). Returns whether a
+    /// row was removed.
+    fn delete_sender_rule(&self, account_id: AccountId, id: i64) -> Result<bool>;
+
+    /// HUMAN-DOOR-ONLY: fetch the full body of exactly one sealed message.
+    /// Reachable only from the squelch-api reveal endpoint, which appends an
+    /// audit row (see [`Store::append_audit`]) BEFORE calling this. Returns
+    /// `NotFound` if the message does not exist or is not sealed. Never cached.
+    fn sealed_body(&self, account_id: AccountId, message_id: i64) -> Result<SealedBody>;
+
+    /// Append a row to the human-door audit log. Returns the new row id.
+    fn append_audit(&self, account_id: AccountId, entry: &NewAuditEntry) -> Result<i64>;
+
+    /// Read the most recent audit rows (newest first), capped at `limit`.
+    fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>>;
+
+    /// Per-tier / sealed / sync-cursor summary counts for the account.
+    fn stats(&self, account_id: AccountId) -> Result<StoreStats>;
 }

@@ -8,26 +8,78 @@ use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// The one and only OAuth scope squelch will ever request. Read-only Gmail.
-/// This is a hard invariant of the project, hence a `const`, not config.
+/// The READ scope. This is all the sync daemon + triage ever request; the read
+/// credential is `gmail.readonly` and nothing else. Hard invariant, hence a
+/// `const`. See [`WRITE_SCOPES`] for the separate, opt-in action credential.
 pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
 
-/// Sync-related tunables. Placeholders in v0 but real config, not constants, so
-/// the sync agent can wire them in without a schema change.
+/// The WRITE scopes, requested ONLY by `squelchd auth --write` and loaded ONLY
+/// by human-door action endpoints — never by sync/triage. `gmail.modify` covers
+/// label/read-state/archive mutations; `gmail.send` covers sending. Kept as a
+/// distinct grep-obvious constant from [`GMAIL_READONLY_SCOPE`] so the two
+/// credentials can never be conflated.
+pub const GMAIL_MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+pub const GMAIL_SEND_SCOPE: &str = "https://www.googleapis.com/auth/gmail.send";
+
+/// Convenience: the full set of scopes for the write credential.
+pub const WRITE_SCOPES: &[&str] = &[GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE];
+
+/// Which backend persists OAuth tokens.
+///
+/// `Keyring` uses the OS secret service (macOS Keychain, Linux Secret Service).
+/// `File` writes a mode-0600 JSON file — the only viable option on a headless
+/// Linux box with no desktop keyring. Default is [`CredentialBackend::default`]:
+/// keyring on macOS, file on Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialBackend {
+    Keyring,
+    File,
+}
+
+impl Default for CredentialBackend {
+    fn default() -> Self {
+        // Headless Linux typically has no Secret Service; default to a file.
+        // macOS always has Keychain.
+        if cfg!(target_os = "macos") {
+            CredentialBackend::Keyring
+        } else {
+            CredentialBackend::File
+        }
+    }
+}
+
+impl CredentialBackend {
+    /// Parse from the `credential_backend` config / `SQUELCH_CRED_BACKEND` env
+    /// string. Case-insensitive. Unknown values fall back to the platform
+    /// default.
+    pub fn from_str_lenient(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "keyring" => Some(CredentialBackend::Keyring),
+            "file" => Some(CredentialBackend::File),
+            _ => None,
+        }
+    }
+}
+
+/// Sync-related tunables. Real config, not constants, so the sync engine can
+/// wire them in without a schema change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
     /// How many days of history to backfill on the initial sync.
     pub backfill_days: u32,
-    /// Debounce window (seconds) for coalescing push/poll notifications.
-    pub coalesce_secs: u64,
+    /// How often (seconds) the incremental poll loop wakes to call
+    /// `history.list`. A poll batch IS the coalesced batch — polling replaces
+    /// the old IDLE wake-coalescing entirely.
+    pub poll_secs: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             backfill_days: 30,
-            coalesce_secs: 30,
+            poll_secs: 45,
         }
     }
 }
@@ -89,13 +141,20 @@ pub struct Config {
 
     /// Path to the SQLite store.
     pub db_path: PathBuf,
+    /// Which backend persists OAuth tokens (`keyring` or `file`). Defaults per
+    /// platform (keyring on macOS, file on Linux). Override with
+    /// `SQUELCH_CRED_BACKEND`.
+    pub credential_backend: CredentialBackend,
+    /// Path to the JSON credentials file used by the `file` backend. Defaults to
+    /// `~/.config/squelch/credentials.json`. Ignored by the keyring backend.
+    pub credentials_path: Option<PathBuf>,
     /// Default minimum importance for surfacing updates.
     pub default_min_importance: u8,
     /// How aggressively to squelch. Placeholder; the triage agent owns semantics.
     pub squelch_level: u8,
     /// Stage-1 rules-engine tuning.
     pub stage1: Stage1Config,
-    /// Sync tunables (backfill window, coalesce debounce).
+    /// Sync tunables (backfill window, poll interval).
     pub sync: SyncConfig,
 }
 
@@ -106,6 +165,8 @@ impl Default for Config {
             client_secret: None,
             account_email: None,
             db_path: PathBuf::from("squelch.db"),
+            credential_backend: CredentialBackend::default(),
+            credentials_path: None,
             default_min_importance: 0,
             squelch_level: 0,
             stage1: Stage1Config::default(),
@@ -171,16 +232,40 @@ impl Config {
         {
             self.sync.backfill_days = n;
         }
-        if let Ok(v) = std::env::var("SQUELCH_COALESCE_SECS")
+        if let Ok(v) = std::env::var("SQUELCH_POLL_SECS")
             && let Ok(n) = v.parse::<u64>()
         {
-            self.sync.coalesce_secs = n;
+            self.sync.poll_secs = n;
         }
         if let Ok(v) = std::env::var("SQUELCH_SQUELCH_LEVEL")
             && let Ok(n) = v.parse::<u8>()
         {
             self.squelch_level = n;
         }
+        if let Ok(v) = std::env::var("SQUELCH_CRED_BACKEND")
+            && let Some(b) = CredentialBackend::from_str_lenient(&v)
+        {
+            self.credential_backend = b;
+        }
+        if let Some(p) = std::env::var_os("SQUELCH_CREDENTIALS_PATH") {
+            self.credentials_path = Some(PathBuf::from(p));
+        }
+    }
+
+    /// Resolve the credentials-file path for the `file` backend: the configured
+    /// path if set, else `~/.config/squelch/credentials.json`.
+    pub fn resolve_credentials_path(&self) -> PathBuf {
+        if let Some(p) = &self.credentials_path {
+            return p.clone();
+        }
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| {
+                h.join(".config")
+                    .join("squelch")
+                    .join("credentials.json")
+            })
+            .unwrap_or_else(|| PathBuf::from("credentials.json"))
     }
 
     /// Load config from an explicit path (if present), then apply env overrides.
@@ -239,7 +324,7 @@ mod tests {
     fn sync_defaults_are_sane() {
         let c = Config::default();
         assert_eq!(c.sync.backfill_days, 30);
-        assert_eq!(c.sync.coalesce_secs, 30);
+        assert_eq!(c.sync.poll_secs, 45);
         assert!(c.client_id.is_none());
     }
 
@@ -271,7 +356,7 @@ backfill_days = 90
         assert_eq!(c.db_path, PathBuf::from("/tmp/squelch.db"));
         assert_eq!(c.sync.backfill_days, 90);
         // unspecified sync field falls back to default
-        assert_eq!(c.sync.coalesce_secs, 30);
+        assert_eq!(c.sync.poll_secs, 45);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -306,5 +391,80 @@ backfill_days = 90
     fn oauth_client_errors_when_missing() {
         let c = Config::default();
         assert!(c.oauth_client().is_err());
+    }
+
+    #[test]
+    fn credential_backend_default_is_platform_appropriate() {
+        let b = CredentialBackend::default();
+        if cfg!(target_os = "macos") {
+            assert_eq!(b, CredentialBackend::Keyring);
+        } else {
+            assert_eq!(b, CredentialBackend::File);
+        }
+    }
+
+    #[test]
+    fn credential_backend_parse() {
+        assert_eq!(
+            CredentialBackend::from_str_lenient("keyring"),
+            Some(CredentialBackend::Keyring)
+        );
+        assert_eq!(
+            CredentialBackend::from_str_lenient("  FILE "),
+            Some(CredentialBackend::File)
+        );
+        assert_eq!(CredentialBackend::from_str_lenient("nonsense"), None);
+    }
+
+    #[test]
+    fn env_selects_credential_backend() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_CRED_BACKEND", "file");
+            std::env::set_var("SQUELCH_CREDENTIALS_PATH", "/tmp/squelch-test-creds.json");
+        }
+        let mut c = Config {
+            credential_backend: CredentialBackend::Keyring,
+            ..Config::default()
+        };
+        c.apply_env_overrides();
+        assert_eq!(c.credential_backend, CredentialBackend::File);
+        assert_eq!(
+            c.resolve_credentials_path(),
+            PathBuf::from("/tmp/squelch-test-creds.json")
+        );
+        unsafe {
+            std::env::remove_var("SQUELCH_CRED_BACKEND");
+            std::env::remove_var("SQUELCH_CREDENTIALS_PATH");
+        }
+    }
+
+    #[test]
+    fn credential_backend_from_toml() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("squelch-cfg-be-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+credential_backend = "file"
+credentials_path = "/var/lib/squelch/creds.json"
+"#,
+        )
+        .unwrap();
+        // Ensure env doesn't clobber the file value under test.
+        unsafe {
+            std::env::remove_var("SQUELCH_CRED_BACKEND");
+            std::env::remove_var("SQUELCH_CREDENTIALS_PATH");
+        }
+        let c = Config::load_from(&path);
+        assert_eq!(c.credential_backend, CredentialBackend::File);
+        assert_eq!(
+            c.resolve_credentials_path(),
+            PathBuf::from("/var/lib/squelch/creds.json")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

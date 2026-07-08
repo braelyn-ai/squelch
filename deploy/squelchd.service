@@ -1,0 +1,47 @@
+# systemd unit for the unified squelch daemon (sync loop + both HTTP doors).
+#
+# Install: copy to /etc/systemd/system/squelchd.service, then
+#   systemctl daemon-reload && systemctl enable --now squelchd
+# Config/secrets come from the EnvironmentFile below (see deploy/DEPLOY.md).
+[Unit]
+Description=squelch unified daemon (sync + agent door /mcp + human door /client)
+Documentation=https://github.com/  # your repo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/squelchd serve
+Restart=on-failure
+RestartSec=5
+
+# Dedicated unprivileged service account (create it: see DEPLOY.md).
+User=squelch
+Group=squelch
+
+# Secrets + tunables live here, NOT in this unit (keeps tokens out of the unit
+# file and out of `systemctl show`). Required keys: SQUELCH_API_TOKEN,
+# SQUELCH_CRED_BACKEND, SQUELCH_ACCOUNT_EMAIL, SQUELCH_DB_PATH, SQUELCH_BIND, etc.
+EnvironmentFile=/etc/squelch/env
+
+# --- Hardening basics ---
+# No privilege escalation, ever.
+NoNewPrivileges=true
+# Read-only view of the whole filesystem...
+ProtectSystem=strict
+# ...except the data dir (SQLite db + file-backend credentials live here).
+# Keep this in sync with SQUELCH_DB_PATH / SQUELCH_CREDENTIALS_PATH.
+ReadWritePaths=/var/lib/squelch
+# Private /tmp, no access to other users' homes, kernel knobs locked down.
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Loopback + tailnet only; the daemon binds 127.0.0.1 and tailscale serve fronts it.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

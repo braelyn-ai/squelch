@@ -19,19 +19,22 @@ use crate::types::{AccountId, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
 use mail_parser::{Address, MessageParser};
 
-/// The raw identity/metadata the IMAP layer supplies alongside the RFC822 body.
-/// `gmail_msg_id` comes from X-GM-MSGID; `gmail_thread_id` from X-GM-THRID when
-/// present, else a header-derived fallback (see [`fallback_thread_id`]).
+/// The raw identity/metadata the transport supplies alongside the RFC822 body.
+/// The Gmail REST engine fills `gmail_msg_id` from the native `message.id` and
+/// `gmail_thread_id` from the native `message.threadId`; when both are absent
+/// (e.g. a synthetic metadata-only Sent ingest) the pipeline falls back to a
+/// header-derived thread key (see [`fallback_thread_id`]).
 #[derive(Debug, Clone)]
 pub struct RawFetched {
     pub account_id: AccountId,
-    /// Stable per-account message id (X-GM-MSGID, or a Message-ID hash fallback).
+    /// Stable per-account message id (Gmail `message.id`, or a Message-ID hash
+    /// fallback when absent).
     pub gmail_msg_id: String,
-    /// X-GM-THRID when available; otherwise a header-derived thread key.
+    /// Gmail `message.threadId` when available; otherwise a header-derived key.
     pub gmail_thread_id: Option<String>,
-    /// Full RFC822 bytes (BODY.PEEK[]).
+    /// Full RFC822 bytes (from `format=raw`), base64url-decoded.
     pub raw: Vec<u8>,
-    /// IMAP INTERNALDATE fallback if the message lacks a parseable Date header.
+    /// Date fallback if the message lacks a parseable Date header.
     pub internal_date: Option<DateTime<Utc>>,
     /// Whether this came from the Sent mailbox (seeds the contacts table).
     pub is_sent: bool,

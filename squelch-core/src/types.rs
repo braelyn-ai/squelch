@@ -178,6 +178,45 @@ pub struct Deadline {
     pub source: String,
 }
 
+/// A keyword-search hit over the FTS index. HUMAN-DOOR-facing (squelch-api).
+/// Sealed rows are excluded by the query, so a `SearchHit` never represents a
+/// sealed message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub id: i64,
+    pub thread_id: String,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+    pub received_at: DateTime<Utc>,
+    pub snippet: String,
+}
+
+/// One row of the human-door audit log. Human-door-only; never crosses MCP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub ts: DateTime<Utc>,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Per-tier / sealed / sync summary counts. Human-door-facing (squelch-api).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreStats {
+    /// Count of non-sealed messages per tier (past_due/deadline/signal/noise).
+    pub tier_counts: std::collections::BTreeMap<String, i64>,
+    /// Total non-sealed, triaged messages.
+    pub total: i64,
+    /// Count of sealed messages (metadata only).
+    pub sealed: i64,
+    /// The persisted Gmail history cursor (mailbox='history'), if any.
+    pub last_history_id: Option<u64>,
+}
+
 /// Input record for upserting a fetched message into the store.
 #[derive(Debug, Clone)]
 pub struct NewMessage {

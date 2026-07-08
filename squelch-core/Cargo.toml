@@ -21,12 +21,6 @@ toml = { workspace = true }
 tiny_http = { workspace = true }
 webbrowser = { workspace = true }
 url = { workspace = true }
-async-imap = { workspace = true }
-async-native-tls = { workspace = true }
+reqwest = { workspace = true }
 mail-parser = { workspace = true }
-futures = { workspace = true }
 base64 = { workspace = true }
-
-[[bin]]
-name = "squelchd"
-path = "src/bin/squelchd.rs"
