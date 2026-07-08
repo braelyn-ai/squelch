@@ -1,19 +1,42 @@
-//! squelch-mcp: stdio MCP server exposing squelch's 5 read-mostly tools.
+//! squelch-mcp: MCP server exposing squelch's 5 read-mostly tools.
 //!
 //! Transport is chosen HERE and only here. Tool logic lives in [`server`] and
-//! is transport-agnostic, so swapping stdio for SSE/streamable-http later is a
-//! one-line change in `run`.
+//! is transport-agnostic. Default (no args) is stdio, exactly as before; passing
+//! `--http [addr]` (or setting `SQUELCH_MCP_HTTP`) serves the MCP Streamable HTTP
+//! transport instead. The endpoint is mounted at `/mcp`.
 
 mod server;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 use squelch_core::store::SqliteStore;
+use tokio_util::sync::CancellationToken;
 
 use crate::server::SquelchServer;
+
+/// Default bind address for HTTP mode. Loopback ONLY: a reverse proxy
+/// (e.g. `tailscale serve`) is expected to front this listener. We never
+/// default to a non-loopback interface.
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8848";
+
+/// Path the Streamable HTTP transport is mounted at. Clients connect to
+/// `http://<addr>/mcp`.
+const HTTP_MCP_PATH: &str = "/mcp";
+
+/// How the server talks to clients. Selected once, in `main`.
+enum Transport {
+    /// stdio: the default, unchanged behavior.
+    Stdio,
+    /// Streamable HTTP bound to `addr` (loopback by default).
+    Http(SocketAddr),
+}
 
 /// Resolve the SQLite path from `SQUELCH_DB`, falling back to the user data dir.
 fn db_path() -> PathBuf {
@@ -42,14 +65,112 @@ fn build_server() -> anyhow::Result<SquelchServer> {
     SquelchServer::new(store, &account_email())
 }
 
+/// Decide the transport from CLI args and env, without touching tool logic.
+///
+/// Rules:
+/// - No `--http` flag and no `SQUELCH_MCP_HTTP` env => stdio (default, unchanged).
+/// - `--http` (optionally followed by an address) => HTTP. An explicit address
+///   wins over the env var, which wins over the loopback default.
+/// - `SQUELCH_MCP_HTTP` set (to an address or empty) => HTTP, unless overridden
+///   by an explicit `--http <addr>`.
+///
+/// The bind address always defaults to loopback; we never silently widen it.
+fn select_transport() -> anyhow::Result<Transport> {
+    // Skip argv[0].
+    let mut args = std::env::args().skip(1);
+    let mut http_flag = false;
+    let mut flag_addr: Option<String> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--http" => {
+                http_flag = true;
+                // Optional inline address: `--http 127.0.0.1:9000`. Peek the
+                // next arg; only consume it if it isn't another flag.
+                if let Some(next) = args.next() {
+                    if next.starts_with('-') {
+                        return Err(anyhow::anyhow!(
+                            "unexpected argument `{next}` after --http"
+                        ));
+                    }
+                    flag_addr = Some(next);
+                }
+            }
+            other => {
+                return Err(anyhow::anyhow!("unknown argument: {other}"));
+            }
+        }
+    }
+
+    let env_addr = std::env::var("SQUELCH_MCP_HTTP").ok();
+    let use_http = http_flag || env_addr.is_some();
+    if !use_http {
+        return Ok(Transport::Stdio);
+    }
+
+    // Flag address wins over env; empty env means "HTTP at the default addr".
+    let addr_str = flag_addr
+        .or_else(|| env_addr.filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string());
+
+    let addr: SocketAddr = addr_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid HTTP bind address `{addr_str}`: {e}"))?;
+    Ok(Transport::Http(addr))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server = build_server()?;
+    // Transport selection lives ONLY here. Tool code is untouched either way.
+    match select_transport()? {
+        Transport::Stdio => {
+            let server = build_server()?;
+            let running = server.serve(stdio()).await?;
+            running.waiting().await?;
+        }
+        Transport::Http(addr) => serve_http(addr).await?,
+    }
+    Ok(())
+}
 
-    // Transport selection lives ONLY here. To add SSE later, branch on config
-    // and call `.serve(sse_transport)` instead — tool code is untouched.
-    let running = server.serve(stdio()).await?;
-    running.waiting().await?;
+/// Serve the MCP Streamable HTTP transport on `addr` until ctrl-c.
+///
+/// rmcp exposes the transport as a tower `Service`; axum hosts it at `/mcp`.
+/// A fresh [`SquelchServer`] is handed to each session via the service factory
+/// (it is cheap to clone — it only wraps an `Arc<SqliteStore>`).
+async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
+    // Build one server up front so a construction error surfaces before we bind,
+    // then clone it per session inside the factory.
+    let template = build_server()?;
+
+    let shutdown = CancellationToken::new();
+    let service = StreamableHttpService::new(
+        move || Ok(template.clone()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().with_cancellation_token(shutdown.child_token()),
+    );
+
+    let router = axum::Router::new().nest_service(HTTP_MCP_PATH, service);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr().unwrap_or(addr);
+
+    // Single startup line on stderr. No tokens or message content are ever logged.
+    eprintln!("squelch-mcp: serving MCP Streamable HTTP on http://{bound}{HTTP_MCP_PATH}");
+
+    // Graceful shutdown: on ctrl-c, cancel the token (terminates active MCP
+    // sessions) and stop accepting connections.
+    let shutdown_signal = {
+        let shutdown = shutdown.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("squelch-mcp: shutting down");
+            shutdown.cancel();
+        }
+    };
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }
 
