@@ -13,10 +13,36 @@ pub use sqlite::SqliteStore;
 use crate::error::Result;
 use crate::triage::DeadlineHit;
 use crate::types::{
-    AccountId, AuditEntry, Deadline, Disposition, NewMessage, SealedKind, SearchHit, SenderRule,
-    Sensitivity, StoreStats, ThreadView, Tier, Update,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, Deadline, Disposition, NewMessage,
+    SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
 };
 use chrono::{DateTime, Utc};
+
+/// A server-side convenience bucket for the sitrep chassis, selectable via the
+/// `band` param on `/client/updates`. See [`Store::attention_updates`].
+///
+/// - `Standing`  — tier is `past_due`/`deadline` AND status != 'done'. Immune to
+///   the surfacing clock; never rotates out until resolved.
+/// - `New`       — `surfaced_at IS NULL`: never surfaced through ANY door.
+/// - `Open`      — status = 'open', sorted by `age * importance` descending (the
+///   aging/escalating band). See the SQL in `sqlite.rs` for the exact ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SitrepBand {
+    Standing,
+    New,
+    Open,
+}
+
+impl SitrepBand {
+    pub fn parse(s: &str) -> Option<SitrepBand> {
+        match s {
+            "standing" => Some(SitrepBand::Standing),
+            "new" => Some(SitrepBand::New),
+            "open" => Some(SitrepBand::Open),
+            _ => None,
+        }
+    }
+}
 
 /// The Gmail sync cursor for one (account, mailbox-ish key). Persisted in
 /// `sync_state`.
@@ -41,6 +67,11 @@ pub struct SyncState {
 #[derive(Debug, Clone)]
 pub struct TriagedMessage {
     pub message: NewMessage,
+    /// For Sent mail only: the To/Cc recipient addresses to seed the contacts
+    /// table with (the account's OWN address is already filtered out at ingest).
+    /// Empty for received mail — contacts are derived exclusively from the
+    /// recipients of mail the user sent, never from senders of inbound mail.
+    pub recipients: Vec<String>,
     pub sensitivity: Sensitivity,
     pub sealed_kind: Option<SealedKind>,
     pub importance: u8,
@@ -187,6 +218,43 @@ pub trait Store: Send + Sync {
     // from MCP, sync, or triage. `search` still excludes sealed rows; the
     // sealed_* / audit methods are the human door's privileged surface.
     // ---------------------------------------------------------------------
+
+    /// HUMAN-DOOR-ONLY: ranked updates carrying attention-lifecycle fields
+    /// (`status`/`surfaced_at`/`resolved_at`) for the sitrep chassis. Sealed rows
+    /// are excluded in SQL exactly like [`Store::ranked_updates`].
+    ///
+    /// `since`/`min_importance` behave as in `ranked_updates`. `status` filters
+    /// to a single lifecycle value. `band` applies a server-side sitrep bucket
+    /// (see [`SitrepBand`]). The returned `surfaced_at` is the PRE-stamp value —
+    /// this method never mutates the ledger; the caller stamps with
+    /// [`Store::mark_surfaced`] AFTER the serialization set is computed.
+    fn attention_updates(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        min_importance: Option<u8>,
+        status: Option<AttentionStatus>,
+        band: Option<SitrepBand>,
+    ) -> Result<Vec<AttentionUpdate>>;
+
+    /// SEEN-LEDGER stamp. For each non-sealed message id: set `surfaced_at=now`
+    /// only if currently NULL, and promote `status` `new`->`open`. Applied in ONE
+    /// transaction after a read door has computed the rows it is about to return.
+    /// Sealed rows are never affected (`sensitivity != 'sealed'` guard in SQL),
+    /// upholding "sealed never surfaces through any of this". Returns the count of
+    /// rows whose `surfaced_at` transitioned from NULL (i.e. first-surface count).
+    fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize>;
+
+    /// Set the attention status of one message's triage row. `Done` stamps
+    /// `resolved_at=now`; `Open`/`New` clear it. Sealed rows are excluded in SQL
+    /// (returns `false` for a missing OR sealed message, keeping them
+    /// indistinguishable). Returns whether a row was updated.
+    fn set_attention_status(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        status: AttentionStatus,
+    ) -> Result<bool>;
 
     /// FTS5 keyword search over non-sealed messages. `limit`/`offset` paginate.
     /// SECURITY: sealed rows are excluded in SQL, exactly like `ranked_updates`.

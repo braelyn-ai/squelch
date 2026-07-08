@@ -24,6 +24,14 @@ struct Detector {
     magic_link: Vec<Regex>,
     login_alert: Vec<Regex>,
     verification: Vec<Regex>,
+    /// Sender-shape corroborators: security@/donotreply@/etc. at a financial-ish
+    /// domain. Used to seal weaker login-ish phrasing when the sender looks like
+    /// a bank/security notifier (bug #4).
+    security_sender: Vec<Regex>,
+    financial_domain: Vec<Regex>,
+    /// Weaker login-ish phrasing that only seals when corroborated by a
+    /// security-shaped sender.
+    login_soft: Vec<Regex>,
 }
 
 fn rx(p: &str) -> Regex {
@@ -69,6 +77,11 @@ fn detector() -> &'static Detector {
             rx(r"\bwas this you\b"),
             rx(r"\bsomeone (just )?(signed|logged) in\b"),
             rx(r"\bsign[-\s]?in (attempt|detected)\b"),
+            // bug #4: Schwab-style "Confirming your recent login".
+            rx(r"\bconfirming your (recent )?login\b"),
+            rx(r"\bsigned in (to|from)\b"),
+            rx(r"\blogin (from|detected|alert)\b"),
+            rx(r"\brecent login\b"),
         ],
         verification: vec![
             rx(r"\bverify your (email|account|identity|address)\b"),
@@ -76,6 +89,20 @@ fn detector() -> &'static Detector {
             rx(r"\bemail verification\b"),
             rx(r"\bactivate your account\b"),
             rx(r"\bverification (link|email|request)\b"),
+        ],
+        security_sender: vec![
+            rx(r"^(security|secure|donotreply|do[-_.]?not[-_.]?reply|no[-_.]?reply|alerts?|account|notify|notifications?)@"),
+        ],
+        financial_domain: vec![
+            // Bank/broker-ish domains and mail-subdomains thereof.
+            rx(r"@(mail\.)?(schwab|chase|wellsfargo|bankofamerica|bofa|citi|capitalone|amex|americanexpress|fidelity|vanguard|paypal|venmo|ally|discover|usbank|pnc|tdbank)\."),
+            rx(r"@[^@]*(bank|creditunion|financial|fcu)\."),
+        ],
+        login_soft: vec![
+            // Weaker phrasing that seals only with a security-shaped sender.
+            rx(r"\blog(ged)?[-\s]?in\b"),
+            rx(r"\bsign(ed)?[-\s]?in\b"),
+            rx(r"\baccount (access|activity)\b"),
         ],
     })
 }
@@ -106,6 +133,20 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
     }
     if any_match(&d.verification, &hay) {
         return Some(SealedKind::Verification);
+    }
+    // bug #4 corroborator: weaker login-ish phrasing seals when the sender looks
+    // like a security/no-reply notifier at a financial-ish domain. Biased to
+    // over-seal: a bank telling you about account access is auth-adjacent.
+    let sender_is_security = d
+        .security_sender
+        .iter()
+        .any(|re| re.is_match(input.from_addr));
+    let sender_is_financial = d
+        .financial_domain
+        .iter()
+        .any(|re| re.is_match(input.from_addr));
+    if sender_is_security && sender_is_financial && any_match(&d.login_soft, &hay) {
+        return Some(SealedKind::LoginAlert);
     }
     None
 }
@@ -176,6 +217,88 @@ mod tests {
         assert_eq!(
             detect_sealed(&inp("Verify your email", "confirm your account")),
             Some(SealedKind::Verification)
+        );
+    }
+
+    /// Build an input with an explicit sender (for sender-shape corroboration).
+    fn inp_from<'a>(from: &'a str, subject: &'a str, body: &'a str) -> SealInput<'a> {
+        SealInput {
+            from_addr: from,
+            subject,
+            body,
+        }
+    }
+
+    #[test]
+    fn bug4_schwab_login_confirmation_seals() {
+        // Confirmed against real mail: this LOGIN ALERT scored noise/40
+        // fallthrough and was NOT sealed. It must be Sealed(LoginAlert).
+        let got = detect_sealed(&inp_from(
+            "donotreply@mail.schwab.com",
+            "Confirming your recent login",
+            "We're confirming your recent login to your Schwab account.",
+        ));
+        assert_eq!(got, Some(SealedKind::LoginAlert));
+    }
+
+    #[test]
+    fn extended_login_alert_phrasings_seal() {
+        // These seal on phrasing alone, any sender.
+        let cases = [
+            "New sign-in to your account",
+            "New sign in detected",
+            "You signed in to a new device",
+            "signed in from a new location",
+            "Login from an unrecognized device",
+            "login detected",
+            "login alert",
+            "Security alert on your account",
+            "Unusual activity detected",
+            "Unusual sign-in detected",
+        ];
+        for s in cases {
+            assert_eq!(
+                detect_sealed(&inp(s, "")),
+                Some(SealedKind::LoginAlert),
+                "login phrasing not sealed: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_login_phrasing_seals_only_for_security_financial_sender() {
+        // Weak phrasing ("account access") from a bank's no-reply => sealed.
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "security@mail.chase.com",
+                "Account access",
+                "There was recent account access on your profile.",
+            )),
+            Some(SealedKind::LoginAlert),
+        );
+        // Same weak phrasing from a random marketing sender => NOT sealed
+        // (no strong phrasing, no security/financial sender shape).
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "hello@randomshop.com",
+                "Account access",
+                "Manage your account access preferences.",
+            )),
+            None,
+        );
+    }
+
+    #[test]
+    fn marketing_signin_offer_does_not_seal() {
+        // Negative fixture: pure marketing that mentions "sign in to view your
+        // offer" from a non-financial marketing sender should not seal.
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "deals@shopmail.com",
+                "Sign in to view your exclusive offer",
+                "Sign in to see 20% off. Unsubscribe anytime.",
+            )),
+            None,
         );
     }
 

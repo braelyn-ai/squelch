@@ -48,9 +48,17 @@ pub fn streamable_http_service(
     cancellation: CancellationToken,
 ) -> anyhow::Result<SquelchHttpService> {
     let template = SquelchServer::new(store, account_email)?;
+    // DNS-rebinding guard: rmcp defaults to loopback-only Host headers, which
+    // 403s requests proxied by `tailscale serve` (Host: *.ts.net). We feed it
+    // the loopback defaults PLUS any hosts from SQUELCH_MCP_ALLOWED_HOSTS,
+    // resolved in ONE place in core config so the bin and `squelchd serve`
+    // honor the same list. Additive — loopback is never dropped.
+    let allowed_hosts = squelch_core::config::mcp_allowed_hosts();
     Ok(StreamableHttpService::new(
         move || Ok(template.clone()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default().with_cancellation_token(cancellation),
+        StreamableHttpServerConfig::default()
+            .with_cancellation_token(cancellation)
+            .with_allowed_hosts(allowed_hosts),
     ))
 }

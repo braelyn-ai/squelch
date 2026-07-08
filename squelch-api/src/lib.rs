@@ -45,6 +45,10 @@ use axum::{
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/client/updates", get(handlers::get_updates))
+        .route(
+            "/client/updates/{message_id}/status",
+            post(handlers::set_update_status),
+        )
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         .route("/client/search", get(handlers::search))
         .route("/client/rules", get(handlers::list_rules))

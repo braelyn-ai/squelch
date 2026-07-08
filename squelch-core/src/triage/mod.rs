@@ -99,32 +99,77 @@ pub fn stage1_with_config(
 
     // ---- Rung 1: BILL / PAYMENT (highest recall) ------------------------
     if let Some(hit) = deadline::detect_bill(subject, body, now) {
-        let tier = if hit.past_due {
+        // Sender trust gates the scream. A bill from a TRUSTED sender (a known
+        // contact / previously-seen biller) keeps full confidence and its
+        // natural PastDue/Deadline tier. A bill from an UNKNOWN sender must NOT
+        // be allowed to land CONFIDENT PastDue — that is exactly the scam vector
+        // in bug #3 (a stranger screaming "past due" for $2.4M). We cap it at
+        // Deadline, mark it not-confident (queue for Stage-2), and use a
+        // moderate importance.
+        let trusted = is_known_contact;
+
+        // Sanity dampeners, applied regardless of sender. These NEVER raise a
+        // tier; they only shave confidence.
+        let absurd_amount = hit
+            .amount
+            .is_some_and(|a| a > cfg.bill_absurd_amount_threshold);
+        let scammy = deadline::has_scammy_phrasing(subject, body);
+        let dampened = absurd_amount || scammy;
+
+        // Tier: trusted senders keep their natural tier. Untrusted senders are
+        // capped at Deadline (never PastDue). Dampeners also cap at Deadline.
+        let natural_tier = if hit.past_due {
             Tier::PastDue
         } else {
             Tier::Deadline
         };
+        let tier = if trusted && !dampened {
+            natural_tier
+        } else {
+            Tier::Deadline
+        };
+
+        // Confidence: trusted + no dampener => final. Anything else => Stage-2.
+        let confident = trusted && !dampened;
+
+        let importance = if trusted {
+            cfg.bill_importance
+        } else {
+            cfg.bill_unknown_sender_importance
+        };
+
         let amount_str = match (hit.amount, hit.currency.as_deref()) {
             (Some(a), Some(c)) => format!(" {a:.2} {c}"),
             _ => String::new(),
         };
-        let one_line = if hit.past_due {
+        let one_line = if tier == Tier::PastDue {
             format!("Past-due bill{amount_str}: {}", short_subject(subject))
         } else {
             format!("Bill due{amount_str}: {}", short_subject(subject))
         };
-        let reason = format!(
+
+        let mut reason = format!(
             "bill/payment signal (kind={}, source={}, past_due={})",
             hit.kind, hit.source, hit.past_due
         );
+        if !trusted {
+            reason.push_str("; bill-like from unknown sender (capped at Deadline, deferring to Stage-2)");
+        }
+        if absurd_amount {
+            reason.push_str("; absurd amount dampener");
+        }
+        if scammy {
+            reason.push_str("; screamy/scam phrasing dampener");
+        }
+
         return Stage1Result {
             tier,
-            importance: cfg.bill_importance,
+            importance,
             one_line,
             reason,
             deadline: Some(hit),
             matched_rule: None,
-            confident: true,
+            confident,
         };
     }
 
@@ -314,12 +359,14 @@ mod tests {
 
     #[test]
     fn past_due_bill() {
+        // Updated for bug #3: a confident PastDue now requires a TRUSTED sender
+        // (known contact). Same email from a known biller still screams.
         let m = msg(
             "billing@utilityco.com",
             "PAST DUE: Your electric bill",
             "Amount due $84.20. This payment is overdue.",
         );
-        let r = run(&m, false, &[]);
+        let r = run(&m, true, &[]);
         assert_eq!(r.tier, Tier::PastDue);
         assert!(r.confident);
         let d = r.deadline.expect("deadline populated");
@@ -331,12 +378,13 @@ mod tests {
 
     #[test]
     fn dated_future_bill_is_deadline() {
+        // Known sender => confident. (Bug #3: unknown senders now defer.)
         let m = msg(
             "invoices@acme.com",
             "Invoice #4402 from Acme",
             "Your invoice total is $1,299.00. Payment due by August 15, 2026.",
         );
-        let r = run(&m, false, &[]);
+        let r = run(&m, true, &[]);
         assert_eq!(r.tier, Tier::Deadline);
         assert!(r.confident);
         let d = r.deadline.unwrap();
@@ -346,16 +394,90 @@ mod tests {
 
     #[test]
     fn bill_wins_over_sender_rule() {
-        // Even a squelch rule must not suppress a bill.
+        // Even a squelch rule must not suppress a bill. Known sender so it keeps
+        // its full PastDue tier (bug #3 caps only UNKNOWN senders).
         let m = msg(
             "billing@acme.com",
             "Your invoice is ready",
             "Amount due: $10.00, due date January 1, 2026",
         );
         let rules = vec![rule(9, "*@acme.com", Disposition::Squelch, "")];
-        let r = run(&m, false, &rules);
+        let r = run(&m, true, &rules);
         assert!(matches!(r.tier, Tier::PastDue));
         assert_eq!(r.matched_rule, None);
+    }
+
+    // ---- Bug #3: sender-trust-gated bills -------------------------------
+
+    #[test]
+    fn pge_style_past_due_from_known_sender_still_screams() {
+        // The user's real fear: a legit past-due from a known biller MUST still
+        // land CONFIDENT PastDue at the top of the scream tier.
+        let m = msg(
+            "customerservice@pge.com",
+            "Your PG&E bill is past due",
+            "Your account is past due. Amount due $214.77. Please pay to avoid \
+             service interruption.",
+        );
+        let r = run(&m, true, &[]);
+        assert_eq!(r.tier, Tier::PastDue, "known-sender past-due must scream");
+        assert!(r.confident, "known-sender past-due must be final, not Stage-2");
+        assert_eq!(r.importance, 95);
+        let d = r.deadline.unwrap();
+        assert!(d.past_due);
+        assert_eq!(d.amount, Some(214.77));
+    }
+
+    #[test]
+    fn scam_past_due_from_unknown_sender_is_not_confident_past_due() {
+        // Bug #3 (confirmed against real mail): a scam "past due" from an unknown
+        // sender parsed $2,470,000 and landed CONFIDENT PastDue at the top of
+        // the scream tier. It must now be Deadline AT MOST, NOT confident.
+        let m = msg(
+            "info@sfmail.corpnet.com",
+            "You're Past Due — Penalties Are Adding Up",
+            "Your balance of $2,470,000 is past due. Penalties are adding up. \
+             Pay now to avoid further action!!!",
+        );
+        let r = run(&m, false, &[]);
+        assert_ne!(r.tier, Tier::PastDue, "scam must NOT be PastDue");
+        assert_eq!(r.tier, Tier::Deadline, "capped at Deadline at most");
+        assert!(!r.confident, "unknown-sender bill must defer to Stage-2");
+        assert_eq!(r.importance, 55, "moderate importance from config");
+        assert!(r.reason.contains("unknown sender"));
+        // Both dampeners should have fired.
+        assert!(r.reason.contains("absurd amount"));
+        assert!(r.reason.contains("screamy/scam"));
+    }
+
+    #[test]
+    fn bill_like_from_unknown_sender_defers_even_without_scam_signals() {
+        // A plain, un-screamy invoice from a stranger: still capped at Deadline
+        // and deferred to Stage-2 (never confident PastDue).
+        let m = msg(
+            "billing@unknown-vendor.example",
+            "Invoice past due",
+            "Your invoice for $120.00 is past due.",
+        );
+        let r = run(&m, false, &[]);
+        assert_eq!(r.tier, Tier::Deadline);
+        assert!(!r.confident);
+        assert_eq!(r.importance, 55);
+    }
+
+    #[test]
+    fn absurd_amount_dampens_even_known_sender() {
+        // Sanity dampener applies regardless of sender: an absurd amount caps a
+        // known-sender bill at Deadline and defers it, even though it's "trusted".
+        let m = msg(
+            "billing@utilityco.com",
+            "PAST DUE",
+            "Your balance of $2,470,000.00 is past due.",
+        );
+        let r = run(&m, true, &[]);
+        assert_eq!(r.tier, Tier::Deadline, "absurd amount caps tier");
+        assert!(!r.confident);
+        assert!(r.reason.contains("absurd amount"));
     }
 
     // ---- Rung 2: sender rules ------------------------------------------

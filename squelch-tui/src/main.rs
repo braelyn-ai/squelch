@@ -43,24 +43,18 @@ const DEFAULT_MIN_IMPORTANCE: u8 = 50;
 /// Live-refresh cadence.
 const TICK: StdDuration = StdDuration::from_secs(2);
 
-/// The account this viewer operates on. Mirrors squelch-mcp's default so they
-/// point at the same account in the same db.
+/// The account this viewer operates on: canonical `SQUELCH_ACCOUNT_EMAIL` >
+/// legacy `SQUELCH_ACCOUNT` (deprecated) > default. Shares core config's
+/// resolver so every binary points at the same account.
 fn account_email() -> String {
-    std::env::var("SQUELCH_ACCOUNT").unwrap_or_else(|_| "me@localhost".to_string())
+    squelch_core::config::resolve_account_email("me@localhost")
 }
 
-/// Resolve the SQLite path from `SQUELCH_DB`, falling back to the SAME default
-/// squelch-mcp uses (see squelch-mcp/src/main.rs::db_path) so they agree.
+/// Resolve the SQLite path via core config's single source of truth: canonical
+/// `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecated) > shared XDG default, so
+/// the TUI, MCP server, and daemon all open the same db.
 fn db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SQUELCH_DB") {
-        return PathBuf::from(p);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let dir = PathBuf::from(home).join(".local/share/squelch");
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join("squelch.db");
-    }
-    PathBuf::from("squelch.db")
+    squelch_core::config::resolve_db_path()
 }
 
 fn main() -> Result<()> {

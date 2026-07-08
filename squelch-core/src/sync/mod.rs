@@ -185,7 +185,8 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     store: Arc<S>,
     creds: Arc<C>,
     account_id: AccountId,
-    #[allow(dead_code)]
+    /// The account's own email; passed to ingest so the user's own address is
+    /// excluded from the Sent-derived contacts table.
     account_email: String,
     config: Config,
     http: reqwest::Client,
@@ -462,6 +463,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 raw,
                 internal_date: parse_internal_date(msg.internal_date.as_deref()),
                 is_sent,
+                account_addr: self.account_email.clone(),
             };
             self.ingest_one(&fetched, &rules, now)?;
             count += 1;
@@ -469,11 +471,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         Ok(count)
     }
 
-    /// Fetch each SENT id `format=metadata` (To/Cc/Date/Message-ID headers) and
-    /// seed contacts via the existing is_sent ingest path. The current sent path
-    /// only needs the parsed From header to seed the contacts table (see
-    /// `upsert_message_conn`'s is_sent branch), so a metadata-only synthetic
-    /// RFC822 blob is sufficient and byte-compatible with the ingest pipeline.
+    /// Fetch each SENT id `format=metadata` (From/To/Cc/Date/Message-ID headers)
+    /// and seed contacts via the is_sent ingest path. Contacts are derived from
+    /// the To/Cc RECIPIENTS (the From header is the account itself); the
+    /// metadata-only synthetic RFC822 blob is byte-compatible with the ingest
+    /// pipeline, which parses To/Cc and filters out the account's own address.
     async fn fetch_metadata_and_seed(&self, ids: &[String]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -495,7 +497,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             };
             // Reconstruct a minimal header-only RFC822 blob so the same
             // mail-parser -> ingest path runs unchanged. is_sent=true seeds
-            // contacts from the From address.
+            // contacts from the To/Cc recipient headers (the From header is the
+            // account itself and is explicitly excluded via account_addr).
             let raw = synthesize_rfc822_headers(headers);
             let fetched = RawFetched {
                 account_id: self.account_id,
@@ -504,6 +507,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 raw: raw.into_bytes(),
                 internal_date: parse_internal_date(msg.internal_date.as_deref()),
                 is_sent: true,
+                account_addr: self.account_email.clone(),
             };
             self.ingest_one(&fetched, &rules, now)?;
             count += 1;
@@ -649,6 +653,7 @@ mod tests {
     use crate::types::Tier;
 
     /// Build a RawFetched from an RFC822 string, as the transport layer would.
+    /// The account's own address is fixed to `me@example.com` in these fixtures.
     fn fixture(account_id: AccountId, msgid: &str, eml: &str, is_sent: bool) -> RawFetched {
         RawFetched {
             account_id,
@@ -657,6 +662,7 @@ mod tests {
             raw: eml.as_bytes().to_vec(),
             internal_date: Some(Utc::now()),
             is_sent,
+            account_addr: "me@example.com".to_string(),
         }
     }
 
@@ -740,10 +746,12 @@ mod tests {
     // ---- header synthesis for metadata-only sent seeding ------------------
 
     #[test]
-    fn synthesize_headers_parses_and_seeds_from() {
+    fn synthesize_headers_seeds_recipients_not_self() {
+        // From is the account itself; contacts come from To/Cc recipients.
         let headers = vec![
-            MessageHeader { name: "From".into(), value: "bob@friends.com".into() },
-            MessageHeader { name: "To".into(), value: "someone@else.com".into() },
+            MessageHeader { name: "From".into(), value: "me@example.com".into() },
+            MessageHeader { name: "To".into(), value: "alice@friends.com".into() },
+            MessageHeader { name: "Cc".into(), value: "bob@friends.com".into() },
             MessageHeader { name: "Subject".into(), value: "re: lunch".into() },
             MessageHeader { name: "Date".into(), value: "Mon, 7 Jul 2026 10:00:00 +0000".into() },
         ];
@@ -755,7 +763,10 @@ mod tests {
         let mut f = fixture(acct, "g-sent", &raw, true);
         f.raw = raw.into_bytes();
         ingest_into(&store, acct, &f, Utc::now());
+        assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
         assert!(store.is_known_contact(acct, "bob@friends.com").unwrap());
+        // The account's own address must NEVER become a contact.
+        assert!(!store.is_known_contact(acct, "me@example.com").unwrap());
     }
 
     #[test]
@@ -841,8 +852,23 @@ mod tests {
 
     #[test]
     fn past_due_bill_lands_past_due_tier() {
+        // Updated for bug #3: a CONFIDENT PastDue now requires a TRUSTED sender.
+        // We first seed the biller as a known contact (via a prior sent-path
+        // message), proving a legit past-due from a known biller still screams.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
+        // Seed billing@utilityco.com as a known contact by having the user send
+        // TO the biller (contacts are derived from Sent-mail recipients).
+        let seed = "From: me@example.com\r\n\
+                    To: Utility <billing@utilityco.com>\r\n\
+                    Subject: account setup\r\n\
+                    Date: Mon, 7 Jul 2026 09:00:00 +0000\r\n\
+                    \r\n\
+                    hello\r\n";
+        let sf = fixture(acct, "g-seed", seed, /* is_sent */ true);
+        ingest_into(&store, acct, &sf, Utc::now());
+        assert!(store.is_known_contact(acct, "billing@utilityco.com").unwrap());
+
         let eml = "From: Utility <billing@utilityco.com>\r\n\
                    Subject: PAST DUE: Your electric bill\r\n\
                    Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
@@ -857,27 +883,49 @@ mod tests {
         let updates = store
             .ranked_updates(acct, now - ChronoDuration::days(1), None)
             .unwrap();
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].tier, Tier::PastDue);
+        // The seed sent-message is excluded from ranked_updates; only the
+        // past-due bill surfaces. Assert it landed the top scream tier for a
+        // KNOWN sender.
+        let bill = updates
+            .iter()
+            .find(|u| u.one_line.contains("PAST DUE"))
+            .expect("past-due bill update present");
+        assert_eq!(bill.tier, Tier::PastDue);
         let deadlines = store.deadlines(acct, None).unwrap();
         assert!(deadlines[0].past_due);
     }
 
     #[test]
-    fn sent_message_seeds_contacts_and_marks_known() {
+    fn sent_message_seeds_recipient_contacts_never_self_and_skips_inbox() {
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
-        let eml = "From: bob@friends.com\r\n\
-                   To: someone@else.com\r\n\
+        // The user (me@example.com) sends to Alice, cc Bob. From == self.
+        let eml = "From: me@example.com\r\n\
+                   To: Alice <alice@friends.com>\r\n\
+                   Cc: bob@friends.com\r\n\
                    Subject: re: lunch\r\n\
                    Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
                    \r\n\
                    sounds good\r\n";
+        let now = Utc::now();
         let f = fixture(acct, "g-sent", eml, /* is_sent */ true);
-        ingest_into(&store, acct, &f, Utc::now());
+        ingest_into(&store, acct, &f, now);
 
+        // Recipients become contacts; the account's own address never does.
+        assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
         assert!(store.is_known_contact(acct, "bob@friends.com").unwrap());
+        assert!(!store.is_known_contact(acct, "me@example.com").unwrap());
         assert!(!store.is_known_contact(acct, "stranger@nowhere.io").unwrap());
+
+        // Sent mail must NOT pollute the ranked inbox.
+        let updates = store
+            .ranked_updates(acct, now - ChronoDuration::days(1), None)
+            .unwrap();
+        assert!(updates.is_empty(), "sent mail must never surface in ranked_updates");
+
+        // And it must not appear in search results either.
+        let hits = store.search(acct, "lunch", 10, 0).unwrap();
+        assert!(hits.is_empty(), "sent mail must not appear in search");
     }
 
     #[test]

@@ -45,6 +45,9 @@ struct BillDetector {
     due_phrase: Vec<Regex>,
     /// "due on receipt" / "due upon receipt" — treated as due *now*.
     due_on_receipt: Regex,
+    /// Screamy / scammy phrasing that legit billers rarely use. A corroborating
+    /// signal for the Stage-1 confidence dampener (bug #3), NOT for tier.
+    scammy: Vec<Regex>,
 }
 
 fn rx(p: &str) -> Regex {
@@ -88,7 +91,26 @@ fn detector() -> &'static BillDetector {
             rx(r"\bby\s+([A-Za-z0-9,\-/ ]{4,30}?)(?:[.,;)\n]|$)"),
         ],
         due_on_receipt: rx(r"\bdue\s+(?:up)?on\s+receipt\b"),
+        scammy: vec![
+            rx(r"penalties are adding up"),
+            rx(r"\bfinal notice\b"),
+            rx(r"\bact (now|immediately)\b"),
+            rx(r"\bavoid (further |additional )?(penalt|prosecution|legal|suspension|arrest)"),
+            rx(r"\bimmediate (action|payment) (is )?required\b"),
+            rx(r"\byour account (will|may) be (suspended|terminated|closed)\b"),
+            // Excessive urgency punctuation: "!!!", "!!", "NOW!!" etc.
+            rx(r"!{2,}"),
+        ],
     })
+}
+
+/// Does the text carry screamy/scammy phrasing (a bug #3 confidence dampener)?
+/// Purely advisory — it never raises a tier, only shaves confidence.
+pub fn has_scammy_phrasing(subject: &str, body: &str) -> bool {
+    let d = detector();
+    d.scammy
+        .iter()
+        .any(|re| re.is_match(subject) || re.is_match(body))
 }
 
 /// Parse a single absolute date fragment into a `NaiveDate`. Tries a battery of

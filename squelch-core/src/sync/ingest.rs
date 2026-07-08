@@ -38,6 +38,12 @@ pub struct RawFetched {
     pub internal_date: Option<DateTime<Utc>>,
     /// Whether this came from the Sent mailbox (seeds the contacts table).
     pub is_sent: bool,
+    /// The account's own email address, used to guard the contacts table so the
+    /// user's own address can NEVER become a contact (Sent mail's From header is
+    /// the user; contacts must be derived from To/Cc recipients instead).
+    /// Lower-cased comparison; may be empty when unknown (then only the From
+    /// address is excluded, since on Sent mail From == the account).
+    pub account_addr: String,
 }
 
 /// Crudely flatten HTML to text: drop tags, decode a handful of common
@@ -80,6 +86,19 @@ fn first_addr(addr: &Address) -> (String, Option<String>) {
     }
 }
 
+/// Collect every non-empty email address from an [`Address`] header (handles
+/// both flat address lists and grouped lists). Used to derive contacts from the
+/// To/Cc recipients of Sent mail.
+fn collect_addrs(addr: &Address, out: &mut Vec<String>) {
+    for a in addr.iter() {
+        if let Some(email) = a.address()
+            && !email.is_empty()
+        {
+            out.push(email.to_string());
+        }
+    }
+}
+
 /// Derive a stable thread key from headers when X-GM-THRID is unavailable.
 /// Uses the root References id, else In-Reply-To, else this message's own
 /// Message-ID. This keeps a reply chain grouped without Gmail's THRID.
@@ -117,6 +136,18 @@ pub fn ingest(
     mut known_contact_lookup: impl FnMut(&str) -> bool,
 ) -> TriagedMessage {
     let parsed = MessageParser::default().parse(&fetched.raw);
+
+    // Recipient addresses (To + Cc) — only meaningful for Sent mail, where they
+    // become contacts. Collected here while the parse is in hand.
+    let mut recipients: Vec<String> = Vec::new();
+    if fetched.is_sent && let Some(m) = &parsed {
+        if let Some(to) = m.to() {
+            collect_addrs(to, &mut recipients);
+        }
+        if let Some(cc) = m.cc() {
+            collect_addrs(cc, &mut recipients);
+        }
+    }
 
     // Extract fields with graceful fallbacks for malformed mail.
     let (from_addr, from_name, subject, received_at, thread_id, msg_id_hdr, text) = match &parsed {
@@ -169,6 +200,22 @@ pub fn ingest(
     // A compact snippet for list views; body text drives triage.
     let snippet: String = text.chars().take(200).collect();
 
+    // Finalize the contact recipients (Sent mail only): drop the account's OWN
+    // address and the From address (on Sent mail From == the account), case-fold
+    // and dedup. This is the explicit guard that the user's own address can
+    // never become a contact.
+    let self_addr = fetched.account_addr.trim().to_ascii_lowercase();
+    let from_lc = from_addr.trim().to_ascii_lowercase();
+    let mut seen: Vec<String> = Vec::new();
+    recipients.retain(|r| {
+        let lc = r.trim().to_ascii_lowercase();
+        if lc.is_empty() || lc == self_addr || lc == from_lc || seen.contains(&lc) {
+            return false;
+        }
+        seen.push(lc);
+        true
+    });
+
     let message = NewMessage {
         account_id: fetched.account_id,
         gmail_msg_id,
@@ -193,12 +240,34 @@ pub fn ingest(
         // to matter — it will never be surfaced or sent to an LLM.
         return TriagedMessage {
             message,
+            recipients,
             sensitivity: Sensitivity::Sealed,
             sealed_kind: Some(kind),
             importance: 0,
             tier: Tier::Noise,
             one_line: String::new(),
             reason: format!("sealed at ingest ({})", kind.as_str()),
+            matched_rule: None,
+            deadline: None,
+            confident: true,
+        };
+    }
+
+    // ---- Sent mail: seed contacts, but DO NOT run Stage-1 triage ----------
+    // The user's own outbox must never pollute the ranked inbox. We write a
+    // neutral tier=noise/importance=0 row (belt: ranked_updates/search also
+    // exclude is_sent=1) and skip the LLM path entirely. Recipients still seed
+    // the contacts table via `ingest_message`.
+    if fetched.is_sent {
+        return TriagedMessage {
+            message,
+            recipients,
+            sensitivity: Sensitivity::Normal,
+            sealed_kind: None,
+            importance: 0,
+            tier: Tier::Noise,
+            one_line: String::new(),
+            reason: "sent mail (contacts seeded; not triaged)".to_string(),
             matched_rule: None,
             deadline: None,
             confident: true,
@@ -213,6 +282,7 @@ pub fn ingest(
 
     TriagedMessage {
         message,
+        recipients,
         sensitivity: Sensitivity::Normal,
         sealed_kind: None,
         importance: result.importance,
@@ -239,7 +309,9 @@ pub fn ingest_with_rules(
     // re-run Stage-1 WITH rules. This keeps the seal invariant in exactly one
     // place while still honoring user rules.
     let mut triaged = ingest(fetched, cfg, now, known_contact_lookup);
-    if triaged.sensitivity == Sensitivity::Sealed || rules.is_empty() {
+    // Sealed and Sent mail never run Stage-1 (Sent is neutral tier-noise), so
+    // they must not run the rules re-pass either.
+    if triaged.sensitivity == Sensitivity::Sealed || fetched.is_sent || rules.is_empty() {
         return triaged;
     }
     let is_known = triaged.matched_rule.is_none()
@@ -267,6 +339,7 @@ mod tests {
             raw: bytes.as_bytes().to_vec(),
             internal_date: Some(Utc::now()),
             is_sent,
+            account_addr: "me@example.com".to_string(),
         }
     }
 
@@ -343,6 +416,53 @@ mod tests {
         });
         assert_eq!(t.tier, Tier::Signal);
         assert!(asked.iter().any(|a| a == "alice@friends.com"));
+    }
+
+    #[test]
+    fn sent_mail_derives_contacts_from_recipients_not_self() {
+        // From is the account (self); To/Cc are the real contacts.
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Alice <alice@friends.com>\r\n\
+                   Cc: bob@friends.com\r\n\
+                   Subject: dinner\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   see you friday\r\n";
+        let f = raw(1, "g-sent", eml, /* is_sent */ true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        // recipients hold alice + bob, never self.
+        assert!(t.recipients.iter().any(|r| r == "alice@friends.com"));
+        assert!(t.recipients.iter().any(|r| r == "bob@friends.com"));
+        assert!(!t.recipients.iter().any(|r| r == "me@example.com"));
+        // Sent mail is not triaged: neutral noise / importance 0.
+        assert_eq!(t.tier, Tier::Noise);
+        assert_eq!(t.importance, 0);
+    }
+
+    #[test]
+    fn sent_mail_never_seeds_self_even_when_to_is_self() {
+        let eml = "From: me@example.com\r\n\
+                   To: me@example.com\r\n\
+                   Subject: note to self\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   reminder\r\n";
+        let f = raw(1, "g-self", eml, true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.recipients.is_empty(), "self address must never be a contact");
+    }
+
+    #[test]
+    fn received_mail_seeds_no_contacts() {
+        let eml = "From: Alice <alice@friends.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: hi\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   hello\r\n";
+        let f = raw(1, "g-recv", eml, /* is_sent */ false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.recipients.is_empty());
     }
 
     #[test]

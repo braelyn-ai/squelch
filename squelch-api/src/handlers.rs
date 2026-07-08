@@ -15,8 +15,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use squelch_core::store::{ActionMessageRef, NewAuditEntry, Store};
-use squelch_core::types::{Disposition, Tier};
+use squelch_core::store::{ActionMessageRef, NewAuditEntry, SitrepBand, Store};
+use squelch_core::types::{AttentionStatus, Disposition, Tier};
 
 use crate::error::ApiError;
 use crate::gmail_write::{
@@ -157,6 +157,10 @@ pub struct UpdatesQuery {
     since: Option<DateTime<Utc>>,
     min_importance: Option<u8>,
     tier: Option<String>,
+    /// Attention-lifecycle filter: new|open|done.
+    status: Option<String>,
+    /// Server-side sitrep bucket: standing|new|open.
+    band: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -172,6 +176,20 @@ pub async fn get_updates(
             ApiError::bad_request("tier must be one of: past_due, deadline, signal, noise")
         })?),
     };
+    let status_filter = match q.status.as_deref() {
+        None => None,
+        Some(s) => Some(
+            AttentionStatus::parse(s)
+                .ok_or_else(|| ApiError::bad_request("status must be one of: new, open, done"))?,
+        ),
+    };
+    let band = match q.band.as_deref() {
+        None => None,
+        Some(s) => Some(
+            SitrepBand::parse(s)
+                .ok_or_else(|| ApiError::bad_request("band must be one of: standing, new, open"))?,
+        ),
+    };
     let since = q
         .since
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
@@ -180,17 +198,27 @@ pub async fn get_updates(
     let store = state.store.clone();
     let account_id = state.account_id;
     let items = blocking(move || {
-        // ranked_updates already excludes sealed rows in SQL. Tier filtering and
-        // pagination are applied here over the ranked slice.
-        let mut all = store.ranked_updates(account_id, since, min_importance)?;
+        // attention_updates excludes sealed rows in SQL and carries the
+        // lifecycle fields. status/band are applied server-side; tier filtering
+        // and pagination are applied over the ranked slice here.
+        let mut all =
+            store.attention_updates(account_id, since, min_importance, status_filter, band)?;
         if let Some(t) = tier_filter {
-            all.retain(|u| u.tier == t);
+            all.retain(|u| u.update.tier == t);
         }
         let page = all
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
             .collect::<Vec<_>>();
+
+        // SEEN-LEDGER: the response carries the PRE-stamp surfaced_at (already in
+        // `page`), then we stamp this exact set: surfaced_at=now if NULL,
+        // new->open. Both doors stamp. Sealed rows can't be in `page` (SQL) and
+        // mark_surfaced re-guards sensitivity anyway.
+        let ids: Vec<i64> = page.iter().map(|u| u.update.id).collect();
+        store.mark_surfaced(account_id, &ids)?;
+
         Ok(page)
     })
     .await?;
@@ -200,6 +228,43 @@ pub async fn get_updates(
         items,
         next_cursor: next,
     }))
+}
+
+// --- POST /client/updates/{message_id}/status -------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct StatusBody {
+    /// "done" to dismiss, "open" to reopen. ("new" is accepted for symmetry.)
+    status: String,
+}
+
+pub async fn set_update_status(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+    Json(body): Json<StatusBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let status = AttentionStatus::parse(&body.status)
+        .ok_or_else(|| ApiError::bad_request("status must be one of: new, open, done"))?;
+
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let updated =
+        blocking(move || store.set_attention_status(account_id, message_id, status)).await?;
+    if !updated {
+        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        return Err(ApiError::not_found());
+    }
+
+    // Audit the explicit dismiss/reopen (actor="client-api", no body content).
+    audit_action(
+        &state,
+        "set_status",
+        Some(message_id.to_string()),
+        status.as_str(),
+    )
+    .await;
+
+    Ok(Json(json!({ "status": status.as_str(), "message_id": message_id })))
 }
 
 // --- GET /client/thread/{thread_id} -----------------------------------------
@@ -457,6 +522,19 @@ async fn audit_action(
     let _ = tokio::task::spawn_blocking(move || store.append_audit(account_id, &entry)).await;
 }
 
+/// RESOLUTION: mark a message's triage row `done` (+ resolved_at) after a
+/// successful action (archive/send). Best-effort like the audit append —
+/// resolution bookkeeping must not mask the action's own success. Sealed rows
+/// are guarded in the store, so this can never touch sealed mail.
+async fn resolve_done(state: &ApiState, message_id: i64) {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let _ = tokio::task::spawn_blocking(move || {
+        store.set_attention_status(account_id, message_id, AttentionStatus::Done)
+    })
+    .await;
+}
+
 /// Resolve the WRITE-bound gmail client, or 403 with a hint if none configured.
 fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
     match state.write_creds() {
@@ -539,6 +617,8 @@ pub async fn action_archive(
 
     match client.archive(&msg.gmail_msg_id).await {
         Ok(()) => {
+            // RESOLUTION: a successful archive auto-resolves the target row.
+            resolve_done(&state, body.message_id).await;
             audit_action(&state, "archive", target, "ok").await;
             Ok(Json(json!({ "status": "archived", "message_id": body.message_id })))
         }
@@ -743,6 +823,11 @@ pub async fn action_send(
 
     match client.send(&raw, thread_id.as_deref()).await {
         Ok(()) => {
+            // RESOLUTION: replying to a stored message auto-resolves it. A cold
+            // send (no reply_to_message_id) has no target row to resolve.
+            if let Some(id) = body.reply_to_message_id {
+                resolve_done(&state, id).await;
+            }
             audit_action(&state, "send", target, "ok").await;
             Ok(Json(json!({ "status": "sent" })))
         }

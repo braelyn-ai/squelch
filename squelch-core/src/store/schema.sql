@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS sender_rules (
     UNIQUE(account_id, match_pattern)
 );
 
+-- ATTENTION LIFECYCLE (sitrep seen-ledger):
+--   status       'new' | 'open' | 'done'. A row starts 'new'; the first time it
+--                flows OUT through a read door (MCP get_inbox_updates OR
+--                GET /client/updates) it is promoted 'new' -> 'open' and stamped
+--                surfaced_at. A successful archive/send, or an explicit dismiss,
+--                sets status='done' + resolved_at.
+--   surfaced_at  first time ANY door surfaced this row (NULL until then). The
+--                seen-ledger: answers "did anyone (agent or human) see this yet".
+--   resolved_at  when the row reached status='done'.
+-- Sealed rows carry these columns like any other row, but stay structurally
+-- absent from every non-local surface, so they never get surfaced/stamped.
 CREATE TABLE IF NOT EXISTS triage (
     message_id      INTEGER PRIMARY KEY,
     account_id      INTEGER NOT NULL,
@@ -57,10 +68,14 @@ CREATE TABLE IF NOT EXISTS triage (
     deadline        TEXT,
     matched_rule_id INTEGER,
     model_used      TEXT,
+    status          TEXT NOT NULL DEFAULT 'new',
+    surfaced_at     TEXT,
+    resolved_at     TEXT,
     created_at      TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_triage_sensitivity ON triage(account_id, sensitivity);
+CREATE INDEX IF NOT EXISTS idx_triage_status ON triage(account_id, status);
 
 CREATE TABLE IF NOT EXISTS deadlines (
     id         INTEGER PRIMARY KEY,

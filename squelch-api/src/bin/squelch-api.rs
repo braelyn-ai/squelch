@@ -8,12 +8,13 @@
 //!
 //! Env:
 //! - `SQUELCH_API_TOKEN` (required): bearer token for every `/client/*` route.
-//! - `SQUELCH_DB` (optional): SQLite path. Defaults to the XDG data dir.
-//! - `SQUELCH_ACCOUNT` (optional): account email. Defaults to `me@localhost`.
+//! - `SQUELCH_DB_PATH` (optional): SQLite path. Defaults to the XDG data dir.
+//!   Legacy `SQUELCH_DB` is still accepted (deprecated).
+//! - `SQUELCH_ACCOUNT_EMAIL` (optional): account email. Defaults to
+//!   `me@localhost`. Legacy `SQUELCH_ACCOUNT` is still accepted (deprecated).
 //! - `SQUELCH_API_HTTP` (optional): bind address. Defaults to 127.0.0.1:8849.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use squelch_api::{ApiState, router};
@@ -23,20 +24,16 @@ use squelch_core::store::SqliteStore;
 /// Loopback default. A reverse proxy fronts this; never widen it silently.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8849";
 
-fn db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SQUELCH_DB") {
-        return PathBuf::from(p);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let dir = PathBuf::from(home).join(".local/share/squelch");
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join("squelch.db");
-    }
-    PathBuf::from("squelch.db")
+/// SQLite path via core config's single source of truth: canonical
+/// `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecated) > shared XDG default.
+fn db_path() -> std::path::PathBuf {
+    squelch_core::config::resolve_db_path()
 }
 
+/// Account email: canonical `SQUELCH_ACCOUNT_EMAIL` > legacy `SQUELCH_ACCOUNT`
+/// (deprecated) > default.
 fn account_email() -> String {
-    std::env::var("SQUELCH_ACCOUNT").unwrap_or_else(|_| "me@localhost".to_string())
+    squelch_core::config::resolve_account_email("me@localhost")
 }
 
 fn bind_addr() -> anyhow::Result<SocketAddr> {

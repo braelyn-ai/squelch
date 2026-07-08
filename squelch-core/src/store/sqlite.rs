@@ -10,10 +10,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
-use crate::store::{NewAuditEntry, SealedBody, SealedMessage, Store, SyncState, TriagedMessage};
+use crate::store::{
+    NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Store, SyncState, TriagedMessage,
+};
 use crate::types::{
-    AccountId, AuditEntry, Deadline, Disposition, NewMessage, SanitizedMessage, SearchHit,
-    SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Deadline, Disposition,
+    NewMessage, SanitizedMessage, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier,
+    Update,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -190,17 +193,35 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
         params![id, msg.subject, msg.body],
     )?;
 
-    // Derived contacts: Sent mail = people I know.
-    if msg.is_sent {
+    // NOTE: contacts are NOT seeded here. Sent mail's From header is the user's
+    // OWN address, so seeding from it produced exactly one bogus self-contact.
+    // Contacts are instead seeded from the To/Cc recipients of Sent mail in
+    // `ingest_message` (which carries the pre-filtered recipient list).
+    Ok(id)
+}
+
+/// Seed the contacts table from the recipients of a Sent message. Each recipient
+/// increments its `sent_count`. Addresses are already de-duplicated and stripped
+/// of the account's own address at ingest, so no self-guard is needed here — but
+/// we defensively skip empties. Received mail passes an empty list (no-op).
+fn seed_contacts_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    recipients: &[String],
+    first_seen: &str,
+) -> Result<()> {
+    for addr in recipients {
+        if addr.trim().is_empty() {
+            continue;
+        }
         conn.execute(
             "INSERT INTO contacts(account_id, addr, sent_count, first_seen)
              VALUES(?1,?2,1,?3)
              ON CONFLICT(account_id, addr) DO UPDATE SET sent_count = sent_count + 1",
-            params![msg.account_id, msg.from_addr, msg.received_at.to_rfc3339()],
+            params![account_id, addr, first_seen],
         )?;
     }
-
-    Ok(id)
+    Ok(())
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
@@ -231,6 +252,7 @@ impl Store for SqliteStore {
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
                AND t.sensitivity != 'sealed'
+               AND m.is_sent = 0
                AND m.received_at >= ?2
                AND t.importance >= ?3
              ORDER BY t.importance DESC, m.received_at DESC",
@@ -468,8 +490,18 @@ impl Store for SqliteStore {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
-        // 1. Upsert the message row (+ FTS + Sent-derived contacts).
+        // 1. Upsert the message row (+ FTS).
         let id = upsert_message_conn(&tx, &triaged.message)?;
+
+        // 1b. Seed contacts from Sent-mail recipients (To/Cc), in the SAME
+        //     transaction. `recipients` is empty for received mail and already
+        //     excludes the account's own address.
+        seed_contacts_conn(
+            &tx,
+            triaged.message.account_id,
+            &triaged.recipients,
+            &triaged.message.received_at.to_rfc3339(),
+        )?;
 
         // 2. Write the triage row IN THE SAME TRANSACTION. For sealed mail this
         //    is the whole point: sensitivity='sealed' is committed atomically
@@ -641,6 +673,7 @@ impl Store for SqliteStore {
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?1
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_sent = 0
                AND messages_fts MATCH ?2
              ORDER BY rank
              LIMIT ?3 OFFSET ?4",
@@ -674,6 +707,193 @@ impl Store for SqliteStore {
             });
         }
         Ok(out)
+    }
+
+    fn attention_updates(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        min_importance: Option<u8>,
+        status: Option<AttentionStatus>,
+        band: Option<SitrepBand>,
+    ) -> Result<Vec<AttentionUpdate>> {
+        let conn = self.lock()?;
+        let min = min_importance.unwrap_or(0) as i64;
+
+        // Base predicate mirrors ranked_updates (sealed excluded, sent excluded,
+        // since/importance window). Band/status add clauses; the ORDER BY differs
+        // for the `open` band (age*importance) — documented below.
+        //
+        // Band semantics:
+        //   standing = tier IN ('past_due','deadline') AND status != 'done'
+        //   new      = surfaced_at IS NULL
+        //   open     = status = 'open'
+        let mut sql = String::from(
+            "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
+                    t.reason, t.deadline, t.matched_rule_id,
+                    t.status, t.surfaced_at, t.resolved_at
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1
+               AND t.sensitivity != 'sealed'
+               AND m.is_sent = 0
+               AND m.received_at >= ?2
+               AND t.importance >= ?3",
+        );
+        if let Some(s) = status {
+            sql.push_str(match s {
+                AttentionStatus::New => " AND t.status = 'new'",
+                AttentionStatus::Open => " AND t.status = 'open'",
+                AttentionStatus::Done => " AND t.status = 'done'",
+            });
+        }
+        match band {
+            Some(SitrepBand::Standing) => {
+                sql.push_str(" AND t.tier IN ('past_due','deadline') AND t.status != 'done'");
+            }
+            Some(SitrepBand::New) => sql.push_str(" AND t.surfaced_at IS NULL"),
+            Some(SitrepBand::Open) => sql.push_str(" AND t.status = 'open'"),
+            None => {}
+        }
+        // The `open` band is the aging/escalating band: sort by age*importance so
+        // long-unresolved-and-important items float. `age` is (now - received_at)
+        // in seconds; we compute it in SQL via julianday so the ordering lives
+        // server-side. Other bands keep the ranked_updates ordering.
+        if band == Some(SitrepBand::Open) {
+            sql.push_str(
+                " ORDER BY (julianday(?4) - julianday(m.received_at)) * t.importance DESC,
+                          m.received_at DESC",
+            );
+        } else {
+            sql.push_str(" ORDER BY t.importance DESC, m.received_at DESC");
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| {
+            let tier_s: String = r.get(2)?;
+            let deadline_s: Option<String> = r.get(7)?;
+            let status_s: String = r.get(9)?;
+            let surfaced_s: Option<String> = r.get(10)?;
+            let resolved_s: Option<String> = r.get(11)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                tier_s,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                deadline_s,
+                r.get::<_, Option<i64>>(8)?,
+                status_s,
+                surfaced_s,
+                resolved_s,
+            ))
+        };
+        let rows = if band == Some(SitrepBand::Open) {
+            stmt.query_map(params![account_id, since.to_rfc3339(), min, now], map_row)?
+        } else {
+            stmt.query_map(params![account_id, since.to_rfc3339(), min], map_row)?
+        };
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                id,
+                thread_id,
+                tier_s,
+                importance,
+                sender,
+                one_line,
+                reason,
+                deadline_s,
+                rule,
+                status_s,
+                surfaced_s,
+                resolved_s,
+            ) = row?;
+            let deadline = match deadline_s {
+                Some(s) => Some(parse_dt(&s)?),
+                None => None,
+            };
+            let surfaced_at = match surfaced_s {
+                Some(s) => Some(parse_dt(&s)?),
+                None => None,
+            };
+            let resolved_at = match resolved_s {
+                Some(s) => Some(parse_dt(&s)?),
+                None => None,
+            };
+            out.push(AttentionUpdate {
+                update: Update {
+                    id,
+                    thread_id,
+                    tier: Tier::parse(&tier_s).unwrap_or(Tier::Noise),
+                    importance: importance.clamp(0, 255) as u8,
+                    sender,
+                    one_line,
+                    reason,
+                    deadline,
+                    matched_rule: rule,
+                },
+                status: AttentionStatus::parse(&status_s).unwrap_or(AttentionStatus::New),
+                surfaced_at,
+                resolved_at,
+            });
+        }
+        Ok(out)
+    }
+
+    fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = conn.transaction()?;
+        let mut first_surfaced = 0usize;
+        {
+            // Stamp surfaced_at only if NULL, and promote new->open. The
+            // sensitivity guard means a sealed row is NEVER stamped, so it can
+            // never leak into a "new since last check" delta. Idempotent: a
+            // second call finds surfaced_at already set and changes nothing.
+            let mut stmt = tx.prepare(
+                "UPDATE triage
+                 SET surfaced_at = COALESCE(surfaced_at, ?1),
+                     status = CASE WHEN status = 'new' THEN 'open' ELSE status END
+                 WHERE account_id = ?2 AND message_id = ?3
+                   AND sensitivity != 'sealed'
+                   AND surfaced_at IS NULL",
+            )?;
+            for &id in message_ids {
+                first_surfaced += stmt.execute(params![now, account_id, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(first_surfaced)
+    }
+
+    fn set_attention_status(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        status: AttentionStatus,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        // Done stamps resolved_at; reopening (open/new) clears it. Sealed rows are
+        // excluded so this can never touch a sealed message.
+        let resolved_at = match status {
+            AttentionStatus::Done => Some(Utc::now().to_rfc3339()),
+            _ => None,
+        };
+        let n = conn.execute(
+            "UPDATE triage
+             SET status = ?1, resolved_at = ?2
+             WHERE account_id = ?3 AND message_id = ?4 AND sensitivity != 'sealed'",
+            params![status.as_str(), resolved_at, account_id, message_id],
+        )?;
+        Ok(n > 0)
     }
 
     fn delete_sender_rule(&self, account_id: AccountId, id: i64) -> Result<bool> {
@@ -810,11 +1030,42 @@ impl Store for SqliteStore {
             )
             .optional()?;
 
+        // Sitrep band counts over non-sealed rows. Definitions match the `band`
+        // query on attention_updates so the header and the list agree.
+        let (standing, new_count, open_count): (i64, i64, i64) = conn.query_row(
+            "SELECT
+                 COUNT(*) FILTER (
+                     WHERE tier IN ('past_due','deadline') AND status != 'done'),
+                 COUNT(*) FILTER (WHERE surfaced_at IS NULL),
+                 COUNT(*) FILTER (WHERE status = 'open')
+             FROM triage
+             WHERE account_id = ?1 AND sensitivity != 'sealed'",
+            params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+
+        let last_surfaced_s: Option<String> = conn.query_row(
+            "SELECT MAX(surfaced_at) FROM triage
+             WHERE account_id = ?1 AND sensitivity != 'sealed'",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        let last_surfaced_at = match last_surfaced_s {
+            Some(s) => Some(parse_dt(&s)?),
+            None => None,
+        };
+
         Ok(StoreStats {
             tier_counts,
             total,
             sealed,
             last_history_id: last_history_id.map(|v| v as u64),
+            bands: BandCounts {
+                standing,
+                new: new_count,
+                open: open_count,
+            },
+            last_surfaced_at,
         })
     }
 }
@@ -1029,6 +1280,217 @@ mod tests {
         assert_eq!(stats.total, 1);
         assert_eq!(stats.tier_counts.get("signal").copied(), Some(1));
         assert_eq!(stats.sealed, 1);
+    }
+
+    // --- sitrep seen-ledger --------------------------------------------------
+
+    /// Helper: a non-sealed triaged message with a chosen tier/importance.
+    fn ingest_normal(
+        store: &SqliteStore,
+        acct: AccountId,
+        gmail: &str,
+        thread: &str,
+        tier: Tier,
+        importance: u8,
+        received: DateTime<Utc>,
+    ) -> i64 {
+        let mut m = sample_msg(acct, gmail, thread);
+        m.received_at = received;
+        let id = store.upsert_message(&m).unwrap();
+        store
+            .set_triage(id, acct, importance, tier, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(1);
+        let id = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, Utc::now());
+
+        // Pre-stamp: status new, surfaced_at NULL.
+        let before = store
+            .attention_updates(acct, since, None, None, None)
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, AttentionStatus::New);
+        assert!(before[0].surfaced_at.is_none());
+
+        // First surface: stamps + promotes.
+        let n = store.mark_surfaced(acct, &[id]).unwrap();
+        assert_eq!(n, 1, "first surface counts as a transition");
+        let after = store
+            .attention_updates(acct, since, None, None, None)
+            .unwrap();
+        assert_eq!(after[0].status, AttentionStatus::Open);
+        let stamp = after[0].surfaced_at.expect("surfaced_at set");
+
+        // Second surface: idempotent, surfaced_at unchanged, no transition.
+        let n2 = store.mark_surfaced(acct, &[id]).unwrap();
+        assert_eq!(n2, 0, "second surface transitions nothing");
+        let after2 = store
+            .attention_updates(acct, since, None, None, None)
+            .unwrap();
+        assert_eq!(after2[0].surfaced_at, Some(stamp));
+        assert_eq!(after2[0].status, AttentionStatus::Open);
+    }
+
+    #[test]
+    fn band_queries_bucket_correctly() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(30);
+
+        // A past_due bill (standing), a fresh signal (new), an aged signal.
+        let bill = ingest_normal(&store, acct, "g1", "t1", Tier::PastDue, 90, Utc::now());
+        let fresh = ingest_normal(&store, acct, "g2", "t2", Tier::Signal, 70, Utc::now());
+        let aged = ingest_normal(
+            &store,
+            acct,
+            "g3",
+            "t3",
+            Tier::Signal,
+            60,
+            Utc::now() - chrono::Duration::days(14),
+        );
+
+        // STANDING: only the bill (tier past_due/deadline, not done).
+        let standing = store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+            .unwrap();
+        assert_eq!(standing.len(), 1);
+        assert_eq!(standing[0].update.id, bill);
+
+        // NEW: everything (nothing surfaced yet).
+        let new = store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .unwrap();
+        assert_eq!(new.len(), 3);
+
+        // Surface fresh + aged -> they become 'open'; bill stays new.
+        store.mark_surfaced(acct, &[fresh, aged]).unwrap();
+
+        // NEW now only the bill.
+        let new2 = store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .unwrap();
+        assert_eq!(new2.len(), 1);
+        assert_eq!(new2[0].update.id, bill);
+
+        // OPEN band sorted by age*importance: aged (14d*60) before fresh (0d*70).
+        let open = store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::Open))
+            .unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].update.id, aged, "older*importance floats to top");
+        assert_eq!(open[1].update.id, fresh);
+    }
+
+    #[test]
+    fn set_attention_status_resolves_and_reopens() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(1);
+        let id = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, Utc::now());
+
+        assert!(store
+            .set_attention_status(acct, id, AttentionStatus::Done)
+            .unwrap());
+        let done = store
+            .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+            .unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].resolved_at.is_some(), "done stamps resolved_at");
+
+        // Reopen clears resolved_at.
+        assert!(store
+            .set_attention_status(acct, id, AttentionStatus::Open)
+            .unwrap());
+        let open = store
+            .attention_updates(acct, since, None, Some(AttentionStatus::Open), None)
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].resolved_at.is_none(), "reopen clears resolved_at");
+
+        // Unknown id => false.
+        assert!(!store
+            .set_attention_status(acct, 999, AttentionStatus::Done)
+            .unwrap());
+    }
+
+    #[test]
+    fn sealed_rows_never_surface_through_the_ledger() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(1);
+
+        let mut otp = sample_msg(acct, "g1", "t1");
+        otp.subject = "Your verification code".to_string();
+        let sealed = store.upsert_message(&otp).unwrap();
+        store
+            .set_triage(
+                sealed,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+
+        // Never appears in attention_updates (any band).
+        assert!(store
+            .attention_updates(acct, since, None, None, None)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .unwrap()
+            .is_empty());
+
+        // mark_surfaced refuses to stamp a sealed row.
+        let n = store.mark_surfaced(acct, &[sealed]).unwrap();
+        assert_eq!(n, 0);
+        // set_attention_status refuses a sealed row.
+        assert!(!store
+            .set_attention_status(acct, sealed, AttentionStatus::Done)
+            .unwrap());
+
+        // Stats: sealed row contributes to `sealed`, never to any band, and
+        // never advances last_surfaced_at.
+        let stats = store.stats(acct).unwrap();
+        assert_eq!(stats.sealed, 1);
+        assert_eq!(stats.bands.new, 0);
+        assert_eq!(stats.bands.standing, 0);
+        assert_eq!(stats.bands.open, 0);
+        assert!(stats.last_surfaced_at.is_none());
+    }
+
+    #[test]
+    fn stats_bands_and_last_surfaced_at() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let bill = ingest_normal(&store, acct, "g1", "t1", Tier::Deadline, 90, Utc::now());
+        let sig = ingest_normal(&store, acct, "g2", "t2", Tier::Signal, 70, Utc::now());
+
+        let s0 = store.stats(acct).unwrap();
+        assert_eq!(s0.bands.standing, 1, "deadline tier counts as standing");
+        assert_eq!(s0.bands.new, 2);
+        assert_eq!(s0.bands.open, 0);
+        assert!(s0.last_surfaced_at.is_none());
+
+        store.mark_surfaced(acct, &[bill, sig]).unwrap();
+        let s1 = store.stats(acct).unwrap();
+        assert_eq!(s1.bands.new, 0, "both surfaced");
+        assert_eq!(s1.bands.open, 2);
+        assert_eq!(s1.bands.standing, 1, "surfacing doesn't change standing");
+        assert!(s1.last_surfaced_at.is_some());
     }
 
     #[test]

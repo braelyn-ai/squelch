@@ -135,6 +135,51 @@ pub struct Update {
     pub matched_rule: Option<i64>,
 }
 
+/// The attention-lifecycle status of a triage row (sitrep seen-ledger).
+/// `new` = never surfaced through any door; `open` = surfaced, still needs
+/// attention; `done` = resolved (acted on or explicitly dismissed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionStatus {
+    New,
+    Open,
+    Done,
+}
+
+impl AttentionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttentionStatus::New => "new",
+            AttentionStatus::Open => "open",
+            AttentionStatus::Done => "done",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AttentionStatus> {
+        match s {
+            "new" => Some(AttentionStatus::New),
+            "open" => Some(AttentionStatus::Open),
+            "done" => Some(AttentionStatus::Done),
+            _ => None,
+        }
+    }
+}
+
+/// A ranked inbox update PLUS its attention-lifecycle fields. HUMAN-DOOR-ONLY
+/// (squelch-api `/client/updates`): the desktop client buckets on these; the
+/// agent (MCP) never sees them (it serializes the leaner [`Update`]). Sealed
+/// rows are excluded in SQL exactly like [`Update`], so this never represents a
+/// sealed message. `surfaced_at` here is the PRE-stamp value: a row with
+/// `surfaced_at == None` is "new since anyone last looked".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionUpdate {
+    #[serde(flatten)]
+    pub update: Update,
+    pub status: AttentionStatus,
+    pub surfaced_at: Option<DateTime<Utc>>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
 /// A single sanitized message body (HTML flattened to text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SanitizedMessage {
@@ -215,6 +260,21 @@ pub struct StoreStats {
     pub sealed: i64,
     /// The persisted Gmail history cursor (mailbox='history'), if any.
     pub last_history_id: Option<u64>,
+    /// Sitrep per-band counts over non-sealed rows (the desktop chassis header):
+    /// `standing` (past_due/deadline, not done), `new` (never surfaced),
+    /// `open` (status='open'). Mirrors the `band` query on `/client/updates`.
+    pub bands: BandCounts,
+    /// The most recent `surfaced_at` across non-sealed rows — powers the
+    /// "last checked: 4h ago" header. `None` if nothing has ever been surfaced.
+    pub last_surfaced_at: Option<DateTime<Utc>>,
+}
+
+/// Per-band counts for the sitrep header. See [`StoreStats::bands`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BandCounts {
+    pub standing: i64,
+    pub new: i64,
+    pub open: i64,
 }
 
 /// Input record for upserting a fetched message into the store.

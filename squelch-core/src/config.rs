@@ -8,6 +8,95 @@ use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Canonical env var for the SQLite path (matches [`Config`]'s `db_path`).
+pub const ENV_DB_PATH: &str = "SQUELCH_DB_PATH";
+/// Legacy alias for [`ENV_DB_PATH`], silently accepted with a deprecation note.
+pub const ENV_DB_PATH_LEGACY: &str = "SQUELCH_DB";
+/// Canonical env var for the account email (matches [`Config`]'s `account_email`).
+pub const ENV_ACCOUNT_EMAIL: &str = "SQUELCH_ACCOUNT_EMAIL";
+/// Legacy alias for [`ENV_ACCOUNT_EMAIL`], silently accepted with a deprecation note.
+pub const ENV_ACCOUNT_EMAIL_LEGACY: &str = "SQUELCH_ACCOUNT";
+/// Env var listing extra hostnames (comma-separated) the agent door's MCP
+/// Streamable HTTP DNS-rebinding guard should accept, additive to the loopback
+/// defaults. Needed when a reverse proxy (`tailscale serve`) rewrites `Host`.
+pub const ENV_MCP_ALLOWED_HOSTS: &str = "SQUELCH_MCP_ALLOWED_HOSTS";
+
+/// The single, canonical default SQLite path: `~/.local/share/squelch/squelch.db`
+/// (XDG data dir). Every binary resolves to THIS when no path is configured, so
+/// the MCP server, the TUI, `squelchd`, and the API all agree on one db file.
+///
+/// Creates the parent directory best-effort. Falls back to a CWD-relative
+/// `squelch.db` only when `HOME` is unset (unusual).
+pub fn default_db_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = PathBuf::from(home).join(".local/share/squelch");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("squelch.db");
+    }
+    PathBuf::from("squelch.db")
+}
+
+/// Read a canonical env var, falling back to a legacy alias. When only the
+/// legacy name is set, emit a one-line deprecation note to stderr (no values are
+/// logged) and return its value. Returns `None` if neither is set/non-empty.
+fn env_with_legacy(canonical: &str, legacy: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(canonical)
+        && !v.is_empty()
+    {
+        return Some(v);
+    }
+    if let Ok(v) = std::env::var(legacy)
+        && !v.is_empty()
+    {
+        eprintln!(
+            "squelch: {legacy} is deprecated; please use {canonical} instead (still honored for now)"
+        );
+        return Some(v);
+    }
+    None
+}
+
+/// Resolve the SQLite path used by ALL binaries, in one place.
+///
+/// Precedence: canonical `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecation
+/// note) > [`default_db_path`]. This is the single source of truth; bins call it
+/// so they can never drift.
+pub fn resolve_db_path() -> PathBuf {
+    env_with_legacy(ENV_DB_PATH, ENV_DB_PATH_LEGACY)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_db_path)
+}
+
+/// Resolve the account email used by ALL binaries, in one place.
+///
+/// Precedence: canonical `SQUELCH_ACCOUNT_EMAIL` > legacy `SQUELCH_ACCOUNT`
+/// (deprecation note) > the provided `default_email`.
+pub fn resolve_account_email(default_email: &str) -> String {
+    env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY)
+        .unwrap_or_else(|| default_email.to_string())
+}
+
+/// The MCP agent-door DNS-rebinding allow-list: the loopback defaults rmcp ships
+/// with (`localhost`, `127.0.0.1`, `::1`) PLUS any comma-separated hostnames in
+/// `SQUELCH_MCP_ALLOWED_HOSTS`. Additive by design — we never drop the loopback
+/// entries — so fronting the door with `tailscale serve` (which rewrites `Host`
+/// to `*.ts.net`) stops returning 403 without opening the guard entirely.
+///
+/// Entries may be bare hosts or `host:port` authorities (rmcp matches either).
+/// Blank entries are ignored.
+pub fn mcp_allowed_hosts() -> Vec<String> {
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Ok(raw) = std::env::var(ENV_MCP_ALLOWED_HOSTS) {
+        for h in raw.split(',') {
+            let h = h.trim();
+            if !h.is_empty() {
+                hosts.push(h.to_string());
+            }
+        }
+    }
+    hosts
+}
+
 /// The READ scope. This is all the sync daemon + triage ever request; the read
 /// credential is `gmail.readonly` and nothing else. Hard invariant, hence a
 /// `const`. See [`WRITE_SCOPES`] for the separate, opt-in action credential.
@@ -112,6 +201,14 @@ pub struct Stage1Config {
     pub noise_importance: u8,
     /// Ambiguous fall-through (unknown sender, no pattern) -> Stage-2.
     pub fallthrough_importance: u8,
+    /// Importance for a bill-shaped message from an UNKNOWN sender. Deliberately
+    /// moderate: it should surface for a Stage-2 look, not scream. See bug #3
+    /// (scam "past-due" from an unknown sender must never land CONFIDENT PastDue).
+    pub bill_unknown_sender_importance: u8,
+    /// Sanity dampener: an extracted bill amount strictly greater than this
+    /// (dollars) is treated as absurd and shaves confidence (never raises tier).
+    /// Default $50,000 — a real household bill essentially never exceeds this.
+    pub bill_absurd_amount_threshold: f64,
 }
 
 impl Default for Stage1Config {
@@ -125,6 +222,8 @@ impl Default for Stage1Config {
             alert_importance: 75,
             noise_importance: 15,
             fallthrough_importance: 40,
+            bill_unknown_sender_importance: 55,
+            bill_absurd_amount_threshold: 50_000.0,
         }
     }
 }
@@ -164,7 +263,9 @@ impl Default for Config {
             client_id: None,
             client_secret: None,
             account_email: None,
-            db_path: PathBuf::from("squelch.db"),
+            // The single canonical default, shared with every other binary (see
+            // `default_db_path`). NOT a CWD-relative "squelch.db".
+            db_path: default_db_path(),
             credential_backend: CredentialBackend::default(),
             credentials_path: None,
             default_min_importance: 0,
@@ -204,7 +305,8 @@ impl Config {
     /// Env-var overrides (highest precedence). Env always wins over the file so
     /// operators can override without editing config.
     fn apply_env_overrides(&mut self) {
-        if let Some(p) = std::env::var_os("SQUELCH_DB_PATH") {
+        // Canonical SQUELCH_DB_PATH, with legacy SQUELCH_DB accepted (deprecated).
+        if let Some(p) = env_with_legacy(ENV_DB_PATH, ENV_DB_PATH_LEGACY) {
             self.db_path = PathBuf::from(p);
         }
         if let Ok(v) = std::env::var("SQUELCH_MIN_IMPORTANCE")
@@ -222,9 +324,9 @@ impl Config {
         {
             self.client_secret = Some(v);
         }
-        if let Ok(v) = std::env::var("SQUELCH_ACCOUNT_EMAIL")
-            && !v.is_empty()
-        {
+        // Canonical SQUELCH_ACCOUNT_EMAIL, with legacy SQUELCH_ACCOUNT accepted
+        // (deprecated).
+        if let Some(v) = env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY) {
             self.account_email = Some(v);
         }
         if let Ok(v) = std::env::var("SQUELCH_BACKFILL_DAYS")
@@ -362,8 +464,116 @@ backfill_days = 90
 
     #[test]
     fn missing_file_is_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // No env overrides in play => the canonical default path.
+        unsafe {
+            std::env::remove_var("SQUELCH_DB_PATH");
+            std::env::remove_var("SQUELCH_DB");
+        }
         let c = Config::load_from(std::path::Path::new("/nonexistent/squelch/config.toml"));
-        assert_eq!(c.db_path, PathBuf::from("squelch.db"));
+        assert_eq!(c.db_path, default_db_path());
+    }
+
+    #[test]
+    fn db_path_precedence_canonical_over_legacy_over_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_DB_PATH");
+            std::env::remove_var("SQUELCH_DB");
+        }
+        // Neither set => canonical default.
+        assert_eq!(resolve_db_path(), default_db_path());
+
+        // Legacy only => legacy value (with a deprecation note to stderr).
+        unsafe {
+            std::env::set_var("SQUELCH_DB", "/tmp/legacy.db");
+        }
+        assert_eq!(resolve_db_path(), PathBuf::from("/tmp/legacy.db"));
+
+        // Canonical set => canonical WINS over legacy.
+        unsafe {
+            std::env::set_var("SQUELCH_DB_PATH", "/tmp/canonical.db");
+        }
+        assert_eq!(resolve_db_path(), PathBuf::from("/tmp/canonical.db"));
+
+        unsafe {
+            std::env::remove_var("SQUELCH_DB_PATH");
+            std::env::remove_var("SQUELCH_DB");
+        }
+    }
+
+    #[test]
+    fn account_email_precedence_canonical_over_legacy_over_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_ACCOUNT_EMAIL");
+            std::env::remove_var("SQUELCH_ACCOUNT");
+        }
+        assert_eq!(resolve_account_email("me@localhost"), "me@localhost");
+
+        unsafe {
+            std::env::set_var("SQUELCH_ACCOUNT", "legacy@x.com");
+        }
+        assert_eq!(resolve_account_email("me@localhost"), "legacy@x.com");
+
+        unsafe {
+            std::env::set_var("SQUELCH_ACCOUNT_EMAIL", "canon@x.com");
+        }
+        assert_eq!(resolve_account_email("me@localhost"), "canon@x.com");
+
+        unsafe {
+            std::env::remove_var("SQUELCH_ACCOUNT_EMAIL");
+            std::env::remove_var("SQUELCH_ACCOUNT");
+        }
+    }
+
+    #[test]
+    fn legacy_db_env_flows_through_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_DB_PATH");
+            std::env::set_var("SQUELCH_DB", "/tmp/legacy-cfg.db");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.db_path, PathBuf::from("/tmp/legacy-cfg.db"));
+        unsafe {
+            std::env::remove_var("SQUELCH_DB");
+        }
+    }
+
+    #[test]
+    fn mcp_allowed_hosts_are_additive_to_loopback() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_MCP_ALLOWED_HOSTS");
+        }
+        let base = mcp_allowed_hosts();
+        assert!(base.contains(&"localhost".to_string()));
+        assert!(base.contains(&"127.0.0.1".to_string()));
+        assert!(base.contains(&"::1".to_string()));
+
+        unsafe {
+            std::env::set_var(
+                "SQUELCH_MCP_ALLOWED_HOSTS",
+                " braelyns-mbp.tail15becf.ts.net , example.com:8080 ,",
+            );
+        }
+        let hosts = mcp_allowed_hosts();
+        // Loopback defaults preserved...
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        // ...and the extras are added, trimmed, blanks dropped.
+        assert!(hosts.contains(&"braelyns-mbp.tail15becf.ts.net".to_string()));
+        assert!(hosts.contains(&"example.com:8080".to_string()));
+        assert_eq!(hosts.len(), 5);
+        unsafe {
+            std::env::remove_var("SQUELCH_MCP_ALLOWED_HOSTS");
+        }
     }
 
     #[test]

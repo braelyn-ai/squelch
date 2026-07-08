@@ -568,3 +568,243 @@ async fn reply_send_success_threads_and_audits_ok() {
     assert_eq!(audit[0].action, "send");
     assert_eq!(audit[0].detail.as_deref(), Some("ok"));
 }
+
+// --- sitrep: seen-ledger + bands + resolution over HTTP ---------------------
+
+use squelch_core::types::AttentionStatus;
+
+/// Seed one signal message and return its local id via search.
+fn seed_one_signal(store: &SqliteStore, acct: i64, gmail: &str, thread: &str, subj: &str) -> i64 {
+    let m = store
+        .upsert_message(&msg(acct, gmail, thread, subj, "body"))
+        .unwrap();
+    store
+        .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+        .unwrap();
+    m
+}
+
+#[tokio::test]
+async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
+    let (app, store, acct) = app_with(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+    });
+
+    // First fetch: pre-stamp surfaced_at is null (this row was never surfaced).
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0]["surfaced_at"].is_null(),
+        "response carries PRE-stamp value (null on first surface)"
+    );
+    assert_eq!(items[0]["status"], "new", "pre-stamp status is new");
+
+    // The ledger was stamped as a side effect.
+    let after = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, None, None)
+        .unwrap();
+    let first_stamp = after[0].surfaced_at.expect("surfaced_at now set");
+    assert_eq!(after[0].status, AttentionStatus::Open);
+
+    // Second fetch: surfaced_at is now present and unchanged (stamp-once).
+    let resp2 = app
+        .oneshot(authed("GET", "/client/updates"))
+        .await
+        .unwrap();
+    let json2 = body_json(resp2).await;
+    assert!(!json2["items"][0]["surfaced_at"].is_null());
+    let after2 = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, None, None)
+        .unwrap();
+    assert_eq!(after2[0].surfaced_at, Some(first_stamp), "stamp did not move");
+}
+
+#[tokio::test]
+async fn band_query_filters_server_side() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        // A past_due bill (standing) + a plain signal.
+        let bill = store
+            .upsert_message(&msg(acct, "g1", "t1", "PG&E past due", "pay"))
+            .unwrap();
+        store
+            .set_triage(bill, acct, 95, Tier::PastDue, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        seed_one_signal(store, acct, "g2", "t2", "hello");
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/updates?band=standing"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "standing = past_due/deadline only");
+    assert_eq!(items[0]["thread_id"], "t1");
+    assert_eq!(items[0]["tier"], "past_due");
+}
+
+#[tokio::test]
+async fn bad_band_and_status_are_400() {
+    let (app, _s, _a) = app_with(|_, _| {});
+    let r1 = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?band=bogus"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::BAD_REQUEST);
+    let r2 = app
+        .oneshot(authed("GET", "/client/updates?status=bogus"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn dismiss_and_reopen_endpoint() {
+    let (app, store, acct) = app_with(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+    });
+    let id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
+
+    // Dismiss -> done.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{id}/status"),
+            serde_json::json!({ "status": "done" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert_eq!(done.len(), 1);
+    assert!(done[0].resolved_at.is_some());
+
+    // The dismiss is audited.
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| a.action == "set_status" && a.detail.as_deref() == Some("done")));
+
+    // Reopen -> open.
+    let resp2 = app
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{id}/status"),
+            serde_json::json!({ "status": "open" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dismiss_unknown_message_is_404() {
+    let (app, _s, _a) = app_with(|_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/updates/999/status",
+            serde_json::json!({ "status": "done" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn dismiss_sealed_message_is_404() {
+    // A sealed row must be invisible to the status endpoint.
+    let (app, store, acct) = app_with(|store, acct| {
+        let s = store
+            .upsert_message(&msg(acct, "g1", "t1", "code", "123456"))
+            .unwrap();
+        store
+            .set_triage(
+                s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None,
+            )
+            .unwrap();
+    });
+    let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{sealed_id}/status"),
+            serde_json::json!({ "status": "done" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn archive_success_resolves_target_to_done() {
+    let (base, handle) = mock_gmail(1).await;
+    let (app, store, acct) = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-abc", "t1", "hi");
+    });
+    let message_id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/archive",
+            serde_json::json!({ "message_id": message_id, "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = handle.await.unwrap();
+
+    // RESOLUTION: the target row is now done + resolved_at set.
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].update.id, message_id);
+    assert!(done[0].resolved_at.is_some());
+}
+
+#[tokio::test]
+async fn stats_expose_bands_and_last_surfaced_at() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        let bill = store
+            .upsert_message(&msg(acct, "g1", "t1", "bill due", "pay"))
+            .unwrap();
+        store
+            .set_triage(bill, acct, 95, Tier::Deadline, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        seed_one_signal(store, acct, "g2", "t2", "hello");
+    });
+
+    // Before any surface: bands.new = 2, last_surfaced_at null.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/stats"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["bands"]["standing"], 1);
+    assert_eq!(json["bands"]["new"], 2);
+    assert!(json["last_surfaced_at"].is_null());
+
+    // Surface via /client/updates, then last_surfaced_at is set and new drops.
+    let _ = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates"))
+        .await
+        .unwrap();
+    let resp2 = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json2 = body_json(resp2).await;
+    assert_eq!(json2["bands"]["new"], 0);
+    assert_eq!(json2["bands"]["open"], 2);
+    assert!(!json2["last_surfaced_at"].is_null());
+}

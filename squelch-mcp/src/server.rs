@@ -150,6 +150,19 @@ impl SquelchServer {
                 safe.push(u);
             }
         }
+
+        // SEEN-LEDGER: the agent door also stamps. Once the serialization set is
+        // fixed, mark those rows surfaced (surfaced_at=now if NULL, new->open) so
+        // the ledger answers "did ANYONE see this" across both doors. Sealed rows
+        // can't be here (SQL + defense-in-depth), and mark_surfaced re-guards
+        // sensitivity, so nothing sealed is ever stamped. The RESPONSE SHAPE IS
+        // UNCHANGED — the agent doesn't bucket, so we serialize `Update` as before
+        // and stamp as a side effect.
+        let ids: Vec<i64> = safe.iter().map(|u| u.id).collect();
+        self.store
+            .mark_surfaced(self.account_id, &ids)
+            .map_err(Self::map_err)?;
+
         Self::ok_json(safe)
     }
 
@@ -246,5 +259,80 @@ impl ServerHandler for SquelchServer {
                  mailbox; the only writes are local sender rules. Auth/2FA/\
                  verification emails are never exposed through these tools.",
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::wrapper::Parameters;
+    use squelch_core::store::Store;
+    use squelch_core::types::{AttentionStatus, SealedKind, Sensitivity, Tier};
+
+    /// A read through the AGENT DOOR (`get_inbox_updates`) stamps the seen-ledger
+    /// exactly like the human door: surfaced_at set, new->open. The response shape
+    /// is unchanged (still an `Update` set) — this asserts the side effect.
+    #[tokio::test]
+    async fn mcp_fetch_stamps_the_ledger() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+
+        // One normal message + one sealed OTP.
+        let mut normal = squelch_core::types::NewMessage {
+            account_id: acct,
+            gmail_msg_id: "g1".into(),
+            thread_id: "t1".into(),
+            from_addr: "alice@example.com".into(),
+            from_name: None,
+            subject: "hi".into(),
+            received_at: Utc::now(),
+            snippet: "".into(),
+            body: "".into(),
+            is_sent: false,
+        };
+        let nid = store.upsert_message(&normal).unwrap();
+        store
+            .set_triage(nid, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        normal.gmail_msg_id = "g2".into();
+        normal.thread_id = "t2".into();
+        normal.subject = "code".into();
+        let sid = store.upsert_message(&normal).unwrap();
+        store
+            .set_triage(
+                sid,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let since = Utc::now() - chrono::Duration::days(1);
+        let _ = server
+            .get_inbox_updates(Parameters(GetInboxUpdatesParams {
+                since,
+                min_importance: None,
+            }))
+            .await
+            .unwrap();
+
+        // The normal row is now surfaced+open; the sealed row is untouched.
+        let rows = store
+            .attention_updates(acct, since, None, None, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "sealed never surfaces");
+        assert_eq!(rows[0].update.id, nid);
+        assert_eq!(rows[0].status, AttentionStatus::Open);
+        assert!(rows[0].surfaced_at.is_some());
+
+        // Sealed row: still status='new', surfaced_at NULL (never stamped).
+        let stats = store.stats(acct).unwrap();
+        assert_eq!(stats.sealed, 1);
     }
 }

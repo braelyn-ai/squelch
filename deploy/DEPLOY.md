@@ -84,6 +84,12 @@ SQUELCH_CLIENT_SECRET=<client secret>
 
 # --- bind (loopback; tailscale serve fronts it) ---
 SQUELCH_BIND=127.0.0.1:8848
+
+# --- agent door DNS-rebinding allow-list (REQUIRED behind tailscale serve) ---
+# The MCP door only accepts loopback Host headers by default, so requests
+# proxied by `tailscale serve` (Host: <box>.<tailnet>.ts.net) get 403. List your
+# tailnet hostname here (comma-separated, additive to the loopback defaults).
+SQUELCH_MCP_ALLOWED_HOSTS=<box>.<tailnet>.ts.net
 ```
 
 ```sh
@@ -94,6 +100,28 @@ sudo chmod 0640 /etc/squelch/env
 A `config.toml` is optional — every value above can come from the env file. If
 you prefer a file, drop it at `/var/lib/squelch/config.toml` and pass
 `--config` (the unit uses env only by default).
+
+### Environment variables
+
+Every binary (`squelchd`, `squelch-mcp`, `squelch-api`, `squelch-tui`) reads the
+**canonical** names below. Two legacy names are still accepted as silent
+fallbacks and log a one-line deprecation note to stderr — migrate off them.
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `SQUELCH_API_TOKEN` | yes (human door) | — | Bearer for every `/client/*` route; door refuses to serve without it. |
+| `SQUELCH_ACCOUNT_EMAIL` | yes | `me@localhost` | Canonical. Legacy alias: `SQUELCH_ACCOUNT`. |
+| `SQUELCH_DB_PATH` | no | `~/.local/share/squelch/squelch.db` | Canonical, identical default across all binaries. Legacy alias: `SQUELCH_DB`. |
+| `SQUELCH_MCP_ALLOWED_HOSTS` | yes behind a proxy | loopback only | Comma-separated extra Host values for the agent door's DNS-rebinding guard, additive to `localhost,127.0.0.1,::1`. Set to your `*.ts.net` name or `/mcp` returns 403. |
+| `SQUELCH_BIND` | no | `127.0.0.1:8848` | `squelchd serve` bind address (both doors). |
+| `SQUELCH_API_HTTP` | no | `127.0.0.1:8849` | Standalone `squelch-api` dev bin bind address. |
+| `SQUELCH_MCP_HTTP` | no | — | Standalone `squelch-mcp` bin: set to switch from stdio to HTTP (address or empty for the loopback default). |
+| `SQUELCH_CRED_BACKEND` | no | `keyring` (macOS) / `file` (Linux) | `keyring` or `file`. |
+| `SQUELCH_CREDENTIALS_PATH` | no | `~/.config/squelch/credentials.json` | Used only by the `file` backend. |
+| `SQUELCH_CLIENT_ID` / `SQUELCH_CLIENT_SECRET` | yes (OAuth) | — | Your GCP "Desktop app" OAuth client. |
+
+The DNS-rebinding allow-list is read once when the agent door is constructed, so
+both `squelchd serve` and the standalone `squelch-mcp --http` honor it identically.
 
 ---
 

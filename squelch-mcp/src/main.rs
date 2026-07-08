@@ -34,24 +34,17 @@ enum Transport {
     Http(SocketAddr),
 }
 
-/// Resolve the SQLite path from `SQUELCH_DB`, falling back to the user data dir.
+/// Resolve the SQLite path via core config's single source of truth: canonical
+/// `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecated) > the shared XDG default.
 fn db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SQUELCH_DB") {
-        return PathBuf::from(p);
-    }
-    // Default: ~/.local/share/squelch/squelch.db (XDG-ish), else CWD.
-    if let Ok(home) = std::env::var("HOME") {
-        let dir = PathBuf::from(home).join(".local/share/squelch");
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join("squelch.db");
-    }
-    PathBuf::from("squelch.db")
+    squelch_core::config::resolve_db_path()
 }
 
-/// The account this server operates on. Multi-account selection is future work;
-/// the schema already carries `account_id` everywhere.
+/// The account this server operates on. Canonical `SQUELCH_ACCOUNT_EMAIL` >
+/// legacy `SQUELCH_ACCOUNT` (deprecated) > default. Multi-account selection is
+/// future work; the schema already carries `account_id` everywhere.
 fn account_email() -> String {
-    std::env::var("SQUELCH_ACCOUNT").unwrap_or_else(|_| "me@localhost".to_string())
+    squelch_core::config::resolve_account_email("me@localhost")
 }
 
 /// Build the server object. Split out so the smoke test can construct it without
