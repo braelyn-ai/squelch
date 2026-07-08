@@ -4,10 +4,12 @@
 //! SECURITY INVARIANT: sealed (auth-related) messages are INVISIBLE to any
 //! MCP-facing query — absent, not redacted. See [`store`] and [`triage::seal`].
 
+pub mod auth;
 pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod store;
+pub mod sync;
 pub mod triage;
 pub mod types;
 

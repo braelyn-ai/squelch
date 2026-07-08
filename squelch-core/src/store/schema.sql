@@ -76,6 +76,17 @@ CREATE TABLE IF NOT EXISTS deadlines (
 
 CREATE INDEX IF NOT EXISTS idx_deadlines_due ON deadlines(account_id, due_at);
 
+-- Per-mailbox IMAP sync cursor. UIDVALIDITY guards the (uidvalidity, last_uid)
+-- pair: if the server's UIDVALIDITY changes the stored last_uid is meaningless
+-- and the sync engine resets the row for that mailbox.
+CREATE TABLE IF NOT EXISTS sync_state (
+    account_id  INTEGER NOT NULL,
+    mailbox     TEXT NOT NULL,
+    uidvalidity INTEGER NOT NULL,
+    last_uid    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(account_id, mailbox)
+);
+
 CREATE TABLE IF NOT EXISTS wake_budget (
     account_id  INTEGER NOT NULL,
     thread_id   TEXT NOT NULL,

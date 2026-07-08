@@ -10,10 +10,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
-use crate::store::{SealedMessage, Store};
+use crate::store::{SealedMessage, Store, SyncState, TriagedMessage};
 use crate::types::{
-    AccountId, Deadline, Disposition, NewMessage, SanitizedMessage, SenderRule, ThreadView, Tier,
-    Update,
+    AccountId, Deadline, Disposition, NewMessage, SanitizedMessage, SenderRule, Sensitivity,
+    ThreadView, Tier, Update,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -106,6 +106,58 @@ impl SqliteStore {
     }
 }
 
+/// Upsert a message + FTS + Sent-derived contacts against an explicit
+/// connection/transaction handle. Shared by [`SqliteStore::upsert_message`] and
+/// the transactional [`Store::ingest_message`] path so both stay in sync.
+fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
+             subject, received_at, snippet, body, is_sent)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
+             thread_id=excluded.thread_id, from_addr=excluded.from_addr,
+             from_name=excluded.from_name, subject=excluded.subject,
+             received_at=excluded.received_at, snippet=excluded.snippet,
+             body=excluded.body, is_sent=excluded.is_sent",
+        params![
+            msg.account_id,
+            msg.gmail_msg_id,
+            msg.thread_id,
+            msg.from_addr,
+            msg.from_name,
+            msg.subject,
+            msg.received_at.to_rfc3339(),
+            msg.snippet,
+            msg.body,
+            msg.is_sent as i64,
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM messages WHERE account_id=?1 AND gmail_msg_id=?2",
+        params![msg.account_id, msg.gmail_msg_id],
+        |r| r.get(0),
+    )?;
+
+    // Keep the FTS index in sync.
+    conn.execute("DELETE FROM messages_fts WHERE rowid=?1", params![id])?;
+    conn.execute(
+        "INSERT INTO messages_fts(rowid, subject, body) VALUES(?1,?2,?3)",
+        params![id, msg.subject, msg.body],
+    )?;
+
+    // Derived contacts: Sent mail = people I know.
+    if msg.is_sent {
+        conn.execute(
+            "INSERT INTO contacts(account_id, addr, sent_count, first_seen)
+             VALUES(?1,?2,1,?3)
+             ON CONFLICT(account_id, addr) DO UPDATE SET sent_count = sent_count + 1",
+            params![msg.account_id, msg.from_addr, msg.received_at.to_rfc3339()],
+        )?;
+    }
+
+    Ok(id)
+}
+
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
@@ -115,52 +167,7 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
 impl Store for SqliteStore {
     fn upsert_message(&self, msg: &NewMessage) -> Result<i64> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
-                 subject, received_at, snippet, body, is_sent)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-             ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
-                 thread_id=excluded.thread_id, from_addr=excluded.from_addr,
-                 from_name=excluded.from_name, subject=excluded.subject,
-                 received_at=excluded.received_at, snippet=excluded.snippet,
-                 body=excluded.body, is_sent=excluded.is_sent",
-            params![
-                msg.account_id,
-                msg.gmail_msg_id,
-                msg.thread_id,
-                msg.from_addr,
-                msg.from_name,
-                msg.subject,
-                msg.received_at.to_rfc3339(),
-                msg.snippet,
-                msg.body,
-                msg.is_sent as i64,
-            ],
-        )?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM messages WHERE account_id=?1 AND gmail_msg_id=?2",
-            params![msg.account_id, msg.gmail_msg_id],
-            |r| r.get(0),
-        )?;
-
-        // Keep the FTS index in sync.
-        conn.execute("DELETE FROM messages_fts WHERE rowid=?1", params![id])?;
-        conn.execute(
-            "INSERT INTO messages_fts(rowid, subject, body) VALUES(?1,?2,?3)",
-            params![id, msg.subject, msg.body],
-        )?;
-
-        // Derived contacts: Sent mail = people I know.
-        if msg.is_sent {
-            conn.execute(
-                "INSERT INTO contacts(account_id, addr, sent_count, first_seen)
-                 VALUES(?1,?2,1,?3)
-                 ON CONFLICT(account_id, addr) DO UPDATE SET sent_count = sent_count + 1",
-                params![msg.account_id, msg.from_addr, msg.received_at.to_rfc3339()],
-            )?;
-        }
-
-        Ok(id)
+        upsert_message_conn(&conn, msg)
     }
 
     fn ranked_updates(
@@ -410,6 +417,124 @@ impl Store for SqliteStore {
             });
         }
         Ok(out)
+    }
+
+    fn ingest_message(&self, triaged: &TriagedMessage) -> Result<i64> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // 1. Upsert the message row (+ FTS + Sent-derived contacts).
+        let id = upsert_message_conn(&tx, &triaged.message)?;
+
+        // 2. Write the triage row IN THE SAME TRANSACTION. For sealed mail this
+        //    is the whole point: sensitivity='sealed' is committed atomically
+        //    with the message so there is no window where it is queryable as
+        //    normal mail. `model_used` stays NULL; combined with
+        //    sensitivity='normal' that is the Stage-2 queue predicate for
+        //    non-confident rows.
+        let deadline_dt = triaged.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
+        tx.execute(
+            "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
+                 sealed_kind, one_line, reason, deadline, matched_rule_id, model_used, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11)
+             ON CONFLICT(message_id) DO UPDATE SET
+                 importance=excluded.importance, tier=excluded.tier,
+                 sensitivity=excluded.sensitivity, sealed_kind=excluded.sealed_kind,
+                 one_line=excluded.one_line, reason=excluded.reason,
+                 deadline=excluded.deadline, matched_rule_id=excluded.matched_rule_id",
+            params![
+                id,
+                triaged.message.account_id,
+                triaged.importance as i64,
+                triaged.tier.as_str(),
+                triaged.sensitivity.as_str(),
+                triaged.sealed_kind.map(|k| k.as_str()),
+                triaged.one_line,
+                triaged.reason,
+                deadline_dt,
+                triaged.matched_rule,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        // 3. Deadlines: only ever present for non-sealed mail (Stage-1 does not
+        //    run on sealed content). Replace any prior deadline for this message
+        //    so re-ingest is idempotent.
+        tx.execute(
+            "DELETE FROM deadlines WHERE message_id=?1",
+            params![id],
+        )?;
+        if triaged.sensitivity != Sensitivity::Sealed
+            && let Some(d) = &triaged.deadline
+        {
+                tx.execute(
+                    "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
+                         due_at, past_due, source)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        triaged.message.account_id,
+                        id,
+                        d.kind,
+                        d.amount,
+                        d.currency,
+                        d.due_at.to_rfc3339(),
+                        d.past_due as i64,
+                        d.source,
+                    ],
+                )?;
+        }
+
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM contacts
+             WHERE account_id=?1 AND addr=?2 COLLATE NOCASE AND sent_count > 0",
+            params![account_id, addr],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT uidvalidity, last_uid FROM sync_state
+                 WHERE account_id=?1 AND mailbox=?2",
+                params![account_id, mailbox],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(uv, lu)| SyncState {
+            uidvalidity: uv as u32,
+            last_uid: lu as u32,
+        }))
+    }
+
+    fn set_sync_state(
+        &self,
+        account_id: AccountId,
+        mailbox: &str,
+        state: &SyncState,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO sync_state(account_id, mailbox, uidvalidity, last_uid)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(account_id, mailbox) DO UPDATE SET
+                 uidvalidity=excluded.uidvalidity, last_uid=excluded.last_uid",
+            params![
+                account_id,
+                mailbox,
+                state.uidvalidity as i64,
+                state.last_uid as i64,
+            ],
+        )?;
+        Ok(())
     }
 
     fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>> {
