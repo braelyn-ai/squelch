@@ -10,6 +10,7 @@ import { api, ApiError } from "../api";
 import type { RevealedSealed, SealedMeta } from "../api";
 import { useKeys, useKeyContext } from "../keys";
 import { dateTime } from "../lib/format";
+import { authKindLabel } from "../lib/authCopy";
 
 export interface RevealPanelProps {
   meta: SealedMeta;
@@ -65,7 +66,7 @@ export function RevealPanel({ meta, onClose }: RevealPanelProps) {
           {(revealed?.from_name ? `${revealed.from_name} · ` : "") + meta.sender}
           {" · "}
           {dateTime(meta.received_at)}
-          {meta.kind ? ` · ${meta.kind}` : ""}
+          {meta.kind ? ` · ${authKindLabel(meta.kind)}` : ""}
         </div>
 
         {loading && <div className="side-loading">revealing…</div>}

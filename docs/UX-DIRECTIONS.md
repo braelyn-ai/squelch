@@ -167,3 +167,40 @@ Actions get friction proportional to their reversibility.
 - The API token is never logged. Sealed bodies are never lifted into the global
   store or written to disk.
 
+---
+
+# Copy guidelines (2026-07-09)
+
+Rules for all **user-facing** copy — section headers, empty states, tooltips,
+aria labels, button/knob labels, the shortcuts overlay, panels. Internal code,
+comments, wire-level enum values, and API paths are exempt.
+
+- **No internal jargon.** The word **"sealed"** never appears in the UI — it's an
+  implementation detail. Auth-related mail (the `/client/sealed` metadata) is
+  presented with auth-centric language: it lives in a dedicated **Auth** tab
+  (key `g`) listing login codes, password resets, sign-in alerts and
+  verifications, with the existing one-time reveal flow. A compact
+  "N auth messages" pill/chip (header + noise line) notices new auth mail and
+  opens the tab. Map `sealed_kind` → friendly labels via `lib/authCopy.ts`
+  (`otp`→"Login code", `password_reset`→"Password reset",
+  `magic_link`→"Sign-in link", `login_alert`→"Sign-in alert",
+  `verification`→"Verification").
+- **"squelch" is the product name only.** Never use it as a verb or noun in copy.
+  "squelched" → "filtered out" / "muted"; the min-importance knob is
+  "Noise filter: N", not "squelch: N". Rule dispositions read "surface / mute /
+  filter" in the UI (via `DISPOSITION_LABEL`) while the wire values are
+  unchanged. Literal CLI command names in empty states (`squelchd auth`,
+  `squelchd run`) stay — they're commands, not copy. The app name/title
+  "squelch" stays.
+- **Age badges only for genuinely aging items.** The STILL OPEN aging badge
+  ("← 2 WEEKS") appears only once an item is past the 48h threshold
+  (`isAging`/`AGING_THRESHOLD_H` in `lib/format.ts`), and only in the STILL OPEN
+  band. Escalating visual weight still ramps for multi-day/week items; fresh open
+  rows read calm and show the plain relative time. New rows never carry it;
+  Standing rows keep their deadline chip.
+- **No remote avatar/asset services, ever (privacy).** Sender avatars are
+  derived locally — initials from the display name (fallback: address
+  local-part) over a deterministic, theme-aware color palette hashed from the
+  address. Never fetch Gravatar, favicons, or any remote avatar/asset: it would
+  leak the correspondent graph off-device.
+

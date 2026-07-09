@@ -21,7 +21,7 @@ const GROUPS: Group[] = [
     items: [
       { keys: ["j", "k"], desc: "move selection" },
       { keys: ["Enter"], desc: "open thread" },
-      { keys: ["r"], desc: "reply · reveal sealed" },
+      { keys: ["r"], desc: "reply" },
       { keys: ["e"], desc: "archive" },
       { keys: ["d"], desc: "done" },
       { keys: ["t"], desc: "tune sender rule" },
@@ -34,6 +34,7 @@ const GROUPS: Group[] = [
     items: [
       { keys: ["a"], desc: "browse all mail" },
       { keys: ["T"], desc: "rules audit" },
+      { keys: ["g"], desc: "auth messages" },
       { keys: ["/"], desc: "search" },
     ],
   },

@@ -1,23 +1,19 @@
 // SITREP VIEW — the main chassis. OWNED BY: view-agent-1 (sitrep).
 //
 // Header (signal/noise + last checked) · STANDING / SINCE LAST CHECK / STILL
-// OPEN bands · collapsed noise line · sealed lock-chip section. Keyboard-first:
-// j/k traverse bands then sealed; Enter drills into a thread; r/e/d/t dispatch
-// through lib/dispatch (the seam to ActionLayer); r on a sealed row reveals.
-//
-// Selection model: the store owns band selection (stable by message id, used by
-// useSitrep + orderedIds). Sealed rows live outside orderedIds, so this view
-// tracks a local "sealed focus" that j/k flows into past the last band row.
+// OPEN bands · collapsed noise line · a compact "auth messages" pill. Auth mail
+// (login codes / password resets / sign-in alerts) lives in its own side view
+// (the Auth tab, `g`), not inline — the pill just notices it and opens the tab.
+// Keyboard-first: j/k traverse bands; Enter drills into a thread; r/e/d/t
+// dispatch through lib/dispatch (the seam to ActionLayer).
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useStore } from "../state";
 import { useKeys } from "../keys";
-import type { AttentionUpdate, SealedMeta } from "../api";
+import type { AttentionUpdate } from "../api";
 import { SitrepHeader } from "../components/SitrepHeader";
 import { BandSection } from "../components/BandSection";
 import { NoiseLine } from "../components/NoiseLine";
-import { SealedSection } from "../components/SealedSection";
-import { RevealPanel } from "../components/RevealPanel";
 import { flipTheme } from "../components/ThemeToggle";
 import { ShortcutsOverlay } from "../components/ShortcutsOverlay";
 import {
@@ -33,88 +29,36 @@ export function SitrepView() {
   const selectedId = useStore((s) => s.selectedId);
   const select = useStore((s) => s.select);
   const move = useStore((s) => s.moveSelection);
-  const orderedIds = useStore((s) => s.orderedIds);
   const openSide = useStore((s) => s.openSide);
   const fireUndo = useStore((s) => s.fireUndo);
   const selectedUpdate = useStore((s) => s.selectedUpdate);
 
-  // Sealed focus lives here (sealed ids are disjoint from band message ids and
-  // absent from orderedIds). null => focus is in the bands.
-  const [sealedFocusId, setSealedFocusId] = useState<number | null>(null);
-  // The one revealed sealed body currently on screen (held only while mounted).
-  const [revealing, setRevealing] = useState<SealedMeta | null>(null);
   // Keyboard-shortcuts help overlay ('?').
   const [showShortcuts, setShowShortcuts] = useState(false);
 
-  const sealed = sitrep.sealed;
-
-  // Keep sealed focus valid across refreshes; drop it if that item vanished.
-  useEffect(() => {
-    if (sealedFocusId !== null && !sealed.some((m) => m.id === sealedFocusId)) {
-      setSealedFocusId(null);
-    }
-  }, [sealed, sealedFocusId]);
+  const authCount = sitrep.sealed.length;
 
   const openThread = (u: AttentionUpdate) =>
     openSide({ kind: "thread", threadId: u.thread_id });
 
-  const revealSealed = (m: SealedMeta) => setRevealing(m);
-
-  // --- j/k that spans bands then sealed --------------------------------------
-  const moveDown = () => {
-    if (sealedFocusId !== null) {
-      const idx = sealed.findIndex((m) => m.id === sealedFocusId);
-      if (idx < sealed.length - 1) setSealedFocusId(sealed[idx + 1].id);
-      return;
-    }
-    const ids = orderedIds();
-    const atLastBand =
-      ids.length > 0 && selectedId === ids[ids.length - 1];
-    if ((atLastBand || ids.length === 0) && sealed.length > 0) {
-      // Cross the boundary into sealed.
-      setSealedFocusId(sealed[0].id);
-      return;
-    }
-    move(1);
-  };
-
-  const moveUp = () => {
-    if (sealedFocusId !== null) {
-      const idx = sealed.findIndex((m) => m.id === sealedFocusId);
-      if (idx > 0) {
-        setSealedFocusId(sealed[idx - 1].id);
-      } else {
-        // Back up into the last band row.
-        setSealedFocusId(null);
-        const ids = orderedIds();
-        if (ids.length > 0) select(ids[ids.length - 1]);
-      }
-      return;
-    }
-    move(-1);
-  };
+  const openAuth = () => openSide({ kind: "auth" });
 
   const bindings = useMemo(
     () => [
-      { key: "j", description: "next", handler: () => moveDown() },
-      { key: "k", description: "prev", handler: () => moveUp() },
+      { key: "j", description: "next", handler: () => move(1) },
+      { key: "k", description: "prev", handler: () => move(-1) },
       {
         key: "Enter",
         description: "drill in",
         handler: () => {
           const u = selectedUpdate();
-          if (sealedFocusId === null && u) openThread(u);
+          if (u) openThread(u);
         },
       },
       {
         key: "r",
-        description: "reply / reveal",
+        description: "reply",
         handler: () => {
-          if (sealedFocusId !== null) {
-            const m = sealed.find((s) => s.id === sealedFocusId);
-            if (m) revealSealed(m);
-            return;
-          }
           const u = selectedUpdate();
           if (u) dispatchReply(u);
         },
@@ -123,7 +67,6 @@ export function SitrepView() {
         key: "e",
         description: "archive",
         handler: () => {
-          if (sealedFocusId !== null) return;
           const u = selectedUpdate();
           if (u) void dispatchArchive(u);
         },
@@ -132,7 +75,6 @@ export function SitrepView() {
         key: "d",
         description: "done",
         handler: () => {
-          if (sealedFocusId !== null) return;
           const u = selectedUpdate();
           if (u) void dispatchDone(u);
         },
@@ -151,6 +93,11 @@ export function SitrepView() {
         handler: () => openSide({ kind: "rules" }),
       },
       {
+        key: "g",
+        description: "auth messages",
+        handler: () => openAuth(),
+      },
+      {
         key: "/",
         description: "search",
         handler: () => openSide({ kind: "search", query: "" }),
@@ -167,16 +114,13 @@ export function SitrepView() {
         handler: () => setShowShortcuts((v) => !v),
       },
     ],
-    // Recompute when selection zone / sealed set changes so closures stay fresh.
+    // Recompute when selection changes so closures stay fresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sealedFocusId, sealed, selectedId],
+    [selectedId],
   );
   useKeys("list", bindings, [bindings]);
 
-  const onSelectBand = (id: number) => {
-    setSealedFocusId(null);
-    select(id);
-  };
+  const onSelectBand = (id: number) => select(id);
 
   const noiseCount =
     sitrep.stats?.tier_counts?.noise ?? 0;
@@ -188,48 +132,41 @@ export function SitrepView() {
         standingCount={sitrep.standing.length}
         newCount={sitrep.new.length}
         openCount={sitrep.open.length}
+        authCount={authCount}
         refreshError={refreshError}
         onShowShortcuts={() => setShowShortcuts(true)}
+        onOpenAuth={openAuth}
       />
 
       <BandSection
         variant="standing"
         items={sitrep.standing}
-        selectedId={sealedFocusId === null ? selectedId : null}
+        selectedId={selectedId}
         onSelect={onSelectBand}
         onOpen={openThread}
       />
       <BandSection
         variant="new"
         items={sitrep.new}
-        selectedId={sealedFocusId === null ? selectedId : null}
+        selectedId={selectedId}
         onSelect={onSelectBand}
         onOpen={openThread}
       />
       <BandSection
         variant="open"
         items={sitrep.open}
-        selectedId={sealedFocusId === null ? selectedId : null}
+        selectedId={selectedId}
         onSelect={onSelectBand}
         onOpen={openThread}
       />
 
       <NoiseLine
         noiseCount={noiseCount}
+        authCount={authCount}
         onBrowse={() => openSide({ kind: "browse" })}
         onRules={() => openSide({ kind: "rules" })}
+        onOpenAuth={openAuth}
       />
-
-      <SealedSection
-        items={sealed}
-        selectedId={sealedFocusId}
-        onSelect={setSealedFocusId}
-        onReveal={revealSealed}
-      />
-
-      {revealing && (
-        <RevealPanel meta={revealing} onClose={() => setRevealing(null)} />
-      )}
 
       {showShortcuts && (
         <ShortcutsOverlay onClose={() => setShowShortcuts(false)} />

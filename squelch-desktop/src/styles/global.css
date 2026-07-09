@@ -308,3 +308,65 @@ kbd {
   font-size: 14px;
   margin: 0 0 6px;
 }
+
+/* ---- sender avatars ------------------------------------------------------- */
+/* Deterministic, LOCAL-ONLY (no remote avatar/favicon services — privacy). A
+   10-slot palette, tuned per theme so initials stay readable on both. Colors are
+   soft, friendly hues that harmonize with the warm-paper light surface and the
+   near-black dark one. */
+:root,
+:root[data-theme="light"] {
+  --av-fg: #ffffff;
+  --av-0: #4f8a6b; /* green   */
+  --av-1: #3f7cc0; /* blue    */
+  --av-2: #b5654a; /* clay    */
+  --av-3: #8a6bbf; /* violet  */
+  --av-4: #c08a2e; /* amber   */
+  --av-5: #4aa1a8; /* teal    */
+  --av-6: #c06592; /* rose    */
+  --av-7: #6f8a3f; /* olive   */
+  --av-8: #5a76c4; /* indigo  */
+  --av-9: #b06a55; /* terra   */
+}
+:root[data-theme="dark"] {
+  --av-fg: #0c0f10;
+  --av-0: #6fce9f;
+  --av-1: #6fa9e6;
+  --av-2: #e0977c;
+  --av-3: #b79ce0;
+  --av-4: #e6bd6a;
+  --av-5: #6fcdd4;
+  --av-6: #e695bd;
+  --av-7: #a7c26f;
+  --av-8: #8ea4ee;
+  --av-9: #e09a82;
+}
+
+.avatar {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-family: var(--sans);
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  color: var(--av-fg);
+  user-select: none;
+  text-transform: uppercase;
+}
+.avatar-0 { background: var(--av-0); }
+.avatar-1 { background: var(--av-1); }
+.avatar-2 { background: var(--av-2); }
+.avatar-3 { background: var(--av-3); }
+.avatar-4 { background: var(--av-4); }
+.avatar-5 { background: var(--av-5); }
+.avatar-6 { background: var(--av-6); }
+.avatar-7 { background: var(--av-7); }
+.avatar-8 { background: var(--av-8); }
+.avatar-9 { background: var(--av-9); }
+/* Known-contact accent: a subtle ring in the signal accent. */
+.avatar.known {
+  box-shadow: 0 0 0 2px var(--bg-raised), 0 0 0 3px var(--accent);
+}

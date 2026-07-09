@@ -1,6 +1,6 @@
 // Browse-all (`a`) — the "radio console" survivor. Fetches ALL updates incl.
-// below-squelch (no band filter), tier-colored, ranked by importance. A
-// client-side squelch knob (min importance) hides the noise below the line
+// below-the-line (no band filter), tier-colored, ranked by importance. A
+// client-side noise-filter knob (min importance) hides the noise below the line
 // without re-fetching. j/k selects, Enter opens the thread.
 
 import { useEffect, useMemo, useState } from "react";
@@ -73,17 +73,17 @@ export function BrowseView() {
       },
       {
         key: "+",
-        description: "raise squelch",
+        description: "raise noise filter",
         handler: () => setSquelch((s) => Math.min(100, s + 5)),
       },
       {
         key: "=",
-        description: "raise squelch",
+        description: "raise noise filter",
         handler: () => setSquelch((s) => Math.min(100, s + 5)),
       },
       {
         key: "-",
-        description: "lower squelch",
+        description: "lower noise filter",
         handler: () => setSquelch((s) => Math.max(0, s - 5)),
       },
     ],
@@ -100,7 +100,7 @@ export function BrowseView() {
   return (
     <div>
       <div className="browse-toolbar num">
-        <span>squelch ≥ {squelch}</span>
+        <span>Noise filter: {squelch}</span>
         <input
           type="range"
           min={0}
@@ -113,7 +113,7 @@ export function BrowseView() {
       </div>
 
       {visible.length === 0 && (
-        <div className="side-empty">nothing above the squelch line.</div>
+        <div className="side-empty">nothing above the noise line.</div>
       )}
 
       {visible.map((u, i) => (

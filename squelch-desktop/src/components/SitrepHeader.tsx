@@ -1,6 +1,8 @@
 // The sitrep header: brand line + signal/noise counts + "last checked: Xh ago".
-// Signal = surfaced items (bands + tier signal), noise = squelched tier count.
-// Pulls straight from store.sitrep.stats; degrades gracefully before first poll.
+// Signal = surfaced items (bands + tier signal), noise = the filtered-out tier
+// count. When auth mail is waiting, a compact chip opens the Auth tab (a login
+// code arriving is worth noticing near the top). Pulls straight from
+// store.sitrep.stats; degrades gracefully before first poll.
 
 import type { StoreStats } from "../api";
 import { lastChecked } from "../lib/format";
@@ -11,8 +13,10 @@ export interface SitrepHeaderProps {
   standingCount: number;
   newCount: number;
   openCount: number;
+  authCount: number;
   refreshError: string | null;
   onShowShortcuts: () => void;
+  onOpenAuth: () => void;
 }
 
 export function SitrepHeader({
@@ -20,8 +24,10 @@ export function SitrepHeader({
   standingCount,
   newCount,
   openCount,
+  authCount,
   refreshError,
   onShowShortcuts,
+  onOpenAuth,
 }: SitrepHeaderProps) {
   const signal = standingCount + newCount + openCount;
   const noise = stats?.tier_counts?.noise ?? 0;
@@ -47,6 +53,16 @@ export function SitrepHeader({
             <span>· last checked: {lastChecked(stats?.last_surfaced_at)}</span>
           )}
         </span>
+        {authCount > 0 && (
+          <button
+            type="button"
+            className="auth-chip"
+            onClick={onOpenAuth}
+            title="login codes, password resets & sign-in alerts (g)"
+          >
+            🔑 {authCount}
+          </button>
+        )}
         <button
           type="button"
           className="theme-toggle help-hint"

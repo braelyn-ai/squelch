@@ -16,6 +16,7 @@ import { useStore } from "../state";
 import { useKeys } from "../keys";
 import { relAge } from "../lib/format";
 import { openRuleEditorRequest } from "./ruleEditorBus";
+import { DISPOSITION_LABEL } from "./RuleEditor";
 
 export function RulesView() {
   const pushToast = useStore((s) => s.pushToast);
@@ -137,7 +138,9 @@ export function RulesView() {
             className={`rule-row${sel ? " sel" : ""}`}
             onClick={() => setIdx(i)}
           >
-            <span className={`disp disp-${r.disposition}`}>{r.disposition}</span>
+            <span className={`disp disp-${r.disposition}`}>
+              {DISPOSITION_LABEL[r.disposition]}
+            </span>
             <span className="pat mono">{r.match_pattern}</span>
             <span
               className="want"

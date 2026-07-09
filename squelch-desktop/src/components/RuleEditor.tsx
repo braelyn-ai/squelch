@@ -13,9 +13,18 @@ import type { Disposition, SenderRule } from "../api";
 
 const DISPOSITIONS: Disposition[] = ["surface", "squelch", "filtered"];
 
+// User-facing labels for the wire-level disposition values. "squelch" is the
+// product name, not a UI verb — the chip reads "mute" so the copy stays plain
+// while the value sent to the API is unchanged.
+export const DISPOSITION_LABEL: Record<Disposition, string> = {
+  surface: "surface",
+  squelch: "mute",
+  filtered: "filter",
+};
+
 const DISPOSITION_HINT: Record<Disposition, string> = {
-  surface: "always surface — never squelch this sender",
-  squelch: "squelch — keep out of the sitrep unless it escalates",
+  surface: "always surface — never mute this sender",
+  squelch: "mute — keep out of the sitrep unless it escalates",
   filtered: "filter — drop before triage entirely",
 };
 
@@ -213,7 +222,7 @@ export function RuleEditor({
                   color: d === disposition ? "var(--accent)" : "var(--fg-dim)",
                 }}
               >
-                {d}
+                {DISPOSITION_LABEL[d]}
               </button>
             ))}
           </div>

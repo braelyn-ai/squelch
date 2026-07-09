@@ -250,47 +250,111 @@
   font-size: 12px;
 }
 
-/* ---- sealed ---- */
-.sealed {
-  margin-top: 14px;
-  padding: 10px 0 0;
-  border-top: 1px dashed var(--border-strong);
-}
-.sealed-head {
-  font-size: 11px;
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
-  font-weight: 700;
+/* ---- auth mail: the compact "N auth messages" pill (noise line) + header
+   chip. Both open the Auth tab (login codes / password resets / sign-in
+   alerts). Lock-purple accent carries the "auth-related" meaning without the
+   internal "sealed" jargon. ---- */
+.noise-line .auth-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
   color: var(--lock);
-  padding: 0 6px 8px;
+  background: var(--lock-soft);
+  border: 1px solid color-mix(in srgb, var(--lock) 40%, var(--border));
+  border-radius: 999px;
 }
-.lock-row {
+.noise-line .auth-pill:hover {
+  border-color: var(--lock);
+  background: color-mix(in srgb, var(--lock-soft) 75%, var(--bg-row));
+}
+.sitrep-header .auth-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--lock);
+  background: var(--lock-soft);
+  border: 1px solid color-mix(in srgb, var(--lock) 40%, var(--border));
+  border-radius: 999px;
+}
+.sitrep-header .auth-chip:hover {
+  border-color: var(--lock);
+}
+
+/* ---- Auth side view (the `g` tab): login codes & alerts ---- */
+.auth-row {
   display: flex;
   align-items: center;
   gap: 12px;
   min-height: var(--row-h);
-  padding: 4px 10px;
+  padding: 6px 8px;
   border-left: 3px solid transparent;
   border-radius: var(--radius-sm);
+  cursor: default;
+}
+.auth-row:hover {
+  background: var(--bg-row);
+}
+.auth-row.sel {
   background: var(--lock-soft);
-  margin-bottom: 4px;
-}
-.lock-row:hover {
-  background: color-mix(in srgb, var(--lock-soft) 70%, var(--bg-row));
-}
-.lock-row.sel {
   border-left-color: var(--lock);
-  outline: 1px solid color-mix(in srgb, var(--lock) 40%, var(--border));
 }
-.lock-row .lock {
-  color: var(--lock);
+.auth-row .sender {
+  color: var(--fg);
+  font-weight: 550;
+  flex: 0 0 auto;
+  width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.lock-row .kind {
+.auth-row .auth-subject {
+  color: var(--fg-dim);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.auth-row .meta {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: var(--fg-faint);
   font-size: 11px;
-  border: 1px solid var(--border-strong);
+}
+.auth-row .auth-kind {
+  color: var(--lock);
+  font-size: 11px;
+  border: 1px solid color-mix(in srgb, var(--lock) 35%, var(--border));
+  background: var(--lock-soft);
   border-radius: 999px;
-  padding: 1px 7px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+.auth-row .age {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+}
+.auth-row .verbs {
+  color: var(--lock);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.auth-foot {
+  position: sticky;
+  bottom: 0;
+  margin-top: 10px;
+  padding: 8px 4px 4px;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  color: var(--fg-faint);
+  font-size: 11px;
 }
 
 /* revealed panel — obviously sensitive */

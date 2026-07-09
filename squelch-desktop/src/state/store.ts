@@ -69,7 +69,8 @@ export type SideView =
   | { kind: "rules" }
   | { kind: "browse" }
   | { kind: "search"; query: string }
-  | { kind: "audit" };
+  | { kind: "audit" }
+  | { kind: "auth" };
 
 // --- toast (non-undo, ephemeral notices) ------------------------------------
 

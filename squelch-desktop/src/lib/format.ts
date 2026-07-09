@@ -45,6 +45,26 @@ function unit(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "S"}`;
 }
 
+/**
+ * Whole hours since an ISO timestamp (0 if missing/invalid/future). Used to gate
+ * the STILL OPEN aging badge so it only appears once an item is genuinely aging
+ * (age > 48h) rather than on every open row.
+ */
+export function ageHours(iso: string | null | undefined): number {
+  if (!iso) return 0;
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return 0;
+  const ms = Date.now() - then;
+  if (ms <= 0) return 0;
+  return ms / 3_600_000;
+}
+
+/** True once an item has aged past the 48h threshold where the badge earns its place. */
+export const AGING_THRESHOLD_H = 48;
+export function isAging(iso: string | null | undefined): boolean {
+  return ageHours(iso) > AGING_THRESHOLD_H;
+}
+
 /** "last checked: Xh ago" tail for the header. */
 export function lastChecked(iso: string | null | undefined): string {
   if (!iso) return "never";

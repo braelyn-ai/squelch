@@ -7,9 +7,11 @@ import type { AttentionUpdate } from "../api";
 import {
   relAge,
   loudAge,
+  isAging,
   deadlineChip,
   importanceColor,
 } from "../lib/format";
+import { Avatar } from "./Avatar";
 
 export interface UpdateRowProps {
   update: AttentionUpdate;
@@ -31,18 +33,22 @@ export function UpdateRow({
   onOpen,
 }: UpdateRowProps) {
   const chip = deadlineChip(u.deadline);
+  // The aging BADGE ("← 2 WEEKS") only earns its place once an item is genuinely
+  // aging (age > 48h). Under that, the STILL OPEN row is still "open" but shows
+  // the plain relative time like any other band — no shouty badge on fresh items.
+  const showAgeBadge = aging && isAging(u.surfaced_at ?? u.resolved_at);
   // Escalation: heavier rail + text that leans toward amber as weight climbs.
-  // color-mix keeps it theme-aware (readable on both light and dark bg) rather
-  // than a hardcoded rgba that only worked against the old dark palette.
-  const railWidth = aging ? 3 + Math.round(weight * 3) : 3;
-  const oneLineColor = aging
+  // The escalating weight still ramps for multi-day/week items; we key it off the
+  // badge so pre-48h open rows read calm. color-mix keeps it theme-aware.
+  const railWidth = showAgeBadge ? 3 + Math.round(weight * 3) : 3;
+  const oneLineColor = showAgeBadge
     ? `color-mix(in srgb, var(--amber) ${Math.round(45 + weight * 55)}%, var(--fg-dim))`
     : "var(--fg-dim)";
 
   return (
     <div
-      className={`row num${selected ? " sel" : ""}${aging ? " aging" : ""}`}
-      style={aging ? { borderLeftWidth: railWidth } : undefined}
+      className={`row num${selected ? " sel" : ""}${showAgeBadge ? " aging" : ""}`}
+      style={showAgeBadge ? { borderLeftWidth: railWidth } : undefined}
       onClick={() => onSelect(u.id)}
       onDoubleClick={() => onOpen(u)}
       role="button"
@@ -51,6 +57,7 @@ export function UpdateRow({
       <span className="imp" style={{ color: importanceColor(u.importance) }}>
         {u.importance}
       </span>
+      <Avatar sender={u.sender} />
       <span className="sender" title={u.sender}>
         {u.sender}
       </span>
@@ -71,7 +78,7 @@ export function UpdateRow({
           </span>
         )}
 
-        {aging ? (
+        {showAgeBadge ? (
           <span className="open-note">
             <span>← {loudAge(u.surfaced_at ?? u.resolved_at)}</span>
           </span>
