@@ -4,3 +4,4 @@ target/
 *.db-shm
 *.db-wal
 .env
+node_modules
