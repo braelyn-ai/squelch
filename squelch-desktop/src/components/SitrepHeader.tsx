@@ -4,7 +4,7 @@
 // code arriving is worth noticing near the top). Pulls straight from
 // store.sitrep.stats; degrades gracefully before first poll.
 
-import { KeyRound } from "lucide-react";
+import { KeyRound, ScrollText } from "lucide-react";
 import type { StoreStats } from "../api";
 import { lastChecked } from "../lib/format";
 import { ThemeToggle } from "./ThemeToggle";
@@ -18,6 +18,7 @@ export interface SitrepHeaderProps {
   refreshError: string | null;
   onShowShortcuts: () => void;
   onOpenAuth: () => void;
+  onOpenAudit: () => void;
 }
 
 export function SitrepHeader({
@@ -29,6 +30,7 @@ export function SitrepHeader({
   refreshError,
   onShowShortcuts,
   onOpenAuth,
+  onOpenAudit,
 }: SitrepHeaderProps) {
   const signal = standingCount + newCount + openCount;
   const noise = stats?.tier_counts?.noise ?? 0;
@@ -64,6 +66,15 @@ export function SitrepHeader({
             <KeyRound size={14} /> {authCount}
           </button>
         )}
+        <button
+          type="button"
+          className="theme-toggle audit-hint"
+          onClick={onOpenAudit}
+          title="audit log — agent & app actions (A)"
+          aria-label="audit log"
+        >
+          <ScrollText size={14} />
+        </button>
         <button
           type="button"
           className="theme-toggle help-hint"

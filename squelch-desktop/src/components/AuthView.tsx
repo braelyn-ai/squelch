@@ -15,6 +15,7 @@ import { useKeys } from "../keys";
 import { relAge } from "../lib/format";
 import { authKindLabel, authKindIcon } from "../lib/authCopy";
 import { Avatar } from "./Avatar";
+import { senderDisplayName } from "../lib/avatar";
 import { RevealPanel } from "./RevealPanel";
 
 export function AuthView() {
@@ -82,7 +83,7 @@ export function AuthView() {
           >
             <Avatar sender={m.sender} />
             <span className="sender" title={m.sender}>
-              {m.sender}
+              {senderDisplayName(m.sender)}
             </span>
             <span className="auth-subject" title={m.subject}>
               {m.subject}

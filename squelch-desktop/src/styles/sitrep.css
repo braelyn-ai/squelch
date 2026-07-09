@@ -702,15 +702,51 @@
   color: var(--fg-faint);
   font-size: 11px;
 }
+.audit-row {
+  cursor: default;
+  border-left: 3px solid transparent;
+  border-radius: var(--radius-sm);
+  align-items: baseline;
+}
+.audit-row:hover {
+  background: var(--bg-row);
+}
+.audit-row.sel {
+  background: var(--bg-row-sel);
+  border-left-color: var(--accent);
+  align-items: flex-start;
+}
 .audit-row .ts {
   color: var(--fg-faint);
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
+  font-size: 11px;
   flex: 0 0 auto;
+  min-width: 34px;
+  text-align: right;
 }
-.audit-row .actor {
-  color: var(--blue);
+/* actor chip: Agent is accent-bordered & visually distinct from the app's You. */
+.audit-row .actor-chip {
   flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 1px 8px;
+  min-width: 52px;
+  text-align: center;
+}
+.audit-row .actor-agent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--accent-soft);
+}
+.audit-row .actor-app {
+  color: var(--fg-dim);
+}
+.audit-row .actor-other {
+  color: var(--fg-faint);
+  font-family: var(--mono);
 }
 .audit-row .act {
   color: var(--fg);
@@ -718,9 +754,24 @@
 }
 .audit-row .tgt {
   color: var(--fg-dim);
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.audit-row .tgt .detail {
+  color: var(--fg-faint);
+}
+.audit-foot {
+  position: sticky;
+  bottom: 0;
+  margin-top: 10px;
+  padding: 8px 4px 4px;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  color: var(--fg-faint);
+  font-size: 11px;
 }
 
 /* browse-all squelch knob */

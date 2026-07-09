@@ -121,6 +121,32 @@ describe("key matching", () => {
     expect(r.handled).toBe(true);
     expect(fired).toEqual(["t"]);
   });
+  test("exact case wins: 'A' (audit) and 'a' (browse) coexist in one set", () => {
+    const fired: string[] = [];
+    // Same set, same registration order as SitrepView: browse then audit.
+    const sets = [
+      set("list", [
+        binding("a", () => fired.push("browse")),
+        binding("A", () => fired.push("audit")),
+      ]),
+    ];
+    // Shift+A -> event.key "A": the exact-case binding must win over the
+    // case-folded "a".
+    dispatchCore({
+      sets,
+      contextStack: ["list"],
+      event: { key: "A", shiftKey: true },
+      editing: false,
+    });
+    // Plain "a" must still fire browse, not audit.
+    dispatchCore({
+      sets,
+      contextStack: ["list"],
+      event: { key: "a" },
+      editing: false,
+    });
+    expect(fired).toEqual(["audit", "browse"]);
+  });
   test("named keys encode shift (shift+Tab != Tab)", () => {
     const fired: string[] = [];
     const sets = [set("list", [binding("Tab", () => fired.push("tab"))])];

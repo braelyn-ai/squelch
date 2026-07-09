@@ -12,6 +12,7 @@ import {
   importanceColor,
 } from "../lib/format";
 import { Avatar } from "./Avatar";
+import { senderDisplayName } from "../lib/avatar";
 
 export interface UpdateRowProps {
   update: AttentionUpdate;
@@ -59,7 +60,7 @@ export function UpdateRow({
       </span>
       <Avatar sender={u.sender} />
       <span className="sender" title={u.sender}>
-        {u.sender}
+        {senderDisplayName(u.sender)}
       </span>
       <span className="one-line" style={{ color: oneLineColor }} title={u.one_line}>
         {u.one_line}

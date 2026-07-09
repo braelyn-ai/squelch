@@ -79,6 +79,32 @@ export function isRobotSender(sender: string): boolean {
 }
 
 /**
+ * The brand's base label — the first label of the favicon domain (the domain
+ * after stripping a mail-ish subdomain, two-label minimum). e.g. ebay.com ->
+ * "ebay", sfmail.corpnet.com -> "corpnet". Null when there's no usable host.
+ * Shared by isBrandSender and the display-name normalizer.
+ */
+export function baseLabel(sender: string): string | null {
+  const domain = faviconDomain(sender);
+  if (!domain) return null;
+  return domain.split(".")[0] || null;
+}
+
+/**
+ * True if the local-part equals the domain's base label (case-insensitive),
+ * e.g. "eBay@eBay.com" or "corpnet@sfmail.corpnet.com". These are brand
+ * mailboxes that name a service, not a person — safe to resolve a favicon for
+ * and to display as the bare brand name.
+ */
+export function isBrandSender(sender: string): boolean {
+  const { addr } = parseSender(sender);
+  const local = (addr.split("@")[0] ?? "").split("+")[0]; // pre-"+tag"
+  const base = baseLabel(sender);
+  if (!local || !base) return false;
+  return local.toLowerCase() === base.toLowerCase();
+}
+
+/**
  * Base domain for a favicon lookup: strip ONE leading mail-ish subdomain label,
  * keeping a two-label minimum (never strips example.com down to com). Naive by
  * design — good enough to map bulk-mail hosts back to the brand domain.
@@ -92,6 +118,31 @@ export function faviconDomain(sender: string): string | null {
     labels.shift();
   }
   return labels.length >= 2 ? labels.join(".") : null;
+}
+
+/**
+ * The name to SHOW for a sender, per the 2026-07-09 display rules:
+ *  1. If a display name exists and differs from the raw address, use it.
+ *  2. Else if a BRAND sender ("eBay@eBay.com"), show the local-part as given
+ *     ("eBay") — no @domain tail.
+ *  3. Else if a ROBOT sender ("no-reply@stripe.com"), show the capitalized base
+ *     domain label ("Stripe").
+ *  4. Else (a human with no display name) show the address as-is.
+ * Never emits "x@x.com"-style redundancy.
+ */
+export function senderDisplayName(sender: string): string {
+  const { name, addr } = parseSender(sender);
+  if (name && name.toLowerCase() !== addr.toLowerCase()) return name;
+
+  if (isBrandSender(sender)) {
+    const local = (addr.split("@")[0] ?? "").split("+")[0];
+    if (local) return local; // "eBay" — as given
+  }
+  if (isRobotSender(sender)) {
+    const base = baseLabel(sender);
+    if (base) return base.charAt(0).toUpperCase() + base.slice(1);
+  }
+  return addr;
 }
 
 /** DuckDuckGo icon service URL for a base domain. */

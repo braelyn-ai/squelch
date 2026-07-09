@@ -34,6 +34,7 @@ const GROUPS: Group[] = [
     items: [
       { keys: ["a"], desc: "browse all mail" },
       { keys: ["T"], desc: "rules audit" },
+      { keys: ["A"], desc: "audit log — agent & app actions" },
       { keys: ["g"], desc: "auth messages" },
       { keys: ["/"], desc: "search" },
     ],

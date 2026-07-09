@@ -44,6 +44,11 @@ export function keyMatches(binding: string, event: string): boolean {
   return binding.toLowerCase() === event.toLowerCase();
 }
 
+/** True only for an EXACT (case-sensitive) match. */
+export function keyMatchesExact(binding: string, event: string): boolean {
+  return binding === event;
+}
+
 export function activeContext(contextStack: KeyContext[]): KeyContext {
   return contextStack[contextStack.length - 1] ?? "list";
 }
@@ -87,16 +92,23 @@ export function dispatchCore(input: DispatchInput): DispatchResult {
   const ctx = activeContext(contextStack);
   const order: KeyContext[] = ctx === "global" ? ["global"] : [ctx, "global"];
 
-  for (const context of order) {
-    for (let i = sets.length - 1; i >= 0; i--) {
-      const s = sets[i];
-      if (s.context !== context) continue;
-      for (const b of s.bindings) {
-        if (!keyMatches(b.key, eventStr)) continue;
-        if (editing && !b.allowInInput) continue;
-        const handled = b.handler(input.event as unknown as KeyboardEvent);
-        if (handled !== false) {
-          return { handled: true, firedKey: b.key, firedContext: context };
+  // Two passes: an EXACT (case-sensitive) match always wins over a case-folded
+  // fallback. This lets a shifted letter (e.g. "A" audit) coexist with its
+  // lowercase sibling (e.g. "a" browse) without collision, while still letting
+  // a shift+letter event (e.g. "T") fall back to a lowercase-registered binding
+  // ("t") when no exact-case binding competes.
+  for (const matcher of [keyMatchesExact, keyMatches]) {
+    for (const context of order) {
+      for (let i = sets.length - 1; i >= 0; i--) {
+        const s = sets[i];
+        if (s.context !== context) continue;
+        for (const b of s.bindings) {
+          if (!matcher(b.key, eventStr)) continue;
+          if (editing && !b.allowInInput) continue;
+          const handled = b.handler(input.event as unknown as KeyboardEvent);
+          if (handled !== false) {
+            return { handled: true, firedKey: b.key, firedContext: context };
+          }
         }
       }
     }

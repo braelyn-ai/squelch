@@ -93,6 +93,11 @@ export function SitrepView() {
         handler: () => openSide({ kind: "rules" }),
       },
       {
+        key: "A",
+        description: "audit log",
+        handler: () => openSide({ kind: "audit" }),
+      },
+      {
         key: "g",
         description: "auth messages",
         handler: () => openAuth(),
@@ -136,6 +141,7 @@ export function SitrepView() {
         refreshError={refreshError}
         onShowShortcuts={() => setShowShortcuts(true)}
         onOpenAuth={openAuth}
+        onOpenAudit={() => openSide({ kind: "audit" })}
       />
 
       <BandSection

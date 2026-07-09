@@ -12,6 +12,7 @@ import { api, ApiError } from "../api";
 import type { ClientThreadView } from "../api";
 import { useKeys } from "../keys";
 import { dateTime } from "../lib/format";
+import { senderDisplayName } from "../lib/avatar";
 import { EmailFrame, hasRemoteRefs } from "./EmailFrame";
 
 export function ThreadPane({ threadId }: { threadId: string }) {
@@ -110,7 +111,11 @@ export function ThreadPane({ threadId }: { threadId: string }) {
           onClick={() => setIdx(i)}
         >
           <div className="msg-head num">
-            <span className="msg-from">{m.from_name ?? m.from_addr}</span>
+            <span className="msg-from">
+              {senderDisplayName(
+                m.from_name ? `${m.from_name} <${m.from_addr}>` : m.from_addr,
+              )}
+            </span>
             <span className="msg-when">{dateTime(m.received_at)}</span>
           </div>
           {m.html ? (

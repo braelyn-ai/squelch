@@ -15,6 +15,7 @@ import {
   initialsFor,
   avatarSlot,
   isRobotSender,
+  isBrandSender,
   faviconDomain,
   faviconUrl,
   faviconVerdict,
@@ -33,9 +34,12 @@ export function Avatar({ sender, known = false, size = 22 }: AvatarProps) {
   const slot = avatarSlot(sender);
   const initials = initialsFor(sender);
 
-  // Only robot senders are ever eligible for a favicon. Humans short-circuit to
-  // initials with no network work of any kind.
-  const domain = isRobotSender(sender) ? faviconDomain(sender) : null;
+  // Only robot / brand senders are ever eligible for a favicon. Humans
+  // short-circuit to initials with no network work of any kind.
+  const domain =
+    isRobotSender(sender) || isBrandSender(sender)
+      ? faviconDomain(sender)
+      : null;
 
   // Track whether the favicon failed *this* mount (start from cached verdict so a
   // previously-failed domain never re-fetches).
