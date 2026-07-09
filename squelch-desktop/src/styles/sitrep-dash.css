@@ -64,12 +64,13 @@
   align-items: center;
   color: var(--fg-dim);
 }
+/* Engraved-label zone header. */
 .zone-head h2 {
   margin: 0;
-  font-size: 12px;
-  letter-spacing: 0.6px;
+  font-size: var(--label-size);
+  letter-spacing: var(--label-track);
   text-transform: uppercase;
-  font-weight: 700;
+  font-weight: 600;
   color: var(--fg-faint);
 }
 .zone-head .zone-count {
@@ -179,6 +180,20 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+.ob-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+/* 5-block importance meter — the same glyph the email rows use, in Plex Mono. */
+.ob-meter {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  flex: 0 0 auto;
 }
 .ob-nodate {
   color: var(--fg-faint);

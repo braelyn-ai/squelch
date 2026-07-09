@@ -81,6 +81,21 @@ export const MAIN_VIEWS: MainView[] = [
   "audit",
 ];
 
+// --- navigation history -----------------------------------------------------
+
+/**
+ * One entry in the view-history stack. Captures the routed view plus, for an
+ * Emails drill-target hand-off (viewInEmails), the selected id to re-focus so
+ * back/forward restores not just the view but where you were pointed.
+ */
+export interface HistoryEntry {
+  view: MainView;
+  selectedId: number | null;
+}
+
+/** Cap the history so a long session can't grow it without bound. */
+export const HISTORY_CAP = 50;
+
 // --- transient side views ---------------------------------------------------
 
 // Side panels remaining after Auth/Rules/Audit were promoted to routed main
@@ -147,6 +162,18 @@ export interface AppState {
    * chips) to hand off to the band list with the right row focused.
    */
   viewInEmails: (id: number) => void;
+
+  // navigation-history slice — a browser-style back/forward stack over the
+  // routed views (+ Emails drill-targets). cmd+[ back / cmd+] forward.
+  history: HistoryEntry[];
+  /** Index of the current entry within `history`. -1 only before first nav. */
+  historyIndex: number;
+  /** True when there is somewhere to go (drives cmd+[ / cmd+] no-ops). */
+  canGoBack: () => boolean;
+  canGoForward: () => boolean;
+  /** Step back/forward and re-apply that entry's view + selection. */
+  goBack: () => void;
+  goForward: () => void;
 
   // sitrep slice
   sitrep: SitrepData;
@@ -220,6 +247,26 @@ function uid(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+/**
+ * Browser-style history push: truncate any forward entries past the cursor,
+ * append the new entry, cap the length (dropping oldest), and point the cursor
+ * at the new tail. Returns the { history, historyIndex } patch to spread into
+ * set(). Pure so it's trivially reasoned about.
+ */
+function pushHistory(
+  history: HistoryEntry[],
+  index: number,
+  entry: HistoryEntry,
+): { history: HistoryEntry[]; historyIndex: number } {
+  // Drop the forward branch (everything after the cursor), then append.
+  const trimmed = history.slice(0, index + 1);
+  trimmed.push(entry);
+  // Cap: drop from the front so the cursor stays on the newest entry.
+  const capped =
+    trimmed.length > HISTORY_CAP ? trimmed.slice(trimmed.length - HISTORY_CAP) : trimmed;
+  return { history: capped, historyIndex: capped.length - 1 };
+}
+
 const emptySitrep: SitrepData = {
   standing: [],
   new: [],
@@ -285,13 +332,68 @@ export const useStore = create<AppState>((set, get) => ({
       sitrep: emptySitrep,
       selectedId: null,
       activeView: "sitrep",
+      history: [{ view: "sitrep", selectedId: null }],
+      historyIndex: 0,
     });
   },
 
-  // --- routed views ---------------------------------------------------------
+  // --- routed views + navigation history ------------------------------------
   activeView: "sitrep", // the abstracted dashboard is the default on launch
-  setView: (view) => set({ activeView: view }),
-  viewInEmails: (id) => set({ activeView: "emails", selectedId: id }),
+  // Seed history with the launch surface so the very first nav has an anchor to
+  // go back to.
+  history: [{ view: "sitrep", selectedId: null }],
+  historyIndex: 0,
+
+  setView: (view) => {
+    set((s) => {
+      // No-op if we're already on this exact view+selection at the cursor — a
+      // repeat click/press shouldn't spam identical history entries.
+      const cur = s.history[s.historyIndex];
+      if (cur && cur.view === view && cur.selectedId === s.selectedId) {
+        return { activeView: view };
+      }
+      return {
+        activeView: view,
+        ...pushHistory(s.history, s.historyIndex, {
+          view,
+          selectedId: s.selectedId,
+        }),
+      };
+    });
+  },
+  viewInEmails: (id) => {
+    set((s) => ({
+      activeView: "emails",
+      selectedId: id,
+      ...pushHistory(s.history, s.historyIndex, {
+        view: "emails",
+        selectedId: id,
+      }),
+    }));
+  },
+
+  canGoBack: () => get().historyIndex > 0,
+  canGoForward: () => get().historyIndex < get().history.length - 1,
+  goBack: () => {
+    const { history, historyIndex } = get();
+    if (historyIndex <= 0) return;
+    const entry = history[historyIndex - 1];
+    set({
+      historyIndex: historyIndex - 1,
+      activeView: entry.view,
+      selectedId: entry.selectedId,
+    });
+  },
+  goForward: () => {
+    const { history, historyIndex } = get();
+    if (historyIndex >= history.length - 1) return;
+    const entry = history[historyIndex + 1];
+    set({
+      historyIndex: historyIndex + 1,
+      activeView: entry.view,
+      selectedId: entry.selectedId,
+    });
+  },
 
   // --- sitrep ---------------------------------------------------------------
   sitrep: emptySitrep,

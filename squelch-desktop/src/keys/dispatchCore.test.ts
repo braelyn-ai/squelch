@@ -161,6 +161,85 @@ describe("key matching", () => {
   });
 });
 
+describe("meta (⌘) matching", () => {
+  test("a meta:true binding fires only when ⌘ is held", () => {
+    const fired: string[] = [];
+    const sets = [
+      set("global", [binding("[", () => fired.push("back"), { meta: true })]),
+    ];
+    // ⌘+[ -> fires
+    const withMeta = dispatchCore({
+      sets,
+      contextStack: ["global"],
+      event: { key: "[", metaKey: true },
+      editing: false,
+    });
+    expect(withMeta.handled).toBe(true);
+    // bare [ -> does NOT fire the meta binding
+    const bare = dispatchCore({
+      sets,
+      contextStack: ["global"],
+      event: { key: "[" },
+      editing: false,
+    });
+    expect(bare.handled).toBe(false);
+    expect(fired).toEqual(["back"]);
+  });
+
+  test("a plain binding is skipped while ⌘ is held (meta equality, like shift)", () => {
+    const fired: string[] = [];
+    const sets = [set("list", [binding("a", () => fired.push("browse"))])];
+    const r = dispatchCore({
+      sets,
+      contextStack: ["list"],
+      event: { key: "a", metaKey: true }, // ⌘+a must not trigger bare "a"
+      editing: false,
+    });
+    expect(r.handled).toBe(false);
+    expect(fired).toEqual([]);
+  });
+
+  test("bare and meta bindings on the same key coexist (⌘+] forward vs bare ])", () => {
+    const fired: string[] = [];
+    const sets = [
+      set("list", [
+        binding("]", () => fired.push("bare")),
+        binding("]", () => fired.push("forward"), { meta: true }),
+      ]),
+    ];
+    dispatchCore({
+      sets,
+      contextStack: ["list"],
+      event: { key: "]", metaKey: true },
+      editing: false,
+    });
+    dispatchCore({
+      sets,
+      contextStack: ["list"],
+      event: { key: "]" },
+      editing: false,
+    });
+    expect(fired).toEqual(["forward", "bare"]);
+  });
+
+  test("meta chords still fire while editing when allowInInput is set", () => {
+    const fired: string[] = [];
+    const sets = [
+      set("global", [
+        binding("[", () => fired.push("back"), { meta: true, allowInInput: true }),
+      ]),
+    ];
+    const r = dispatchCore({
+      sets,
+      contextStack: ["global"],
+      event: { key: "[", metaKey: true },
+      editing: true,
+    });
+    expect(r.handled).toBe(true);
+    expect(fired).toEqual(["back"]);
+  });
+});
+
 describe("registration priority", () => {
   test("latest registration in a context wins (mounted-on-top)", () => {
     const fired: string[] = [];

@@ -145,6 +145,29 @@ CREATE TABLE IF NOT EXISTS stage2_usage (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
 
+-- ON-BOX SEMANTIC RECALL (v1). A sqlite-vec `vec0` virtual table holding one
+-- embedding per NON-SEALED message. The rowid is the local `messages.id`, so a
+-- KNN hit joins straight back to `messages`. `account_id` is a vec0 METADATA
+-- column so KNN queries can constrain by account in the WHERE clause (multi-
+-- tenant scoping, same as every other owned table).
+--
+-- SECURITY (structural exclusion, not filtering): SEALED MESSAGES ARE NEVER
+-- INSERTED HERE. The embed-at-write path is gated on `sensitivity='normal'`, so
+-- sealed content is absent from the vector space entirely — there is nothing to
+-- leak into semantic search. `semantic_search` additionally re-joins `triage`
+-- and re-excludes sealed rows (belt-and-suspenders).
+--
+-- DIMENSION: float[384] matches the default BGE-small-en-v1.5 model. The store
+-- asserts the configured embedder's dims == 384 at open time. Changing the model
+-- dimension requires editing this literal AND resetting the dev db (schema
+-- applies fresh — no migrations). The vec0 extension is statically linked and
+-- registered via sqlite3_auto_extension before the connection opens.
+CREATE VIRTUAL TABLE IF NOT EXISTS message_vecs USING vec0(
+    message_id INTEGER PRIMARY KEY,
+    embedding  FLOAT[384],
+    account_id INTEGER
+);
+
 -- Audit log for the HUMAN DOOR (squelch-api /client/*). Every sealed-body
 -- reveal (and, later, every write action) appends a row here BEFORE returning.
 -- This table is human-door-only; it is never read or written by MCP, sync, or

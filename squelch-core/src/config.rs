@@ -206,6 +206,62 @@ impl Default for SyncConfig {
     }
 }
 
+/// The default embedding-weights cache dir: `~/.local/share/squelch/models`
+/// (a sibling of the sqlite db under the XDG data dir). Falls back to a
+/// CWD-relative `squelch-models` only when `HOME` is unset.
+pub fn default_embed_cache_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local/share/squelch")
+            .join("models");
+    }
+    PathBuf::from("squelch-models")
+}
+
+/// On-box semantic-recall (v1) tunables. Embeddings run locally via fastembed
+/// (ONNX, CPU); weights download ONCE to `cache_dir` on first run. `model` and
+/// `dims` MUST agree with each other and with the `message_vecs` vec0 table's
+/// `float[N]` declaration in `store/schema.sql` — the store asserts this at open
+/// time. Schema applies fresh; changing `dims` means resetting the dev db.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbedConfig {
+    /// fastembed model name/alias. Default: BGE-small-en-v1.5 (384-dim, small,
+    /// English). Accepts the fastembed `model_code` or a friendly alias.
+    pub model: String,
+    /// Embedding dimensionality; must match `model` and the vec0 table width.
+    pub dims: usize,
+    /// Where ONNX weights cache on disk. Default: [`default_embed_cache_dir`].
+    pub cache_dir: PathBuf,
+    /// Characters of `subject + body` fed to the embedder per message.
+    pub max_chars: usize,
+    /// Backfill batch size: how many missing-vector messages to embed per pass.
+    pub backfill_batch: usize,
+}
+
+impl Default for EmbedConfig {
+    fn default() -> Self {
+        Self {
+            model: "bge-small-en-v1.5".to_string(),
+            dims: 384,
+            cache_dir: default_embed_cache_dir(),
+            max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
+            backfill_batch: 64,
+        }
+    }
+}
+
+impl EmbedConfig {
+    /// Build the resolved [`crate::embed::EmbedSettings`] the embedder needs.
+    pub fn settings(&self) -> crate::embed::EmbedSettings {
+        crate::embed::EmbedSettings {
+            model_name: self.model.clone(),
+            dims: self.dims,
+            cache_dir: self.cache_dir.clone(),
+        }
+    }
+}
+
 /// Resolved (present) OAuth client credentials.
 #[derive(Debug, Clone)]
 pub struct OAuthClientConfig {
@@ -426,6 +482,8 @@ pub struct Config {
     pub stage2: Stage2Config,
     /// Sync tunables (backfill window, poll interval).
     pub sync: SyncConfig,
+    /// On-box semantic-recall (v1) tunables (embedding model, dims, cache dir).
+    pub embed: EmbedConfig,
 }
 
 impl Default for Config {
@@ -444,6 +502,7 @@ impl Default for Config {
             stage1: Stage1Config::default(),
             stage2: Stage2Config::default(),
             sync: SyncConfig::default(),
+            embed: EmbedConfig::default(),
         }
     }
 }
@@ -837,13 +896,21 @@ backfill_days = 90
         assert_eq!(c.price_out_per_mtok, 5.0);
     }
 
+    /// Clear every Stage-2 key/provider env var. Caller must hold `ENV_LOCK`.
+    fn clear_stage2_env() {
+        // SAFETY: caller holds ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE2_API_KEY");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("SQUELCH_STAGE2_PROVIDER");
+        }
+    }
+
     #[test]
     fn stage2_enabled_by_key_presence() {
         let _g = ENV_LOCK.lock().unwrap();
-        // SAFETY: guarded by ENV_LOCK.
-        unsafe {
-            std::env::remove_var("ANTHROPIC_API_KEY");
-        }
+        clear_stage2_env();
         let mut c = Stage2Config::default();
         assert!(!c.enabled(), "no key => disabled");
         // Config-file key enables.
@@ -861,6 +928,131 @@ backfill_days = 90
             std::env::remove_var("ANTHROPIC_API_KEY");
         }
         assert!(!c.enabled());
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn stage2_provider_prefix_sniff_and_precedence() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        let c = Stage2Config::default();
+
+        // Nothing set => disabled.
+        assert!(c.resolve_key_and_provider().is_none());
+
+        // 1. Explicit SQUELCH_STAGE2_API_KEY, sk-ant- prefix => Anthropic.
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE2_API_KEY", "sk-ant-abc123");
+        }
+        assert_eq!(
+            c.resolve_key_and_provider(),
+            Some(("sk-ant-abc123".to_string(), Stage2Provider::Anthropic))
+        );
+
+        // Explicit var, non-anthropic prefix => OpenAI (sniff).
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE2_API_KEY", "sk-proj-openai");
+        }
+        assert_eq!(
+            c.resolve_key_and_provider(),
+            Some(("sk-proj-openai".to_string(), Stage2Provider::OpenAI))
+        );
+
+        // Explicit var WINS over ANTHROPIC_API_KEY and OPENAI_API_KEY.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-other");
+            std::env::set_var("OPENAI_API_KEY", "sk-openai-other");
+        }
+        assert_eq!(
+            c.resolve_key_and_provider(),
+            Some(("sk-proj-openai".to_string(), Stage2Provider::OpenAI))
+        );
+
+        // 2. Without the explicit var, ANTHROPIC_API_KEY wins over OPENAI_API_KEY.
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE2_API_KEY");
+        }
+        assert_eq!(
+            c.resolve_key_and_provider(),
+            Some(("sk-ant-other".to_string(), Stage2Provider::Anthropic))
+        );
+
+        // 3. OPENAI_API_KEY only => OpenAI.
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        assert_eq!(
+            c.resolve_key_and_provider(),
+            Some(("sk-openai-other".to_string(), Stage2Provider::OpenAI))
+        );
+
+        // 4. Config-file key (no env) => Anthropic.
+        clear_stage2_env();
+        let c2 = Stage2Config {
+            anthropic_api_key: Some("sk-config".into()),
+            ..Stage2Config::default()
+        };
+        assert_eq!(
+            c2.resolve_key_and_provider(),
+            Some(("sk-config".to_string(), Stage2Provider::Anthropic))
+        );
+
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn stage2_provider_force_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+
+        // An sk-ant- key would sniff Anthropic, but the config override forces
+        // OpenAI (e.g. a proxy that accepts an anthropic-shaped key).
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE2_API_KEY", "sk-ant-shaped");
+        }
+        let c = Stage2Config {
+            stage2_provider: Some(Stage2Provider::OpenAI),
+            ..Stage2Config::default()
+        };
+        assert_eq!(
+            c.resolve_key_and_provider(),
+            Some(("sk-ant-shaped".to_string(), Stage2Provider::OpenAI))
+        );
+
+        // And the reverse: OPENAI_API_KEY forced to Anthropic.
+        clear_stage2_env();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "sk-openai-x");
+        }
+        let c2 = Stage2Config {
+            stage2_provider: Some(Stage2Provider::Anthropic),
+            ..Stage2Config::default()
+        };
+        assert_eq!(
+            c2.resolve_key_and_provider(),
+            Some(("sk-openai-x".to_string(), Stage2Provider::Anthropic))
+        );
+
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn stage2_provider_env_override_folds_into_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE2_PROVIDER", "openai");
+        }
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.stage2.stage2_provider, Some(Stage2Provider::OpenAI));
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn stage2_provider_default_prices() {
+        assert_eq!(Stage2Provider::Anthropic.default_prices(), (1.0, 5.0));
+        assert_eq!(Stage2Provider::OpenAI.default_prices(), (0.15, 0.60));
     }
 
     #[test]

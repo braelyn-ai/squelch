@@ -10,6 +10,7 @@ import {
   isAging,
   deadlineChip,
   importanceColor,
+  importanceMeter,
 } from "../lib/format";
 import { Avatar } from "./Avatar";
 import { senderDisplayName } from "../lib/avatar";
@@ -55,8 +56,13 @@ export function UpdateRow({
       role="button"
       tabIndex={-1}
     >
-      <span className="imp" style={{ color: importanceColor(u.importance) }}>
-        {u.importance}
+      <span
+        className="imp meter"
+        style={{ color: importanceColor(u.importance) }}
+        title={`importance ${u.importance}`}
+        aria-label={`importance ${u.importance}`}
+      >
+        {importanceMeter(u.importance)}
       </span>
       <Avatar sender={u.sender} />
       <span className="sender" title={u.sender}>

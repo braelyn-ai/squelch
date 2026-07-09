@@ -4,10 +4,11 @@
 //! trait is implemented synchronously. See `store/mod.rs` for rationale.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use zerocopy::AsBytes;
 
 use crate::error::{CoreError, Result};
 use crate::store::{
@@ -22,19 +23,53 @@ use crate::types::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+/// The embedding dimension declared by the `message_vecs` vec0 table
+/// (`FLOAT[384]`). The store asserts the configured embedder matches this at
+/// registration time; the schema literal and this constant must move together.
+pub const VEC_DIMS: usize = 384;
+
+static VEC_EXT_INIT: Once = Once::new();
+
+/// Register the statically-linked sqlite-vec (`vec0`) extension with SQLite's
+/// auto-extension hook so EVERY connection opened afterwards has the `vec0`
+/// virtual table available. This is a process-global, one-time registration
+/// (guarded by [`Once`]); it must run BEFORE the schema (which creates a
+/// `message_vecs USING vec0(...)` table) is applied.
+fn register_vec_extension() {
+    VEC_EXT_INIT.call_once(|| {
+        // SAFETY: `sqlite3_vec_init` is the C entrypoint the sqlite-vec crate
+        // statically links; transmuting it to the auto-extension fn pointer type
+        // is the documented rusqlite integration pattern.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    /// The on-box embedder used by [`SqliteStore::semantic_search`] /
+    /// [`SqliteStore::hybrid_search`] to embed the QUERY text, and available to
+    /// callers for embedding message bodies at ingest/backfill. `None` when
+    /// semantic recall is not wired (e.g. plain unit tests) — the vector methods
+    /// then return [`CoreError::InvalidInput`]. Set via
+    /// [`SqliteStore::with_embedder`].
+    embedder: Option<std::sync::Arc<dyn crate::embed::Embedder>>,
 }
 
 impl SqliteStore {
     /// Open (or create) a store at `path`, applying the schema.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        register_vec_extension();
         let conn = Connection::open(path)?;
         Self::init(conn)
     }
 
     /// Open an in-memory store (tests).
     pub fn open_in_memory() -> Result<Self> {
+        register_vec_extension();
         let conn = Connection::open_in_memory()?;
         Self::init(conn)
     }
@@ -43,7 +78,32 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            embedder: None,
         })
+    }
+
+    /// Attach an [`Embedder`](crate::embed::Embedder) so the semantic-recall
+    /// methods work. Asserts the embedder's dimensionality matches the
+    /// `message_vecs` vec0 table ([`VEC_DIMS`]); a mismatch is a config/schema
+    /// error that would silently corrupt the index, so it fails loudly here.
+    pub fn with_embedder(
+        mut self,
+        embedder: std::sync::Arc<dyn crate::embed::Embedder>,
+    ) -> Result<Self> {
+        if embedder.dims() != VEC_DIMS {
+            return Err(CoreError::InvalidInput(format!(
+                "embedder dims {} != message_vecs vec0 width {VEC_DIMS}",
+                embedder.dims()
+            )));
+        }
+        self.embedder = Some(embedder);
+        Ok(self)
+    }
+
+    /// The attached embedder, if any. Used by the sync engine to embed message
+    /// bodies at ingest/backfill without holding a second handle.
+    pub fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
+        self.embedder.clone()
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {

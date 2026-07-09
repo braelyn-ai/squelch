@@ -35,7 +35,14 @@ import { api, ApiError } from "../api";
 import type { AttentionUpdate, SenderRule } from "../api";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
-import { deadlineChip, lastChecked, loudAge, relAge } from "../lib/format";
+import {
+  deadlineChip,
+  lastChecked,
+  loudAge,
+  relAge,
+  importanceColor,
+  importanceMeter,
+} from "../lib/format";
 import { senderDisplayName } from "../lib/avatar";
 import { Avatar } from "../components/Avatar";
 import { dispatchDone } from "../lib/dispatch";
@@ -329,13 +336,23 @@ function ObligationCard({
       {!amount && <p className="ob-line" title={u.one_line}>{u.one_line}</p>}
 
       <div className="ob-bottom">
-        {chip ? (
-          <span className={`chip ${overdue ? "overdue" : "upcoming"}`}>
-            {chip.text}
+        <span className="ob-lead">
+          <span
+            className="ob-meter"
+            style={{ color: importanceColor(u.importance) }}
+            title={`importance ${u.importance}`}
+            aria-label={`importance ${u.importance}`}
+          >
+            {importanceMeter(u.importance)}
           </span>
-        ) : (
-          <span className="ob-nodate">no due date</span>
-        )}
+          {chip ? (
+            <span className={`chip ${overdue ? "overdue" : "upcoming"}`}>
+              {chip.text}
+            </span>
+          ) : (
+            <span className="ob-nodate">no due date</span>
+          )}
+        </span>
         <span className="ob-actions">
           <button
             type="button"

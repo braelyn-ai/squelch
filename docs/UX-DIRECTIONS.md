@@ -379,3 +379,113 @@ Both flows preserve the dispatchCore/keymap/modal patterns, the ruleEditorBus
 overlay contract (extended with optional `disposition`/`want`/`pattern` prefill),
 and the fresh dashboard structure.
 
+
+---
+
+## Visual identity — "Precision instrument" (committed 2026-07-09)
+
+This supersedes the earlier generic light-theme note. The brand anchor is the
+app icon: a **machined brass radio squelch knob**. The whole UI is the
+instrument that knob belongs to — warm paper, hairline structure, engraved
+labels, mono readouts, and exactly one accent: **brass**. The failure mode of
+this direction is steampunk; **restraint is the spec.**
+
+### The restraint rule (load-bearing)
+
+**Brass (`--brass` `#a8834a`) marks STATE, never decorates, and stays under
+~10% of any screen.** It is the focus ring, text selection, the active sidebar
+item, the primary button fill, the noise-filter knob/slider, and the 2FA
+countdown ring. Everything else is warm ink on warm paper with hairline borders.
+Signal/deadline/past-due tiers keep their own semantic hues (below) — they are
+not brass. If a screen looks brassy, it's wrong.
+
+### Palette
+
+Two palettes, one CSS-var system, keyed on `data-theme` (`src/styles/global.css`).
+Light is default; dark is a translation, not a redesign.
+
+| Token | Light | Dark | Role |
+| --- | --- | --- | --- |
+| `--bg` | `#f7f4ee` | `#17150f` | warm paper / warm near-black base |
+| `--bg-raised` | `#fffdf9` | `#201d16` | raised card |
+| `--bg-sunken` | `#f1ede4` | `#131109` | wells (readouts, code) |
+| `--bg-row` | `#efece4` | `#262218` | hover row |
+| `--bg-row-sel` | `#f0e6d4` | `#322a1b` | selection — faint brass wash |
+| `--border` | `#e3ded2` | `#322d22` | hairline (1px, low contrast) |
+| `--border-strong` | `#d2ccbd` | `#46402f` | stronger hairline |
+| `--fg` | `#26231e` | `#ece6d8` | ink |
+| `--fg-dim` | `#5f5a50` | `#a49d8c` | dim ink |
+| `--fg-faint` | `#918b7d` | `#6f6857` | faint ink (labels) |
+| `--brass` | `#a8834a` | `#c19a5b` | **THE accent** — state marker |
+| `--brass-soft` | `#f0e6d4` | `#322a1b` | brass wash (active/selection) |
+| `--brass-line` | `#c8ab7d` | `#6e5a34` | brass-tinted hairline (squelch line) |
+| `--accent` (signal) | `#5c7a4e` | `#8aa374` | desaturated bronze-green |
+| `--red` (past-due) | `#b3392f` | `#d9635a` | overdue |
+| `--amber` (deadline) | `#a8710a` | `#d29a4a` | warm amber |
+| `--lock` (sealed/auth) | `#7a5a86` | `#b295bd` | auth surface — distinct, tuned in |
+
+Shadows are nearly absent (`--shadow-card` ~ 1px @ 3% alpha); **hairlines carry
+the structure.**
+
+### Type
+
+Bundled **locally** via `@fontsource` (imported in `main.tsx`, weights 400/500/600)
+— **no font CDNs** (privacy). `--sans` = **IBM Plex Sans** (body); `--mono` =
+**IBM Plex Mono** for all data: importance meters, timestamps, patterns/globs,
+2FA codes.
+
+- **Body:** Plex Sans, 13.5px / 1.55.
+- **Engraved-label** (zone/band/section headers): Plex Sans **600**, UPPERCASE,
+  **+0.08em** tracking, small (**11px**), `--fg-faint`. Tokenized as
+  `--label-size` / `--label-track` and applied to `.band-head`, `.zone-head h2`,
+  `.field label`, `.reveal-card .banner`, `.sc-group-title`.
+- **Data / mono:** Plex Mono, tabular-nums. The **2FA code readout** is the
+  showpiece — 40px Plex Mono, `0.28em` letterspacing, sunken panel with a brass
+  hairline top-edge so it reads like an instrument display.
+
+### Components
+
+- **Radii:** tightened to **4–6px** everywhere (`--radius` 6, `--radius-sm` 4) —
+  machined, not rounded.
+- **Buttons — machined-flat:** 1px border, a subtle top-light gradient
+  (`--btn-topfill`) so the face reads slightly domed, `:active` translates down
+  0.5px like a pressed keycap. `.primary` = brass-filled (the one loud control
+  per surface).
+- **Importance meter:** shown as a **5-block glyph** `▰▰▰▱▱` in Plex Mono
+  (`importanceMeter()` in `lib/format.ts`; filled = `ceil(n/20)`), colored by
+  `importanceColor()`, with the numeric value as the title/aria text. Used
+  consistently in **email rows** (`.row .imp.meter`, replacing the bare number)
+  **and obligation cards** (`.ob-meter`).
+- **Noise divider (the squelch line):** a **brass-tinted hairline gradient**
+  (`--squelch-line` via `--brass-line`). The noise-filter knob button + the
+  browse `range` slider (the literal squelch knob) go brass.
+- **Focus / selection:** brass outline (`2px`) + `::selection` brass wash.
+- **Cards:** shadows near-zero; hairline borders only.
+
+### Window chrome (macOS)
+
+`tauri.conf.json`: `titleBarStyle: "Overlay"` + `hiddenTitle: true` (traffic
+lights stay, native title hidden). A slim non-interactive **drag strip**
+(`.drag-strip`, `data-tauri-drag-region`) covers the top `--chrome-top` (28px)
+of the window but stops `280px` short of the right edge so it never swallows the
+Emails-header control cluster; header buttons also opt out with
+`-webkit-app-region: no-drag`. The sidebar rail gets `--chrome-top` top padding
+so the rail icons clear the traffic lights.
+
+### Navigation history
+
+Browser-style **back / forward** over the routed views: **⌘[ back / ⌘] forward**
+(registered on the `global` key context in `App.tsx`, `allowInInput` so chords
+work with a field focused). The store (`state/store.ts`) holds a `history`
+stack of `{ view, selectedId }` entries + a `historyIndex` cursor (cap
+`HISTORY_CAP = 50`). `setView` and `viewInEmails` **push** (truncating any
+forward branch, deduping an identical current entry, dropping oldest past the
+cap); `goBack`/`goForward` move the cursor and **re-apply** the entry's view +
+selection without re-pushing. `disconnect` resets history to the launch anchor.
+
+The keymap gains **meta-modifier** support: `KeyBinding` grows an optional
+`meta?: boolean`, and `dispatchCore` matches meta like `shift` — the event's ⌘
+state must **equal** the binding's, so a bare key never fires under ⌘ and a ⌘
+chord never fires without it (two-pass exact/case-fold semantics preserved).
+`normalize` no longer bakes `meta` into the key string. Covered by new tests in
+`dispatchCore.test.ts` (39 pass total).

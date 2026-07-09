@@ -13,6 +13,15 @@ export interface KeyBinding {
   description: string;
   handler: (e: KeyboardEvent) => boolean | void;
   allowInInput?: boolean;
+  /**
+   * Require the meta (⌘) modifier to match this binding. Matched like `shift`:
+   * the event's meta state must EQUAL the binding's (a meta:true binding fires
+   * only with ⌘ held; a plain binding never fires while ⌘ is held). Lets
+   * ⌘-chords (cmd+[ back / cmd+] forward) coexist with bare keys. The binding's
+   * `key` stays the base key ("[", "]") — meta is expressed by this flag, not by
+   * baking "meta+" into the string.
+   */
+  meta?: boolean;
 }
 
 export interface RegisteredSet {
@@ -33,8 +42,11 @@ export interface KeyEventLike {
 export function normalize(e: KeyEventLike): string {
   const parts: string[] = [];
   if (e.ctrlKey) parts.push("ctrl");
-  if (e.metaKey) parts.push("meta");
   if (e.altKey) parts.push("alt");
+  // NOTE: meta (⌘) is intentionally NOT baked into the string. It is matched
+  // separately via each binding's `meta` flag (like shift is matched by key
+  // case / a "shift+" prefix on named keys), so a bare-key binding never fires
+  // under ⌘ and a meta chord fires only under ⌘. See dispatchCore's meta guard.
   let k = e.key;
   if (k === " ") k = "Space";
   if (e.shiftKey && k.length > 1) parts.push("shift");
@@ -92,6 +104,7 @@ export interface DispatchResult {
 export function dispatchCore(input: DispatchInput): DispatchResult {
   const { sets, contextStack, editing } = input;
   const eventStr = normalize(input.event);
+  const metaHeld = !!input.event.metaKey;
   const ctx = activeContext(contextStack);
   const order: KeyContext[] = ctx === "global" ? ["global"] : [ctx, "global"];
 
@@ -106,6 +119,10 @@ export function dispatchCore(input: DispatchInput): DispatchResult {
         const s = sets[i];
         if (s.context !== context) continue;
         for (const b of s.bindings) {
+          // Meta must match exactly (like shift): a meta:true binding requires ⌘
+          // held; a plain binding is skipped while ⌘ is held. This keeps ⌘-chords
+          // (cmd+[ / cmd+]) from colliding with bare keys and vice-versa.
+          if ((b.meta ?? false) !== metaHeld) continue;
           if (!matcher(b.key, eventStr)) continue;
           if (editing && !b.allowInInput) continue;
           const handled = b.handler(input.event as unknown as KeyboardEvent);

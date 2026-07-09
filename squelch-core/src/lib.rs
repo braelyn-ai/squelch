@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod config;
 pub mod credentials;
+pub mod embed;
 pub mod error;
 pub mod store;
 pub mod sync;

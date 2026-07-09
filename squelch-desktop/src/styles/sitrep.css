@@ -65,14 +65,15 @@
   box-shadow: var(--shadow-card);
   overflow: hidden;
 }
+/* Engraved-label band header: Plex Sans 600, uppercase, +0.08em, small, faint. */
 .band-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
-  letter-spacing: 0.6px;
+  font-size: var(--label-size);
+  letter-spacing: var(--label-track);
   text-transform: uppercase;
-  font-weight: 700;
+  font-weight: 600;
   padding: 9px 12px 8px;
   color: var(--fg-faint);
   border-bottom: 1px solid var(--border);
@@ -133,14 +134,19 @@
   background: var(--bg-row-sel);
   border-left-color: var(--accent);
 }
+/* Importance as a 5-block meter glyph (▰▰▰▱▱), Plex Mono. The letterspacing
+   gives the blocks a little air so they read as an instrument gauge. */
 .row .imp {
-  width: 28px;
-  text-align: right;
+  text-align: left;
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--fg-dim);
   flex: 0 0 auto;
+}
+.row .imp.meter {
+  letter-spacing: 0.05em;
+  font-size: 11px;
 }
 .row .sender {
   color: var(--fg);
@@ -246,9 +252,15 @@
   gap: 8px;
   align-items: center;
 }
+/* The noise-filter knob — the literal product metaphor; brass on hover marks it
+   as the active control. */
 .noise-line .knob button {
   padding: 3px 10px;
   font-size: 12px;
+}
+.noise-line .knob button:hover {
+  border-color: color-mix(in srgb, var(--brass) 55%, var(--border));
+  color: var(--brass);
 }
 
 /* ---- auth mail: the compact "N auth messages" pill (noise line) + header
@@ -380,10 +392,10 @@
 }
 .reveal-card .banner {
   color: var(--lock);
-  font-size: 11px;
-  letter-spacing: 0.6px;
+  font-size: var(--label-size);
+  letter-spacing: var(--label-track);
   text-transform: uppercase;
-  font-weight: 700;
+  font-weight: 600;
   margin-bottom: 10px;
   display: flex;
   justify-content: space-between;
@@ -818,9 +830,10 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+/* The noise-filter slider is the literal squelch knob — brass thumb/track. */
 .browse-toolbar input[type="range"] {
   flex: 1;
-  accent-color: var(--accent);
+  accent-color: var(--brass);
 }
 .tier-dot {
   width: 9px;
@@ -863,10 +876,10 @@
   margin-bottom: 16px;
 }
 .shortcuts-card .sc-group-title {
-  font-size: 11px;
+  font-size: var(--label-size);
   text-transform: uppercase;
-  letter-spacing: 0.6px;
-  font-weight: 700;
+  letter-spacing: var(--label-track);
+  font-weight: 600;
   color: var(--fg-faint);
   margin-bottom: 6px;
 }

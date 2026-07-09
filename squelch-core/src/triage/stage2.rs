@@ -433,12 +433,18 @@ impl std::fmt::Display for ClassifyError {
     }
 }
 
-/// Classify one email against the Anthropic Messages API.
+/// Classify one email against the configured Stage-2 provider.
 ///
-/// Retry policy (skill-verified): 429 (honor `retry-after`) and 529/5xx are
-/// retryable with exponential backoff (cap 60s, max 3 tries); 400/401 are not.
-/// `stop_reason == "max_tokens"` means truncated JSON — retried once with a
-/// higher `max_tokens`. `stop_reason == "refusal"` yields [`ClassifyOutcome::Refused`].
+/// Provider is selected by `provider` (resolved from the key prefix / config at
+/// the sync layer). Both providers consume the IDENTICAL system prompt, trusted/
+/// untrusted user message, and output schema (single source of truth).
+///
+/// Retry policy (shared, skill-verified): 429 (honor `retry-after`) and 529/5xx
+/// are retryable with exponential backoff (cap 60s, max 3 tries); 400/401 are
+/// permanent. A truncation (Anthropic `stop_reason == "max_tokens"` / OpenAI
+/// `finish_reason == "length"`) is retried once with a higher token budget. A
+/// refusal (Anthropic `stop_reason == "refusal"` / OpenAI message `refusal`
+/// field) yields [`ClassifyOutcome::Refused`].
 ///
 /// REDACTION: this never logs the request/response body or the API key. On a
 /// hard failure it returns a redacted [`ClassifyError`].
@@ -446,14 +452,34 @@ pub async fn classify(
     http: &reqwest::Client,
     api_key: &str,
     cfg: &Stage2Config,
+    provider: Stage2Provider,
     ctx: &RowContext<'_>,
 ) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    classify_at(http, API_URL, api_key, cfg, ctx).await
+    let url = match provider {
+        Stage2Provider::Anthropic => API_URL,
+        Stage2Provider::OpenAI => OPENAI_API_URL,
+    };
+    classify_at(http, url, api_key, cfg, provider, ctx).await
 }
 
 /// [`classify`] against an explicit endpoint URL. The production entry point
-/// pins [`API_URL`]; tests point this at a mock server.
+/// pins the provider URL; tests point this at a mock server.
 pub async fn classify_at(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    cfg: &Stage2Config,
+    provider: Stage2Provider,
+    ctx: &RowContext<'_>,
+) -> std::result::Result<ClassifyOutcome, ClassifyError> {
+    match provider {
+        Stage2Provider::Anthropic => classify_anthropic(http, url, api_key, cfg, ctx).await,
+        Stage2Provider::OpenAI => classify_openai(http, url, api_key, cfg, ctx).await,
+    }
+}
+
+/// The Anthropic Messages API path.
+async fn classify_anthropic(
     http: &reqwest::Client,
     url: &str,
     api_key: &str,
@@ -490,12 +516,15 @@ pub async fn classify_at(
             },
         };
 
-        let resp = send_with_retry(http, url, api_key, &body).await?;
-
-        // Non-retryable HTTP errors resolved to a redacted outcome inside
-        // send_with_retry; here we only see a successful (2xx) response OR a
-        // permanent-failure marker.
-        let parsed: MessagesResponse = match resp {
+        // The Anthropic request carries x-api-key + anthropic-version headers.
+        let build = || {
+            http.post(url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", API_VERSION)
+                .header("content-type", "application/json")
+                .json(&body)
+        };
+        let parsed: MessagesResponse = match send_with_retry(build).await? {
             SendOk::Body(b) => b,
             SendOk::PermanentFailure(kind) => return Ok(ClassifyOutcome::Failed(kind)),
         };
@@ -524,27 +553,131 @@ pub async fn classify_at(
             Some(t) => t,
             None => return Ok(ClassifyOutcome::Failed("no_text_block".into())),
         };
-        let out: Stage2Output = match serde_json::from_str(text) {
-            Ok(o) => o,
-            Err(_) => return Ok(ClassifyOutcome::Failed("json_parse".into())),
-        };
-        // Client-side range validation (schema can't express min/max).
-        if !(0..=100).contains(&out.importance) {
-            return Ok(ClassifyOutcome::Failed("importance_out_of_range".into()));
-        }
-        return Ok(ClassifyOutcome::Ok(out, parsed.usage));
+        return finalize_output(text, parsed.usage);
     }
 }
 
+/// The OpenAI Chat Completions path. Same prompt/schema/retry discipline as the
+/// Anthropic path; only the wire shapes and refusal/truncation signals differ.
+async fn classify_openai(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    cfg: &Stage2Config,
+    ctx: &RowContext<'_>,
+) -> std::result::Result<ClassifyOutcome, ClassifyError> {
+    let system = build_system_prompt();
+    let user = build_user_message(ctx);
+    let schema = output_schema();
+
+    // Mirror the 400/800 Anthropic doubling via max_completion_tokens.
+    let mut max_completion_tokens = MAX_TOKENS;
+    let mut allow_token_retry = true;
+
+    loop {
+        let body = OpenAiRequest {
+            model: &cfg.model,
+            // SAME trusted/untrusted strings the Anthropic path uses: the system
+            // prompt as the system message, the fenced user message as the user
+            // message.
+            messages: vec![
+                OpenAiMessage {
+                    role: "system",
+                    content: system,
+                },
+                OpenAiMessage {
+                    role: "user",
+                    content: &user,
+                },
+            ],
+            max_completion_tokens,
+            response_format: OpenAiResponseFormat {
+                kind: "json_schema",
+                json_schema: OpenAiJsonSchema {
+                    name: "triage",
+                    strict: true,
+                    schema: schema.clone(),
+                },
+            },
+        };
+
+        // OpenAI auth is a Bearer token; no version header.
+        let build = || {
+            http.post(url)
+                .bearer_auth(api_key)
+                .header("content-type", "application/json")
+                .json(&body)
+        };
+        let parsed: OpenAiResponse = match send_with_retry(build).await? {
+            SendOk::Body(b) => b,
+            SendOk::PermanentFailure(kind) => return Ok(ClassifyOutcome::Failed(kind)),
+        };
+
+        let choice = match parsed.choices.into_iter().next() {
+            Some(c) => c,
+            None => return Ok(ClassifyOutcome::Failed("no_choice".into())),
+        };
+        let message = match choice.message {
+            Some(m) => m,
+            None => return Ok(ClassifyOutcome::Failed("no_message".into())),
+        };
+
+        // A non-null refusal field => the model declined (parity with Anthropic
+        // stop_reason == "refusal").
+        if message.refusal.is_some() {
+            return Ok(ClassifyOutcome::Refused);
+        }
+
+        // finish_reason "length" => truncation (parity with stop_reason
+        // max_tokens): retry once at the doubled budget, then fail.
+        match choice.finish_reason.as_deref() {
+            Some("length") if allow_token_retry => {
+                max_completion_tokens = MAX_TOKENS_RETRY;
+                allow_token_retry = false;
+                continue;
+            }
+            Some("length") => {
+                return Ok(ClassifyOutcome::Failed("max_tokens_truncation".into()));
+            }
+            _ => {}
+        }
+
+        let text = match message.content.as_deref() {
+            Some(t) => t,
+            None => return Ok(ClassifyOutcome::Failed("no_text_block".into())),
+        };
+        return finalize_output(text, parsed.usage.map(OpenAiUsage::into_usage));
+    }
+}
+
+/// Parse the model's JSON verdict text, validate importance range, and package
+/// the outcome. Shared by both provider paths (same [`TriageVerdict`]/
+/// [`Stage2Output`] struct and same client-side range check).
+fn finalize_output(
+    text: &str,
+    usage: Option<Usage>,
+) -> std::result::Result<ClassifyOutcome, ClassifyError> {
+    let out: Stage2Output = match serde_json::from_str(text) {
+        Ok(o) => o,
+        Err(_) => return Ok(ClassifyOutcome::Failed("json_parse".into())),
+    };
+    // Client-side range validation (schema can't express min/max).
+    if !(0..=100).contains(&out.importance) {
+        return Ok(ClassifyOutcome::Failed("importance_out_of_range".into()));
+    }
+    Ok(ClassifyOutcome::Ok(out, usage))
+}
+
 /// Internal: the two success shapes from [`send_with_retry`].
-enum SendOk {
-    Body(MessagesResponse),
+enum SendOk<T> {
+    Body(T),
     /// A permanent (400/401) failure with a redacted kind string.
     PermanentFailure(String),
 }
 
-/// Anthropic error-body shape (only the type is read; the message is never
-/// logged).
+/// Provider error-body shape. Both Anthropic and OpenAI use
+/// `{"error": {"type": ...}}`; only the redacted `type` is read — the message is
+/// never logged.
 #[derive(Debug, Deserialize)]
 struct ApiErrorBody {
     error: Option<ApiErrorInner>,
@@ -556,26 +689,20 @@ struct ApiErrorInner {
     kind: Option<String>,
 }
 
-/// POST the request, applying the retry policy for retryable statuses. Returns a
-/// parsed body on 2xx, a permanent-failure marker on 400/401, and a redacted
-/// [`ClassifyError`] when retries are exhausted or a transport error occurs.
-async fn send_with_retry(
-    http: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    body: &MessagesRequest<'_>,
-) -> std::result::Result<SendOk, ClassifyError> {
+/// POST the request, applying the SHARED retry policy for retryable statuses.
+/// Generic over the decoded success body `T` and the request-builder closure so
+/// both providers reuse one policy object. Returns a parsed body on 2xx, a
+/// permanent-failure marker on 400/401, and a redacted [`ClassifyError`] when
+/// retries are exhausted or a transport error occurs.
+async fn send_with_retry<T, F>(build: F) -> std::result::Result<SendOk<T>, ClassifyError>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn() -> reqwest::RequestBuilder,
+{
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let send = http
-            .post(url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await;
+        let send = build().send().await;
 
         let resp = match send {
             Ok(r) => r,
@@ -594,7 +721,7 @@ async fn send_with_retry(
 
         let status = resp.status();
         if status.is_success() {
-            let parsed: MessagesResponse = resp.json().await.map_err(|_| ClassifyError {
+            let parsed: T = resp.json().await.map_err(|_| ClassifyError {
                 kind: "response_decode".into(),
                 retryable: false,
             })?;
@@ -1123,6 +1250,35 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    /// Spawn a server that answers `responses.len()` sequential connections, each
+    /// with the corresponding `(status, body)`, capturing every request line/body.
+    /// Returns (url, join-handle-of-all-requests). Used to exercise the
+    /// truncation-retry path deterministically.
+    async fn mock_seq(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut reqs = Vec::new();
+            for (status, body) in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 16384];
+                let n = sock.read(&mut buf).await.unwrap();
+                reqs.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            reqs
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[tokio::test]
     async fn classify_end_to_end_against_mock_server() {
         let resp = r#"{
@@ -1136,7 +1292,7 @@ mod tests {
         let q = queued(false, None);
         let ctx = RowContext::from_queued(&q, 4000);
 
-        let outcome = classify_at(&http, &url, "sk-test", &cfg, &ctx).await.unwrap();
+        let outcome = classify_at(&http, &url, "sk-test", &cfg, Stage2Provider::Anthropic, &ctx).await.unwrap();
         let req = handle.await.unwrap();
 
         // Request shape: POST, headers, and the untrusted fence present.
@@ -1172,7 +1328,7 @@ mod tests {
         let cfg = Stage2Config::default();
         let q = queued(false, None);
         let ctx = RowContext::from_queued(&q, 4000);
-        let outcome = classify_at(&http, &url, "sk-test", &cfg, &ctx).await.unwrap();
+        let outcome = classify_at(&http, &url, "sk-test", &cfg, Stage2Provider::Anthropic, &ctx).await.unwrap();
         handle.await.unwrap();
         assert!(matches!(outcome, ClassifyOutcome::Refused));
     }
@@ -1185,13 +1341,155 @@ mod tests {
         let cfg = Stage2Config::default();
         let q = queued(false, None);
         let ctx = RowContext::from_queued(&q, 4000);
-        let outcome = classify_at(&http, &url, "sk-test", &cfg, &ctx).await.unwrap();
+        let outcome = classify_at(&http, &url, "sk-test", &cfg, Stage2Provider::Anthropic, &ctx).await.unwrap();
         handle.await.unwrap();
         match outcome {
             ClassifyOutcome::Failed(kind) => {
                 assert!(kind.contains("http_400"));
                 // The upstream error TYPE may appear, but never the message body.
                 assert!(!kind.contains("secret detail"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    // ---- OpenAI provider path --------------------------------------------
+
+    /// A well-formed OpenAI Chat Completions body wrapping `verdict_json` in
+    /// `choices[0].message.content` (finish_reason "stop").
+    fn openai_ok_body(verdict_json: &str) -> String {
+        let escaped = serde_json::to_string(verdict_json).unwrap();
+        format!(
+            r#"{{"choices":[{{"index":0,"finish_reason":"stop","message":{{"role":"assistant","content":{escaped}}}}}],"usage":{{"prompt_tokens":1300,"completion_tokens":70}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn classify_openai_request_shape_and_parse() {
+        let verdict = r#"{"importance":81,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"openai verdict","reason":"personal","matches_sender_rule":null}"#;
+        let (url, handle) = mock_seq(vec![(200, openai_ok_body(verdict))]).await;
+        let http = reqwest::Client::new();
+        let cfg = Stage2Config {
+            model: "gpt-4o-mini".into(),
+            ..Stage2Config::default()
+        };
+        let q = queued(false, Some("only real bills"));
+        let ctx = RowContext::from_queued(&q, 4000);
+
+        let outcome = classify_at(&http, &url, "sk-openai", &cfg, Stage2Provider::OpenAI, &ctx)
+            .await
+            .unwrap();
+        let req = handle.await.unwrap().remove(0);
+
+        // Request shape: POST, Bearer auth (NOT x-api-key), OpenAI json_schema
+        // strict response_format. No Anthropic-only fields.
+        assert!(req.starts_with("POST "));
+        assert!(
+            req.contains("authorization: Bearer sk-openai")
+                || req.contains("Authorization: Bearer sk-openai"),
+            "bearer auth header present"
+        );
+        assert!(
+            !req.to_ascii_lowercase().contains("x-api-key"),
+            "no anthropic x-api-key header"
+        );
+        assert!(
+            !req.to_ascii_lowercase().contains("anthropic-version"),
+            "no anthropic-version header"
+        );
+        assert!(!req.contains("cache_control"), "no anthropic cache_control");
+        assert!(!req.contains("output_config"), "no anthropic output_config");
+        assert!(req.contains("gpt-4o-mini"), "model in body");
+        assert!(req.contains("max_completion_tokens"), "openai token field");
+        assert!(req.contains("response_format"), "openai response_format");
+        assert!(req.contains("json_schema"), "structured output present");
+        assert!(req.contains("\"strict\":true"), "strict json_schema");
+        assert!(req.contains("\"name\":\"triage\""), "schema name");
+        // SAME trusted/untrusted prompt strings as the Anthropic path.
+        assert!(req.contains("BEGIN UNTRUSTED EMAIL"), "fenced body present");
+        assert!(req.contains("UNTRUSTED DATA"), "system trust rule present");
+        assert!(req.contains("only real bills"), "trusted want_text present");
+
+        match outcome {
+            ClassifyOutcome::Ok(out, usage) => {
+                assert_eq!(out.importance, 81);
+                assert_eq!(out.one_line, "openai verdict");
+                let u = usage.expect("usage present");
+                // prompt_tokens/completion_tokens map to the SAME ledger columns.
+                assert_eq!(u.input_tokens, 1300);
+                assert_eq!(u.output_tokens, 70);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_openai_length_retries_then_succeeds() {
+        // First response: finish_reason "length" (truncation). Second: success.
+        let truncated = r#"{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"{\"importance\":50"}}]}"#;
+        let verdict = r#"{"importance":66,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"retried ok","reason":"x","matches_sender_rule":null}"#;
+        let (url, handle) = mock_seq(vec![
+            (200, truncated.to_string()),
+            (200, openai_ok_body(verdict)),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let cfg = Stage2Config::default();
+        let q = queued(false, None);
+        let ctx = RowContext::from_queued(&q, 4000);
+
+        let outcome = classify_at(&http, &url, "sk-openai", &cfg, Stage2Provider::OpenAI, &ctx)
+            .await
+            .unwrap();
+        let reqs = handle.await.unwrap();
+
+        // Two requests: the first at the base budget, the retry at the doubled.
+        assert_eq!(reqs.len(), 2, "length triggered exactly one token-retry");
+        assert!(
+            reqs[0].contains(&format!("\"max_completion_tokens\":{MAX_TOKENS}")),
+            "first request uses base token budget"
+        );
+        assert!(
+            reqs[1].contains(&format!("\"max_completion_tokens\":{MAX_TOKENS_RETRY}")),
+            "retry uses doubled token budget"
+        );
+        match outcome {
+            ClassifyOutcome::Ok(out, _) => assert_eq!(out.importance, 66),
+            other => panic!("expected Ok after retry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_openai_refusal_field_maps_to_refused() {
+        let resp = r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":null,"refusal":"I can't help with that."}}]}"#;
+        let (url, handle) = mock_seq(vec![(200, resp.to_string())]).await;
+        let http = reqwest::Client::new();
+        let cfg = Stage2Config::default();
+        let q = queued(false, None);
+        let ctx = RowContext::from_queued(&q, 4000);
+        let outcome = classify_at(&http, &url, "sk-openai", &cfg, Stage2Provider::OpenAI, &ctx)
+            .await
+            .unwrap();
+        handle.await.unwrap();
+        assert!(matches!(outcome, ClassifyOutcome::Refused));
+    }
+
+    #[tokio::test]
+    async fn classify_openai_400_is_permanent_failure() {
+        let resp = r#"{"error":{"type":"invalid_request_error","message":"secret detail","code":"bad"}}"#;
+        let (url, handle) = mock_seq(vec![(400, resp.to_string())]).await;
+        let http = reqwest::Client::new();
+        let cfg = Stage2Config::default();
+        let q = queued(false, None);
+        let ctx = RowContext::from_queued(&q, 4000);
+        let outcome = classify_at(&http, &url, "sk-openai", &cfg, Stage2Provider::OpenAI, &ctx)
+            .await
+            .unwrap();
+        handle.await.unwrap();
+        match outcome {
+            ClassifyOutcome::Failed(kind) => {
+                assert!(kind.contains("http_400"));
+                assert!(!kind.contains("secret detail"), "no message body leaked");
             }
             other => panic!("expected Failed, got {other:?}"),
         }

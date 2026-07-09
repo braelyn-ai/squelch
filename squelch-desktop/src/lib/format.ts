@@ -147,3 +147,19 @@ export function importanceColor(n: number): string {
   if (n >= 40) return "var(--fg)";
   return "var(--fg-dim)";
 }
+
+/**
+ * Importance (0..100) as a 5-block meter glyph, e.g. "▰▰▰▱▱" — the machined
+ * readout used consistently in rows AND obligation cards (Precision-instrument
+ * identity). Filled blocks = ceil(n/20), clamped 0..5; the number itself is the
+ * title/aria text so the glyph stays glanceable. Render in Plex Mono.
+ */
+export const METER_SEGMENTS = 5;
+export function importanceMeter(n: number): string {
+  const clamped = Math.max(0, Math.min(100, n));
+  const filled = Math.min(
+    METER_SEGMENTS,
+    Math.ceil((clamped / 100) * METER_SEGMENTS),
+  );
+  return "▰".repeat(filled) + "▱".repeat(METER_SEGMENTS - filled);
+}

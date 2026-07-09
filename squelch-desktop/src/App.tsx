@@ -53,24 +53,49 @@ function Main() {
 
   const activeView = useStore((s) => s.activeView);
   const setView = useStore((s) => s.setView);
+  const goBack = useStore((s) => s.goBack);
+  const goForward = useStore((s) => s.goForward);
 
-  // 1..5 view nav. Registered in the "global" context so it composes with the
-  // active context (list / sitrep / modal) rather than being gated by it —
-  // switching views must always work, even from a routed panel. Digits are
-  // otherwise unbound across the app.
+  // 1..5 view nav + cmd+[ back / cmd+] forward. Registered in the "global"
+  // context so they compose with the active context (list / sitrep / modal)
+  // rather than being gated by it — nav must always work, even from a routed
+  // panel. Digits are otherwise unbound; the ⌘ chords use the new `meta` flag so
+  // a bare "[" / "]" never triggers them. allowInInput keeps history nav working
+  // even with a search/compose field focused (it's a chord, not a typed char).
   const navBindings = useMemo(
-    () =>
-      MAIN_VIEWS.map((view, i) => ({
+    () => [
+      ...MAIN_VIEWS.map((view, i) => ({
         key: String(i + 1),
         description: `go to ${view}`,
         handler: () => setView(view),
       })),
-    [setView],
+      {
+        key: "[",
+        meta: true,
+        allowInInput: true,
+        description: "back",
+        handler: () => goBack(),
+      },
+      {
+        key: "]",
+        meta: true,
+        allowInInput: true,
+        description: "forward",
+        handler: () => goForward(),
+      },
+    ],
+    [setView, goBack, goForward],
   );
   useKeys("global", navBindings, [navBindings]);
 
   return (
     <div className="app-shell">
+      {/* macOS overlay-titlebar drag region: a slim, non-interactive top strip.
+          Only over empty chrome — the rail/header controls sit above it in the
+          normal flow and are not covered by an interactive area, so their clicks
+          are never swallowed. data-tauri-drag-region makes the OS treat it as
+          the titlebar for window drag. */}
+      <div className="drag-strip" data-tauri-drag-region aria-hidden="true" />
       <Sidebar />
       <div className="app-main">
         <RouteBody view={activeView} />

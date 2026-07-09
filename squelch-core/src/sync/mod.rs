@@ -33,7 +33,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{Config, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
@@ -211,10 +211,10 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     account_email: String,
     config: Config,
     http: reqwest::Client,
-    /// The resolved Anthropic API key for Stage-2, if present at startup. When
-    /// `None`, Stage-2 is DISABLED gracefully (rows stay queued, one stderr
-    /// notice, sync continues). Never logged.
-    stage2_key: Option<String>,
+    /// The resolved Stage-2 API key and its provider, if present at startup.
+    /// When `None`, Stage-2 is DISABLED gracefully (rows stay queued, one stderr
+    /// notice, sync continues). The key is never logged.
+    stage2_key: Option<(String, Stage2Provider)>,
 }
 
 impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
@@ -232,13 +232,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client build");
-        // Resolve the Stage-2 API key once. Absence => graceful disable with a
-        // single stderr notice (no key material logged).
-        let stage2_key = config.stage2.resolve_api_key();
+        // Resolve the Stage-2 API key + provider once. Absence => graceful
+        // disable with a single stderr notice (no key material logged).
+        let stage2_key = config.stage2.resolve_key_and_provider();
         if stage2_key.is_none() {
             eprintln!(
-                "squelch: ANTHROPIC_API_KEY not set — Stage-2 LLM triage disabled \
-                 (ambiguous rows stay queued; sync continues)"
+                "squelch: no Stage-2 API key set (SQUELCH_STAGE2_API_KEY / ANTHROPIC_API_KEY / \
+                 OPENAI_API_KEY) — Stage-2 LLM triage disabled (ambiguous rows stay queued; \
+                 sync continues)"
             );
         }
         Self {
@@ -582,9 +583,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
     ///
     /// No-op when Stage-2 is disabled (no API key).
     async fn stage2_pass(&self) {
-        let Some(api_key) = self.stage2_key.as_deref() else {
+        let Some((api_key, provider)) = self.stage2_key.as_ref() else {
             return; // disabled; notice already emitted at startup
         };
+        let api_key = api_key.as_str();
+        let provider = *provider;
         let cfg = &self.config.stage2;
 
         let queued = match self.store.stage2_queue(self.account_id, cfg.batch_per_cycle) {
@@ -729,7 +732,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
 
             // Classify.
             let ctx = RowContext::from_queued(row, cfg.max_body_chars);
-            let outcome = stage2::classify(&self.http, api_key, cfg, &ctx).await;
+            let outcome = stage2::classify(&self.http, api_key, cfg, provider, &ctx).await;
 
             match outcome {
                 Ok(ClassifyOutcome::Ok(out, usage)) => {
