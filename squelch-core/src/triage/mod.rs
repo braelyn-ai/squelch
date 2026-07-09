@@ -683,6 +683,7 @@ mod tests {
             from_addr: "x@y.com".into(),
             subject: "s".into(),
             body: "b".into(),
+            received_at: Utc::now(),
             is_known_contact: false,
             rule_want_text: None,
             sensitivity,

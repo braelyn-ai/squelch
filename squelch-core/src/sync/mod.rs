@@ -57,6 +57,18 @@ const HISTORY_KEY: &str = "history";
 /// schema addition.
 const GLOBAL_BUDGET_KEY: &str = "__global__";
 
+/// Prefix for the per-SENDER-per-day Stage-2 budget key stored in the same
+/// `wake_budget` table (`thread_id = "sender:<addr>"`). No real Gmail thread id
+/// starts with `sender:` (they are hex), so this never collides with a real
+/// per-thread row or the `__global__` sentinel. Mirrors the `__global__`
+/// pattern; avoids a schema addition. (Schema applies fresh; dev dbs get reset.)
+const SENDER_BUDGET_PREFIX: &str = "sender:";
+
+/// Model id stamped on a row skipped for being older than `stage2_max_age_days`:
+/// it is marked processed WITHOUT a model call so it neither consumes budget nor
+/// sits queued forever, keeping its Stage-1 values.
+const STALE_SKIP_MODEL: &str = "stale-skip";
+
 /// Reconnect / retry backoff bounds for the outer driver loop.
 const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
@@ -586,11 +598,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         }
 
         // UTC date key for the budget rows; one value for the whole pass.
-        let day = Utc::now().format("%Y-%m-%d").to_string();
-        // "at most once per cycle" per-thread exhaustion notice. (The global
-        // notice fires at most once because hitting the cap breaks the loop.)
+        let now = Utc::now();
+        let day = now.format("%Y-%m-%d").to_string();
+        // The staleness cutoff: rows received before this are stale-skipped.
+        let stale_cutoff = now - ChronoDuration::days(cfg.max_age_days as i64);
+        // "at most once per cycle" per-thread / per-sender exhaustion notices.
+        // (The global notice fires at most once because hitting the cap breaks
+        // the loop.)
         let mut warned_thread = false;
+        let mut warned_sender = false;
         let mut processed = 0usize;
+        let mut stale_skipped = 0usize;
         let mut in_tok = 0u64;
         let mut out_tok = 0u64;
 
@@ -599,6 +617,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             // SQL, but re-check before every classify call.
             if let Err(e) = stage2_sealed_guard(row) {
                 eprintln!("squelch: stage-2 sealed guard tripped ({e}); skipping row");
+                continue;
+            }
+
+            // SKIP-STALE: a queued row older than max_age_days is marked processed
+            // WITHOUT a model call (model_used='stale-skip'), keeping Stage-1
+            // values. It neither consumes budget nor sits queued forever.
+            if row.received_at < stale_cutoff {
+                let _ = self.store.stage2_mark_processed(
+                    self.account_id,
+                    row.message_id,
+                    STALE_SKIP_MODEL,
+                );
+                stale_skipped += 1;
                 continue;
             }
 
@@ -645,8 +676,34 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 }
             }
 
-            // Increment BOTH budgets BEFORE the call so the attempt counts even
-            // if it errors or retries.
+            // PER-SENDER budget check (per-account-per-day, keyed by from_addr).
+            // Stops one chatty sender fanning many DIFFERENT threads from burning
+            // the budget. Same sentinel-row pattern as __global__.
+            let sender_key = format!("{SENDER_BUDGET_PREFIX}{}", row.from_addr);
+            match self
+                .store
+                .stage2_budget_used(self.account_id, &sender_key, &day)
+            {
+                Ok(used) if used >= cfg.sender_daily_cap => {
+                    if !warned_sender {
+                        eprintln!(
+                            "squelch: stage-2 per-sender daily budget exhausted for at least \
+                             one sender ({}/{}); those rows stay queued",
+                            used, cfg.sender_daily_cap
+                        );
+                        warned_sender = true;
+                    }
+                    continue; // this sender is capped; try the next row
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("squelch: stage-2 sender budget read failed ({e}); skipping row");
+                    continue;
+                }
+            }
+
+            // Increment ALL THREE budgets BEFORE the call so the attempt counts
+            // even if it errors or retries.
             if let Err(e) =
                 self.store
                     .stage2_increment_budget(self.account_id, GLOBAL_BUDGET_KEY, &day)
@@ -661,6 +718,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 eprintln!("squelch: stage-2 thread budget increment failed ({e}); skipping row");
                 continue;
             }
+            if let Err(e) =
+                self.store
+                    .stage2_increment_budget(self.account_id, &sender_key, &day)
+            {
+                eprintln!("squelch: stage-2 sender budget increment failed ({e}); skipping row");
+                continue;
+            }
 
             // Classify.
             let ctx = RowContext::from_queued(row, cfg.max_body_chars);
@@ -671,6 +735,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                     if let Some(u) = usage {
                         in_tok += u.input_tokens;
                         out_tok += u.output_tokens;
+                        // USAGE LEDGER: record this successful call's token usage
+                        // per account per day. Best-effort — a ledger write
+                        // failure must not affect triage.
+                        if let Err(e) = self.store.stage2_bump_usage(
+                            self.account_id,
+                            &day,
+                            u.input_tokens,
+                            u.output_tokens,
+                        ) {
+                            eprintln!("squelch: stage-2 usage ledger bump failed ({e})");
+                        }
                     }
                     let applied = stage2::apply_result(row, &out, &cfg.model, Utc::now());
                     if let Err(e) = self.store.stage2_apply(&applied) {
@@ -708,10 +783,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             }
         }
 
-        if processed > 0 {
+        if processed > 0 || stale_skipped > 0 {
             eprintln!(
                 "squelch: stage-2 processed {processed} rows (model={}, in_tok={in_tok}, \
-                 out_tok={out_tok})",
+                 out_tok={out_tok}); stale-skipped {stale_skipped}",
                 cfg.model
             );
         }

@@ -774,6 +774,98 @@ async fn archive_success_resolves_target_to_done() {
 }
 
 #[tokio::test]
+async fn update_rule_edits_in_place_and_404s_bogus() {
+    // TASK 6: create -> PUT -> GET shows updated -> 404 on a bogus id.
+    let (app, _s, _a) = app_with(|_, _| {});
+
+    // Create a rule.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "*@old.com",
+                "want": "old want",
+                "disposition": "squelch"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let rule_id = created["rule_id"].as_i64().unwrap();
+
+    // PUT updates it in place.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/client/rules/{rule_id}"),
+            serde_json::json!({
+                "match_pattern": "*@new.com",
+                "want": "new want",
+                "disposition": "surface"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GET reflects the update (same id, new fields).
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/rules"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let rules = json.as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["id"].as_i64().unwrap(), rule_id);
+    assert_eq!(rules[0]["match_pattern"], "*@new.com");
+    assert_eq!(rules[0]["want_text"], "new want");
+    assert_eq!(rules[0]["disposition"], "surface");
+
+    // PUT a bogus id => 404.
+    let resp = app
+        .oneshot(authed_json(
+            "PUT",
+            "/client/rules/999999",
+            serde_json::json!({
+                "match_pattern": "*@x.com",
+                "want": "",
+                "disposition": "squelch"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stats_expose_stage2_usage_and_cost() {
+    // TASK 5: GET /client/stats surfaces a stage2 object with today's usage +
+    // an estimated cost from the default per-MTok prices (1.0 in / 5.0 out).
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let (app, _s, _a) = app_with(move |store, acct| {
+        // 2 calls: 1_000_000 input tokens, 200_000 output tokens today.
+        store.stage2_bump_usage(acct, &day, 600_000, 100_000).unwrap();
+        store.stage2_bump_usage(acct, &day, 400_000, 100_000).unwrap();
+    });
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let s2 = &json["stage2"];
+    assert_eq!(s2["calls_today"], 2);
+    assert_eq!(s2["input_tokens_today"], 1_000_000);
+    assert_eq!(s2["output_tokens_today"], 200_000);
+    // cost = 1.0*(1e6/1e6) + 5.0*(0.2e6/1e6) = 1.0 + 1.0 = 2.0
+    let cost = s2["est_cost_usd_today"].as_f64().unwrap();
+    assert!((cost - 2.0).abs() < 1e-9, "expected 2.0, got {cost}");
+}
+
+#[tokio::test]
 async fn stats_expose_bands_and_last_surfaced_at() {
     let (app, _s, _a) = app_with(|store, acct| {
         let bill = store

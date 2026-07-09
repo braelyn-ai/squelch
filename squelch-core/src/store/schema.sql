@@ -121,6 +121,22 @@ CREATE TABLE IF NOT EXISTS wake_budget (
     PRIMARY KEY(account_id, thread_id, day)
 );
 
+-- STAGE-2 USAGE LEDGER. One row per (account, UTC day): running totals of the
+-- Anthropic Messages API usage the Stage-2 pass consumed. `calls` counts
+-- SUCCESSFUL classify responses that carried a usage block; input/output tokens
+-- are summed from each response's usage. Read by GET /client/stats to surface
+-- today's usage + an estimated cost (cost is computed at read time from the
+-- config-driven per-MTok prices, so it is NOT stored here). Schema applies fresh
+-- on open; dev dbs get reset.
+CREATE TABLE IF NOT EXISTS stage2_usage (
+    account_id    INTEGER NOT NULL,
+    day           TEXT NOT NULL,
+    calls         INTEGER NOT NULL DEFAULT 0,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(account_id, day)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
 
 -- Audit log for the HUMAN DOOR (squelch-api /client/*). Every sealed-body

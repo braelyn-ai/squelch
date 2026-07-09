@@ -31,7 +31,7 @@ pub use state::{ApiState, StateError};
 use axum::{
     Router,
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 /// Build the `/client/*` router for the human door.
@@ -53,6 +53,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/client/search", get(handlers::search))
         .route("/client/rules", get(handlers::list_rules))
         .route("/client/rules", post(handlers::create_rule))
+        .route("/client/rules/{id}", put(handlers::update_rule))
         .route("/client/rules/{id}", delete(handlers::delete_rule))
         .route("/client/sealed", get(handlers::list_sealed))
         .route(

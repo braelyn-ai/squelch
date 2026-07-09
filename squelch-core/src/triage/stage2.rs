@@ -41,8 +41,8 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 /// Default max_tokens; a compact JSON object fits comfortably. A `max_tokens`
 /// truncation is retried once at this doubled value.
-const MAX_TOKENS: u32 = 1024;
-const MAX_TOKENS_RETRY: u32 = 2048;
+const MAX_TOKENS: u32 = 400;
+const MAX_TOKENS_RETRY: u32 = 800;
 /// Retry policy for retryable statuses (429 / 5xx / 529).
 const MAX_TRIES: u32 = 3;
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
@@ -161,7 +161,9 @@ pub fn build_user_message(ctx: &RowContext) -> String {
                  Filtered rule for this sender and said they only want mail matching \
                  the following. Judge matches_sender_rule against it:\n",
             );
-            out.push_str("  \"");
+            // Emit the want_text on its own line as clean prompt text: a single
+            // quoted string with NO leading source-style indent whitespace.
+            out.push('"');
             out.push_str(want.trim());
             out.push_str("\"\n");
         }
@@ -713,6 +715,7 @@ mod tests {
             from_addr: "someone@example.com".into(),
             subject: "hi".into(),
             body: "hello".into(),
+            received_at: Utc::now(),
             is_known_contact: known,
             rule_want_text: want.map(|s| s.to_string()),
             sensitivity: Sensitivity::Normal,
@@ -747,6 +750,24 @@ mod tests {
         assert!(
             !untrusted.contains("only discounts, clearance, new collections"),
             "want_text must NOT appear in the untrusted region"
+        );
+    }
+
+    #[test]
+    fn want_text_line_is_clean_no_source_indentation() {
+        // The want_text must be emitted as a single quoted line with NO leading
+        // source-indentation whitespace before the opening quote (the old smell
+        // pushed "  \"..." with a 2-space code-style indent).
+        let q = queued(false, Some("only school closures"));
+        let ctx = RowContext::from_queued(&q, 4000);
+        let msg = build_user_message(&ctx);
+        assert!(
+            msg.contains("\n\"only school closures\"\n"),
+            "want_text must be a clean quoted line: {msg:?}"
+        );
+        assert!(
+            !msg.contains("  \"only school closures\""),
+            "no leading source-indent whitespace before the want_text quote"
         );
     }
 

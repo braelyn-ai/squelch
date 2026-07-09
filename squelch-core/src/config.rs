@@ -260,6 +260,27 @@ pub struct Stage2Config {
     /// discipline, counted via a `thread_id='__global__'` sentinel row in
     /// `wake_budget`.
     pub global_daily_cap: u32,
+    /// Per-SENDER-per-day API-call cap. Same increment-before discipline as the
+    /// thread/global caps, counted via a `thread_id='sender:<addr>'` sentinel
+    /// row in `wake_budget` (no real Gmail thread id starts with `sender:`).
+    /// Stops one chatty sender fanning many DIFFERENT threads from burning the
+    /// budget. Env: `SQUELCH_STAGE2_SENDER_DAILY_CAP`.
+    pub sender_daily_cap: u32,
+    /// Skip (don't spend a model call on) any queued row whose message
+    /// `received_at` is older than this many days: it is marked processed with
+    /// `model_used='stale-skip'`, keeping its Stage-1 values, so it neither
+    /// consumes budget nor sits queued forever. Env: `SQUELCH_STAGE2_MAX_AGE_DAYS`.
+    pub max_age_days: u32,
+    /// Per-million-input-token price (USD) for the configured model, used only to
+    /// compute the `est_cost_usd_today` figure surfaced by `/client/stats`.
+    /// Default 1.0 matches claude-haiku-4-5. NOTE: if you change `model`, update
+    /// this and `price_out_per_mtok` to that model's pricing. Env:
+    /// `SQUELCH_STAGE2_PRICE_IN_PER_MTOK`.
+    pub price_in_per_mtok: f64,
+    /// Per-million-output-token price (USD) for the configured model. Default 5.0
+    /// matches claude-haiku-4-5. See [`Stage2Config::price_in_per_mtok`]. Env:
+    /// `SQUELCH_STAGE2_PRICE_OUT_PER_MTOK`.
+    pub price_out_per_mtok: f64,
 }
 
 impl Default for Stage2Config {
@@ -267,10 +288,14 @@ impl Default for Stage2Config {
         Self {
             anthropic_api_key: None,
             model: "claude-haiku-4-5".to_string(),
-            max_body_chars: 4000,
+            max_body_chars: 1500,
             batch_per_cycle: 10,
             thread_daily_cap: 3,
             global_daily_cap: 200,
+            sender_daily_cap: 5,
+            max_age_days: 7,
+            price_in_per_mtok: 1.0,
+            price_out_per_mtok: 5.0,
         }
     }
 }
@@ -449,6 +474,26 @@ impl Config {
             && let Ok(n) = v.parse::<u32>()
         {
             self.stage2.global_daily_cap = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_SENDER_DAILY_CAP")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.stage2.sender_daily_cap = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_MAX_AGE_DAYS")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.stage2.max_age_days = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.stage2.price_in_per_mtok = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.stage2.price_out_per_mtok = n;
         }
     }
 
@@ -699,10 +744,14 @@ backfill_days = 90
     fn stage2_defaults_are_sane() {
         let c = Stage2Config::default();
         assert_eq!(c.model, "claude-haiku-4-5");
-        assert_eq!(c.max_body_chars, 4000);
+        assert_eq!(c.max_body_chars, 1500);
         assert_eq!(c.batch_per_cycle, 10);
         assert_eq!(c.thread_daily_cap, 3);
         assert_eq!(c.global_daily_cap, 200);
+        assert_eq!(c.sender_daily_cap, 5);
+        assert_eq!(c.max_age_days, 7);
+        assert_eq!(c.price_in_per_mtok, 1.0);
+        assert_eq!(c.price_out_per_mtok, 5.0);
     }
 
     #[test]
@@ -741,6 +790,10 @@ backfill_days = 90
             std::env::set_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP", "500");
             std::env::set_var("SQUELCH_STAGE2_BATCH_PER_CYCLE", "25");
             std::env::set_var("SQUELCH_STAGE2_MAX_BODY_CHARS", "8000");
+            std::env::set_var("SQUELCH_STAGE2_SENDER_DAILY_CAP", "9");
+            std::env::set_var("SQUELCH_STAGE2_MAX_AGE_DAYS", "14");
+            std::env::set_var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK", "3.0");
+            std::env::set_var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK", "15.0");
         }
         let mut c = Config::default();
         c.apply_env_overrides();
@@ -749,12 +802,20 @@ backfill_days = 90
         assert_eq!(c.stage2.global_daily_cap, 500);
         assert_eq!(c.stage2.batch_per_cycle, 25);
         assert_eq!(c.stage2.max_body_chars, 8000);
+        assert_eq!(c.stage2.sender_daily_cap, 9);
+        assert_eq!(c.stage2.max_age_days, 14);
+        assert_eq!(c.stage2.price_in_per_mtok, 3.0);
+        assert_eq!(c.stage2.price_out_per_mtok, 15.0);
         unsafe {
             std::env::remove_var("SQUELCH_MODEL");
             std::env::remove_var("SQUELCH_STAGE2_THREAD_DAILY_CAP");
             std::env::remove_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP");
             std::env::remove_var("SQUELCH_STAGE2_BATCH_PER_CYCLE");
             std::env::remove_var("SQUELCH_STAGE2_MAX_BODY_CHARS");
+            std::env::remove_var("SQUELCH_STAGE2_SENDER_DAILY_CAP");
+            std::env::remove_var("SQUELCH_STAGE2_MAX_AGE_DAYS");
+            std::env::remove_var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK");
+            std::env::remove_var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK");
         }
     }
 

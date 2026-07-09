@@ -54,6 +54,12 @@ async fn main() -> anyhow::Result<()> {
     // `with_write_credentials`; the sync/triage read path never touches it. If
     // the OAuth client isn't configured, actions return 403 with a hint.
     let cfg = Config::load();
+    // Wire the Stage-2 per-MTok prices so /client/stats reports cost against the
+    // configured model's pricing.
+    state = state.with_stage2_prices(
+        cfg.stage2.price_in_per_mtok,
+        cfg.stage2.price_out_per_mtok,
+    );
     match cfg.oauth_client() {
         Ok(client) => {
             state = state.with_write_credentials(

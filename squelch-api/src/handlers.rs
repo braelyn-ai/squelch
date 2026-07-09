@@ -349,6 +349,31 @@ pub async fn create_rule(
     Ok((StatusCode::CREATED, Json(json!({ "rule_id": id }))))
 }
 
+pub async fn update_rule(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateRuleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.match_pattern.trim().is_empty() {
+        return Err(ApiError::bad_request("match_pattern must not be empty"));
+    }
+    let disposition = Disposition::parse(&body.disposition)
+        .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
+
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    // Rule writes (POST/DELETE) do not audit, so PUT mirrors that: no audit row.
+    let updated = blocking(move || {
+        store.update_sender_rule(account_id, id, &body.match_pattern, &body.want, disposition)
+    })
+    .await?;
+    if updated {
+        Ok(Json(json!({ "rule_id": id })))
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
 pub async fn delete_rule(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
@@ -479,8 +504,33 @@ pub async fn get_stats(
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.store.clone();
     let account_id = state.account_id;
-    let stats = blocking(move || store.stats(account_id)).await?;
-    Ok(Json(stats))
+    // UTC day key for today's Stage-2 usage row.
+    let day = Utc::now().format("%Y-%m-%d").to_string();
+    let (stats, usage) = blocking(move || {
+        let stats = store.stats(account_id)?;
+        let usage = store.stage2_usage_today(account_id, &day)?;
+        Ok((stats, usage))
+    })
+    .await?;
+
+    // Cost = tokens/1e6 * per-MTok price, summed over input+output. Prices come
+    // from the config (default matches claude-haiku-4-5); switching the model
+    // means updating stage2_price_*_per_mtok so this stays accurate.
+    let est_cost_usd_today = (usage.input_tokens as f64 / 1_000_000.0)
+        * state.stage2_price_in_per_mtok
+        + (usage.output_tokens as f64 / 1_000_000.0) * state.stage2_price_out_per_mtok;
+
+    // Serialize the core stats, then attach a `stage2` object alongside its
+    // existing fields.
+    let mut body = serde_json::to_value(&stats)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+    body["stage2"] = json!({
+        "calls_today": usage.calls,
+        "input_tokens_today": usage.input_tokens,
+        "output_tokens_today": usage.output_tokens,
+        "est_cost_usd_today": est_cost_usd_today,
+    });
+    Ok(Json(body))
 }
 
 // --- ACTIONS: the ONLY write capability in the system -----------------------

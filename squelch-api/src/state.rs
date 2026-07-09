@@ -31,6 +31,13 @@ pub struct ApiState {
     /// Gmail base. Set only in tests (point at a local mock server); production
     /// never sets it, so live traffic always hits the real API.
     pub(crate) write_api_base: Option<String>,
+    /// Per-MTok input price (USD) used to compute `est_cost_usd_today` in
+    /// `/client/stats`. Defaults to the Stage2Config default (claude-haiku-4-5);
+    /// wire the operator's config value in with [`ApiState::with_stage2_prices`].
+    pub(crate) stage2_price_in_per_mtok: f64,
+    /// Per-MTok output price (USD) for `est_cost_usd_today`. See
+    /// [`ApiState::stage2_price_in_per_mtok`].
+    pub(crate) stage2_price_out_per_mtok: f64,
 }
 
 /// Why [`ApiState`] could not be constructed.
@@ -59,13 +66,27 @@ impl ApiState {
         if token.trim().is_empty() {
             return Err(StateError::MissingToken);
         }
+        // Prices default to the Stage2Config defaults so /client/stats always has
+        // a sane cost basis; the bin overrides them from the loaded config.
+        let s2 = squelch_core::config::Stage2Config::default();
         Ok(Self {
             store,
             account_id,
             token: Arc::from(token.as_str()),
             write_creds: None,
             write_api_base: None,
+            stage2_price_in_per_mtok: s2.price_in_per_mtok,
+            stage2_price_out_per_mtok: s2.price_out_per_mtok,
         })
+    }
+
+    /// Override the Stage-2 per-MTok prices used for `est_cost_usd_today`. Wire
+    /// this from the loaded [`squelch_core::config::Stage2Config`] so switching
+    /// `model` (and thus its config prices) reflects in the surfaced cost.
+    pub fn with_stage2_prices(mut self, price_in_per_mtok: f64, price_out_per_mtok: f64) -> Self {
+        self.stage2_price_in_per_mtok = price_in_per_mtok;
+        self.stage2_price_out_per_mtok = price_out_per_mtok;
+        self
     }
 
     /// TEST HOOK: attach a raw write-credential store AND a mock Gmail API base

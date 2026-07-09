@@ -151,6 +151,10 @@ pub struct Stage2Queued {
     pub from_addr: String,
     pub subject: String,
     pub body: String,
+    /// When the message was received. Used by the pass loop's SKIP-STALE check:
+    /// rows older than `stage2_max_age_days` are marked processed
+    /// (`model_used='stale-skip'`) without spending a model call.
+    pub received_at: DateTime<Utc>,
     /// `true` if the sender is in the account's Sent-derived contacts. Feeds the
     /// TRUSTED CONTEXT block and gates unknown-sender deadline capping.
     pub is_known_contact: bool,
@@ -179,6 +183,16 @@ pub struct Stage2Applied {
     pub model_used: String,
     /// A deadline to (re)write for this message, if the model extracted one.
     pub deadline: Option<DeadlineHit>,
+}
+
+/// A day's Stage-2 API usage for one account, read from the `stage2_usage`
+/// ledger. Cost is NOT stored — the human door computes `est_cost_usd_today`
+/// from the config-driven per-MTok prices at read time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stage2Usage {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// A locally-stored sealed message, exposed ONLY to the TUI. This type never
@@ -234,6 +248,20 @@ pub trait Store: Send + Sync {
     ) -> Result<i64>;
 
     fn list_sender_rules(&self, account_id: AccountId) -> Result<Vec<SenderRule>>;
+
+    /// Update an existing sender rule by id (scoped to `account_id`): overwrite
+    /// `match_pattern`, `want_text`, and `disposition`, restamping `updated_at`.
+    /// Returns whether a row was updated (`false` => unknown id => the caller
+    /// returns 404). Mirrors [`Store::set_sender_rule`]'s shapes but keys on id
+    /// so the desktop's old delete+recreate dance is unnecessary.
+    fn update_sender_rule(
+        &self,
+        account_id: AccountId,
+        id: i64,
+        match_pattern: &str,
+        want_text: &str,
+        disposition: Disposition,
+    ) -> Result<bool>;
 
     /// Atomically store a message plus its triage (and any deadline) in ONE
     /// transaction. This is the ONLY ingest path the sync engine uses so that a
@@ -381,4 +409,20 @@ pub trait Store: Send + Sync {
         message_id: i64,
         model_used: &str,
     ) -> Result<()>;
+
+    /// Bump the Stage-2 usage ledger for `(account_id, day)`: +1 call and add the
+    /// response's input/output token counts. Upserts the `stage2_usage` row.
+    /// Called after each successful classify that carried a usage block. `day` is
+    /// the caller-provided UTC date key (e.g. `2026-07-09`) for determinism.
+    fn stage2_bump_usage(
+        &self,
+        account_id: AccountId,
+        day: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()>;
+
+    /// Read the Stage-2 usage totals for `(account_id, day)`. Returns a zeroed
+    /// [`Stage2Usage`] when no row exists for that day.
+    fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage>;
 }

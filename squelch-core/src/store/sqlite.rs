@@ -11,8 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied, Stage2Queued, Store,
-    SyncState, TriagedMessage,
+    NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied, Stage2Queued, Stage2Usage,
+    Store, SyncState, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Deadline, Disposition,
@@ -453,6 +453,31 @@ impl Store for SqliteStore {
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    fn update_sender_rule(
+        &self,
+        account_id: AccountId,
+        id: i64,
+        match_pattern: &str,
+        want_text: &str,
+        disposition: Disposition,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE sender_rules SET
+                 match_pattern = ?3, want_text = ?4, disposition = ?5, updated_at = ?6
+             WHERE account_id = ?1 AND id = ?2",
+            params![
+                account_id,
+                id,
+                match_pattern,
+                want_text,
+                disposition.as_str(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(n > 0)
     }
 
     fn list_sender_rules(&self, account_id: AccountId) -> Result<Vec<SenderRule>> {
@@ -1082,7 +1107,7 @@ impl Store for SqliteStore {
         // `is_known_contact`).
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
-                    sr.want_text,
+                    sr.want_text, m.received_at,
                     EXISTS(
                         SELECT 1 FROM contacts c
                         WHERE c.account_id = m.account_id
@@ -1102,22 +1127,29 @@ impl Store for SqliteStore {
         let rows = stmt.query_map(params![account_id, limit as i64], |r| {
             let sensitivity: String = r.get(5)?;
             let want_text: Option<String> = r.get(6)?;
-            let is_known: i64 = r.get(7)?;
-            Ok(Stage2Queued {
-                message_id: r.get(0)?,
-                account_id,
-                thread_id: r.get(1)?,
-                from_addr: r.get(2)?,
-                subject: r.get(3)?,
-                body: r.get(4)?,
-                is_known_contact: is_known != 0,
-                rule_want_text: want_text.filter(|s| !s.is_empty()),
-                sensitivity: Sensitivity::parse(&sensitivity),
-            })
+            let received_at: String = r.get(7)?;
+            let is_known: i64 = r.get(8)?;
+            Ok((
+                Stage2Queued {
+                    message_id: r.get(0)?,
+                    account_id,
+                    thread_id: r.get(1)?,
+                    from_addr: r.get(2)?,
+                    subject: r.get(3)?,
+                    body: r.get(4)?,
+                    received_at: Utc::now(), // replaced below after parse
+                    is_known_contact: is_known != 0,
+                    rule_want_text: want_text.filter(|s| !s.is_empty()),
+                    sensitivity: Sensitivity::parse(&sensitivity),
+                },
+                received_at,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let (mut q, received_at) = row?;
+            q.received_at = parse_dt(&received_at)?;
+            out.push(q);
         }
         Ok(out)
     }
@@ -1231,6 +1263,51 @@ impl Store for SqliteStore {
             params![message_id, account_id, model_used],
         )?;
         Ok(())
+    }
+
+    fn stage2_bump_usage(
+        &self,
+        account_id: AccountId,
+        day: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO stage2_usage(account_id, day, calls, input_tokens, output_tokens)
+             VALUES(?1, ?2, 1, ?3, ?4)
+             ON CONFLICT(account_id, day) DO UPDATE SET
+                 calls = calls + 1,
+                 input_tokens = input_tokens + excluded.input_tokens,
+                 output_tokens = output_tokens + excluded.output_tokens",
+            params![account_id, day, input_tokens as i64, output_tokens as i64],
+        )?;
+        Ok(())
+    }
+
+    fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT calls, input_tokens, output_tokens FROM stage2_usage
+                 WHERE account_id = ?1 AND day = ?2",
+                params![account_id, day],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row
+            .map(|(calls, in_tok, out_tok)| Stage2Usage {
+                calls: calls.max(0) as u64,
+                input_tokens: in_tok.max(0) as u64,
+                output_tokens: out_tok.max(0) as u64,
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -1753,6 +1830,88 @@ mod tests {
     }
 
     #[test]
+    fn stage2_prompt_carries_only_the_matched_rules_want_text() {
+        // DETERMINISM: with N sender rules in the db, a Stage-2 prompt must carry
+        // AT MOST the ONE rule's want_text whose id equals the row's
+        // matched_rule_id (chosen by Stage-1's pure `match_sender_rule`), and NONE
+        // of the others'. Rule selection is pure code: the queue LEFT JOINs
+        // exactly `sr.id = t.matched_rule_id`, so the full rule list is NEVER fed
+        // to the prompt.
+        use crate::triage::stage2::{RowContext, build_user_message};
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Three distinct Filtered rules, each with a unique, greppable want_text.
+        let wants = [
+            "WANT_ALPHA only closures",
+            "WANT_BRAVO only invoices",
+            "WANT_CHARLIE only shipments",
+        ];
+        let patterns = ["*@alpha.com", "*@bravo.com", "*@charlie.com"];
+        let mut rule_ids = Vec::new();
+        for (pat, want) in patterns.iter().zip(wants.iter()) {
+            rule_ids.push(
+                store
+                    .set_sender_rule(acct, pat, want, Disposition::Filtered)
+                    .unwrap(),
+            );
+        }
+
+        // A queued row whose Stage-1 match landed on rule #2 (bravo). We stamp
+        // matched_rule_id exactly as Stage-1 would (it selects a single rule id).
+        let matched_id = rule_ids[1];
+        let id = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+        store
+            .set_triage(
+                id, acct, 30, Tier::Noise, Sensitivity::Normal, None, "filtered",
+                "matched filtered rule", None,
+            )
+            .unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE triage SET matched_rule_id=?2 WHERE message_id=?1",
+                params![id, matched_id],
+            )
+            .unwrap();
+        }
+
+        let rows = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        // Only the matched rule's want_text surfaces from the store.
+        assert_eq!(rows[0].rule_want_text.as_deref(), Some("WANT_BRAVO only invoices"));
+
+        // And the BUILT prompt contains exactly that one rule's text — none of
+        // the other two rules leak in.
+        let ctx = RowContext::from_queued(&rows[0], 4000);
+        let prompt = build_user_message(&ctx);
+        assert!(prompt.contains("WANT_BRAVO only invoices"), "matched want must appear");
+        assert!(!prompt.contains("WANT_ALPHA"), "non-matched rule must not leak");
+        assert!(!prompt.contains("WANT_CHARLIE"), "non-matched rule must not leak");
+        assert_eq!(
+            prompt.matches("WANT_").count(),
+            1,
+            "exactly one rule's want_text in the prompt"
+        );
+
+        // NO-MATCH case: a row with matched_rule_id NULL carries zero rule text.
+        let id2 = store.upsert_message(&sample_msg(acct, "g2", "t2")).unwrap();
+        store
+            .set_triage(
+                id2, acct, 40, Tier::Noise, Sensitivity::Normal, None, "ambiguous",
+                "no rule matched", None,
+            )
+            .unwrap();
+        let rows2 = store.stage2_queue(acct, 10).unwrap();
+        let unmatched = rows2.iter().find(|r| r.message_id == id2).unwrap();
+        assert!(unmatched.rule_want_text.is_none(), "no rule => no want_text");
+        let prompt2 = build_user_message(&RowContext::from_queued(unmatched, 4000));
+        assert!(!prompt2.contains("WANT_"), "unmatched row prompt has zero rule text");
+        assert!(prompt2.contains("standing_instruction_for_this_sender: none"));
+    }
+
+    #[test]
     fn stage2_budget_increment_and_exhaustion() {
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
@@ -1808,6 +1967,174 @@ mod tests {
             thread_daily_cap,
             "counter must not exceed the cap"
         );
+    }
+
+    #[test]
+    fn one_sender_across_many_threads_capped_at_sender_daily_cap() {
+        // TASK 3: a chatty sender fanning 10 messages across 10 DIFFERENT threads
+        // must cost AT MOST `sender_daily_cap` calls. Models the per-sender
+        // check-BEFORE-increment the pass runs (keyed by sender:<addr>), with the
+        // per-thread and global caps set high so the per-sender cap binds.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let day = "2026-07-09";
+        let sender_key = "sender:chatty@example.com";
+        let sender_daily_cap: u32 = 5; // matches Stage2Config default
+
+        let mut calls = 0u32;
+        for i in 0..10 {
+            // Each message is in its OWN thread — the per-thread cap never binds.
+            let _thread = format!("t-{i}");
+            let used = store.stage2_budget_used(acct, sender_key, day).unwrap();
+            if used >= sender_daily_cap {
+                continue; // sender capped: row stays queued, no call
+            }
+            store.stage2_increment_budget(acct, sender_key, day).unwrap();
+            calls += 1;
+        }
+
+        assert_eq!(
+            calls, sender_daily_cap,
+            "10 messages from one sender across 10 threads cost at most sender_daily_cap"
+        );
+        assert_eq!(
+            store.stage2_budget_used(acct, sender_key, day).unwrap(),
+            sender_daily_cap
+        );
+    }
+
+    #[test]
+    fn stage2_usage_ledger_bumps_and_reads() {
+        // TASK 5: bumping the usage ledger accumulates calls + tokens per day, and
+        // reading returns the running totals (zeroed for an untouched day).
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let day = "2026-07-09";
+
+        // Untouched day reads as zeros.
+        let z = store.stage2_usage_today(acct, day).unwrap();
+        assert_eq!(z, Stage2Usage::default());
+
+        store.stage2_bump_usage(acct, day, 1200, 60).unwrap();
+        store.stage2_bump_usage(acct, day, 800, 40).unwrap();
+        let u = store.stage2_usage_today(acct, day).unwrap();
+        assert_eq!(u.calls, 2);
+        assert_eq!(u.input_tokens, 2000);
+        assert_eq!(u.output_tokens, 100);
+
+        // A different day is an independent row.
+        assert_eq!(
+            store.stage2_usage_today(acct, "2026-07-10").unwrap(),
+            Stage2Usage::default()
+        );
+    }
+
+    #[test]
+    fn update_sender_rule_edits_by_id_and_404s_unknown() {
+        // TASK 6 (store layer): update_sender_rule overwrites pattern/want/disp by
+        // id, returns false for an unknown id.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let id = store
+            .set_sender_rule(acct, "*@old.com", "old want", Disposition::Squelch)
+            .unwrap();
+
+        let updated = store
+            .update_sender_rule(acct, id, "*@new.com", "new want", Disposition::Surface)
+            .unwrap();
+        assert!(updated);
+        let rules = store.list_sender_rules(acct).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].match_pattern, "*@new.com");
+        assert_eq!(rules[0].want_text, "new want");
+        assert_eq!(rules[0].disposition, Disposition::Surface);
+
+        // Unknown id => false (handler turns this into 404).
+        assert!(!store
+            .update_sender_rule(acct, 9999, "*@x.com", "", Disposition::Squelch)
+            .unwrap());
+    }
+
+    #[test]
+    fn stale_skip_marks_processed_without_budget() {
+        // TASK 4: a row older than the cutoff is stale-skipped: marked processed
+        // with model_used='stale-skip' (keeping Stage-1 values), leaving the
+        // queue, and NOT touching any budget row. Models the pass-loop decision.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let max_age_days: i64 = 7;
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(max_age_days);
+
+        // A stale row (received 30d ago) and a fresh row (now).
+        let mut stale = sample_msg(acct, "g-stale", "t-stale");
+        stale.received_at = now - chrono::Duration::days(30);
+        let stale_id = store.upsert_message(&stale).unwrap();
+        store
+            .set_triage(stale_id, acct, 40, Tier::Noise, Sensitivity::Normal, None, "amb", "", None)
+            .unwrap();
+        let mut fresh = sample_msg(acct, "g-fresh", "t-fresh");
+        fresh.received_at = now;
+        let fresh_id = store.upsert_message(&fresh).unwrap();
+        store
+            .set_triage(fresh_id, acct, 40, Tier::Noise, Sensitivity::Normal, None, "amb", "", None)
+            .unwrap();
+
+        // Apply the pass-loop decision: stale-skip old rows, keep fresh queued.
+        let day = "2026-07-09";
+        for row in store.stage2_queue(acct, 10).unwrap() {
+            if row.received_at < cutoff {
+                store
+                    .stage2_mark_processed(acct, row.message_id, "stale-skip")
+                    .unwrap();
+            }
+        }
+
+        // Only the fresh row remains queued.
+        let remaining = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message_id, fresh_id);
+
+        // No budget was spent on the stale skip.
+        assert_eq!(store.stage2_budget_used(acct, "t-stale", day).unwrap(), 0);
+        assert_eq!(
+            store.stage2_budget_used(acct, "__global__", day).unwrap(),
+            0
+        );
+
+        // The stale row's triage is stamped 'stale-skip' with Stage-1 values kept.
+        let conn = store.lock().unwrap();
+        let (imp, model): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT importance, model_used FROM triage WHERE message_id=?1",
+                params![stale_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(imp, 40, "stale-skip keeps Stage-1 importance");
+        assert_eq!(model.as_deref(), Some("stale-skip"));
+    }
+
+    #[test]
+    fn stage2_queue_carries_received_at() {
+        // TASK 4 support: the queue surfaces received_at so the pass can skip
+        // stale rows.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let mut m = sample_msg(acct, "g1", "t1");
+        let when = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        m.received_at = when;
+        let id = store.upsert_message(&m).unwrap();
+        store
+            .set_triage(
+                id, acct, 40, Tier::Noise, Sensitivity::Normal, None, "amb", "", None,
+            )
+            .unwrap();
+        let rows = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].received_at, when);
     }
 
     #[test]
