@@ -37,6 +37,8 @@ use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules};
+use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
+use crate::triage::stage2_sealed_guard;
 use crate::types::{AccountId, SenderRule};
 
 /// Gmail REST base for the authenticated user. Fixed; not user-tunable.
@@ -48,6 +50,12 @@ const LABEL_SENT: &str = "SENT";
 
 /// The single `sync_state` row key for the REST engine's historyId cursor.
 const HISTORY_KEY: &str = "history";
+
+/// The `wake_budget.thread_id` sentinel for the global-per-account-per-day
+/// Stage-2 budget. No real Gmail thread id can collide (Gmail thread ids are
+/// hex, never this literal). Keeping global counting in the same table avoids a
+/// schema addition.
+const GLOBAL_BUDGET_KEY: &str = "__global__";
 
 /// Reconnect / retry backoff bounds for the outer driver loop.
 const BACKOFF_START: Duration = Duration::from_secs(2);
@@ -190,6 +198,10 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     account_email: String,
     config: Config,
     http: reqwest::Client,
+    /// The resolved Anthropic API key for Stage-2, if present at startup. When
+    /// `None`, Stage-2 is DISABLED gracefully (rows stay queued, one stderr
+    /// notice, sync continues). Never logged.
+    stage2_key: Option<String>,
 }
 
 impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
@@ -207,6 +219,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client build");
+        // Resolve the Stage-2 API key once. Absence => graceful disable with a
+        // single stderr notice (no key material logged).
+        let stage2_key = config.stage2.resolve_api_key();
+        if stage2_key.is_none() {
+            eprintln!(
+                "squelch: ANTHROPIC_API_KEY not set — Stage-2 LLM triage disabled \
+                 (ambiguous rows stay queued; sync continues)"
+            );
+        }
         Self {
             store,
             creds,
@@ -214,6 +235,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             account_email,
             config,
             http,
+            stage2_key,
         }
     }
 
@@ -268,6 +290,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         let cursor = self.load_history_cursor()?;
         if cursor.is_none() {
             self.backfill().await?;
+            // Stage-2 pass over the backfill batch's ambiguous rows.
+            self.stage2_pass().await;
         }
 
         self.poll_loop(shutdown).await
@@ -306,6 +330,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 return Ok(());
             }
             self.poll_once().await?;
+            // Stage-2 LLM triage pass after each ingest batch. Never crashes the
+            // sync loop (all failures handled internally).
+            self.stage2_pass().await;
 
             // Sleep the poll interval, waking early on shutdown.
             tokio::select! {
@@ -527,6 +554,167 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         );
         self.store.ingest_message(&triaged)?;
         Ok(())
+    }
+
+    /// Run one Stage-2 LLM triage pass over the queued (non-confident) rows.
+    ///
+    /// Fetch up to `batch_per_cycle` rows (`model_used IS NULL AND
+    /// sensitivity='normal'`), process sequentially (no rate limiter needed at
+    /// this volume). For each row: enforce the sealed guard, check the
+    /// per-thread and global daily budgets, increment BEFORE the call (so retry
+    /// storms can't exceed the cap), classify, and apply the result. Budget
+    /// exhaustion skips the row (it stays queued) and logs at most one notice
+    /// per cycle. Any per-row failure is logged (redacted) and never crashes the
+    /// sync loop — the whole pass returns `Ok(())` regardless.
+    ///
+    /// No-op when Stage-2 is disabled (no API key).
+    async fn stage2_pass(&self) {
+        let Some(api_key) = self.stage2_key.as_deref() else {
+            return; // disabled; notice already emitted at startup
+        };
+        let cfg = &self.config.stage2;
+
+        let queued = match self.store.stage2_queue(self.account_id, cfg.batch_per_cycle) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("squelch: stage-2 queue read failed ({e}); skipping pass");
+                return;
+            }
+        };
+        if queued.is_empty() {
+            return;
+        }
+
+        // UTC date key for the budget rows; one value for the whole pass.
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        // "at most once per cycle" per-thread exhaustion notice. (The global
+        // notice fires at most once because hitting the cap breaks the loop.)
+        let mut warned_thread = false;
+        let mut processed = 0usize;
+        let mut in_tok = 0u64;
+        let mut out_tok = 0u64;
+
+        for row in &queued {
+            // SEALED GUARD (defense in depth): the queue excludes sealed rows in
+            // SQL, but re-check before every classify call.
+            if let Err(e) = stage2_sealed_guard(row) {
+                eprintln!("squelch: stage-2 sealed guard tripped ({e}); skipping row");
+                continue;
+            }
+
+            // GLOBAL budget check (per-account-per-day).
+            match self
+                .store
+                .stage2_budget_used(self.account_id, GLOBAL_BUDGET_KEY, &day)
+            {
+                Ok(used) if used >= cfg.global_daily_cap => {
+                    eprintln!(
+                        "squelch: stage-2 global daily budget exhausted ({used}/{}); \
+                         remaining rows stay queued",
+                        cfg.global_daily_cap
+                    );
+                    break; // global cap blocks every remaining row this cycle
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("squelch: stage-2 global budget read failed ({e}); skipping row");
+                    continue;
+                }
+            }
+
+            // PER-THREAD budget check.
+            match self
+                .store
+                .stage2_budget_used(self.account_id, &row.thread_id, &day)
+            {
+                Ok(used) if used >= cfg.thread_daily_cap => {
+                    if !warned_thread {
+                        eprintln!(
+                            "squelch: stage-2 per-thread daily budget exhausted for at least \
+                             one thread ({}/{}); those rows stay queued",
+                            used, cfg.thread_daily_cap
+                        );
+                        warned_thread = true;
+                    }
+                    continue; // this thread is capped; try the next row
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("squelch: stage-2 thread budget read failed ({e}); skipping row");
+                    continue;
+                }
+            }
+
+            // Increment BOTH budgets BEFORE the call so the attempt counts even
+            // if it errors or retries.
+            if let Err(e) =
+                self.store
+                    .stage2_increment_budget(self.account_id, GLOBAL_BUDGET_KEY, &day)
+            {
+                eprintln!("squelch: stage-2 global budget increment failed ({e}); skipping row");
+                continue;
+            }
+            if let Err(e) =
+                self.store
+                    .stage2_increment_budget(self.account_id, &row.thread_id, &day)
+            {
+                eprintln!("squelch: stage-2 thread budget increment failed ({e}); skipping row");
+                continue;
+            }
+
+            // Classify.
+            let ctx = RowContext::from_queued(row, cfg.max_body_chars);
+            let outcome = stage2::classify(&self.http, api_key, cfg, &ctx).await;
+
+            match outcome {
+                Ok(ClassifyOutcome::Ok(out, usage)) => {
+                    if let Some(u) = usage {
+                        in_tok += u.input_tokens;
+                        out_tok += u.output_tokens;
+                    }
+                    let applied = stage2::apply_result(row, &out, &cfg.model, Utc::now());
+                    if let Err(e) = self.store.stage2_apply(&applied) {
+                        eprintln!("squelch: stage-2 apply failed ({e}); row stays queued");
+                    } else {
+                        processed += 1;
+                    }
+                }
+                Ok(ClassifyOutcome::Refused) => {
+                    // Keep Stage-1 values; mark processed so it doesn't loop.
+                    // Redacted: no body/subject logged.
+                    eprintln!("squelch: stage-2 refusal (redacted); keeping stage-1 values");
+                    let _ = self.store.stage2_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        &cfg.model,
+                    );
+                }
+                Ok(ClassifyOutcome::Failed(kind)) => {
+                    // Permanent failure (400/401/truncation/parse): mark the row
+                    // failed (processed) so it does not loop forever. `kind` is
+                    // already redacted (status/error-type only).
+                    eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
+                    let _ = self.store.stage2_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        &cfg.model,
+                    );
+                }
+                Err(e) => {
+                    // Retryable class exhausted / transport error. Leave the row
+                    // queued for a future cycle. `e` is redacted.
+                    eprintln!("squelch: stage-2 {e}; row stays queued");
+                }
+            }
+        }
+
+        if processed > 0 {
+            eprintln!(
+                "squelch: stage-2 processed {processed} rows (model={}, in_tok={in_tok}, \
+                 out_tok={out_tok})",
+                cfg.model
+            );
+        }
     }
 
     /// `users.getProfile` -> the account's current historyId.

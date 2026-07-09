@@ -11,7 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Store, SyncState, TriagedMessage,
+    NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied, Stage2Queued, Store,
+    SyncState, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Deadline, Disposition,
@@ -1068,6 +1069,169 @@ impl Store for SqliteStore {
             last_surfaced_at,
         })
     }
+
+    // ---- STAGE-2 ----------------------------------------------------------
+
+    fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>> {
+        let conn = self.lock()?;
+        // The Stage-2 queue predicate, verbatim: non-confident Stage-1 rows are
+        // left with model_used IS NULL; sealed rows carry sensitivity='sealed'
+        // and are structurally excluded. Join the message for context and
+        // LEFT JOIN the matched sender rule for its want_text. is_known_contact
+        // is derived from a correlated EXISTS against contacts (mirrors
+        // `is_known_contact`).
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
+                    sr.want_text,
+                    EXISTS(
+                        SELECT 1 FROM contacts c
+                        WHERE c.account_id = m.account_id
+                          AND c.addr = m.from_addr COLLATE NOCASE
+                          AND c.sent_count > 0
+                    ) AS is_known
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             LEFT JOIN sender_rules sr ON sr.id = t.matched_rule_id
+             WHERE t.account_id = ?1
+               AND t.model_used IS NULL
+               AND t.sensitivity = 'normal'
+               AND m.is_sent = 0
+             ORDER BY m.received_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit as i64], |r| {
+            let sensitivity: String = r.get(5)?;
+            let want_text: Option<String> = r.get(6)?;
+            let is_known: i64 = r.get(7)?;
+            Ok(Stage2Queued {
+                message_id: r.get(0)?,
+                account_id,
+                thread_id: r.get(1)?,
+                from_addr: r.get(2)?,
+                subject: r.get(3)?,
+                body: r.get(4)?,
+                is_known_contact: is_known != 0,
+                rule_want_text: want_text.filter(|s| !s.is_empty()),
+                sensitivity: Sensitivity::parse(&sensitivity),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn stage2_budget_used(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+        day: &str,
+    ) -> Result<u32> {
+        let conn = self.lock()?;
+        let n: i64 = conn
+            .query_row(
+                "SELECT model_calls FROM wake_budget
+                 WHERE account_id=?1 AND thread_id=?2 AND day=?3",
+                params![account_id, thread_id, day],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Ok(n.max(0) as u32)
+    }
+
+    fn stage2_increment_budget(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+        day: &str,
+    ) -> Result<u32> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO wake_budget(account_id, thread_id, day, model_calls)
+             VALUES(?1, ?2, ?3, 1)
+             ON CONFLICT(account_id, thread_id, day)
+             DO UPDATE SET model_calls = model_calls + 1",
+            params![account_id, thread_id, day],
+        )?;
+        let n: i64 = conn.query_row(
+            "SELECT model_calls FROM wake_budget
+             WHERE account_id=?1 AND thread_id=?2 AND day=?3",
+            params![account_id, thread_id, day],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    fn stage2_apply(&self, applied: &Stage2Applied) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        // Overwrite triage fields and stamp model_used. Guarded by
+        // sensitivity='normal' so a sealed row can never be mutated here even if
+        // a caller mis-targets one (defense in depth; the queue already excludes
+        // sealed rows).
+        let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
+        tx.execute(
+            "UPDATE triage SET
+                 importance = ?3,
+                 tier = ?4,
+                 one_line = ?5,
+                 reason = ?6,
+                 deadline = ?7,
+                 model_used = ?8
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.importance as i64,
+                applied.tier.as_str(),
+                applied.one_line,
+                applied.reason,
+                deadline_dt,
+                applied.model_used,
+            ],
+        )?;
+        // (Re)write the deadlines row idempotently.
+        tx.execute(
+            "DELETE FROM deadlines WHERE message_id=?1",
+            params![applied.message_id],
+        )?;
+        if let Some(d) = &applied.deadline {
+            tx.execute(
+                "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
+                     due_at, past_due, source)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    applied.account_id,
+                    applied.message_id,
+                    d.kind,
+                    d.amount,
+                    d.currency,
+                    d.due_at.to_rfc3339(),
+                    d.past_due as i64,
+                    d.source,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn stage2_mark_processed(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        model_used: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE triage SET model_used = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![message_id, account_id, model_used],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1504,5 +1668,218 @@ mod tests {
         let rules = store.list_sender_rules(acct).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].disposition, Disposition::Squelch);
+    }
+
+    // ---- Stage-2 store methods -------------------------------------------
+
+    /// Insert a message + a triage row with model_used NULL (queued) or set
+    /// (processed), controlling sensitivity so the sealed-exclusion is testable.
+    fn seed_triage_row(
+        store: &SqliteStore,
+        acct: AccountId,
+        gmail_id: &str,
+        thread: &str,
+        sensitivity: Sensitivity,
+    ) -> i64 {
+        let id = store
+            .upsert_message(&sample_msg(acct, gmail_id, thread))
+            .unwrap();
+        store
+            .set_triage(
+                id, acct, 40, Tier::Noise, sensitivity, None, "ambiguous",
+                "no rule matched", None,
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn stage2_queue_selects_only_normal_unprocessed_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // A queued (normal, model_used NULL) row.
+        let q1 = seed_triage_row(&store, acct, "g-normal", "t-1", Sensitivity::Normal);
+        // A sealed row must be excluded.
+        seed_triage_row(&store, acct, "g-sealed", "t-2", Sensitivity::Sealed);
+        // A processed row (model_used set) must be excluded.
+        let done = seed_triage_row(&store, acct, "g-done", "t-3", Sensitivity::Normal);
+        store
+            .stage2_mark_processed(acct, done, "claude-haiku-4-5")
+            .unwrap();
+
+        let rows = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(rows.len(), 1, "only the normal, unprocessed row is queued");
+        assert_eq!(rows[0].message_id, q1);
+        assert_eq!(rows[0].sensitivity, Sensitivity::Normal);
+        assert!(rows[0].rule_want_text.is_none());
+    }
+
+    #[test]
+    fn stage2_queue_surfaces_matched_rule_want_text() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let rule_id = store
+            .set_sender_rule(
+                acct,
+                "*@shop.com",
+                "only discounts, clearance, new collections",
+                Disposition::Filtered,
+            )
+            .unwrap();
+        let id = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+        store
+            .set_triage(
+                id, acct, 30, Tier::Noise, Sensitivity::Normal, None, "filtered",
+                "matched filtered rule", None,
+            )
+            .unwrap();
+        // Attach the matched rule id (set_triage leaves matched_rule_id NULL).
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE triage SET matched_rule_id=?2 WHERE message_id=?1",
+                params![id, rule_id],
+            )
+            .unwrap();
+        }
+
+        let rows = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].rule_want_text.as_deref(),
+            Some("only discounts, clearance, new collections")
+        );
+    }
+
+    #[test]
+    fn stage2_budget_increment_and_exhaustion() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let day = "2026-07-09";
+
+        assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 0);
+        assert_eq!(store.stage2_increment_budget(acct, "t-abc", day).unwrap(), 1);
+        assert_eq!(store.stage2_increment_budget(acct, "t-abc", day).unwrap(), 2);
+        assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 2);
+
+        // A different thread and a different day are independent counters.
+        assert_eq!(store.stage2_budget_used(acct, "t-other", day).unwrap(), 0);
+        assert_eq!(store.stage2_budget_used(acct, "t-abc", "2026-07-10").unwrap(), 0);
+
+        // The global sentinel is a separate scope in the same table.
+        assert_eq!(store.stage2_increment_budget(acct, "__global__", day).unwrap(), 1);
+        assert_eq!(store.stage2_budget_used(acct, "__global__", day).unwrap(), 1);
+        // The per-thread counter is unaffected by the global increment.
+        assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 2);
+    }
+
+    #[test]
+    fn mailing_list_storm_capped_at_thread_daily_cap() {
+        // Audit (c): a mailing-list storm — 30 messages, all in ONE thread —
+        // must result in AT MOST `thread_daily_cap` API calls. This models the
+        // exact check-BEFORE-increment discipline stage2_pass runs per row:
+        // read the per-thread counter, skip if it's already at the cap, else
+        // increment (which is what "make a call" costs). Any global cap is set
+        // high so the per-thread cap is the binding constraint.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let day = "2026-07-09";
+        let thread = "t-listserv";
+        let thread_daily_cap: u32 = 3; // matches Stage2Config default
+
+        let mut calls = 0u32;
+        for _ in 0..30 {
+            let used = store.stage2_budget_used(acct, thread, day).unwrap();
+            if used >= thread_daily_cap {
+                continue; // capped: row stays queued, no call
+            }
+            // "Make the call": increment BEFORE the attempt.
+            store.stage2_increment_budget(acct, thread, day).unwrap();
+            calls += 1;
+        }
+
+        assert_eq!(
+            calls, thread_daily_cap,
+            "30-message storm on one thread must cost at most thread_daily_cap calls"
+        );
+        assert_eq!(
+            store.stage2_budget_used(acct, thread, day).unwrap(),
+            thread_daily_cap,
+            "counter must not exceed the cap"
+        );
+    }
+
+    #[test]
+    fn stage2_apply_updates_row_stamps_model_and_writes_deadline() {
+        use crate::triage::DeadlineHit;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let id = seed_triage_row(&store, acct, "g1", "t1", Sensitivity::Normal);
+
+        let due = DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let applied = Stage2Applied {
+            message_id: id,
+            account_id: acct,
+            importance: 88,
+            tier: Tier::Deadline,
+            one_line: "invoice due sep 1".into(),
+            reason: "stage-2 (m): real bill".into(),
+            model_used: "claude-haiku-4-5".into(),
+            deadline: Some(DeadlineHit {
+                kind: "invoice".into(),
+                amount: None,
+                currency: None,
+                due_at: due,
+                past_due: false,
+                source: "stage2".into(),
+            }),
+        };
+        store.stage2_apply(&applied).unwrap();
+
+        // Row left the queue (model_used stamped).
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+        // A deadlines row was written.
+        let ds = store.deadlines(acct, Some(365)).unwrap();
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].kind, "invoice");
+        // The ranked update reflects the new tier/importance.
+        let ups = store
+            .ranked_updates(acct, Utc::now() - chrono::Duration::days(1), None)
+            .unwrap();
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].tier, Tier::Deadline);
+        assert_eq!(ups[0].importance, 88);
+    }
+
+    #[test]
+    fn stage2_apply_never_touches_sealed_row() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let id = seed_triage_row(&store, acct, "g-sealed", "t1", Sensitivity::Sealed);
+        let applied = Stage2Applied {
+            message_id: id,
+            account_id: acct,
+            importance: 99,
+            tier: Tier::Signal,
+            one_line: "leak".into(),
+            reason: "should not apply".into(),
+            model_used: "m".into(),
+            deadline: None,
+        };
+        store.stage2_apply(&applied).unwrap();
+        // The sealed row's triage must be unchanged (guarded by sensitivity).
+        let conn = store.lock().unwrap();
+        let (imp, model): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT importance, model_used FROM triage WHERE message_id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(imp, 40, "sealed row importance unchanged");
+        assert!(model.is_none(), "sealed row model_used untouched");
     }
 }

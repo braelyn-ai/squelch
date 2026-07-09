@@ -133,6 +133,54 @@ pub struct NewAuditEntry {
     pub detail: Option<String>,
 }
 
+/// One non-confident triage row queued for the Stage-2 LLM pass, plus the
+/// message context and the matched Filtered-rule's `want_text` (when a rule
+/// fired). Produced by [`Store::stage2_queue`].
+///
+/// SECURITY: the query that produces these EXCLUDES sealed rows in SQL (the
+/// queue predicate is `model_used IS NULL AND sensitivity='normal'`), so a
+/// `Stage2Queued` never represents sealed mail. The Stage-2 pass additionally
+/// re-checks the sealed guard defensively before every classify call.
+#[derive(Debug, Clone)]
+pub struct Stage2Queued {
+    /// Local message id (triage.message_id).
+    pub message_id: i64,
+    pub account_id: AccountId,
+    /// Gmail thread id — the per-thread budget key.
+    pub thread_id: String,
+    pub from_addr: String,
+    pub subject: String,
+    pub body: String,
+    /// `true` if the sender is in the account's Sent-derived contacts. Feeds the
+    /// TRUSTED CONTEXT block and gates unknown-sender deadline capping.
+    pub is_known_contact: bool,
+    /// The matched sender rule's `want_text`, present only when a Filtered rule
+    /// fired. Presented in the TRUSTED CONTEXT block as the account owner's
+    /// standing instruction for this sender.
+    pub rule_want_text: Option<String>,
+    /// The row's current sensitivity as stored — always `'normal'` for queued
+    /// rows (sealed is excluded in SQL). Carried so the sealed guard can assert.
+    pub sensitivity: Sensitivity,
+}
+
+/// The store-facing outcome of applying a parsed Stage-2 result onto a triage
+/// row. Pure mapping lives in `triage::stage2::apply_result`; this is what the
+/// store persists. When `deadline` is `Some`, a `deadlines` row is (re)written.
+#[derive(Debug, Clone)]
+pub struct Stage2Applied {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    pub importance: u8,
+    pub tier: Tier,
+    pub one_line: String,
+    pub reason: String,
+    /// The model id string to stamp `model_used` with (marks the row processed
+    /// so the queue predicate no longer selects it).
+    pub model_used: String,
+    /// A deadline to (re)write for this message, if the model extracted one.
+    pub deadline: Option<DeadlineHit>,
+}
+
 /// A locally-stored sealed message, exposed ONLY to the TUI. This type never
 /// crosses the MCP boundary.
 #[derive(Debug, Clone)]
@@ -284,4 +332,53 @@ pub trait Store: Send + Sync {
 
     /// Per-tier / sealed / sync-cursor summary counts for the account.
     fn stats(&self, account_id: AccountId) -> Result<StoreStats>;
+
+    // ---------------------------------------------------------------------
+    // STAGE-2 additions. These support the LLM triage pass in the sync loop.
+    // The queue predicate is `model_used IS NULL AND sensitivity='normal'`;
+    // sealed rows are structurally excluded (never `model_used IS NULL AND
+    // sensitivity='normal'` — sealed rows carry sensitivity='sealed').
+    // ---------------------------------------------------------------------
+
+    /// Fetch up to `limit` queued Stage-2 rows (non-confident Stage-1 output:
+    /// `model_used IS NULL AND sensitivity='normal'`) with their message
+    /// context and, when a Filtered sender rule matched, that rule's
+    /// `want_text`. Ordered newest-first so the freshest ambiguous mail gets a
+    /// look first. Sealed rows are excluded in SQL.
+    fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>>;
+
+    /// Read today's Stage-2 API-call count for a budget scope. `thread_id` is
+    /// either a real Gmail thread id (per-thread cap) or the `'__global__'`
+    /// sentinel (per-account cap). `day` is the caller-provided UTC date key
+    /// (e.g. `2026-07-09`) so tests are deterministic.
+    fn stage2_budget_used(&self, account_id: AccountId, thread_id: &str, day: &str)
+    -> Result<u32>;
+
+    /// Increment (and return the new value of) today's Stage-2 API-call count
+    /// for a budget scope. Called BEFORE the API attempt so retries count and
+    /// cannot exceed the cap. Upserts the `wake_budget` row.
+    fn stage2_increment_budget(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+        day: &str,
+    ) -> Result<u32>;
+
+    /// Apply a parsed Stage-2 result onto a triage row IN ONE TRANSACTION:
+    /// overwrite importance/tier/one_line/reason, stamp `model_used` (marking
+    /// the row processed so it leaves the queue), and (re)write the message's
+    /// `deadlines` row when the model extracted a deadline. Never touches sealed
+    /// rows (guarded by `sensitivity='normal'` in the UPDATE).
+    fn stage2_apply(&self, applied: &Stage2Applied) -> Result<()>;
+
+    /// Mark a queued row PROCESSED without changing its Stage-1 values — stamp
+    /// `model_used` only. Used when the model refused (keep Stage-1 output) or a
+    /// permanent (non-retryable) API error was hit, so the row does not loop
+    /// forever. Guarded by `sensitivity='normal'`.
+    fn stage2_mark_processed(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        model_used: &str,
+    ) -> Result<()>;
 }

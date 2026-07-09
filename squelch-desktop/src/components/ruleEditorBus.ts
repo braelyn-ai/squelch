@@ -6,6 +6,8 @@
 // This is deliberately not in the zustand store: these are transient, action-
 // side overlays that only ActionLayer mounts.
 
+import type { SenderRule } from "../api";
+
 type Listener<T> = (payload: T) => void;
 
 function bus<T>() {
@@ -21,14 +23,34 @@ function bus<T>() {
   };
 }
 
-const ruleEditor = bus<{ sender: string }>();
+/**
+ * Rule editor open request. Three shapes:
+ *   - { sender }                 → tune (`t`): prefill *@domain, create-only.
+ *   - { rule: null, onSaved }    → create from scratch (RulesView `n`).
+ *   - { rule: SenderRule, onSaved } → edit an existing rule (RulesView Enter/e).
+ * `onSaved` lets the opener (RulesView) re-fetch after a mutation.
+ */
+export interface RuleEditorRequest {
+  sender?: string;
+  /** null = blank create; a SenderRule = edit (create-new + delete-old on save). */
+  rule?: SenderRule | null;
+  onSaved?: () => void;
+}
+
+const ruleEditor = bus<RuleEditorRequest>();
 const processMode = bus<void>();
 
 /** Open the rule editor prefilled from a sender address (read views call this). */
 export function openRuleEditor(sender: string): void {
   ruleEditor.emit({ sender });
 }
-export function onOpenRuleEditor(l: (p: { sender: string }) => void): () => void {
+
+/** Open the rule editor for a from-scratch or edit flow (rules management view). */
+export function openRuleEditorRequest(req: RuleEditorRequest): void {
+  ruleEditor.emit(req);
+}
+
+export function onOpenRuleEditor(l: (p: RuleEditorRequest) => void): () => void {
   return ruleEditor.subscribe(l);
 }
 

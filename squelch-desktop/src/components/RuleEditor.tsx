@@ -9,7 +9,7 @@ import { useMemo, useState, useRef, useEffect } from "react";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import { api, ApiError } from "../api";
-import type { Disposition } from "../api";
+import type { Disposition, SenderRule } from "../api";
 
 const DISPOSITIONS: Disposition[] = ["surface", "squelch", "filtered"];
 
@@ -31,22 +31,44 @@ export function patternFromSender(sender: string): string {
 
 export function RuleEditor({
   sender,
+  editRule,
+  onSaved,
   onClose,
 }: {
-  sender: string;
+  /** Present for the `t` tune flow: prefill *@domain from this sender. */
+  sender?: string;
+  /** Present for the edit flow: prefill from this rule; save = create+delete. */
+  editRule?: SenderRule | null;
+  /** Called after a successful save (opener re-fetches its list). */
+  onSaved?: () => void;
   onClose: () => void;
 }) {
   const pushToast = useStore((s) => s.pushToast);
-  const [pattern, setPattern] = useState(() => patternFromSender(sender));
-  const [want, setWant] = useState("");
-  const [disposition, setDisposition] = useState<Disposition>("squelch");
+  const [pattern, setPattern] = useState(() =>
+    editRule ? editRule.match_pattern : sender ? patternFromSender(sender) : "",
+  );
+  const [want, setWant] = useState(() => editRule?.want_text ?? "");
+  const [disposition, setDisposition] = useState<Disposition>(
+    () => editRule?.disposition ?? "squelch",
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const wantRef = useRef<HTMLInputElement>(null);
+  const patternRef = useRef<HTMLInputElement>(null);
+
+  const mode: "tune" | "create" | "edit" = editRule
+    ? "edit"
+    : sender
+      ? "tune"
+      : "create";
 
   useKeyContext("modal");
   useEffect(() => {
-    wantRef.current?.focus();
+    // From-scratch create starts on the (empty) pattern field; otherwise the
+    // pattern is prefilled so focus lands on the want text.
+    if (mode === "create") patternRef.current?.focus();
+    else wantRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function cycleDisposition(dir: 1 | -1 = 1) {
@@ -66,12 +88,23 @@ export function RuleEditor({
     setSaving(true);
     setError(null);
     try {
+      // Edit = create-new THEN delete-old, in that order so a mid-flight
+      // failure can never lose the rule (worst case: a transient duplicate).
+      // TODO: a PUT /client/rules/{id} endpoint would make this atomic; the
+      // server owner has no update route yet, so we emulate it client-side.
       await api.createRule({
         match_pattern: pattern.trim(),
         want: want.trim(),
         disposition,
       });
-      pushToast(`rule saved · ${pattern.trim()} → ${disposition}`, "success");
+      if (editRule) {
+        await api.deleteRule(editRule.id);
+      }
+      pushToast(
+        `${editRule ? "rule updated" : "rule saved"} · ${pattern.trim()} → ${disposition}`,
+        "success",
+      );
+      onSaved?.();
       onClose();
     } catch (e) {
       if (e instanceof ApiError && e.kind === "forbidden") {
@@ -131,18 +164,31 @@ export function RuleEditor({
         }}
       >
         <div style={{ color: "var(--fg)", fontSize: 13, marginBottom: 4, letterSpacing: 0.5 }}>
-          tune sender
+          {mode === "edit" ? "edit rule" : mode === "create" ? "new rule" : "tune sender"}
         </div>
         <div style={{ color: "var(--fg-faint)", fontSize: 11, marginBottom: 14 }}>
-          from <span className="mono">{sender}</span>
+          {mode === "tune" ? (
+            <>
+              from <span className="mono">{sender}</span>
+            </>
+          ) : mode === "edit" ? (
+            <>
+              editing <span className="mono">{editRule?.match_pattern}</span> · save
+              replaces it
+            </>
+          ) : (
+            "define a sender rule from scratch"
+          )}
         </div>
 
         <div className="field">
           <label>match pattern</label>
           <input
+            ref={patternRef}
             className="mono"
             value={pattern}
             onChange={(e) => setPattern(e.target.value)}
+            placeholder="*@example.com"
           />
         </div>
         <div className="field">

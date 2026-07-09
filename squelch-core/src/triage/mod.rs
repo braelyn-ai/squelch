@@ -35,10 +35,13 @@
 pub mod deadline;
 pub mod rules;
 pub mod seal;
+pub mod stage2;
 
 pub use deadline::DeadlineHit;
 
 use crate::config::Stage1Config;
+use crate::error::CoreError;
+use crate::store::Stage2Queued;
 use crate::types::{Disposition, NewMessage, SealedKind, SenderRule, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
 
@@ -302,18 +305,41 @@ pub fn apply_sender_rules<'a>(
     rules::match_sender_rule(from_addr, rules).map(|r| (r, r.disposition))
 }
 
-/// Stage-2 LLM triage. STUB in v0 — never called for sealed content.
+/// The SEALED GUARD for Stage-2 (defense in depth).
 ///
-/// The `debug_assert` documents the invariant: callers must not route sealed
-/// messages here.
-pub fn stage2_llm_triage(sensitivity: Sensitivity) -> Option<TriageResult> {
-    debug_assert!(
-        !matches!(sensitivity, Sensitivity::Sealed),
-        "sealed content must never reach the LLM stage"
-    );
-    // TODO: call the model, fill importance/tier/one_line/reason. Only messages
-    // with `Stage1Result.confident == false` should ever get here.
-    None
+/// The Stage-2 queue predicate already excludes sealed rows in SQL, but that is
+/// one layer. This is the second: a REAL runtime check (compiled into release,
+/// unlike the old `debug_assert!`) that refuses to let any sealed row cross into
+/// the LLM path. Returns `Err(CoreError::InvalidInput)` if a sealed row is ever
+/// handed to Stage-2 — a bug in the caller, surfaced loudly rather than
+/// silently leaking auth content to the model.
+///
+/// Call this on every queued row immediately before building the API request.
+pub fn stage2_sealed_guard(row: &Stage2Queued) -> crate::error::Result<()> {
+    if matches!(row.sensitivity, Sensitivity::Sealed) {
+        // Redacted: no subject/body/sender — just the invariant and the id.
+        return Err(CoreError::InvalidInput(format!(
+            "stage-2 sealed guard: message {} is sealed and must never reach the LLM",
+            row.message_id
+        )));
+    }
+    Ok(())
+}
+
+/// Back-compat guard entry kept for callers that only have a [`Sensitivity`].
+/// Replaces the old `debug_assert!`-only stub with a REAL release-mode check:
+/// returns an error for sealed input instead of compiling the assertion out.
+///
+/// The per-row orchestration now lives in [`stage2`] (prompt build, `classify`,
+/// `apply_result`) and is driven by the sync loop; this remains the minimal
+/// invariant gate.
+pub fn stage2_llm_triage(sensitivity: Sensitivity) -> crate::error::Result<()> {
+    if matches!(sensitivity, Sensitivity::Sealed) {
+        return Err(CoreError::InvalidInput(
+            "sealed content must never reach the LLM stage".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -645,5 +671,42 @@ mod tests {
         // Exercise the 3-arg public entry point (uses default config + now()).
         let m = msg("alice@friends.com", "hi", "hello");
         let _ = stage1(&m, true, &[]);
+    }
+
+    // ---- Stage-2 sealed guard (real, release-mode) ----------------------
+
+    fn queued_row(sensitivity: Sensitivity) -> Stage2Queued {
+        Stage2Queued {
+            message_id: 7,
+            account_id: 1,
+            thread_id: "t".into(),
+            from_addr: "x@y.com".into(),
+            subject: "s".into(),
+            body: "b".into(),
+            is_known_contact: false,
+            rule_want_text: None,
+            sensitivity,
+        }
+    }
+
+    #[test]
+    fn sealed_guard_rejects_sealed_row() {
+        let row = queued_row(Sensitivity::Sealed);
+        let err = stage2_sealed_guard(&row).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn sealed_guard_allows_normal_row() {
+        let row = queued_row(Sensitivity::Normal);
+        assert!(stage2_sealed_guard(&row).is_ok());
+    }
+
+    #[test]
+    fn llm_triage_guard_errors_on_sealed_in_release_semantics() {
+        // The old stub used debug_assert! (compiled out in release). This must be
+        // a REAL error return regardless of build profile.
+        assert!(stage2_llm_triage(Sensitivity::Sealed).is_err());
+        assert!(stage2_llm_triage(Sensitivity::Normal).is_ok());
     }
 }

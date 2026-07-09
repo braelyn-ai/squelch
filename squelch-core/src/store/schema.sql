@@ -105,6 +105,14 @@ CREATE TABLE IF NOT EXISTS sync_state (
     PRIMARY KEY(account_id, mailbox)
 );
 
+-- STAGE-2 BUDGET (circuit breaker). model_calls counts Anthropic API attempts
+-- (incremented BEFORE the call, so retry storms can't exceed the cap). Two
+-- accounting scopes share this one table, keyed by thread_id:
+--   * per-thread-per-day: thread_id = the message's real thread id.
+--   * global-per-account-per-day: thread_id = the sentinel '__global__' (no
+--     real Gmail thread can collide — Gmail thread ids are hex, never that
+--     literal). This avoids a schema addition; both caps are checked before
+--     each call. (Schema applies fresh; dev dbs get reset.)
 CREATE TABLE IF NOT EXISTS wake_budget (
     account_id  INTEGER NOT NULL,
     thread_id   TEXT NOT NULL,

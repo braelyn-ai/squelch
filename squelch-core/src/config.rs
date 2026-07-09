@@ -228,6 +228,72 @@ impl Default for Stage1Config {
     }
 }
 
+/// Stage-2 LLM triage tunables. The Anthropic API pass runs ONLY over rows
+/// Stage-1 left non-confident (`model_used IS NULL AND sensitivity='normal'`),
+/// under a strict per-thread + per-account daily budget.
+///
+/// Stage-2 is ENABLED BY KEY PRESENCE: it turns on only when an API key is
+/// resolvable ([`Stage2Config::api_key`] / `ANTHROPIC_API_KEY`). The `model`,
+/// caps, and budgets are all config so an operator can retune without a
+/// recompile. Env overrides follow the existing naming (`SQUELCH_MODEL`,
+/// `SQUELCH_STAGE2_*`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stage2Config {
+    /// Anthropic API key. Resolved from the config file's `anthropic_api_key`
+    /// or the standard `ANTHROPIC_API_KEY` env var (env wins). When absent,
+    /// Stage-2 is DISABLED gracefully (one stderr notice; rows stay queued).
+    /// Never logged.
+    pub anthropic_api_key: Option<String>,
+    /// The model id string. Default `claude-haiku-4-5`. Written verbatim into
+    /// the `model` request field and stored as `model_used` on applied rows.
+    pub model: String,
+    /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
+    /// The body is truncated to this and the truncation is noted in-band.
+    pub max_body_chars: usize,
+    /// How many queued rows to process per sync cycle (fetch cap).
+    pub batch_per_cycle: usize,
+    /// Per-thread-per-day API-call cap (the circuit breaker). Incremented
+    /// BEFORE the call so retry storms can't exceed it.
+    pub thread_daily_cap: u32,
+    /// NEW global-per-account-per-day API-call cap. Same increment-before
+    /// discipline, counted via a `thread_id='__global__'` sentinel row in
+    /// `wake_budget`.
+    pub global_daily_cap: u32,
+}
+
+impl Default for Stage2Config {
+    fn default() -> Self {
+        Self {
+            anthropic_api_key: None,
+            model: "claude-haiku-4-5".to_string(),
+            max_body_chars: 4000,
+            batch_per_cycle: 10,
+            thread_daily_cap: 3,
+            global_daily_cap: 200,
+        }
+    }
+}
+
+impl Stage2Config {
+    /// Resolve the API key: config-file value first, then `ANTHROPIC_API_KEY`
+    /// env (env wins, matching the rest of `apply_env_overrides`). Empty strings
+    /// are treated as absent. Never logged by callers.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Ok(v) = std::env::var("ANTHROPIC_API_KEY")
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+        self.anthropic_api_key.clone().filter(|s| !s.is_empty())
+    }
+
+    /// Stage-2 is enabled iff an API key is resolvable.
+    pub fn enabled(&self) -> bool {
+        self.resolve_api_key().is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -253,6 +319,8 @@ pub struct Config {
     pub squelch_level: u8,
     /// Stage-1 rules-engine tuning.
     pub stage1: Stage1Config,
+    /// Stage-2 LLM triage tuning (Anthropic API, budgets).
+    pub stage2: Stage2Config,
     /// Sync tunables (backfill window, poll interval).
     pub sync: SyncConfig,
 }
@@ -271,6 +339,7 @@ impl Default for Config {
             default_min_importance: 0,
             squelch_level: 0,
             stage1: Stage1Config::default(),
+            stage2: Stage2Config::default(),
             sync: SyncConfig::default(),
         }
     }
@@ -351,6 +420,35 @@ impl Config {
         }
         if let Some(p) = std::env::var_os("SQUELCH_CREDENTIALS_PATH") {
             self.credentials_path = Some(PathBuf::from(p));
+        }
+
+        // ---- Stage-2 overrides ---------------------------------------------
+        // The API key itself is resolved lazily via ANTHROPIC_API_KEY in
+        // `Stage2Config::resolve_api_key`; no need to copy it into the struct.
+        if let Ok(v) = std::env::var("SQUELCH_MODEL")
+            && !v.is_empty()
+        {
+            self.stage2.model = v;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_MAX_BODY_CHARS")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.stage2.max_body_chars = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_BATCH_PER_CYCLE")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.stage2.batch_per_cycle = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_THREAD_DAILY_CAP")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.stage2.thread_daily_cap = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.stage2.global_daily_cap = n;
         }
     }
 
@@ -594,6 +692,69 @@ backfill_days = 90
         unsafe {
             std::env::remove_var("SQUELCH_CLIENT_ID");
             std::env::remove_var("SQUELCH_BACKFILL_DAYS");
+        }
+    }
+
+    #[test]
+    fn stage2_defaults_are_sane() {
+        let c = Stage2Config::default();
+        assert_eq!(c.model, "claude-haiku-4-5");
+        assert_eq!(c.max_body_chars, 4000);
+        assert_eq!(c.batch_per_cycle, 10);
+        assert_eq!(c.thread_daily_cap, 3);
+        assert_eq!(c.global_daily_cap, 200);
+    }
+
+    #[test]
+    fn stage2_enabled_by_key_presence() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        let mut c = Stage2Config::default();
+        assert!(!c.enabled(), "no key => disabled");
+        // Config-file key enables.
+        c.anthropic_api_key = Some("sk-config".into());
+        assert!(c.enabled());
+        assert_eq!(c.resolve_api_key().as_deref(), Some("sk-config"));
+        // Env wins over config-file key.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-env");
+        }
+        assert_eq!(c.resolve_api_key().as_deref(), Some("sk-env"));
+        // Empty config-file key is treated as absent.
+        c.anthropic_api_key = Some(String::new());
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        assert!(!c.enabled());
+    }
+
+    #[test]
+    fn stage2_env_overrides() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_MODEL", "claude-opus-4-8");
+            std::env::set_var("SQUELCH_STAGE2_THREAD_DAILY_CAP", "7");
+            std::env::set_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP", "500");
+            std::env::set_var("SQUELCH_STAGE2_BATCH_PER_CYCLE", "25");
+            std::env::set_var("SQUELCH_STAGE2_MAX_BODY_CHARS", "8000");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.stage2.model, "claude-opus-4-8");
+        assert_eq!(c.stage2.thread_daily_cap, 7);
+        assert_eq!(c.stage2.global_daily_cap, 500);
+        assert_eq!(c.stage2.batch_per_cycle, 25);
+        assert_eq!(c.stage2.max_body_chars, 8000);
+        unsafe {
+            std::env::remove_var("SQUELCH_MODEL");
+            std::env::remove_var("SQUELCH_STAGE2_THREAD_DAILY_CAP");
+            std::env::remove_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP");
+            std::env::remove_var("SQUELCH_STAGE2_BATCH_PER_CYCLE");
+            std::env::remove_var("SQUELCH_STAGE2_MAX_BODY_CHARS");
         }
     }
 
