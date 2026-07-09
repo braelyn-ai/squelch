@@ -67,10 +67,22 @@ pub fn router(state: ApiState) -> Router {
         .route("/client/actions/archive", post(handlers::action_archive))
         .route("/client/actions/label", post(handlers::action_label))
         .route("/client/actions/send", post(handlers::action_send))
-        // Bearer auth wraps EVERY route above. Applied last so it is outermost.
+        // Bearer auth wraps EVERY route above.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
         ))
+        // CORS wraps auth (outermost) so OPTIONS preflights — which browsers
+        // send WITHOUT the Authorization header — are answered instead of
+        // 401ing. Permissive by design: the webview clients live on
+        // tauri://localhost / http://localhost:1420 / proxied tailnet hosts,
+        // bearer auth is the actual security boundary, and non-browser
+        // clients ignore CORS entirely. No cookies are involved.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
         .with_state(state)
 }

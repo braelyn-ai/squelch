@@ -24,6 +24,9 @@ thiserror = { workspace = true }
 # same axum 0.8 line squelch-mcp pins.
 axum = { version = "0.8" }
 tower = "0.5"
+# CORS for the desktop client's webview (tauri://localhost / vite dev origin).
+# CORS is a browser courtesy, not the security boundary — bearer auth is.
+tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = "0.7"
 # Constant-time bearer-token comparison. Already in the workspace lock graph.
 subtle = "2"

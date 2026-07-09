@@ -2476,6 +2476,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tower-http",
 ]
 
 [[package]]
