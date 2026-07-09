@@ -600,12 +600,22 @@ pub fn apply_result(
     // the email matches the user's standing instruction for the sender.
     let deadline_trusted = queued.is_known_contact || out.matches_sender_rule == Some(true);
 
-    // Parse an optional deadline timestamp.
+    // Parse an optional deadline timestamp. Apply the SAME received_at-relative
+    // sanity bounds Stage-1 uses (parity): a model-provided date more than
+    // ~1 year before, or ~3 years after, the message's receipt is treated as a
+    // bad extraction and dropped (no deadline). The model returns full ISO so
+    // year bugs are unlikely, but this keeps the two stages consistent.
+    const MAX_DAYS_PAST: i64 = 365;
+    const MAX_DAYS_FUTURE: i64 = 365 * 3;
     let due_at: Option<DateTime<Utc>> = out
         .deadline_iso
         .as_deref()
         .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-        .map(|d| d.with_timezone(&Utc));
+        .map(|d| d.with_timezone(&Utc))
+        .filter(|d| {
+            let days = (*d - queued.received_at).num_days();
+            (-MAX_DAYS_PAST..=MAX_DAYS_FUTURE).contains(&days)
+        });
 
     // Determine tier + build any deadline hit.
     let (tier, deadline) = if out.has_deadline {
@@ -715,7 +725,7 @@ mod tests {
             from_addr: "someone@example.com".into(),
             subject: "hi".into(),
             body: "hello".into(),
-            received_at: Utc::now(),
+            received_at: now(),
             is_known_contact: known,
             rule_want_text: want.map(|s| s.to_string()),
             sensitivity: Sensitivity::Normal,
@@ -913,6 +923,20 @@ mod tests {
         let a = apply_result(&q, &o, "m", now());
         assert_eq!(a.tier, Tier::PastDue);
         assert!(a.deadline.unwrap().past_due);
+    }
+
+    #[test]
+    fn absurd_model_deadline_is_dropped_no_row() {
+        // Parity with Stage-1: a model deadline more than 3 years out (or >1yr
+        // past) relative to receipt is treated as a bad extraction — no row.
+        let q = queued(true, None);
+        let mut o = out(90);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2099-01-01T00:00:00Z".into()); // absurd future
+        let a = apply_result(&q, &o, "m", now());
+        assert!(a.deadline.is_none(), "absurd model date must not persist a row");
+        // No usable date => falls back to the no-date bill: Deadline tier.
+        assert_eq!(a.tier, Tier::Deadline);
     }
 
     #[test]

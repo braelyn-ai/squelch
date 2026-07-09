@@ -550,6 +550,75 @@ mod tests {
     }
 
     #[test]
+    fn ebay_return_refund_is_not_a_past_due_bill() {
+        // The real inbox case (today = 2026-07-09): an eBay RETURN REFUND arriving
+        // "by July 13th" was mis-triaged as a past-due bill "104 weeks after due
+        // date". It must now produce NO bill tier, NO past_due, and no deadline row.
+        let eml = "From: eBay <ebay@ebay.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your return refund is on its way\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Your eBay return refund of $23.99 will be issued by July 13th.\r\n";
+        let f = raw(1, "g-ebay", eml, false);
+        let now = DateTime::parse_from_rfc3339("2026-07-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t = ingest(&f, &Stage1Config::default(), now, |_| false);
+        assert_ne!(t.tier, Tier::PastDue, "refund must not be past-due");
+        assert_ne!(t.tier, Tier::Deadline, "refund must not be a deadline");
+        assert!(t.deadline.is_none(), "no deadline row for a refund");
+    }
+
+    #[test]
+    fn yearless_genuine_bill_resolves_to_receipt_year_future() {
+        // A genuine bill "due July 13" (no year) received 2026-07-09 resolves to
+        // 2026-07-13 (this year, future) => Deadline tier, NOT past_due.
+        let eml = "From: Acme <billing@acme.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Invoice #900\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Amount due $50.00. Payment due July 13th.\r\n";
+        let f = raw(1, "g-yearless", eml, false);
+        let now = DateTime::parse_from_rfc3339("2026-07-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t = ingest(&f, &Stage1Config::default(), now, |_| true);
+        assert_eq!(t.tier, Tier::Deadline);
+        let d = t.deadline.expect("deadline extracted");
+        assert!(!d.past_due, "future year-less date is not past-due");
+        assert_eq!(
+            d.due_at,
+            DateTime::parse_from_rfc3339("2026-07-13T23:59:59Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn yearless_recently_passed_bill_is_past_due_by_days() {
+        // "due July 1" received 2026-07-09 => 2026-07-01 (past by days, within the
+        // 14-day grace) => PastDue, legitimately, not "weeks/years" late.
+        let eml = "From: Acme <billing@acme.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Invoice #901\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Amount due $50.00. Payment due July 1.\r\n";
+        let f = raw(1, "g-recent", eml, false);
+        let now = DateTime::parse_from_rfc3339("2026-07-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t = ingest(&f, &Stage1Config::default(), now, |_| true);
+        let d = t.deadline.expect("deadline extracted");
+        assert!(d.past_due);
+        // Due date is 2026-07-01, ~8 days before receipt — days, not weeks.
+        let days = (now - d.due_at).num_days();
+        assert!((7..=9).contains(&days), "past by days, got {days}");
+    }
+
+    #[test]
     fn html_only_body_is_flattened_before_triage() {
         let eml = "From: News <news@substack.com>\r\n\
                    Subject: The Weekly Roundup\r\n\
