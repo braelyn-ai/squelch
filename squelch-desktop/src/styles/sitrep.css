@@ -435,26 +435,85 @@
   font-size: 12px;
   align-items: baseline;
 }
+.rule-row {
+  cursor: default;
+  border-left: 2px solid transparent;
+}
+.rule-row:hover {
+  background: var(--bg-row);
+}
+.rule-row.sel {
+  background: var(--bg-row-sel);
+  border-left-color: var(--accent);
+}
 .rule-row .pat {
   color: var(--fg);
-  flex: 1;
+  flex: 0 0 auto;
+  width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-row .want {
+  color: var(--fg-dim);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-row .want-empty {
+  color: var(--fg-faint);
+}
+.rule-row .matches {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+.rule-row .matches.dead {
+  color: var(--fg-faint);
+  opacity: 0.55;
+}
+.rule-row .when {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  min-width: 30px;
+  text-align: right;
 }
 .rule-row .disp {
   font-size: 11px;
   border: 1px solid var(--border);
   border-radius: 3px;
   padding: 0 5px;
+  flex: 0 0 auto;
+  width: 62px;
+  text-align: center;
 }
 .disp-surface {
   color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
 }
 .disp-squelch {
   color: var(--fg-faint);
 }
 .disp-filtered {
-  color: var(--red);
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+}
+
+/* rules-view footer hint bar */
+.rules-foot {
+  position: sticky;
+  bottom: 0;
+  margin-top: 8px;
+  padding: 6px 4px 2px;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  color: var(--fg-faint);
+  font-size: 11px;
 }
 .audit-row .ts {
   color: var(--fg-faint);

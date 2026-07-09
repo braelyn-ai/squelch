@@ -227,7 +227,7 @@ export function RuleEditor({
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
           <button onClick={() => onClose()}>esc cancel</button>
           <button onClick={() => void save()} disabled={saving}>
-            {saving ? "saving…" : "save rule"}
+            {saving ? "saving…" : editRule ? "update rule" : "save rule"}
           </button>
         </div>
       </div>

@@ -22,6 +22,7 @@ import {
   onOpenRuleEditor,
   onOpenProcessMode,
   openProcessMode,
+  type RuleEditorRequest,
 } from "../components/ruleEditorBus";
 
 export function ActionLayer() {
@@ -34,11 +35,11 @@ export function ActionLayer() {
   const act = useActions();
 
   // Overlay state for the two store-less action modals (rule editor + process).
-  const [ruleSender, setRuleSender] = useState<string | null>(null);
+  const [ruleReq, setRuleReq] = useState<RuleEditorRequest | null>(null);
   const [processOpen, setProcessOpen] = useState(false);
 
   useEffect(() => {
-    const off1 = onOpenRuleEditor(({ sender }) => setRuleSender(sender));
+    const off1 = onOpenRuleEditor((req) => setRuleReq(req));
     const off2 = onOpenProcessMode(() => setProcessOpen(true));
     return () => {
       off1();
@@ -140,9 +141,15 @@ export function ActionLayer() {
       {/* Send ceremony (edit -> review -> guard verdict -> fire). */}
       {compose && <ComposeReview />}
 
-      {/* Rule editor (t) — store-less overlay via the bus. */}
-      {ruleSender !== null && (
-        <RuleEditor sender={ruleSender} onClose={() => setRuleSender(null)} />
+      {/* Rule editor — store-less overlay via the bus. Serves the `t` tune flow
+          (sender prefill) plus the rules-view create (`n`) and edit (Enter/e). */}
+      {ruleReq !== null && (
+        <RuleEditor
+          sender={ruleReq.sender}
+          editRule={ruleReq.rule ?? null}
+          onSaved={ruleReq.onSaved}
+          onClose={() => setRuleReq(null)}
+        />
       )}
 
       {/* Process mode (p) — card-by-card triage deck. */}

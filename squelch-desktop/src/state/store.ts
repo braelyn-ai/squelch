@@ -34,7 +34,7 @@ export interface SitrepData {
 
 // --- undo model -------------------------------------------------------------
 
-export type UndoKind = "archive" | "done" | "label";
+export type UndoKind = "archive" | "done" | "label" | "rule_delete";
 
 /**
  * A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click.
@@ -44,6 +44,7 @@ export type UndoKind = "archive" | "done" | "label";
 export interface PendingUndo {
   id: string;
   kind: UndoKind;
+  /** The message id for mail actions; the (now-deleted) rule id for rule_delete. */
   messageId: number;
   label: string; // human text for the toast, e.g. "archived PG&E"
   createdAt: number;
