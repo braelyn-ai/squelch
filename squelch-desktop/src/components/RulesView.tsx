@@ -165,7 +165,7 @@ export function RulesView() {
       })}
       <div className="rules-foot">
         <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>n</kbd> new · <kbd>e</kbd>/
-        <kbd>↵</kbd> edit · <kbd>x</kbd> delete · <kbd>Esc</kbd> close
+        <kbd>↵</kbd> edit · <kbd>x</kbd> delete
       </div>
     </div>
   );

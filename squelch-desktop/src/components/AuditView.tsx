@@ -169,7 +169,7 @@ export function AuditView() {
         );
       })}
       <div className="audit-foot">
-        <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>Esc</kbd> close
+        <kbd>j</kbd>/<kbd>k</kbd> select
       </div>
     </div>
   );

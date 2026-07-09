@@ -126,6 +126,16 @@ export interface BandCounts {
   open: number;
 }
 
+/**
+ * core::types::Stage2Stats — the stage-2 (LLM triage) cost/usage rollup. Optional
+ * on the wire: older servers omit it entirely, so every field is treated as
+ * best-effort by the read side. `est_cost_usd_today` is the running estimate the
+ * Sitrep status strip surfaces ("triage: $0.02 today").
+ */
+export interface Stage2Stats {
+  est_cost_usd_today?: number;
+}
+
 /** core::types::StoreStats (GET /client/stats) */
 export interface StoreStats {
   tier_counts: Record<string, number>;
@@ -134,6 +144,8 @@ export interface StoreStats {
   last_history_id: number | null;
   bands: BandCounts;
   last_surfaced_at: string | null;
+  /** Stage-2 cost/usage rollup; absent on older servers. */
+  stage2?: Stage2Stats | null;
 }
 
 /** handlers::SealedMeta (GET /client/sealed) — metadata ONLY, never bodies. */

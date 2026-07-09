@@ -3,7 +3,10 @@
 // pure lets it be unit-tested directly (see dispatchCore.test.ts) which is how we
 // proved the "modal context permanently on the stack" gating bug and its fix.
 
-export type KeyContext = "list" | "modal" | "input" | "global";
+// "sitrep" is the Sitrep dashboard's own minimal context (obligation j/k, d,
+// Enter/v). Like "list"/"modal" it composes with "global" (see dispatchCore),
+// so the global 1..5 view-nav keys keep firing while it's active.
+export type KeyContext = "list" | "sitrep" | "modal" | "input" | "global";
 
 export interface KeyBinding {
   key: string;

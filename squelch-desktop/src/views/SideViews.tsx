@@ -15,9 +15,6 @@ import type { SideView } from "../state";
 import { ThreadPane } from "../components/ThreadPane";
 import { SearchView } from "../components/SearchView";
 import { BrowseView } from "../components/BrowseView";
-import { RulesView } from "../components/RulesView";
-import { AuditView } from "../components/AuditView";
-import { AuthView } from "../components/AuthView";
 import "../styles/sitrep.css";
 
 export function SideViews() {
@@ -67,12 +64,6 @@ function SideBody({ view }: { view: SideView }) {
       return <SearchView initialQuery={view.query} />;
     case "browse":
       return <BrowseView />;
-    case "rules":
-      return <RulesView />;
-    case "audit":
-      return <AuditView />;
-    case "auth":
-      return <AuthView />;
     default:
       return null;
   }
@@ -82,16 +73,10 @@ function titleFor(v: SideView): string {
   switch (v.kind) {
     case "thread":
       return "thread";
-    case "rules":
-      return "rules audit";
     case "browse":
       return "browse — all mail";
     case "search":
       return "search";
-    case "audit":
-      return "audit log";
-    case "auth":
-      return "auth — login codes & alerts";
     default:
       return "";
   }

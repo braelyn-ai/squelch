@@ -420,7 +420,38 @@
   justify-content: space-between;
 }
 
-/* ---- side panel (thread / rules / browse / search / audit) ---- */
+/* ---- routed main view host (Auth / Rules / Audit promoted from panels) ----
+   Reuses the inner list/table styles (.auth-row / .rule-row / .audit-row),
+   just laid out as a full-width main column instead of a right-hand panel. */
+.routed-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.routed-head {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.routed-head h2 {
+  font-size: 14px;
+  font-weight: 650;
+  margin: 0;
+  color: var(--fg);
+  letter-spacing: -0.1px;
+}
+.routed-body {
+  flex: 1;
+  overflow: auto;
+  padding: 14px 20px;
+  max-width: 960px;
+  width: 100%;
+}
+
+/* ---- side panel (thread / browse / search) ---- */
 .side {
   position: fixed;
   top: 0;

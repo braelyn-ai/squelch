@@ -1,8 +1,9 @@
-export { useStore } from "./store";
+export { useStore, MAIN_VIEWS } from "./store";
 export type {
   AppState,
   SitrepData,
   BandKey,
+  MainView,
   PendingUndo,
   UndoKind,
   ConnStatus,

@@ -100,8 +100,7 @@ export function AuthView() {
       })}
 
       <div className="auth-foot">
-        <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>r</kbd>/<kbd>↵</kbd> reveal ·{" "}
-        <kbd>Esc</kbd> close
+        <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>r</kbd>/<kbd>↵</kbd> reveal
       </div>
 
       {revealing && (

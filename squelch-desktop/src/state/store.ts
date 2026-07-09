@@ -61,16 +61,35 @@ export type ConnStatus =
   | "connected"
   | "error";
 
+// --- routed main views ------------------------------------------------------
+
+/**
+ * Which primary surface the sidebar rail is showing. `sitrep` is the abstracted
+ * dashboard (the default on launch, zero email rows); `emails` is the classic
+ * band list (all its keys/behavior unchanged); auth/rules/audit are the former
+ * side panels promoted to routed views. SidePanel/overlay machinery (thread,
+ * reveal, rule editor, compose, process mode) is orthogonal to this.
+ */
+export type MainView = "sitrep" | "emails" | "auth" | "rules" | "audit";
+
+/** The rail order — also the 1..5 number-key mapping. */
+export const MAIN_VIEWS: MainView[] = [
+  "sitrep",
+  "emails",
+  "auth",
+  "rules",
+  "audit",
+];
+
 // --- transient side views ---------------------------------------------------
 
+// Side panels remaining after Auth/Rules/Audit were promoted to routed main
+// views (see MainView): thread drill-in, browse-all, and search.
 export type SideView =
   | { kind: "none" }
   | { kind: "thread"; threadId: string }
-  | { kind: "rules" }
   | { kind: "browse" }
-  | { kind: "search"; query: string }
-  | { kind: "audit" }
-  | { kind: "auth" };
+  | { kind: "search"; query: string };
 
 // --- toast (non-undo, ephemeral notices) ------------------------------------
 
@@ -89,6 +108,16 @@ export interface AppState {
   /** Test a candidate URL+token via /client/stats; on success persist + connect. */
   connect: (serverUrl: string, apiToken: string) => Promise<boolean>;
   disconnect: () => void;
+
+  // routed-view slice — which sidebar surface is active
+  activeView: MainView;
+  setView: (view: MainView) => void;
+  /**
+   * Switch to the Emails view with a specific update selected. Used by the
+   * Sitrep dashboard's "view" affordances (obligation card, attention/aging
+   * chips) to hand off to the band list with the right row focused.
+   */
+  viewInEmails: (id: number) => void;
 
   // sitrep slice
   sitrep: SitrepData;
@@ -213,8 +242,14 @@ export const useStore = create<AppState>((set, get) => ({
       settings: null,
       sitrep: emptySitrep,
       selectedId: null,
+      activeView: "sitrep",
     });
   },
+
+  // --- routed views ---------------------------------------------------------
+  activeView: "sitrep", // the abstracted dashboard is the default on launch
+  setView: (view) => set({ activeView: view }),
+  viewInEmails: (id) => set({ activeView: "emails", selectedId: id }),
 
   // --- sitrep ---------------------------------------------------------------
   sitrep: emptySitrep,

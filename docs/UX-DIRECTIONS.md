@@ -235,3 +235,70 @@ comments, wire-level enum values, and API paths are exempt.
 
 _(Avatar-favicon + icon guidance added 2026-07-09.)_
 
+---
+
+# Sidebar navigation + Sitrep as the abstracted dashboard (2026-07-09)
+
+**User decision, implementing the "abstract over single emails" principle
+structurally.** The app gains a persistent left nav and the Sitrep name is
+redefined: it is now the *fully-abstracted dashboard* (the default surface on
+launch), and the original band-list-of-email-rows chassis lives on unchanged as
+the **Emails** view.
+
+## Sidebar (icon rail)
+
+A slim ~52px icon rail (`src/components/Sidebar.tsx`) routes the primary views,
+theme-aware in both palettes, with hover tooltips and an active-state accent:
+
+1. **Sitrep** (`Gauge`) — the abstracted dashboard, default on launch.
+2. **Emails** (`Mail`) — the band list (formerly the whole "sitrep" chassis).
+3. **Auth** (`KeyRound`) — login codes / password resets / sign-in alerts.
+4. **Rules** (`SlidersHorizontal`) — sender rules.
+5. **Audit** (`ScrollText`) — agent & app actions.
+
+**Number keys 1–5 switch views** (registered in the `global` KeyContext in
+`App.tsx` so they fire from every view, including modal panels; digits were
+otherwise unbound). The rail order and the key mapping share one source of
+truth: `MAIN_VIEWS` in `src/state/store.ts` (`store.activeView` / `setView`).
+
+## Routed views vs. side panels
+
+Auth / Rules / Audit were **promoted from side panels to routed main views**
+(cleaner with a persistent rail). Their historical keybinds still work: `g`
+(auth), `T` (rules), `A` (audit) now *route to the view* instead of opening a
+panel. The three inner components are reused **verbatim** — a host
+(`src/views/RoutedView.tsx`) pushes the `modal` KeyContext they already register
+into, so their `j/k/n/e/x/r/Enter` bindings light up unchanged.
+
+**Side panels / overlays are retained** for the drill-in / ceremony surfaces:
+thread drill-in, browse-all (`a`), search (`/`), reveal, rule editor, compose,
+and process mode. The `SideView` union is trimmed to `thread | browse | search`.
+
+## Sitrep — the abstracted dashboard (zero email rows)
+
+`src/views/SitrepView.tsx` is rebuilt as four soft-card zones (light/dark aware,
+`src/styles/sitrep-dash.css`), with **no individual email rows** by design:
+
+- **(a) Obligations** — deadline cards from `band=standing`: avatar + sender,
+  amount (parsed best-effort from `one_line`; falls back to the one_line when
+  absent) + due-date chip, past-due state visually loud. Actions: **done**
+  (`d` / button, the existing status endpoint via `dispatchDone`) and **view**
+  (hands off to the Emails view with that item selected, via `viewInEmails`).
+- **(b) Attention** — aggregate only: "N new since <relative last check>"
+  (`stats.bands.new` sense + `last_surfaced_at`) plus deduped sender chips from
+  `band=new`; the zone clicks through to Emails.
+- **(c) Aging** — from `band=open` filtered to age > 7d: "N items sitting over a
+  week" + per-item sender + duration ONLY (no subjects/one_lines — abstraction);
+  each row clicks through to Emails.
+- **(d) Status strip** — auth chip (→ Auth), last sync/check relative time,
+  today's triage cost (`stats.stage2.est_cost_usd_today`, shown "triage: $0.02
+  today"; the `stage2` stats field is optional and rendered only when present),
+  and a rules-count chip (→ Rules).
+
+Each zone has its own empty state ("Nothing standing — clear board.", etc.).
+Sitrep owns a minimal `sitrep` KeyContext: `j/k` move between obligation cards,
+`d` marks the focused one done, `Enter`/`v` view it in Emails; the global 1–5
+nav composes over it. All existing Emails-view behavior, the dispatchCore
+two-pass semantics, the SidePanel conditional-mount pattern, and the themes are
+preserved.
+
