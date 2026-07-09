@@ -15,9 +15,9 @@ use crate::store::{
     Store, SyncState, TriagedMessage,
 };
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Deadline, Disposition,
-    NewMessage, SanitizedMessage, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier,
-    Update,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, ClientMessage,
+    ClientThreadView, Deadline, Disposition, NewMessage, SanitizedMessage, SearchHit, SenderRule,
+    Sensitivity, StoreStats, ThreadView, Tier, Update,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -161,13 +161,13 @@ impl SqliteStore {
 fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
-             subject, received_at, snippet, body, is_sent)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             subject, received_at, snippet, body, body_html, is_sent)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
              thread_id=excluded.thread_id, from_addr=excluded.from_addr,
              from_name=excluded.from_name, subject=excluded.subject,
              received_at=excluded.received_at, snippet=excluded.snippet,
-             body=excluded.body, is_sent=excluded.is_sent",
+             body=excluded.body, body_html=excluded.body_html, is_sent=excluded.is_sent",
         params![
             msg.account_id,
             msg.gmail_msg_id,
@@ -178,6 +178,7 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.received_at.to_rfc3339(),
             msg.snippet,
             msg.body,
+            msg.body_html,
             msg.is_sent as i64,
         ],
     )?;
@@ -360,6 +361,79 @@ impl Store for SqliteStore {
         }
 
         Ok(ThreadView {
+            thread_id: thread_id.to_string(),
+            subject,
+            messages,
+        })
+    }
+
+    fn thread_view_with_html(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+    ) -> Result<ClientThreadView> {
+        let conn = self.lock()?;
+
+        // SECURITY: identical sealed/nonexistent -> NotFound guard as
+        // `thread_view`. If ANY message in this thread is sealed, the whole
+        // thread is NotFound (indistinguishable from nonexistent), so this
+        // human-door variant never reveals a sealed thread's html either.
+        let sealed_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM triage
+             WHERE account_id=?1 AND sensitivity='sealed'
+               AND message_id IN (SELECT id FROM messages WHERE account_id=?1 AND thread_id=?2)",
+            params![account_id, thread_id],
+            |r| r.get(0),
+        )?;
+        if sealed_count > 0 {
+            return Err(CoreError::NotFound);
+        }
+
+        let subject: Option<String> = conn
+            .query_row(
+                "SELECT subject FROM messages
+                 WHERE account_id=?1 AND thread_id=?2
+                 ORDER BY received_at ASC LIMIT 1",
+                params![account_id, thread_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let subject = subject.ok_or(CoreError::NotFound)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, from_addr, from_name, received_at, body, body_html
+             FROM messages
+             WHERE account_id=?1 AND thread_id=?2
+             ORDER BY received_at ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id, thread_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let (id, from_addr, from_name, received_at, body, body_html) = row?;
+            messages.push(ClientMessage {
+                id,
+                from_addr,
+                from_name,
+                received_at: parse_dt(&received_at)?,
+                content: body,
+                html: body_html,
+            });
+        }
+        if messages.is_empty() {
+            return Err(CoreError::NotFound);
+        }
+
+        Ok(ClientThreadView {
             thread_id: thread_id.to_string(),
             subject,
             messages,
@@ -1327,6 +1401,7 @@ mod tests {
             received_at: Utc::now(),
             snippet: "want to grab lunch".to_string(),
             body: "Hey, want to grab lunch tomorrow?".to_string(),
+            body_html: None,
             is_sent: false,
         }
     }
@@ -1401,6 +1476,20 @@ mod tests {
         // Nonexistent thread also => NotFound (indistinguishable).
         let err2 = store.thread_view(acct, "does-not-exist").unwrap_err();
         assert!(matches!(err2, CoreError::NotFound));
+
+        // The human-door html variant enforces the SAME guard: a sealed thread
+        // (and a nonexistent one) are both NotFound, so html never leaks a
+        // sealed thread either.
+        assert!(matches!(
+            store.thread_view_with_html(acct, "t2").unwrap_err(),
+            CoreError::NotFound
+        ));
+        assert!(matches!(
+            store
+                .thread_view_with_html(acct, "does-not-exist")
+                .unwrap_err(),
+            CoreError::NotFound
+        ));
 
         // sealed_messages (local-only) DOES surface it.
         let sealed = store.sealed_messages(acct).unwrap();

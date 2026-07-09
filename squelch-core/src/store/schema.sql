@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS messages (
     received_at TEXT NOT NULL,
     snippet     TEXT NOT NULL,
     body        TEXT NOT NULL DEFAULT '',
+    -- Server-side-sanitized (ammonia) HTML body, NULL for plain-text-only mail.
+    -- Populated at ingest; served ONLY through the human door
+    -- (GET /client/thread/{id}). Never crosses /mcp: the agent door flattens to
+    -- `body` text only. Sealed mail stores this like `body` (storage is fine;
+    -- serving is guarded — sealed threads are NotFound on every non-local door).
+    body_html   TEXT,
     is_sent     INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, gmail_msg_id)
 );

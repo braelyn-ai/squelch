@@ -38,7 +38,11 @@ export interface AttentionUpdate extends Update {
   resolved_at: string | null;
 }
 
-/** core::types::SanitizedMessage */
+/**
+ * core::types::SanitizedMessage — the AGENT-door (/mcp) shape. TEXT ONLY; this
+ * never carries html. Retained for parity but the desktop client uses
+ * ClientThreadView (below) for the thread drill-in.
+ */
 export interface SanitizedMessage {
   id: number;
   from_addr: string;
@@ -47,11 +51,33 @@ export interface SanitizedMessage {
   content: string;
 }
 
-/** core::types::ThreadView (GET /client/thread/{id}) */
+/** core::types::ThreadView — the MCP shape (no html). */
 export interface ThreadView {
   thread_id: string;
   subject: string;
   messages: SanitizedMessage[];
+}
+
+/**
+ * core::types::ClientMessage — the HUMAN-door message shape. Adds `html`: a
+ * server-side-sanitized (ammonia) HTML string, or null for plain-text-only
+ * mail (client then falls back to `content`). Remote content is blocked by the
+ * client CSP, never at ingest.
+ */
+export interface ClientMessage {
+  id: number;
+  from_addr: string;
+  from_name: string | null;
+  received_at: string;
+  content: string;
+  html: string | null;
+}
+
+/** core::types::ClientThreadView (GET /client/thread/{id}). */
+export interface ClientThreadView {
+  thread_id: string;
+  subject: string;
+  messages: ClientMessage[];
 }
 
 /** core::types::SenderRule (GET /client/rules) */

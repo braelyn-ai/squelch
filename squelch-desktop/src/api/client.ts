@@ -23,7 +23,7 @@ import type {
   SendBody,
   SenderRule,
   StoreStats,
-  ThreadView,
+  ClientThreadView,
   UpdatesParams,
 } from "./types";
 
@@ -128,8 +128,8 @@ export function getUpdates(
   });
 }
 
-export function getThread(threadId: string): Promise<ThreadView> {
-  return request<ThreadView>(
+export function getThread(threadId: string): Promise<ClientThreadView> {
+  return request<ClientThreadView>(
     `/client/thread/${encodeURIComponent(threadId)}`,
   );
 }

@@ -229,7 +229,23 @@ pub trait Store: Send + Sync {
 
     /// MCP-facing thread view. Returns `NotFound` for a sealed thread so it is
     /// indistinguishable from a nonexistent one.
+    ///
+    /// SECURITY: the returned [`ThreadView`] carries text ONLY — never HTML. The
+    /// html-bearing variant is [`Store::thread_view_with_html`], reachable ONLY
+    /// from the human door. Keeping them as two methods returning two types is
+    /// the structural guarantee that html never crosses /mcp.
     fn thread_view(&self, account_id: AccountId, thread_id: &str) -> Result<ThreadView>;
+
+    /// HUMAN-DOOR-ONLY thread view: same sealed/nonexistent -> `NotFound`
+    /// behavior as [`Store::thread_view`], but each message additionally carries
+    /// its server-side-sanitized `html` (`None` when the mail was
+    /// plain-text-only). Used solely by squelch-api `GET /client/thread/{id}`;
+    /// MUST NOT be called from MCP, sync, or triage.
+    fn thread_view_with_html(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+    ) -> Result<crate::types::ClientThreadView>;
 
     /// MCP-facing deadlines within `within_days` (None = all). Sealed excluded.
     fn deadlines(

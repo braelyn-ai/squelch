@@ -380,6 +380,40 @@
   user-select: text;
 }
 
+/* html email rendered in a hard-sandboxed iframe. The email keeps its own
+   (usually light) background inside the frame; app chrome stays dark. */
+.email-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.email-iframe {
+  width: 100%;
+  height: 320px;
+  max-height: 65vh;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  /* internal scroll: the frame can't self-size (opaque, script-less). */
+  overflow: auto;
+}
+/* clickable "remote images blocked" affordance; hidden when no remote refs. */
+.remote-bar {
+  align-self: flex-start;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.remote-bar:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
 /* search input row */
 .search-bar {
   display: flex;

@@ -24,3 +24,4 @@ url = { workspace = true }
 reqwest = { workspace = true }
 mail-parser = { workspace = true }
 base64 = { workspace = true }
+ammonia = "4"

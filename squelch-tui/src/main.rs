@@ -293,6 +293,7 @@ fn seed_fake_data(store: &SqliteStore, account: AccountId) -> Result<()> {
             received_at: now - Duration::hours(fk.age_hours),
             snippet: fk.one_line.to_string(),
             body: fk.body.to_string(),
+            body_html: None,
             is_sent: false,
         })?;
         store.set_triage(

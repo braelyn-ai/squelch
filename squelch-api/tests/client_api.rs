@@ -28,6 +28,7 @@ fn msg(account_id: i64, gmail: &str, thread: &str, subject: &str, body: &str) ->
         received_at: chrono::Utc::now(),
         snippet: subject.to_string(),
         body: body.to_string(),
+        body_html: None,
         is_sent: false,
     }
 }
@@ -899,4 +900,67 @@ async fn stats_expose_bands_and_last_surfaced_at() {
     assert_eq!(json2["bands"]["new"], 0);
     assert_eq!(json2["bands"]["open"], 2);
     assert!(!json2["last_surfaced_at"].is_null());
+}
+
+// --- GET /client/thread/{id} carries per-message sanitized html -------------
+
+#[tokio::test]
+async fn thread_response_carries_html_field() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        // One HTML message and one plain-text message in the same thread.
+        let mut html_msg = msg(acct, "g-html", "t-html", "Newsletter", "flattened text");
+        html_msg.body_html = Some("<p>Hello <strong>world</strong></p>".to_string());
+        let h = store.upsert_message(&html_msg).unwrap();
+        store
+            .set_triage(h, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        let plain = msg(acct, "g-plain", "t-html", "Newsletter", "just text");
+        let p = store.upsert_message(&plain).unwrap();
+        store
+            .set_triage(p, acct, 55, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t-html"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let msgs = json["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    // The HTML message carries sanitized html; the plain one carries null.
+    assert_eq!(msgs[0]["html"], "<p>Hello <strong>world</strong></p>");
+    assert_eq!(msgs[1]["html"], Value::Null);
+    // Text content is always present (client fallback).
+    assert_eq!(msgs[0]["content"], "flattened text");
+}
+
+#[tokio::test]
+async fn thread_sealed_is_not_found_even_with_html() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        let mut sealed = msg(acct, "g-otp", "t-sealed", "verification code", "123456");
+        sealed.body_html = Some("<p>code 123456</p>".to_string());
+        let s = store.upsert_message(&sealed).unwrap();
+        store
+            .set_triage(
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t-sealed"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

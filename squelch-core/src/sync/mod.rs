@@ -22,6 +22,7 @@
 //! - Tokens / `Authorization` headers / message bodies are NEVER logged. Only
 //!   counts and redacted context.
 
+pub mod html;
 pub mod ingest;
 
 use std::sync::Arc;
@@ -1189,6 +1190,76 @@ mod tests {
         // And it must not appear in search results either.
         let hits = store.search(acct, "lunch", 10, 0).unwrap();
         assert!(hits.is_empty(), "sent mail must not appear in search");
+    }
+
+    // ---- HTML body: ingest sanitize + human-door serving ------------------
+
+    #[test]
+    fn html_email_stores_sanitized_html_served_by_client_thread_view() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        // An HTML email carrying dangerous markup (script, onerror, javascript:
+        // href, form) plus benign table/img/style content.
+        let eml = "From: News <news@substack.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Weekly\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <html><body><script>steal()</script>\
+                   <table><tr><td style=\"color:red\">Hello</td></tr></table>\
+                   <img src=\"https://cdn.example.com/x.png\" onerror=\"evil()\">\
+                   <a href=\"javascript:evil()\">bad</a>\
+                   <form action=\"http://evil\"><input name=\"pw\"></form>\
+                   </body></html>\r\n";
+        let f = fixture(acct, "g-html", eml, false);
+        ingest_into(&store, acct, &f, Utc::now());
+
+        // gmail_thread_id is None in `fixture`, so thread_id falls back to the
+        // message id "g-html".
+        let view = store
+            .thread_view_with_html(acct, "g-html")
+            .expect("thread present");
+        let msg = &view.messages[0];
+        let html = msg.html.as_deref().expect("html stored");
+
+        // Dangerous constructs are gone.
+        assert!(!html.to_lowercase().contains("script"));
+        assert!(!html.contains("steal"));
+        assert!(!html.to_lowercase().contains("onerror"));
+        assert!(!html.contains("evil"));
+        assert!(!html.to_lowercase().contains("javascript:"));
+        assert!(!html.to_lowercase().contains("<form"));
+        assert!(!html.to_lowercase().contains("<input"));
+        // Benign content survives recognizably.
+        assert!(html.contains("<table"));
+        assert!(html.contains("style=\"color:red\""));
+        assert!(html.contains("https://cdn.example.com/x.png"));
+
+        // The flattened text path is unaffected and still feeds triage/FTS.
+        assert!(msg.content.contains("Hello"));
+        assert!(!msg.content.contains('<'));
+    }
+
+    #[test]
+    fn plaintext_email_leaves_html_null() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let eml = "From: Alice <alice@friends.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: hi\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   plain text only, no markup\r\n";
+        let f = fixture(acct, "g-plain", eml, false);
+        ingest_into(&store, acct, &f, Utc::now());
+
+        let view = store.thread_view_with_html(acct, "g-plain").unwrap();
+        assert!(
+            view.messages[0].html.is_none(),
+            "plain-text-only mail must leave html NULL"
+        );
+        assert!(view.messages[0].content.contains("plain text only"));
     }
 
     #[test]

@@ -362,6 +362,7 @@ mod tests {
             received_at: now(),
             snippet: String::new(),
             body: body.into(),
+            body_html: None,
             is_sent: false,
         }
     }

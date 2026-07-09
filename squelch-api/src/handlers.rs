@@ -275,9 +275,11 @@ pub async fn get_thread(
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.store.clone();
     let account_id = state.account_id;
-    // thread_view returns NotFound for sealed OR nonexistent threads, keeping
-    // the two indistinguishable exactly as on the MCP surface.
-    let view = blocking(move || store.thread_view(account_id, &thread_id)).await?;
+    // thread_view_with_html returns NotFound for sealed OR nonexistent threads,
+    // keeping the two indistinguishable exactly as on the MCP surface. Unlike the
+    // MCP `thread_view`, each message additionally carries its server-side-
+    // sanitized `html` (null for plain-text-only mail) for the client to render.
+    let view = blocking(move || store.thread_view_with_html(account_id, &thread_id)).await?;
     Ok(Json(view))
 }
 

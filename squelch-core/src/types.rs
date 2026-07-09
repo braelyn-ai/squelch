@@ -191,11 +191,46 @@ pub struct SanitizedMessage {
 }
 
 /// A full thread as exposed over MCP. Sealed threads are NotFound, never this.
+///
+/// SECURITY: this type is serialized DIRECTLY by the agent door
+/// (`squelch-mcp get_thread`). It carries NO HTML — by construction (structural
+/// absence, matching the sealed philosophy), not by filtering. The HTML-bearing
+/// view for the human door is the separate [`ClientThreadView`] below, which the
+/// MCP layer never touches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadView {
     pub thread_id: String,
     pub subject: String,
     pub messages: Vec<SanitizedMessage>,
+}
+
+/// A single message body for the HUMAN DOOR: flattened text PLUS the optional
+/// server-side-sanitized HTML body. `html` is `None` for plain-text-only mail;
+/// the client falls back to rendering `content` (text) in that case.
+///
+/// This is the html-bearing sibling of [`SanitizedMessage`]. It exists as a
+/// SEPARATE type (never `#[serde(flatten)]`-ed into the MCP path) so `html` can
+/// NEVER cross the agent door — structural absence over runtime filtering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientMessage {
+    pub id: i64,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub content: String,
+    /// Server-side-sanitized HTML body, or `None` when the email was
+    /// plain-text-only. Served ONLY here (GET /client/thread/{id}).
+    pub html: Option<String>,
+}
+
+/// A full thread for the HUMAN DOOR (squelch-api `GET /client/thread/{id}`),
+/// carrying per-message sanitized HTML. Sealed threads are still `NotFound`,
+/// never this. The MCP surface uses [`ThreadView`] instead and never sees `html`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientThreadView {
+    pub thread_id: String,
+    pub subject: String,
+    pub messages: Vec<ClientMessage>,
 }
 
 /// A local rule that biases how a sender is dispositioned.
@@ -289,5 +324,69 @@ pub struct NewMessage {
     pub received_at: DateTime<Utc>,
     pub snippet: String,
     pub body: String,
+    /// Server-side-sanitized (ammonia) HTML body. `None` for plain-text-only
+    /// mail. Stored in `messages.body_html`; served ONLY through the human door.
+    /// Never crosses /mcp — the agent door serves flattened `body` text only.
+    pub body_html: Option<String>,
     pub is_sent: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// COMPILE + SERDE PROOF that the AGENT-DOOR type carries NO html: the
+    /// MCP-serialized `ThreadView`/`SanitizedMessage` JSON has no `html` key —
+    /// structural absence, not runtime filtering. (Also a compile-level proof:
+    /// `SanitizedMessage` has no `html` field, so `get_thread` physically cannot
+    /// serialize one.)
+    #[test]
+    fn mcp_thread_view_json_has_no_html_key() {
+        let tv = ThreadView {
+            thread_id: "t1".into(),
+            subject: "s".into(),
+            messages: vec![SanitizedMessage {
+                id: 1,
+                from_addr: "a@b.com".into(),
+                from_name: None,
+                received_at: Utc::now(),
+                content: "text".into(),
+            }],
+        };
+        let v = serde_json::to_value(&tv).unwrap();
+        let msg = &v["messages"][0];
+        assert!(msg.get("html").is_none(), "MCP thread view must not carry html");
+        assert!(msg.get("content").is_some());
+    }
+
+    /// The HUMAN-DOOR type DOES carry html (null when absent).
+    #[test]
+    fn client_thread_view_json_carries_html() {
+        let ctv = ClientThreadView {
+            thread_id: "t1".into(),
+            subject: "s".into(),
+            messages: vec![
+                ClientMessage {
+                    id: 1,
+                    from_addr: "a@b.com".into(),
+                    from_name: None,
+                    received_at: Utc::now(),
+                    content: "text".into(),
+                    html: Some("<p>hi</p>".into()),
+                },
+                ClientMessage {
+                    id: 2,
+                    from_addr: "a@b.com".into(),
+                    from_name: None,
+                    received_at: Utc::now(),
+                    content: "plain".into(),
+                    html: None,
+                },
+            ],
+        };
+        let v = serde_json::to_value(&ctv).unwrap();
+        assert_eq!(v["messages"][0]["html"], serde_json::json!("<p>hi</p>"));
+        // Absent html serializes as JSON null (the client falls back to text).
+        assert_eq!(v["messages"][1]["html"], serde_json::Value::Null);
+    }
 }

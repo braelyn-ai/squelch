@@ -288,6 +288,7 @@ mod tests {
             received_at: Utc::now(),
             snippet: "".into(),
             body: "".into(),
+            body_html: None,
             is_sent: false,
         };
         let nid = store.upsert_message(&normal).unwrap();

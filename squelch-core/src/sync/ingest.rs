@@ -13,6 +13,7 @@
 
 use crate::config::Stage1Config;
 use crate::store::TriagedMessage;
+use crate::sync::html::sanitize_email_html;
 use crate::triage::seal::{self, SealInput};
 use crate::triage::stage1_with_config;
 use crate::types::{AccountId, NewMessage, Sensitivity, Tier};
@@ -274,40 +275,73 @@ pub fn ingest(
     }
 
     // Extract fields with graceful fallbacks for malformed mail.
-    let (from_addr, from_name, subject, received_at, thread_id, msg_id_hdr, text) = match &parsed {
-        Some(m) => {
-            let (fa, fname) = m.from().map(first_addr).unwrap_or_default();
-            let subject = m.subject().unwrap_or("").to_string();
-            let received = m
-                .date()
-                .and_then(|d| DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok())
-                .map(|d| d.with_timezone(&Utc))
-                .or(fetched.internal_date)
-                .unwrap_or(now);
-            // Prefer a plain-text body; fall back to HTML flattened to text.
-            let text = if m.text_body_count() > 0 {
-                m.body_text(0).map(|c| c.into_owned()).unwrap_or_default()
-            } else if m.html_body_count() > 0 {
-                html_to_text(&m.body_html(0).map(|c| c.into_owned()).unwrap_or_default())
-            } else {
-                String::new()
-            };
-            let thr = fetched
-                .gmail_thread_id
-                .clone()
-                .or_else(|| fallback_thread_id(m));
-            (fa, fname, subject, received, thr, m.message_id().map(|s| s.to_string()), text)
-        }
-        None => (
-            String::new(),
-            None,
-            String::new(),
-            fetched.internal_date.unwrap_or(now),
-            fetched.gmail_thread_id.clone(),
-            None,
-            String::new(),
-        ),
-    };
+    #[allow(clippy::type_complexity)]
+    let (from_addr, from_name, subject, received_at, thread_id, msg_id_hdr, text, body_html) =
+        match &parsed {
+            Some(m) => {
+                let (fa, fname) = m.from().map(first_addr).unwrap_or_default();
+                let subject = m.subject().unwrap_or("").to_string();
+                let received = m
+                    .date()
+                    .and_then(|d| DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok())
+                    .map(|d| d.with_timezone(&Utc))
+                    .or(fetched.internal_date)
+                    .unwrap_or(now);
+                // Prefer a plain-text body; fall back to HTML flattened to text.
+                // This flattened `text` is the UNCHANGED path that feeds triage,
+                // FTS, and the agent door — it must not be affected by the HTML
+                // work below.
+                let text = if m.text_body_count() > 0 {
+                    m.body_text(0).map(|c| c.into_owned()).unwrap_or_default()
+                } else if m.html_body_count() > 0 {
+                    html_to_text(&m.body_html(0).map(|c| c.into_owned()).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                // Separately: capture the RENDERED HTML body (when present) and
+                // sanitize it server-side for the human door. `None` for
+                // plain-text-only mail (leaves body_html NULL). This never feeds
+                // triage/FTS/MCP — only GET /client/thread/{id}.
+                //
+                // IMPORTANT: mail-parser's `body_html(0)` SYNTHESIZES HTML from a
+                // text/plain part when no real HTML alternative exists (it wraps
+                // the text in <p> tags), and `html_body_count()` counts that
+                // synthetic entry. We must NOT store that — a genuinely
+                // plain-text-only email has to leave body_html NULL. So we check
+                // the actual part type (`is_text_html`) and only capture a REAL
+                // `text/html` MIME part.
+                let body_html = m
+                    .html_part(0)
+                    .filter(|p| p.is_text_html())
+                    .and_then(|_| m.body_html(0))
+                    .map(|c| sanitize_email_html(&c))
+                    .filter(|s| !s.trim().is_empty());
+                let thr = fetched
+                    .gmail_thread_id
+                    .clone()
+                    .or_else(|| fallback_thread_id(m));
+                (
+                    fa,
+                    fname,
+                    subject,
+                    received,
+                    thr,
+                    m.message_id().map(|s| s.to_string()),
+                    text,
+                    body_html,
+                )
+            }
+            None => (
+                String::new(),
+                None,
+                String::new(),
+                fetched.internal_date.unwrap_or(now),
+                fetched.gmail_thread_id.clone(),
+                None,
+                String::new(),
+                None,
+            ),
+        };
 
     // A gmail_msg_id is required to key the row. Fall back to Message-ID, then a
     // hash of the raw bytes so nothing collides on an empty string.
@@ -355,6 +389,7 @@ pub fn ingest(
         received_at,
         snippet,
         body: text.clone(),
+        body_html,
         is_sent: fetched.is_sent,
     };
 
