@@ -20,5 +20,8 @@
     "noFallthroughCasesInSwitch": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Test files run under `bun test` (which provides the `bun:test` module and
+  // Bun globals), not the vite/tsc app build — exclude them from typecheck/build.
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

@@ -24,7 +24,6 @@ import {
   dispatchArchive,
   dispatchDone,
   dispatchReply,
-  dispatchTuneSender,
 } from "../lib/dispatch";
 import "../styles/sitrep.css";
 
@@ -138,15 +137,9 @@ export function SitrepView() {
           if (u) void dispatchDone(u);
         },
       },
-      {
-        key: "t",
-        description: "tune sender",
-        handler: () => {
-          if (sealedFocusId !== null) return;
-          const u = selectedUpdate();
-          if (u) dispatchTuneSender(u);
-        },
-      },
+      // NOTE: `t` (tune sender) is registered by ActionLayer, which owns the tune
+      // overlay. It used to be double-registered here too; removed to avoid a
+      // silent collision in the "list" context.
       {
         key: "a",
         description: "browse all",

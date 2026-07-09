@@ -21,6 +21,19 @@ import "../styles/sitrep.css";
 
 export function SideViews() {
   const sideView = useStore((s) => s.sideView);
+
+  // CRITICAL: only mount the panel (and thus push the "modal" KeyContext) while a
+  // side view is actually open. This component is always mounted by <Main>, so if
+  // the modal context were pushed here unconditionally it would sit on top of the
+  // context stack forever — permanently gating out the entire "list" keymap
+  // (j/k/Enter/t/T/e/d/…) and leaving Escape as the only working key. Pushing the
+  // context lives in <SidePanel>, which mounts only when kind !== "none".
+  if (sideView.kind === "none") return null;
+
+  return <SidePanel sideView={sideView} />;
+}
+
+function SidePanel({ sideView }: { sideView: SideView }) {
   const close = useStore((s) => s.closeSide);
 
   useKeyContext("modal");
@@ -29,8 +42,6 @@ export function SideViews() {
     [close],
   );
   useKeys("modal", bindings, [bindings]);
-
-  if (sideView.kind === "none") return null;
 
   return (
     <aside className="side">
