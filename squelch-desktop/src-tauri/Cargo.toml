@@ -1,0 +1,29 @@
+[package]
+name = "squelch-desktop"
+version = "0.1.0"
+description = "squelch desktop client"
+authors = ["braelyn"]
+edition = "2021"
+
+# NOTE: intentionally NOT a member of the root workspace (see root Cargo.toml
+# `exclude`). This crate has its own lockfile and pins its own deps.
+
+[lib]
+name = "squelch_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Secure OS-keyring storage for the server URL + API token. Version-matched to
+# the workspace's keyring pin (v4); v4 has no feature flags — the platform
+# credential stores (apple/windows/secret-service) are pulled in by default.
+keyring = "4"
+
+[features]
+# Kept for parity with the tauri template; no custom protocol features used.
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["squelch-core", "squelch-mcp", "squelch-tui", "squelch-api", "squelchd"]
+exclude = ["squelch-desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

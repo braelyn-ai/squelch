@@ -1,0 +1,158 @@
+/* squelch-desktop global styles. Dark, dense, terminal-adjacent. Hand-rolled;
+   no design system. View agents may add CSS modules per view. */
+
+:root {
+  --bg: #0b0d0e;
+  --bg-raised: #121618;
+  --bg-row: #14191b;
+  --bg-row-sel: #1d262a;
+  --border: #232b2e;
+  --fg: #d5dbdc;
+  --fg-dim: #8a9698;
+  --fg-faint: #5a6567;
+  --accent: #4fd6a8;
+  --red: #ff5c57;
+  --amber: #f0c674;
+  --yellow: #e6db74;
+  --blue: #6aa9ff;
+  --lock: #b48ead;
+
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo,
+    Consolas, monospace;
+
+  --row-h: 26px;
+  --gap: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Tabular numerals everywhere numbers matter (importance, counts, dates). */
+.num,
+.mono {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+}
+
+/* The squelch line — the visible noise divider. */
+.squelch-line {
+  border: none;
+  border-top: 1px dashed var(--border);
+  margin: var(--gap) 0;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover {
+  border-color: var(--fg-faint);
+}
+button:focus-visible,
+input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--fg);
+  background: #0f1416;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 8px;
+}
+
+kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  color: var(--fg-dim);
+}
+
+.app-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Connect screen */
+.connect {
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+.connect-card {
+  width: 380px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 22px;
+}
+.connect-card h1 {
+  font-size: 15px;
+  margin: 0 0 4px;
+  letter-spacing: 0.5px;
+}
+.connect-card .sub {
+  color: var(--fg-dim);
+  margin: 0 0 18px;
+  font-size: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.field label {
+  color: var(--fg-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.err {
+  color: var(--red);
+  font-size: 12px;
+  margin: 4px 0 10px;
+}
+
+.placeholder-view {
+  padding: 16px;
+  color: var(--fg-dim);
+}
+.placeholder-view h2 {
+  color: var(--fg);
+  font-size: 13px;
+  margin: 0 0 6px;
+}
