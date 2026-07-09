@@ -13,7 +13,7 @@ import type { SealedMeta } from "../api";
 import { useStore } from "../state";
 import { useKeys } from "../keys";
 import { relAge } from "../lib/format";
-import { authKindLabel } from "../lib/authCopy";
+import { authKindLabel, authKindIcon } from "../lib/authCopy";
 import { Avatar } from "./Avatar";
 import { RevealPanel } from "./RevealPanel";
 
@@ -70,6 +70,7 @@ export function AuthView() {
     <div className="auth-list">
       {items.map((m, i) => {
         const sel = i === idx;
+        const KindIcon = authKindIcon(m.kind);
         return (
           <div
             key={m.id}
@@ -87,7 +88,9 @@ export function AuthView() {
               {m.subject}
             </span>
             <span className="meta">
-              <span className="auth-kind">{authKindLabel(m.kind)}</span>
+              <span className="auth-kind">
+                <KindIcon size={13} /> {authKindLabel(m.kind)}
+              </span>
               <span className="age">{relAge(m.received_at)}</span>
               {sel && <span className="verbs">[r] reveal</span>}
             </span>

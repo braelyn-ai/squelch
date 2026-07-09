@@ -3,6 +3,7 @@
 // theme is flipped from elsewhere (the '\' keybinding in SitrepView).
 
 import { useEffect, useState } from "react";
+import { Sun, Moon } from "lucide-react";
 import { currentTheme, toggleTheme, type Theme } from "../state/theme";
 
 // Module-level listeners so any toggle (button or keybind) notifies all mounts.
@@ -34,7 +35,7 @@ export function ThemeToggle() {
       title={`${dark ? "light" : "dark"} mode (\\)`}
       aria-label={`switch to ${dark ? "light" : "dark"} mode`}
     >
-      {dark ? "☀" : "☾"}
+      {dark ? <Sun size={16} /> : <Moon size={16} />}
     </button>
   );
 }

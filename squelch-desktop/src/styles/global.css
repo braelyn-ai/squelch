@@ -224,6 +224,23 @@ kbd {
   flex-direction: column;
 }
 
+/* ---- inline lucide icons ------------------------------------------------- */
+/* Icons render as <svg> inheriting currentColor, so they follow theme + the
+   surrounding text tone automatically. Nudge them onto the text baseline and
+   give inline label spans a small gap so glyph + text read as one unit. */
+svg.lucide {
+  display: inline-block;
+  vertical-align: -0.15em;
+  flex: 0 0 auto;
+}
+.auth-kind,
+.kind-tag,
+.banner-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
 /* ---- theme toggle button (header) ---------------------------------------- */
 .theme-toggle {
   padding: 4px 8px;
@@ -366,6 +383,14 @@ kbd {
 .avatar-7 { background: var(--av-7); }
 .avatar-8 { background: var(--av-8); }
 .avatar-9 { background: var(--av-9); }
+/* Robot-sender favicons: round-cropped like initials, on a neutral tile with a
+   subtle border so light logos still read on the light theme. */
+.avatar-favicon {
+  object-fit: cover;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  padding: 1px;
+}
 /* Known-contact accent: a subtle ring in the signal accent. */
 .avatar.known {
   box-shadow: 0 0 0 2px var(--bg-raised), 0 0 0 3px var(--accent);

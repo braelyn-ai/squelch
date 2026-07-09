@@ -4,6 +4,7 @@
 // code arriving is worth noticing near the top). Pulls straight from
 // store.sitrep.stats; degrades gracefully before first poll.
 
+import { KeyRound } from "lucide-react";
 import type { StoreStats } from "../api";
 import { lastChecked } from "../lib/format";
 import { ThemeToggle } from "./ThemeToggle";
@@ -60,7 +61,7 @@ export function SitrepHeader({
             onClick={onOpenAuth}
             title="login codes, password resets & sign-in alerts (g)"
           >
-            🔑 {authCount}
+            <KeyRound size={14} /> {authCount}
           </button>
         )}
         <button

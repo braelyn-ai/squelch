@@ -198,9 +198,40 @@ comments, wire-level enum values, and API paths are exempt.
   band. Escalating visual weight still ramps for multi-day/week items; fresh open
   rows read calm and show the plain relative time. New rows never carry it;
   Standing rows keep their deadline chip.
-- **No remote avatar/asset services, ever (privacy).** Sender avatars are
-  derived locally — initials from the display name (fallback: address
-  local-part) over a deterministic, theme-aware color palette hashed from the
-  address. Never fetch Gravatar, favicons, or any remote avatar/asset: it would
-  leak the correspondent graph off-device.
+- **Sender avatars are local initials for humans; favicons for robots only
+  (privacy).** By default sender avatars are derived locally — initials from the
+  display name (fallback: address local-part) over a deterministic, theme-aware
+  color palette hashed from the address. **Human correspondents NEVER trigger a
+  network fetch** (no Gravatar, no favicon): resolving a human's avatar remotely
+  would leak the human correspondent graph off-device, and that must never
+  happen. The **only** exception is **robot senders** — automated mailboxes whose
+  local-part matches known service shapes (`no-reply`, `notifications`, `alerts`,
+  `billing`, `receipts`, `support`, `security`, `newsletter`, … see `ROBOT_LOCAL`
+  in `lib/avatar.ts`, matched on the segment before any `+tag`). For those we show
+  the sending domain's favicon from DuckDuckGo's icon service
+  (`https://icons.duckduckgo.com/ip3/<base-domain>.ico`). The base domain is
+  derived by peeling one leading mail-ish subdomain label
+  (`mail.`/`email.`/`notifications.`/… , two-label minimum). This is a **one
+  cached hit per domain**, not a per-message beacon: verdicts (`ok`/`failed`) are
+  cached per-domain in memory + `localStorage` (`squelch.favicons`), so each
+  domain resolves at most once and an `img` error / blank response falls back to
+  the initials avatar forever. A robot mailbox names a service, not a person, so
+  this leaks nothing about who a human talks to. Favicons are round-cropped with a
+  subtle border so light logos read on the light theme. (CSP: `img-src` allows
+  `https://icons.duckduckgo.com`.)
+- **Icons, not emojis.** User-facing glyphs use `lucide-react` icons, never emoji
+  or dingbat characters (emoji render inconsistently across platforms/themes and
+  ignore our color tokens). Import icons individually for tree-shaking; size them
+  16–18px inline and let them inherit `currentColor` so they follow the theme and
+  the surrounding text tone automatically. Keep tier/state COLOR semantics via the
+  existing CSS vars — an icon may replace a colored dot where it reads better, but
+  the color meaning stays. Current mappings: auth pills/chips → `KeyRound`; theme
+  toggle → `Sun`/`Moon`; reveal banner → `Lock`; bands → `TriangleAlert`
+  (Standing) / `Sparkles` (Since last check) / `Hourglass` (Still open); auth
+  kinds (`AuthView`/`RevealPanel`, via `authKindIcon`) → `KeyRound` (login code) /
+  `LockKeyhole` (password reset) / `MailCheck` (sign-in link) / `ShieldAlert`
+  (sign-in alert) / `BadgeCheck` (verification). Keyboard-notation characters in
+  `<kbd>`/hints (`↵`, `⌘`, `→`, `\`) are keycaps, not emoji, and stay.
+
+_(Avatar-favicon + icon guidance added 2026-07-09.)_
 

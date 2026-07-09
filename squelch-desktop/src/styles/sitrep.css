@@ -78,7 +78,8 @@
   border-bottom: 1px solid var(--border);
 }
 .band-head .glyph {
-  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
 }
 .band-head .count {
   color: var(--fg-dim);

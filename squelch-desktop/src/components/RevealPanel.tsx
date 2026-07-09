@@ -6,11 +6,12 @@
 // Unmount nulls the state; the panel is rendered only while a reveal is active.
 
 import { useEffect, useMemo, useState } from "react";
+import { Lock } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { RevealedSealed, SealedMeta } from "../api";
 import { useKeys, useKeyContext } from "../keys";
 import { dateTime } from "../lib/format";
-import { authKindLabel } from "../lib/authCopy";
+import { authKindLabel, authKindIcon } from "../lib/authCopy";
 
 export interface RevealPanelProps {
   meta: SealedMeta;
@@ -28,6 +29,8 @@ export function RevealPanel({ meta, onClose }: RevealPanelProps) {
     [onClose],
   );
   useKeys("modal", bindings, [bindings]);
+
+  const KindIcon = authKindIcon(meta.kind);
 
   useEffect(() => {
     let alive = true;
@@ -56,7 +59,9 @@ export function RevealPanel({ meta, onClose }: RevealPanelProps) {
     <div className="reveal-panel" onClick={onClose}>
       <div className="reveal-card num" onClick={(e) => e.stopPropagation()}>
         <div className="banner">
-          <span>🔒 sensitive · one-time reveal · not stored</span>
+          <span className="banner-label">
+            <Lock size={14} /> sensitive · one-time reveal · not stored
+          </span>
           <span>
             <kbd>Esc</kbd> close
           </span>
@@ -66,7 +71,12 @@ export function RevealPanel({ meta, onClose }: RevealPanelProps) {
           {(revealed?.from_name ? `${revealed.from_name} · ` : "") + meta.sender}
           {" · "}
           {dateTime(meta.received_at)}
-          {meta.kind ? ` · ${authKindLabel(meta.kind)}` : ""}
+          {meta.kind && (
+            <span className="kind-tag">
+              {" · "}
+              <KindIcon size={13} /> {authKindLabel(meta.kind)}
+            </span>
+          )}
         </div>
 
         {loading && <div className="side-loading">revealing…</div>}

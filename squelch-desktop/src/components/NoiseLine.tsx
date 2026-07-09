@@ -4,6 +4,8 @@
 // compact pill sits here too (a login code arriving is worth a glance) and opens
 // the Auth tab.
 
+import { KeyRound } from "lucide-react";
+
 export interface NoiseLineProps {
   noiseCount: number;
   authCount: number;
@@ -29,8 +31,8 @@ export function NoiseLine({
           onClick={onOpenAuth}
           title="login codes, password resets & sign-in alerts"
         >
-          🔑 {authCount} auth {authCount === 1 ? "message" : "messages"}{" "}
-          <kbd>g</kbd>
+          <KeyRound size={14} /> {authCount} auth{" "}
+          {authCount === 1 ? "message" : "messages"} <kbd>g</kbd>
         </button>
       )}
       <span className="knob">
