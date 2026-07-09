@@ -99,6 +99,130 @@ fn collect_addrs(addr: &Address, out: &mut Vec<String>) {
     }
 }
 
+/// Heuristic: does `addr` look like a machine/robot address rather than a real
+/// person? Used ONLY to filter recipient contact seeding, so Gmail's
+/// mailto-unsubscribe traffic (real emails sent to unsubscribe/leave/optout
+/// robots) never becomes a "person I know" contact and pollutes triage.
+///
+/// Kept deliberately simple — obvious rules over cleverness. It combines:
+///   * local-part prefixes/patterns (unsub, leave-, optout, bounce, noreply…),
+///   * domain first-label hints (unsub., leave., bounce., optout.…),
+///   * token-like locals (long hex/UUID blobs, or multiple +-separated
+///     UUID-ish segments) that no human picks as an address.
+///
+/// A real local part like `rentbikes.net` must pass (short, has vowels, not a
+/// hex blob), and so must ordinary `first@domain.com` addresses.
+pub fn is_robot_address(addr: &str) -> bool {
+    let addr = addr.trim().to_ascii_lowercase();
+    let (local, domain) = match addr.split_once('@') {
+        Some((l, d)) if !l.is_empty() && !d.is_empty() => (l, d),
+        // No parseable local@domain — not our concern here; let it through.
+        _ => return false,
+    };
+
+    // --- Domain first-label hints (e.g. leave.mcmap.chase.com, unsub.beehiiv.com)
+    let first_label = domain.split('.').next().unwrap_or("");
+    const DOMAIN_ROBOT_LABELS: &[&str] =
+        &["unsub", "unsubscribe", "leave", "bounce", "optout", "opt-out"];
+    if DOMAIN_ROBOT_LABELS.contains(&first_label) {
+        return true;
+    }
+
+    // --- Local-part prefixes/patterns.
+    // The + is the plus-address boundary; segment on it so a prefix on ANY
+    // +-segment (e.g. "unsubscribe-mc.us22_...") is caught.
+    const LOCAL_ROBOT_PREFIXES: &[&str] = &[
+        "unsubscribe",
+        "unsub",
+        "leave-",
+        "optout",
+        "opt-out",
+        "bounce",
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "list-",
+    ];
+    let plus_segments: Vec<&str> = local.split('+').collect();
+    for seg in &plus_segments {
+        for p in LOCAL_ROBOT_PREFIXES {
+            if seg.starts_with(p) {
+                return true;
+            }
+        }
+        // "*.optout" style suffix on a segment (e.g. dxirq3pb.560xwm.9t9eb.optout).
+        if seg.ends_with(".optout") || seg.ends_with("-optout") {
+            return true;
+        }
+    }
+
+    // --- Token-like locals: opaque machine blobs no human would choose.
+    // Multiple +-separated UUID-ish segments (beehiiv style).
+    let uuidish_segments = plus_segments.iter().filter(|s| looks_uuidish(s)).count();
+    if uuidish_segments >= 1 && plus_segments.len() >= 2 {
+        return true;
+    }
+    // A single segment that is itself a UUID or a long hex/token blob.
+    for seg in &plus_segments {
+        if looks_uuidish(seg) || is_hex_blob(seg) {
+            return true;
+        }
+    }
+
+    // A long opaque alnum run (>=25 chars) with a machine-token character mix:
+    // digits present AND a low vowel ratio. Break the local on the usual
+    // separators and inspect each run so a real dotted name (rentbikes.net)
+    // never trips it — its runs are short and vowel-rich.
+    for run in local.split(['.', '-', '_', '=']) {
+        if is_token_blob(run) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// A long random-looking machine token: >=25 alphanumeric chars, containing at
+/// least one digit, with a low vowel ratio (<20%). Human words — even long ones
+/// — carry far more vowels; random ids skimp on them and pepper in digits.
+fn is_token_blob(s: &str) -> bool {
+    if s.len() < 25 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let has_digit = s.bytes().any(|b| b.is_ascii_digit());
+    if !has_digit {
+        return false;
+    }
+    let vowels = s.bytes().filter(|b| b"aeiou".contains(b)).count();
+    // Low vowel density is the tell of a random token.
+    vowels * 5 < s.len()
+}
+
+/// A UUID shape: 8-4-4-4-12 hex groups separated by hyphens.
+fn looks_uuidish(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    if groups.len() != 5 {
+        return false;
+    }
+    let lens = [8, 4, 4, 4, 12];
+    groups
+        .iter()
+        .zip(lens.iter())
+        .all(|(g, &n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A long opaque hex/token blob: >=20 chars drawn only from [0-9a-f-] (and not a
+/// human-readable dotted name). Real names like `rentbikes.net` contain letters
+/// outside a-f and stay well under the threshold, so they pass.
+fn is_hex_blob(s: &str) -> bool {
+    if s.len() < 20 {
+        return false;
+    }
+    // Only hex digits and hyphens — a machine token, not a word.
+    s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
 /// Derive a stable thread key from headers when X-GM-THRID is unavailable.
 /// Uses the root References id, else In-Reply-To, else this message's own
 /// Message-ID. This keeps a reply chain grouped without Gmail's THRID.
@@ -210,6 +334,11 @@ pub fn ingest(
     recipients.retain(|r| {
         let lc = r.trim().to_ascii_lowercase();
         if lc.is_empty() || lc == self_addr || lc == from_lc || seen.contains(&lc) {
+            return false;
+        }
+        // Drop machine/robot recipients (Gmail mailto-unsubscribe traffic goes to
+        // real addresses that must never become "people I know" contacts).
+        if is_robot_address(&lc) {
             return false;
         }
         seen.push(lc);
@@ -463,6 +592,55 @@ mod tests {
         let f = raw(1, "g-recv", eml, /* is_sent */ false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert!(t.recipients.is_empty());
+    }
+
+    #[test]
+    fn robot_addresses_are_filtered() {
+        // Every one of these is a live example that MUST be filtered.
+        let robots = [
+            "leave-HXZRUFGHTN2UJLNONA7FQQ27HY.110064@leave.mcmap.chase.com",
+            "9b284cf8-cebd-451c-95f9-cb939dc4682d+dac84f53-1111-2222-3333-444455556666+xyz@unsub.beehiiv.com",
+            "unsubscribe-mc.us22_89497e127e8f1447718905808.aef79637c2-4c8c73a87a@unsubscribe.mailchimpapp.net",
+            "dxirq3pb.560xwm.9t9eb.optout@e2ma.net",
+            "unsubscribe@gf.d.sender-sib.com",
+            "unsubscribe@unsub.spmta.com",
+            "d6f58aa9b599316889f7d3cc20bf13bc@hous.craigslist.org",
+            "1axcsnai4asp830zv6mplv6pvulamp169hk3nf-bboynton97=gmail.com@bf02.na2.hubspotemail.net",
+            "097a2550-566e-11e6-83f0-002590e879ee@unsub.r.groupon.com",
+        ];
+        for r in robots {
+            assert!(is_robot_address(r), "should be filtered as robot: {r}");
+        }
+    }
+
+    #[test]
+    fn real_people_survive() {
+        // Real people that MUST pass through as contacts.
+        let people = [
+            "ellie@elliehuxtable.com",
+            "bam@bamteamre.com",
+            "cameron@tcpre.com",
+            "rentbikes.net@gmail.com",
+        ];
+        for p in people {
+            assert!(!is_robot_address(p), "should NOT be filtered: {p}");
+        }
+    }
+
+    #[test]
+    fn sent_mail_drops_robot_recipients_keeps_people() {
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Alice <alice@friends.com>, unsubscribe@unsub.spmta.com\r\n\
+                   Cc: d6f58aa9b599316889f7d3cc20bf13bc@hous.craigslist.org\r\n\
+                   Subject: mixed\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   body\r\n";
+        let f = raw(1, "g-mixed", eml, true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.recipients.iter().any(|r| r == "alice@friends.com"));
+        assert!(!t.recipients.iter().any(|r| r.contains("unsub")));
+        assert!(!t.recipients.iter().any(|r| r.contains("craigslist")));
     }
 
     #[test]
