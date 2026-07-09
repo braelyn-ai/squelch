@@ -10,7 +10,7 @@
 // remain SidePanel/overlay surfaces, orthogonal to the routed view.
 
 import { useEffect, useMemo } from "react";
-import { useStore, useSitrep } from "./state";
+import { useStore, useSitrep, useAuthArrival } from "./state";
 import { MAIN_VIEWS } from "./state";
 import { useKeys } from "./keys";
 import { Connect } from "./views/Connect";
@@ -48,6 +48,8 @@ export function App() {
 function Main() {
   // Polling hook drives the sitrep read model (10s + on focus).
   useSitrep();
+  // Watches sealed metadata for fresh auth arrivals → ring + code modal.
+  useAuthArrival();
 
   const activeView = useStore((s) => s.activeView);
   const setView = useStore((s) => s.setView);

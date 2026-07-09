@@ -302,3 +302,80 @@ nav composes over it. All existing Emails-view behavior, the dispatchCore
 two-pass semantics, the SidePanel conditional-mount pattern, and the themes are
 preserved.
 
+## 2FA — "present, don't read" (2026-07-09)
+
+**Thesis:** people don't *read* login-code emails — they request a code, glance
+at it, and move on. The client should present the code, not the message. Under
+`gmail.readonly` we can't (and don't want to) mark anything read in Gmail; the
+**seen-set + the ring's expiry ARE the read state**, and the Auth tab stays a
+calm history rather than an unread pile.
+
+- **Arrival detection** (`src/state/useAuthArrival.ts`) rides the existing 10s
+  sealed-metadata poll (`useSitrep`). A persisted seen-set
+  (`localStorage["squelch.auth-seen"]`, capped ~200 ids) records every sealed id
+  we've processed. On the first tick of a session the whole current backlog is
+  seeded **silently** so history never fires. Thereafter a sealed entry that is
+  *not* in the set and whose `received_at` is within ~2 minutes counts as a fresh
+  arrival and fires the flow **once** (late-arriving history is recorded as seen
+  but stays quiet).
+- **Ring timer** (`src/components/AuthRing.tsx`, store `authRings` + `RING_MS`):
+  the auth rail icon gains an SVG countdown ring — a 60s `stroke-dashoffset`
+  sweep (pure CSS keyframes, `--ring-circ` = circumference), rotated to start at
+  12 o'clock — that removes itself `onAnimationEnd`. Both themes; stroke is the
+  `--lock` accent. If the app mounts mid-sweep the animation is shortened to the
+  remaining time so it never over-runs. The ring fires for **every** auth kind
+  (resets and sign-in alerts included).
+- **Code modal** (`src/components/AuthCodeModal.tsx`) fires for code kinds only
+  (`otp` / `login_code` / `verification`; resets/alerts get the ring but no
+  modal). On arrival we **auto-reveal** the body (`api.revealSealed`, which the
+  server audits — every auto-reveal writes an audit row, same as a manual one)
+  and extract the code client-side (`src/lib/authCode.ts`): prefer a 4–8 digit
+  run **closest** to a code word (code / verification / OTP / one-time / pin,
+  ±80 chars), else the longest standalone 4–8 digit run; space/hyphen-split codes
+  are re-joined. If nothing is found the modal shows sender + kind with an **Open
+  Auth** button instead of a code. The modal is a conditional-mount overlay in
+  its own `modal` KeyContext (canonical pattern): sender avatar +
+  `senderDisplayName` + kind label, the code **huge** (mono, letter-spaced),
+  **Copy** (`c`; `navigator.clipboard` with a hidden-textarea fallback for the
+  Tauri webview — no new plugin needed) and **Dismiss** (`Esc`/`Enter`). The code
+  lives in store state only and is dropped from the queue on dismiss; multiple
+  arrivals queue **newest-first**.
+
+## Newsletters — the rule-onboarding surface (2026-07-09)
+
+A fifth Sitrep zone (after Aging, before the status strip;
+`src/lib/newsletters.ts` + `NewslettersZone` in `SitrepView.tsx`). It turns the
+recurring noise pile into the place the product **teaches the rule (Minga) flow**
+— "choose what you want to see" — instead of nagging.
+
+- **Data:** fetches `tier=noise` updates (`limit 200`) plus `listRules()`,
+  filters to the last 7 days client-side (the wire `AttentionUpdate` carries no
+  `received_at`, so we date on `surfaced_at`), and groups by sender address.
+- **Heuristic** (calibrated against `squelch-core/src/triage` rung-5 reason
+  strings, read-only): a sender qualifies when its reason matches the
+  newsletter/bulk shape — the engine's exact literal is
+  `"bulk/list mail (unsubscribe footer)"` (we substring-match `"unsubscribe
+  footer"`, with an `unsubscribe|newsletter|marketing|digest|…` backstop) — **or**
+  it's a robot/brand sender (`isRobotSender`/`isBrandSender`) with ≥2 noise
+  messages in the window. Senders whose window is **entirely receipts** are
+  excluded via the distinct `"order confirmation / receipt"` reason (plus an
+  `order|receipt|shipment|tracking` backstop); a sender with both newsletter and
+  receipt evidence still qualifies.
+- **Cards:** avatar + `senderDisplayName`, "N this week", latest `one_line`
+  truncated as the summary. **Rule state:** if a rule matches the sender
+  (client-side glob match of `match_pattern` against the address, most-specific
+  wins) the card shows a chip — disposition label + truncated `want_text` —
+  that opens the RuleEditor to **edit** it. If **no** rule matches, an inviting
+  CTA ("Choose what you want to see →") opens the RuleEditor **prefilled**:
+  `*@domain` (favicon-normalized so mail subdomains collapse to the brand),
+  disposition **filtered** preselected, want field autofocused — the Minga first
+  choice being "stop showing me these, unless…". The zone's empty state is
+  "No newsletters this week."
+- **Keyboard:** cards are focusable (`tabIndex`); `Enter` on a focused card opens
+  the editor (edit or create), same as a click — folded in without disturbing the
+  `sitrep` context's obligation `j/k`.
+
+Both flows preserve the dispatchCore/keymap/modal patterns, the ruleEditorBus
+overlay contract (extended with optional `disposition`/`want`/`pattern` prefill),
+and the fresh dashboard structure.
+

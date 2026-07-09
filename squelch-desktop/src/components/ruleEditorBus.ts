@@ -6,7 +6,7 @@
 // This is deliberately not in the zustand store: these are transient, action-
 // side overlays that only ActionLayer mounts.
 
-import type { SenderRule } from "../api";
+import type { Disposition, SenderRule } from "../api";
 
 type Listener<T> = (payload: T) => void;
 
@@ -35,6 +35,19 @@ export interface RuleEditorRequest {
   /** null = blank create; a SenderRule = edit (create-new + delete-old on save). */
   rule?: SenderRule | null;
   onSaved?: () => void;
+  /**
+   * Override the initial disposition for a tune/create flow. Used by the
+   * newsletters zone CTA to preselect "filtered" so the human's first choice is
+   * "stop showing me these" (the Minga onboarding default). Ignored for edits.
+   */
+  disposition?: Disposition;
+  /** Override the initial want text (tune/create). Editor autofocuses the field. */
+  want?: string;
+  /**
+   * Explicit match_pattern for a create flow (skips deriving it from `sender`).
+   * The newsletters CTA passes a favicon-normalized "*@domain" here.
+   */
+  pattern?: string;
 }
 
 const ruleEditor = bus<RuleEditorRequest>();

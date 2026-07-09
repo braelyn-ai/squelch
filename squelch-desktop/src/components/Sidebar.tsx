@@ -15,6 +15,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useStore, MAIN_VIEWS, type MainView } from "../state";
+import { AuthRings } from "./AuthRing";
 
 interface RailItem {
   view: MainView;
@@ -52,6 +53,7 @@ export function Sidebar() {
             title={`${label} · ${num || i + 1}`}
           >
             <Icon size={20} />
+            {view === "auth" && <AuthRings />}
             {view === "auth" && authCount > 0 && (
               <span className="rail-badge" aria-hidden="true">
                 {authCount}

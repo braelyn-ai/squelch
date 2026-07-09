@@ -1,4 +1,4 @@
-export { useStore, MAIN_VIEWS } from "./store";
+export { useStore, MAIN_VIEWS, RING_MS } from "./store";
 export type {
   AppState,
   SitrepData,
@@ -10,9 +10,12 @@ export type {
   SideView,
   Toast,
   ComposeState,
+  AuthRing,
+  AuthCodeEntry,
 } from "./store";
 export { useSitrep } from "./useSitrep";
 export type { SitrepController } from "./useSitrep";
+export { useAuthArrival } from "./useAuthArrival";
 export {
   applyTheme,
   toggleTheme,

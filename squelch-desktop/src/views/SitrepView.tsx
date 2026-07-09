@@ -28,15 +28,24 @@ import {
   Bell,
   Hourglass,
   Receipt,
+  Mails,
+  Pencil,
 } from "lucide-react";
 import { api, ApiError } from "../api";
-import type { AttentionUpdate } from "../api";
+import type { AttentionUpdate, SenderRule } from "../api";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import { deadlineChip, lastChecked, loudAge, relAge } from "../lib/format";
 import { senderDisplayName } from "../lib/avatar";
 import { Avatar } from "../components/Avatar";
 import { dispatchDone } from "../lib/dispatch";
+import {
+  deriveNewsletters,
+  domainPattern,
+  type Newsletter,
+} from "../lib/newsletters";
+import { DISPOSITION_LABEL } from "../components/RuleEditor";
+import { openRuleEditorRequest } from "../components/ruleEditorBus";
 import "../styles/sitrep-dash.css";
 
 // Aging threshold for zone (c): only items sitting longer than a week.
@@ -260,6 +269,9 @@ function SitrepBody({
         )}
       </section>
 
+      {/* ---- NEWSLETTERS (rule-onboarding surface) ---- */}
+      <NewslettersZone />
+
       {/* ---- (d) STATUS STRIP ---- */}
       <StatusStrip
         authCount={sealed.length}
@@ -381,6 +393,151 @@ function SenderChips({ items }: { items: AttentionUpdate[] }) {
         </span>
       ))}
       {extra > 0 && <span className="sender-chip more">+{extra} more</span>}
+    </div>
+  );
+}
+
+// ---- NEWSLETTERS zone: the rule-onboarding surface -------------------------
+
+// Pull a generous window of noise-tier updates and filter to the last 7 days
+// client-side (the wire model carries no received_at; we date on surfaced_at).
+const NL_FETCH_LIMIT = 200;
+
+function NewslettersZone() {
+  const [updates, setUpdates] = useState<AttentionUpdate[] | null>(null);
+  const [rules, setRules] = useState<SenderRule[]>([]);
+
+  // Fetch noise updates + rules once; re-fetch after a rule save so chips/CTAs
+  // reflect the new rule immediately.
+  const load = useMemo(
+    () => async () => {
+      try {
+        const [page, rl] = await Promise.all([
+          api.getUpdates({ tier: "noise", limit: NL_FETCH_LIMIT }),
+          api.listRules(),
+        ]);
+        setUpdates(page.items);
+        setRules(rl);
+      } catch (e) {
+        // Non-fatal: leave the zone empty rather than surfacing token/url.
+        if (!(e instanceof ApiError)) setUpdates([]);
+        else setUpdates([]);
+      }
+    },
+    [],
+  );
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const newsletters = useMemo(
+    () => (updates ? deriveNewsletters(updates, rules) : []),
+    [updates, rules],
+  );
+
+  function editRule(nl: Newsletter) {
+    if (!nl.rule) return;
+    openRuleEditorRequest({ rule: nl.rule, onSaved: () => void load() });
+  }
+  function createRule(nl: Newsletter) {
+    // Prefill *@domain (favicon-normalized so mail-subdomains collapse to the
+    // brand), disposition "filtered" (the onboarding default), and land focus on
+    // the want field so the human describes what they DO want to see.
+    openRuleEditorRequest({
+      sender: nl.address,
+      pattern: domainPattern(nl.address),
+      disposition: "filtered",
+      onSaved: () => void load(),
+    });
+  }
+
+  return (
+    <section className="zone zone-newsletters">
+      <div className="zone-head">
+        <span className="glyph">
+          <Mails size={15} />
+        </span>
+        <h2>Newsletters</h2>
+        {newsletters.length > 0 && (
+          <span className="zone-count">{newsletters.length}</span>
+        )}
+        <span className="zone-sub">recurring noise · choose what you want</span>
+      </div>
+      {newsletters.length === 0 ? (
+        <p className="zone-empty">No newsletters this week.</p>
+      ) : (
+        <div className="nl-grid">
+          {newsletters.map((nl) => (
+            <NewsletterCard
+              key={nl.address}
+              nl={nl}
+              onEdit={() => editRule(nl)}
+              onCreate={() => createRule(nl)}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s;
+}
+
+function NewsletterCard({
+  nl,
+  onEdit,
+  onCreate,
+}: {
+  nl: Newsletter;
+  onEdit: () => void;
+  onCreate: () => void;
+}) {
+  const hasRule = nl.rule !== null;
+  // Enter (with the card focused) opens the right editor; click does the same.
+  const open = hasRule ? onEdit : onCreate;
+
+  return (
+    <div
+      className={`nl-card${hasRule ? " ruled" : ""}`}
+      role="button"
+      tabIndex={0}
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          open();
+        }
+      }}
+    >
+      <div className="nl-top">
+        <Avatar sender={nl.sender} size={24} />
+        <span className="nl-sender" title={nl.sender}>
+          {senderDisplayName(nl.sender)}
+        </span>
+        <span className="nl-count">{nl.count} this week</span>
+      </div>
+
+      {nl.summary && (
+        <p className="nl-summary" title={nl.summary}>
+          {truncate(nl.summary, 90)}
+        </p>
+      )}
+
+      {hasRule ? (
+        <div className="nl-rulechip" title="edit this rule">
+          <span className="nl-disp">{DISPOSITION_LABEL[nl.rule!.disposition]}</span>
+          {nl.rule!.want_text && (
+            <span className="nl-want">{truncate(nl.rule!.want_text, 48)}</span>
+          )}
+          <Pencil size={12} className="nl-pencil" />
+        </div>
+      ) : (
+        <div className="nl-cta">
+          Choose what you want to see <ArrowUpRight size={13} />
+        </div>
+      )}
     </div>
   );
 }

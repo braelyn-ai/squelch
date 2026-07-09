@@ -18,6 +18,7 @@ import { useActions } from "../actions/useActions";
 import { ComposeReview } from "../components/ComposeReview";
 import { RuleEditor } from "../components/RuleEditor";
 import { ProcessMode } from "../components/ProcessMode";
+import { AuthCodeModal } from "../components/AuthCodeModal";
 import {
   onOpenRuleEditor,
   onOpenProcessMode,
@@ -32,6 +33,7 @@ export function ActionLayer() {
   const dismissToast = useStore((s) => s.dismissToast);
   const selectedUpdate = useStore((s) => s.selectedUpdate);
   const compose = useStore((s) => s.compose);
+  const hasAuthCode = useStore((s) => s.authQueue.length > 0);
   const act = useActions();
 
   // Overlay state for the two store-less action modals (rule editor + process).
@@ -149,11 +151,18 @@ export function ActionLayer() {
           editRule={ruleReq.rule ?? null}
           onSaved={ruleReq.onSaved}
           onClose={() => setRuleReq(null)}
+          initialDisposition={ruleReq.disposition}
+          initialWant={ruleReq.want}
+          initialPattern={ruleReq.pattern}
         />
       )}
 
       {/* Process mode (p) — card-by-card triage deck. */}
       {processOpen && <ProcessMode onClose={() => setProcessOpen(false)} />}
+
+      {/* 2FA present-don't-read: the big code modal (auto-revealed on arrival).
+          Conditional-mount on the queue so the code lives only while shown. */}
+      {hasAuthCode && <AuthCodeModal />}
     </>
   );
 }

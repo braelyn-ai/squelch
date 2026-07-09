@@ -151,6 +151,39 @@ impl CredentialBackend {
     }
 }
 
+/// Which LLM provider Stage-2 talks to. Selected by KEY PREFIX at resolution
+/// time (see [`Stage2Config::resolve_key_and_provider`]) unless forced via the
+/// `stage2_provider` config field / `SQUELCH_STAGE2_PROVIDER` env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stage2Provider {
+    Anthropic,
+    OpenAI,
+}
+
+impl Stage2Provider {
+    /// Parse from the `stage2_provider` config / `SQUELCH_STAGE2_PROVIDER` env
+    /// string. Case-insensitive. Unknown values return `None` (caller falls back
+    /// to prefix sniffing).
+    pub fn from_str_lenient(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "anthropic" => Some(Stage2Provider::Anthropic),
+            "openai" => Some(Stage2Provider::OpenAI),
+            _ => None,
+        }
+    }
+
+    /// Per-provider default cost-ledger prices (USD per MTok input, output).
+    /// Anthropic: claude-haiku-4-5 (1.0 / 5.0). OpenAI: gpt-4o-mini (0.15 / 0.60)
+    /// — change with the model.
+    pub fn default_prices(self) -> (f64, f64) {
+        match self {
+            Stage2Provider::Anthropic => (1.0, 5.0),
+            Stage2Provider::OpenAI => (0.15, 0.60),
+        }
+    }
+}
+
 /// Sync-related tunables. Real config, not constants, so the sync engine can
 /// wire them in without a schema change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,8 +278,14 @@ pub struct Stage2Config {
     /// Stage-2 is DISABLED gracefully (one stderr notice; rows stay queued).
     /// Never logged.
     pub anthropic_api_key: Option<String>,
-    /// The model id string. Default `claude-haiku-4-5`. Written verbatim into
-    /// the `model` request field and stored as `model_used` on applied rows.
+    /// Force the Stage-2 provider, overriding key-prefix sniffing. `anthropic`
+    /// or `openai`. When `None` (default), the provider is inferred from which
+    /// key is resolved and its prefix. Env: `SQUELCH_STAGE2_PROVIDER`.
+    pub stage2_provider: Option<Stage2Provider>,
+    /// The model id string. Default `claude-haiku-4-5` (Anthropic). For OpenAI,
+    /// set this to an OpenAI model such as `gpt-4o-mini` (config-driven so the
+    /// provider can change without code). Written verbatim into the `model`
+    /// request field and stored as `model_used` on applied rows.
     pub model: String,
     /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
     /// The body is truncated to this and the truncation is noted in-band.
@@ -273,13 +312,15 @@ pub struct Stage2Config {
     pub max_age_days: u32,
     /// Per-million-input-token price (USD) for the configured model, used only to
     /// compute the `est_cost_usd_today` figure surfaced by `/client/stats`.
-    /// Default 1.0 matches claude-haiku-4-5. NOTE: if you change `model`, update
-    /// this and `price_out_per_mtok` to that model's pricing. Env:
-    /// `SQUELCH_STAGE2_PRICE_IN_PER_MTOK`.
+    /// Default 1.0 matches claude-haiku-4-5 (Anthropic); the OpenAI default is
+    /// 0.15 (gpt-4o-mini). NOTE: change-with-model — if you change `model` or
+    /// provider, update this and `price_out_per_mtok` to that model's pricing.
+    /// Env: `SQUELCH_STAGE2_PRICE_IN_PER_MTOK`.
     pub price_in_per_mtok: f64,
     /// Per-million-output-token price (USD) for the configured model. Default 5.0
-    /// matches claude-haiku-4-5. See [`Stage2Config::price_in_per_mtok`]. Env:
-    /// `SQUELCH_STAGE2_PRICE_OUT_PER_MTOK`.
+    /// matches claude-haiku-4-5 (Anthropic); the OpenAI default is 0.60
+    /// (gpt-4o-mini). Change-with-model. See [`Stage2Config::price_in_per_mtok`].
+    /// Env: `SQUELCH_STAGE2_PRICE_OUT_PER_MTOK`.
     pub price_out_per_mtok: f64,
 }
 
@@ -287,6 +328,7 @@ impl Default for Stage2Config {
     fn default() -> Self {
         Self {
             anthropic_api_key: None,
+            stage2_provider: None,
             model: "claude-haiku-4-5".to_string(),
             max_body_chars: 1500,
             batch_per_cycle: 10,
@@ -301,22 +343,58 @@ impl Default for Stage2Config {
 }
 
 impl Stage2Config {
-    /// Resolve the API key: config-file value first, then `ANTHROPIC_API_KEY`
-    /// env (env wins, matching the rest of `apply_env_overrides`). Empty strings
-    /// are treated as absent. Never logged by callers.
+    /// Resolve the Stage-2 API key AND its provider.
+    ///
+    /// Resolution order (first match wins):
+    ///   1. `SQUELCH_STAGE2_API_KEY` — explicit, provider SNIFFED from the key
+    ///      prefix: `sk-ant-` => Anthropic, otherwise OpenAI.
+    ///   2. `ANTHROPIC_API_KEY` — provider = Anthropic.
+    ///   3. `OPENAI_API_KEY` — provider = OpenAI.
+    ///   4. config-file `anthropic_api_key` — provider = Anthropic.
+    ///
+    /// The `stage2_provider` config field / `SQUELCH_STAGE2_PROVIDER` env var
+    /// (already folded into `stage2_provider` by `apply_env_overrides`) FORCE-
+    /// OVERRIDES the inferred provider when set. Empty strings are treated as
+    /// absent. Key material is never logged by callers.
+    pub fn resolve_key_and_provider(&self) -> Option<(String, Stage2Provider)> {
+        let (key, inferred) = if let Some(key) = env_nonempty("SQUELCH_STAGE2_API_KEY") {
+            // Explicit var: sniff the provider from the prefix.
+            let provider = if key.starts_with("sk-ant-") {
+                Stage2Provider::Anthropic
+            } else {
+                Stage2Provider::OpenAI
+            };
+            (key, provider)
+        } else if let Some(key) = env_nonempty("ANTHROPIC_API_KEY") {
+            (key, Stage2Provider::Anthropic)
+        } else if let Some(key) = env_nonempty("OPENAI_API_KEY") {
+            (key, Stage2Provider::OpenAI)
+        } else if let Some(key) = self.anthropic_api_key.clone().filter(|s| !s.is_empty()) {
+            (key, Stage2Provider::Anthropic)
+        } else {
+            return None;
+        };
+
+        // Config force-override wins over the inferred provider.
+        let provider = self.stage2_provider.unwrap_or(inferred);
+        Some((key, provider))
+    }
+
+    /// Resolve just the API key (provider-agnostic). Retained for callers that
+    /// only need presence/the key string. See [`resolve_key_and_provider`].
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Ok(v) = std::env::var("ANTHROPIC_API_KEY")
-            && !v.is_empty()
-        {
-            return Some(v);
-        }
-        self.anthropic_api_key.clone().filter(|s| !s.is_empty())
+        self.resolve_key_and_provider().map(|(k, _)| k)
     }
 
     /// Stage-2 is enabled iff an API key is resolvable.
     pub fn enabled(&self) -> bool {
-        self.resolve_api_key().is_some()
+        self.resolve_key_and_provider().is_some()
     }
+}
+
+/// Read an env var, returning `None` when unset or empty.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,8 +526,13 @@ impl Config {
         }
 
         // ---- Stage-2 overrides ---------------------------------------------
-        // The API key itself is resolved lazily via ANTHROPIC_API_KEY in
-        // `Stage2Config::resolve_api_key`; no need to copy it into the struct.
+        // The API key itself is resolved lazily via env in
+        // `Stage2Config::resolve_key_and_provider`; no need to copy it here.
+        if let Ok(v) = std::env::var("SQUELCH_STAGE2_PROVIDER")
+            && let Some(p) = Stage2Provider::from_str_lenient(&v)
+        {
+            self.stage2.stage2_provider = Some(p);
+        }
         if let Ok(v) = std::env::var("SQUELCH_MODEL")
             && !v.is_empty()
         {

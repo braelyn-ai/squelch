@@ -27,7 +27,7 @@
 //! response bodies. Callers log counts, the model id, redacted error types, and
 //! token-usage numbers (which are fine to log).
 
-use crate::config::Stage2Config;
+use crate::config::{Stage2Config, Stage2Provider};
 use crate::store::{Stage2Applied, Stage2Queued};
 use crate::triage::DeadlineHit;
 use crate::types::Tier;
@@ -37,7 +37,15 @@ use std::time::Duration;
 
 /// Anthropic Messages API endpoint.
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
-/// Pinned API version header value.
+/// OpenAI Chat Completions API endpoint. Request/response shapes below follow
+/// the OpenAI Chat Completions spec (platform.openai.com/docs/api-reference/chat)
+/// as of 2026-07-09; verified against the user-provided spec (docs unreachable
+/// via WebFetch from this environment). Structured output uses
+/// `response_format: {type:"json_schema", json_schema:{name, strict, schema}}`;
+/// strict mode requires every property in `required` and `additionalProperties:
+/// false` everywhere — [`output_schema`] already satisfies this.
+const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+/// Pinned Anthropic API version header value.
 const API_VERSION: &str = "2023-06-01";
 /// Default max_tokens; a compact JSON object fits comfortably. A `max_tokens`
 /// truncation is retried once at this doubled value.
@@ -285,6 +293,82 @@ struct OutputFormat {
     #[serde(rename = "type")]
     kind: &'static str,
     schema: serde_json::Value,
+}
+
+// ---- OpenAI Chat Completions wire types -----------------------------------
+
+#[derive(Debug, Serialize)]
+struct OpenAiRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAiMessage<'a>>,
+    /// OpenAI's per-response output cap. Mirrors the Anthropic `max_tokens`
+    /// doubling on a truncation retry.
+    max_completion_tokens: u32,
+    response_format: OpenAiResponseFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiMessage<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: OpenAiJsonSchema,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiJsonSchema {
+    name: &'static str,
+    strict: bool,
+    schema: serde_json::Value,
+}
+
+/// The subset of the OpenAI response we consume.
+#[derive(Debug, Deserialize)]
+struct OpenAiResponse {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    message: Option<OpenAiChoiceMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoiceMessage {
+    #[serde(default)]
+    content: Option<String>,
+    /// Present (non-null) when the model declined the request.
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
+impl OpenAiUsage {
+    /// Map onto the SAME ledger columns as the Anthropic path.
+    fn into_usage(self) -> Usage {
+        Usage {
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+        }
+    }
 }
 
 /// The subset of the API response we consume.

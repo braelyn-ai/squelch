@@ -43,6 +43,9 @@ export function RuleEditor({
   editRule,
   onSaved,
   onClose,
+  initialDisposition,
+  initialWant,
+  initialPattern,
 }: {
   /** Present for the `t` tune flow: prefill *@domain from this sender. */
   sender?: string;
@@ -51,14 +54,22 @@ export function RuleEditor({
   /** Called after a successful save (opener re-fetches its list). */
   onSaved?: () => void;
   onClose: () => void;
+  /** Preselect a disposition for tune/create (e.g. newsletters CTA → "filtered"). */
+  initialDisposition?: Disposition;
+  /** Prefill the want text for tune/create. */
+  initialWant?: string;
+  /** Explicit match_pattern override (create flow); wins over deriving from sender. */
+  initialPattern?: string;
 }) {
   const pushToast = useStore((s) => s.pushToast);
   const [pattern, setPattern] = useState(() =>
-    editRule ? editRule.match_pattern : sender ? patternFromSender(sender) : "",
+    editRule
+      ? editRule.match_pattern
+      : initialPattern ?? (sender ? patternFromSender(sender) : ""),
   );
-  const [want, setWant] = useState(() => editRule?.want_text ?? "");
+  const [want, setWant] = useState(() => editRule?.want_text ?? initialWant ?? "");
   const [disposition, setDisposition] = useState<Disposition>(
-    () => editRule?.disposition ?? "squelch",
+    () => editRule?.disposition ?? initialDisposition ?? "squelch",
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);

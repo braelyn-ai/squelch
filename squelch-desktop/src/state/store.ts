@@ -91,6 +91,35 @@ export type SideView =
   | { kind: "browse" }
   | { kind: "search"; query: string };
 
+// --- 2FA "present, don't read" flow -----------------------------------------
+
+/**
+ * A live countdown ring on the auth rail icon. One per freshly-arrived auth
+ * message; the ring sweeps over RING_MS then removes itself. The ring + the
+ * seen-set ARE the read state (Gmail read-marking is impossible and unwanted).
+ */
+export interface AuthRing {
+  /** The sealed message id this ring represents. */
+  id: number;
+  /** ms epoch the ring started sweeping (drives the countdown). */
+  startedAt: number;
+}
+
+/**
+ * A queued code-modal entry. Populated on arrival of an otp/login_code/
+ * verification message: we auto-reveal (audited) and extract the code client-
+ * side. `code` is null when extraction failed (modal shows an "Open Auth"
+ * affordance instead). Held in memory only; never persisted.
+ */
+export interface AuthCodeEntry {
+  meta: SealedMeta;
+  /** Extracted code, or null if none was confidently found. */
+  code: string | null;
+}
+
+/** How long an auth ring sweeps before it disappears. */
+export const RING_MS = 60_000;
+
 // --- toast (non-undo, ephemeral notices) ------------------------------------
 
 export interface Toast {
@@ -145,6 +174,19 @@ export interface AppState {
   toasts: Toast[];
   pushToast: (text: string, tone?: Toast["tone"]) => string;
   dismissToast: (id: string) => void;
+
+  // 2FA present-don't-read slice — rings on the auth rail + code-modal queue.
+  authRings: AuthRing[];
+  /** Newest-first queue of code-modal entries (only otp/login_code/verification). */
+  authQueue: AuthCodeEntry[];
+  /** Start a 60s countdown ring for a freshly-arrived auth message. */
+  pushAuthRing: (id: number) => void;
+  /** Remove a ring once its sweep completes (or is superseded). */
+  expireAuthRing: (id: number) => void;
+  /** Enqueue a code-modal entry (newest-first). */
+  pushAuthCode: (entry: AuthCodeEntry) => void;
+  /** Pop the front (currently-shown) code-modal entry on dismiss. */
+  dismissAuthCode: () => void;
 
   // side view slice
   sideView: SideView;
@@ -328,6 +370,31 @@ export const useStore = create<AppState>((set, get) => ({
   },
   dismissToast: (id) =>
     set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+
+  // --- 2FA present-don't-read -----------------------------------------------
+  authRings: [],
+  authQueue: [],
+  pushAuthRing: (id) =>
+    set((s) =>
+      // Dedupe: one ring per id. Re-arming restarts the sweep.
+      ({
+        authRings: [
+          ...s.authRings.filter((r) => r.id !== id),
+          { id, startedAt: Date.now() },
+        ],
+      }),
+    ),
+  expireAuthRing: (id) =>
+    set((s) => ({ authRings: s.authRings.filter((r) => r.id !== id) })),
+  pushAuthCode: (entry) =>
+    set((s) =>
+      // Newest-first, deduped by id (a re-detection shouldn't double-queue).
+      s.authQueue.some((e) => e.meta.id === entry.meta.id)
+        ? s
+        : { authQueue: [entry, ...s.authQueue] },
+    ),
+  dismissAuthCode: () =>
+    set((s) => ({ authQueue: s.authQueue.slice(1) })),
 
   // --- side view ------------------------------------------------------------
   sideView: { kind: "none" },
