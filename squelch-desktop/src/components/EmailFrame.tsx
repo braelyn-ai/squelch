@@ -13,9 +13,13 @@
 //     child of <head> so it applies before any resource is fetched:
 //       default-src 'none'; style-src 'unsafe-inline'
 //     Remote content is off by default. When `allowRemote` is true we add
-//       img-src https: data:
+//       img-src http: https: data:
 //     for THIS message only — inline style url() fetches would need img-src too
 //     (they resolve under img-src per CSP), so the same relaxation covers both.
+//     http: is included because a lot of real-world marketing mail references
+//     plain http:// image hosts (and protocol-relative //host paths, which under
+//     the opaque srcdoc origin resolve against http/https); https:-only silently
+//     blocked those, which is what made "load images" appear to do nothing.
 //
 // LINKS: no opener/shell plugin is wired in src-tauri (checked: only the two
 // keyring commands + core window perms). Because the sandbox omits
@@ -61,7 +65,7 @@ function countRemoteImgs(html: string): number {
 
 function buildSrcdoc(html: string, allowRemote: boolean): string {
   const csp = allowRemote
-    ? "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:"
+    ? "default-src 'none'; style-src 'unsafe-inline'; img-src http: https: data:"
     : "default-src 'none'; style-src 'unsafe-inline'";
   // The CSP meta MUST be the first thing in <head> so it governs every
   // subsequent resource. <base target="_blank"> keeps any (currently inert)
@@ -118,23 +122,32 @@ export function EmailFrame({
 
   return (
     <div className="email-frame">
-      {remoteRefs && !allowRemote && (
-        <button
-          type="button"
-          className="remote-bar"
-          onClick={allow}
-          title={
-            selected
-              ? "press i to load remote images for this message"
-              : "load remote images for this message"
-          }
-        >
-          remote images blocked
-          {blockedCount > 0 ? ` (${blockedCount})` : ""} — load
-          {selected ? " (i)" : ""}
-        </button>
-      )}
+      {remoteRefs &&
+        (allowRemote ? (
+          <div className="remote-bar loaded" aria-live="polite">
+            remote images loaded
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="remote-bar"
+            onClick={allow}
+            title={
+              selected
+                ? "press i to load remote images for this message"
+                : "load remote images for this message"
+            }
+          >
+            remote images blocked
+            {blockedCount > 0 ? ` (${blockedCount})` : ""} — load
+            {selected ? " (i)" : ""}
+          </button>
+        ))}
       <iframe
+        // Force a full remount when the allow state flips so the browser reloads
+        // the srcdoc under the new CSP (updating srcDoc in place is enough in
+        // practice, but a keyed remount removes any ambiguity about stale frames).
+        key={String(allowRemote)}
         // sandbox="" => no capabilities at all (opaque origin, no scripts).
         sandbox=""
         // Kept out of the tab order so it never steals keyboard focus from the

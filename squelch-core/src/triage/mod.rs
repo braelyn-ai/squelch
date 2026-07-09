@@ -100,24 +100,39 @@ pub fn stage1_with_config(
     let body = msg.body.as_str();
     let from = msg.from_addr.as_str();
 
+    // Resolve the matched sender rule ONCE, up front. Rung 2 still owns the
+    // rule's disposition-driven tiering below; here we only need it to decide
+    // bill-trust in rung 1 (bills are evaluated first). Matching is pure — this
+    // reorder changes no behavior for the non-bill rungs.
+    let matched_rule = rules::match_sender_rule(from, rules);
+
     // ---- Rung 1: BILL / PAYMENT (highest recall) ------------------------
     if let Some(hit) = deadline::detect_bill(subject, body, now) {
-        // Sender trust gates the scream. A bill from a TRUSTED sender (a known
-        // contact / previously-seen biller) keeps full confidence and its
-        // natural PastDue/Deadline tier. A bill from an UNKNOWN sender must NOT
-        // be allowed to land CONFIDENT PastDue — that is exactly the scam vector
-        // in bug #3 (a stranger screaming "past due" for $2.4M). We cap it at
-        // Deadline, mark it not-confident (queue for Stage-2), and use a
-        // moderate importance.
-        let trusted = is_known_contact;
+        // Sender trust gates the scream. A bill from a TRUSTED sender keeps full
+        // confidence and its natural PastDue/Deadline tier. Trust has two
+        // sources:
+        //   * a KNOWN CONTACT (the sender appears in the user's Sent mail), or
+        //   * an explicit SURFACE sender rule — the user ruled this sender, which
+        //     is a direct statement of trust in their own vendor.
+        // A bill from an UNKNOWN, unruled sender must NOT be allowed to land
+        // CONFIDENT PastDue — that is exactly the scam vector in bug #3 (a
+        // stranger screaming "past due" for $2.4M). We cap it at Deadline, mark
+        // it not-confident (queue for Stage-2), and use a moderate importance.
+        let surface_ruled = matched_rule
+            .is_some_and(|r| r.disposition == Disposition::Surface);
+        let trusted = is_known_contact || surface_ruled;
 
-        // Sanity dampeners, applied regardless of sender. These NEVER raise a
-        // tier; they only shave confidence.
+        // Sanity dampeners. These NEVER raise a tier; they only shave confidence.
+        // A SURFACE-ruled sender is an EXPLICIT user trust statement: the user
+        // knows their vendor sends big, urgent invoices, so the absurd-amount and
+        // scammy-phrasing dampeners are bypassed for them. Known-contact trust
+        // does NOT bypass the dampeners (a known biller with a $2.4M "past due" is
+        // still suspicious); only the explicit rule does.
         let absurd_amount = hit
             .amount
             .is_some_and(|a| a > cfg.bill_absurd_amount_threshold);
         let scammy = deadline::has_scammy_phrasing(subject, body);
-        let dampened = absurd_amount || scammy;
+        let dampened = (absurd_amount || scammy) && !surface_ruled;
 
         // Tier: trusted senders keep their natural tier. Untrusted senders are
         // capped at Deadline (never PastDue). Dampeners also cap at Deadline.
@@ -155,13 +170,23 @@ pub fn stage1_with_config(
             "bill/payment signal (kind={}, source={}, past_due={})",
             hit.kind, hit.source, hit.past_due
         );
-        if !trusted {
+        // Name the trust source that applied (or that it was absent).
+        if surface_ruled {
+            if let Some(r) = matched_rule {
+                reason.push_str(&format!(
+                    "; trusted via surface rule #{} ({})",
+                    r.id, r.match_pattern
+                ));
+            }
+        } else if is_known_contact {
+            reason.push_str("; trusted via known contact");
+        } else {
             reason.push_str("; bill-like from unknown sender (capped at Deadline, deferring to Stage-2)");
         }
-        if absurd_amount {
+        if dampened && absurd_amount {
             reason.push_str("; absurd amount dampener");
         }
-        if scammy {
+        if dampened && scammy {
             reason.push_str("; screamy/scam phrasing dampener");
         }
 
@@ -177,7 +202,8 @@ pub fn stage1_with_config(
     }
 
     // ---- Rung 2: SENDER RULES (user's own local rules) ------------------
-    if let Some(rule) = rules::match_sender_rule(from, rules) {
+    // Reuse the rule resolved up front for rung 1's bill-trust decision.
+    if let Some(rule) = matched_rule {
         return match rule.disposition {
             Disposition::Squelch => Stage1Result {
                 tier: Tier::Noise,
@@ -490,6 +516,85 @@ mod tests {
         assert_eq!(r.tier, Tier::Deadline);
         assert!(!r.confident);
         assert_eq!(r.importance, 55);
+    }
+
+    #[test]
+    fn corpnet_past_due_with_surface_rule_is_confident_pastdue_dampeners_bypassed() {
+        // A Surface rule is an explicit user statement of trust in their vendor.
+        // The real corpnet-style fixture: large amount + "penalties are adding up"
+        // + a Surface rule => CONFIDENT PastDue, BOTH dampeners bypassed. The user
+        // ruled the sender; they know this vendor sends big, urgent invoices.
+        let m = msg(
+            "info@sfmail.corpnet.com",
+            "You're Past Due — Penalties Are Adding Up",
+            "Your balance of $2,470,000 is past due. Penalties are adding up. \
+             Pay now to avoid further action!!!",
+        );
+        let rules = vec![rule(11, "*@sfmail.corpnet.com", Disposition::Surface, "")];
+        let r = run(&m, false, &rules);
+        assert_eq!(r.tier, Tier::PastDue, "surface-ruled sender screams past-due");
+        assert!(r.confident, "surface-ruled bill is final, not Stage-2");
+        assert_eq!(r.importance, 95, "full bill importance for trusted sender");
+        // Dampeners are BYPASSED: their notes must NOT appear.
+        assert!(!r.reason.contains("absurd amount"), "absurd dampener bypassed");
+        assert!(!r.reason.contains("screamy/scam"), "scammy dampener bypassed");
+        assert!(r.reason.contains("surface rule"), "names the trust source");
+        // The bill rung wins over rung-2 rule tiering, so no matched_rule id here.
+        assert_eq!(r.matched_rule, None);
+    }
+
+    #[test]
+    fn corpnet_past_due_without_rule_is_still_dampened_regression() {
+        // Same email, no Surface rule, unknown sender: the bug #3 protections
+        // still hold — capped at Deadline, not confident, both dampeners fire.
+        let m = msg(
+            "info@sfmail.corpnet.com",
+            "You're Past Due — Penalties Are Adding Up",
+            "Your balance of $2,470,000 is past due. Penalties are adding up. \
+             Pay now to avoid further action!!!",
+        );
+        let r = run(&m, false, &[]);
+        assert_ne!(r.tier, Tier::PastDue);
+        assert_eq!(r.tier, Tier::Deadline);
+        assert!(!r.confident, "unknown-sender bill defers to Stage-2");
+        assert_eq!(r.importance, 55);
+        assert!(r.reason.contains("unknown sender"));
+        assert!(r.reason.contains("absurd amount"));
+        assert!(r.reason.contains("screamy/scam"));
+    }
+
+    #[test]
+    fn squelch_ruled_sender_bill_unchanged() {
+        // A Squelch rule does NOT confer bill-trust: the sender is not explicitly
+        // trusted, so an unknown-sender past-due stays capped at Deadline and
+        // deferred (the squelch rule still can't suppress a bill — rung 1 wins).
+        let m = msg(
+            "info@sfmail.corpnet.com",
+            "You're Past Due — Penalties Are Adding Up",
+            "Your balance of $2,470,000 is past due. Penalties are adding up!!!",
+        );
+        let rules = vec![rule(12, "*@sfmail.corpnet.com", Disposition::Squelch, "")];
+        let r = run(&m, false, &rules);
+        assert_eq!(r.tier, Tier::Deadline, "squelch confers no bill-trust");
+        assert!(!r.confident);
+        assert_eq!(r.matched_rule, None, "bill rung wins over the squelch rule");
+    }
+
+    #[test]
+    fn surface_rule_trust_on_clean_past_due_names_source() {
+        // A clean past-due (no dampeners) from an unknown sender WITH a Surface
+        // rule: confident PastDue, reason names the surface-rule trust source.
+        let m = msg(
+            "billing@myvendor.example",
+            "Invoice past due",
+            "Your invoice for $120.00 is past due.",
+        );
+        let rules = vec![rule(13, "billing@myvendor.example", Disposition::Surface, "")];
+        let r = run(&m, false, &rules);
+        assert_eq!(r.tier, Tier::PastDue);
+        assert!(r.confident);
+        assert_eq!(r.importance, 95);
+        assert!(r.reason.contains("surface rule #13"));
     }
 
     #[test]

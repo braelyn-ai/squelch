@@ -122,7 +122,7 @@ export function ProcessMode({ onClose }: { onClose: () => void }) {
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.6)",
+        background: "var(--overlay)",
         display: "grid",
         placeItems: "center",
         zIndex: 90,

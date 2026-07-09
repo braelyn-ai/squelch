@@ -12,3 +12,11 @@ export type {
 } from "./store";
 export { useSitrep } from "./useSitrep";
 export type { SitrepController } from "./useSitrep";
+export {
+  applyTheme,
+  toggleTheme,
+  currentTheme,
+  getStoredTheme,
+  THEME_KEY,
+} from "./theme";
+export type { Theme } from "./theme";

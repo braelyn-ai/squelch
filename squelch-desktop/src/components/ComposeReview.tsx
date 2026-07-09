@@ -154,7 +154,7 @@ function ComposeInner() {
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.55)",
+        background: "var(--overlay)",
         display: "grid",
         placeItems: "center",
         zIndex: 100,
@@ -310,9 +310,9 @@ function ReviewPane({
         style={{
           marginTop: 8,
           padding: "8px 10px",
-          background: "#0f1416",
+          background: "var(--bg-sunken)",
           border: "1px solid var(--border)",
-          borderRadius: 3,
+          borderRadius: 6,
           maxHeight: 220,
           overflow: "auto",
           whiteSpace: "pre-wrap",

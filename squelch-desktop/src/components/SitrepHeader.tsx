@@ -4,6 +4,7 @@
 
 import type { StoreStats } from "../api";
 import { lastChecked } from "../lib/format";
+import { ThemeToggle } from "./ThemeToggle";
 
 export interface SitrepHeaderProps {
   stats: StoreStats | null;
@@ -11,6 +12,7 @@ export interface SitrepHeaderProps {
   newCount: number;
   openCount: number;
   refreshError: string | null;
+  onShowShortcuts: () => void;
 }
 
 export function SitrepHeader({
@@ -19,29 +21,41 @@ export function SitrepHeader({
   newCount,
   openCount,
   refreshError,
+  onShowShortcuts,
 }: SitrepHeaderProps) {
   const signal = standingCount + newCount + openCount;
   const noise = stats?.tier_counts?.noise ?? 0;
 
   return (
-    <header className="sitrep-header num">
+    <header className="sitrep-header">
       <span className="brand">
         squelch <span className="dim">· sitrep</span>
       </span>
-      <span className="stat-line">
-        <span className="signal">
-          <b>{signal}</b> signal
-        </span>
-        <span className="noise">
-          <b>{noise}</b> noise
-        </span>
-        {refreshError ? (
-          <span className="refresh-err" title={refreshError}>
-            · offline
+      <span className="head-right">
+        <span className="stat-line">
+          <span className="signal">
+            <b>{signal}</b> signal
           </span>
-        ) : (
-          <span>· last checked: {lastChecked(stats?.last_surfaced_at)}</span>
-        )}
+          <span className="noise">
+            <b>{noise}</b> noise
+          </span>
+          {refreshError ? (
+            <span className="refresh-err" title={refreshError}>
+              · offline
+            </span>
+          ) : (
+            <span>· last checked: {lastChecked(stats?.last_surfaced_at)}</span>
+          )}
+        </span>
+        <button
+          type="button"
+          className="theme-toggle help-hint"
+          onClick={onShowShortcuts}
+          title="keyboard shortcuts (?)"
+        >
+          ?
+        </button>
+        <ThemeToggle />
       </span>
     </header>
   );

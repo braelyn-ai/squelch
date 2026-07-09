@@ -75,3 +75,95 @@ Rejected: assumes email is a daily ritual; squelch's whole premise is that it is
 - Sealed mail: metadata in lists (lock chip); body only via explicit per-message reveal
   (audited server-side, `Cache-Control: no-store`, never persisted client-side).
 - Writes exist only here (human door). The agent door has none.
+
+
+---
+
+# Core product principle: abstract over single emails (2026-07-09)
+
+**The goal is for users to open a single email as seldom as possible.** The UI
+abstracts over individual emails — one_lines, bands, deadline chips, digests,
+and actions-from-the-list carry the load. Drill-in (reading the actual email)
+is the escape hatch, reserved for when it genuinely matters that a human reads
+that specific email. Evaluate every feature against: "does this reduce the need
+to open emails, or does it drag the user back into reading mail?" The
+email-rendering work exists for the escape-hatch case, not as a primary surface.
+
+---
+
+# Aesthetic law (revised 2026-07-09 — supersedes "dark, dense, terminal-adjacent")
+
+## Aesthetic law (current)
+
+**Light-first, friendly, keyboard-first retained; dark mode via toggle.**
+
+- **Light mode by default.** A warm near-white surface, high-contrast dark
+  text. Dark mode is opt-in via a header sun/moon toggle (and the `\` keybind),
+  persisted in `localStorage` under `squelch-theme` and applied before first
+  paint (inline script in `index.html`) so there's no flash.
+- **Friendly, not terminal.** Body copy is a native sans stack
+  (`system-ui`/`-apple-system`/…). Monospace is reserved for genuinely tabular
+  or data fragments: importance scores, timestamps, match patterns/globs.
+- **Soft cards over ruled lines.** The three bands (Standing / Since last check
+  / Still open) are cards with a subtle border, radius, and background
+  differentiation. Rows have real hover states; buttons are real buttons with
+  hover/active states and comfortable padding.
+- **The squelch line stays.** The noise divider is the product metaphor — it
+  remains a distinct visual element (a soft gradient rule), not an ASCII-style
+  dash.
+- **Density is still deliberate.** This is a power tool, not a marketing site.
+  Spacing and line-height loosened, but the sitrep still reads at a glance.
+
+> **Note (user decision, 2026-07-09):** This light-first direction **supersedes**
+> the original "dark, dense, terminal-adjacent" aesthetic law. The app should be
+> less terminal-looking and more user-friendly. Dark mode is preserved as a
+> faithful translation of the old palette, now reachable through the toggle
+> rather than being the only skin. Everything below (keyboard-first, action
+> feel, security posture) is unchanged.
+
+### Theme system
+
+All colors flow through CSS custom properties on `:root`. Two palettes are
+selected by a `data-theme="light"|"dark"` attribute on `<html>`:
+
+- `:root` / `:root[data-theme="light"]` — the light palette (default).
+- `:root[data-theme="dark"]` — the dark palette (translated from the original).
+
+Tier semantics are preserved and tuned per background: past-due red, deadline
+amber, signal green-ish, noise muted, sealed a distinct lock purple with a
+subtle soft-fill treatment. See `src/styles/global.css` for the variable
+definitions and `src/state/theme.ts` for the runtime toggle/persistence.
+
+---
+
+## Keyboard-first
+
+Every action has a key. The list context owns
+`j`/`k`/`Enter`/`r`/`e`/`d`/`t`/`p`/`a`/`T`/`/`/`u`; modal and input contexts
+override as needed. `\` toggles the theme, `?` opens the shortcuts overlay.
+Typing into an `<input>`/`<textarea>` suppresses single-letter list bindings
+automatically. All bindings flow through the single keymap registry
+(`src/keys/useKeys.ts`) so they can't collide silently.
+
+---
+
+## Action feel
+
+Actions get friction proportional to their reversibility.
+
+- **Undo-first** for archive / done / label / rule-delete: the forward action
+  fires immediately and a 5s toast (`u` or click) takes it back.
+- **Send is the one irreversible action** and gets a two-step compose → review
+  ceremony with an outbound-guard verdict before it fires.
+- **Reveal of sealed content** is explicit, one-time, audited server-side, and
+  never persisted client-side.
+
+---
+
+## Security posture (unchanged)
+
+- HTML email renders in a hard-sandboxed, script-less, opaque-origin iframe with
+  a strict CSP; remote images are blocked until per-message opt-in.
+- The API token is never logged. Sealed bodies are never lifted into the global
+  store or written to disk.
+

@@ -11,10 +11,14 @@ export interface NoiseLineProps {
 export function NoiseLine({ noiseCount, onBrowse, onRules }: NoiseLineProps) {
   return (
     <div className="noise-line num">
-      <span>◌ {noiseCount} squelched</span>
+      <span>{noiseCount} squelched below the line</span>
       <span className="knob">
-        <button onClick={onBrowse}>[a] all mail</button>
-        <button onClick={onRules}>[T] rules</button>
+        <button onClick={onBrowse}>
+          All mail <kbd>a</kbd>
+        </button>
+        <button onClick={onRules}>
+          Rules <kbd>T</kbd>
+        </button>
       </span>
     </div>
   );

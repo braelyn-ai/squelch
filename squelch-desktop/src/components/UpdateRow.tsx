@@ -31,10 +31,12 @@ export function UpdateRow({
   onOpen,
 }: UpdateRowProps) {
   const chip = deadlineChip(u.deadline);
-  // Escalation: brighter text + heavier rail as weight climbs.
-  const railWidth = aging ? 2 + Math.round(weight * 3) : 2;
+  // Escalation: heavier rail + text that leans toward amber as weight climbs.
+  // color-mix keeps it theme-aware (readable on both light and dark bg) rather
+  // than a hardcoded rgba that only worked against the old dark palette.
+  const railWidth = aging ? 3 + Math.round(weight * 3) : 3;
   const oneLineColor = aging
-    ? `rgba(240, 198, 116, ${0.55 + weight * 0.45})`
+    ? `color-mix(in srgb, var(--amber) ${Math.round(45 + weight * 55)}%, var(--fg-dim))`
     : "var(--fg-dim)";
 
   return (

@@ -1,27 +1,104 @@
-/* squelch-desktop global styles. Dark, dense, terminal-adjacent. Hand-rolled;
-   no design system. View agents may add CSS modules per view. */
+/* squelch-desktop global styles.
+   Light-first, friendly, keyboard-first (see docs/UX-DIRECTIONS.md). Two
+   palettes driven entirely by CSS custom properties, selected by a
+   data-theme="light"|"dark" attribute on <html>. Light is the default; dark is
+   a translation of the original terminal-adjacent palette into the same vars.
+   Hand-rolled; no design system. */
 
-:root {
+/* ---- LIGHT PALETTE (default) --------------------------------------------- */
+:root,
+:root[data-theme="light"] {
+  /* surfaces: warm near-white, layered by subtle differentiation */
+  --bg: #faf8f5;
+  --bg-raised: #ffffff;
+  --bg-row: #f2efe9;
+  --bg-row-sel: #e7efe9;
+  --bg-sunken: #f6f3ee; /* code/preview wells */
+  --border: #e0dcd4;
+  --border-strong: #cdc7bc;
+
+  /* text: high-contrast dark on warm paper */
+  --fg: #1f2321;
+  --fg-dim: #5c625f;
+  --fg-faint: #8b918d;
+
+  /* tier semantics, tuned for a light background */
+  --accent: #128a5f; /* signal green-ish */
+  --accent-soft: #e2f1ea;
+  --red: #c62f2a; /* past-due */
+  --red-soft: #fbe7e6;
+  --amber: #b5730a; /* deadline */
+  --amber-soft: #f8ecd6;
+  --yellow: #a07d00;
+  --blue: #1f6fd6;
+  --lock: #8a4d8f; /* sealed */
+  --lock-soft: #f1e7f2;
+
+  --shadow-card: 0 1px 2px rgba(31, 35, 33, 0.05);
+  --shadow-panel: -8px 0 30px rgba(31, 35, 33, 0.1);
+  --shadow-modal: 0 12px 48px rgba(31, 35, 33, 0.22);
+  --overlay: rgba(31, 35, 33, 0.28);
+
+  /* the squelch line — the product metaphor, kept as a distinct element */
+  --squelch-line: linear-gradient(
+    90deg,
+    transparent,
+    var(--border-strong) 12%,
+    var(--border-strong) 88%,
+    transparent
+  );
+}
+
+/* ---- DARK PALETTE (opt-in) ----------------------------------------------- */
+:root[data-theme="dark"] {
   --bg: #0b0d0e;
   --bg-raised: #121618;
   --bg-row: #14191b;
   --bg-row-sel: #1d262a;
+  --bg-sunken: #0f1416;
   --border: #232b2e;
+  --border-strong: #35403f;
+
   --fg: #d5dbdc;
   --fg-dim: #8a9698;
   --fg-faint: #5a6567;
+
   --accent: #4fd6a8;
+  --accent-soft: #14312a;
   --red: #ff5c57;
+  --red-soft: #331a19;
   --amber: #f0c674;
+  --amber-soft: #2e2717;
   --yellow: #e6db74;
   --blue: #6aa9ff;
   --lock: #b48ead;
+  --lock-soft: #241d24;
 
+  --shadow-card: none;
+  --shadow-panel: -8px 0 30px rgba(0, 0, 0, 0.5);
+  --shadow-modal: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --overlay: rgba(0, 0, 0, 0.55);
+
+  --squelch-line: linear-gradient(
+    90deg,
+    transparent,
+    var(--border-strong) 12%,
+    var(--border-strong) 88%,
+    transparent
+  );
+}
+
+/* ---- shared tokens (theme-independent) ----------------------------------- */
+:root {
+  --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo,
     Consolas, monospace;
 
-  --row-h: 26px;
-  --gap: 8px;
+  --row-h: 30px;
+  --gap: 10px;
+  --radius: 8px;
+  --radius-sm: 6px;
 }
 
 * {
@@ -38,66 +115,107 @@ body,
 body {
   background: var(--bg);
   color: var(--fg);
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.4;
+  font-family: var(--sans);
+  font-size: 13.5px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   user-select: none;
 }
 
-/* Tabular numerals everywhere numbers matter (importance, counts, dates). */
+/* Mono ONLY for genuinely tabular/data fragments: scores, timestamps,
+   patterns/globs, importance. Everything else is the sans stack. */
 .num,
 .mono {
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
 }
 
-/* The squelch line — the visible noise divider. */
+/* The squelch line — the visible noise divider, prettier than an ASCII rule
+   but still a distinct product element. */
 .squelch-line {
   border: none;
-  border-top: 1px dashed var(--border);
+  height: 1px;
+  background: var(--squelch-line);
   margin: var(--gap) 0;
 }
 
+/* ---- real buttons -------------------------------------------------------- */
 button {
-  font-family: inherit;
-  font-size: inherit;
+  font-family: var(--sans);
+  font-size: 13px;
   color: var(--fg);
   background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
   cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease;
 }
 button:hover {
   border-color: var(--fg-faint);
+  background: var(--bg-row);
+}
+button:active {
+  transform: translateY(0.5px);
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 button:focus-visible,
-input:focus-visible {
-  outline: 1px solid var(--accent);
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* Primary (accent-filled) action button */
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button.primary:hover {
+  filter: brightness(1.05);
+  background: var(--accent);
+}
+:root[data-theme="dark"] button.primary {
+  color: #08130f;
 }
 
 input,
 textarea {
-  font-family: inherit;
-  font-size: inherit;
+  font-family: var(--sans);
+  font-size: 13px;
   color: var(--fg);
-  background: #0f1416;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 6px 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+}
+input.mono,
+textarea.mono {
+  font-family: var(--mono);
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--fg-faint);
 }
 
 kbd {
   font-family: var(--mono);
   font-size: 11px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 0 4px;
+  background: var(--bg-row);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 5px;
   color: var(--fg-dim);
+  white-space: nowrap;
 }
 
 .app-shell {
@@ -106,45 +224,79 @@ kbd {
   flex-direction: column;
 }
 
-/* Connect screen */
+/* ---- theme toggle button (header) ---------------------------------------- */
+.theme-toggle {
+  padding: 4px 8px;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg-dim);
+}
+.theme-toggle:hover {
+  background: var(--bg-row);
+  border-color: var(--border);
+  color: var(--fg);
+}
+.help-hint {
+  font-size: 13px;
+  font-weight: 700;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  color: var(--fg-faint);
+}
+
+/* ---- Connect screen ------------------------------------------------------ */
 .connect {
   height: 100%;
   display: grid;
   place-items: center;
+  background: var(--bg);
 }
 .connect-card {
-  width: 380px;
+  width: 400px;
+  max-width: 90vw;
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 22px;
+  border-radius: var(--radius);
+  padding: 28px;
+  box-shadow: var(--shadow-card);
 }
 .connect-card h1 {
-  font-size: 15px;
+  font-size: 22px;
   margin: 0 0 4px;
-  letter-spacing: 0.5px;
+  letter-spacing: -0.3px;
+  color: var(--fg);
 }
 .connect-card .sub {
   color: var(--fg-dim);
-  margin: 0 0 18px;
-  font-size: 12px;
+  margin: 0 0 22px;
+  font-size: 13px;
 }
 .field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-bottom: 12px;
+  gap: 5px;
+  margin-bottom: 14px;
 }
 .field label {
   color: var(--fg-dim);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  font-weight: 600;
 }
 .err {
   color: var(--red);
-  font-size: 12px;
-  margin: 4px 0 10px;
+  background: var(--red-soft);
+  border: 1px solid color-mix(in srgb, var(--red) 30%, var(--border));
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  padding: 7px 10px;
+  margin: 6px 0 12px;
 }
 
 .placeholder-view {
@@ -153,6 +305,6 @@ kbd {
 }
 .placeholder-view h2 {
   color: var(--fg);
-  font-size: 13px;
+  font-size: 14px;
   margin: 0 0 6px;
 }

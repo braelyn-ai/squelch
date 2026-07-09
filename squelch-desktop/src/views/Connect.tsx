@@ -53,7 +53,12 @@ export function Connect() {
 
         {connError && <div className="err">{connError}</div>}
 
-        <button type="submit" disabled={busy} style={{ width: "100%" }}>
+        <button
+          type="submit"
+          className="primary"
+          disabled={busy}
+          style={{ width: "100%" }}
+        >
           {busy ? "testing…" : "connect"}
         </button>
       </form>

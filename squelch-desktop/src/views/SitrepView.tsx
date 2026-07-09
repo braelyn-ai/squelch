@@ -18,6 +18,8 @@ import { BandSection } from "../components/BandSection";
 import { NoiseLine } from "../components/NoiseLine";
 import { SealedSection } from "../components/SealedSection";
 import { RevealPanel } from "../components/RevealPanel";
+import { flipTheme } from "../components/ThemeToggle";
+import { ShortcutsOverlay } from "../components/ShortcutsOverlay";
 import {
   dispatchArchive,
   dispatchDone,
@@ -42,6 +44,8 @@ export function SitrepView() {
   const [sealedFocusId, setSealedFocusId] = useState<number | null>(null);
   // The one revealed sealed body currently on screen (held only while mounted).
   const [revealing, setRevealing] = useState<SealedMeta | null>(null);
+  // Keyboard-shortcuts help overlay ('?').
+  const [showShortcuts, setShowShortcuts] = useState(false);
 
   const sealed = sitrep.sealed;
 
@@ -159,6 +163,16 @@ export function SitrepView() {
         handler: () => openSide({ kind: "search", query: "" }),
       },
       { key: "u", description: "undo", handler: () => void fireUndo() },
+      {
+        key: "\\",
+        description: "toggle light/dark theme",
+        handler: () => flipTheme(),
+      },
+      {
+        key: "?",
+        description: "keyboard shortcuts",
+        handler: () => setShowShortcuts((v) => !v),
+      },
     ],
     // Recompute when selection zone / sealed set changes so closures stay fresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -182,6 +196,7 @@ export function SitrepView() {
         newCount={sitrep.new.length}
         openCount={sitrep.open.length}
         refreshError={refreshError}
+        onShowShortcuts={() => setShowShortcuts(true)}
       />
 
       <BandSection
@@ -221,6 +236,10 @@ export function SitrepView() {
 
       {revealing && (
         <RevealPanel meta={revealing} onClose={() => setRevealing(null)} />
+      )}
+
+      {showShortcuts && (
+        <ShortcutsOverlay onClose={() => setShowShortcuts(false)} />
       )}
     </div>
   );
