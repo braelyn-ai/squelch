@@ -263,6 +263,21 @@ pub trait Store: Send + Sync {
         disposition: Disposition,
     ) -> Result<i64>;
 
+    /// AGENT-DOOR upsert: identical to [`Store::set_sender_rule`] but appends the
+    /// given audit row IN THE SAME TRANSACTION as the rule write. FAIL-CLOSED: if
+    /// the audit insert fails, the whole transaction rolls back and the rule write
+    /// is NOT committed — an untrusted-adjacent agent write must never land
+    /// untraced. Returns the rule id. `entry.action`/`actor`/`target`/`detail` are
+    /// written verbatim (the MCP door supplies actor="agent", action="rule.set").
+    fn set_sender_rule_audited(
+        &self,
+        account_id: AccountId,
+        match_pattern: &str,
+        want_text: &str,
+        disposition: Disposition,
+        audit: &NewAuditEntry,
+    ) -> Result<i64>;
+
     fn list_sender_rules(&self, account_id: AccountId) -> Result<Vec<SenderRule>>;
 
     /// Update an existing sender rule by id (scoped to `account_id`): overwrite

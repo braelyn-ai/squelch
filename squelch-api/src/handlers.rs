@@ -344,10 +344,15 @@ pub async fn create_rule(
 
     let store = state.store.clone();
     let account_id = state.account_id;
+    let pattern = body.match_pattern.clone();
     let id = blocking(move || {
         store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
+    // Best-effort audit (actor="client-api"): the human is the actor here, so
+    // ledger completeness matters less than not breaking their edit. target is
+    // the match_pattern; detail records the resulting rule id.
+    audit_action(&state, "rule.create", Some(pattern), &id.to_string()).await;
     Ok((StatusCode::CREATED, Json(json!({ "rule_id": id }))))
 }
 
@@ -364,12 +369,15 @@ pub async fn update_rule(
 
     let store = state.store.clone();
     let account_id = state.account_id;
-    // Rule writes (POST/DELETE) do not audit, so PUT mirrors that: no audit row.
+    let pattern = body.match_pattern.clone();
     let updated = blocking(move || {
         store.update_sender_rule(account_id, id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
     if updated {
+        // Best-effort audit (actor="client-api"). Only a real edit is recorded; a
+        // 404 (unknown id) changed nothing, so it writes no row.
+        audit_action(&state, "rule.update", Some(pattern), &id.to_string()).await;
         Ok(Json(json!({ "rule_id": id })))
     } else {
         Err(ApiError::not_found())
@@ -384,6 +392,9 @@ pub async fn delete_rule(
     let account_id = state.account_id;
     let deleted = blocking(move || store.delete_sender_rule(account_id, id)).await?;
     if deleted {
+        // Best-effort audit (actor="client-api"). target is the rule id (the
+        // pattern is gone post-delete); only a real removal is recorded.
+        audit_action(&state, "rule.delete", Some(id.to_string()), "ok").await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found())

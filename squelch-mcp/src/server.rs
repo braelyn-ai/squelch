@@ -22,7 +22,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use squelch_core::error::CoreError;
-use squelch_core::store::{SqliteStore, Store};
+use squelch_core::store::{NewAuditEntry, SqliteStore, Store};
 use squelch_core::types::{AccountId, Disposition, ThreadView, Update};
 
 /// The squelch MCP server. Holds the store and the active account.
@@ -74,6 +74,21 @@ pub struct SetSenderRuleParams {
     pub want: String,
     /// One of: "surface", "squelch", "filtered".
     pub disposition: String,
+}
+
+/// Truncate `s` to at most `max` characters (not bytes — safe on UTF-8),
+/// appending a single ellipsis when it was cut. Used to keep audit `detail`
+/// bounded and readable for the human review UI.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut it = s.char_indices();
+    match it.nth(max) {
+        Some((idx, _)) => {
+            let mut out = s[..idx].to_string();
+            out.push('…');
+            out
+        }
+        None => s.to_string(),
+    }
 }
 
 impl SquelchServer {
@@ -224,13 +239,36 @@ impl SquelchServer {
                 None,
             )
         })?;
+
+        // AUDIT (agent door): this is the highest-value entry in the ledger — a
+        // prompt-injected agent tampering with rules is the known blast radius of
+        // this tool, and it must never write untraced. detail carries the
+        // disposition + the `want` text truncated to ~120 chars so the human
+        // review UI reads cleanly without unbounded free text.
+        let detail = format!(
+            "{}: {}",
+            disposition.as_str(),
+            truncate_chars(&params.want, 120)
+        );
+        let audit = NewAuditEntry {
+            actor: "agent".to_string(),
+            action: "rule.set".to_string(),
+            target: Some(params.match_pattern.clone()),
+            detail: Some(detail),
+        };
+
+        // FAIL-CLOSED: the audit row is committed in the SAME transaction as the
+        // rule write. If the audit insert fails, the rule write is rolled back and
+        // the tool returns an error — stricter than the human door's best-effort
+        // action audit, because this is a WRITE by an untrusted-adjacent actor.
         let id = self
             .store
-            .set_sender_rule(
+            .set_sender_rule_audited(
                 self.account_id,
                 &params.match_pattern,
                 &params.want,
                 disposition,
+                &audit,
             )
             .map_err(Self::map_err)?;
         Self::ok_json(serde_json::json!({ "rule_id": id }))
@@ -335,5 +373,63 @@ mod tests {
         // Sealed row: still status='new', surfaced_at NULL (never stamped).
         let stats = store.stats(acct).unwrap();
         assert_eq!(stats.sealed, 1);
+    }
+
+    /// The AGENT DOOR write (`set_sender_rule`) appends an audit row: actor
+    /// "agent", action "rule.set", target = the match_pattern, detail carrying the
+    /// disposition + truncated want text. This is the highest-value ledger entry.
+    #[tokio::test]
+    async fn set_sender_rule_writes_audit_row() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+
+        let long_want = "x".repeat(200);
+        let res = server
+            .set_sender_rule(Parameters(SetSenderRuleParams {
+                match_pattern: "*@spam.com".into(),
+                want: long_want,
+                disposition: "squelch".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error.unwrap_or(false));
+
+        // The rule landed...
+        let rules = store.list_sender_rules(acct).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].match_pattern, "*@spam.com");
+
+        // ...and so did exactly one audit row with the expected shape.
+        let audit = store.list_audit(acct, 10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].actor, "agent");
+        assert_eq!(audit[0].action, "rule.set");
+        assert_eq!(audit[0].target.as_deref(), Some("*@spam.com"));
+        let detail = audit[0].detail.as_deref().unwrap();
+        assert!(detail.starts_with("squelch: "), "detail: {detail}");
+        // want was truncated (200 chars -> ~120 + ellipsis), so far under the raw.
+        assert!(detail.chars().count() <= 132, "detail too long: {detail}");
+        assert!(detail.ends_with('…'), "truncation marker missing: {detail}");
+    }
+
+    /// FAIL-CLOSED: an invalid disposition never reaches the store, so no rule and
+    /// no audit row is written — the tool errors out clean.
+    #[tokio::test]
+    async fn set_sender_rule_bad_disposition_writes_nothing() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+
+        let err = server
+            .set_sender_rule(Parameters(SetSenderRuleParams {
+                match_pattern: "*@spam.com".into(),
+                want: "nope".into(),
+                disposition: "bogus".into(),
+            }))
+            .await;
+        assert!(err.is_err());
+        assert_eq!(store.list_sender_rules(acct).unwrap().len(), 0);
+        assert_eq!(store.list_audit(acct, 10).unwrap().len(), 0);
     }
 }

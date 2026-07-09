@@ -529,6 +529,54 @@ impl Store for SqliteStore {
         Ok(id)
     }
 
+    fn set_sender_rule_audited(
+        &self,
+        account_id: AccountId,
+        match_pattern: &str,
+        want_text: &str,
+        disposition: Disposition,
+        audit: &NewAuditEntry,
+    ) -> Result<i64> {
+        // FAIL-CLOSED: the rule write and its audit row share ONE transaction. If
+        // the audit INSERT errors, `?` bails before commit and the tx is rolled
+        // back on drop — so the agent-door rule write never lands untraced.
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sender_rules(account_id, match_pattern, want_text, disposition, updated_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(account_id, match_pattern) DO UPDATE SET
+                 want_text=excluded.want_text, disposition=excluded.disposition,
+                 updated_at=excluded.updated_at",
+            params![
+                account_id,
+                match_pattern,
+                want_text,
+                disposition.as_str(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let id: i64 = tx.query_row(
+            "SELECT id FROM sender_rules WHERE account_id=?1 AND match_pattern=?2",
+            params![account_id, match_pattern],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO audit_log(account_id, ts, actor, action, target, detail)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                account_id,
+                Utc::now().to_rfc3339(),
+                audit.actor,
+                audit.action,
+                audit.target,
+                audit.detail,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     fn update_sender_rule(
         &self,
         account_id: AccountId,
@@ -2297,5 +2345,54 @@ mod tests {
             .unwrap();
         assert_eq!(imp, 40, "sealed row importance unchanged");
         assert!(model.is_none(), "sealed row model_used untouched");
+    }
+
+    #[test]
+    fn set_sender_rule_audited_writes_both_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let audit = NewAuditEntry {
+            actor: "agent".into(),
+            action: "rule.set".into(),
+            target: Some("*@spam.com".into()),
+            detail: Some("squelch: kill it".into()),
+        };
+        let id = store
+            .set_sender_rule_audited(acct, "*@spam.com", "kill it", Disposition::Squelch, &audit)
+            .unwrap();
+        assert!(id > 0);
+
+        let rules = store.list_sender_rules(acct).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].match_pattern, "*@spam.com");
+
+        let log = store.list_audit(acct, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].actor, "agent");
+        assert_eq!(log[0].action, "rule.set");
+        assert_eq!(log[0].target.as_deref(), Some("*@spam.com"));
+    }
+
+    #[test]
+    fn set_sender_rule_audited_rolls_back_rule_when_audit_fails() {
+        // FAIL-CLOSED: force the audit INSERT to error (drop the audit_log table)
+        // and assert the rule write did NOT land — the whole tx rolled back.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch("DROP TABLE audit_log").unwrap();
+        }
+        let audit = NewAuditEntry {
+            actor: "agent".into(),
+            action: "rule.set".into(),
+            target: Some("*@spam.com".into()),
+            detail: None,
+        };
+        let res =
+            store.set_sender_rule_audited(acct, "*@spam.com", "kill it", Disposition::Squelch, &audit);
+        assert!(res.is_err(), "audit failure must fail the whole call");
+        // The rule write must have been rolled back.
+        assert_eq!(store.list_sender_rules(acct).unwrap().len(), 0);
     }
 }

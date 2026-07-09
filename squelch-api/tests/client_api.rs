@@ -844,6 +844,94 @@ async fn update_rule_edits_in_place_and_404s_bogus() {
 }
 
 #[tokio::test]
+async fn rule_mutations_write_audit_rows() {
+    // Each of POST/PUT/DELETE /client/rules writes a best-effort audit row
+    // (actor="client-api"), so the human review UI can see rule changes.
+    let (app, store, acct) = app_with(|_, _| {});
+
+    // POST => rule.create, target = match_pattern.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "*@old.com",
+                "want": "old want",
+                "disposition": "squelch"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let rule_id = body_json(resp).await["rule_id"].as_i64().unwrap();
+
+    // PUT => rule.update.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/client/rules/{rule_id}"),
+            serde_json::json!({
+                "match_pattern": "*@new.com",
+                "want": "new want",
+                "disposition": "surface"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // DELETE => rule.delete, target = rule id.
+    let resp = app
+        .clone()
+        .oneshot(authed("DELETE", &format!("/client/rules/{rule_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let audit = store.list_audit(acct, 20).unwrap();
+    // Newest-first. All three rows are actor="client-api".
+    assert!(audit.iter().all(|a| a.actor == "client-api"));
+    let create = audit.iter().find(|a| a.action == "rule.create").unwrap();
+    assert_eq!(create.target.as_deref(), Some("*@old.com"));
+    assert_eq!(create.detail.as_deref(), Some(rule_id.to_string().as_str()));
+    let update = audit.iter().find(|a| a.action == "rule.update").unwrap();
+    assert_eq!(update.target.as_deref(), Some("*@new.com"));
+    let delete = audit.iter().find(|a| a.action == "rule.delete").unwrap();
+    assert_eq!(delete.target.as_deref(), Some(rule_id.to_string().as_str()));
+}
+
+#[tokio::test]
+async fn failed_rule_mutations_write_no_audit_row() {
+    // A 404 (unknown id) on PUT/DELETE changed nothing, so it writes no row.
+    let (app, store, acct) = app_with(|_, _| {});
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            "/client/rules/999999",
+            serde_json::json!({
+                "match_pattern": "*@x.com",
+                "want": "",
+                "disposition": "squelch"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(authed("DELETE", "/client/rules/999999"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(store.list_audit(acct, 20).unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn stats_expose_stage2_usage_and_cost() {
     // TASK 5: GET /client/stats surfaces a stage2 object with today's usage +
     // an estimated cost from the default per-MTok prices (1.0 in / 5.0 out).
