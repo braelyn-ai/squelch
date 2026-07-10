@@ -32,6 +32,7 @@ import {
   Pencil,
   Package,
   Truck,
+  PackageCheck,
 } from "lucide-react";
 import { api, ApiError } from "../api";
 import type {
@@ -191,6 +192,7 @@ function SitrepBody({
 
   return (
     <div className="dash-zones">
+      <div className="dash-main">
       {/* ---- (a) OBLIGATIONS ---- */}
       <section className="zone zone-obligations">
         <div className="zone-head">
@@ -218,9 +220,6 @@ function SitrepBody({
           </div>
         )}
       </section>
-
-      {/* ---- IN TRANSIT (shipment tracking) ---- */}
-      <InTransitZone />
 
       {/* ---- (b) ATTENTION ---- */}
       <section
@@ -300,6 +299,10 @@ function SitrepBody({
         onAuth={() => onGoto("auth")}
         onRules={() => onGoto("rules")}
       />
+      </div>
+
+      {/* ---- SHIPMENTS (tall right-hand column) ---- */}
+      <ShipmentsColumn />
     </div>
   );
 }
@@ -439,7 +442,8 @@ const CARRIER_DOMAIN: Partial<Record<Shipment["carrier"], string>> = {
 
 // Status → chip class + label. Colors defined in sitrep-dash.css:
 //   out_for_delivery = amber/loud, shipped = signal bronze-green (accent),
-//   exception = red, ordered = faint/muted, delivered = muted (unseen here).
+//   exception = red, ordered = faint/muted, delivered = muted w/ checkmark
+//   (delivered-today items surface here via the includeDelivered filter).
 const SHIP_STATUS: Record<
   ShipmentStatus,
   { cls: string; label: string }
@@ -461,13 +465,37 @@ function carrierLabel(carrier: Shipment["carrier"]): string {
   return carrier.charAt(0).toUpperCase() + carrier.slice(1);
 }
 
-function InTransitZone() {
+/**
+ * True if an RFC3339 timestamp falls on the current LOCAL calendar day. Parses
+ * defensively: a missing/unparseable stamp returns false (older delivered items
+ * without a good stamp stay hidden, which is the safe/quiet default).
+ */
+function isToday(iso: string | null | undefined): boolean {
+  if (!iso) return false;
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return false;
+  const now = new Date();
+  return (
+    t.getFullYear() === now.getFullYear() &&
+    t.getMonth() === now.getMonth() &&
+    t.getDate() === now.getDate()
+  );
+}
+
+/**
+ * SHIPMENTS zone, rendered as the tall right-hand column. Fetches with
+ * includeDelivered=true then keeps a shipment when it's still active
+ * (status !== "delivered") OR it was delivered TODAY (local calendar day).
+ * Yesterday's-and-older deliveries drop out. View-only by design: no j/k, but
+ * each card's Track button is a real focusable/clickable affordance.
+ */
+function ShipmentsColumn() {
   const [shipments, setShipments] = useState<Shipment[] | null>(null);
 
   useEffect(() => {
     let alive = true;
     api
-      .getShipments(false)
+      .getShipments(true)
       .then((s) => alive && setShipments(s))
       .catch(() => {
         // Non-fatal: leave the zone empty rather than surface token/url.
@@ -478,28 +506,36 @@ function InTransitZone() {
     };
   }, []);
 
-  const rows = shipments ?? [];
+  const rows = useMemo(
+    () =>
+      (shipments ?? []).filter(
+        (s) => s.status !== "delivered" || isToday(s.last_update),
+      ),
+    [shipments],
+  );
 
   return (
-    <section className="zone zone-transit">
-      <div className="zone-head">
-        <span className="glyph">
-          <Truck size={15} />
-        </span>
-        <h2>In Transit</h2>
-        {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
-        <span className="zone-sub">packages en route</span>
-      </div>
-      {rows.length === 0 ? (
-        <p className="zone-empty">Nothing in transit.</p>
-      ) : (
-        <div className="transit-grid">
-          {rows.map((s) => (
-            <ShipmentCard key={s.id} shipment={s} />
-          ))}
+    <aside className="dash-right">
+      <section className="zone zone-transit">
+        <div className="zone-head">
+          <span className="glyph">
+            <Truck size={15} />
+          </span>
+          <h2>Shipments</h2>
+          {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
+          <span className="zone-sub">en route · delivered today</span>
         </div>
-      )}
-    </section>
+        {rows.length === 0 ? (
+          <p className="zone-empty">No shipments.</p>
+        ) : (
+          <div className="transit-grid">
+            {rows.map((s) => (
+              <ShipmentCard key={s.id} shipment={s} />
+            ))}
+          </div>
+        )}
+      </section>
+    </aside>
   );
 }
 
@@ -535,9 +571,10 @@ function ShipmentCard({ shipment: s }: { shipment: Shipment }) {
   const title =
     s.item_name.trim() || `Package via ${carrierLabel(s.carrier)}`;
   const canTrack = !!s.tracking_url;
+  const delivered = s.status === "delivered";
 
   return (
-    <div className="transit-card">
+    <div className={`transit-card${delivered ? " delivered" : ""}`}>
       <div className="transit-top">
         <CarrierBadge carrier={s.carrier} />
         <span className="transit-name" title={title}>
@@ -545,7 +582,10 @@ function ShipmentCard({ shipment: s }: { shipment: Shipment }) {
         </span>
       </div>
       <div className="transit-bottom">
-        <span className={`transit-chip ${st.cls}`}>{st.label}</span>
+        <span className={`transit-chip ${st.cls}`}>
+          {delivered && <PackageCheck size={12} />}
+          {st.label}
+        </span>
         {canTrack && (
           <button
             type="button"

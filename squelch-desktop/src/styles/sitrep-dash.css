@@ -5,8 +5,11 @@
 
 .sitrep-dash {
   flex: 1;
-  overflow: auto;
-  padding: 12px 20px 48px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 20px 0;
 }
 
 .dash-header {
@@ -32,11 +35,71 @@
   font-size: 12.5px;
 }
 
+/* Two-column dashboard: a flexible MAIN column (obligations / attention / aging
+   / newsletters / status strip) and a fixed-width TALL right column for
+   SHIPMENTS. A hairline divider sits between them (not a heavy border). The
+   grid fills the remaining height so the right column can own its own scroll. */
 .dash-zones {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 0;
+}
+
+/* MAIN column: the original vertical stack, now scrolling independently. */
+.dash-main {
   display: flex;
   flex-direction: column;
   gap: 14px;
   max-width: 960px;
+  min-width: 0;
+  overflow-y: auto;
+  padding-bottom: 48px;
+  padding-right: 20px;
+}
+
+/* RIGHT column: full available height, hairline divider on the left, its own
+   scroll when the shipment list runs long. */
+.dash-right {
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  padding-left: 20px;
+  padding-bottom: 48px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.dash-right .zone-transit {
+  display: flex;
+  flex-direction: column;
+}
+/* In the tall column the shipment cards stack single-file. */
+.dash-right .transit-grid {
+  grid-template-columns: 1fr;
+}
+
+/* Responsive fallback: on a narrow window collapse to a single column so the
+   right column drops below the main stack (no divider, normal stacked zone). */
+@media (max-width: 900px) {
+  .dash-zones {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .dash-main {
+    overflow-y: visible;
+    padding-right: 0;
+    padding-bottom: 14px;
+    max-width: 960px;
+  }
+  .dash-right {
+    border-left: none;
+    padding-left: 0;
+    overflow-y: visible;
+  }
+  .dash-right .transit-grid {
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  }
 }
 
 /* ---- shared zone card ---- */
@@ -319,6 +382,14 @@
 .transit-card:hover {
   background: var(--bg-row);
 }
+/* Delivered-today: quieter than active shipments — dimmed name, no left signal. */
+.transit-card.delivered {
+  opacity: 0.72;
+}
+.transit-card.delivered .transit-name {
+  font-weight: 550;
+  color: var(--fg-dim);
+}
 .transit-top {
   display: flex;
   align-items: center;
@@ -361,6 +432,7 @@
 .transit-chip {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   padding: 2px 9px;
   border-radius: 999px;
   font-size: 11px;

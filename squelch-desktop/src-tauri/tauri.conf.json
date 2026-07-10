@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "squelch",
-        "width": 1100,
-        "height": 750,
-        "minWidth": 900,
-        "minHeight": 600,
+        "width": 1320,
+        "height": 880,
+        "minWidth": 940,
+        "minHeight": 640,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "backgroundColor": "#f7f4ee"
