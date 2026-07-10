@@ -33,12 +33,14 @@
 //!    Noise-ish importance but **not confident**, so Stage-2 gets a look.
 
 pub mod deadline;
+pub mod receipt;
 pub mod rules;
 pub mod seal;
 pub mod shipment;
 pub mod stage2;
 
 pub use deadline::DeadlineHit;
+pub use receipt::{ReceiptInfo, detect_receipt};
 pub use shipment::{ShipmentInfo, ShipmentStatus, detect_shipment};
 
 use crate::config::Stage1Config;

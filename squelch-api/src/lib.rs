@@ -51,6 +51,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         .route("/client/shipments", get(handlers::get_shipments))
+        .route("/client/receipts", get(handlers::get_receipts))
         .route("/client/search", get(handlers::search))
         .route("/client/rules", get(handlers::list_rules))
         .route("/client/rules", post(handlers::create_rule))

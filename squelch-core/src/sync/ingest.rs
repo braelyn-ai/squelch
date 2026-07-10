@@ -14,6 +14,7 @@
 use crate::config::Stage1Config;
 use crate::store::TriagedMessage;
 use crate::sync::html::sanitize_email_html;
+use crate::triage::receipt;
 use crate::triage::seal::{self, SealInput};
 use crate::triage::shipment;
 use crate::triage::stage1_with_config;
@@ -415,6 +416,7 @@ pub fn ingest(
             matched_rule: None,
             deadline: None,
             shipment: None,
+            receipt: None,
             confident: true,
         };
     }
@@ -437,6 +439,7 @@ pub fn ingest(
             matched_rule: None,
             deadline: None,
             shipment: None,
+            receipt: None,
             confident: true,
         };
     }
@@ -453,6 +456,16 @@ pub fn ingest(
     // short-circuited above and never reaches this line.
     let shipment = shipment::detect_shipment(&from_addr, &subject, &text);
 
+    // RECEIPT DETECTION runs INDEPENDENTLY of the triage tier AND of shipment
+    // detection: a receipt (record of money already paid) is noise-tier for the
+    // ranked inbox but feeds the Receipts category, and an order-confirmation with
+    // a total AND tracking is BOTH a receipt and a shipment. Only ever runs here,
+    // on the NON-SEALED path — a sealed OTP short-circuited above and never reaches
+    // this line, so a receipt can never carry sealed data. When a receipt is
+    // present, the store's ingest write force-resolves this message's triage row
+    // (status='done') so it never surfaces as inbox clutter.
+    let receipt = receipt::detect_receipt(&from_addr, &subject, &text);
+
     TriagedMessage {
         message,
         recipients,
@@ -465,6 +478,7 @@ pub fn ingest(
         matched_rule: result.matched_rule,
         deadline: result.deadline,
         shipment,
+        receipt,
         confident: result.confident,
     }
 }
@@ -773,6 +787,65 @@ mod tests {
         assert_eq!(s.item_name, "Wireless Headphones");
         // Shipping mail is noise-tier for the ranked inbox.
         assert_eq!(t.tier, Tier::Noise);
+    }
+
+    #[test]
+    fn bay_wheels_receipt_produces_a_receipt_row_with_amount() {
+        // The live bug: a Bay Wheels ride receipt landed in Newsletters. It must
+        // now classify as a receipt (with its total) and drop from inbox clutter.
+        let eml = "From: Bay Wheels <no-reply@baywheels.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your Bay Wheels ride receipt\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Thanks for riding! Receipt for your ride. Total: $3.49.\r\n";
+        let f = raw(1, "g-baywheels", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        let r = t.receipt.expect("receipt detected");
+        assert_eq!(r.amount, Some(3.49));
+        // Receipts are noise-tier for the ranked inbox.
+        assert_eq!(t.tier, Tier::Noise);
+    }
+
+    #[test]
+    fn order_confirmation_receipt_extracts_total() {
+        let eml = "From: Shop <orders@shop.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Order confirmation #12345\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Thank you for your order. Order total $3.49.\r\n";
+        let f = raw(1, "g-order", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.receipt.expect("receipt").amount, Some(3.49));
+    }
+
+    #[test]
+    fn refund_is_not_a_receipt_at_ingest() {
+        let eml = "From: eBay <ebay@ebay.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your refund receipt\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Your refund of $23.99 has been issued to your card.\r\n";
+        let f = raw(1, "g-refund", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.receipt.is_none(), "a refund must not be a receipt");
+    }
+
+    #[test]
+    fn sealed_otp_never_produces_a_receipt() {
+        // A sealed OTP short-circuits before receipt detection ever runs.
+        let eml = "From: Bank <noreply@bank.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your verification code\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Your one-time passcode is 483920. Thank you for your payment.\r\n";
+        let f = raw(1, "g-otp-rcpt", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.sensitivity, Sensitivity::Sealed);
+        assert!(t.receipt.is_none(), "sealed mail must never yield a receipt");
     }
 
     #[test]

@@ -110,6 +110,22 @@ export interface Shipment {
   last_update: string; // RFC3339
 }
 
+/**
+ * core::types::Receipt (GET /client/receipts) — snake_case on the wire. A record
+ * of money already paid. `amount`/`currency` are best-effort: a receipt with no
+ * parseable total still exists (amount === null → render "—").
+ */
+export interface Receipt {
+  id: number;
+  account_id: number;
+  message_id: number;
+  from_addr: string;
+  from_name: string | null;
+  amount: number | null;
+  currency: string | null;
+  received_at: string; // RFC3339
+}
+
 /** core::types::SenderRule (GET /client/rules) */
 export interface SenderRule {
   id: number;

@@ -69,6 +69,7 @@
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+  gap: 14px;
 }
 .dash-right .zone-transit {
   display: flex;
@@ -641,4 +642,44 @@
 }
 .status-strip .status-chip.auth:hover {
   border-color: var(--lock);
+}
+
+/* ---- RECEIPTS zone: thin, dense records (right column, under Shipments) ---- */
+.zone-receipts .zone-head .glyph {
+  color: var(--fg-dim);
+}
+/* Much denser than the other cards: no per-row card chrome, just hairline
+   dividers between records. */
+.receipts-list {
+  display: flex;
+  flex-direction: column;
+}
+.receipt-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.receipt-row:last-child {
+  border-bottom: none;
+}
+/* Merchant name — clean, left, truncates so the amount is never pushed off. */
+.receipt-sender {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+}
+/* Total — right-aligned, Plex Mono, tabular so decimals line up. */
+.receipt-amount {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--fg-dim);
+  white-space: nowrap;
 }

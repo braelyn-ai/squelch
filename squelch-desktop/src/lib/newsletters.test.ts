@@ -119,6 +119,21 @@ describe("deriveNewsletters", () => {
     expect(nls[0].count).toBe(2);
   });
 
+  test("Bay Wheels receipt (auto-resolved status='done') is NOT a newsletter", () => {
+    // The live bug: a Bay Wheels ride receipt is a brand/robot sender appearing
+    // multiple times, which would otherwise qualify via the robot>=2 path. The
+    // server auto-resolves receipts to status='done', and the derivation must drop
+    // those — a settled record is not recurring noise to onboard a rule for.
+    const nls = deriveNewsletters(
+      [
+        upd({ sender: "Bay Wheels <no-reply@baywheels.com>", reason: "receipt", status: "done" }),
+        upd({ sender: "Bay Wheels <no-reply@baywheels.com>", reason: "receipt", status: "done" }),
+      ],
+      [],
+    );
+    expect(nls.length).toBe(0);
+  });
+
   test("attaches a matching rule to the card", () => {
     const nls = deriveNewsletters(
       [upd({ sender: "news@acme.com", reason: "bulk/list mail (unsubscribe footer)" })],

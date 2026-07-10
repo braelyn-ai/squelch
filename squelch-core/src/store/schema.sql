@@ -126,6 +126,36 @@ CREATE TABLE IF NOT EXISTS shipments (
 
 CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status);
 
+-- RECEIPTS. One row per (account, message): a record of money ALREADY PAID,
+-- extracted from NON-SEALED past-transaction mail (payment received / receipt /
+-- order confirmation / you were charged) by the ingest pipeline. Receipts are
+-- records, not obligations and not signals — they live ONLY in the desktop
+-- "Receipts" category and are auto-resolved (triage.status='done') at ingest so
+-- they never surface as New/Attention/Aging clutter. `from_addr`/`from_name` are
+-- stored so the client can render a clean merchant name with no extra join.
+-- `amount`/`currency` are best-effort — a receipt with no parseable total is
+-- still a receipt (amount NULL). A receipt and a shipment can COEXIST (an order
+-- confirmation with a total AND tracking is both); receipt detection is
+-- independent of shipment detection.
+--
+-- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A RECEIPT. The
+-- ingest path runs receipt detection ONLY for sensitivity='normal' mail, so this
+-- table has no sealed rows BY CONSTRUCTION — there is nothing to leak and no
+-- sealed join is needed on read.
+CREATE TABLE IF NOT EXISTS receipts (
+    id          INTEGER PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    from_addr   TEXT NOT NULL,
+    from_name   TEXT,
+    amount      REAL,
+    currency    TEXT,
+    received_at TEXT NOT NULL,
+    UNIQUE(account_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipts_received ON receipts(account_id, received_at);
+
 -- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
 -- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
 -- last_uid holds the account's historyId (a u64 that fits in SQLite's i64

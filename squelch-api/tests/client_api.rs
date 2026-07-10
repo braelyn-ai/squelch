@@ -198,6 +198,57 @@ async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
     assert_eq!(json.as_array().unwrap().len(), 2, "delivered included with flag");
 }
 
+#[tokio::test]
+async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
+    use squelch_core::triage::ReceiptInfo;
+    let (app, _s, _a) = app_with(|store, acct| {
+        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "receipt a", "b")).unwrap();
+        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "receipt b", "b")).unwrap();
+        // Older, then newer — expect newest-first ordering on read.
+        store
+            .upsert_receipt(
+                acct,
+                m1,
+                "no-reply@baywheels.com",
+                Some("Bay Wheels"),
+                &ReceiptInfo { amount: Some(3.49), currency: Some("USD".into()) },
+                chrono::Utc::now() - chrono::Duration::hours(2),
+            )
+            .unwrap();
+        store
+            .upsert_receipt(
+                acct,
+                m2,
+                "orders@shop.com",
+                None,
+                &ReceiptInfo { amount: None, currency: None },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    });
+
+    // Bearer-gated: no token => 401.
+    let unauth = Request::builder()
+        .uri("/client/receipts")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauth).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Authed: rows, newest-first, with clean sender + null amount preserved.
+    let resp = app.oneshot(authed("GET", "/client/receipts")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["from_addr"], "orders@shop.com", "newest first");
+    assert_eq!(items[0]["amount"], Value::Null, "null amount preserved");
+    assert_eq!(items[1]["from_addr"], "no-reply@baywheels.com");
+    assert_eq!(items[1]["from_name"], "Bay Wheels");
+    assert_eq!(items[1]["amount"], 3.49);
+    assert_eq!(items[1]["currency"], "USD");
+}
+
 /// A garbage `mode` value is a 400.
 #[tokio::test]
 async fn search_bad_mode_is_400() {

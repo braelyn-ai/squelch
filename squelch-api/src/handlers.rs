@@ -423,6 +423,31 @@ pub async fn get_shipments(
     Ok(Json(items))
 }
 
+// --- GET /client/receipts ---------------------------------------------------
+
+/// Default look-back window for the receipts list.
+const DEFAULT_RECEIPTS_DAYS: u32 = 30;
+
+#[derive(Debug, Deserialize)]
+pub struct ReceiptsQuery {
+    /// Look-back window in days. Default 30.
+    days: Option<u32>,
+}
+
+pub async fn get_receipts(
+    State(state): State<ApiState>,
+    Query(q): Query<ReceiptsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let days = q.days.unwrap_or(DEFAULT_RECEIPTS_DAYS);
+    // Newest-first receipt rows. The receipts table holds no sealed rows by
+    // construction (detection never runs on sealed mail), so there is no sealed
+    // filtering to apply here.
+    let items = blocking(move || store.list_receipts(account_id, days)).await?;
+    Ok(Json(items))
+}
+
 // --- GET/POST/DELETE /client/rules ------------------------------------------
 
 pub async fn list_rules(

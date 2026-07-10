@@ -11,10 +11,10 @@ pub mod sqlite;
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
-use crate::triage::{DeadlineHit, ShipmentInfo};
+use crate::triage::{DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, Deadline, Disposition, NewMessage,
-    SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
+    Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
 };
 use chrono::{DateTime, Utc};
 
@@ -86,6 +86,14 @@ pub struct TriagedMessage {
     /// `Some` for non-sealed mail — sealed content is never inspected for
     /// shipments, so a shipment can never carry sealed data.
     pub shipment: Option<ShipmentInfo>,
+    /// A detected receipt (record of money already paid), if any. Runs
+    /// INDEPENDENTLY of the triage tier AND of shipment detection — an order
+    /// confirmation with a total AND tracking is both a receipt and a shipment.
+    /// Only ever `Some` for non-sealed mail. When present, the ingest write also
+    /// AUTO-RESOLVES the message's triage row (`status='done'`) so a receipt never
+    /// surfaces as New/Attention/Aging clutter — it lives only in the Receipts
+    /// category.
+    pub receipt: Option<ReceiptInfo>,
     /// `false` when Stage-1 was not confident: the row is left with
     /// `model_used IS NULL` so the Stage-2 queue predicate
     /// (`model_used IS NULL AND sensitivity = 'normal'`) picks it up.
@@ -310,6 +318,28 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         include_delivered: bool,
     ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// Upsert a receipt keyed by `(account_id, message_id)`. A first sight
+    /// inserts; a re-ingest of the same message UPDATES the row (idempotent).
+    /// Returns the receipt row id.
+    ///
+    /// SECURITY: the caller runs this ONLY for non-sealed mail; the `receipts`
+    /// table therefore holds no sealed rows by construction (no sealed join is
+    /// needed on read).
+    fn upsert_receipt(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        from_addr: &str,
+        from_name: Option<&str>,
+        receipt: &ReceiptInfo,
+        received_at: DateTime<Utc>,
+    ) -> Result<i64>;
+
+    /// List receipts for the account received within the last `days`, newest
+    /// first. Sealed rows are structurally absent (never inserted), so no sealed
+    /// filter is required.
+    fn list_receipts(&self, account_id: AccountId, days: u32) -> Result<Vec<Receipt>>;
 
     /// Upsert a sender rule. Returns the rule id.
     fn set_sender_rule(

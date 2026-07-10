@@ -17,8 +17,8 @@ use crate::store::{
 };
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, ClientMessage,
-    ClientThreadView, Deadline, Disposition, NewMessage, SanitizedMessage, SearchHit, SenderRule,
-    Sensitivity, StoreStats, ThreadView, Tier, Update,
+    ClientThreadView, Deadline, Disposition, NewMessage, Receipt, SanitizedMessage, SearchHit,
+    SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -665,6 +665,46 @@ fn upsert_shipment_conn(
     }
 }
 
+/// Upsert a receipt keyed by `(account_id, message_id)`. Idempotent: a re-ingest
+/// of the same message overwrites amount/currency/sender/received_at. Runs in the
+/// caller's connection/transaction.
+///
+/// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
+fn upsert_receipt_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+    from_addr: &str,
+    from_name: Option<&str>,
+    r: &crate::triage::ReceiptInfo,
+    received_at: DateTime<Utc>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO receipts(account_id, message_id, from_addr, from_name,
+             amount, currency, received_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+             from_addr=excluded.from_addr, from_name=excluded.from_name,
+             amount=excluded.amount, currency=excluded.currency,
+             received_at=excluded.received_at",
+        params![
+            account_id,
+            message_id,
+            from_addr,
+            from_name,
+            r.amount,
+            r.currency,
+            received_at.to_rfc3339(),
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM receipts WHERE account_id=?1 AND message_id=?2",
+        params![account_id, message_id],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
@@ -1037,6 +1077,68 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn upsert_receipt(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        from_addr: &str,
+        from_name: Option<&str>,
+        receipt: &crate::triage::ReceiptInfo,
+        received_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let conn = self.lock()?;
+        upsert_receipt_conn(
+            &conn,
+            account_id,
+            message_id,
+            from_addr,
+            from_name,
+            receipt,
+            received_at,
+        )
+    }
+
+    fn list_receipts(&self, account_id: AccountId, days: u32) -> Result<Vec<Receipt>> {
+        let conn = self.lock()?;
+        // Newest-first, within the last `days`. No sealed filter needed: the table
+        // holds no sealed rows by construction (detection never runs on sealed
+        // mail).
+        let since = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, message_id, from_addr, from_name, amount, currency, received_at
+             FROM receipts
+             WHERE account_id=?1 AND received_at >= ?2
+             ORDER BY received_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id, since], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, acct, message_id, from_addr, from_name, amount, currency, received_at) = row?;
+            out.push(Receipt {
+                id,
+                account_id: acct,
+                message_id,
+                from_addr,
+                from_name,
+                amount,
+                currency,
+                received_at: parse_dt(&received_at)?,
+            });
+        }
+        Ok(out)
+    }
+
     fn set_sender_rule(
         &self,
         account_id: AccountId,
@@ -1196,15 +1298,39 @@ impl Store for SqliteStore {
         //    sensitivity='normal' that is the Stage-2 queue predicate for
         //    non-confident rows.
         let deadline_dt = triaged.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
+        // AUTO-RESOLVE receipts: a receipt-classified message is a RECORD, not
+        // something the user must act on. We set its attention-lifecycle status to
+        // the terminal 'done' at ingest (stamping resolved_at) so it is excluded
+        // from the New/Attention/Aging bands and never becomes inbox clutter — it
+        // lives ONLY in the Receipts category. Non-receipt rows start 'new' as
+        // usual. Sealed mail never carries a receipt, so this only ever fires on
+        // non-sealed receipt-classified rows.
+        let now_s = Utc::now().to_rfc3339();
+        let is_receipt = triaged.sensitivity != Sensitivity::Sealed && triaged.receipt.is_some();
+        let (status, resolved_at) = if is_receipt {
+            ("done", Some(now_s.clone()))
+        } else {
+            ("new", None)
+        };
+        // On re-ingest of a NON-receipt row we must PRESERVE the existing
+        // attention lifecycle (status/resolved_at) — a re-sync must not reopen an
+        // item the user dismissed. A receipt row, however, is force-resolved to
+        // 'done' on every ingest (a receipt is always a record). The CASE keys off
+        // `excluded.status`: 'done' (only receipts pass 'done' in) overwrites;
+        // otherwise the existing lifecycle is kept.
         tx.execute(
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
-                 sealed_kind, one_line, reason, deadline, matched_rule_id, model_used, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11)
+                 sealed_kind, one_line, reason, deadline, matched_rule_id, model_used,
+                 status, resolved_at, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11,?12,?13)
              ON CONFLICT(message_id) DO UPDATE SET
                  importance=excluded.importance, tier=excluded.tier,
                  sensitivity=excluded.sensitivity, sealed_kind=excluded.sealed_kind,
                  one_line=excluded.one_line, reason=excluded.reason,
-                 deadline=excluded.deadline, matched_rule_id=excluded.matched_rule_id",
+                 deadline=excluded.deadline, matched_rule_id=excluded.matched_rule_id,
+                 status=CASE WHEN excluded.status='done' THEN 'done' ELSE triage.status END,
+                 resolved_at=CASE WHEN excluded.status='done'
+                     THEN excluded.resolved_at ELSE triage.resolved_at END",
             params![
                 id,
                 triaged.message.account_id,
@@ -1216,7 +1342,9 @@ impl Store for SqliteStore {
                 triaged.reason,
                 deadline_dt,
                 triaged.matched_rule,
-                Utc::now().to_rfc3339(),
+                status,
+                resolved_at,
+                now_s,
             ],
         )?;
 
@@ -1261,6 +1389,28 @@ impl Store for SqliteStore {
                 triaged.message.account_id,
                 id,
                 s,
+                triaged.message.received_at,
+            )?;
+        }
+
+        // 5. Receipt: only ever present for NON-SEALED mail (detection is not run
+        //    on sealed content). Insert into the receipts category in the SAME
+        //    transaction. Independent of shipment detection — an order
+        //    confirmation with a total AND tracking lands in BOTH tables. The
+        //    triage row was already force-resolved to status='done' above so this
+        //    message never surfaces as inbox clutter. Sealed mail carries
+        //    `receipt == None`, so this branch never runs for it — the `receipts`
+        //    table is sealed-free by construction.
+        if triaged.sensitivity != Sensitivity::Sealed
+            && let Some(r) = &triaged.receipt
+        {
+            upsert_receipt_conn(
+                &tx,
+                triaged.message.account_id,
+                id,
+                &triaged.message.from_addr,
+                triaged.message.from_name.as_deref(),
+                r,
                 triaged.message.received_at,
             )?;
         }
@@ -1430,8 +1580,13 @@ impl Store for SqliteStore {
         //
         // Band semantics:
         //   standing = tier IN ('past_due','deadline') AND status != 'done'
-        //   new      = surfaced_at IS NULL
+        //   new      = surfaced_at IS NULL AND status != 'done'
         //   open     = status = 'open'
+        // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts (done at
+        // ingest, never surfaced) out of the Attention/New band — a receipt is a
+        // record, not new inbox clutter. Only receipt-classified rows are auto-
+        // done at ingest; every other row starts 'new', so genuine mail is
+        // unaffected.
         let mut sql = String::from(
             "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
                     t.reason, t.deadline, t.matched_rule_id,
@@ -1455,7 +1610,9 @@ impl Store for SqliteStore {
             Some(SitrepBand::Standing) => {
                 sql.push_str(" AND t.tier IN ('past_due','deadline') AND t.status != 'done'");
             }
-            Some(SitrepBand::New) => sql.push_str(" AND t.surfaced_at IS NULL"),
+            Some(SitrepBand::New) => {
+                sql.push_str(" AND t.surfaced_at IS NULL AND t.status != 'done'")
+            }
             Some(SitrepBand::Open) => sql.push_str(" AND t.status = 'open'"),
             None => {}
         }
@@ -1740,7 +1897,7 @@ impl Store for SqliteStore {
             "SELECT
                  COUNT(*) FILTER (
                      WHERE tier IN ('past_due','deadline') AND status != 'done'),
-                 COUNT(*) FILTER (WHERE surfaced_at IS NULL),
+                 COUNT(*) FILTER (WHERE surfaced_at IS NULL AND status != 'done'),
                  COUNT(*) FILTER (WHERE status = 'open')
              FROM triage
              WHERE account_id = ?1 AND sensitivity != 'sealed'",
@@ -2074,6 +2231,89 @@ mod tests {
             body_html: None,
             is_sent: false,
         }
+    }
+
+    /// Build a store-ready TriagedMessage carrying a receipt (noise tier), for
+    /// the auto-resolve tests.
+    fn receipt_triaged(
+        acct: AccountId,
+        gmail: &str,
+        thread: &str,
+        amount: Option<f64>,
+    ) -> TriagedMessage {
+        let mut m = sample_msg(acct, gmail, thread);
+        m.from_addr = "no-reply@baywheels.com".into();
+        m.from_name = Some("Bay Wheels".into());
+        m.subject = "Your Bay Wheels ride receipt".into();
+        TriagedMessage {
+            message: m,
+            recipients: vec![],
+            sensitivity: Sensitivity::Normal,
+            sealed_kind: None,
+            importance: 15,
+            tier: Tier::Noise,
+            one_line: "Your Bay Wheels ride receipt".into(),
+            reason: "receipt".into(),
+            matched_rule: None,
+            deadline: None,
+            shipment: None,
+            receipt: Some(crate::triage::ReceiptInfo {
+                amount,
+                currency: amount.map(|_| "USD".into()),
+            }),
+            confident: true,
+        }
+    }
+
+    #[test]
+    fn receipt_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(30);
+
+        let id = store
+            .ingest_message(&receipt_triaged(acct, "g-r1", "t-r1", Some(3.49)))
+            .unwrap();
+
+        // 1. The receipt row exists with its amount + clean sender.
+        let receipts = store.list_receipts(acct, 30).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].amount, Some(3.49));
+        assert_eq!(receipts[0].currency.as_deref(), Some("USD"));
+        assert_eq!(receipts[0].from_addr, "no-reply@baywheels.com");
+        assert_eq!(receipts[0].from_name.as_deref(), Some("Bay Wheels"));
+
+        // 2. AUTO-RESOLVE: the triage row is status='done' with resolved_at set.
+        let done = store
+            .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+            .unwrap();
+        assert_eq!(done.len(), 1, "receipt is auto-resolved to done");
+        assert_eq!(done[0].update.id, id);
+        assert!(done[0].resolved_at.is_some());
+
+        // 3. It is ABSENT from the New band (never inbox clutter) even though it
+        //    was never surfaced (surfaced_at IS NULL).
+        let fresh = store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .unwrap();
+        assert!(fresh.is_empty(), "auto-done receipt must not be in the New band");
+
+        // 4. Bands counts agree: new == 0, standing == 0.
+        let stats = store.stats(acct).unwrap();
+        assert_eq!(stats.bands.new, 0, "receipt excluded from new count");
+        assert_eq!(stats.bands.standing, 0);
+    }
+
+    #[test]
+    fn receipt_with_no_amount_still_lists() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        store
+            .ingest_message(&receipt_triaged(acct, "g-r2", "t-r2", None))
+            .unwrap();
+        let receipts = store.list_receipts(acct, 30).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].amount, None, "a receipt with no total is still a receipt");
     }
 
     #[test]

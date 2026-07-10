@@ -140,6 +140,15 @@ export function deriveNewsletters(
   const byAddr = new Map<string, Bucket>();
 
   for (const u of updates) {
+    // EXCLUDE RECEIPTS. The server AUTO-RESOLVES receipt-classified mail to
+    // status='done' at ingest (it lives only in the Receipts category, never the
+    // inbox). A done row is a settled record, not recurring noise to onboard a
+    // rule for — so it must never surface as a "newsletter". This is what keeps
+    // Bay Wheels (a ride receipt) out of Newsletters even when the /client/updates
+    // noise feed still carries it. Belt-and-suspenders with the receipt-reason
+    // exclusion below (which still catches any receipt-shaped sender not yet
+    // auto-resolved).
+    if (u.status === "done") continue;
     if (dateOf(u) < since) continue;
     const address = senderAddress(u.sender);
     if (!address.includes("@")) continue;

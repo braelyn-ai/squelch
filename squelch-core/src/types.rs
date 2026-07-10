@@ -279,6 +279,25 @@ pub struct Shipment {
     pub last_update: DateTime<Utc>,
 }
 
+/// A receipt: a record of money ALREADY PAID, produced from NON-SEALED
+/// past-transaction mail by the ingest pipeline and stored in the `receipts`
+/// table (keyed by message). Surfaced by the human door (`GET /client/receipts`);
+/// deliberately NOT exposed on the agent door (the agent doesn't need receipts).
+/// Sealed mail never produces a receipt, so this type is structurally incapable
+/// of representing sealed content. `amount`/`currency` are best-effort — a receipt
+/// with no parseable total is still a receipt (`amount == None`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub message_id: i64,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
 /// A keyword-search hit over the FTS index. HUMAN-DOOR-facing (squelch-api).
 /// Sealed rows are excluded by the query, so a `SearchHit` never represents a
 /// sealed message.

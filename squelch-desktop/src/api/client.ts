@@ -17,6 +17,7 @@ import type {
   CreateRuleBody,
   LabelBody,
   Page,
+  Receipt,
   RevealedSealed,
   SealedMeta,
   SearchHit,
@@ -162,6 +163,17 @@ export function getShipments(
 ): Promise<Shipment[]> {
   return request<Shipment[]>("/client/shipments", {
     query: { include_delivered: String(includeDelivered) },
+  });
+}
+
+/**
+ * Receipts (records of money already paid) received within the last `days`
+ * (default 30), newest-first. Sealed mail never produces a receipt, so these are
+ * structurally sealed-free.
+ */
+export function getReceipts(days?: number): Promise<Receipt[]> {
+  return request<Receipt[]>("/client/receipts", {
+    query: { days },
   });
 }
 

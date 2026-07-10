@@ -37,6 +37,7 @@ import {
 import { api, ApiError } from "../api";
 import type {
   AttentionUpdate,
+  Receipt as ReceiptRecord,
   SenderRule,
   Shipment,
   ShipmentStatus,
@@ -301,8 +302,11 @@ function SitrepBody({
       />
       </div>
 
-      {/* ---- SHIPMENTS (tall right-hand column) ---- */}
-      <ShipmentsColumn />
+      {/* ---- SHIPMENTS + RECEIPTS (tall right-hand column) ---- */}
+      <aside className="dash-right">
+        <ShipmentsColumn />
+        <ReceiptsZone />
+      </aside>
     </div>
   );
 }
@@ -515,27 +519,97 @@ function ShipmentsColumn() {
   );
 
   return (
-    <aside className="dash-right">
-      <section className="zone zone-transit">
-        <div className="zone-head">
-          <span className="glyph">
-            <Truck size={15} />
-          </span>
-          <h2>Shipments</h2>
-          {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
-          <span className="zone-sub">en route · delivered today</span>
+    <section className="zone zone-transit">
+      <div className="zone-head">
+        <span className="glyph">
+          <Truck size={15} />
+        </span>
+        <h2>Shipments</h2>
+        {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
+        <span className="zone-sub">en route · delivered today</span>
+      </div>
+      {rows.length === 0 ? (
+        <p className="zone-empty">No shipments.</p>
+      ) : (
+        <div className="transit-grid">
+          {rows.map((s) => (
+            <ShipmentCard key={s.id} shipment={s} />
+          ))}
         </div>
-        {rows.length === 0 ? (
-          <p className="zone-empty">No shipments.</p>
-        ) : (
-          <div className="transit-grid">
-            {rows.map((s) => (
-              <ShipmentCard key={s.id} shipment={s} />
-            ))}
-          </div>
-        )}
-      </section>
-    </aside>
+      )}
+    </section>
+  );
+}
+
+// ---- RECEIPTS zone: thin records of money already paid ---------------------
+
+/** Format a receipt total: "$3.49", or "—" when the amount didn't parse. */
+function receiptAmount(r: ReceiptRecord): string {
+  if (r.amount === null || r.amount === undefined || Number.isNaN(r.amount)) {
+    return "—";
+  }
+  // USD-only in v0 (the server always emits USD). Two decimals, thousands sep.
+  return `$${r.amount.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+/**
+ * RECEIPTS zone, stacked under Shipments in the right-hand column. Records, not
+ * actions — deliberately the densest zone: each row is JUST the clean merchant
+ * name (left) and the total (right, Plex Mono). No subject, no body, no
+ * affordances. A running count sits in the header ("RECEIPTS · 6").
+ */
+function ReceiptsZone() {
+  const [receipts, setReceipts] = useState<ReceiptRecord[] | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getReceipts()
+      .then((r) => alive && setReceipts(r))
+      .catch(() => {
+        // Non-fatal: leave the zone empty rather than surface token/url.
+        if (alive) setReceipts([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const rows = receipts ?? [];
+
+  return (
+    <section className="zone zone-receipts">
+      <div className="zone-head">
+        <span className="glyph">
+          <Receipt size={15} />
+        </span>
+        <h2>Receipts</h2>
+        {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
+        <span className="zone-sub">paid · records</span>
+      </div>
+      {rows.length === 0 ? (
+        <p className="zone-empty">No receipts.</p>
+      ) : (
+        <div className="receipts-list">
+          {rows.map((r) => {
+            const sender = r.from_name
+              ? `${r.from_name} <${r.from_addr}>`
+              : r.from_addr;
+            return (
+              <div className="receipt-row" key={r.id}>
+                <span className="receipt-sender" title={r.from_addr}>
+                  {senderDisplayName(sender)}
+                </span>
+                <span className="receipt-amount">{receiptAmount(r)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
