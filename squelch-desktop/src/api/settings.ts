@@ -66,3 +66,29 @@ export async function setSettings(settings: Settings): Promise<void> {
   }
   await invoke("set_settings", { settings });
 }
+
+/**
+ * Clear stored settings (Disconnect). In the browser dev fallback we drop the
+ * localStorage entry; under Tauri we overwrite the keyring with empties (the
+ * shell exposes no delete command, and empty {server_url, api_token} is treated
+ * as "no settings" by getSettings on next boot). Best-effort: swallow errors so
+ * a disconnect always returns the UI to the Connect gate.
+ */
+export async function clearSettings(): Promise<void> {
+  if (!hasTauri()) {
+    warnDevFallback();
+    try {
+      localStorage.removeItem(LS_KEY);
+    } catch {
+      // storage unavailable — nothing persisted to clear.
+    }
+    return;
+  }
+  try {
+    await invoke("set_settings", {
+      settings: { server_url: "", api_token: "" },
+    });
+  } catch {
+    // Keyring write failed; the in-memory disconnect still takes effect.
+  }
+}

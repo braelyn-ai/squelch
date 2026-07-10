@@ -17,6 +17,8 @@ import { Connect } from "./views/Connect";
 import { SitrepView } from "./views/SitrepView";
 import { EmailsView } from "./views/EmailsView";
 import { RoutedView } from "./views/RoutedView";
+import { SettingsView } from "./views/SettingsView";
+import { UsageView } from "./views/UsageView";
 import { ActionLayer } from "./views/ActionLayer";
 import { SideViews } from "./views/SideViews";
 import { Sidebar } from "./components/Sidebar";
@@ -120,6 +122,10 @@ function RouteBody({ view }: { view: ReturnType<typeof useStore.getState>["activ
       return <RoutedView view="rules" />;
     case "audit":
       return <RoutedView view="audit" />;
+    case "usage":
+      return <UsageView />;
+    case "settings":
+      return <SettingsView />;
     default:
       return <SitrepView />;
   }

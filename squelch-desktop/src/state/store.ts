@@ -17,7 +17,12 @@ import type {
   StoreStats,
 } from "../api";
 import { configureClient } from "../api/client";
-import { getSettings, setSettings, type Settings } from "../api/settings";
+import {
+  getSettings,
+  setSettings,
+  clearSettings,
+  type Settings,
+} from "../api/settings";
 
 // --- band model -------------------------------------------------------------
 
@@ -70,9 +75,21 @@ export type ConnStatus =
  * side panels promoted to routed views. SidePanel/overlay machinery (thread,
  * reveal, rule editor, compose, process mode) is orthogonal to this.
  */
-export type MainView = "sitrep" | "emails" | "auth" | "rules" | "audit";
+export type MainView =
+  | "sitrep"
+  | "emails"
+  | "auth"
+  | "rules"
+  | "audit"
+  | "usage"
+  | "settings";
 
-/** The rail order — also the 1..5 number-key mapping. */
+/**
+ * The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
+ * DELIBERATELY excluded: they live in a separate bottom group (see BOTTOM_VIEWS)
+ * reached by sidebar click, so adding them never renumbers 1..5. Keep this list
+ * (and only this list) as the digit-key source.
+ */
 export const MAIN_VIEWS: MainView[] = [
   "sitrep",
   "emails",
@@ -80,6 +97,13 @@ export const MAIN_VIEWS: MainView[] = [
   "rules",
   "audit",
 ];
+
+/**
+ * The BOTTOM rail group, pinned below a divider: Usage + Settings. Routed like
+ * the top group but intentionally OUT of the 1..5 number sequence so existing
+ * digit nav stays stable. Sidebar click always routes to them.
+ */
+export const BOTTOM_VIEWS: MainView[] = ["usage", "settings"];
 
 // --- navigation history -----------------------------------------------------
 
@@ -151,6 +175,16 @@ export interface AppState {
   loadSettings: () => Promise<void>;
   /** Test a candidate URL+token via /client/stats; on success persist + connect. */
   connect: (serverUrl: string, apiToken: string) => Promise<boolean>;
+  /**
+   * Settings-screen re-validate: test a candidate URL+token against /client/stats
+   * and, on success, persist + swap the live client to them — WITHOUT dropping the
+   * global connStatus out of "connected" on failure (so the Settings view stays
+   * mounted rather than bouncing to the Connect gate). Returns an ok/error result.
+   */
+  revalidate: (
+    serverUrl: string,
+    apiToken: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
   disconnect: () => void;
 
   // routed-view slice — which sidebar surface is active
@@ -325,7 +359,37 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  revalidate: async (serverUrl, apiToken) => {
+    // Probe with the candidate config. On failure we RESTORE the previously-good
+    // client so the app stays connected against whatever was working before.
+    const prev = get().settings;
+    configureClient(serverUrl, apiToken);
+    try {
+      await api.getStats(); // 401 => bad token; network => bad url
+      await setSettings({ server_url: serverUrl, api_token: apiToken });
+      set({ settings: { server_url: serverUrl, api_token: apiToken } });
+      return { ok: true };
+    } catch (e) {
+      // Restore the prior working client (never leave the app pointed at a bad
+      // config just because the human fat-fingered the token in Settings).
+      if (prev) configureClient(prev.server_url, prev.api_token);
+      const msg =
+        e instanceof ApiError
+          ? e.kind === "unauthorized"
+            ? "token rejected (401)"
+            : e.kind === "network"
+              ? "cannot reach that server URL"
+              : e.message
+          : "connection failed";
+      return { ok: false, error: msg };
+    }
+  },
+
   disconnect: () => {
+    // Wipe persisted settings (keyring / localStorage) so the next boot lands on
+    // the Connect gate. Best-effort + fire-and-forget: the in-memory reset below
+    // takes effect immediately regardless.
+    void clearSettings();
     set({
       connStatus: "disconnected",
       settings: null,

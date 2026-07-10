@@ -4,7 +4,7 @@
 
 import { useEffect, useState } from "react";
 import { Sun, Moon } from "lucide-react";
-import { currentTheme, toggleTheme, type Theme } from "../state/theme";
+import { applyTheme, currentTheme, toggleTheme, type Theme } from "../state/theme";
 
 // Module-level listeners so any toggle (button or keybind) notifies all mounts.
 const listeners = new Set<(t: Theme) => void>();
@@ -16,15 +16,25 @@ export function flipTheme(): Theme {
   return next;
 }
 
+/** Apply an explicit theme and notify subscribers (Settings' real control). */
+export function setThemeTo(theme: Theme): Theme {
+  applyTheme(theme);
+  listeners.forEach((fn) => fn(theme));
+  return theme;
+}
+
+/** Subscribe to theme changes; returns an unsubscribe. Keeps mounts in sync. */
+export function subscribeTheme(fn: (t: Theme) => void): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
 export function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>(() => currentTheme());
 
-  useEffect(() => {
-    listeners.add(setTheme);
-    return () => {
-      listeners.delete(setTheme);
-    };
-  }, []);
+  useEffect(() => subscribeTheme(setTheme), []);
 
   const dark = theme === "dark";
   return (

@@ -1168,6 +1168,50 @@ async fn stats_expose_stage2_usage_and_cost() {
 }
 
 #[tokio::test]
+async fn usage_returns_rows_totals_and_is_bearer_gated() {
+    // GET /client/usage: newest-first daily rows, aggregate totals with est cost
+    // from the default per-MTok prices (1.0 in / 5.0 out), and the model label.
+    let (app, _s, _a) = app_with(|store, acct| {
+        store.stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000).unwrap();
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/usage"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    let rows = json["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    // Newest-first.
+    assert_eq!(rows[0]["day"], "2026-07-09");
+    assert_eq!(rows[0]["input_tokens"], 600_000);
+    assert_eq!(rows[1]["day"], "2026-07-08");
+
+    let totals = &json["totals"];
+    assert_eq!(totals["calls"], 2);
+    assert_eq!(totals["input_tokens"], 1_000_000);
+    assert_eq!(totals["output_tokens"], 200_000);
+    // cost = 1.0*(1e6/1e6) + 5.0*(0.2e6/1e6) = 2.0
+    let cost = totals["est_cost_usd"].as_f64().unwrap();
+    assert!((cost - 2.0).abs() < 1e-9, "expected 2.0, got {cost}");
+
+    // Default model label present.
+    assert_eq!(json["model"], "claude-haiku-4-5");
+
+    // Bearer-gated: no token => 401.
+    let req = Request::builder()
+        .uri("/client/usage")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn stats_expose_bands_and_last_surfaced_at() {
     let (app, _s, _a) = app_with(|store, acct| {
         let bill = store

@@ -13,7 +13,7 @@ use zerocopy::AsBytes;
 use crate::error::{CoreError, Result};
 use crate::store::{
     MissingVector, NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied,
-    Stage2Queued, Stage2Usage, Store, SyncState, TriagedMessage,
+    Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, ClientMessage,
@@ -2145,6 +2145,27 @@ impl Store for SqliteStore {
             .unwrap_or_default())
     }
 
+    fn list_usage(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT day, calls, input_tokens, output_tokens FROM stage2_usage
+             WHERE account_id = ?1
+             ORDER BY day DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id, days as i64], |r| {
+                Ok(Stage2UsageDay {
+                    day: r.get::<_, String>(0)?,
+                    calls: r.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: r.get::<_, i64>(3)?.max(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     fn upsert_message_vector(
         &self,
         account_id: AccountId,
@@ -3123,6 +3144,35 @@ mod tests {
             store.stage2_usage_today(acct, "2026-07-10").unwrap(),
             Stage2Usage::default()
         );
+    }
+
+    #[test]
+    fn list_usage_returns_recent_days_newest_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Empty ledger => no rows.
+        assert!(store.list_usage(acct, 30).unwrap().is_empty());
+
+        store.stage2_bump_usage(acct, "2026-07-07", 100, 10).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-08", 200, 20).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-09", 300, 30).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-09", 100, 10).unwrap();
+
+        // Newest-first, sparse (only days with a row).
+        let rows = store.list_usage(acct, 30).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].day, "2026-07-09");
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].input_tokens, 400);
+        assert_eq!(rows[0].output_tokens, 40);
+        assert_eq!(rows[2].day, "2026-07-07");
+
+        // `days` caps the row count (still newest-first).
+        let capped = store.list_usage(acct, 2).unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].day, "2026-07-09");
+        assert_eq!(capped[1].day, "2026-07-08");
     }
 
     #[test]

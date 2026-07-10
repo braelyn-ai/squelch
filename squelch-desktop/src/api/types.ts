@@ -194,6 +194,38 @@ export interface StoreStats {
   stage2?: Stage2Stats | null;
 }
 
+/**
+ * One day's Stage-2 (triage) usage row (GET /client/usage → `rows[]`). Newest-
+ * first on the wire; sparse (only days that actually spent tokens appear).
+ */
+export interface UsageRow {
+  day: string; // "YYYY-MM-DD"
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+/** Aggregate totals over the returned usage window (GET /client/usage). */
+export interface UsageTotals {
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  /** Estimated USD cost, computed server-side from the config per-MTok prices. */
+  est_cost_usd: number;
+}
+
+/**
+ * GET /client/usage response — Stage-2 triage usage history + totals + the model
+ * label that produced the spend. `provider` is null when not explicitly
+ * configured server-side; `model` is always present (the configured model id).
+ */
+export interface UsageResponse {
+  rows: UsageRow[];
+  totals: UsageTotals;
+  provider: string | null;
+  model: string;
+}
+
 /** handlers::SealedMeta (GET /client/sealed) — metadata ONLY, never bodies. */
 export interface SealedMeta {
   id: number;

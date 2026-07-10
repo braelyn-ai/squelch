@@ -64,6 +64,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/client/audit", get(handlers::get_audit))
         .route("/client/stats", get(handlers::get_stats))
+        .route("/client/usage", get(handlers::get_usage))
         // Action STUBS. Another agent implements these THIS SESSION on top of
         // this router; they slot in by replacing the stub handlers. Each returns
         // 501 with {"error":"actions not yet wired"} for now.

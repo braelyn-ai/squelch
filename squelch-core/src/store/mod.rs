@@ -208,6 +208,17 @@ pub struct Stage2Usage {
     pub output_tokens: u64,
 }
 
+/// One day's Stage-2 usage row carrying its `day` key, returned by
+/// [`Store::list_usage`] for the human-door usage history. Newest-first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stage2UsageDay {
+    /// UTC date key, `YYYY-MM-DD`.
+    pub day: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// A NON-SEALED message that still needs an embedding vector, returned by
 /// [`Store::messages_missing_vectors`] for the startup backfill pass. Carries
 /// only the text the embedder consumes (subject + body).
@@ -543,6 +554,11 @@ pub trait Store: Send + Sync {
     /// Read the Stage-2 usage totals for `(account_id, day)`. Returns a zeroed
     /// [`Stage2Usage`] when no row exists for that day.
     fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage>;
+
+    /// Stage-2 usage history for `account_id`: the most recent `days` rows from
+    /// the `stage2_usage` ledger, newest-first. Only days that actually have a
+    /// row are returned (sparse — no zero-filling). `days` caps the row count.
+    fn list_usage(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>>;
 
     // ---------------------------------------------------------------------
     // SEMANTIC RECALL (v1) vector-index writes. The embedder itself lives in

@@ -27,6 +27,7 @@ import type {
   StoreStats,
   ClientThreadView,
   UpdatesParams,
+  UsageResponse,
 } from "./types";
 
 interface ClientConfig {
@@ -147,6 +148,15 @@ export function search(
 
 export function getStats(): Promise<StoreStats> {
   return request<StoreStats>("/client/stats");
+}
+
+/**
+ * Stage-2 (triage) usage history for the last `days` (default 30), newest-first,
+ * with aggregate totals + the model/provider label. Additive to getStats (whose
+ * `stage2` today-rollup is unchanged).
+ */
+export function getUsage(days?: number): Promise<UsageResponse> {
+  return request<UsageResponse>("/client/usage", { query: { days } });
 }
 
 export function getAudit(limit?: number): Promise<AuditEntry[]> {

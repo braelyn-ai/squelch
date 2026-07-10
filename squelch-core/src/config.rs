@@ -173,6 +173,14 @@ impl Stage2Provider {
         }
     }
 
+    /// A stable lowercase label for the provider, surfaced on `/client/usage`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage2Provider::Anthropic => "anthropic",
+            Stage2Provider::OpenAI => "openai",
+        }
+    }
+
     /// Per-provider default cost-ledger prices (USD per MTok input, output).
     /// Anthropic: claude-haiku-4-5 (1.0 / 5.0). OpenAI: gpt-4o-mini (0.15 / 0.60)
     /// — change with the model.

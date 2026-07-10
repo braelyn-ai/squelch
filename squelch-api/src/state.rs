@@ -38,6 +38,12 @@ pub struct ApiState {
     /// Per-MTok output price (USD) for `est_cost_usd_today`. See
     /// [`ApiState::stage2_price_in_per_mtok`].
     pub(crate) stage2_price_out_per_mtok: f64,
+    /// The configured Stage-2 model id (e.g. `claude-haiku-4-5`), surfaced as a
+    /// label on `/client/usage`. Defaults to the Stage2Config default.
+    pub(crate) stage2_model: Arc<str>,
+    /// The configured Stage-2 provider label (e.g. `anthropic`/`openai`), if
+    /// known, surfaced on `/client/usage`. `None` when not explicitly configured.
+    pub(crate) stage2_provider: Option<Arc<str>>,
 }
 
 /// Why [`ApiState`] could not be constructed.
@@ -77,7 +83,22 @@ impl ApiState {
             write_api_base: None,
             stage2_price_in_per_mtok: s2.price_in_per_mtok,
             stage2_price_out_per_mtok: s2.price_out_per_mtok,
+            stage2_model: Arc::from(s2.model.as_str()),
+            stage2_provider: None,
         })
+    }
+
+    /// Set the Stage-2 model + provider labels surfaced on `/client/usage`. Wire
+    /// this from the loaded [`squelch_core::config::Stage2Config`] alongside the
+    /// prices so the usage page shows what model produced the spend.
+    pub fn with_stage2_model(
+        mut self,
+        model: impl Into<String>,
+        provider: Option<String>,
+    ) -> Self {
+        self.stage2_model = Arc::from(model.into().as_str());
+        self.stage2_provider = provider.map(|p| Arc::from(p.as_str()));
+        self
     }
 
     /// Override the Stage-2 per-MTok prices used for `est_cost_usd_today`. Wire

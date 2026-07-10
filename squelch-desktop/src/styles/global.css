@@ -314,6 +314,18 @@ kbd {
   background: var(--bg-raised);
   border-right: 1px solid var(--border);
 }
+/* Flex spacer: pushes the bottom rail group (Usage/Settings) to the floor. */
+.rail-spacer {
+  flex: 1 1 auto;
+}
+/* Hairline above the bottom group, separating it from the main nav. */
+.rail-divider {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 1px;
+  margin: 2px 0 6px;
+  background: var(--border);
+}
 .rail-btn {
   position: relative;
   width: 38px;

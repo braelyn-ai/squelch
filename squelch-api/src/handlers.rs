@@ -680,6 +680,82 @@ pub async fn get_stats(
     Ok(Json(body))
 }
 
+// --- GET /client/usage -------------------------------------------------------
+
+/// Default look-back window (rows) for the usage history.
+const DEFAULT_USAGE_DAYS: u32 = 30;
+const MAX_USAGE_DAYS: u32 = 365;
+
+#[derive(Debug, Deserialize)]
+pub struct UsageQuery {
+    /// How many recent days of Stage-2 usage to return. Default 30.
+    days: Option<u32>,
+}
+
+/// One day's row in the usage history response.
+#[derive(Debug, Serialize)]
+struct UsageRow {
+    day: String,
+    calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// Totals across the returned window, including the estimated cost computed from
+/// the same per-MTok price config `get_stats` uses.
+#[derive(Debug, Serialize)]
+struct UsageTotals {
+    calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    est_cost_usd: f64,
+}
+
+/// GET /client/usage — Stage-2 (triage) usage history + totals + model label.
+/// Bearer-authed; additive to `/client/stats` (which still carries today's
+/// `stage2` rollup untouched).
+pub async fn get_usage(
+    State(state): State<ApiState>,
+    Query(q): Query<UsageQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let days = q.days.unwrap_or(DEFAULT_USAGE_DAYS).clamp(1, MAX_USAGE_DAYS);
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let rows = blocking(move || store.list_usage(account_id, days)).await?;
+
+    // Cost from the same config-driven per-MTok prices as /client/stats.
+    let (mut in_tok, mut out_tok, mut calls) = (0u64, 0u64, 0u64);
+    let out_rows: Vec<UsageRow> = rows
+        .into_iter()
+        .map(|r| {
+            calls += r.calls;
+            in_tok += r.input_tokens;
+            out_tok += r.output_tokens;
+            UsageRow {
+                day: r.day,
+                calls: r.calls,
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+            }
+        })
+        .collect();
+
+    let est_cost_usd = (in_tok as f64 / 1_000_000.0) * state.stage2_price_in_per_mtok
+        + (out_tok as f64 / 1_000_000.0) * state.stage2_price_out_per_mtok;
+
+    Ok(Json(json!({
+        "rows": out_rows,
+        "totals": UsageTotals {
+            calls,
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            est_cost_usd,
+        },
+        "provider": state.stage2_provider.as_deref(),
+        "model": state.stage2_model.as_ref(),
+    })))
+}
+
 // --- ACTIONS: the ONLY write capability in the system -----------------------
 //
 // GATES (all non-negotiable, enforced here):

@@ -1,4 +1,4 @@
-export { useStore, MAIN_VIEWS, RING_MS } from "./store";
+export { useStore, MAIN_VIEWS, BOTTOM_VIEWS, RING_MS } from "./store";
 export type {
   AppState,
   SitrepData,

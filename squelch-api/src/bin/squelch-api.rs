@@ -60,6 +60,11 @@ async fn main() -> anyhow::Result<()> {
         cfg.stage2.price_in_per_mtok,
         cfg.stage2.price_out_per_mtok,
     );
+    // Surface the configured model + provider label on /client/usage.
+    state = state.with_stage2_model(
+        cfg.stage2.model.clone(),
+        cfg.stage2.stage2_provider.map(|p| p.as_str().to_string()),
+    );
     match cfg.oauth_client() {
         Ok(client) => {
             state = state.with_write_credentials(

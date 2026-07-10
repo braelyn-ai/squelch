@@ -1,0 +1,262 @@
+/* SETTINGS + USAGE — precision-instrument styling for the two bottom-rail
+   routed views. Engraved uppercase section labels, Plex Mono numbers, brass used
+   sparingly (est-cost figure, the daily bars, the connected dot). Inherits the
+   app theme vars (--bg / --fg / --brass / --mono / --label-track ...). */
+
+.settings,
+.usage {
+  max-width: 720px;
+}
+
+/* ---- section scaffold (shared) ---- */
+.set-section {
+  padding: 14px 0 18px;
+  border-bottom: 1px solid var(--border);
+}
+.set-section:last-child {
+  border-bottom: none;
+}
+
+/* Engraved section label. */
+.set-label {
+  display: inline-block;
+  color: var(--fg-faint);
+  font-size: var(--label-size);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  margin-bottom: 12px;
+}
+
+/* ---- CONNECTION form ---- */
+.set-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 420px;
+}
+.set-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.set-field label {
+  color: var(--fg-faint);
+  font-size: var(--label-size);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  font-weight: 600;
+}
+.set-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.set-status {
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.set-status.ok {
+  color: var(--fg-dim);
+}
+.set-status.ok .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--brass);
+  display: inline-block;
+}
+.set-status.err {
+  color: var(--red);
+}
+.set-hint,
+.set-sub {
+  font-size: 12px;
+  color: var(--fg-faint);
+}
+
+/* ---- APPEARANCE toggle ---- */
+.set-field-inline {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.set-key {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  min-width: 60px;
+}
+.set-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.set-toggle button {
+  padding: 5px 14px;
+  font-size: 12.5px;
+  border: none;
+  border-radius: 0;
+  background: var(--bg-raised);
+  color: var(--fg-dim);
+}
+.set-toggle button + button {
+  border-left: 1px solid var(--border);
+}
+.set-toggle button.active {
+  background: var(--brass-soft);
+  color: var(--brass);
+}
+
+/* ---- ACCOUNT meta grid ---- */
+.set-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+}
+.set-meta > div {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.set-meta dt {
+  min-width: 110px;
+  font-size: var(--label-size);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  color: var(--fg-faint);
+  font-weight: 600;
+}
+.set-meta dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+/* ---- DISCONNECT ---- */
+button.danger {
+  background: transparent;
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 40%, var(--border));
+}
+button.danger:hover {
+  background: var(--red-soft);
+  border-color: var(--red);
+}
+
+/* utility */
+.mono {
+  font-family: var(--mono);
+}
+.brass {
+  color: var(--brass);
+}
+
+/* ============================ USAGE ============================ */
+.usage-cat-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.usage-cat-head .set-label {
+  margin-bottom: 0;
+}
+.usage-model {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+.usage-sub {
+  font-size: 12px;
+  color: var(--fg-faint);
+  margin: 0 0 14px;
+}
+.usage-empty {
+  font-size: 13px;
+  color: var(--fg-faint);
+  padding: 10px 0;
+}
+.usage-empty.err {
+  color: var(--red);
+}
+
+/* Totals strip. */
+.usage-totals {
+  display: flex;
+  gap: 28px;
+  padding: 10px 0 16px;
+  flex-wrap: wrap;
+}
+.usage-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.usage-stat .k {
+  font-size: var(--label-size);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  color: var(--fg-faint);
+  font-weight: 600;
+}
+.usage-stat .v {
+  font-size: 18px;
+  color: var(--fg);
+}
+
+/* Daily breakdown table with hand-rolled inline bars. */
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.usage-table th {
+  text-align: left;
+  font-size: var(--label-size);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  color: var(--fg-faint);
+  font-weight: 600;
+  padding: 4px 10px 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.usage-table th.num,
+.usage-table td.num {
+  text-align: right;
+}
+.usage-table td {
+  padding: 5px 10px 5px 0;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+}
+.usage-table td.day {
+  color: var(--fg);
+}
+.usage-table .bar-col {
+  width: 34%;
+  padding-right: 0;
+}
+/* The bar itself — brass, the one accent; scaled to the busiest day. */
+.usage-bar {
+  height: 8px;
+  min-width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--brass) 78%, transparent);
+}
+
+/* ASSISTANT placeholder well. */
+.usage-placeholder {
+  font-size: 12.5px;
+  color: var(--fg-faint);
+  background: var(--bg-sunken);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  max-width: 520px;
+  line-height: 1.5;
+}
