@@ -5,3 +5,4 @@ target/
 *.db-wal
 .env
 node_modules
+scripts/rules.backup.json
