@@ -210,9 +210,14 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     /// When `None`, Stage-2 is DISABLED gracefully (rows stay queued, one stderr
     /// notice, sync continues). The key is never logged.
     stage2_key: Option<(String, Stage2Provider)>,
-    /// On-box embedder for v1 semantic recall. `None` disables embedding
-    /// gracefully (ingest/backfill skip the vector write; sync continues). CPU
-    /// work runs under `spawn_blocking` so the poll loop never stalls on it.
+    /// On-box embedder OVERRIDE for v1 semantic recall. Usually `None`: the
+    /// effective embedder is resolved via [`SyncEngine::embedder`], which falls
+    /// back to the STORE's embedder. Reading it from the store each time means a
+    /// LATE-attached embedder (e.g. `squelchd serve` attaches it in the background
+    /// after binding the port) is picked up automatically — until it is ready,
+    /// ingest simply skips the vector write and the startup/periodic backfill pass
+    /// fills the gap once the embedder appears. CPU work runs under
+    /// `spawn_blocking` so the poll loop never stalls on it.
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
 }
 
@@ -253,12 +258,24 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         }
     }
 
-    /// Attach an on-box [`Embedder`](crate::embed::Embedder) so ingest and the
-    /// startup backfill populate the semantic-recall vector index. Absence keeps
-    /// sync fully functional (no vectors written). Chainable with [`new`].
+    /// Attach an on-box [`Embedder`](crate::embed::Embedder) OVERRIDE so ingest
+    /// and the startup backfill populate the semantic-recall vector index. Usually
+    /// unnecessary — the engine falls back to the STORE's embedder (see
+    /// [`SyncEngine::embedder`]) — but kept for callers (`run`) that build the
+    /// embedder eagerly and want it used even if the store's copy differs. Absence
+    /// keeps sync fully functional (no vectors written). Chainable with [`new`].
     pub fn with_embedder(mut self, embedder: Arc<dyn crate::embed::Embedder>) -> Self {
         self.embedder = Some(embedder);
         self
+    }
+
+    /// Resolve the EFFECTIVE embedder for this tick: the explicit override if set,
+    /// else whatever is currently attached to the store. Reading the store each
+    /// time means a background-attached embedder (`squelchd serve`) is picked up
+    /// automatically once it becomes ready — before that, this returns `None` and
+    /// ingest simply skips the vector write (the backfill pass fills it in later).
+    fn embedder(&self) -> Option<Arc<dyn crate::embed::Embedder>> {
+        self.embedder.clone().or_else(|| self.store.embedder())
     }
 
     /// Perform an authenticated GET returning parsed JSON. On a 401 we re-request
@@ -370,6 +387,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             // Stage-2 LLM triage pass after each ingest batch. Never crashes the
             // sync loop (all failures handled internally).
             self.stage2_pass().await;
+
+            // VECTOR BACKFILL each tick. Cheap no-op when no embedder is attached
+            // or the queue is empty. This is what makes a BACKGROUND-attached
+            // embedder (`squelchd serve` attaches it after binding the port) catch
+            // up WITHOUT a daemon restart: rows ingested while the embedder was not
+            // yet ready are picked up on the next tick once it becomes available.
+            self.backfill_missing_vectors().await;
 
             // Sleep the poll interval, waking early on shutdown.
             tokio::select! {
@@ -576,7 +600,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
     /// propagates — the vector can be recovered by the backfill pass, so an embed
     /// failure must never block or crash ingest.
     async fn embed_and_store(&self, message_id: i64, text: String) {
-        let Some(embedder) = self.embedder.clone() else {
+        let Some(embedder) = self.embedder() else {
             return;
         };
         let account_id = self.account_id;
@@ -605,7 +629,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
     /// logs a redacted one-liner and moves on (the row stays missing and is retried
     /// next startup). No-op when no embedder is attached.
     async fn backfill_missing_vectors(&self) {
-        let Some(embedder) = self.embedder.clone() else {
+        let Some(embedder) = self.embedder() else {
             return;
         };
         let batch = self.config.embed.backfill_batch.max(1);

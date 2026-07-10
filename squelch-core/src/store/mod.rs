@@ -546,4 +546,12 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         limit: usize,
     ) -> Result<Vec<MissingVector>>;
+
+    /// The currently-attached embedder, if any. Lets the sync engine resolve a
+    /// LATE-attached embedder (e.g. one attached in the background after
+    /// `squelchd serve` binds its port) without holding a second handle. Default
+    /// `None` for stores that don't wire semantic recall.
+    fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
+        None
+    }
 }

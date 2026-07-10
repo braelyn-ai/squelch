@@ -4,7 +4,7 @@
 //! trait is implemented synchronously. See `store/mod.rs` for rationale.
 
 use std::path::Path;
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, RwLock};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -62,9 +62,14 @@ pub struct SqliteStore {
     /// [`SqliteStore::hybrid_search`] to embed the QUERY text, and available to
     /// callers for embedding message bodies at ingest/backfill. `None` when
     /// semantic recall is not wired (e.g. plain unit tests) — the vector methods
-    /// then return [`CoreError::InvalidInput`]. Set via
-    /// [`SqliteStore::with_embedder`].
-    embedder: Option<std::sync::Arc<dyn crate::embed::Embedder>>,
+    /// then return [`CoreError::InvalidInput`] and hybrid search degrades to
+    /// keyword-only. Set at construction via [`SqliteStore::with_embedder`], OR
+    /// SWAPPED IN LATER via [`SqliteStore::attach_embedder`] while the store is
+    /// already shared behind an `Arc` — that is what lets `squelchd serve` bind
+    /// the HTTP port immediately and attach the embedder in the background once
+    /// the model has finished downloading. `RwLock` keeps concurrent readers
+    /// (every search) cheap; the single background write is rare.
+    embedder: RwLock<Option<std::sync::Arc<dyn crate::embed::Embedder>>>,
 }
 
 impl SqliteStore {
@@ -86,7 +91,7 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            embedder: None,
+            embedder: RwLock::new(None),
         })
     }
 
@@ -95,23 +100,45 @@ impl SqliteStore {
     /// `message_vecs` vec0 table ([`VEC_DIMS`]); a mismatch is a config/schema
     /// error that would silently corrupt the index, so it fails loudly here.
     pub fn with_embedder(
-        mut self,
+        self,
         embedder: std::sync::Arc<dyn crate::embed::Embedder>,
     ) -> Result<Self> {
+        self.attach_embedder(embedder)?;
+        Ok(self)
+    }
+
+    /// Swap in (or replace) the embedder while the store may ALREADY be shared
+    /// behind an `Arc` (`&self`, not `self`). This is the hook `squelchd serve`
+    /// uses to attach the embedder in the BACKGROUND after binding the HTTP port:
+    /// search runs keyword-only until this fires, then upgrades to hybrid/semantic
+    /// live. Asserts the dimensionality matches [`VEC_DIMS`] (a mismatch would
+    /// silently corrupt the index, so it fails loudly). Returns the previous
+    /// embedder, if any.
+    pub fn attach_embedder(
+        &self,
+        embedder: std::sync::Arc<dyn crate::embed::Embedder>,
+    ) -> Result<Option<std::sync::Arc<dyn crate::embed::Embedder>>> {
         if embedder.dims() != VEC_DIMS {
             return Err(CoreError::InvalidInput(format!(
                 "embedder dims {} != message_vecs vec0 width {VEC_DIMS}",
                 embedder.dims()
             )));
         }
-        self.embedder = Some(embedder);
-        Ok(self)
+        let mut guard = self
+            .embedder
+            .write()
+            .map_err(|_| CoreError::Other(anyhow::anyhow!("embedder lock poisoned")))?;
+        Ok(guard.replace(embedder))
     }
 
     /// The attached embedder, if any. Used by the sync engine to embed message
-    /// bodies at ingest/backfill without holding a second handle.
+    /// bodies at ingest/backfill without holding a second handle, and by the
+    /// vector-search paths to embed the query text. Cheap clone of the `Arc`.
     pub fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
-        self.embedder.clone()
+        self.embedder
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -249,8 +276,7 @@ impl SqliteStore {
         k: usize,
     ) -> Result<Vec<(i64, f32)>> {
         let embedder = self
-            .embedder
-            .as_ref()
+            .embedder()
             .ok_or_else(|| CoreError::InvalidInput("no embedder attached".into()))?;
         let qvec = embedder.embed(query_text)?;
         self.knn_by_vector(account_id, &qvec, k)
@@ -315,8 +341,10 @@ impl SqliteStore {
     ) -> Result<Vec<SearchHit>> {
         const RRF_K: f32 = 60.0;
 
-        // Vector ranks (if an embedder is attached; degrade gracefully if not).
-        let vec_hits: Vec<(i64, f32)> = match self.embedder.as_ref() {
+        // Vector ranks (if an embedder is attached; degrade gracefully to
+        // keyword-only if not — e.g. before the background embedder attaches under
+        // `squelchd serve`).
+        let vec_hits: Vec<(i64, f32)> = match self.embedder() {
             Some(embedder) => {
                 let qvec = embedder.embed(query_text)?;
                 self.knn_by_vector(account_id, &qvec, k)?
@@ -2018,6 +2046,13 @@ impl Store for SqliteStore {
         }
         Ok(out)
     }
+
+    /// Trait override: expose the swappable, possibly-late-attached embedder so a
+    /// generic `S: Store` caller (the sync engine) resolves the CURRENT embedder,
+    /// including one attached in the background after `serve` bound its port.
+    fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
+        SqliteStore::embedder(self)
+    }
 }
 
 #[cfg(test)]
@@ -3330,6 +3365,52 @@ mod tests {
             Ok(_) => panic!("dims mismatch must be rejected at attach"),
             Err(e) => assert!(matches!(e, CoreError::InvalidInput(_))),
         }
+    }
+
+    #[test]
+    fn keyword_search_works_before_embedder_then_attaches_live() {
+        // BUG 3 (issue #16) serve-bind model. This mirrors `squelchd serve`: the
+        // store is already SHARED (behind Arc) and serving, with NO embedder yet.
+        // 1) hybrid_search must work KEYWORD-ONLY (no embedder) — proving both
+        //    doors stay useful while the model downloads in the background.
+        // 2) semantic_search must fail gracefully (no embedder attached).
+        // 3) attach_embedder on &self (post-Arc) must swap the embedder in live.
+        // 4) semantic_search must then work — no restart, no rebind.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut msg = sample_msg(acct, "g-kw", "t-kw");
+        msg.subject = "quarterly invoice".to_string();
+        msg.body = "The quarterly invoice from Acme is attached.".to_string();
+        let id = store.upsert_message(&msg).unwrap();
+        store
+            .set_triage(id, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        // 1) Keyword-only hybrid search returns the doc with no embedder attached.
+        assert!(store.embedder().is_none(), "no embedder before background attach");
+        let hits = store.hybrid_search(acct, "quarterly invoice", 5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == id),
+            "hybrid_search must return keyword hits before the embedder is ready"
+        );
+
+        // 2) Semantic search has nothing to embed against yet.
+        assert!(store.semantic_search(acct, "quarterly invoice", 5).is_err());
+
+        // 3) Background attach (post-Arc, &self) — the serve-bind mechanism.
+        let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+        let prev = store.attach_embedder(embedder.clone()).unwrap();
+        assert!(prev.is_none(), "no previous embedder");
+        assert!(store.embedder().is_some(), "embedder attached live");
+
+        // 4) Now embed the row and prove semantic recall works without any restart.
+        embed_and_store(&store, &*embedder, acct, id, &msg.subject, &msg.body);
+        let sem = store.semantic_search(acct, "quarterly invoice", 5).unwrap();
+        assert!(
+            sem.iter().any(|(hid, _)| *hid == id),
+            "semantic_search must work once the embedder attaches — no rebind/restart"
+        );
     }
 
     /// E2E against the REAL fastembed model. Gated behind SQUELCH_EMBED_E2E so CI

@@ -332,16 +332,17 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
     let email = config.require_account_email()?;
     let client = config.oauth_client()?;
 
-    let mut store = SqliteStore::open(&config.db_path)?;
+    let store = SqliteStore::open(&config.db_path)?;
     let account_id = store.ensure_account(&email)?;
 
-    // On-box semantic recall (v1): one embedder, attached to the store (query
-    // side, shared with the human door's search) and the sync engine (write side).
-    let embedder = build_embedder(&config);
-    if let Some(e) = &embedder {
-        store = store.with_embedder(e.clone())?;
-    }
-
+    // On-box semantic recall (v1): the embedder is NOT built here. Building it may
+    // download ~30MB of ONNX weights on first run, and we refuse to block the HTTP
+    // bind on that (issue #16: both doors were unreachable during the download).
+    // Instead we bind immediately and attach the embedder to the store in the
+    // BACKGROUND (spawned below). Until it is ready, search degrades to keyword-
+    // only (the store's hybrid_search returns keyword hits when no embedder is
+    // attached) and the sync engine skips the vector write at ingest, letting the
+    // per-tick backfill fill vectors in once the embedder appears — no restart.
     let store = Arc::new(store);
 
     let backend = config.credential_backend;
@@ -369,12 +370,13 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
 
         // Spawn the sync loop. It is monomorphic over the credential store, so
         // we pick the concrete Read-bound backend here. Sync NEVER touches the
-        // write credential.
+        // write credential. It does NOT receive an embedder override — it resolves
+        // the embedder from the SHARED store each tick, so it picks up the
+        // background-attached embedder automatically once it is ready.
         let sync_handle = {
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
-            let embedder = embedder.clone();
             tokio::spawn(async move {
                 match backend {
                     CredentialBackend::Keyring => {
@@ -383,10 +385,7 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
                             email.clone(),
                             client,
                         ));
-                        let mut engine = SyncEngine::new(store, creds, account_id, email, config);
-                        if let Some(e) = embedder {
-                            engine = engine.with_embedder(e);
-                        }
+                        let engine = SyncEngine::new(store, creds, account_id, email, config);
                         engine.run(shutdown_rx).await
                     }
                     CredentialBackend::File => {
@@ -396,17 +395,15 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
                             creds_path,
                             client,
                         ));
-                        let mut engine = SyncEngine::new(store, creds, account_id, email, config);
-                        if let Some(e) = embedder {
-                            engine = engine.with_embedder(e);
-                        }
+                        let engine = SyncEngine::new(store, creds, account_id, email, config);
                         engine.run(shutdown_rx).await
                     }
                 }
             })
         };
 
-        // Build the combined app and bind before announcing.
+        // Build the combined app and bind BEFORE building the embedder. Binding is
+        // the priority: both doors must be reachable immediately (issue #16).
         let app = build_serve_router(store.clone(), &email, api_state, mcp_cancel.clone())
             .map_err(squelch_core::CoreError::Other)?;
         let listener = tokio::net::TcpListener::bind(bind)
@@ -417,6 +414,39 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
         eprintln!(
             "squelchd: serving agent door http://{bound}/mcp and human door http://{bound}/client/*"
         );
+
+        // BACKGROUND EMBEDDER INIT (issue #16). The server is ALREADY serving; we
+        // build the embedder off the runtime (first run downloads ~30MB of ONNX
+        // weights) and attach it to the shared store when ready. Until then, search
+        // is keyword-only. `spawn_blocking` keeps the CPU/IO-bound construction off
+        // the async workers. Attach failures are logged and leave search in the
+        // (fully functional) keyword-only mode.
+        {
+            let store = store.clone();
+            let config = config.clone();
+            eprintln!(
+                "squelchd: initializing semantic-recall embedder in the background \
+                 (first run downloads the model; the server is already serving, \
+                 search is keyword-only until the embedder is ready)"
+            );
+            tokio::spawn(async move {
+                let built = tokio::task::spawn_blocking(move || build_embedder(&config)).await;
+                match built {
+                    Ok(Some(embedder)) => match store.attach_embedder(embedder) {
+                        Ok(_) => eprintln!(
+                            "squelchd: embedder ready — semantic + hybrid search now enabled"
+                        ),
+                        Err(e) => eprintln!(
+                            "squelchd: embedder attach failed ({e}); search stays keyword-only"
+                        ),
+                    },
+                    Ok(None) => { /* build_embedder already logged the reason */ }
+                    Err(e) => eprintln!(
+                        "squelchd: embedder init task join error ({e}); search stays keyword-only"
+                    ),
+                }
+            });
+        }
 
         // Graceful shutdown: stop accepting, cancel MCP sessions, then signal
         // sync to flush.
