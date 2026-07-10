@@ -523,6 +523,120 @@ fn seed_contacts_conn(
     Ok(())
 }
 
+/// Upsert a shipment against an explicit connection/transaction handle, keyed by
+/// `(account_id, tracking_number)`. On first sight it inserts; on a repeat it
+/// applies the no-regress status state machine
+/// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
+/// walked back — refreshes `last_update`/`last_message_id`, and adopts a better
+/// `item_name` (a non-empty incoming name replaces an empty stored one, or a
+/// strictly longer one replaces a shorter one). `carrier`/`tracking_url` are also
+/// refreshed when the incoming carrier is more specific (not "unknown").
+///
+/// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
+fn upsert_shipment_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+    s: &crate::triage::ShipmentInfo,
+    seen_at: DateTime<Utc>,
+) -> Result<i64> {
+    use crate::triage::ShipmentStatus;
+
+    let ts = seen_at.to_rfc3339();
+
+    // Read any existing row to run the merge (status state machine + item-name
+    // preference) in Rust rather than a gnarly SQL CASE.
+    let existing: Option<(i64, String, String, String)> = conn
+        .query_row(
+            "SELECT id, status, item_name, carrier FROM shipments
+             WHERE account_id=?1 AND tracking_number=?2",
+            params![account_id, s.tracking_number],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    match existing {
+        None => {
+            conn.execute(
+                "INSERT INTO shipments(account_id, tracking_number, carrier, item_name,
+                     status, tracking_url, last_message_id, first_seen, last_update)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+                params![
+                    account_id,
+                    s.tracking_number,
+                    s.carrier,
+                    s.item_name,
+                    s.status.as_str(),
+                    s.tracking_url,
+                    message_id,
+                    ts,
+                ],
+            )?;
+            let id: i64 = conn.query_row(
+                "SELECT id FROM shipments WHERE account_id=?1 AND tracking_number=?2",
+                params![account_id, s.tracking_number],
+                |r| r.get(0),
+            )?;
+            Ok(id)
+        }
+        Some((id, cur_status_s, cur_item, cur_carrier)) => {
+            let cur_status =
+                ShipmentStatus::parse(&cur_status_s).unwrap_or(ShipmentStatus::Shipped);
+            let merged = ShipmentStatus::merge(cur_status, s.status);
+
+            // Prefer a more informative item name.
+            let item_name = if !s.item_name.is_empty()
+                && (cur_item.is_empty() || s.item_name.len() > cur_item.len())
+            {
+                s.item_name.clone()
+            } else {
+                cur_item
+            };
+            // Prefer a concrete carrier over a prior "unknown".
+            let (carrier, tracking_url) = if cur_carrier == "unknown" && s.carrier != "unknown" {
+                (s.carrier.clone(), s.tracking_url.clone())
+            } else {
+                (cur_carrier, None) // tracking_url handled below (keep existing)
+            };
+
+            // When we kept the existing carrier, don't clobber a good tracking_url
+            // with NULL — only update the url when we switched carrier.
+            if carrier == s.carrier && s.carrier != "unknown" {
+                conn.execute(
+                    "UPDATE shipments SET status=?1, item_name=?2, carrier=?3,
+                         tracking_url=?4, last_message_id=?5, last_update=?6
+                     WHERE id=?7",
+                    params![
+                        merged.as_str(),
+                        item_name,
+                        carrier,
+                        s.tracking_url,
+                        message_id,
+                        ts,
+                        id,
+                    ],
+                )?;
+            } else {
+                let _ = tracking_url; // existing url retained
+                conn.execute(
+                    "UPDATE shipments SET status=?1, item_name=?2,
+                         last_message_id=?3, last_update=?4
+                     WHERE id=?5",
+                    params![merged.as_str(), item_name, message_id, ts, id],
+                )?;
+            }
+            Ok(id)
+        }
+    }
+}
+
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
@@ -821,6 +935,80 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn upsert_shipment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        shipment: &crate::triage::ShipmentInfo,
+        seen_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let conn = self.lock()?;
+        upsert_shipment_conn(&conn, account_id, message_id, shipment, seen_at)
+    }
+
+    fn list_shipments(
+        &self,
+        account_id: AccountId,
+        include_delivered: bool,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        let conn = self.lock()?;
+        // En-route by default (status != 'delivered'); delivered included only on
+        // request. Ordered most-recently-updated first. No sealed filter needed:
+        // the table holds no sealed rows by construction (detection never runs on
+        // sealed mail).
+        let sql = if include_delivered {
+            "SELECT id, account_id, tracking_number, carrier, item_name, status,
+                    tracking_url, first_seen, last_update
+             FROM shipments WHERE account_id=?1
+             ORDER BY last_update DESC"
+        } else {
+            "SELECT id, account_id, tracking_number, carrier, item_name, status,
+                    tracking_url, first_seen, last_update
+             FROM shipments WHERE account_id=?1 AND status != 'delivered'
+             ORDER BY last_update DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![account_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                id,
+                acct,
+                tracking_number,
+                carrier,
+                item_name,
+                status,
+                tracking_url,
+                first_seen,
+                last_update,
+            ) = row?;
+            out.push(crate::types::Shipment {
+                id,
+                account_id: acct,
+                tracking_number,
+                carrier,
+                item_name,
+                status,
+                tracking_url,
+                first_seen: parse_dt(&first_seen)?,
+                last_update: parse_dt(&last_update)?,
+            });
+        }
+        Ok(out)
+    }
+
     fn set_sender_rule(
         &self,
         account_id: AccountId,
@@ -1029,6 +1217,24 @@ impl Store for SqliteStore {
                         d.source,
                     ],
                 )?;
+        }
+
+        // 4. Shipment: only ever present for NON-SEALED mail (detection is not run
+        //    on sealed content). Upsert into the tracker in the SAME transaction
+        //    so a package's state and its source message land atomically. The
+        //    upsert applies the no-regress status state machine. Sealed mail
+        //    carries `shipment == None`, so this branch never runs for it — the
+        //    `shipments` table is sealed-free by construction.
+        if triaged.sensitivity != Sensitivity::Sealed
+            && let Some(s) = &triaged.shipment
+        {
+            upsert_shipment_conn(
+                &tx,
+                triaged.message.account_id,
+                id,
+                s,
+                triaged.message.received_at,
+            )?;
         }
 
         tx.commit()?;
@@ -1857,6 +2063,70 @@ mod tests {
         let tv = store.thread_view(acct, "t1").unwrap();
         assert_eq!(tv.messages.len(), 1);
         assert_eq!(tv.subject, "Lunch?");
+    }
+
+    #[test]
+    fn shipment_upsert_dedupes_and_state_machine_no_regress() {
+        use crate::triage::{ShipmentInfo, ShipmentStatus};
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let mid = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+
+        let ship = |status, item: &str| ShipmentInfo {
+            carrier: "ups".into(),
+            tracking_number: "1Z999AA10123456784".into(),
+            item_name: item.into(),
+            status,
+            tracking_url: Some("https://www.ups.com/track?tracknum=1Z999AA10123456784".into()),
+        };
+
+        // First sight: shipped.
+        let t0 = Utc::now();
+        let id1 = store
+            .upsert_shipment(acct, mid, &ship(ShipmentStatus::Shipped, ""), t0)
+            .unwrap();
+        // Second email, same tracking number: out_for_delivery + a better item
+        // name. Must UPDATE the same row (dedupe), advance status, adopt name.
+        let id2 = store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ship(ShipmentStatus::OutForDelivery, "Wireless Headphones"),
+                t0 + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        assert_eq!(id1, id2, "same tracking number dedupes to one row");
+
+        let en_route = store.list_shipments(acct, false).unwrap();
+        assert_eq!(en_route.len(), 1);
+        assert_eq!(en_route[0].status, "out_for_delivery");
+        assert_eq!(en_route[0].item_name, "Wireless Headphones");
+
+        // Deliver it.
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ship(ShipmentStatus::Delivered, ""),
+                t0 + chrono::Duration::minutes(2),
+            )
+            .unwrap();
+        // A LATE stale "shipped" email must NOT regress the delivered shipment.
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ship(ShipmentStatus::Shipped, ""),
+                t0 + chrono::Duration::minutes(3),
+            )
+            .unwrap();
+
+        // En-route list now excludes it (delivered).
+        assert!(store.list_shipments(acct, false).unwrap().is_empty());
+        // include_delivered surfaces it, still delivered (no regress).
+        let all = store.list_shipments(acct, true).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, "delivered", "delivered never regresses");
     }
 
     /// `thread_id_for_message` (the get_thread forgiveness fallback) resolves a

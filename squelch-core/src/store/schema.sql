@@ -97,6 +97,35 @@ CREATE TABLE IF NOT EXISTS deadlines (
 
 CREATE INDEX IF NOT EXISTS idx_deadlines_due ON deadlines(account_id, due_at);
 
+-- PACKAGE TRACKING. One row per (account, tracking_number): a shipment currently
+-- (or formerly) in transit, extracted from NON-SEALED shipping/delivery mail by
+-- the ingest pipeline. A new email about an existing tracking number UPDATES the
+-- row (status state machine + last_update/last_message_id); a tracking number is
+-- REQUIRED to create a row (it is the dedupe/track key — mail with no number is
+-- skipped). `status` follows the ordered<shipped<out_for_delivery<delivered
+-- ladder (exception is a flag); the ingest upsert never regresses a delivered
+-- shipment.
+--
+-- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A SHIPMENT. The
+-- ingest path runs shipment detection ONLY for sensitivity='normal' mail, so this
+-- table has no sealed rows BY CONSTRUCTION — there is nothing to leak and no
+-- sealed join is needed on read.
+CREATE TABLE IF NOT EXISTS shipments (
+    id              INTEGER PRIMARY KEY,
+    account_id      INTEGER NOT NULL,
+    tracking_number TEXT NOT NULL,
+    carrier         TEXT NOT NULL,
+    item_name       TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'shipped',
+    tracking_url    TEXT,
+    last_message_id INTEGER,
+    first_seen      TEXT NOT NULL,
+    last_update     TEXT NOT NULL,
+    UNIQUE(account_id, tracking_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status);
+
 -- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
 -- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
 -- last_uid holds the account's historyId (a u64 that fits in SQLite's i64

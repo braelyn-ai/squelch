@@ -11,7 +11,7 @@ pub mod sqlite;
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
-use crate::triage::DeadlineHit;
+use crate::triage::{DeadlineHit, ShipmentInfo};
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, Deadline, Disposition, NewMessage,
     SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
@@ -81,6 +81,11 @@ pub struct TriagedMessage {
     pub matched_rule: Option<i64>,
     /// The Stage-1 deadline hit, if any. Only ever `Some` for non-sealed mail.
     pub deadline: Option<DeadlineHit>,
+    /// A detected shipment/package, if any. Runs INDEPENDENTLY of the triage
+    /// tier (shipping mail is noise-tier but still feeds the tracker). Only ever
+    /// `Some` for non-sealed mail — sealed content is never inspected for
+    /// shipments, so a shipment can never carry sealed data.
+    pub shipment: Option<ShipmentInfo>,
     /// `false` when Stage-1 was not confident: the row is left with
     /// `model_used IS NULL` so the Stage-2 queue predicate
     /// (`model_used IS NULL AND sensitivity = 'normal'`) picks it up.
@@ -277,6 +282,34 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         within_days: Option<u32>,
     ) -> Result<Vec<Deadline>>;
+
+    /// Upsert a shipment keyed by `(account_id, tracking_number)`. A first sight
+    /// inserts; a subsequent email about the same tracking number UPDATES the
+    /// row via the no-regress status state machine (a delivered shipment is never
+    /// walked back), refreshing `last_update`, `last_message_id`, and adopting a
+    /// better (non-empty, longer) `item_name`. Returns the shipment row id.
+    ///
+    /// SECURITY: the caller runs this ONLY for non-sealed mail; the `shipments`
+    /// table therefore holds no sealed rows by construction (no sealed join is
+    /// needed on read).
+    fn upsert_shipment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        shipment: &ShipmentInfo,
+        seen_at: DateTime<Utc>,
+    ) -> Result<i64>;
+
+    /// List shipments for the account. When `include_delivered` is false, only
+    /// en-route shipments (status != 'delivered') are returned; when true, all
+    /// shipments including delivered ones. Ordered by `last_update` descending
+    /// (most-recently-updated first). Sealed rows are structurally absent (never
+    /// inserted), so no sealed filter is required.
+    fn list_shipments(
+        &self,
+        account_id: AccountId,
+        include_delivered: bool,
+    ) -> Result<Vec<crate::types::Shipment>>;
 
     /// Upsert a sender rule. Returns the rule id.
     fn set_sender_rule(

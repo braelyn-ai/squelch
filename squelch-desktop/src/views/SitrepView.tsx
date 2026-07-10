@@ -30,9 +30,17 @@ import {
   Receipt,
   Mails,
   Pencil,
+  Package,
+  Truck,
 } from "lucide-react";
 import { api, ApiError } from "../api";
-import type { AttentionUpdate, SenderRule } from "../api";
+import type {
+  AttentionUpdate,
+  SenderRule,
+  Shipment,
+  ShipmentStatus,
+} from "../api";
+import { openExternal } from "../lib/opener";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import {
@@ -43,7 +51,7 @@ import {
   importanceColor,
   importanceMeter,
 } from "../lib/format";
-import { senderDisplayName } from "../lib/avatar";
+import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { Avatar } from "../components/Avatar";
 import { dispatchDone } from "../lib/dispatch";
 import {
@@ -210,6 +218,9 @@ function SitrepBody({
           </div>
         )}
       </section>
+
+      {/* ---- IN TRANSIT (shipment tracking) ---- */}
+      <InTransitZone />
 
       {/* ---- (b) ATTENTION ---- */}
       <section
@@ -410,6 +421,142 @@ function SenderChips({ items }: { items: AttentionUpdate[] }) {
         </span>
       ))}
       {extra > 0 && <span className="sender-chip more">+{extra} more</span>}
+    </div>
+  );
+}
+
+// ---- IN TRANSIT zone: shipment tracking ------------------------------------
+
+// Carriers with a favicon we can resolve via the existing avatar service.
+// amazon/unknown fall through to the lucide Package glyph (no clean single
+// domain / a generic package).
+const CARRIER_DOMAIN: Partial<Record<Shipment["carrier"], string>> = {
+  ups: "ups.com",
+  usps: "usps.com",
+  fedex: "fedex.com",
+  dhl: "dhl.com",
+};
+
+// Status → chip class + label. Colors defined in sitrep-dash.css:
+//   out_for_delivery = amber/loud, shipped = signal bronze-green (accent),
+//   exception = red, ordered = faint/muted, delivered = muted (unseen here).
+const SHIP_STATUS: Record<
+  ShipmentStatus,
+  { cls: string; label: string }
+> = {
+  ordered: { cls: "ordered", label: "ordered" },
+  shipped: { cls: "shipped", label: "shipped" },
+  out_for_delivery: { cls: "ofd", label: "out for delivery" },
+  delivered: { cls: "delivered", label: "delivered" },
+  exception: { cls: "exception", label: "exception" },
+};
+
+/** Title-case a carrier for display ("ups" -> "UPS", "amazon" -> "Amazon"). */
+function carrierLabel(carrier: Shipment["carrier"]): string {
+  if (carrier === "unknown") return "carrier";
+  if (carrier === "ups" || carrier === "usps" || carrier === "dhl") {
+    return carrier.toUpperCase();
+  }
+  if (carrier === "fedex") return "FedEx";
+  return carrier.charAt(0).toUpperCase() + carrier.slice(1);
+}
+
+function InTransitZone() {
+  const [shipments, setShipments] = useState<Shipment[] | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getShipments(false)
+      .then((s) => alive && setShipments(s))
+      .catch(() => {
+        // Non-fatal: leave the zone empty rather than surface token/url.
+        if (alive) setShipments([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const rows = shipments ?? [];
+
+  return (
+    <section className="zone zone-transit">
+      <div className="zone-head">
+        <span className="glyph">
+          <Truck size={15} />
+        </span>
+        <h2>In Transit</h2>
+        {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
+        <span className="zone-sub">packages en route</span>
+      </div>
+      {rows.length === 0 ? (
+        <p className="zone-empty">Nothing in transit.</p>
+      ) : (
+        <div className="transit-grid">
+          {rows.map((s) => (
+            <ShipmentCard key={s.id} shipment={s} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function CarrierBadge({ carrier }: { carrier: Shipment["carrier"] }) {
+  const domain = CARRIER_DOMAIN[carrier];
+  const [failed, setFailed] = useState(!domain);
+
+  if (domain && !failed) {
+    return (
+      <img
+        className="transit-carrier-icon"
+        src={faviconUrl(domain)}
+        width={24}
+        height={24}
+        alt=""
+        aria-hidden="true"
+        title={carrierLabel(carrier)}
+        referrerPolicy="no-referrer"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+  // amazon / unknown / failed favicon → neutral package glyph.
+  return (
+    <span className="transit-carrier-glyph" title={carrierLabel(carrier)}>
+      <Package size={16} />
+    </span>
+  );
+}
+
+function ShipmentCard({ shipment: s }: { shipment: Shipment }) {
+  const st = SHIP_STATUS[s.status] ?? SHIP_STATUS.ordered;
+  const title =
+    s.item_name.trim() || `Package via ${carrierLabel(s.carrier)}`;
+  const canTrack = !!s.tracking_url;
+
+  return (
+    <div className="transit-card">
+      <div className="transit-top">
+        <CarrierBadge carrier={s.carrier} />
+        <span className="transit-name" title={title}>
+          {title}
+        </span>
+      </div>
+      <div className="transit-bottom">
+        <span className={`transit-chip ${st.cls}`}>{st.label}</span>
+        {canTrack && (
+          <button
+            type="button"
+            className="transit-track"
+            onClick={() => void openExternal(s.tracking_url!)}
+            title={`track ${s.tracking_number} · ${carrierLabel(s.carrier)}`}
+          >
+            <ArrowUpRight size={13} /> Track
+          </button>
+        )}
+      </div>
     </div>
   );
 }

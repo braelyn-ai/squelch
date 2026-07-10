@@ -298,6 +298,126 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- IN TRANSIT (shipment tracking) ---- */
+.zone-transit .zone-head .glyph {
+  color: var(--fg-dim);
+}
+.transit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+}
+.transit-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.transit-card:hover {
+  background: var(--bg-row);
+}
+.transit-top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.transit-carrier-icon {
+  flex: 0 0 auto;
+  border-radius: 4px;
+}
+.transit-carrier-glyph {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  color: var(--fg-dim);
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+}
+.transit-name {
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 13.5px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.transit-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+/* Status chip — color-coded by lifecycle. Brass is reserved for the accent
+   Track affordance; statuses use amber/accent/red/faint from the palette. */
+.transit-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: lowercase;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+}
+.transit-chip.ordered {
+  color: var(--fg-faint);
+  background: var(--bg-row);
+  border-color: var(--border);
+}
+.transit-chip.shipped {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+.transit-chip.ofd {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-color: color-mix(in srgb, var(--amber) 45%, var(--border));
+}
+.transit-chip.exception {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+}
+.transit-chip.delivered {
+  color: var(--fg-faint);
+  background: var(--bg-row);
+  border-color: var(--border);
+}
+/* Track: the one brass touch on the card (accent, sparingly). */
+.transit-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--bg-raised);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+.transit-track:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.transit-track:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
 /* ---- newsletters (rule-onboarding surface) ---- */
 .zone-newsletters .zone-head .glyph {
   color: var(--lock);

@@ -401,6 +401,28 @@ pub async fn search(
     }))
 }
 
+// --- GET /client/shipments --------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ShipmentsQuery {
+    /// Include delivered shipments too. Default false => en-route only.
+    #[serde(default)]
+    include_delivered: bool,
+}
+
+pub async fn get_shipments(
+    State(state): State<ApiState>,
+    Query(q): Query<ShipmentsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    // En-route only by default; delivered included with the flag. The shipments
+    // table holds no sealed rows by construction (detection never runs on sealed
+    // mail), so there is no sealed filtering to apply here.
+    let items = blocking(move || store.list_shipments(account_id, q.include_delivered)).await?;
+    Ok(Json(items))
+}
+
 // --- GET/POST/DELETE /client/rules ------------------------------------------
 
 pub async fn list_rules(

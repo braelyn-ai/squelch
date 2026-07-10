@@ -21,14 +21,20 @@
 //     the opaque srcdoc origin resolve against http/https); https:-only silently
 //     blocked those, which is what made "load images" appear to do nothing.
 //
-// LINKS: no opener/shell plugin is wired in src-tauri (checked: only the two
-// keyring commands + core window perms). Because the sandbox omits
-// allow-popups AND allow-top-navigation, a link click is INERT — it cannot
-// navigate the opaque frame or open a window. We still set <base target="_blank">
-// so that IF allow-popups is ever added, links open in a new context rather
-// than replacing the frame. The visible href is preserved for hover/status.
-// TODO(v2): wire @tauri-apps/plugin-opener + a capability, then intercept
-// clicks to open in the system browser. Not possible today without allow-scripts.
+// LINKS: because the sandbox omits allow-popups AND allow-top-navigation (and
+// has no allow-scripts), a link click INSIDE the frame is INERT — it cannot
+// navigate the opaque frame, open a window, or postMessage out. We still set
+// <base target="_blank"> as belt-and-suspenders.
+//
+// CHOSEN FIX (2026-07): extract the http(s) hrefs from the sanitized html and
+// render them as a compact list BELOW the frame — real <button>s that call
+// openExternal() (Tauri opener plugin / window.open fallback). This keeps the
+// jail fully intact: we do NOT touch the sandbox or CSP, and we never inject
+// script. The hrefs come from the SAME server-sanitized html the frame renders
+// (ammonia already stripped javascript:/data: and other dangerous schemes), and
+// openExternal itself re-guards to http/https only — so nothing unsafe reaches
+// the shell. We de-dupe + cap the list so a marketing mail with 40 tracking
+// links doesn't swamp the pane. If the html has no links, nothing renders.
 //
 // FOCUS/KEYS: an opaque, script-less iframe still steals keyboard focus if it
 // is tabbable, and keydowns landing inside it never reach the parent window's
@@ -43,6 +49,63 @@
 // that grows to a max and scrolls internally. Good enough; documented.
 
 import { useMemo, useState } from "react";
+import { openExternal } from "../lib/opener";
+
+/** An extracted, de-duped outbound link: the http(s) href + its visible text. */
+interface EmailLink {
+  href: string;
+  text: string;
+}
+
+/** How many links we surface below a frame before collapsing to "+N more". */
+const MAX_LINKS = 8;
+
+/**
+ * Pull http/https anchor hrefs out of the sanitized html, in document order,
+ * de-duped by href. Uses DOMParser (available in the app webview + happy-dom
+ * test env) with a regex fallback so it degrades gracefully. The visible link
+ * text is captured for a readable label; empty/echo-the-url text falls back to
+ * the href host. Only http/https survive — everything else is dropped here and
+ * re-guarded in openExternal.
+ */
+export function extractLinks(html: string): EmailLink[] {
+  const out: EmailLink[] = [];
+  const seen = new Set<string>();
+  const push = (href: string, text: string) => {
+    const h = href.trim();
+    if (!/^https?:\/\//i.test(h) || seen.has(h)) return;
+    seen.add(h);
+    const label = text.replace(/\s+/g, " ").trim();
+    out.push({ href: h, text: label || hostOf(h) });
+  };
+
+  if (typeof DOMParser !== "undefined") {
+    try {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      for (const a of Array.from(doc.querySelectorAll("a[href]"))) {
+        push(a.getAttribute("href") ?? "", a.textContent ?? "");
+      }
+      return out;
+    } catch {
+      // fall through to the regex path
+    }
+  }
+
+  // Fallback: coarse anchor scan (label unavailable → host is used).
+  const re = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) push(m[1], "");
+  return out;
+}
+
+/** Best-effort host label for a url, or the raw url if it won't parse. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
 
 /** Cheap scan: does this html reference any remote/network content? */
 export function hasRemoteRefs(html: string): boolean {
@@ -114,6 +177,11 @@ export function EmailFrame({
     () => buildSrcdoc(html, allowRemote),
     [html, allowRemote],
   );
+  // Links can't navigate out of the sandbox (see header) — surface them below
+  // the frame as openExternal buttons instead.
+  const links = useMemo(() => extractLinks(html), [html]);
+  const shownLinks = links.slice(0, MAX_LINKS);
+  const extraLinks = links.length - shownLinks.length;
 
   const allow = () => {
     if (onAllowRemote) onAllowRemote();
@@ -159,6 +227,25 @@ export function EmailFrame({
         // referrerPolicy hardens remote fetches once the user opts in.
         referrerPolicy="no-referrer"
       />
+      {shownLinks.length > 0 && (
+        <div className="email-links" aria-label="links in this message">
+          <span className="email-links-label">links open externally</span>
+          {shownLinks.map((l) => (
+            <button
+              key={l.href}
+              type="button"
+              className="email-link"
+              onClick={() => void openExternal(l.href)}
+              title={l.href}
+            >
+              {l.text}
+            </button>
+          ))}
+          {extraLinks > 0 && (
+            <span className="email-links-more">+{extraLinks} more</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

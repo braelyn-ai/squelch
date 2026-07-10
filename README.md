@@ -12,7 +12,7 @@ Gmail (REST API, gmail.readonly OAuth)
         v
 squelchd ── sync ──> SQLite ──> triage (rules first, LLM later)
         |
-        ├── /mcp      agent door: 6 read tools, no writes,
+        ├── /mcp      agent door: 7 read tools, no writes,
         |             auth emails (2FA, resets) structurally absent
         └── /client   human door: bearer-authed rich API for your
                       own clients, holds the only write actions

@@ -163,12 +163,12 @@ async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Smoke test: the server object constructs and exposes exactly the 6 tools
+    /// Smoke test: the server object constructs and exposes exactly the 7 tools
     /// over an in-memory store, without binding any transport.
     #[test]
-    fn constructs_server_with_six_tools() {
+    fn constructs_server_with_seven_tools() {
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
         let server = SquelchServer::new(store, "me@localhost").expect("server");
-        assert_eq!(server.tool_count(), 6, "expected exactly 6 MCP tools");
+        assert_eq!(server.tool_count(), 7, "expected exactly 7 MCP tools");
     }
 }

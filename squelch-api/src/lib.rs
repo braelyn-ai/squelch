@@ -50,6 +50,7 @@ pub fn router(state: ApiState) -> Router {
             post(handlers::set_update_status),
         )
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
+        .route("/client/shipments", get(handlers::get_shipments))
         .route("/client/search", get(handlers::search))
         .route("/client/rules", get(handlers::list_rules))
         .route("/client/rules", post(handlers::create_rule))

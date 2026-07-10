@@ -17,6 +17,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Opens external https URLs in the system browser (Sitrep "Track" buttons +
+# email link list). Version-matched to the JS @tauri-apps/plugin-opener.
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Secure OS-keyring storage for the server URL + API token. Version-matched to

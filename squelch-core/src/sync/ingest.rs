@@ -15,6 +15,7 @@ use crate::config::Stage1Config;
 use crate::store::TriagedMessage;
 use crate::sync::html::sanitize_email_html;
 use crate::triage::seal::{self, SealInput};
+use crate::triage::shipment;
 use crate::triage::stage1_with_config;
 use crate::types::{AccountId, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
@@ -413,6 +414,7 @@ pub fn ingest(
             reason: format!("sealed at ingest ({})", kind.as_str()),
             matched_rule: None,
             deadline: None,
+            shipment: None,
             confident: true,
         };
     }
@@ -434,6 +436,7 @@ pub fn ingest(
             reason: "sent mail (contacts seeded; not triaged)".to_string(),
             matched_rule: None,
             deadline: None,
+            shipment: None,
             confident: true,
         };
     }
@@ -443,6 +446,12 @@ pub fn ingest(
     // Sender rules are matched inside stage1; the caller supplies them via cfg's
     // sibling argument. We accept them through the wrapper below.
     let result = stage1_with_config(&message, is_known, &[], cfg, now);
+
+    // SHIPMENT DETECTION runs INDEPENDENTLY of the triage tier: a "your order
+    // shipped" email is noise-tier for the ranked inbox but still feeds the
+    // package tracker. Only ever runs here, on the NON-SEALED path — a sealed OTP
+    // short-circuited above and never reaches this line.
+    let shipment = shipment::detect_shipment(&from_addr, &subject, &text);
 
     TriagedMessage {
         message,
@@ -455,6 +464,7 @@ pub fn ingest(
         reason: result.reason,
         matched_rule: result.matched_rule,
         deadline: result.deadline,
+        shipment,
         confident: result.confident,
     }
 }
@@ -745,6 +755,39 @@ mod tests {
         assert!(t.recipients.iter().any(|r| r == "alice@friends.com"));
         assert!(!t.recipients.iter().any(|r| r.contains("unsub")));
         assert!(!t.recipients.iter().any(|r| r.contains("craigslist")));
+    }
+
+    #[test]
+    fn shipping_email_produces_a_shipment() {
+        let eml = "From: UPS <ship-confirm@ups.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your order of Wireless Headphones has shipped\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Your UPS package is on its way. Tracking number 1Z999AA10123456784.\r\n";
+        let f = raw(1, "g-ship", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        let s = t.shipment.expect("shipment detected");
+        assert_eq!(s.carrier, "ups");
+        assert_eq!(s.tracking_number, "1Z999AA10123456784");
+        assert_eq!(s.item_name, "Wireless Headphones");
+        // Shipping mail is noise-tier for the ranked inbox.
+        assert_eq!(t.tier, Tier::Noise);
+    }
+
+    #[test]
+    fn sealed_otp_never_produces_a_shipment() {
+        // A sealed OTP short-circuits before shipment detection ever runs.
+        let eml = "From: Bank <noreply@bank.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your verification code\r\n\
+                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Your one-time passcode is 483920123456. Enter this code to continue.\r\n";
+        let f = raw(1, "g-otp2", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.sensitivity, Sensitivity::Sealed);
+        assert!(t.shipment.is_none(), "sealed mail must never yield a shipment");
     }
 
     #[test]

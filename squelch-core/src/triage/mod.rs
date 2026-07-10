@@ -35,9 +35,11 @@
 pub mod deadline;
 pub mod rules;
 pub mod seal;
+pub mod shipment;
 pub mod stage2;
 
 pub use deadline::DeadlineHit;
+pub use shipment::{ShipmentInfo, ShipmentStatus, detect_shipment};
 
 use crate::config::Stage1Config;
 use crate::error::CoreError;

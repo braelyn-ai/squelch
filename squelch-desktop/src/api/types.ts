@@ -80,6 +80,36 @@ export interface ClientThreadView {
   messages: ClientMessage[];
 }
 
+/** Carriers a shipment can be tracked through (serde snake_case / lowercase). */
+export type Carrier =
+  | "ups"
+  | "usps"
+  | "fedex"
+  | "dhl"
+  | "amazon"
+  | "unknown";
+
+/** Shipment lifecycle status (serde rename_all = "snake_case"). */
+export type ShipmentStatus =
+  | "ordered"
+  | "shipped"
+  | "out_for_delivery"
+  | "delivered"
+  | "exception";
+
+/** core::types::Shipment (GET /client/shipments) — snake_case on the wire. */
+export interface Shipment {
+  id: number;
+  account_id: number;
+  tracking_number: string;
+  carrier: Carrier;
+  item_name: string;
+  status: ShipmentStatus;
+  tracking_url: string | null;
+  first_seen: string; // RFC3339
+  last_update: string; // RFC3339
+}
+
 /** core::types::SenderRule (GET /client/rules) */
 export interface SenderRule {
   id: number;

@@ -1,7 +1,7 @@
 //! Transport-agnostic MCP server for squelch.
 //!
 //! This module knows nothing about stdio vs SSE vs streamable-http. It defines
-//! the [`SquelchServer`] handler and its 6 tools. `main.rs` picks the transport
+//! the [`SquelchServer`] handler and its 7 tools. `main.rs` picks the transport
 //! and calls `.serve(...)`.
 //!
 //! SECURITY: sealed (auth-related) messages are excluded structurally by the
@@ -88,6 +88,26 @@ pub struct GetDeadlinesParams {
     /// Only return deadlines due within this many days. Omit for all deadlines.
     #[serde(default)]
     pub within_days: Option<u32>,
+}
+
+/// Parameters for `get_shipments`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetShipmentsParams {
+    /// Include delivered shipments too. Omit/false => en-route packages only.
+    #[serde(default)]
+    pub include_delivered: Option<bool>,
+}
+
+/// One `get_shipments` result: a tracked package. No message body / no sealed
+/// content — shipments are extracted from non-sealed shipping mail only.
+#[derive(Debug, serde::Serialize)]
+pub struct ShipmentHit {
+    pub item_name: String,
+    pub carrier: String,
+    pub status: String,
+    pub tracking_number: String,
+    pub tracking_url: Option<String>,
+    pub last_update: DateTime<Utc>,
 }
 
 /// Parameters for `set_sender_rule`.
@@ -289,6 +309,43 @@ impl SquelchServer {
         Self::ok_json(deadlines)
     }
 
+    /// Packages currently in transit (and, optionally, delivered ones). Extracted
+    /// from non-sealed shipping/delivery mail; sealed content can never appear
+    /// here (shipments are never built from sealed mail).
+    #[tool(
+        name = "get_shipments",
+        description = "Tracked packages/shipments. Returns en-route packages by \
+                       default (item_name, carrier, status, tracking_number, \
+                       tracking_url, last_update); pass include_delivered=true to \
+                       also include delivered ones. Extracted from shipping mail; \
+                       auth/verification emails are never represented."
+    )]
+    async fn get_shipments(
+        &self,
+        Parameters(params): Parameters<GetShipmentsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let include_delivered = params.include_delivered.unwrap_or(false);
+        // The shipments table holds no sealed rows by construction (detection
+        // never runs on sealed mail), so — unlike thread/update surfaces — there
+        // is no sealed row to filter here.
+        let shipments = self
+            .store
+            .list_shipments(self.account_id, include_delivered)
+            .map_err(Self::map_err)?;
+        let out: Vec<ShipmentHit> = shipments
+            .into_iter()
+            .map(|s| ShipmentHit {
+                item_name: s.item_name,
+                carrier: s.carrier,
+                status: s.status,
+                tracking_number: s.tracking_number,
+                tracking_url: s.tracking_url,
+                last_update: s.last_update,
+            })
+            .collect();
+        Self::ok_json(out)
+    }
+
     /// Create or update a local sender rule. Writes ONLY squelch's local store;
     /// never touches Gmail.
     #[tool(
@@ -426,8 +483,9 @@ impl ServerHandler for SquelchServer {
                  mailbox; the only writes are local sender rules. Use search_mail \
                  to find mail (summaries only) and get_thread to read a thread — \
                  pass a result's thread_id (get_thread also accepts a message id). \
-                 Auth/2FA/verification emails are never exposed through these \
-                 tools.",
+                 get_deadlines lists bills due; get_shipments lists packages in \
+                 transit. Auth/2FA/verification emails are never exposed through \
+                 these tools.",
             )
     }
 }
@@ -660,6 +718,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(sealed_thread_err.code, missing_err.code);
+    }
+
+    /// get_shipments returns en-route packages by default and includes delivered
+    /// ones only when asked. Shipments are structurally sealed-free (never built
+    /// from sealed mail), so there is no sealed row to exclude here.
+    #[tokio::test]
+    async fn get_shipments_en_route_by_default_and_delivered_with_flag() {
+        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        let mid = seed_msg(&store, acct, "g1", "t1", "shipped", Sensitivity::Normal, None);
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "ups".into(),
+                    tracking_number: "1Z999AA10123456784".into(),
+                    item_name: "Headphones".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: Some("https://www.ups.com/track?tracknum=1Z".into()),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "usps".into(),
+                    tracking_number: "9400111899223817428490".into(),
+                    item_name: "Book".into(),
+                    status: ShipmentStatus::Delivered,
+                    tracking_url: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+
+        // Default: en-route only.
+        let res = server
+            .get_shipments(Parameters(GetShipmentsParams { include_delivered: None }))
+            .await
+            .unwrap();
+        let text = res.content[0].as_text().unwrap().text.as_str();
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        let hits = v.as_array().unwrap();
+        assert_eq!(hits.len(), 1, "delivered excluded by default");
+        assert_eq!(hits[0]["status"], "shipped");
+        assert_eq!(hits[0]["tracking_number"], "1Z999AA10123456784");
+        // SUMMARY-ONLY shape: no body key.
+        assert!(hits[0].get("body").is_none());
+
+        // With the flag: both.
+        let res = server
+            .get_shipments(Parameters(GetShipmentsParams {
+                include_delivered: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = res.content[0].as_text().unwrap().text.as_str();
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
     }
 
     /// FAIL-CLOSED: an invalid disposition never reaches the store, so no rule and

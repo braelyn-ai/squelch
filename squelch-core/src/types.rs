@@ -258,6 +258,27 @@ pub struct Deadline {
     pub source: String,
 }
 
+/// A tracked shipment/package. Produced from NON-SEALED shipping mail by the
+/// ingest pipeline and stored in the `shipments` table (keyed by tracking
+/// number). Surfaced by both the human door (`GET /client/shipments`) and the
+/// agent door (`get_shipments`). Sealed mail never produces a shipment, so this
+/// type is structurally incapable of representing sealed content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shipment {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub tracking_number: String,
+    /// Carrier slug: "ups" | "usps" | "fedex" | "dhl" | "amazon" | "unknown".
+    pub carrier: String,
+    pub item_name: String,
+    /// One of: ordered | shipped | out_for_delivery | delivered | exception.
+    pub status: String,
+    /// Carrier tracking URL, or `None` (Amazon / unknown carrier).
+    pub tracking_url: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub last_update: DateTime<Utc>,
+}
+
 /// A keyword-search hit over the FTS index. HUMAN-DOOR-facing (squelch-api).
 /// Sealed rows are excluded by the query, so a `SearchHit` never represents a
 /// sealed message.

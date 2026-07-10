@@ -139,6 +139,65 @@ async fn search_excludes_sealed() {
     assert_eq!(json["match_kind"], "keyword");
 }
 
+#[tokio::test]
+async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
+    use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
+    let (app, store, acct) = app_with(|store, acct| {
+        let mid = store.upsert_message(&msg(acct, "g1", "t1", "shipped", "b")).unwrap();
+        // One en-route (shipped) and one delivered.
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "ups".into(),
+                    tracking_number: "1Z999AA10123456784".into(),
+                    item_name: "Headphones".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: Some("https://www.ups.com/track?tracknum=1Z999AA10123456784".into()),
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "usps".into(),
+                    tracking_number: "9400111899223817428490".into(),
+                    item_name: "Book".into(),
+                    status: ShipmentStatus::Delivered,
+                    tracking_url: None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    });
+    let _ = (&store, acct);
+
+    // Default: en-route only (the shipped one, not the delivered one).
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1, "delivered excluded by default");
+    assert_eq!(items[0]["tracking_number"], "1Z999AA10123456784");
+    assert_eq!(items[0]["status"], "shipped");
+
+    // include_delivered=true: both.
+    let resp = app
+        .oneshot(authed("GET", "/client/shipments?include_delivered=true"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().unwrap().len(), 2, "delivered included with flag");
+}
+
 /// A garbage `mode` value is a 400.
 #[tokio::test]
 async fn search_bad_mode_is_400() {

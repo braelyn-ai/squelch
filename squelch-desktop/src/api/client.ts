@@ -22,6 +22,7 @@ import type {
   SearchHit,
   SendBody,
   SenderRule,
+  Shipment,
   StoreStats,
   ClientThreadView,
   UpdatesParams,
@@ -149,6 +150,19 @@ export function getStats(): Promise<StoreStats> {
 
 export function getAudit(limit?: number): Promise<AuditEntry[]> {
   return request<AuditEntry[]>("/client/audit", { query: { limit } });
+}
+
+/**
+ * En-route (and optionally delivered) shipment tracking rows. Pass
+ * `includeDelivered: true` to include already-delivered packages; the default
+ * (false) returns only what's still in transit — what the Sitrep zone shows.
+ */
+export function getShipments(
+  includeDelivered = false,
+): Promise<Shipment[]> {
+  return request<Shipment[]>("/client/shipments", {
+    query: { include_delivered: String(includeDelivered) },
+  });
 }
 
 // --- rules ------------------------------------------------------------------
