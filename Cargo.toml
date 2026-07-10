@@ -41,5 +41,5 @@ base64 = "0.22"
 # dir); sqlite-vec statically links the vec0 virtual-table extension; zerocopy
 # passes Vec<f32> to sqlite as raw bytes without copying.
 fastembed = "5"
-sqlite-vec = "0.1.10-alpha.4"
+sqlite-vec = "0.1.9"
 zerocopy = "0.7"

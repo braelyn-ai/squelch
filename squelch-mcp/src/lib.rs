@@ -1,4 +1,4 @@
-//! squelch-mcp: MCP server exposing squelch's 5 read-mostly tools (AGENT DOOR).
+//! squelch-mcp: MCP server exposing squelch's 6 read-mostly tools (AGENT DOOR).
 //!
 //! Tool logic lives in [`server`] and is transport-agnostic. The MCP bin
 //! (`main.rs`) picks stdio vs Streamable HTTP; the unified `squelchd serve`

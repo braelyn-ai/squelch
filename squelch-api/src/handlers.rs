@@ -290,6 +290,48 @@ pub struct SearchQuery {
     q: String,
     limit: Option<u32>,
     cursor: Option<String>,
+    /// Retrieval mode: keyword|semantic|hybrid. Omitted => hybrid when a vector
+    /// index is available (an embedder is attached), else keyword.
+    mode: Option<String>,
+}
+
+/// The three retrieval modes for `/client/search`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Keyword,
+    Semantic,
+    Hybrid,
+}
+
+impl SearchMode {
+    fn parse(s: &str) -> Option<SearchMode> {
+        match s {
+            "keyword" => Some(SearchMode::Keyword),
+            "semantic" => Some(SearchMode::Semantic),
+            "hybrid" => Some(SearchMode::Hybrid),
+            _ => None,
+        }
+    }
+
+    /// The `match_kind` label echoed on the response so the client knows which
+    /// leg produced the results.
+    fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Keyword => "keyword",
+            SearchMode::Semantic => "semantic",
+            SearchMode::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// Search response envelope: a page of hits plus the resolved `match_kind` (the
+/// mode actually run, after default resolution).
+#[derive(Debug, Serialize)]
+struct SearchPage<T> {
+    items: Vec<T>,
+    match_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
 }
 
 pub async fn search(
@@ -302,14 +344,59 @@ pub async fn search(
     }
     let (limit, offset) = paginate(query.limit, query.cursor.as_deref())?;
 
+    // Does this store have a vector index? (an embedder attached => vectors are
+    // being written). Drives the default mode and gates semantic/hybrid.
+    let have_vectors = state.store.embedder().is_some();
+
+    // Resolve the mode: explicit value (400 on garbage) else the default —
+    // hybrid when vectors exist, keyword otherwise.
+    let mode = match query.mode.as_deref() {
+        Some(s) => SearchMode::parse(s).ok_or_else(|| {
+            ApiError::bad_request("mode must be one of: keyword, semantic, hybrid")
+        })?,
+        None => {
+            if have_vectors {
+                SearchMode::Hybrid
+            } else {
+                SearchMode::Keyword
+            }
+        }
+    };
+
+    // Semantic/hybrid need a vector index. If asked explicitly without one,
+    // fall back to keyword rather than erroring — but report the kind actually
+    // run so the client isn't misled.
+    let effective = match mode {
+        SearchMode::Semantic | SearchMode::Hybrid if !have_vectors => SearchMode::Keyword,
+        other => other,
+    };
+
     let store = state.store.clone();
     let account_id = state.account_id;
-    // Store::search excludes sealed rows in SQL.
-    let items = blocking(move || store.search(account_id, &term, limit, offset)).await?;
+    // Keyword paginates (limit/offset); semantic/hybrid are ranked recall over a
+    // top-k window (offset applied to the fused slice). All legs exclude sealed
+    // rows in SQL.
+    let items = blocking(move || match effective {
+        SearchMode::Keyword => store.search(account_id, &term, limit, offset),
+        SearchMode::Semantic => {
+            let k = (limit + offset) as usize;
+            let mut hits = store.semantic_search_hits(account_id, &term, k)?;
+            let dropped: Vec<_> = hits.drain(..).skip(offset as usize).take(limit as usize).collect();
+            Ok(dropped)
+        }
+        SearchMode::Hybrid => {
+            let k = (limit + offset) as usize;
+            let mut hits = store.hybrid_search(account_id, &term, k)?;
+            let dropped: Vec<_> = hits.drain(..).skip(offset as usize).take(limit as usize).collect();
+            Ok(dropped)
+        }
+    })
+    .await?;
 
     let next = next_cursor(items.len(), limit, offset);
-    Ok(Json(Page {
+    Ok(Json(SearchPage {
         items,
+        match_kind: effective.as_str(),
         next_cursor: next,
     }))
 }

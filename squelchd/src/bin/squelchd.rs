@@ -19,6 +19,7 @@ use squelch_core::config::{Config, CredentialBackend};
 use squelch_core::credentials::{
     FileCredentialStore, KeyringCredentialStore, load_token_backend, store_token_backend,
 };
+use squelch_core::embed::{Embedder, FastEmbedder};
 use squelch_core::store::SqliteStore;
 use squelch_core::sync::SyncEngine;
 use std::net::SocketAddr;
@@ -97,6 +98,25 @@ fn load_config(cli: &Cli) -> Config {
     match &cli.config {
         Some(path) => Config::load_from(path),
         None => Config::load(),
+    }
+}
+
+/// Build the on-box semantic-recall embedder from config. Returns `None` (with a
+/// single redacted stderr notice) if the model fails to construct — semantic
+/// recall then degrades gracefully: sync, triage, and keyword search all keep
+/// working, only vector recall is unavailable. First construction downloads the
+/// ONNX weights to the configured cache dir (fastembed logs its own progress; the
+/// core embedder logs a one-line first-download notice).
+fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
+    match FastEmbedder::new(&config.embed.settings()) {
+        Ok(e) => Some(Arc::new(e) as Arc<dyn Embedder>),
+        Err(e) => {
+            eprintln!(
+                "squelch: embedder unavailable ({e}); semantic recall disabled \
+                 (keyword search + triage unaffected)"
+            );
+            None
+        }
     }
 }
 
@@ -191,8 +211,17 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
 
     // Open the store and ensure the account row exists; its id threads through
     // the engine (multi-tenant-shaped).
-    let store = SqliteStore::open(&config.db_path)?;
+    let mut store = SqliteStore::open(&config.db_path)?;
     let account_id = store.ensure_account(&email)?;
+
+    // On-box semantic recall (v1): build the embedder once, attach it to BOTH the
+    // store (query-side: semantic_search/hybrid_search embed the query) and the
+    // sync engine (write-side: embed at ingest + startup backfill). `None` keeps
+    // everything working without vector recall.
+    let embedder = build_embedder(&config);
+    if let Some(e) = &embedder {
+        store = store.with_embedder(e.clone())?;
+    }
 
     let store = Arc::new(store);
 
@@ -222,9 +251,11 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
                     email.clone(),
                     client,
                 ));
-                SyncEngine::new(store, creds, account_id, email, config)
-                    .run(shutdown_rx)
-                    .await
+                let mut engine = SyncEngine::new(store, creds, account_id, email, config);
+                if let Some(e) = embedder {
+                    engine = engine.with_embedder(e);
+                }
+                engine.run(shutdown_rx).await
             }
             CredentialBackend::File => {
                 let creds = Arc::new(FileCredentialStore::new(
@@ -233,9 +264,11 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
                     creds_path,
                     client,
                 ));
-                SyncEngine::new(store, creds, account_id, email, config)
-                    .run(shutdown_rx)
-                    .await
+                let mut engine = SyncEngine::new(store, creds, account_id, email, config);
+                if let Some(e) = embedder {
+                    engine = engine.with_embedder(e);
+                }
+                engine.run(shutdown_rx).await
             }
         }
     })?;
@@ -299,8 +332,16 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
     let email = config.require_account_email()?;
     let client = config.oauth_client()?;
 
-    let store = SqliteStore::open(&config.db_path)?;
+    let mut store = SqliteStore::open(&config.db_path)?;
     let account_id = store.ensure_account(&email)?;
+
+    // On-box semantic recall (v1): one embedder, attached to the store (query
+    // side, shared with the human door's search) and the sync engine (write side).
+    let embedder = build_embedder(&config);
+    if let Some(e) = &embedder {
+        store = store.with_embedder(e.clone())?;
+    }
+
     let store = Arc::new(store);
 
     let backend = config.credential_backend;
@@ -333,6 +374,7 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
+            let embedder = embedder.clone();
             tokio::spawn(async move {
                 match backend {
                     CredentialBackend::Keyring => {
@@ -341,9 +383,11 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
                             email.clone(),
                             client,
                         ));
-                        SyncEngine::new(store, creds, account_id, email, config)
-                            .run(shutdown_rx)
-                            .await
+                        let mut engine = SyncEngine::new(store, creds, account_id, email, config);
+                        if let Some(e) = embedder {
+                            engine = engine.with_embedder(e);
+                        }
+                        engine.run(shutdown_rx).await
                     }
                     CredentialBackend::File => {
                         let creds = Arc::new(FileCredentialStore::new(
@@ -352,9 +396,11 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
                             creds_path,
                             client,
                         ));
-                        SyncEngine::new(store, creds, account_id, email, config)
-                            .run(shutdown_rx)
-                            .await
+                        let mut engine = SyncEngine::new(store, creds, account_id, email, config);
+                        if let Some(e) = embedder {
+                            engine = engine.with_embedder(e);
+                        }
+                        engine.run(shutdown_rx).await
                     }
                 }
             })

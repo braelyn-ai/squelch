@@ -12,8 +12,8 @@ use zerocopy::AsBytes;
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied, Stage2Queued, Stage2Usage,
-    Store, SyncState, TriagedMessage,
+    MissingVector, NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied,
+    Stage2Queued, Stage2Usage, Store, SyncState, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, ClientMessage,
@@ -41,9 +41,17 @@ fn register_vec_extension() {
         // statically links; transmuting it to the auto-extension fn pointer type
         // is the documented rusqlite integration pattern.
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            // Explicit transmute annotation (clippy::missing_transmute_annotations):
+            // the source is the C init fn as a bare pointer, the target is the
+            // auto-extension entrypoint signature rusqlite expects.
+            let init: unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int = std::mem::transmute(
                 sqlite_vec::sqlite3_vec_init as *const (),
-            )));
+            );
+            rusqlite::ffi::sqlite3_auto_extension(Some(init));
         }
     });
 }
@@ -213,7 +221,236 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+
+    // =====================================================================
+    // ON-BOX SEMANTIC RECALL (v1). Inherent methods (not on the `Store`
+    // trait) because they depend on the attached [`Embedder`] and the
+    // sqlite-vec `message_vecs` table, which not every `Store` impl carries.
+    //
+    // SECURITY: SEALED MESSAGES ARE NEVER EMBEDDED. Vector inserts here are
+    // callable for any id, but the ONLY caller (the sync ingest/backfill path)
+    // gates on `sensitivity='normal'`, and [`messages_missing_vectors`] selects
+    // ONLY normal rows, so sealed text is structurally absent from the vector
+    // space. Query-time methods additionally re-exclude sealed rows in SQL.
+    // =====================================================================
+
+    /// SEMANTIC RECALL. Embed `query_text` with the attached embedder and return
+    /// the `k` nearest messages as `(message_id, distance)` (smaller distance =
+    /// closer), scoped to `account_id`.
+    ///
+    /// SECURITY: the KNN hit set is JOINed back to `triage` and sealed rows are
+    /// re-excluded in SQL (belt: vectors were never written for sealed mail;
+    /// suspenders: this join re-checks). BOTH `is_sent` values are INCLUDED —
+    /// recall wants the user's own sent mail ("did I say I'd send X").
+    pub fn semantic_search(
+        &self,
+        account_id: AccountId,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        let embedder = self
+            .embedder
+            .as_ref()
+            .ok_or_else(|| CoreError::InvalidInput("no embedder attached".into()))?;
+        let qvec = embedder.embed(query_text)?;
+        self.knn_by_vector(account_id, &qvec, k)
+    }
+
+    /// Lower-level KNN used by [`semantic_search`] (and reused by
+    /// [`hybrid_search`]): given an already-computed query vector, return the `k`
+    /// nearest non-sealed messages for the account as `(message_id, distance)`.
+    fn knn_by_vector(
+        &self,
+        account_id: AccountId,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        if query.len() != VEC_DIMS {
+            return Err(CoreError::InvalidInput(format!(
+                "query embedding len {} != vec0 width {VEC_DIMS}",
+                query.len()
+            )));
+        }
+        let conn = self.lock()?;
+        // vec0 KNN: MATCH the embedding, constrain by the account_id metadata
+        // column, and cap with `k = ?`. We over-fetch (k rows from the index)
+        // then re-join triage to drop any sealed row defensively; sealed rows
+        // should never be in the index, so this rarely trims anything.
+        let mut stmt = conn.prepare(
+            "SELECT v.message_id, v.distance
+             FROM message_vecs v
+             JOIN messages m ON m.id = v.message_id
+             LEFT JOIN triage t ON t.message_id = v.message_id
+             WHERE v.embedding MATCH ?1
+               AND v.account_id = ?2
+               AND v.k = ?3
+               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+             ORDER BY v.distance",
+        )?;
+        let rows = stmt.query_map(
+            params![query.as_bytes(), account_id, k as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32)),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// HYBRID RECALL: merge FTS5 keyword rank and vector distance with Reciprocal
+    /// Rank Fusion (RRF). Each candidate's score is `sum(1 / (rrf_k + rank))`
+    /// across the two lists it appears in; results are returned best-first as
+    /// [`SearchHit`]s. `rrf_k` is the standard smoothing constant (60). Both
+    /// lists exclude sealed rows; both `is_sent` values are INCLUDED (recall).
+    ///
+    /// This is the cheap "belt-and-suspenders" retrieval: keyword catches exact
+    /// tokens, vectors catch paraphrase. Falls back to whichever list is
+    /// available (e.g. FTS-only if the query embeds empty).
+    pub fn hybrid_search(
+        &self,
+        account_id: AccountId,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        const RRF_K: f32 = 60.0;
+
+        // Vector ranks (if an embedder is attached; degrade gracefully if not).
+        let vec_hits: Vec<(i64, f32)> = match self.embedder.as_ref() {
+            Some(embedder) => {
+                let qvec = embedder.embed(query_text)?;
+                self.knn_by_vector(account_id, &qvec, k)?
+            }
+            None => Vec::new(),
+        };
+
+        // FTS ranks over the SAME query text. `fts_recall` mirrors `search` but
+        // INCLUDES sent mail (recall) and returns bare ids in rank order.
+        let fts_ids = self.fts_recall_ids(account_id, query_text, k)?;
+
+        // Fuse: accumulate RRF score per message id.
+        use std::collections::HashMap;
+        let mut score: HashMap<i64, f32> = HashMap::new();
+        for (rank, (id, _dist)) in vec_hits.iter().enumerate() {
+            *score.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        }
+        for (rank, id) in fts_ids.iter().enumerate() {
+            *score.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        }
+
+        let mut ranked: Vec<(i64, f32)> = score.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked.truncate(k);
+
+        // Hydrate the winners into SearchHits in fused order.
+        let mut out = Vec::with_capacity(ranked.len());
+        for (id, _s) in ranked {
+            if let Some(hit) = self.search_hit_by_id(account_id, id)? {
+                out.push(hit);
+            }
+        }
+        Ok(out)
+    }
+
+    /// SEMANTIC-ONLY recall as hydrated [`SearchHit`]s (vector KNN, no keyword
+    /// leg), best-first by distance. Used by the human door's
+    /// `mode=semantic` search. Requires an attached embedder; returns an empty
+    /// list when none is attached (nothing to embed against). Sealed rows are
+    /// excluded in SQL by [`knn_by_vector`] and re-checked by
+    /// [`search_hit_by_id`]; both `is_sent` values are included (recall).
+    pub fn semantic_search_hits(
+        &self,
+        account_id: AccountId,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let ids = self.semantic_search(account_id, query_text, k)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, _dist) in ids {
+            if let Some(hit) = self.search_hit_by_id(account_id, id)? {
+                out.push(hit);
+            }
+        }
+        Ok(out)
+    }
+
+    /// FTS5 recall helper for [`hybrid_search`]: keyword search returning bare
+    /// message ids in rank order. Unlike [`Store::search`] this INCLUDES sent
+    /// mail (`is_sent` not constrained) because recall wants the user's own
+    /// outbound mail. Sealed rows are excluded in SQL. A malformed FTS query
+    /// yields an empty list rather than an error (recall degrades to vectors).
+    fn fts_recall_ids(&self, account_id: AccountId, query: &str, limit: usize) -> Result<Vec<i64>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.rowid
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND messages_fts MATCH ?2
+             ORDER BY rank
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, query, limit as i64], |r| {
+            r.get::<_, i64>(0)
+        });
+        let rows = match rows {
+            Ok(r) => r,
+            // A syntactically-invalid MATCH expression => no keyword hits.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(id) => out.push(id),
+                Err(_) => return Ok(out),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Hydrate a single non-sealed message id into a [`SearchHit`] (sealed rows
+    /// return `None`, keeping them absent from hybrid results).
+    fn search_hit_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<SearchHit>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
+                        m.received_at, m.snippet
+                 FROM messages m
+                 LEFT JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1 AND m.id = ?2
+                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'",
+                params![account_id, id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, thread_id, from_addr, from_name, subject, received_at, snippet)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(SearchHit {
+            id,
+            thread_id,
+            from_addr,
+            from_name,
+            subject,
+            received_at: parse_dt(&received_at)?,
+            snippet,
+        }))
+    }
 }
+
 
 /// Upsert a message + FTS + Sent-derived contacts against an explicit
 /// connection/transaction handle. Shared by [`SqliteStore::upsert_message`] and
@@ -425,6 +662,31 @@ impl Store for SqliteStore {
             subject,
             messages,
         })
+    }
+
+    fn thread_id_for_message(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        // SECURITY: exclude sealed rows in SQL. A sealed message id resolves to
+        // `None` exactly like a nonexistent one, so the `get_thread` message-id
+        // fallback can never confirm that a sealed message (or its thread)
+        // exists. A message with no triage row is treated as non-sealed
+        // (COALESCE) so plain mail still resolves.
+        let thread_id: Option<String> = conn
+            .query_row(
+                "SELECT m.thread_id
+                 FROM messages m
+                 LEFT JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1 AND m.id = ?2
+                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'",
+                params![account_id, message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(thread_id)
     }
 
     fn thread_view_with_html(
@@ -1491,6 +1753,65 @@ impl Store for SqliteStore {
             })
             .unwrap_or_default())
     }
+
+    fn upsert_message_vector(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.len() != VEC_DIMS {
+            return Err(CoreError::InvalidInput(format!(
+                "embedding len {} != vec0 width {VEC_DIMS}",
+                embedding.len()
+            )));
+        }
+        let conn = self.lock()?;
+        // vec0 rejects a re-INSERT on an existing rowid, so delete-then-insert
+        // keeps re-embed idempotent.
+        conn.execute(
+            "DELETE FROM message_vecs WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        conn.execute(
+            "INSERT INTO message_vecs(message_id, embedding, account_id)
+             VALUES (?1, ?2, ?3)",
+            params![message_id, embedding.as_bytes(), account_id],
+        )?;
+        Ok(())
+    }
+
+    fn messages_missing_vectors(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<MissingVector>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.subject, m.body
+             FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND t.sensitivity = 'normal'
+               AND NOT EXISTS (
+                   SELECT 1 FROM message_vecs v WHERE v.message_id = m.id
+               )
+             ORDER BY m.received_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit as i64], |r| {
+            Ok(MissingVector {
+                message_id: r.get(0)?,
+                subject: r.get(1)?,
+                body: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -1536,6 +1857,39 @@ mod tests {
         let tv = store.thread_view(acct, "t1").unwrap();
         assert_eq!(tv.messages.len(), 1);
         assert_eq!(tv.subject, "Lunch?");
+    }
+
+    /// `thread_id_for_message` (the get_thread forgiveness fallback) resolves a
+    /// normal message id to its thread, returns None for an unknown id, and
+    /// returns None for a SEALED message id — so a sealed id is indistinguishable
+    /// from a nonexistent one and never leaks thread existence.
+    #[test]
+    fn thread_id_for_message_resolves_normal_and_hides_sealed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let normal = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+        store
+            .set_triage(normal, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        let sealed = store.upsert_message(&sample_msg(acct, "g2", "t2")).unwrap();
+        store
+            .set_triage(
+                sealed, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.thread_id_for_message(acct, normal).unwrap().as_deref(),
+            Some("t1")
+        );
+        assert_eq!(store.thread_id_for_message(acct, 999_999).unwrap(), None);
+        assert_eq!(
+            store.thread_id_for_message(acct, sealed).unwrap(),
+            None,
+            "sealed message id must not resolve (no thread-existence leak)"
+        );
     }
 
     #[test]
@@ -2454,5 +2808,306 @@ mod tests {
         assert!(res.is_err(), "audit failure must fail the whole call");
         // The rule write must have been rolled back.
         assert_eq!(store.list_sender_rules(acct).unwrap().len(), 0);
+    }
+
+    // ---- SEMANTIC RECALL (v1) --------------------------------------------
+    //
+    // These exercise the vec0 index + gating with a deterministic, download-free
+    // `StubEmbedder`, so the SQL/gating/ranking are covered offline. The e2e test
+    // against the real fastembed model is feature-gated behind an env var
+    // (SQUELCH_EMBED_E2E) so CI never downloads weights.
+
+    use crate::embed::{Embedder, StubEmbedder, message_embed_text};
+    use std::sync::Arc;
+
+    /// Embed a message's subject+body with `embedder` and write its vector, exactly
+    /// as the sync ingest/backfill path does. CALLER ensures the row is non-sealed
+    /// (mirrors the structural gate: sealed mail never reaches this).
+    fn embed_and_store(
+        store: &SqliteStore,
+        embedder: &dyn Embedder,
+        acct: AccountId,
+        message_id: i64,
+        subject: &str,
+        body: &str,
+    ) {
+        let text = message_embed_text(subject, body, 2000);
+        let v = embedder.embed(&text).unwrap();
+        store
+            .upsert_message_vector(acct, message_id, &v)
+            .unwrap();
+    }
+
+    /// Count vectors present for a given message id (0 or 1). Used to assert a
+    /// sealed message is structurally absent from the vector space.
+    fn vec_count_for(store: &SqliteStore, message_id: i64) -> i64 {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_vecs WHERE message_id = ?1",
+            params![message_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sealed_message_is_never_embedded() {
+        // The structural gate lives at the CALLER (ingest/backfill only embed
+        // non-sealed rows). `messages_missing_vectors` — the backfill's source —
+        // must NEVER return a sealed row, so a sealed message can never acquire a
+        // vector through the supported path. We assert both: the sealed row is
+        // absent from the missing-vector list, and its vec slot stays empty.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // A normal message and a sealed OTP.
+        let normal = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+        store
+            .set_triage(normal, acct, 70, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        let mut otp = sample_msg(acct, "g2", "t2");
+        otp.subject = "Your verification code".to_string();
+        otp.body = "code 123456".to_string();
+        let sealed = store.upsert_message(&otp).unwrap();
+        store
+            .set_triage(
+                sealed, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp),
+                "", "", None,
+            )
+            .unwrap();
+
+        // messages_missing_vectors returns the normal row, NEVER the sealed one.
+        let missing = store.messages_missing_vectors(acct, 10).unwrap();
+        assert!(missing.iter().any(|m| m.message_id == normal));
+        assert!(
+            !missing.iter().any(|m| m.message_id == sealed),
+            "sealed message must be structurally absent from the backfill source"
+        );
+
+        // Simulate the backfill embedding only what it was handed: the sealed row
+        // gets no vector.
+        let embedder = StubEmbedder::new(VEC_DIMS);
+        for m in &missing {
+            embed_and_store(&store, &embedder, acct, m.message_id, &m.subject, &m.body);
+        }
+        assert_eq!(vec_count_for(&store, sealed), 0, "sealed row has no vector");
+        assert_eq!(vec_count_for(&store, normal), 1, "normal row was embedded");
+    }
+
+    #[test]
+    fn sent_raw_body_is_stored_and_embeddable() {
+        // TASK 3/7: a SENT message stores its full body (recall covers what the
+        // USER wrote), and that body flows through the missing-vector backfill so
+        // it becomes embeddable — even though sent mail is excluded from triage.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut sent = sample_msg(acct, "g-sent", "t-sent");
+        sent.is_sent = true;
+        sent.subject = "re: the design doc".to_string();
+        sent.body = "I'll send you the revised design doc by Friday.".to_string();
+        let id = store.upsert_message(&sent).unwrap();
+        // Sent mail ingests with a neutral normal-sensitivity triage row.
+        store
+            .set_triage(id, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        // The raw body is stored verbatim.
+        {
+            let conn = store.lock().unwrap();
+            let body: String = conn
+                .query_row("SELECT body FROM messages WHERE id=?1", params![id], |r| r.get(0))
+                .unwrap();
+            assert!(body.contains("revised design doc by Friday"));
+        }
+
+        // And it is a backfill candidate (sent mail is embeddable for recall).
+        let missing = store.messages_missing_vectors(acct, 10).unwrap();
+        let row = missing
+            .iter()
+            .find(|m| m.message_id == id)
+            .expect("sent message is a missing-vector candidate");
+        assert!(row.body.contains("revised design doc"));
+
+        let embedder = StubEmbedder::new(VEC_DIMS);
+        embed_and_store(&store, &embedder, acct, id, &row.subject, &row.body);
+        assert_eq!(vec_count_for(&store, id), 1);
+    }
+
+    #[test]
+    fn semantic_search_ranks_relevant_above_decoy_and_includes_sent() {
+        // Plant a relevant SENT doc and an unrelated decoy; the query about what
+        // the user said they'd send must rank the relevant doc first. Sent mail is
+        // INCLUDED (recall wants it) — unlike keyword `search`, which excludes it.
+        let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+        let store = SqliteStore::open_in_memory()
+            .unwrap()
+            .with_embedder(embedder.clone())
+            .unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Relevant: the user promised to send an invoice.
+        let mut relevant = sample_msg(acct, "g-rel", "t-rel");
+        relevant.is_sent = true;
+        relevant.subject = "invoice".to_string();
+        relevant.body =
+            "Hi Dana, I will send you the invoice for the consulting work tomorrow.".to_string();
+        let rel = store.upsert_message(&relevant).unwrap();
+        store
+            .set_triage(rel, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        // Decoy: completely unrelated received mail.
+        let mut decoy = sample_msg(acct, "g-dec", "t-dec");
+        decoy.subject = "weekend hiking trip".to_string();
+        decoy.body = "The mountain trail was gorgeous and the weather held up nicely.".to_string();
+        let dec = store.upsert_message(&decoy).unwrap();
+        store
+            .set_triage(dec, acct, 20, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        // Embed both through the missing-vector path (mirrors backfill).
+        for m in store.messages_missing_vectors(acct, 10).unwrap() {
+            embed_and_store(&store, &*embedder, acct, m.message_id, &m.subject, &m.body);
+        }
+
+        let hits = store
+            .semantic_search(acct, "did I say I would send the invoice", 5)
+            .unwrap();
+        assert!(!hits.is_empty(), "expected at least one hit");
+        assert_eq!(hits[0].0, rel, "the relevant sent doc must rank first");
+        // The decoy, if present, ranks strictly worse (larger distance).
+        if let Some(d) = hits.iter().find(|(id, _)| *id == dec) {
+            assert!(d.1 >= hits[0].1, "decoy must not beat the relevant doc");
+        }
+    }
+
+    #[test]
+    fn semantic_search_excludes_sealed_even_if_a_vector_leaked() {
+        // BELT-AND-SUSPENDERS: vectors are never written for sealed mail, but if a
+        // vector somehow existed, semantic_search's re-join to triage must still
+        // drop it. We force the pathological case by inserting a vector directly.
+        let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+        let store = SqliteStore::open_in_memory()
+            .unwrap()
+            .with_embedder(embedder.clone())
+            .unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut otp = sample_msg(acct, "g-seal", "t-seal");
+        otp.subject = "verification code".to_string();
+        otp.body = "your one time passcode is 999111".to_string();
+        let sealed = store.upsert_message(&otp).unwrap();
+        store
+            .set_triage(
+                sealed, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp),
+                "", "", None,
+            )
+            .unwrap();
+
+        // Pathological: write a vector for the sealed row anyway (bypassing the gate).
+        embed_and_store(&store, &*embedder, acct, sealed, "verification code",
+            "your one time passcode is 999111");
+        assert_eq!(vec_count_for(&store, sealed), 1, "vector was forced in");
+
+        // semantic_search must STILL never return it (re-join drops sealed).
+        let hits = store
+            .semantic_search(acct, "verification code passcode", 5)
+            .unwrap();
+        assert!(
+            !hits.iter().any(|(id, _)| *id == sealed),
+            "sealed row must be excluded by the query-time re-join"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_fuses_keyword_and_vector_and_includes_sent() {
+        // RRF hybrid: a sent doc that both keyword-matches and vector-matches the
+        // query should surface. Confirms hybrid_search returns SearchHits and
+        // includes sent mail (recall).
+        let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+        let store = SqliteStore::open_in_memory()
+            .unwrap()
+            .with_embedder(embedder.clone())
+            .unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut sent = sample_msg(acct, "g-h", "t-h");
+        sent.is_sent = true;
+        sent.subject = "contract".to_string();
+        sent.body = "I promised to send the signed contract to the vendor.".to_string();
+        let id = store.upsert_message(&sent).unwrap();
+        store
+            .set_triage(id, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        embed_and_store(&store, &*embedder, acct, id, &sent.subject, &sent.body);
+
+        let hits = store.hybrid_search(acct, "signed contract vendor", 5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == id),
+            "hybrid search must surface the matching sent doc (recall includes sent mail)"
+        );
+    }
+
+    #[test]
+    fn embedder_dims_mismatch_is_rejected_at_attach() {
+        // The store asserts the embedder width matches the vec0 table at attach.
+        let wrong = Arc::new(StubEmbedder::new(VEC_DIMS + 1));
+        // `SqliteStore` is not `Debug`, so match on the Result rather than
+        // `unwrap_err()` (which would require `Ok: Debug`).
+        match SqliteStore::open_in_memory().unwrap().with_embedder(wrong) {
+            Ok(_) => panic!("dims mismatch must be rejected at attach"),
+            Err(e) => assert!(matches!(e, CoreError::InvalidInput(_))),
+        }
+    }
+
+    /// E2E against the REAL fastembed model. Gated behind SQUELCH_EMBED_E2E so CI
+    /// never downloads ONNX weights. Run with:
+    ///   SQUELCH_EMBED_E2E=1 cargo test -p squelch-core embed_e2e
+    #[test]
+    fn embed_e2e_real_model_ranks_relevant_first() {
+        if std::env::var("SQUELCH_EMBED_E2E").ok().as_deref() != Some("1") {
+            eprintln!("skipping embed_e2e (set SQUELCH_EMBED_E2E=1 to run)");
+            return;
+        }
+        use crate::config::EmbedConfig;
+        use crate::embed::FastEmbedder;
+
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(FastEmbedder::new(&EmbedConfig::default().settings()).unwrap());
+        let store = SqliteStore::open_in_memory()
+            .unwrap()
+            .with_embedder(embedder.clone())
+            .unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let mut relevant = sample_msg(acct, "g-rel", "t-rel");
+        relevant.is_sent = true;
+        relevant.subject = "invoice".to_string();
+        relevant.body =
+            "I will send over the invoice for last month's work by end of day.".to_string();
+        let rel = store.upsert_message(&relevant).unwrap();
+        store
+            .set_triage(rel, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        let mut decoy = sample_msg(acct, "g-dec", "t-dec");
+        decoy.subject = "lunch".to_string();
+        decoy.body = "Want to grab tacos on Thursday?".to_string();
+        let dec = store.upsert_message(&decoy).unwrap();
+        store
+            .set_triage(dec, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+
+        for m in store.messages_missing_vectors(acct, 10).unwrap() {
+            embed_and_store(&store, &*embedder, acct, m.message_id, &m.subject, &m.body);
+        }
+
+        let hits = store
+            .semantic_search(acct, "when did I promise to send the invoice?", 5)
+            .unwrap();
+        assert_eq!(hits[0].0, rel, "real model must rank the invoice doc first");
+        assert!(hits.iter().any(|(id, _)| *id == dec), "decoy present but lower");
     }
 }

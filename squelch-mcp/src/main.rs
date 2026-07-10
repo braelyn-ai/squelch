@@ -1,4 +1,4 @@
-//! squelch-mcp: MCP server exposing squelch's 5 read-mostly tools.
+//! squelch-mcp: MCP server exposing squelch's 6 read-mostly tools.
 //!
 //! Transport is chosen HERE and only here. Tool logic lives in [`server`] and
 //! is transport-agnostic. Default (no args) is stdio, exactly as before; passing
@@ -163,12 +163,12 @@ async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Smoke test: the server object constructs and exposes exactly the 5 tools
+    /// Smoke test: the server object constructs and exposes exactly the 6 tools
     /// over an in-memory store, without binding any transport.
     #[test]
-    fn constructs_server_with_five_tools() {
+    fn constructs_server_with_six_tools() {
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
         let server = SquelchServer::new(store, "me@localhost").expect("server");
-        assert_eq!(server.tool_count(), 5, "expected exactly 5 MCP tools");
+        assert_eq!(server.tool_count(), 6, "expected exactly 6 MCP tools");
     }
 }

@@ -195,6 +195,16 @@ pub struct Stage2Usage {
     pub output_tokens: u64,
 }
 
+/// A NON-SEALED message that still needs an embedding vector, returned by
+/// [`Store::messages_missing_vectors`] for the startup backfill pass. Carries
+/// only the text the embedder consumes (subject + body).
+#[derive(Debug, Clone)]
+pub struct MissingVector {
+    pub message_id: i64,
+    pub subject: String,
+    pub body: String,
+}
+
 /// A locally-stored sealed message, exposed ONLY to the TUI. This type never
 /// crosses the MCP boundary.
 #[derive(Debug, Clone)]
@@ -235,6 +245,20 @@ pub trait Store: Send + Sync {
     /// from the human door. Keeping them as two methods returning two types is
     /// the structural guarantee that html never crosses /mcp.
     fn thread_view(&self, account_id: AccountId, thread_id: &str) -> Result<ThreadView>;
+
+    /// Resolve a LOCAL MESSAGE id to its `thread_id`, for the `get_thread`
+    /// forgiveness path (caller passed a message id where a thread id was
+    /// expected). Returns `NotFound` when the id is unknown OR the message is
+    /// sealed — sealed rows must never leak thread existence, so the two are
+    /// indistinguishable exactly as in [`Store::thread_view`]. The returned
+    /// thread id may still contain sealed messages; the caller re-runs the full
+    /// sealed guard via `thread_view`, so this method does not itself vouch for
+    /// the whole thread being unsealed.
+    fn thread_id_for_message(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<String>>;
 
     /// HUMAN-DOOR-ONLY thread view: same sealed/nonexistent -> `NotFound`
     /// behavior as [`Store::thread_view`], but each message additionally carries
@@ -456,4 +480,37 @@ pub trait Store: Send + Sync {
     /// Read the Stage-2 usage totals for `(account_id, day)`. Returns a zeroed
     /// [`Stage2Usage`] when no row exists for that day.
     fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage>;
+
+    // ---------------------------------------------------------------------
+    // SEMANTIC RECALL (v1) vector-index writes. The embedder itself lives in
+    // the caller (sync engine), so these take a precomputed vector / return the
+    // text to embed — they never touch a model. QUERY-side methods
+    // (`semantic_search`/`hybrid_search`) are inherent on `SqliteStore` because
+    // they need the attached embedder.
+    //
+    // SECURITY: SEALED MESSAGES ARE NEVER EMBEDDED. `upsert_message_vector`'s
+    // only callers gate on `sensitivity='normal'`, and
+    // `messages_missing_vectors` selects ONLY normal rows, so sealed content is
+    // structurally absent from the vector space.
+    // ---------------------------------------------------------------------
+
+    /// Insert (or replace) the embedding vector for one message. `embedding.len()`
+    /// MUST equal the vec0 table width (384). CALLER MUST ensure the message is
+    /// non-sealed; this does not re-check (ingest/backfill gate structurally).
+    /// Idempotent — re-embedding overwrites.
+    fn upsert_message_vector(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        embedding: &[f32],
+    ) -> Result<()>;
+
+    /// Fetch up to `limit` NON-SEALED messages that have no vector yet (subject +
+    /// body to embed). Drives the startup backfill pass (pre-existing rows +
+    /// ingest-time embed failures). Sealed rows are excluded in SQL. Newest-first.
+    fn messages_missing_vectors(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<MissingVector>>;
 }

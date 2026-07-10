@@ -135,6 +135,109 @@ async fn search_excludes_sealed() {
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "sealed hit must be excluded from search");
     assert_eq!(items[0]["thread_id"], "t1");
+    // No embedder attached => default mode resolves to keyword.
+    assert_eq!(json["match_kind"], "keyword");
+}
+
+/// A garbage `mode` value is a 400.
+#[tokio::test]
+async fn search_bad_mode_is_400() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        let n = store
+            .upsert_message(&msg(acct, "g1", "t1", "hello world", "body"))
+            .unwrap();
+        store
+            .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+    });
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=hello&mode=bogus"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Explicit `mode=semantic` with NO vector index degrades to keyword and reports
+/// the kind actually run — never erroring the caller.
+#[tokio::test]
+async fn search_semantic_without_vectors_falls_back_to_keyword() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        let n = store
+            .upsert_message(&msg(acct, "g1", "t1", "quarterly report attached", "body"))
+            .unwrap();
+        store
+            .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+    });
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=quarterly&mode=semantic"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "keyword", "no vectors => keyword fallback");
+    assert_eq!(json["items"].as_array().unwrap().len(), 1);
+}
+
+/// With an embedder attached, the default mode is hybrid, semantic/hybrid run,
+/// and sealed mail is STILL excluded from every mode.
+#[tokio::test]
+async fn search_modes_with_embedder_and_sealed_excluded() {
+    use squelch_core::embed::StubEmbedder;
+
+    // Attach a deterministic stub embedder (384-dim to match the vec0 table)
+    // before wrapping the store in an Arc.
+    let store = SqliteStore::open_in_memory()
+        .unwrap()
+        .with_embedder(Arc::new(StubEmbedder::new(384)))
+        .unwrap();
+    let acct = store.ensure_account("me@example.com").unwrap();
+    let store = Arc::new(store);
+
+    // Normal message + its vector.
+    let n = store
+        .upsert_message(&msg(acct, "g1", "t1", "acme invoice for services", "please pay"))
+        .unwrap();
+    store
+        .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+        .unwrap();
+    let v = store.embedder().unwrap().embed("acme invoice for services please pay").unwrap();
+    store.upsert_message_vector(acct, n, &v).unwrap();
+
+    // Sealed OTP + (defensively) a leaked vector — must never surface.
+    let s = store
+        .upsert_message(&msg(acct, "g2", "t2", "acme verification code", "123456"))
+        .unwrap();
+    store
+        .set_triage(s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None)
+        .unwrap();
+    let sv = store.embedder().unwrap().embed("acme verification code 123456").unwrap();
+    store.upsert_message_vector(acct, s, &sv).unwrap();
+
+    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
+    let app = router(state);
+
+    // Default (no mode) => hybrid; sealed absent.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=acme"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "hybrid");
+    let items = json["items"].as_array().unwrap();
+    assert!(items.iter().all(|i| i["thread_id"] != "t2"), "sealed never surfaces");
+    assert!(items.iter().any(|i| i["thread_id"] == "t1"));
+
+    // Explicit semantic => runs semantic, sealed still absent.
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=acme&mode=semantic"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "semantic");
+    let items = json["items"].as_array().unwrap();
+    assert!(items.iter().all(|i| i["thread_id"] != "t2"), "sealed never surfaces in semantic");
 }
 
 #[tokio::test]

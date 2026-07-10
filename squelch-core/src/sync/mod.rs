@@ -40,7 +40,7 @@ use crate::store::{Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::stage2_sealed_guard;
-use crate::types::{AccountId, SenderRule};
+use crate::types::{AccountId, SenderRule, Sensitivity};
 
 /// Gmail REST base for the authenticated user. Fixed; not user-tunable.
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -146,18 +146,13 @@ struct RawMessage {
     /// Milliseconds since epoch as a decimal string (Gmail's `internalDate`).
     #[serde(default)]
     internal_date: Option<String>,
-    /// Parsed header payload (present with `format=metadata`).
-    #[serde(default)]
-    payload: Option<MessagePayload>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MessagePayload {
-    #[serde(default)]
-    headers: Vec<MessageHeader>,
-}
-
-#[derive(Debug, Deserialize)]
+/// A single Gmail metadata header. Test-only now that SENT backfill fetches full
+/// bodies (`format=raw`) rather than headers — the contacts-seeding tests build
+/// these to exercise the header-parsing ingest path via
+/// [`synthesize_rfc822_headers`].
+#[cfg(test)]
 struct MessageHeader {
     name: String,
     value: String,
@@ -215,6 +210,10 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     /// When `None`, Stage-2 is DISABLED gracefully (rows stay queued, one stderr
     /// notice, sync continues). The key is never logged.
     stage2_key: Option<(String, Stage2Provider)>,
+    /// On-box embedder for v1 semantic recall. `None` disables embedding
+    /// gracefully (ingest/backfill skip the vector write; sync continues). CPU
+    /// work runs under `spawn_blocking` so the poll loop never stalls on it.
+    embedder: Option<Arc<dyn crate::embed::Embedder>>,
 }
 
 impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
@@ -250,7 +249,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             config,
             http,
             stage2_key,
+            embedder: None,
         }
+    }
+
+    /// Attach an on-box [`Embedder`](crate::embed::Embedder) so ingest and the
+    /// startup backfill populate the semantic-recall vector index. Absence keeps
+    /// sync fully functional (no vectors written). Chainable with [`new`].
+    pub fn with_embedder(mut self, embedder: Arc<dyn crate::embed::Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Perform an authenticated GET returning parsed JSON. On a 401 we re-request
@@ -308,6 +316,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             self.stage2_pass().await;
         }
 
+        // VECTOR BACKFILL: embed any NON-SEALED messages still missing a vector.
+        // Covers pre-existing rows (schema/model added after a prior sync) and
+        // ingest-time embed failures. Sealed rows are structurally excluded by
+        // `messages_missing_vectors` (it selects sensitivity='normal' only), so
+        // this can never embed sealed content. No-op when no embedder is attached.
+        self.backfill_missing_vectors().await;
+
         self.poll_loop(shutdown).await
     }
 
@@ -322,11 +337,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         let n = self.fetch_raw_and_ingest(&inbox_ids, /* is_sent */ false).await?;
         eprintln!("squelch: backfilled {n} INBOX messages");
 
-        // SENT headers only (seed contacts). Reuses the exact is_sent ingest path
-        // via a metadata-only synthetic RawFetched (see `ingest_sent_metadata`).
+        // SENT bodies (format=raw). Fetching full bodies (not just headers) is
+        // what makes v1 semantic recall cover WHAT THE USER WROTE ("did I say
+        // I'd send X"). The is_sent ingest path is otherwise unchanged: contacts
+        // are still derived from To/Cc recipients, the row is stored neutral
+        // (tier=noise, importance=0) and stays out of triage/updates/search via
+        // the existing is_sent exclusions. The extra win over the old
+        // headers-only path is that the sent BODY lands in `messages.body`, so
+        // it is embeddable for recall.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
-        let seeded = self.fetch_metadata_and_seed(&sent_ids).await?;
-        eprintln!("squelch: seeded contacts from {seeded} sent messages");
+        let seeded = self
+            .fetch_raw_and_ingest(&sent_ids, /* is_sent */ true)
+            .await?;
+        eprintln!("squelch: backfilled {seeded} SENT messages (bodies for recall + contacts)");
 
         // Establish the historyId cursor from the profile.
         let history_id = self.fetch_profile_history_id().await?;
@@ -506,59 +529,27 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 is_sent,
                 account_addr: self.account_email.clone(),
             };
-            self.ingest_one(&fetched, &rules, now)?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Fetch each SENT id `format=metadata` (From/To/Cc/Date/Message-ID headers)
-    /// and seed contacts via the is_sent ingest path. Contacts are derived from
-    /// the To/Cc RECIPIENTS (the From header is the account itself); the
-    /// metadata-only synthetic RFC822 blob is byte-compatible with the ingest
-    /// pipeline, which parses To/Cc and filters out the account's own address.
-    async fn fetch_metadata_and_seed(&self, ids: &[String]) -> Result<usize> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let rules = self.store.list_sender_rules(self.account_id)?;
-        let now = Utc::now();
-        let mut count = 0usize;
-
-        for id in ids {
-            let url = format!(
-                "{GMAIL_API_BASE}/messages/{id}?format=metadata\
-                 &metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc\
-                 &metadataHeaders=Date&metadataHeaders=Message-ID"
-            );
-            let msg: RawMessage = self.get_json(&url).await?;
-            let headers = match &msg.payload {
-                Some(p) => &p.headers,
-                None => continue,
-            };
-            // Reconstruct a minimal header-only RFC822 blob so the same
-            // mail-parser -> ingest path runs unchanged. is_sent=true seeds
-            // contacts from the To/Cc recipient headers (the From header is the
-            // account itself and is explicitly excluded via account_addr).
-            let raw = synthesize_rfc822_headers(headers);
-            let fetched = RawFetched {
-                account_id: self.account_id,
-                gmail_msg_id: if msg.id.is_empty() { id.clone() } else { msg.id.clone() },
-                gmail_thread_id: msg.thread_id.clone(),
-                raw: raw.into_bytes(),
-                internal_date: parse_internal_date(msg.internal_date.as_deref()),
-                is_sent: true,
-                account_addr: self.account_email.clone(),
-            };
-            self.ingest_one(&fetched, &rules, now)?;
+            if let Some((id, text)) = self.ingest_one(&fetched, &rules, now)? {
+                self.embed_and_store(id, text).await;
+            }
             count += 1;
         }
         Ok(count)
     }
 
     /// Run one fetched message through the unchanged seal-first ingest pipeline
-    /// and commit it atomically.
-    fn ingest_one(&self, fetched: &RawFetched, rules: &[SenderRule], now: DateTime<Utc>) -> Result<()> {
+    /// and commit it atomically. Returns `Some((message_id, embed_text))` for a
+    /// NORMAL-sensitivity message so the caller can embed it for semantic recall,
+    /// or `None` for a SEALED message — the STRUCTURAL GATE that keeps sealed
+    /// content out of the vector space (there is nothing to embed, not a filtered
+    /// embedding). `embed_text` is the same subject+body flattening used at query
+    /// time, truncated per config.
+    fn ingest_one(
+        &self,
+        fetched: &RawFetched,
+        rules: &[SenderRule],
+        now: DateTime<Utc>,
+    ) -> Result<Option<(i64, String)>> {
         let triaged = ingest_with_rules(
             fetched,
             &self.config.stage1,
@@ -566,8 +557,115 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             rules,
             |addr| self.store.is_known_contact(self.account_id, addr).unwrap_or(false),
         );
-        self.store.ingest_message(&triaged)?;
-        Ok(())
+        let id = self.store.ingest_message(&triaged)?;
+        // STRUCTURAL EXCLUSION: sealed mail is never embedded.
+        if triaged.sensitivity != Sensitivity::Normal {
+            return Ok(None);
+        }
+        let text = crate::embed::message_embed_text(
+            &triaged.message.subject,
+            &triaged.message.body,
+            self.config.embed.max_chars,
+        );
+        Ok(Some((id, text)))
+    }
+
+    /// Embed `text` off the async runtime (CPU work) and write the vector for
+    /// `message_id`. No-op when no embedder is attached. A failure logs a
+    /// REDACTED one-liner (id + error kind only, never body) and never
+    /// propagates — the vector can be recovered by the backfill pass, so an embed
+    /// failure must never block or crash ingest.
+    async fn embed_and_store(&self, message_id: i64, text: String) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        let account_id = self.account_id;
+        let store = self.store.clone();
+        // spawn_blocking: ONNX inference is CPU-bound; keep it off the poll loop.
+        let result = tokio::task::spawn_blocking(move || {
+            let vec = embedder.embed(&text)?;
+            store.upsert_message_vector(account_id, message_id, &vec)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("squelch: embed failed for message {message_id} (recoverable via backfill): {e}"),
+            Err(e) => eprintln!("squelch: embed task join error for message {message_id}: {e}"),
+        }
+    }
+
+    /// STARTUP VECTOR BACKFILL: embed every NON-SEALED message that still lacks a
+    /// vector, in throttled batches, so semantic recall covers pre-existing rows
+    /// and any ingest-time embed failures.
+    ///
+    /// SECURITY: [`Store::messages_missing_vectors`] selects ONLY
+    /// `sensitivity='normal'` rows, so sealed content is structurally absent from
+    /// this pass — there is nothing sealed to embed. Each batch's embedding is CPU
+    /// work run under `spawn_blocking` so the async runtime never stalls; a failure
+    /// logs a redacted one-liner and moves on (the row stays missing and is retried
+    /// next startup). No-op when no embedder is attached.
+    async fn backfill_missing_vectors(&self) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        let batch = self.config.embed.backfill_batch.max(1);
+        let max_chars = self.config.embed.max_chars;
+        let account_id = self.account_id;
+        let mut total = 0usize;
+
+        loop {
+            let missing = match self.store.messages_missing_vectors(account_id, batch) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("squelch: vector backfill query failed ({e}); stopping pass");
+                    return;
+                }
+            };
+            if missing.is_empty() {
+                break;
+            }
+            let n = missing.len();
+            // Flatten each message the SAME way ingest/query does, then embed the
+            // whole batch in one blocking ONNX pass and write the vectors.
+            let store = self.store.clone();
+            let embedder = embedder.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                let texts: Vec<String> = missing
+                    .iter()
+                    .map(|m| crate::embed::message_embed_text(&m.subject, &m.body, max_chars))
+                    .collect();
+                let vecs = embedder.embed_batch(&texts)?;
+                for (m, vec) in missing.iter().zip(vecs.iter()) {
+                    store.upsert_message_vector(account_id, m.message_id, vec)?;
+                }
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => total += n,
+                Ok(Err(e)) => {
+                    eprintln!("squelch: vector backfill batch failed ({e}); stopping pass");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("squelch: vector backfill task join error ({e}); stopping pass");
+                    break;
+                }
+            }
+
+            // A short batch means we drained the queue; stop before re-querying.
+            if n < batch {
+                break;
+            }
+            // Throttle between batches so a large backfill doesn't peg the CPU or
+            // starve the poll loop.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        if total > 0 {
+            eprintln!("squelch: vector backfill embedded {total} message(s) for semantic recall");
+        }
     }
 
     /// Run one Stage-2 LLM triage pass over the queued (non-confident) rows.
@@ -892,6 +990,11 @@ fn parse_internal_date(s: Option<&str>) -> Option<DateTime<Utc>> {
 /// Rebuild a header-only RFC822 blob from Gmail metadata headers so the existing
 /// mail-parser-based ingest path runs unchanged. A trailing blank line ends the
 /// header section (empty body).
+///
+/// Test-only since SENT backfill switched to `format=raw` (full bodies for
+/// recall); retained because the contacts-seeding tests exercise the header
+/// parsing path through it.
+#[cfg(test)]
 fn synthesize_rfc822_headers(headers: &[MessageHeader]) -> String {
     let mut out = String::new();
     for h in headers {
