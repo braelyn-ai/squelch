@@ -40,6 +40,11 @@ base64 = "0.22"
 # no network at inference time (weights download once to a cache under the data
 # dir); sqlite-vec statically links the vec0 virtual-table extension; zerocopy
 # passes Vec<f32> to sqlite as raw bytes without copying.
-fastembed = "5"
+# Force the whole fastembed download path onto rustls: the default features pull
+# native-tls for BOTH the model downloader (hf-hub) and the ONNX-runtime binary
+# downloader (ort), which drags in openssl-sys — fine on macOS (Secure Transport),
+# but a hard build failure on the headless Linux box (no libssl-dev). rustls keeps
+# the tree pure-Rust everywhere. `image-models` is dropped: we only do text embeddings.
+fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 sqlite-vec = "0.1.9"
 zerocopy = "0.7"
