@@ -14,6 +14,18 @@ export type SealedKind =
   | "login_alert"
   | "verification";
 
+/**
+ * Per-property triage justifications. Each value is a short (<= ~200 char)
+ * human-readable reason for THAT property's value. An absent key means no reason
+ * was recorded for that property; the whole object is `null` for rows that
+ * predate the feature. Surfaced as hover tooltips at each value's display site.
+ */
+export interface FieldReasons {
+  importance?: string;
+  deadline?: string;
+  tier?: string;
+}
+
 /** core::types::Update — the ranked update. */
 export interface Update {
   id: number;
@@ -25,6 +37,12 @@ export interface Update {
   reason: string;
   deadline: string | null; // RFC3339
   matched_rule: number | null;
+  /** Per-property triage reasons; null on rows predating the feature. */
+  /** Per-property triage reasons. The key is ABSENT (undefined) on rows without
+   *  recorded reasons — the server omits it rather than emitting null (the
+   *  agent-door byte-absence guarantee depends on skip_serializing_if). Always
+   *  access via `u.field_reasons?.<key>`. */
+  field_reasons?: FieldReasons | null;
 }
 
 /**
@@ -126,6 +144,26 @@ export interface Receipt {
   received_at: string; // RFC3339
 }
 
+/** What a calendar notification IS: a fresh invite, a changed event, a
+ *  cancellation, or someone's RSVP to an event of yours. */
+export type CalendarKind = "invite" | "update" | "cancellation" | "response";
+
+/**
+ * GET /client/calendar — a calendar-notification record (Google/Outlook invite
+ * mail etc.), auto-resolved out of the attention bands at ingest; the Sitrep
+ * right rail is its only surface. `event_title`/`starts_at`/`organizer` are
+ * best-effort extractions and may be null.
+ */
+export interface CalendarUpdate {
+  id: number;
+  message_id: number;
+  kind: CalendarKind;
+  event_title: string | null;
+  starts_at: string | null; // RFC3339
+  organizer: string | null;
+  received_at: string; // RFC3339
+}
+
 /** core::types::SenderRule (GET /client/rules) */
 export interface SenderRule {
   id: number;
@@ -141,6 +179,48 @@ export interface CreateRuleBody {
   match_pattern: string;
   want: string;
   disposition: Disposition;
+}
+
+// --- unsubscribe ------------------------------------------------------------
+
+/** How an unsubscribe request is carried out. `browser` is the only method the
+ *  server ever returns or records now (the client opens the link; the server
+ *  never delivers anything). Pre-revision dev DBs may hold legacy
+ *  one_click/mailto ledger rows, which GET /client/unsubscribes would surface
+ *  verbatim — tolerate them when reading. */
+export type UnsubscribeMethod = "browser" | "one_click" | "mailto";
+
+/** Terminal state a human put an unsubscribe record into ("Block"/"Keep"). */
+export type UnsubResolution = "blocked" | "dismissed";
+
+/**
+ * POST /client/unsubscribe result. The server always returns the `browser`
+ * shape now (one_click/mailto execution was removed): `sender` is the lowercased
+ * address the request targeted, and `url` is the http(s) url the client must
+ * open in the system browser for the human to finish the unsubscribe there.
+ * A 422 (no http(s) unsubscribe link) surfaces as an ApiError, never this shape;
+ * a 404 (unknown/sealed message) likewise.
+ */
+export interface UnsubscribeResult {
+  method: "browser";
+  sender: string;
+  url: string;
+}
+
+/**
+ * GET /client/unsubscribes row — one per sender the human asked to unsubscribe
+ * from, newest `requested_at` first. `violation_count`/`last_violation_at` count
+ * inbound mail that landed >72h AFTER the request while still unresolved (the
+ * "they're ignoring you" signal). `resolution` is null until the human blocks or
+ * dismisses; a non-null resolution freezes violation accrual server-side.
+ */
+export interface UnsubscribeRecord {
+  sender: string;
+  requested_at: string; // RFC3339
+  method: UnsubscribeMethod;
+  violation_count: number;
+  last_violation_at: string | null; // RFC3339
+  resolution: UnsubResolution | null;
 }
 
 /** core::types::SearchHit (GET /client/search) */
@@ -163,6 +243,15 @@ export interface AuditEntry {
   action: string;
   target: string | null;
   detail: string | null;
+  /**
+   * Resolved sender/subject when `target` parses as a message id that exists for
+   * the account (`target_sender` = from_name or from_addr, `target_subject` = raw
+   * subject). Human-door data: a sealed message's sender/subject IS included here
+   * by design (the Auth tab already shows them to the human) — sealed CONTENT is
+   * never present. Null when the target isn't a resolvable message id.
+   */
+  target_sender: string | null;
+  target_subject: string | null;
 }
 
 /** core::types::BandCounts */
@@ -215,15 +304,101 @@ export interface UsageTotals {
 }
 
 /**
- * GET /client/usage response — Stage-2 triage usage history + totals + the model
- * label that produced the spend. `provider` is null when not explicitly
- * configured server-side; `model` is always present (the configured model id).
+ * One usage ledger category (GET /client/usage → `categories` map VALUES). The
+ * triage pipeline reports its stages as separate categories, keyed on the wire by
+ * id ("stage1" runs on every email, "stage2" on escalations). Each entry carries
+ * ONLY its own daily rows, aggregate totals, and the model that produced the
+ * spend — the category id is the map KEY (never a field), and there is no
+ * server-supplied label or provider here (the client derives the label from the
+ * key). `provider` is tolerated as optional for forward-compat but the server
+ * does not emit it per-entry.
+ */
+export interface UsageCategory {
+  rows: UsageRow[];
+  totals: UsageTotals;
+  model: string;
+  provider?: string | null;
+}
+
+/**
+ * GET /client/usage response — triage usage history + totals + the model label
+ * that produced the spend. `provider` is null when not explicitly configured
+ * server-side; `model` is always present (the configured model id). The top-level
+ * `rows`/`totals`/`model`/`provider` describe the primary (Stage-2) category and
+ * remain for older servers + the Settings account read; `categories`, when
+ * present, is the full per-stage breakdown the Usage view renders generically —
+ * an OBJECT MAP keyed by category id ({"stage1": {...}, "stage2": {...}}), not an
+ * array.
  */
 export interface UsageResponse {
   rows: UsageRow[];
   totals: UsageTotals;
   provider: string | null;
   model: string;
+  categories?: Record<string, UsageCategory>;
+}
+
+/**
+ * Where each cap value came from: the built-in "default", the server's
+ * "config" file, or a live "app override" written through POST /client/triage-config.
+ */
+export type TriageConfigSource = "default" | "config" | "override";
+
+/** Per-cap provenance (GET/POST /client/triage-config → `sources`). */
+export interface TriageConfigSources {
+  thread_daily_cap: TriageConfigSource;
+  sender_daily_cap: TriageConfigSource;
+  global_daily_cap: TriageConfigSource;
+}
+
+/**
+ * Stage-1 triage (the small LLM that runs on EVERY email) config + trailing-14d
+ * usage/pricing. `global_daily_cap` is its own daily ceiling (independent of the
+ * Stage-2 caps), with the same default/config/override provenance in `source`.
+ * `avg_tokens_*` are null until the Stage-1 ledger has at least one call.
+ */
+export interface TriageStage1 {
+  model: string; // e.g. "claude-haiku-4-5-20251001"
+  global_daily_cap: number;
+  source: TriageConfigSource;
+  avg_calls_per_day: number;
+  avg_tokens_in_per_call: number | null;
+  avg_tokens_out_per_call: number | null;
+  price_in_per_mtok: number;
+  price_out_per_mtok: number;
+}
+
+/**
+ * GET/POST /client/triage-config — the Stage-2 triage daily caps plus the
+ * trailing-14d usage/pricing figures the settings estimator reads. `avg_tokens_*`
+ * are null until the usage ledger has at least one Stage-2 call. `stage1` carries
+ * the Stage-1 (every-email small-LLM) model/cap/usage; `stage2_model` is the
+ * capable model that Stage-2 escalations run on.
+ */
+export interface TriageConfig {
+  thread_daily_cap: number;
+  sender_daily_cap: number;
+  global_daily_cap: number;
+  sources: TriageConfigSources;
+  avg_inbound_per_day: number;
+  avg_stage2_calls_per_day: number;
+  avg_tokens_in_per_call: number | null;
+  avg_tokens_out_per_call: number | null;
+  price_in_per_mtok: number;
+  price_out_per_mtok: number;
+  stage1: TriageStage1;
+  stage2_model: string;
+}
+
+/**
+ * POST /client/triage-config body — any subset of the three Stage-2 caps plus the
+ * optional Stage-1 global daily cap (same 1..=100000 validation / 400 semantics).
+ */
+export interface TriageConfigPatch {
+  thread_daily_cap?: number;
+  sender_daily_cap?: number;
+  global_daily_cap?: number;
+  stage1_global_daily_cap?: number;
 }
 
 /** handlers::SealedMeta (GET /client/sealed) — metadata ONLY, never bodies. */

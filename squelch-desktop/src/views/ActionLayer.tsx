@@ -11,20 +11,27 @@
 // and the modal-context keys live inside each overlay component. All intelligence
 // is server-side; nothing here logs the token or any sealed body.
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { useStore } from "../state";
 import { useKeys } from "../keys";
+import { api, ApiError } from "../api";
+import type { UnsubscribeRecord } from "../api";
+import { relAge } from "../lib/format";
+import { senderDisplayName } from "../lib/avatar";
 import { useActions } from "../actions/useActions";
+import { createBlockRule } from "../actions/blockSender";
 import { ComposeReview } from "../components/ComposeReview";
 import { RuleEditor } from "../components/RuleEditor";
 import { ProcessMode } from "../components/ProcessMode";
 import { AuthCodeModal } from "../components/AuthCodeModal";
+import { AskBar } from "../components/AskBar";
 import {
   onOpenRuleEditor,
   onOpenProcessMode,
   openProcessMode,
   type RuleEditorRequest,
 } from "../components/ruleEditorBus";
+import { onOpenAskBar } from "../components/askBarBus";
 
 export function ActionLayer() {
   const undos = useStore((s) => s.undos);
@@ -34,18 +41,88 @@ export function ActionLayer() {
   const selectedUpdate = useStore((s) => s.selectedUpdate);
   const compose = useStore((s) => s.compose);
   const hasAuthCode = useStore((s) => s.authQueue.length > 0);
+  const lastRefresh = useStore((s) => s.lastRefresh);
+  const pushToast = useStore((s) => s.pushToast);
   const act = useActions();
 
-  // Overlay state for the two store-less action modals (rule editor + process).
+  // Unsubscribe-violation prompt: a sender still mailing >72h after the human
+  // asked to unsubscribe (violation_count > 0, resolution === null). We surface
+  // ONE at a time as a card in the toast stack. `actedRef` remembers senders the
+  // human already blocked/kept THIS session so a lagging read model can't re-nag.
+  const [blockPrompt, setBlockPrompt] = useState<UnsubscribeRecord | null>(null);
+  const [blockBusy, setBlockBusy] = useState(false);
+  const actedRef = useRef<Set<string>>(new Set());
+
+  // Re-scan whenever the read model ticks (same subscribe pattern as the views).
+  useEffect(() => {
+    let alive = true;
+    api
+      .getUnsubscribes()
+      .then((rows) => {
+        if (!alive) return;
+        const next = rows.find(
+          (r) =>
+            r.violation_count > 0 &&
+            r.resolution === null &&
+            !actedRef.current.has(r.sender),
+        );
+        setBlockPrompt(next ?? null);
+      })
+      .catch(() => {
+        /* transient — leave whatever prompt (if any) is up */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [lastRefresh]);
+
+  async function blockSender(rec: UnsubscribeRecord) {
+    if (blockBusy) return;
+    setBlockBusy(true);
+    // Mark acted immediately so a refresh mid-flight can't re-surface it.
+    actedRef.current.add(rec.sender);
+    try {
+      // Squelch rule on the EXACT sender address (shared with the thread viewer's
+      // no-link fallback — see actions/blockSender).
+      await createBlockRule(rec.sender);
+      await api.setUnsubResolution(rec.sender, "blocked");
+      pushToast(`blocked ${rec.sender}`, "success");
+    } catch (e) {
+      pushToast(e instanceof ApiError ? e.message : "block failed", "error");
+    } finally {
+      setBlockBusy(false);
+      setBlockPrompt(null);
+    }
+  }
+
+  async function keepSender(rec: UnsubscribeRecord) {
+    if (blockBusy) return;
+    setBlockBusy(true);
+    actedRef.current.add(rec.sender);
+    try {
+      await api.setUnsubResolution(rec.sender, "dismissed");
+    } catch {
+      /* best-effort: the session-level actedRef already suppresses re-nag */
+    } finally {
+      setBlockBusy(false);
+      setBlockPrompt(null);
+    }
+  }
+
+  // Overlay state for the store-less action modals (rule editor + process +
+  // ⌘K ask bar).
   const [ruleReq, setRuleReq] = useState<RuleEditorRequest | null>(null);
   const [processOpen, setProcessOpen] = useState(false);
+  const [askOpen, setAskOpen] = useState(false);
 
   useEffect(() => {
     const off1 = onOpenRuleEditor((req) => setRuleReq(req));
     const off2 = onOpenProcessMode(() => setProcessOpen(true));
+    const off3 = onOpenAskBar(() => setAskOpen(true));
     return () => {
       off1();
       off2();
+      off3();
     };
   }, []);
 
@@ -86,6 +163,33 @@ export function ActionLayer() {
           maxWidth: 340,
         }}
       >
+        {/* Unsubscribe-violation prompt — a flat action card above the toasts.
+            sender strings are email-derived → rendered as text only, never HTML. */}
+        {blockPrompt && (
+          <div className="block-prompt">
+            <div className="block-prompt-text">
+              <strong>{senderDisplayName(blockPrompt.sender)}</strong> is
+              ignoring your unsubscribe — {blockPrompt.violation_count} email
+              {blockPrompt.violation_count === 1 ? "" : "s"} since you asked{" "}
+              {relAge(blockPrompt.requested_at)} ago.
+            </div>
+            <div className="block-prompt-actions">
+              <button
+                className="primary"
+                disabled={blockBusy}
+                onClick={() => void blockSender(blockPrompt)}
+              >
+                Block sender
+              </button>
+              <button
+                disabled={blockBusy}
+                onClick={() => void keepSender(blockPrompt)}
+              >
+                Keep
+              </button>
+            </div>
+          </div>
+        )}
         {toasts.map((t) => (
           <div
             key={t.id}
@@ -163,6 +267,10 @@ export function ActionLayer() {
       {/* 2FA present-don't-read: the big code modal (auto-revealed on arrival).
           Conditional-mount on the queue so the code lives only while shown. */}
       {hasAuthCode && <AuthCodeModal />}
+
+      {/* ⌘K ask-your-inbox assistant. Conditional-mount so its "modal" context is
+          only on the stack while open (same contract as the other overlays). */}
+      {askOpen && <AskBar onClose={() => setAskOpen(false)} />}
     </>
   );
 }

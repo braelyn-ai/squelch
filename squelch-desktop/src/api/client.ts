@@ -14,6 +14,7 @@ import type {
   ArchiveBody,
   AttentionUpdate,
   AuditEntry,
+  CalendarUpdate,
   CreateRuleBody,
   LabelBody,
   Page,
@@ -25,7 +26,12 @@ import type {
   SenderRule,
   Shipment,
   StoreStats,
+  TriageConfig,
+  TriageConfigPatch,
   ClientThreadView,
+  UnsubResolution,
+  UnsubscribeRecord,
+  UnsubscribeResult,
   UpdatesParams,
   UsageResponse,
 } from "./types";
@@ -131,6 +137,17 @@ export function getUpdates(
   });
 }
 
+/**
+ * Poke the daemon to poll Gmail immediately instead of waiting out its ~45s
+ * interval. Fire-and-forget on the server: it returns as soon as the sync loop
+ * is woken, NOT when new mail has landed — so callers should re-pull the read
+ * model a beat later (the 10s poller also backstops it). `triggered` is false
+ * when the server has no sync loop wired (shouldn't happen for `squelchd serve`).
+ */
+export function refreshMail(): Promise<{ triggered: boolean }> {
+  return request<{ triggered: boolean }>("/client/refresh", { method: "POST" });
+}
+
 export function getThread(threadId: string): Promise<ClientThreadView> {
   return request<ClientThreadView>(
     `/client/thread/${encodeURIComponent(threadId)}`,
@@ -139,10 +156,15 @@ export function getThread(threadId: string): Promise<ClientThreadView> {
 
 export function search(
   q: string,
-  opts: { limit?: number; cursor?: string } = {},
+  opts: {
+    limit?: number;
+    cursor?: string;
+    /** keyword | semantic | hybrid. Server default is hybrid when vectors exist. */
+    mode?: "keyword" | "semantic" | "hybrid";
+  } = {},
 ): Promise<Page<SearchHit>> {
   return request<Page<SearchHit>>("/client/search", {
-    query: { q, limit: opts.limit, cursor: opts.cursor },
+    query: { q, limit: opts.limit, cursor: opts.cursor, mode: opts.mode },
   });
 }
 
@@ -157,6 +179,26 @@ export function getStats(): Promise<StoreStats> {
  */
 export function getUsage(days?: number): Promise<UsageResponse> {
   return request<UsageResponse>("/client/usage", { query: { days } });
+}
+
+/**
+ * The Stage-2 triage daily caps + the trailing-14d usage/pricing figures the
+ * settings "Triage budget" estimator reads. See TriageConfig for the shape.
+ */
+export function getTriageConfig(): Promise<TriageConfig> {
+  return request<TriageConfig>("/client/triage-config");
+}
+
+/**
+ * Apply a subset of the caps (the three Stage-2 caps and/or the Stage-1 global
+ * cap) and return the fresh config (same shape as GET). Each cap must be an
+ * integer 1..=100000 — an out-of-range value yields a 400 (kind "bad_request").
+ */
+export function setTriageConfig(patch: TriageConfigPatch): Promise<TriageConfig> {
+  return request<TriageConfig>("/client/triage-config", {
+    method: "POST",
+    body: patch,
+  });
 }
 
 export function getAudit(limit?: number): Promise<AuditEntry[]> {
@@ -187,6 +229,15 @@ export function getReceipts(days?: number): Promise<Receipt[]> {
   });
 }
 
+/**
+ * Calendar notifications received within the last `hours` (server default 24),
+ * newest-received first. These never sit in the attention bands (auto-resolved
+ * at ingest) — the Sitrep right rail is their surface.
+ */
+export function getCalendar(hours?: number): Promise<CalendarUpdate[]> {
+  return request<CalendarUpdate[]>("/client/calendar", { query: { hours } });
+}
+
 // --- rules ------------------------------------------------------------------
 
 export function listRules(): Promise<SenderRule[]> {
@@ -206,6 +257,42 @@ export function deleteRule(id: number): Promise<void> {
   return request<void>(`/client/rules/${id}`, {
     method: "DELETE",
     noContent: true,
+  });
+}
+
+// --- unsubscribe ------------------------------------------------------------
+
+/**
+ * Ask the server to unsubscribe from the sender of `messageId`. The server always
+ * returns the `browser` shape now: an http(s) `url` the caller opens externally
+ * for the human to finish (one_click/mailto server-side execution was removed).
+ * A 422 (no http(s) unsubscribe link) throws ApiError (status 422); a 404
+ * (unknown/sealed message) throws kind "not_found" — same as every sealed route.
+ */
+export function unsubscribe(messageId: number): Promise<UnsubscribeResult> {
+  return request<UnsubscribeResult>("/client/unsubscribe", {
+    method: "POST",
+    body: { message_id: messageId },
+  });
+}
+
+/** All unsubscribe records for this account, newest requested_at first. */
+export function getUnsubscribes(): Promise<UnsubscribeRecord[]> {
+  return request<UnsubscribeRecord[]>("/client/unsubscribes");
+}
+
+/**
+ * Resolve an unsubscribe record (freezes violation accrual server-side):
+ * "blocked" after creating a squelch rule, "dismissed" when the human keeps the
+ * sender. 404 (kind "not_found") if no record exists for `sender`.
+ */
+export function setUnsubResolution(
+  sender: string,
+  resolution: UnsubResolution,
+): Promise<{ sender: string; resolution: string }> {
+  return request("/client/unsubscribes/resolution", {
+    method: "POST",
+    body: { sender, resolution },
   });
 }
 

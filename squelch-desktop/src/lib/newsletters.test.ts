@@ -24,6 +24,7 @@ function upd(p: Partial<AttentionUpdate> & { sender: string; reason: string }): 
     reason: p.reason,
     deadline: null,
     matched_rule: null,
+    field_reasons: null,
     status: "new",
     surfaced_at: p.surfaced_at ?? new Date(NOW).toISOString(),
     resolved_at: null,
