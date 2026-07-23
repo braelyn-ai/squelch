@@ -518,6 +518,8 @@ mod tests {
             body: "".into(),
             body_html: None,
             is_sent: false,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
         };
         let nid = store.upsert_message(&normal).unwrap();
         store
@@ -625,6 +627,8 @@ mod tests {
             body: subject.into(),
             body_html: None,
             is_sent: false,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
         };
         let id = store.upsert_message(&msg).unwrap();
         store

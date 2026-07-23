@@ -11,10 +11,11 @@ pub mod sqlite;
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
-use crate::triage::{DeadlineHit, ReceiptInfo, ShipmentInfo};
+use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, Deadline, Disposition, NewMessage,
-    Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, CalendarUpdate, Deadline, Disposition,
+    FieldReasons, NewMessage, Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats,
+    ThreadView, Tier, Update, UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
 
@@ -78,6 +79,10 @@ pub struct TriagedMessage {
     pub tier: Tier,
     pub one_line: String,
     pub reason: String,
+    /// Per-property Stage-1 justifications (importance / deadline / tier). Written
+    /// to the triage row's `field_reasons` JSON column and served HUMAN-DOOR ONLY.
+    /// Empty [`FieldReasons`] for sealed / sent mail (nothing to explain).
+    pub field_reasons: FieldReasons,
     pub matched_rule: Option<i64>,
     /// The Stage-1 deadline hit, if any. Only ever `Some` for non-sealed mail.
     pub deadline: Option<DeadlineHit>,
@@ -94,6 +99,13 @@ pub struct TriagedMessage {
     /// surfaces as New/Attention/Aging clutter — it lives only in the Receipts
     /// category.
     pub receipt: Option<ReceiptInfo>,
+    /// A detected calendar update (invite / update / cancellation / RSVP
+    /// response), if any. Runs INDEPENDENTLY of the triage tier, exactly like
+    /// receipts. Only ever `Some` for non-sealed mail. When present, the ingest
+    /// write AUTO-RESOLVES the message's triage row (`status='done'`) so a
+    /// calendar notification never surfaces as New/Attention/Aging clutter — it
+    /// lives only in the Calendar category.
+    pub calendar: Option<CalendarInfo>,
     /// `false` when Stage-1 was not confident: the row is left with
     /// `model_used IS NULL` so the Stage-2 queue predicate
     /// (`model_used IS NULL AND sensitivity = 'normal'`) picks it up.
@@ -135,6 +147,20 @@ pub struct ActionMessageRef {
     pub from_addr: String,
     pub from_name: Option<String>,
     pub subject: String,
+}
+
+/// The stored unsubscribe intent for one NON-SEALED message, resolved by
+/// [`Store::message_unsub_fields`] for `POST /client/unsubscribe`. Sealed rows
+/// are excluded in SQL so this is returned `None` for a missing OR sealed
+/// message (indistinguishable), mirroring [`Store::thread_view`].
+#[derive(Debug, Clone)]
+pub struct MessageUnsub {
+    /// The sender address as stored (the caller lowercases it for the wire).
+    pub from_addr: String,
+    /// Raw `List-Unsubscribe` header value, or `None`.
+    pub list_unsubscribe: Option<String>,
+    /// RFC 8058 one-click advertised.
+    pub list_unsub_one_click: bool,
 }
 
 /// A row to append to the human-door audit log.
@@ -191,9 +217,68 @@ pub struct Stage2Applied {
     pub tier: Tier,
     pub one_line: String,
     pub reason: String,
+    /// Per-property Stage-2 justifications (importance / deadline / tier),
+    /// synthesized in [`crate::triage::stage2::apply_result`] to describe the
+    /// values THIS apply actually stores. Written to the `field_reasons` column,
+    /// fully replacing any Stage-1 reasons (Stage-2 owns all three properties on
+    /// apply). Served HUMAN-DOOR ONLY.
+    pub field_reasons: FieldReasons,
     /// The model id string to stamp `model_used` with (marks the row processed
     /// so the queue predicate no longer selects it).
     pub model_used: String,
+    /// A deadline to (re)write for this message, if the model extracted one.
+    pub deadline: Option<DeadlineHit>,
+}
+
+/// One row queued for the Stage-1 LLM refine pass: an ingested, NON-SEALED,
+/// non-rule-decided message still carrying its heuristic seed values
+/// (`stage1_model_used IS NULL AND sensitivity='normal'`). Produced by
+/// [`Store::stage1_queue`].
+///
+/// SECURITY: the query EXCLUDES sealed rows in SQL, so a `Stage1Queued` never
+/// represents sealed mail. The Stage-1 pass additionally re-checks
+/// [`crate::triage::stage1_sealed_guard`] before every classify call.
+#[derive(Debug, Clone)]
+pub struct Stage1Queued {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    /// Gmail thread id (carried for context/logging; Stage-1 uses only a GLOBAL
+    /// budget scope, never per-thread).
+    pub thread_id: String,
+    pub from_addr: String,
+    pub subject: String,
+    pub body: String,
+    /// When the message was received (drives the deadline sanity bounds and the
+    /// stale-skip check).
+    pub received_at: DateTime<Utc>,
+    /// `true` if the sender is a Sent-derived contact. Feeds the TRUSTED CONTEXT
+    /// block and gates the unknown-sender deadline cap.
+    pub is_known_contact: bool,
+    /// Always `'normal'` for queued rows (sealed is excluded in SQL). Carried so
+    /// the sealed guard can assert.
+    pub sensitivity: Sensitivity,
+}
+
+/// The store-facing outcome of applying a parsed Stage-1 LLM result onto a triage
+/// row. Pure mapping lives in [`crate::triage::stage1_llm::apply_result`]. Stamps
+/// `stage1_model_used` (removing the row from the Stage-1 queue) and sets
+/// `needs_stage2` (whether the row escalates to the Stage-2 queue).
+#[derive(Debug, Clone)]
+pub struct Stage1Applied {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    pub importance: u8,
+    pub tier: Tier,
+    pub one_line: String,
+    pub reason: String,
+    /// Per-property Stage-1 justifications describing the STORED values. Written
+    /// to `field_reasons`, replacing the heuristic seed reasons. Human-door only.
+    pub field_reasons: FieldReasons,
+    /// The Stage-1 model id to stamp `stage1_model_used` with.
+    pub stage1_model_used: String,
+    /// `true` when the model was not confident: sets `needs_stage2=1` so the
+    /// Stage-2 queue predicate picks the row up.
+    pub needs_stage2: bool,
     /// A deadline to (re)write for this message, if the model extracted one.
     pub deadline: Option<DeadlineHit>,
 }
@@ -217,6 +302,22 @@ pub struct Stage2UsageDay {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+/// The runtime Stage-2 daily-cap overrides read from the `app_settings` table
+/// (one row per set cap). `None` for a cap means no override row exists, so the
+/// caller falls back to its config/env value (then the built-in default). Only
+/// values that parse as an integer in `1..=100000` are surfaced; a malformed or
+/// out-of-range stored value is treated as absent. Returned by
+/// [`Store::stage2_cap_overrides`] in a single query so the Stage-2 pass can
+/// re-read all three caps cheaply at the start of each cycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stage2CapOverrides {
+    pub thread_daily_cap: Option<u32>,
+    pub sender_daily_cap: Option<u32>,
+    pub global_daily_cap: Option<u32>,
+    /// The Stage-1 GLOBAL daily-cap override (Stage-1 has only a global cap).
+    pub stage1_global_daily_cap: Option<u32>,
 }
 
 /// A NON-SEALED message that still needs an embedding vector, returned by
@@ -352,6 +453,31 @@ pub trait Store: Send + Sync {
     /// filter is required.
     fn list_receipts(&self, account_id: AccountId, days: u32) -> Result<Vec<Receipt>>;
 
+    /// Upsert a calendar update keyed by `(account_id, message_id)`. A first
+    /// sight inserts; a re-ingest of the same message UPDATES the row
+    /// (idempotent). Returns the calendar row id.
+    ///
+    /// SECURITY: the caller runs this ONLY for non-sealed mail; the
+    /// `calendar_updates` table therefore holds no sealed rows by construction
+    /// (no sealed join is needed on read).
+    fn upsert_calendar_update(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        calendar: &CalendarInfo,
+        received_at: DateTime<Utc>,
+    ) -> Result<i64>;
+
+    /// List calendar updates for the account RECEIVED within the last `hours`
+    /// (mail arrival window, NOT event start time), newest-received first.
+    /// Sealed rows are structurally absent (never inserted), so no sealed
+    /// filter is required.
+    fn list_calendar_updates(
+        &self,
+        account_id: AccountId,
+        hours: u32,
+    ) -> Result<Vec<CalendarUpdate>>;
+
     /// Upsert a sender rule. Returns the rule id.
     fn set_sender_rule(
         &self,
@@ -484,7 +610,52 @@ pub trait Store: Send + Sync {
     /// Append a row to the human-door audit log. Returns the new row id.
     fn append_audit(&self, account_id: AccountId, entry: &NewAuditEntry) -> Result<i64>;
 
-    /// Read the most recent audit rows (newest first), capped at `limit`.
+    // ---------------------------------------------------------------------
+    // UNSUBSCRIBE (human door). All four are `/client/*`-only. Sealed mail is
+    // invisible: `message_unsub_fields` excludes sealed rows in SQL so an
+    // unsubscribe against a sealed message is `None` (=> 404) exactly like an
+    // unknown id.
+    // ---------------------------------------------------------------------
+
+    /// Load the stored unsubscribe fields for a NON-SEALED message. Returns
+    /// `None` for a missing OR sealed message (indistinguishable), so the caller
+    /// maps `None` to 404. Never returns sealed content.
+    fn message_unsub_fields(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<MessageUnsub>>;
+
+    /// Upsert the unsubscribe row for `(account_id, sender)`. On conflict this
+    /// RESETS the violation ledger: `requested_at`/`method`/`source_message_id`
+    /// are overwritten and `violation_count -> 0`, `last_violation_at -> NULL`,
+    /// `resolution -> NULL` (the user re-asked; the 72h grace clock restarts).
+    /// `sender` is stored verbatim — the caller passes it already lowercased.
+    fn upsert_unsubscribe(
+        &self,
+        account_id: AccountId,
+        sender: &str,
+        method: &str,
+        source_message_id: Option<i64>,
+        requested_at: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// List the account's unsubscribe records, newest `requested_at` first.
+    fn list_unsubscribes(&self, account_id: AccountId) -> Result<Vec<UnsubscribeRecord>>;
+
+    /// Set the `resolution` (blocked|dismissed) on an existing unsubscribe row.
+    /// Returns `false` when no row exists for that sender (=> caller returns
+    /// 404). Resolving disarms the violation detector for that sender.
+    fn set_unsubscribe_resolution(
+        &self,
+        account_id: AccountId,
+        sender: &str,
+        resolution: &str,
+    ) -> Result<bool>;
+
+    /// Read the most recent audit rows (newest first), capped at `limit`. Each row
+    /// is enriched with `target_sender`/`target_subject` when its `target` parses
+    /// as a message id that exists for the account (otherwise those are `None`).
     fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>>;
 
     /// Per-tier / sealed / sync-cursor summary counts for the account.
@@ -497,11 +668,56 @@ pub trait Store: Send + Sync {
     // sensitivity='normal'` — sealed rows carry sensitivity='sealed').
     // ---------------------------------------------------------------------
 
-    /// Fetch up to `limit` queued Stage-2 rows (non-confident Stage-1 output:
-    /// `model_used IS NULL AND sensitivity='normal'`) with their message
-    /// context and, when a Filtered sender rule matched, that rule's
-    /// `want_text`. Ordered newest-first so the freshest ambiguous mail gets a
-    /// look first. Sealed rows are excluded in SQL.
+    /// Fetch up to `limit` rows queued for the Stage-1 LLM refine pass
+    /// (`stage1_model_used IS NULL AND sensitivity='normal' AND is_sent=0`).
+    /// Rows decided by an explicit sender rule (or a Filtered rule that skips to
+    /// Stage-2) carry a non-NULL `stage1_model_used` and are excluded. Newest
+    /// first. Sealed rows are excluded in SQL.
+    fn stage1_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage1Queued>>;
+
+    /// Apply a parsed Stage-1 LLM result onto a triage row IN ONE TRANSACTION:
+    /// overwrite importance/tier/one_line/reason/field_reasons, stamp
+    /// `stage1_model_used` (leaving the Stage-1 queue), set `needs_stage2`, and
+    /// (re)write the message's `deadlines` row. Guarded by `sensitivity='normal'`.
+    /// Does NOT touch `model_used` (the Stage-2 marker).
+    fn stage1_apply(&self, applied: &Stage1Applied) -> Result<()>;
+
+    /// Mark a Stage-1-queued row PROCESSED without changing its heuristic seed
+    /// values — stamp `stage1_model_used` only, PRESERVING the `needs_stage2`
+    /// seed written at ingest (`= !heuristic-confident`). Used on the
+    /// heuristic-only fallback (API down / refusal / permanent error): the row
+    /// keeps its seed values and the seed's own confidence decides escalation.
+    /// Guarded by `sensitivity='normal'`.
+    fn stage1_mark_processed(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        stage1_model_used: &str,
+    ) -> Result<()>;
+
+    /// Bump the Stage-1 usage ledger for `(account_id, day)`: +1 call and add the
+    /// response's input/output token counts. Its own category, separate from
+    /// Stage-2's ledger.
+    fn stage1_bump_usage(
+        &self,
+        account_id: AccountId,
+        day: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()>;
+
+    /// Sum the Stage-1 usage ledger over every day `>= since_day`. Drives the
+    /// trailing-window Stage-1 averages on `/client/triage-config`.
+    fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage>;
+
+    /// Stage-1 usage history: the most recent `days` rows, newest-first (sparse).
+    fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>>;
+
+    /// Fetch up to `limit` queued Stage-2 rows (Stage-1 escalated them:
+    /// `stage1_model_used IS NOT NULL AND needs_stage2=1 AND model_used IS NULL
+    /// AND sensitivity='normal'`) with their message context and, when a Filtered
+    /// sender rule matched, that rule's `want_text`. Ordered newest-first so the
+    /// freshest ambiguous mail gets a look first. Sealed rows are excluded in SQL.
     fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>>;
 
     /// Read today's Stage-2 API-call count for a budget scope. `thread_id` is
@@ -559,6 +775,36 @@ pub trait Store: Send + Sync {
     /// the `stage2_usage` ledger, newest-first. Only days that actually have a
     /// row are returned (sparse — no zero-filling). `days` caps the row count.
     fn list_usage(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>>;
+
+    /// Sum the Stage-2 usage ledger for `account_id` over every day `>= since_day`
+    /// (a `YYYY-MM-DD` UTC key; lexical compare is correct for that format).
+    /// Zeroed when no rows fall in the window. Drives the trailing-window
+    /// averages on `/client/triage-config`.
+    fn stage2_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage>;
+
+    // ---------------------------------------------------------------------
+    // RUNTIME APP SETTINGS (human door). A tiny per-account key/value store for
+    // operator knobs a client can change at runtime without editing config or
+    // restarting — currently the Stage-2 daily-cap overrides. The Stage-2 pass
+    // re-reads the overrides at the START of each cycle so a change applies
+    // without a restart. Precedence: override > config/env > default.
+    // ---------------------------------------------------------------------
+
+    /// Read one `app_settings` value for `(account_id, key)`, or `None` if unset.
+    fn get_app_setting(&self, account_id: AccountId, key: &str) -> Result<Option<String>>;
+
+    /// Upsert one `app_settings` value for `(account_id, key)`.
+    fn set_app_setting(&self, account_id: AccountId, key: &str, value: &str) -> Result<()>;
+
+    /// Read the three Stage-2 daily-cap overrides in ONE query. A cap is `None`
+    /// when no row exists OR the stored value does not parse as an integer in
+    /// `1..=100000` (a malformed value is ignored, not surfaced). The Stage-2
+    /// pass calls this once per cycle; the human door uses it to report sources.
+    fn stage2_cap_overrides(&self, account_id: AccountId) -> Result<Stage2CapOverrides>;
+
+    /// Count NON-SENT (`is_sent=0`) messages received at or after `since`. Feeds
+    /// the `avg_inbound_per_day` figure on `/client/triage-config`.
+    fn count_inbound_since(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<u64>;
 
     // ---------------------------------------------------------------------
     // SEMANTIC RECALL (v1) vector-index writes. The embedder itself lives in

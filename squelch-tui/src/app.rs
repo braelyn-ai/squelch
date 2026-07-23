@@ -474,6 +474,7 @@ mod tests {
             reason: "r".to_string(),
             deadline: None,
             matched_rule: None,
+            field_reasons: None,
         }
     }
 

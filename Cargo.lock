@@ -908,6 +908,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3278,6 +3284,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlite-vec",
  "thiserror 2.0.18",
  "tiny_http",
@@ -3323,6 +3330,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dotenvy",
  "squelch-api",
  "squelch-core",
  "squelch-mcp",

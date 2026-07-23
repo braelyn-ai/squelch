@@ -306,6 +306,32 @@ pub struct Stage1Config {
     /// (dollars) is treated as absurd and shaves confidence (never raises tier).
     /// Default $50,000 — a real household bill essentially never exceeds this.
     pub bill_absurd_amount_threshold: f64,
+
+    // ---- Stage-1 LLM pass (the SMALL model run on every non-rule email) ----
+    //
+    // The heuristic fields above are the SEED / FALLBACK; these tune the LLM
+    // refine pass. The Stage-1 pass reuses Stage-2's key/provider resolution
+    // ([`Stage2Config::resolve_key_and_provider`]) — only the model, prices,
+    // batch size, and (global-only) daily cap are Stage-1-specific.
+    /// The Stage-1 model id string. Default `claude-haiku-4-5` (a small, cheap
+    /// model — it sees nearly every email). Env: `SQUELCH_STAGE1_MODEL`.
+    pub model: String,
+    /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
+    /// Env: `SQUELCH_STAGE1_MAX_BODY_CHARS`.
+    pub max_body_chars: usize,
+    /// How many queued rows to refine per sync cycle. Env:
+    /// `SQUELCH_STAGE1_BATCH_PER_CYCLE`.
+    pub batch_per_cycle: usize,
+    /// GLOBAL-per-account-per-day Stage-1 API-call cap. Stage-1 needs ONLY a
+    /// global cap — it must see every email, so per-thread/sender caps make no
+    /// sense here. Default 1000. Env: `SQUELCH_STAGE1_GLOBAL_DAILY_CAP`.
+    pub global_daily_cap: u32,
+    /// Per-million-input-token price (USD) for the Stage-1 model. Default 1.0
+    /// (claude-haiku-4-5). Env: `SQUELCH_STAGE1_PRICE_IN_PER_MTOK`.
+    pub price_in_per_mtok: f64,
+    /// Per-million-output-token price (USD) for the Stage-1 model. Default 5.0
+    /// (claude-haiku-4-5). Env: `SQUELCH_STAGE1_PRICE_OUT_PER_MTOK`.
+    pub price_out_per_mtok: f64,
 }
 
 impl Default for Stage1Config {
@@ -321,13 +347,23 @@ impl Default for Stage1Config {
             fallthrough_importance: 40,
             bill_unknown_sender_importance: 55,
             bill_absurd_amount_threshold: 50_000.0,
+            // Stage-1 LLM defaults.
+            model: "claude-haiku-4-5".to_string(),
+            max_body_chars: 1500,
+            batch_per_cycle: 10,
+            global_daily_cap: 1000,
+            price_in_per_mtok: 1.0,
+            price_out_per_mtok: 5.0,
         }
     }
 }
 
 /// Stage-2 LLM triage tunables. The Anthropic API pass runs ONLY over rows
-/// Stage-1 left non-confident (`model_used IS NULL AND sensitivity='normal'`),
-/// under a strict per-thread + per-account daily budget.
+/// Stage-1 refined but left non-confident. The queue predicate is the four
+/// clauses: `stage1_model_used IS NOT NULL AND needs_stage2=1 AND model_used IS
+/// NULL AND sensitivity='normal'` (Stage-1 has looked, escalation is flagged,
+/// Stage-2 hasn't processed it yet, and it is non-sealed). Runs under a strict
+/// per-thread + per-sender + per-account daily budget.
 ///
 /// Stage-2 is ENABLED BY KEY PRESENCE: it turns on only when an API key is
 /// resolvable ([`Stage2Config::api_key`] / `ANTHROPIC_API_KEY`). The `model`,
@@ -393,15 +429,17 @@ impl Default for Stage2Config {
         Self {
             anthropic_api_key: None,
             stage2_provider: None,
-            model: "claude-haiku-4-5".to_string(),
+            // Stage-2 is the ESCALATION pass on a MORE CAPABLE model.
+            model: "claude-sonnet-5".to_string(),
             max_body_chars: 1500,
             batch_per_cycle: 10,
             thread_daily_cap: 3,
             global_daily_cap: 200,
             sender_daily_cap: 5,
             max_age_days: 7,
-            price_in_per_mtok: 1.0,
-            price_out_per_mtok: 5.0,
+            // claude-sonnet-5 per-MTok (input / output).
+            price_in_per_mtok: 3.0,
+            price_out_per_mtok: 15.0,
         }
     }
 }
@@ -459,6 +497,114 @@ impl Stage2Config {
 /// Read an env var, returning `None` when unset or empty.
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+// ---- Stage-2 daily-cap runtime-override plumbing ---------------------------
+//
+// The three Stage-2 daily caps are configurable at THREE layers, highest wins:
+//   1. runtime OVERRIDE — an `app_settings` row (key below), set by the human
+//      door's POST /client/triage-config. Applied without a restart.
+//   2. config/env — the TOML `[stage2]` key OR its `SQUELCH_STAGE2_*` env var.
+//   3. built-in default — [`Stage2Config::default`].
+// These constants are the shared `app_settings.key` names so the store (writer),
+// the sync pass (reader), and the API (reader/writer) never drift.
+
+/// `app_settings.key` for the per-thread-per-day Stage-2 cap override.
+pub const APP_SETTING_THREAD_DAILY_CAP: &str = "stage2_thread_daily_cap";
+/// `app_settings.key` for the per-sender-per-day Stage-2 cap override.
+pub const APP_SETTING_SENDER_DAILY_CAP: &str = "stage2_sender_daily_cap";
+/// `app_settings.key` for the global-per-account-per-day Stage-2 cap override.
+pub const APP_SETTING_GLOBAL_DAILY_CAP: &str = "stage2_global_daily_cap";
+/// `app_settings.key` for the global-per-account-per-day Stage-1 cap override.
+pub const APP_SETTING_STAGE1_GLOBAL_DAILY_CAP: &str = "stage1_global_daily_cap";
+
+/// Inclusive bounds a Stage-2 daily-cap value must fall within (validated by the
+/// human door before persisting an override).
+pub const STAGE2_CAP_MIN: u32 = 1;
+pub const STAGE2_CAP_MAX: u32 = 100_000;
+
+/// Which layer supplied a Stage-2 daily cap, reported by the human door's
+/// triage-config endpoint. `Config` covers BOTH the TOML file and env overrides
+/// (indistinguishable to the client and both mean "operator-set"); `Default`
+/// means the built-in default was used. The runtime `app_settings` OVERRIDE
+/// layer is reported separately by the API (as "override" when a row exists), so
+/// it is not represented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapSource {
+    Default,
+    Config,
+}
+
+impl CapSource {
+    /// Stable lowercase label for the wire (`"default"` / `"config"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapSource::Default => "default",
+            CapSource::Config => "config",
+        }
+    }
+}
+
+/// The config/env-layer source of each Stage-2 daily cap. Computed at config
+/// load and threaded to the human door so it can report "default" vs "config"
+/// (the "override" case is decided at read time from `app_settings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage2CapSources {
+    pub thread_daily_cap: CapSource,
+    pub sender_daily_cap: CapSource,
+    pub global_daily_cap: CapSource,
+    /// The config/env-layer source of the Stage-1 global daily cap.
+    pub stage1_global_daily_cap: CapSource,
+}
+
+impl Default for Stage2CapSources {
+    fn default() -> Self {
+        Self {
+            thread_daily_cap: CapSource::Default,
+            sender_daily_cap: CapSource::Default,
+            global_daily_cap: CapSource::Default,
+            stage1_global_daily_cap: CapSource::Default,
+        }
+    }
+}
+
+/// A cap is `Config`-sourced if the TOML `[stage2]` table carries its key OR its
+/// env var is set (non-empty); otherwise it fell through to the built-in default.
+fn cap_source(stage2_tbl: Option<&toml::Table>, key: &str, env_var: &str) -> CapSource {
+    let in_toml = stage2_tbl.map(|t| t.contains_key(key)).unwrap_or(false);
+    let in_env = std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false);
+    if in_toml || in_env {
+        CapSource::Config
+    } else {
+        CapSource::Default
+    }
+}
+
+/// Compute the config/env-layer [`Stage2CapSources`] for a (possibly absent)
+/// config file path, consulting both the TOML `[stage2]` keys and the
+/// `SQUELCH_STAGE2_*` env vars. A missing/unparseable file contributes no TOML
+/// keys (env may still promote a cap to `Config`).
+fn stage2_cap_sources_for(path: Option<&std::path::Path>) -> Stage2CapSources {
+    let parsed: Option<toml::Table> = path
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| text.parse::<toml::Table>().ok());
+    let stage2_tbl: Option<toml::Table> = parsed
+        .as_ref()
+        .and_then(|t| t.get("stage2").and_then(|v| v.as_table()).cloned());
+    let stage1_tbl: Option<toml::Table> = parsed
+        .as_ref()
+        .and_then(|t| t.get("stage1").and_then(|v| v.as_table()).cloned());
+    let s = stage2_tbl.as_ref();
+    Stage2CapSources {
+        thread_daily_cap: cap_source(s, "thread_daily_cap", "SQUELCH_STAGE2_THREAD_DAILY_CAP"),
+        sender_daily_cap: cap_source(s, "sender_daily_cap", "SQUELCH_STAGE2_SENDER_DAILY_CAP"),
+        global_daily_cap: cap_source(s, "global_daily_cap", "SQUELCH_STAGE2_GLOBAL_DAILY_CAP"),
+        stage1_global_daily_cap: cap_source(
+            stage1_tbl.as_ref(),
+            "global_daily_cap",
+            "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +678,32 @@ impl Config {
         };
         cfg.apply_env_overrides();
         cfg
+    }
+
+    /// Like [`Config::load`], but ALSO returns the config/env-layer
+    /// [`Stage2CapSources`] (whether each Stage-2 daily cap came from the
+    /// default or from config/env). Wire the sources into the human door so it
+    /// can report "default" vs "config" on `/client/triage-config`.
+    pub fn load_with_cap_sources() -> (Self, Stage2CapSources) {
+        let path = Self::default_path();
+        let mut cfg = match &path {
+            Some(p) => Self::from_path(p).unwrap_or_default(),
+            None => Self::default(),
+        };
+        // Sources are read from the raw TOML + env BEFORE env is folded into cfg
+        // (folding is lossy — it collapses "explicitly set" into the value).
+        let sources = stage2_cap_sources_for(path.as_deref());
+        cfg.apply_env_overrides();
+        (cfg, sources)
+    }
+
+    /// Like [`Config::load_from`], but ALSO returns the config/env-layer
+    /// [`Stage2CapSources`]. See [`Config::load_with_cap_sources`].
+    pub fn load_from_with_cap_sources(path: &std::path::Path) -> (Self, Stage2CapSources) {
+        let mut cfg = Self::from_path(path).unwrap_or_default();
+        let sources = stage2_cap_sources_for(Some(path));
+        cfg.apply_env_overrides();
+        (cfg, sources)
     }
 
     /// Parse a config from a specific TOML file. Returns `None` if the file is
@@ -645,6 +817,62 @@ impl Config {
         {
             self.stage2.price_out_per_mtok = n;
         }
+
+        // ---- Stage-1 LLM overrides -----------------------------------------
+        if let Ok(v) = std::env::var("SQUELCH_STAGE1_MODEL")
+            && !v.is_empty()
+        {
+            self.stage1.model = v;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE1_MAX_BODY_CHARS")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.stage1.max_body_chars = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE1_BATCH_PER_CYCLE")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.stage1.batch_per_cycle = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.stage1.global_daily_cap = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE1_PRICE_IN_PER_MTOK")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.stage1.price_in_per_mtok = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_STAGE1_PRICE_OUT_PER_MTOK")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.stage1.price_out_per_mtok = n;
+        }
+
+        // RANGE-GUARD the daily caps from config/env, matching the POST
+        // /client/triage-config validation (1..=100000). Without this, a cap of
+        // 0 from toml/env silently blocks EVERY stage-2 row each cycle (used >=
+        // cap is always true at 0) with only a once-daily notice to show for
+        // it. Out-of-range values clamp with a startup warning rather than
+        // erroring — a misconfigured cap shouldn't take the daemon down. Runs
+        // here (the tail of env application, which itself runs after TOML
+        // parse) so it guards BOTH layers.
+        for (name, cap) in [
+            ("stage2.thread_daily_cap", &mut self.stage2.thread_daily_cap),
+            ("stage2.sender_daily_cap", &mut self.stage2.sender_daily_cap),
+            ("stage2.global_daily_cap", &mut self.stage2.global_daily_cap),
+            ("stage1.global_daily_cap", &mut self.stage1.global_daily_cap),
+        ] {
+            if !(STAGE2_CAP_MIN..=STAGE2_CAP_MAX).contains(cap) {
+                let clamped = (*cap).clamp(STAGE2_CAP_MIN, STAGE2_CAP_MAX);
+                eprintln!(
+                    "squelch: config {name}={cap} is out of range \
+                     ({STAGE2_CAP_MIN}..={STAGE2_CAP_MAX}); clamping to {clamped}"
+                );
+                *cap = clamped;
+            }
+        }
     }
 
     /// Resolve the credentials-file path for the `file` backend: the configured
@@ -707,6 +935,120 @@ impl Config {
     }
 }
 
+/// Mirror config-representable keys from parsed `.env` pairs into the TOML
+/// config file at `path`, merging with any existing content.
+///
+/// A repo-root `.env` only works when a binary is launched from that CWD;
+/// mirroring it into `~/.config/squelch/config.toml` makes the same
+/// account/paths visible to every binary (`squelch-tui`, `squelch-mcp`,
+/// standalone `squelch-api`) regardless of CWD. Only keys that are actual
+/// [`Config`] fields are written — env-only secrets (`SQUELCH_API_TOKEN`,
+/// `ANTHROPIC_API_KEY`, …) never land on disk here. Existing unrelated keys in
+/// the file are preserved; keys the `.env` defines win. Refuses to touch a file
+/// it cannot parse (never clobbers a broken-but-hand-written config).
+///
+/// Returns `Ok(true)` if the file was (re)written, `Ok(false)` if there was
+/// nothing to change.
+pub fn mirror_env_pairs_to_config(
+    pairs: &[(String, String)],
+    path: &std::path::Path,
+) -> std::io::Result<bool> {
+    let get = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    // Canonical name wins over its legacy alias, same as apply_env_overrides.
+    let get2 = |canonical: &str, legacy: &str| get(canonical).or_else(|| get(legacy));
+
+    let mut mapped: Vec<(&str, toml::Value)> = Vec::new();
+    if let Some(v) = get("SQUELCH_CLIENT_ID") {
+        mapped.push(("client_id", toml::Value::String(v)));
+    }
+    if let Some(v) = get("SQUELCH_CLIENT_SECRET") {
+        mapped.push(("client_secret", toml::Value::String(v)));
+    }
+    if let Some(v) = get2(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY) {
+        mapped.push(("account_email", toml::Value::String(v)));
+    }
+    if let Some(v) = get2(ENV_DB_PATH, ENV_DB_PATH_LEGACY) {
+        mapped.push(("db_path", toml::Value::String(v)));
+    }
+    if let Some(b) = get("SQUELCH_CRED_BACKEND").and_then(|v| CredentialBackend::from_str_lenient(&v)) {
+        let s = match b {
+            CredentialBackend::Keyring => "keyring",
+            CredentialBackend::File => "file",
+        };
+        mapped.push(("credential_backend", toml::Value::String(s.to_string())));
+    }
+    if let Some(v) = get("SQUELCH_CREDENTIALS_PATH") {
+        mapped.push(("credentials_path", toml::Value::String(v)));
+    }
+    if mapped.is_empty() {
+        return Ok(false);
+    }
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let mut table: toml::Table = match &existing {
+        Some(text) => text.parse().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("refusing to rewrite unparseable {}: {e}", path.display()),
+            )
+        })?,
+        None => toml::Table::new(),
+    };
+
+    let mut changed = false;
+    for (key, val) in mapped {
+        if table.get(key) != Some(&val) {
+            table.insert(key.to_string(), val);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let rendered = toml::to_string_pretty(&table)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // Write-then-rename so a crash mid-write can't leave a half-written config
+    // (which we would then refuse to touch). The tmp file is CREATED 0600 —
+    // client_secret lives in here, so it must never exist world-readable even
+    // for the instant before a chmod. Any failure removes the tmp file.
+    let tmp = path.with_extension("toml.tmp");
+    // A leftover tmp from a crashed prior run may carry old (possibly 0644)
+    // permissions; mode(0o600) only applies at CREATE, so clear it first.
+    let _ = std::fs::remove_file(&tmp);
+    let write_tmp = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(rendered.as_bytes())?;
+        f.sync_all()
+    };
+    if let Err(e) = write_tmp().and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +1063,84 @@ mod tests {
         assert_eq!(c.sync.backfill_days, 30);
         assert_eq!(c.sync.poll_secs, 45);
         assert!(c.client_id.is_none());
+    }
+
+    #[test]
+    fn mirror_env_pairs_creates_config_with_mapped_keys_only() {
+        let dir = std::env::temp_dir().join(format!("squelch-mirror-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::remove_file(&path).ok();
+
+        let pairs: Vec<(String, String)> = [
+            ("SQUELCH_CLIENT_ID", "abc.apps.googleusercontent.com"),
+            ("SQUELCH_CLIENT_SECRET", "sekret"),
+            ("SQUELCH_ACCOUNT_EMAIL", "you@gmail.com"),
+            ("SQUELCH_DB_PATH", "/tmp/squelch.db"),
+            // env-only values must NOT be mirrored to disk
+            ("SQUELCH_API_TOKEN", "supersecret"),
+            ("ANTHROPIC_API_KEY", "sk-ant-xxx"),
+            ("SQUELCH_MCP_ALLOWED_HOSTS", "box.tailnet.ts.net"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .into();
+
+        assert!(mirror_env_pairs_to_config(&pairs, &path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("supersecret"));
+        assert!(!text.contains("sk-ant-xxx"));
+        assert!(!text.contains("ts.net"));
+
+        let c = Config::from_path(&path).unwrap();
+        assert_eq!(c.client_id.as_deref(), Some("abc.apps.googleusercontent.com"));
+        assert_eq!(c.client_secret.as_deref(), Some("sekret"));
+        assert_eq!(c.account_email.as_deref(), Some("you@gmail.com"));
+        assert_eq!(c.db_path, PathBuf::from("/tmp/squelch.db"));
+
+        // Second mirror with identical pairs is a no-op.
+        assert!(!mirror_env_pairs_to_config(&pairs, &path).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mirror_env_pairs_merges_and_preserves_unrelated_keys() {
+        let dir = std::env::temp_dir().join(format!("squelch-mirror2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "account_email = \"old@gmail.com\"\nsquelch_level = 3\n\n[sync]\nbackfill_days = 90\n",
+        )
+        .unwrap();
+
+        let pairs = vec![(
+            "SQUELCH_ACCOUNT_EMAIL".to_string(),
+            "new@gmail.com".to_string(),
+        )];
+        assert!(mirror_env_pairs_to_config(&pairs, &path).unwrap());
+
+        let c = Config::from_path(&path).unwrap();
+        assert_eq!(c.account_email.as_deref(), Some("new@gmail.com"));
+        assert_eq!(c.squelch_level, 3);
+        assert_eq!(c.sync.backfill_days, 90);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mirror_env_pairs_refuses_unparseable_config() {
+        let dir = std::env::temp_dir().join(format!("squelch-mirror3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is [not toml").unwrap();
+
+        let pairs = vec![("SQUELCH_ACCOUNT_EMAIL".to_string(), "x@y.com".to_string())];
+        assert!(mirror_env_pairs_to_config(&pairs, &path).is_err());
+        // The broken file is left exactly as it was.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is [not toml"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -893,15 +1313,72 @@ backfill_days = 90
     #[test]
     fn stage2_defaults_are_sane() {
         let c = Stage2Config::default();
-        assert_eq!(c.model, "claude-haiku-4-5");
+        assert_eq!(c.model, "claude-sonnet-5");
         assert_eq!(c.max_body_chars, 1500);
         assert_eq!(c.batch_per_cycle, 10);
         assert_eq!(c.thread_daily_cap, 3);
         assert_eq!(c.global_daily_cap, 200);
         assert_eq!(c.sender_daily_cap, 5);
         assert_eq!(c.max_age_days, 7);
+        assert_eq!(c.price_in_per_mtok, 3.0);
+        assert_eq!(c.price_out_per_mtok, 15.0);
+    }
+
+    #[test]
+    fn stage1_llm_defaults_are_sane() {
+        let c = Stage1Config::default();
+        assert_eq!(c.model, "claude-haiku-4-5");
+        assert_eq!(c.global_daily_cap, 1000);
+        assert_eq!(c.batch_per_cycle, 10);
+        assert_eq!(c.max_body_chars, 1500);
         assert_eq!(c.price_in_per_mtok, 1.0);
         assert_eq!(c.price_out_per_mtok, 5.0);
+    }
+
+    #[test]
+    fn stage1_env_overrides_and_range_guard() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE1_MODEL", "claude-haiku-4-5-20251001");
+            std::env::set_var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP", "0"); // below min -> clamp to 1
+            std::env::set_var("SQUELCH_STAGE1_PRICE_IN_PER_MTOK", "0.8");
+            std::env::set_var("SQUELCH_STAGE1_BATCH_PER_CYCLE", "25");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.stage1.model, "claude-haiku-4-5-20251001");
+        assert_eq!(c.stage1.global_daily_cap, 1, "0 clamps to STAGE2_CAP_MIN");
+        assert_eq!(c.stage1.price_in_per_mtok, 0.8);
+        assert_eq!(c.stage1.batch_per_cycle, 25);
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE1_MODEL");
+            std::env::remove_var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP");
+            std::env::remove_var("SQUELCH_STAGE1_PRICE_IN_PER_MTOK");
+            std::env::remove_var("SQUELCH_STAGE1_BATCH_PER_CYCLE");
+        }
+    }
+
+    #[test]
+    fn stage1_cap_source_default_then_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP");
+        }
+        let missing = std::path::Path::new("/nonexistent/squelch/config.toml");
+        let (_, src) = Config::load_from_with_cap_sources(missing);
+        assert_eq!(src.stage1_global_daily_cap, CapSource::Default);
+
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP", "500");
+        }
+        let (cfg, src) = Config::load_from_with_cap_sources(missing);
+        assert_eq!(src.stage1_global_daily_cap, CapSource::Config);
+        assert_eq!(cfg.stage1.global_daily_cap, 500);
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP");
+        }
     }
 
     /// Clear every Stage-2 key/provider env var. Caller must hold `ENV_LOCK`.
@@ -1100,6 +1577,42 @@ backfill_days = 90
             std::env::remove_var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK");
             std::env::remove_var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK");
         }
+    }
+
+    #[test]
+    fn stage2_cap_sources_track_toml_env_and_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE2_THREAD_DAILY_CAP");
+            std::env::remove_var("SQUELCH_STAGE2_SENDER_DAILY_CAP");
+            std::env::remove_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP");
+        }
+        let dir = std::env::temp_dir().join(format!("squelch-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[stage2]\nthread_daily_cap = 7\n").unwrap();
+
+        // thread from TOML => Config; the untouched caps fall to Default.
+        let (cfg, sources) = Config::load_from_with_cap_sources(&path);
+        assert_eq!(cfg.stage2.thread_daily_cap, 7);
+        assert_eq!(sources.thread_daily_cap, CapSource::Config);
+        assert_eq!(sources.sender_daily_cap, CapSource::Default);
+        assert_eq!(sources.global_daily_cap, CapSource::Default);
+
+        // Env promotes global to Config (and overrides the effective value).
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP", "500");
+        }
+        let (cfg, sources) = Config::load_from_with_cap_sources(&path);
+        assert_eq!(cfg.stage2.global_daily_cap, 500);
+        assert_eq!(sources.global_daily_cap, CapSource::Config);
+        assert_eq!(sources.thread_daily_cap, CapSource::Config);
+        assert_eq!(sources.sender_daily_cap, CapSource::Default);
+        unsafe {
+            std::env::remove_var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -15,7 +15,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use squelch_core::auth::{AuthFlowOptions, AuthScopes, DEFAULT_HEADLESS_PORT, run_auth_flow};
-use squelch_core::config::{Config, CredentialBackend};
+use squelch_core::config::{Config, CredentialBackend, Stage2CapSources};
 use squelch_core::credentials::{
     FileCredentialStore, KeyringCredentialStore, load_token_backend, store_token_backend,
 };
@@ -94,10 +94,14 @@ struct AuthArgs {
     port: u16,
 }
 
-fn load_config(cli: &Cli) -> Config {
+/// Load config AND the config/env-layer Stage-2 cap sources (whether each daily
+/// cap came from the default or config/env), so the human door's
+/// `/client/triage-config` can report "default" vs "config". Only `serve` uses
+/// the sources; the other subcommands ignore them.
+fn load_config(cli: &Cli) -> (Config, Stage2CapSources) {
     match &cli.config {
-        Some(path) => Config::load_from(path),
-        None => Config::load(),
+        Some(path) => Config::load_from_with_cap_sources(path),
+        None => Config::load_with_cap_sources(),
     }
 }
 
@@ -120,14 +124,50 @@ fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
     }
 }
 
+/// Mirror the `.env` we just loaded into `~/.config/squelch/config.toml` so the
+/// other binaries (`squelch-tui`, `squelch-mcp`, standalone `squelch-api`) and
+/// non-repo CWDs resolve the same account/paths without needing the `.env`.
+/// Only [`Config`]-representable keys are written (client id/secret, account
+/// email, db/credentials paths, backend) — env-only secrets like
+/// `SQUELCH_API_TOKEN` stay env-only. Best-effort: failure is a warning, never
+/// fatal, since the env vars themselves are already set for THIS process.
+fn mirror_env_to_config(env_path: &std::path::Path) {
+    let Some(config_path) = Config::default_path() else {
+        return;
+    };
+    let pairs: Vec<(String, String)> = match dotenvy::from_path_iter(env_path) {
+        Ok(iter) => iter.flatten().collect(),
+        Err(e) => {
+            eprintln!("squelchd: could not re-read {}: {e}", env_path.display());
+            return;
+        }
+    };
+    match squelch_core::config::mirror_env_pairs_to_config(&pairs, &config_path) {
+        Ok(true) => eprintln!("squelchd: mirrored .env settings into {}", config_path.display()),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "squelchd: could not mirror .env into {}: {e}",
+            config_path.display()
+        ),
+    }
+}
+
 fn main() -> ExitCode {
+    // Dev convenience: pick up a `.env` from the CWD (or an ancestor) before
+    // config reads the environment. Never overrides vars already exported, and
+    // a missing file is fine — prod boxes get their env from systemd instead.
+    if let Ok(path) = dotenvy::dotenv() {
+        eprintln!("squelchd: loaded env from {}", path.display());
+        mirror_env_to_config(&path);
+    }
+
     let cli = Cli::parse();
-    let config = load_config(&cli);
+    let (config, cap_sources) = load_config(&cli);
 
     let result = match &cli.command {
         Command::Auth(args) => cmd_auth(&config, args),
         Command::Run => run_daemon(config),
-        Command::Serve(args) => cmd_serve(config, args),
+        Command::Serve(args) => cmd_serve(config, cap_sources, args),
     };
 
     match result {
@@ -326,7 +366,11 @@ fn build_serve_router(
 /// - On Ctrl-C we: cancel the MCP token (drops active MCP sessions), tell axum
 ///   to stop accepting connections, then signal the sync loop to finish
 ///   in-flight work and flush. We await the sync task before returning.
-fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreError> {
+fn cmd_serve(
+    config: Config,
+    cap_sources: Stage2CapSources,
+    args: &ServeArgs,
+) -> Result<(), squelch_core::CoreError> {
     // Fail fast on config/address problems before opening the store or runtime.
     let bind = resolve_bind(args)?;
     let email = config.require_account_email()?;
@@ -354,9 +398,35 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
     // a WRITE-bound credential store here. It is bound to CredentialKind::Write
     // inside `with_write_credentials`; the SyncEngine below is handed a SEPARATE
     // Read-bound store and never sees this one.
+    // Manual-refresh signal shared between the human door and the sync loop:
+    // `POST /client/refresh` fires it, the poll loop wakes and polls Gmail now
+    // instead of waiting out `poll_secs`. One handle, two clones (API + engine).
+    let refresh = Arc::new(tokio::sync::Notify::new());
+
     let api_state = squelch_api::ApiState::from_env(store.clone(), &email)
         .map_err(|e| squelch_core::CoreError::Other(anyhow::anyhow!("{e}")))?
-        .with_write_credentials(backend, email.clone(), creds_path.clone(), client.clone());
+        .with_write_credentials(backend, email.clone(), creds_path.clone(), client.clone())
+        .with_refresh(refresh.clone())
+        // Surface the Stage-2 pricing/model/caps on the human door so
+        // /client/stats, /client/usage, and /client/triage-config report the
+        // operator's configured values (and cap "sources") rather than defaults.
+        .with_stage2_prices(config.stage2.price_in_per_mtok, config.stage2.price_out_per_mtok)
+        .with_stage2_model(
+            config.stage2.model.clone(),
+            config.stage2.stage2_provider.map(|p| p.as_str().to_string()),
+        )
+        .with_stage2_caps(
+            config.stage2.thread_daily_cap,
+            config.stage2.sender_daily_cap,
+            config.stage2.global_daily_cap,
+            cap_sources,
+        )
+        .with_stage1_config(
+            config.stage1.model.clone(),
+            config.stage1.price_in_per_mtok,
+            config.stage1.price_out_per_mtok,
+            config.stage1.global_daily_cap,
+        );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -377,6 +447,7 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
+            let refresh = refresh.clone();
             tokio::spawn(async move {
                 match backend {
                     CredentialBackend::Keyring => {
@@ -385,7 +456,8 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
                             email.clone(),
                             client,
                         ));
-                        let engine = SyncEngine::new(store, creds, account_id, email, config);
+                        let engine = SyncEngine::new(store, creds, account_id, email, config)
+                            .with_refresh(refresh);
                         engine.run(shutdown_rx).await
                     }
                     CredentialBackend::File => {
@@ -395,7 +467,8 @@ fn cmd_serve(config: Config, args: &ServeArgs) -> Result<(), squelch_core::CoreE
                             creds_path,
                             client,
                         ));
-                        let engine = SyncEngine::new(store, creds, account_id, email, config);
+                        let engine = SyncEngine::new(store, creds, account_id, email, config)
+                            .with_refresh(refresh);
                         engine.run(shutdown_rx).await
                     }
                 }

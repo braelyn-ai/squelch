@@ -38,8 +38,9 @@ use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules};
+use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
-use crate::triage::stage2_sealed_guard;
+use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
 use crate::types::{AccountId, SenderRule, Sensitivity};
 
 /// Gmail REST base for the authenticated user. Fixed; not user-tunable.
@@ -65,6 +66,13 @@ const GLOBAL_BUDGET_KEY: &str = "__global__";
 /// pattern; avoids a schema addition. (Schema applies fresh; dev dbs get reset.)
 const SENDER_BUDGET_PREFIX: &str = "sender:";
 
+/// The `wake_budget.thread_id` sentinel for the GLOBAL-per-account-per-day
+/// Stage-1 budget. Stage-1 needs only a global cap (it must see every email), so
+/// there is no per-thread/sender Stage-1 scope. Distinct from the Stage-2
+/// `__global__` sentinel so the two stages' daily counts never collide. No real
+/// Gmail thread id can match (they are hex).
+const STAGE1_GLOBAL_BUDGET_KEY: &str = "__stage1_global__";
+
 /// Model id stamped on a row skipped for being older than `stage2_max_age_days`:
 /// it is marked processed WITHOUT a model call so it neither consumes budget nor
 /// sits queued forever, keeping its Stage-1 values.
@@ -73,6 +81,33 @@ const STALE_SKIP_MODEL: &str = "stale-skip";
 /// Reconnect / retry backoff bounds for the outer driver loop.
 const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// Collapse an untrusted, header-derived string down to a short run of printable
+/// ASCII for safe logging. Non-printable/non-ASCII bytes (control chars, ANSI
+/// escapes, newlines that could forge log lines) become `.`, and the result is
+/// capped so a pathological header can't flood the log. Used on values that
+/// originate from mail headers before they reach the daemon log.
+fn sanitize_ascii(s: &str, max: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '.' })
+        .take(max)
+        .collect()
+}
+
+/// A stable, non-reversible tag for a sender address, safe to print in the
+/// once-daily budget notices. The raw `from_addr` is UNTRUSTED (hostile-header
+/// derived) PII, so instead of logging it we log the first 12 hex chars of its
+/// SHA-256 as `sender#<hex>` — enough to correlate repeated notices for the same
+/// sender across a day without ever writing the address itself.
+fn redact_sender(from_addr: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(from_addr.as_bytes());
+    let mut hex = String::with_capacity(12);
+    for b in digest.iter().take(6) {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    format!("sender#{hex}")
+}
 
 /// Decode a base64url (Gmail `format=raw`) payload into RFC822 bytes.
 ///
@@ -196,6 +231,27 @@ fn parse_history_id(s: &str) -> u64 {
     s.trim().parse::<u64>().unwrap_or(0)
 }
 
+/// Which Stage-2 daily cap a budget-exhausted notice is about. Used to rate-
+/// limit each notice to at most once per UTC day (see [`SyncEngine::warn_days`]).
+#[derive(Debug, Clone, Copy)]
+enum CapKind {
+    Thread,
+    Sender,
+    Global,
+    Stage1Global,
+}
+
+/// The last UTC day (`YYYY-MM-DD`) a budget-exhausted notice was emitted for each
+/// cap kind. Re-armed when the day rolls over, so a persistently-capped account
+/// logs each notice once a day instead of every ~45s poll.
+#[derive(Default)]
+struct WarnDays {
+    thread: Option<String>,
+    sender: Option<String>,
+    global: Option<String>,
+    stage1_global: Option<String>,
+}
+
 /// Everything the sync loop needs, resolved once at startup.
 pub struct SyncEngine<S: Store, C: CredentialStore> {
     store: Arc<S>,
@@ -219,6 +275,16 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     /// fills the gap once the embedder appears. CPU work runs under
     /// `spawn_blocking` so the poll loop never stalls on it.
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
+    /// Manual-refresh signal. The poll loop sleeps `poll_secs` between ticks;
+    /// notifying this wakes it EARLY so it runs a fresh Gmail poll now instead of
+    /// waiting out the interval. The human door's `POST /client/refresh` holds a
+    /// clone and fires it on user request. Coalescing is intentional: several
+    /// pokes during one in-flight poll collapse into a single extra tick.
+    refresh: Arc<tokio::sync::Notify>,
+    /// Per-cap-kind last-warned UTC day, so budget-exhausted notices fire at most
+    /// once per day rather than every poll. In-memory only (a restart re-arms
+    /// them, which is fine — a fresh notice on restart is acceptable).
+    warn_days: std::sync::Mutex<WarnDays>,
 }
 
 impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
@@ -255,7 +321,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             http,
             stage2_key,
             embedder: None,
+            refresh: Arc::new(tokio::sync::Notify::new()),
+            warn_days: std::sync::Mutex::new(WarnDays::default()),
         }
+    }
+
+    /// Share a manual-refresh [`Notify`](tokio::sync::Notify) with the engine so
+    /// an external caller (the human door's `POST /client/refresh`) can wake the
+    /// poll loop between intervals. Create ONE `Notify` at daemon startup, hand a
+    /// clone here and a clone to the API state, and the button's poke turns into
+    /// an immediate Gmail poll. Chainable with [`new`]; without it the engine
+    /// still polls on its own interval, just never early.
+    pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
+        self.refresh = refresh;
+        self
     }
 
     /// Attach an on-box [`Embedder`](crate::embed::Embedder) OVERRIDE so ingest
@@ -329,7 +408,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         let cursor = self.load_history_cursor()?;
         if cursor.is_none() {
             self.backfill().await?;
-            // Stage-2 pass over the backfill batch's ambiguous rows.
+            // Stage-1 LLM refine pass over the backfill batch, then Stage-2 over
+            // any rows Stage-1 escalated.
+            self.stage1_pass().await;
             self.stage2_pass().await;
         }
 
@@ -384,8 +465,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 return Ok(());
             }
             self.poll_once().await?;
-            // Stage-2 LLM triage pass after each ingest batch. Never crashes the
-            // sync loop (all failures handled internally).
+            // Stage-1 LLM refine pass after each ingest batch, then Stage-2 over
+            // any rows Stage-1 escalated (both refine within the same cycle).
+            // Never crashes the sync loop (all failures handled internally).
+            self.stage1_pass().await;
             self.stage2_pass().await;
 
             // VECTOR BACKFILL each tick. Cheap no-op when no embedder is attached
@@ -395,9 +478,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             // yet ready are picked up on the next tick once it becomes available.
             self.backfill_missing_vectors().await;
 
-            // Sleep the poll interval, waking early on shutdown.
+            // Sleep the poll interval, waking early on shutdown OR on a manual
+            // refresh poke (human door). A poke that arrives mid-poll is not lost:
+            // `Notify` stores one permit, so the next `notified()` returns at once
+            // and the loop runs one more immediate tick.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
+                _ = self.refresh.notified() => {
+                    eprintln!("squelch: manual refresh — polling now");
+                }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return Ok(()); }
                 }
@@ -703,6 +792,187 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
     /// per cycle. Any per-row failure is logged (redacted) and never crashes the
     /// sync loop — the whole pass returns `Ok(())` regardless.
     ///
+    /// Return `true` at most once per UTC `day` for the given cap `kind`, so a
+    /// persistently-capped account logs each budget-exhausted notice once a day
+    /// instead of on every ~45s poll. Updates the stored day as a side effect. A
+    /// poisoned lock defaults to warning (never silently swallow the notice).
+    fn warn_once_per_day(&self, kind: CapKind, day: &str) -> bool {
+        let mut guard = match self.warn_days.lock() {
+            Ok(g) => g,
+            Err(_) => return true,
+        };
+        let slot = match kind {
+            CapKind::Thread => &mut guard.thread,
+            CapKind::Sender => &mut guard.sender,
+            CapKind::Global => &mut guard.global,
+            CapKind::Stage1Global => &mut guard.stage1_global,
+        };
+        if slot.as_deref() == Some(day) {
+            false
+        } else {
+            *slot = Some(day.to_string());
+            true
+        }
+    }
+
+    /// Run one Stage-1 LLM refine pass over the queued (not-yet-refined) rows.
+    ///
+    /// Every non-sealed, non-rule-decided row was stored at ingest with HEURISTIC
+    /// seed values and `stage1_model_used IS NULL`. This pass fetches up to
+    /// `stage1.batch_per_cycle` of them, enforces the sealed guard, checks the
+    /// GLOBAL Stage-1 budget (increment-before-call so retries can't exceed it),
+    /// classifies with the small model, and applies the result — which stamps
+    /// `stage1_model_used` (leaving the Stage-1 queue) and sets `needs_stage2`
+    /// (escalation). On API-down / refusal / permanent-error the row keeps its
+    /// heuristic seed values, stamped `heuristic-only`; the seed's own confidence
+    /// (the `needs_stage2` seed written at ingest) then decides escalation. Budget
+    /// exhaustion DEFERS the remaining rows without loss (they stay queued). Never
+    /// crashes the sync loop.
+    ///
+    /// No-op when the LLM is disabled (no API key) — rows keep their heuristic
+    /// seed values and are re-attempted once a key is present.
+    async fn stage1_pass(&self) {
+        let Some((api_key, provider)) = self.stage2_key.as_ref() else {
+            return; // disabled; notice already emitted at startup
+        };
+        let api_key = api_key.as_str();
+        let provider = *provider;
+        let cfg = &self.config.stage1;
+
+        // RUNTIME OVERRIDE: re-read the Stage-1 global cap at the START of the
+        // pass so a client change via POST /client/triage-config applies within a
+        // cycle. Precedence: override > config/env > default.
+        let caps = self
+            .store
+            .stage2_cap_overrides(self.account_id)
+            .unwrap_or_default();
+        let global_daily_cap = caps
+            .stage1_global_daily_cap
+            .unwrap_or(cfg.global_daily_cap);
+
+        let queued = match self.store.stage1_queue(self.account_id, cfg.batch_per_cycle) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("squelch: stage-1 queue read failed ({e}); skipping pass");
+                return;
+            }
+        };
+        if queued.is_empty() {
+            return;
+        }
+
+        let now = Utc::now();
+        let day = now.format("%Y-%m-%d").to_string();
+        // Reuse the Stage-2 max-age as the staleness cutoff for parity.
+        let stale_cutoff = now - ChronoDuration::days(self.config.stage2.max_age_days as i64);
+        let mut refined = 0usize;
+        let mut fallback = 0usize;
+        let mut stale_skipped = 0usize;
+        let mut in_tok = 0u64;
+        let mut out_tok = 0u64;
+
+        for row in &queued {
+            // SEALED GUARD (defense in depth): the queue excludes sealed rows in
+            // SQL, but re-check before every classify call.
+            if let Err(e) = stage1_sealed_guard(row) {
+                eprintln!("squelch: stage-1 sealed guard tripped ({e}); skipping row");
+                continue;
+            }
+
+            // SKIP-STALE: a row older than max_age_days is marked processed with
+            // 'heuristic-only' WITHOUT a model call, keeping its seed values.
+            if row.received_at < stale_cutoff {
+                let _ = self.store.stage1_mark_processed(
+                    self.account_id,
+                    row.message_id,
+                    HEURISTIC_ONLY,
+                );
+                stale_skipped += 1;
+                continue;
+            }
+
+            // GLOBAL budget check (Stage-1's ONLY scope). Once hit, every
+            // remaining row this cycle is deferred (stays queued) with no stamp.
+            match self
+                .store
+                .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
+            {
+                Ok(used) if used >= global_daily_cap => {
+                    if self.warn_once_per_day(CapKind::Stage1Global, &day) {
+                        eprintln!(
+                            "squelch: stage-1 global daily budget exhausted \
+                             ({used}/{global_daily_cap}); remaining rows stay queued"
+                        );
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("squelch: stage-1 global budget read failed ({e}); skipping row");
+                    continue;
+                }
+            }
+
+            // Increment BEFORE the call so the attempt counts even on error/retry.
+            if let Err(e) =
+                self.store
+                    .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
+            {
+                eprintln!("squelch: stage-1 global budget increment failed ({e}); skipping row");
+                continue;
+            }
+
+            let outcome = stage1_llm::classify(&self.http, api_key, cfg, provider, row).await;
+            match outcome {
+                Ok(stage1_llm::ClassifyOutcome::Ok(out, usage)) => {
+                    if let Some(u) = usage {
+                        in_tok += u.input_tokens;
+                        out_tok += u.output_tokens;
+                        if let Err(e) = self.store.stage1_bump_usage(
+                            self.account_id,
+                            &day,
+                            u.input_tokens,
+                            u.output_tokens,
+                        ) {
+                            eprintln!("squelch: stage-1 usage ledger bump failed ({e})");
+                        }
+                    }
+                    let applied = stage1_llm::apply_result(row, &out, &cfg.model, Utc::now());
+                    if let Err(e) = self.store.stage1_apply(&applied) {
+                        eprintln!("squelch: stage-1 apply failed ({e}); row stays queued");
+                    } else {
+                        refined += 1;
+                    }
+                }
+                Ok(stage1_llm::ClassifyOutcome::Refused)
+                | Ok(stage1_llm::ClassifyOutcome::Failed(_)) => {
+                    // HEURISTIC FALLBACK: keep the seed values, mark processed so
+                    // the row does not loop; the ingest-time needs_stage2 seed
+                    // (= !heuristic-confident) is preserved and drives escalation.
+                    let _ = self.store.stage1_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        HEURISTIC_ONLY,
+                    );
+                    fallback += 1;
+                }
+                Err(e) => {
+                    // Retryable class exhausted / transport error. Leave the row
+                    // queued (stage1_model_used stays NULL) for a future cycle.
+                    eprintln!("squelch: stage-1 {e}; row stays queued");
+                }
+            }
+        }
+
+        if refined > 0 || fallback > 0 || stale_skipped > 0 {
+            eprintln!(
+                "squelch: stage-1 refined {refined} rows (model={}, in_tok={in_tok}, \
+                 out_tok={out_tok}); heuristic-fallback {fallback}; stale-skipped {stale_skipped}",
+                cfg.model
+            );
+        }
+    }
+
     /// No-op when Stage-2 is disabled (no API key).
     async fn stage2_pass(&self) {
         let Some((api_key, provider)) = self.stage2_key.as_ref() else {
@@ -711,6 +981,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         let api_key = api_key.as_str();
         let provider = *provider;
         let cfg = &self.config.stage2;
+
+        // RUNTIME OVERRIDES: re-read the three daily caps at the START of the pass
+        // (one cheap SELECT) so a client change via POST /client/triage-config
+        // applies within a cycle, no restart. Precedence: override > config/env >
+        // default (the config/env value already folded into `cfg`).
+        let caps = self
+            .store
+            .stage2_cap_overrides(self.account_id)
+            .unwrap_or_default();
+        let thread_daily_cap = caps.thread_daily_cap.unwrap_or(cfg.thread_daily_cap);
+        let sender_daily_cap = caps.sender_daily_cap.unwrap_or(cfg.sender_daily_cap);
+        let global_daily_cap = caps.global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
         let queued = match self.store.stage2_queue(self.account_id, cfg.batch_per_cycle) {
             Ok(q) => q,
@@ -728,11 +1010,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         let day = now.format("%Y-%m-%d").to_string();
         // The staleness cutoff: rows received before this are stale-skipped.
         let stale_cutoff = now - ChronoDuration::days(cfg.max_age_days as i64);
-        // "at most once per cycle" per-thread / per-sender exhaustion notices.
-        // (The global notice fires at most once because hitting the cap breaks
-        // the loop.)
-        let mut warned_thread = false;
-        let mut warned_sender = false;
+        // Budget-exhausted notices name the offending thread/sender and fire at
+        // most once per UTC day (via `warn_once_per_day`), not every poll.
         let mut processed = 0usize;
         let mut stale_skipped = 0usize;
         let mut in_tok = 0u64;
@@ -759,17 +1038,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 continue;
             }
 
-            // GLOBAL budget check (per-account-per-day).
+            // GLOBAL budget check (per-account-per-day). Keeps its BREAK semantics
+            // — once the account cap is hit every remaining row this cycle is
+            // blocked — but the notice now fires at most once per UTC day.
             match self
                 .store
                 .stage2_budget_used(self.account_id, GLOBAL_BUDGET_KEY, &day)
             {
-                Ok(used) if used >= cfg.global_daily_cap => {
-                    eprintln!(
-                        "squelch: stage-2 global daily budget exhausted ({used}/{}); \
-                         remaining rows stay queued",
-                        cfg.global_daily_cap
-                    );
+                Ok(used) if used >= global_daily_cap => {
+                    if self.warn_once_per_day(CapKind::Global, &day) {
+                        eprintln!(
+                            "squelch: stage-2 global daily budget exhausted ({used}/{global_daily_cap}); \
+                             remaining rows stay queued"
+                        );
+                    }
                     break; // global cap blocks every remaining row this cycle
                 }
                 Ok(_) => {}
@@ -779,19 +1061,21 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                 }
             }
 
-            // PER-THREAD budget check.
+            // PER-THREAD budget check. The notice NAMES the capped thread and
+            // fires at most once per UTC day.
             match self
                 .store
                 .stage2_budget_used(self.account_id, &row.thread_id, &day)
             {
-                Ok(used) if used >= cfg.thread_daily_cap => {
-                    if !warned_thread {
+                Ok(used) if used >= thread_daily_cap => {
+                    if self.warn_once_per_day(CapKind::Thread, &day) {
+                        // thread_id is Gmail hex (safe), but sanitize defensively
+                        // in case a malformed cursor ever supplies otherwise.
                         eprintln!(
-                            "squelch: stage-2 per-thread daily budget exhausted for at least \
-                             one thread ({}/{}); those rows stay queued",
-                            used, cfg.thread_daily_cap
+                            "squelch: stage-2 per-thread daily budget exhausted for thread {} \
+                             ({used}/{thread_daily_cap}); those rows stay queued",
+                            sanitize_ascii(&row.thread_id, 64)
                         );
-                        warned_thread = true;
                     }
                     continue; // this thread is capped; try the next row
                 }
@@ -804,20 +1088,22 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
 
             // PER-SENDER budget check (per-account-per-day, keyed by from_addr).
             // Stops one chatty sender fanning many DIFFERENT threads from burning
-            // the budget. Same sentinel-row pattern as __global__.
+            // the budget. Same sentinel-row pattern as __global__. The notice
+            // NAMES the capped sender and fires at most once per UTC day.
             let sender_key = format!("{SENDER_BUDGET_PREFIX}{}", row.from_addr);
             match self
                 .store
                 .stage2_budget_used(self.account_id, &sender_key, &day)
             {
-                Ok(used) if used >= cfg.sender_daily_cap => {
-                    if !warned_sender {
+                Ok(used) if used >= sender_daily_cap => {
+                    if self.warn_once_per_day(CapKind::Sender, &day) {
+                        // from_addr is UNTRUSTED header PII — log a non-reversible
+                        // sha256 tag, never the address itself.
                         eprintln!(
-                            "squelch: stage-2 per-sender daily budget exhausted for at least \
-                             one sender ({}/{}); those rows stay queued",
-                            used, cfg.sender_daily_cap
+                            "squelch: stage-2 per-sender daily budget exhausted for sender {} \
+                             ({used}/{sender_daily_cap}); those rows stay queued",
+                            redact_sender(&row.from_addr)
                         );
-                        warned_sender = true;
                     }
                     continue; // this sender is capped; try the next row
                 }
@@ -1072,6 +1358,31 @@ mod tests {
             store.is_known_contact(account_id, addr).unwrap_or(false)
         });
         store.ingest_message(&triaged).unwrap()
+    }
+
+    // ---- budget-notice log redaction (PII safety) -------------------------
+
+    #[test]
+    fn redact_sender_hides_the_address_but_stays_stable() {
+        let a = redact_sender("attacker@evil.example");
+        assert!(a.starts_with("sender#"), "tagged form: {a}");
+        assert_eq!(a.len(), "sender#".len() + 12, "12 hex chars of sha256");
+        assert!(!a.contains("attacker") && !a.contains("evil"), "address must not leak: {a}");
+        let hex = &a["sender#".len()..];
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "hex only: {hex}");
+        // Deterministic (correlatable across a day) and injective per sender.
+        assert_eq!(a, redact_sender("attacker@evil.example"));
+        assert_ne!(a, redact_sender("someone@else.example"));
+    }
+
+    #[test]
+    fn sanitize_ascii_strips_control_and_caps_length() {
+        // Newlines (log-forging), ANSI escapes, and RTL-override become '.'.
+        let clean = sanitize_ascii("abc\n\x1b[31mDEF\u{202e}", 64);
+        assert!(!clean.contains('\n') && !clean.contains('\u{1b}') && !clean.contains('\u{202e}'));
+        assert!(clean.starts_with("abc."), "printable kept, control replaced: {clean}");
+        // Pathologically long header can't flood the log.
+        assert_eq!(sanitize_ascii(&"a".repeat(200), 10).chars().count(), 10);
     }
 
     // ---- base64url raw decode ---------------------------------------------

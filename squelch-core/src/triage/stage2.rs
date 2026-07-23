@@ -1,13 +1,15 @@
 //! Stage-2 LLM triage: the Anthropic API pass over Stage-1's ambiguous middle.
 //!
-//! Stage-1 leaves two kinds of row non-confident (`model_used IS NULL AND
-//! sensitivity='normal'`):
+//! Stage-1 leaves two kinds of row escalated for this stage:
 //!   * the ambiguous fall-through (unknown sender, importance ~40-55), and
 //!   * Filtered sender-rule matches whose `want_text` is a natural-language
 //!     predicate we can't evaluate without a model.
 //!
-//! ONLY those rows reach this stage, and NEVER sealed content (the queue
-//! predicate excludes it; [`stage2_llm_triage`](super::stage2_llm_triage)
+//! The queue predicate is the four clauses `stage1_model_used IS NOT NULL AND
+//! needs_stage2=1 AND model_used IS NULL AND sensitivity='normal'` — Stage-1 has
+//! looked, escalation is flagged, Stage-2 hasn't processed it yet, and the row
+//! is non-sealed. ONLY those rows reach this stage, and NEVER sealed content
+//! (the predicate excludes it; [`stage2_llm_triage`](super::stage2_llm_triage)
 //! additionally enforces a real release-mode guard).
 //!
 //! ## The injection boundary (the whole security story)
@@ -30,30 +32,16 @@
 use crate::config::{Stage2Config, Stage2Provider};
 use crate::store::{Stage2Applied, Stage2Queued};
 use crate::triage::DeadlineHit;
-use crate::types::Tier;
+use crate::triage::llm::{self, LlmOutcome, LlmRequest};
+use crate::types::{FieldReasons, Tier};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
-/// Anthropic Messages API endpoint.
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
-/// OpenAI Chat Completions API endpoint. Request/response shapes below follow
-/// the OpenAI Chat Completions spec (platform.openai.com/docs/api-reference/chat)
-/// as of 2026-07-09; verified against the user-provided spec (docs unreachable
-/// via WebFetch from this environment). Structured output uses
-/// `response_format: {type:"json_schema", json_schema:{name, strict, schema}}`;
-/// strict mode requires every property in `required` and `additionalProperties:
-/// false` everywhere — [`output_schema`] already satisfies this.
-const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
-/// Pinned Anthropic API version header value.
-const API_VERSION: &str = "2023-06-01";
-/// Default max_tokens; a compact JSON object fits comfortably. A `max_tokens`
-/// truncation is retried once at this doubled value.
-const MAX_TOKENS: u32 = 400;
-const MAX_TOKENS_RETRY: u32 = 800;
-/// Retry policy for retryable statuses (429 / 5xx / 529).
-const MAX_TRIES: u32 = 3;
-const BACKOFF_CAP: Duration = Duration::from_secs(60);
+// Provider plumbing (endpoints, retry policy, truncation-retry, wire types)
+// lives in [`crate::triage::llm`] and is SHARED with Stage-1 — this module owns
+// only the Stage-2 system prompt, fenced user message, output schema, verdict
+// parse, and apply. Re-export the two types the Stage-2 public surface exposes.
+pub use crate::triage::llm::{ClassifyError, Usage};
 
 // ===========================================================================
 // System prompt (static — SAME BYTES every call so haiku prompt caching can
@@ -87,6 +75,11 @@ has_deadline=true with deadline_iso=null.
 
 ONE_LINE: a single terse line (<=120 chars), no leading label, describing what \
 this email is and why it matters. reason: a short internal justification.
+
+IMPORTANCE_REASON: one short clause (<=160 chars) stating WHY you chose that \
+importance score. DEADLINE_REASON: when has_deadline=true, one short clause \
+(<=160 chars) naming what obligation/date you found; when has_deadline=false, \
+set deadline_reason to null.
 
 SENDER RULE: when the TRUSTED CONTEXT gives a standing instruction for this \
 sender (what the user said they want from them), set matches_sender_rule to \
@@ -223,7 +216,9 @@ pub fn output_schema() -> serde_json::Value {
             "deadline_kind",
             "one_line",
             "reason",
-            "matches_sender_rule"
+            "matches_sender_rule",
+            "importance_reason",
+            "deadline_reason"
         ],
         "properties": {
             "importance": { "type": "integer" },
@@ -232,7 +227,9 @@ pub fn output_schema() -> serde_json::Value {
             "deadline_kind": { "type": ["string", "null"] },
             "one_line": { "type": "string" },
             "reason": { "type": "string" },
-            "matches_sender_rule": { "type": ["boolean", "null"] }
+            "matches_sender_rule": { "type": ["boolean", "null"] },
+            "importance_reason": { "type": "string" },
+            "deadline_reason": { "type": ["string", "null"] }
         }
     })
 }
@@ -247,160 +244,19 @@ pub struct Stage2Output {
     pub one_line: String,
     pub reason: String,
     pub matches_sender_rule: Option<bool>,
+    /// Model's justification for the importance score. UNTRUSTED model text
+    /// derived from email content — stored as DATA, never executed, and capped
+    /// on apply (see [`apply_result`]).
+    #[serde(default)]
+    pub importance_reason: String,
+    /// Model's justification for the deadline, or `None` when `has_deadline` is
+    /// false. Same untrusted-data handling as `importance_reason`.
+    #[serde(default)]
+    pub deadline_reason: Option<String>,
 }
 
 // ===========================================================================
-// Wire request / response types.
-// ===========================================================================
-
-#[derive(Debug, Serialize)]
-struct MessagesRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    system: Vec<SystemBlock<'a>>,
-    messages: Vec<RequestMessage<'a>>,
-    output_config: OutputConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct SystemBlock<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<CacheControl>,
-}
-
-#[derive(Debug, Serialize)]
-struct CacheControl {
-    #[serde(rename = "type")]
-    kind: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct RequestMessage<'a> {
-    role: &'static str,
-    content: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct OutputConfig {
-    format: OutputFormat,
-}
-
-#[derive(Debug, Serialize)]
-struct OutputFormat {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    schema: serde_json::Value,
-}
-
-// ---- OpenAI Chat Completions wire types -----------------------------------
-
-#[derive(Debug, Serialize)]
-struct OpenAiRequest<'a> {
-    model: &'a str,
-    messages: Vec<OpenAiMessage<'a>>,
-    /// OpenAI's per-response output cap. Mirrors the Anthropic `max_tokens`
-    /// doubling on a truncation retry.
-    max_completion_tokens: u32,
-    response_format: OpenAiResponseFormat,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiMessage<'a> {
-    role: &'static str,
-    content: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiResponseFormat {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    json_schema: OpenAiJsonSchema,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiJsonSchema {
-    name: &'static str,
-    strict: bool,
-    schema: serde_json::Value,
-}
-
-/// The subset of the OpenAI response we consume.
-#[derive(Debug, Deserialize)]
-struct OpenAiResponse {
-    #[serde(default)]
-    choices: Vec<OpenAiChoice>,
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChoice {
-    #[serde(default)]
-    finish_reason: Option<String>,
-    #[serde(default)]
-    message: Option<OpenAiChoiceMessage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChoiceMessage {
-    #[serde(default)]
-    content: Option<String>,
-    /// Present (non-null) when the model declined the request.
-    #[serde(default)]
-    refusal: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-}
-
-impl OpenAiUsage {
-    /// Map onto the SAME ledger columns as the Anthropic path.
-    fn into_usage(self) -> Usage {
-        Usage {
-            input_tokens: self.prompt_tokens,
-            output_tokens: self.completion_tokens,
-        }
-    }
-}
-
-/// The subset of the API response we consume.
-#[derive(Debug, Deserialize)]
-pub struct MessagesResponse {
-    #[serde(default)]
-    pub content: Vec<ContentBlock>,
-    #[serde(default)]
-    pub stop_reason: Option<String>,
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ContentBlock {
-    #[serde(default, rename = "type")]
-    pub kind: String,
-    #[serde(default)]
-    pub text: Option<String>,
-}
-
-/// Token usage — numbers are fine to log.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct Usage {
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-}
-
-// ===========================================================================
-// classify() — the async HTTP call with the retry policy.
+// classify() — delegates transport to [`crate::triage::llm`].
 // ===========================================================================
 
 /// The outcome of a single [`classify`] call.
@@ -416,38 +272,15 @@ pub enum ClassifyOutcome {
     Failed(String),
 }
 
-/// A redacted classification error (transport / retry-exhaustion). Never
-/// carries a body or key.
-#[derive(Debug)]
-pub struct ClassifyError {
-    /// A short, redacted description (status code / error type only).
-    pub kind: String,
-    /// Whether this was a retryable class that exhausted its budget (vs. a hard
-    /// transport error). Informational for logging.
-    pub retryable: bool,
-}
-
-impl std::fmt::Display for ClassifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stage2 classify error: {} (retryable={})", self.kind, self.retryable)
-    }
-}
-
 /// Classify one email against the configured Stage-2 provider.
 ///
-/// Provider is selected by `provider` (resolved from the key prefix / config at
-/// the sync layer). Both providers consume the IDENTICAL system prompt, trusted/
-/// untrusted user message, and output schema (single source of truth).
+/// Builds the Stage-2 system prompt + fenced user message + output schema and
+/// hands them to the shared [`crate::triage::llm`] transport, then parses the
+/// model's raw verdict text into a [`Stage2Output`]. Both providers consume the
+/// IDENTICAL prompt/schema (single source of truth).
 ///
-/// Retry policy (shared, skill-verified): 429 (honor `retry-after`) and 529/5xx
-/// are retryable with exponential backoff (cap 60s, max 3 tries); 400/401 are
-/// permanent. A truncation (Anthropic `stop_reason == "max_tokens"` / OpenAI
-/// `finish_reason == "length"`) is retried once with a higher token budget. A
-/// refusal (Anthropic `stop_reason == "refusal"` / OpenAI message `refusal`
-/// field) yields [`ClassifyOutcome::Refused`].
-///
-/// REDACTION: this never logs the request/response body or the API key. On a
-/// hard failure it returns a redacted [`ClassifyError`].
+/// REDACTION: never logs the request/response body or the API key. On a hard
+/// failure it returns a redacted [`ClassifyError`].
 pub async fn classify(
     http: &reqwest::Client,
     api_key: &str,
@@ -455,11 +288,7 @@ pub async fn classify(
     provider: Stage2Provider,
     ctx: &RowContext<'_>,
 ) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    let url = match provider {
-        Stage2Provider::Anthropic => API_URL,
-        Stage2Provider::OpenAI => OPENAI_API_URL,
-    };
-    classify_at(http, url, api_key, cfg, provider, ctx).await
+    classify_at(http, llm::provider_url(provider), api_key, cfg, provider, ctx).await
 }
 
 /// [`classify`] against an explicit endpoint URL. The production entry point
@@ -472,187 +301,22 @@ pub async fn classify_at(
     provider: Stage2Provider,
     ctx: &RowContext<'_>,
 ) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    match provider {
-        Stage2Provider::Anthropic => classify_anthropic(http, url, api_key, cfg, ctx).await,
-        Stage2Provider::OpenAI => classify_openai(http, url, api_key, cfg, ctx).await,
-    }
-}
-
-/// The Anthropic Messages API path.
-async fn classify_anthropic(
-    http: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    cfg: &Stage2Config,
-    ctx: &RowContext<'_>,
-) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    let system = build_system_prompt();
     let user = build_user_message(ctx);
-    let schema = output_schema();
-
-    // Two token budgets: normal, then a single higher-budget retry on a
-    // max_tokens truncation.
-    let mut max_tokens = MAX_TOKENS;
-    let mut allow_token_retry = true;
-
-    loop {
-        let body = MessagesRequest {
-            model: &cfg.model,
-            max_tokens,
-            system: vec![SystemBlock {
-                kind: "text",
-                text: system,
-                cache_control: Some(CacheControl { kind: "ephemeral" }),
-            }],
-            messages: vec![RequestMessage {
-                role: "user",
-                content: &user,
-            }],
-            output_config: OutputConfig {
-                format: OutputFormat {
-                    kind: "json_schema",
-                    schema: schema.clone(),
-                },
-            },
-        };
-
-        // The Anthropic request carries x-api-key + anthropic-version headers.
-        let build = || {
-            http.post(url)
-                .header("x-api-key", api_key)
-                .header("anthropic-version", API_VERSION)
-                .header("content-type", "application/json")
-                .json(&body)
-        };
-        let parsed: MessagesResponse = match send_with_retry(build).await? {
-            SendOk::Body(b) => b,
-            SendOk::PermanentFailure(kind) => return Ok(ClassifyOutcome::Failed(kind)),
-        };
-
-        match parsed.stop_reason.as_deref() {
-            Some("refusal") => return Ok(ClassifyOutcome::Refused),
-            Some("max_tokens") if allow_token_retry => {
-                // Truncated JSON — retry once with a larger budget.
-                max_tokens = MAX_TOKENS_RETRY;
-                allow_token_retry = false;
-                continue;
-            }
-            Some("max_tokens") => {
-                return Ok(ClassifyOutcome::Failed("max_tokens_truncation".into()));
-            }
-            _ => {}
-        }
-
-        // First text content block is guaranteed valid JSON matching the schema.
-        let text = parsed
-            .content
-            .iter()
-            .find(|b| b.kind == "text")
-            .and_then(|b| b.text.as_deref());
-        let text = match text {
-            Some(t) => t,
-            None => return Ok(ClassifyOutcome::Failed("no_text_block".into())),
-        };
-        return finalize_output(text, parsed.usage);
-    }
-}
-
-/// The OpenAI Chat Completions path. Same prompt/schema/retry discipline as the
-/// Anthropic path; only the wire shapes and refusal/truncation signals differ.
-async fn classify_openai(
-    http: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    cfg: &Stage2Config,
-    ctx: &RowContext<'_>,
-) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    let system = build_system_prompt();
-    let user = build_user_message(ctx);
-    let schema = output_schema();
-
-    // Mirror the 400/800 Anthropic doubling via max_completion_tokens.
-    let mut max_completion_tokens = MAX_TOKENS;
-    let mut allow_token_retry = true;
-
-    loop {
-        let body = OpenAiRequest {
-            model: &cfg.model,
-            // SAME trusted/untrusted strings the Anthropic path uses: the system
-            // prompt as the system message, the fenced user message as the user
-            // message.
-            messages: vec![
-                OpenAiMessage {
-                    role: "system",
-                    content: system,
-                },
-                OpenAiMessage {
-                    role: "user",
-                    content: &user,
-                },
-            ],
-            max_completion_tokens,
-            response_format: OpenAiResponseFormat {
-                kind: "json_schema",
-                json_schema: OpenAiJsonSchema {
-                    name: "triage",
-                    strict: true,
-                    schema: schema.clone(),
-                },
-            },
-        };
-
-        // OpenAI auth is a Bearer token; no version header.
-        let build = || {
-            http.post(url)
-                .bearer_auth(api_key)
-                .header("content-type", "application/json")
-                .json(&body)
-        };
-        let parsed: OpenAiResponse = match send_with_retry(build).await? {
-            SendOk::Body(b) => b,
-            SendOk::PermanentFailure(kind) => return Ok(ClassifyOutcome::Failed(kind)),
-        };
-
-        let choice = match parsed.choices.into_iter().next() {
-            Some(c) => c,
-            None => return Ok(ClassifyOutcome::Failed("no_choice".into())),
-        };
-        let message = match choice.message {
-            Some(m) => m,
-            None => return Ok(ClassifyOutcome::Failed("no_message".into())),
-        };
-
-        // A non-null refusal field => the model declined (parity with Anthropic
-        // stop_reason == "refusal").
-        if message.refusal.is_some() {
-            return Ok(ClassifyOutcome::Refused);
-        }
-
-        // finish_reason "length" => truncation (parity with stop_reason
-        // max_tokens): retry once at the doubled budget, then fail.
-        match choice.finish_reason.as_deref() {
-            Some("length") if allow_token_retry => {
-                max_completion_tokens = MAX_TOKENS_RETRY;
-                allow_token_retry = false;
-                continue;
-            }
-            Some("length") => {
-                return Ok(ClassifyOutcome::Failed("max_tokens_truncation".into()));
-            }
-            _ => {}
-        }
-
-        let text = match message.content.as_deref() {
-            Some(t) => t,
-            None => return Ok(ClassifyOutcome::Failed("no_text_block".into())),
-        };
-        return finalize_output(text, parsed.usage.map(OpenAiUsage::into_usage));
+    let req = LlmRequest {
+        model: &cfg.model,
+        system: build_system_prompt(),
+        user: &user,
+        schema: output_schema(),
+    };
+    match llm::classify_llm(http, url, api_key, provider, &req).await? {
+        LlmOutcome::Json(text, usage) => finalize_output(&text, usage),
+        LlmOutcome::Refused => Ok(ClassifyOutcome::Refused),
+        LlmOutcome::Failed(kind) => Ok(ClassifyOutcome::Failed(kind)),
     }
 }
 
 /// Parse the model's JSON verdict text, validate importance range, and package
-/// the outcome. Shared by both provider paths (same [`TriageVerdict`]/
-/// [`Stage2Output`] struct and same client-side range check).
+/// the outcome.
 fn finalize_output(
     text: &str,
     usage: Option<Usage>,
@@ -666,111 +330,6 @@ fn finalize_output(
         return Ok(ClassifyOutcome::Failed("importance_out_of_range".into()));
     }
     Ok(ClassifyOutcome::Ok(out, usage))
-}
-
-/// Internal: the two success shapes from [`send_with_retry`].
-enum SendOk<T> {
-    Body(T),
-    /// A permanent (400/401) failure with a redacted kind string.
-    PermanentFailure(String),
-}
-
-/// Provider error-body shape. Both Anthropic and OpenAI use
-/// `{"error": {"type": ...}}`; only the redacted `type` is read — the message is
-/// never logged.
-#[derive(Debug, Deserialize)]
-struct ApiErrorBody {
-    error: Option<ApiErrorInner>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiErrorInner {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-}
-
-/// POST the request, applying the SHARED retry policy for retryable statuses.
-/// Generic over the decoded success body `T` and the request-builder closure so
-/// both providers reuse one policy object. Returns a parsed body on 2xx, a
-/// permanent-failure marker on 400/401, and a redacted [`ClassifyError`] when
-/// retries are exhausted or a transport error occurs.
-async fn send_with_retry<T, F>(build: F) -> std::result::Result<SendOk<T>, ClassifyError>
-where
-    T: serde::de::DeserializeOwned,
-    F: Fn() -> reqwest::RequestBuilder,
-{
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        let send = build().send().await;
-
-        let resp = match send {
-            Ok(r) => r,
-            Err(_) => {
-                // Transport error — retryable up to MAX_TRIES.
-                if attempt >= MAX_TRIES {
-                    return Err(ClassifyError {
-                        kind: "transport".into(),
-                        retryable: true,
-                    });
-                }
-                sleep_backoff(attempt, None).await;
-                continue;
-            }
-        };
-
-        let status = resp.status();
-        if status.is_success() {
-            let parsed: T = resp.json().await.map_err(|_| ClassifyError {
-                kind: "response_decode".into(),
-                retryable: false,
-            })?;
-            return Ok(SendOk::Body(parsed));
-        }
-
-        let code = status.as_u16();
-        // Retryable: 429 (retry-after) and 529/5xx.
-        let retryable = code == 429 || code == 529 || (500..600).contains(&code);
-        if retryable {
-            if attempt >= MAX_TRIES {
-                return Err(ClassifyError {
-                    kind: format!("http_{code}"),
-                    retryable: true,
-                });
-            }
-            let retry_after = parse_retry_after(&resp);
-            sleep_backoff(attempt, retry_after).await;
-            continue;
-        }
-
-        // Non-retryable (400/401/403/404/...). Read the redacted error type only.
-        let kind = resp
-            .json::<ApiErrorBody>()
-            .await
-            .ok()
-            .and_then(|b| b.error)
-            .and_then(|e| e.kind)
-            .unwrap_or_else(|| "unknown".to_string());
-        return Ok(SendOk::PermanentFailure(format!("http_{code}:{kind}")));
-    }
-}
-
-/// Parse a `retry-after` header (seconds) if present.
-fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    resp.headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-}
-
-/// Exponential backoff with a 60s cap; honors a server `retry-after` when given.
-async fn sleep_backoff(attempt: u32, retry_after: Option<Duration>) {
-    let base = retry_after.unwrap_or_else(|| {
-        let secs = 1u64 << (attempt.min(6) - 1); // 1,2,4,8,16,32...
-        Duration::from_secs(secs)
-    });
-    tokio::time::sleep(base.min(BACKOFF_CAP)).await;
 }
 
 // ===========================================================================
@@ -808,71 +367,37 @@ pub fn apply_result(
     }
 
     // A deadline claim is trusted for tiering only when the sender is known or
-    // the email matches the user's standing instruction for the sender.
-    let deadline_trusted = queued.is_known_contact || out.matches_sender_rule == Some(true);
+    // the email matches the user's standing instruction for the sender. The
+    // matches_sender_rule trust is honored ONLY when the row actually carried a
+    // standing instruction (`rule_want_text.is_some()`): a model steered by
+    // hostile email content could otherwise claim `matches_sender_rule=true` on
+    // a no-rule row to un-cap an unknown sender's "past due" scream.
+    let deadline_trusted = queued.is_known_contact
+        || (queued.rule_want_text.is_some() && out.matches_sender_rule == Some(true));
 
-    // Parse an optional deadline timestamp. Apply the SAME received_at-relative
-    // sanity bounds Stage-1 uses (parity): a model-provided date more than
-    // ~1 year before, or ~3 years after, the message's receipt is treated as a
-    // bad extraction and dropped (no deadline). The model returns full ISO so
-    // year bugs are unlikely, but this keeps the two stages consistent.
-    const MAX_DAYS_PAST: i64 = 365;
-    const MAX_DAYS_FUTURE: i64 = 365 * 3;
-    let due_at: Option<DateTime<Utc>> = out
-        .deadline_iso
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-        .map(|d| d.with_timezone(&Utc))
-        .filter(|d| {
-            let days = (*d - queued.received_at).num_days();
-            (-MAX_DAYS_PAST..=MAX_DAYS_FUTURE).contains(&days)
-        });
-
-    // Determine tier + build any deadline hit.
-    let (tier, deadline) = if out.has_deadline {
-        match due_at {
-            Some(when) => {
-                let past = when < now;
-                // Natural tier from the date, then cap for untrusted senders.
-                let natural = if past { Tier::PastDue } else { Tier::Deadline };
-                let tier = if deadline_trusted {
-                    natural
-                } else {
-                    // Unknown-sender deadline claim caps at Deadline, never
-                    // PastDue (scam dampening, mirrors Stage-1).
-                    Tier::Deadline
-                };
-                let hit = DeadlineHit {
-                    kind: out
-                        .deadline_kind
-                        .clone()
-                        .unwrap_or_else(|| "bill".to_string()),
-                    amount: None,
-                    currency: None,
-                    due_at: when,
-                    // past_due flag also respects the trust cap.
-                    past_due: past && deadline_trusted,
-                    source: "stage2".to_string(),
-                };
-                (tier, Some(hit))
-            }
-            // Bill exists but no concrete date: Deadline tier, no deadlines row
-            // (there is no due_at to persist).
-            None => (Tier::Deadline, None),
-        }
-    } else {
-        // No deadline: tier follows importance against the same anchors used in
-        // the rubric / Stage-1 config ladder.
-        (tier_from_importance(importance), None)
-    };
+    // Deadline + tier derivation is the SHARED, un-forked path both stages use
+    // (identical sanity bounds and trust caps). See [`derive_deadline_and_tier`].
+    let (mut tier, deadline, deadline_reason, mut tier_reason) = derive_deadline_and_tier(
+        &DeadlineInput {
+            has_deadline: out.has_deadline,
+            deadline_iso: out.deadline_iso.as_deref(),
+            deadline_kind: out.deadline_kind.as_deref(),
+            deadline_reason: out.deadline_reason.as_deref(),
+            received_at: queued.received_at,
+            deadline_trusted,
+            source: "stage2",
+            stage_label: "stage-2",
+        },
+        importance,
+        now,
+    );
 
     // If the rule floored importance to noise, keep the tier as Noise too — a
     // "don't want this" verdict shouldn't surface as Signal on importance alone.
-    let tier = if rule_says_no && !out.has_deadline {
-        Tier::Noise
-    } else {
-        tier
-    };
+    if rule_says_no && !out.has_deadline {
+        tier = Tier::Noise;
+        tier_reason = "stage-2: standing instruction not matched -> noise".to_string();
+    }
 
     let reason = if rule_says_no {
         format!(
@@ -882,16 +407,156 @@ pub fn apply_result(
         format!("stage-2 ({model}): {}", truncate_reason(&out.reason))
     };
 
+    // Importance reason describes the STORED value. The model's reason text is
+    // UNTRUSTED email-derived DATA: stored as data (never executed) and hard-
+    // capped so a hostile email cannot balloon the row.
+    let importance_reason = if rule_says_no {
+        format!(
+            "stage-2: sender's standing instruction not matched -> floored to noise (importance {importance})"
+        )
+    } else {
+        let m = truncate_field_reason(out.importance_reason.trim());
+        if m.is_empty() {
+            format!("stage-2 ({model}): importance {importance}")
+        } else {
+            format!("stage-2: {m}")
+        }
+    };
+
     Stage2Applied {
         message_id: queued.message_id,
         account_id: queued.account_id,
         importance,
         tier,
-        one_line: out.one_line.clone(),
+        one_line: truncate_one_line(&out.one_line),
         reason,
+        field_reasons: FieldReasons {
+            importance: Some(importance_reason),
+            deadline: deadline_reason,
+            tier: Some(tier_reason),
+        },
         model_used: model.to_string(),
         deadline,
     }
+}
+
+/// Inputs to the SHARED deadline + tier derivation ([`derive_deadline_and_tier`]),
+/// used by BOTH Stage-1 and Stage-2's apply so the deadline sanity bounds and the
+/// unknown-sender trust cap are identical (never forked). `source` labels the
+/// produced [`DeadlineHit`] (`"stage1"`/`"stage2"`); `stage_label` prefixes the
+/// synthesized field reasons (`"stage-1"`/`"stage-2"`).
+pub(crate) struct DeadlineInput<'a> {
+    pub has_deadline: bool,
+    pub deadline_iso: Option<&'a str>,
+    pub deadline_kind: Option<&'a str>,
+    pub deadline_reason: Option<&'a str>,
+    pub received_at: DateTime<Utc>,
+    /// `true` when a PAST deadline may land [`Tier::PastDue`] (known sender or a
+    /// matched-rule trust statement); `false` caps it at [`Tier::Deadline`].
+    pub deadline_trusted: bool,
+    pub source: &'static str,
+    pub stage_label: &'static str,
+}
+
+/// SHARED deadline + tier derivation for both LLM stages. Parses the model's
+/// deadline against receipt-relative sanity bounds, derives the tier (deadline
+/// present -> Deadline/PastDue with the unknown-sender cap; otherwise importance
+/// against the rubric anchors), and synthesizes the deadline + tier field
+/// reasons describing the STORED (winning) values. Returns
+/// `(tier, Option<DeadlineHit>, deadline_field_reason, tier_field_reason)`.
+///
+/// `importance` is the already-clamped (and, for Stage-2, possibly floored)
+/// score used for the no-deadline tier.
+pub(crate) fn derive_deadline_and_tier(
+    inp: &DeadlineInput,
+    importance: u8,
+    now: DateTime<Utc>,
+) -> (Tier, Option<DeadlineHit>, Option<String>, String) {
+    // Receipt-relative sanity bounds: a model date more than ~1 year before, or
+    // ~3 years after, the message's receipt is a bad extraction and is dropped.
+    const MAX_DAYS_PAST: i64 = 365;
+    const MAX_DAYS_FUTURE: i64 = 365 * 3;
+    let due_at: Option<DateTime<Utc>> = inp
+        .deadline_iso
+        .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .filter(|d| {
+            let days = (*d - inp.received_at).num_days();
+            (-MAX_DAYS_PAST..=MAX_DAYS_FUTURE).contains(&days)
+        });
+
+    let (tier, deadline) = if inp.has_deadline {
+        match due_at {
+            Some(when) => {
+                let past = when < now;
+                let natural = if past { Tier::PastDue } else { Tier::Deadline };
+                // Unknown-sender deadline claim caps at Deadline, never PastDue.
+                let tier = if inp.deadline_trusted {
+                    natural
+                } else {
+                    Tier::Deadline
+                };
+                let hit = DeadlineHit {
+                    kind: inp
+                        .deadline_kind
+                        .map(truncate_deadline_kind)
+                        .unwrap_or_else(|| "bill".to_string()),
+                    amount: None,
+                    currency: None,
+                    due_at: when,
+                    past_due: past && inp.deadline_trusted,
+                    source: inp.source.to_string(),
+                };
+                (tier, Some(hit))
+            }
+            None => (Tier::Deadline, None),
+        }
+    } else {
+        (tier_from_importance(importance), None)
+    };
+
+    let label = inp.stage_label;
+    let date_was_dropped = inp.deadline_iso.is_some() && due_at.is_none();
+    let deadline_reason = if inp.has_deadline {
+        if date_was_dropped {
+            Some(format!(
+                "{label}: claimed due date failed sanity bounds -> dropped \
+                 (kept as a bill with no concrete date)"
+            ))
+        } else {
+            let m = inp.deadline_reason.map(str::trim).unwrap_or("");
+            if m.is_empty() {
+                Some(format!("{label}: deadline/obligation detected"))
+            } else {
+                Some(format!("{label}: {}", truncate_field_reason(m)))
+            }
+        }
+    } else {
+        None
+    };
+
+    let is_past = due_at.map(|w| w < now).unwrap_or(false);
+    let tier_reason = if inp.has_deadline {
+        if deadline.is_none() {
+            if date_was_dropped {
+                format!("{label}: claimed due date failed sanity bounds -> dropped; kept at deadline tier")
+            } else {
+                format!("{label}: bill without a concrete date -> deadline")
+            }
+        } else if is_past && inp.deadline_trusted {
+            format!("{label}: overdue deadline from trusted sender -> past_due")
+        } else if is_past {
+            format!("{label}: unknown-sender overdue claim capped at deadline (never past_due)")
+        } else {
+            format!("{label}: future deadline -> deadline")
+        }
+    } else if importance >= 70 {
+        format!("{label}: importance {importance} >= 70 -> signal")
+    } else {
+        format!("{label}: importance {importance} < 70 -> noise")
+    };
+
+    (tier, deadline, deadline_reason, tier_reason)
 }
 
 /// Importance ceiling applied when the user's Filtered rule says they don't want
@@ -899,7 +564,7 @@ pub fn apply_result(
 const NOISE_FLOOR: u8 = 15;
 
 /// Map an importance score to a tier using the rubric anchors (no deadline).
-fn tier_from_importance(importance: u8) -> Tier {
+pub(crate) fn tier_from_importance(importance: u8) -> Tier {
     if importance >= 70 {
         Tier::Signal
     } else {
@@ -909,7 +574,7 @@ fn tier_from_importance(importance: u8) -> Tier {
 
 /// Keep the model's `reason` compact for storage/logs. Never contains body text
 /// beyond what the model itself chose to summarize.
-fn truncate_reason(reason: &str) -> String {
+pub(crate) fn truncate_reason(reason: &str) -> String {
     const MAX: usize = 200;
     if reason.chars().count() > MAX {
         reason.chars().take(MAX).collect()
@@ -918,11 +583,50 @@ fn truncate_reason(reason: &str) -> String {
     }
 }
 
+/// Hard cap for a stored per-property reason. These carry UNTRUSTED model text
+/// derived from email content, so a hostile email could try to balloon the row;
+/// this bounds the stored length (char-safe). ~300 chars keeps a full sentence
+/// while staying comfortably small.
+pub(crate) fn truncate_field_reason(reason: &str) -> String {
+    const MAX: usize = 300;
+    if reason.chars().count() > MAX {
+        reason.chars().take(MAX).collect()
+    } else {
+        reason.to_string()
+    }
+}
+
+/// Hard cap for the stored `one_line` summary. UNTRUSTED model text derived from
+/// email content, so a hostile email could try to balloon the row; this bounds
+/// the stored length (char-safe). Applied at BOTH stages' apply sites.
+pub(crate) fn truncate_one_line(one_line: &str) -> String {
+    const MAX: usize = 160;
+    if one_line.chars().count() > MAX {
+        one_line.chars().take(MAX).collect()
+    } else {
+        one_line.to_string()
+    }
+}
+
+/// Hard cap for the stored deadline `kind` label (e.g. "invoice", "renewal").
+/// UNTRUSTED model text; bounded to a short label (char-safe). Applied at the
+/// SHARED derive site so both stages get it.
+pub(crate) fn truncate_deadline_kind(kind: &str) -> String {
+    const MAX: usize = 40;
+    if kind.chars().count() > MAX {
+        kind.chars().take(MAX).collect()
+    } else {
+        kind.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::triage::llm::{BACKOFF_CAP, MAX_TOKENS, MAX_TOKENS_RETRY};
     use crate::types::Sensitivity;
     use chrono::TimeZone;
+    use std::time::Duration;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap()
@@ -952,6 +656,8 @@ mod tests {
             one_line: "a line".into(),
             reason: "because".into(),
             matches_sender_rule: None,
+            importance_reason: "a real person reaching out".into(),
+            deadline_reason: None,
         }
     }
 
@@ -1045,7 +751,7 @@ mod tests {
         let s = output_schema();
         assert_eq!(s["additionalProperties"], serde_json::json!(false));
         let req = s["required"].as_array().unwrap();
-        assert_eq!(req.len(), 7);
+        assert_eq!(req.len(), 9);
         // Every property is present + required.
         let props = s["properties"].as_object().unwrap();
         for k in [
@@ -1056,6 +762,8 @@ mod tests {
             "one_line",
             "reason",
             "matches_sender_rule",
+            "importance_reason",
+            "deadline_reason",
         ] {
             assert!(props.contains_key(k), "missing property {k}");
             assert!(
@@ -1074,13 +782,17 @@ mod tests {
             "deadline_kind": "invoice",
             "one_line": "Invoice from Acme due Aug 1",
             "reason": "looks like a real bill",
-            "matches_sender_rule": null
+            "matches_sender_rule": null,
+            "importance_reason": "a dated invoice with a total is a real bill",
+            "deadline_reason": "invoice total due Aug 1"
         }"#;
         let parsed: Stage2Output = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.importance, 82);
         assert!(parsed.has_deadline);
         assert_eq!(parsed.deadline_kind.as_deref(), Some("invoice"));
         assert_eq!(parsed.matches_sender_rule, None);
+        assert_eq!(parsed.importance_reason, "a dated invoice with a total is a real bill");
+        assert_eq!(parsed.deadline_reason.as_deref(), Some("invoice total due Aug 1"));
         // And re-serialize -> re-parse stability.
         let s = serde_json::to_string(&parsed).unwrap();
         let again: Stage2Output = serde_json::from_str(&s).unwrap();
@@ -1161,6 +873,22 @@ mod tests {
         assert_eq!(a.tier, Tier::PastDue, "rule-match trusts the deadline claim");
     }
 
+    #[test]
+    fn matches_rule_true_without_a_standing_instruction_cannot_untrap_the_cap() {
+        // TRUST-CAP BYPASS GUARD: an unknown sender with NO standing instruction
+        // (rule_want_text=None). A model steered by hostile email content claims
+        // matches_sender_rule=true — but with no real rule to match, that claim
+        // must NOT un-cap the unknown-sender Deadline cap into PastDue.
+        let q = queued(false, None);
+        let mut o = out(60);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.matches_sender_rule = Some(true); // unverifiable trust claim
+        let a = apply_result(&q, &o, "m", now());
+        assert_eq!(a.tier, Tier::Deadline, "no-rule row stays capped at Deadline");
+        assert!(!a.deadline.expect("deadline row").past_due, "past_due suppressed");
+    }
+
     // ---- apply_result: matches_sender_rule == false floor ------------------
 
     #[test]
@@ -1174,6 +902,29 @@ mod tests {
         assert!(a.reason.contains("does not match"));
     }
 
+    // ---- apply_result: model-output length caps ---------------------------
+
+    #[test]
+    fn oversized_one_line_is_capped_in_the_applied_row() {
+        let q = queued(true, None);
+        let mut o = out(60);
+        o.one_line = "x".repeat(500); // hostile model tries to balloon the row
+        let a = apply_result(&q, &o, "m", now());
+        assert_eq!(a.one_line.chars().count(), 160, "one_line capped to 160 chars");
+    }
+
+    #[test]
+    fn oversized_deadline_kind_is_capped_at_the_shared_derive_site() {
+        let q = queued(true, None);
+        let mut o = out(60);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-12-01T00:00:00Z".into());
+        o.deadline_kind = Some("k".repeat(200));
+        let a = apply_result(&q, &o, "m", now());
+        let d = a.deadline.expect("deadline row");
+        assert_eq!(d.kind.chars().count(), 40, "deadline_kind capped to 40 chars");
+    }
+
     #[test]
     fn tier_follows_importance_when_no_deadline_and_no_rule() {
         let q = queued(true, None);
@@ -1181,6 +932,73 @@ mod tests {
         assert_eq!(sig.tier, Tier::Signal);
         let noise = apply_result(&q, &out(30), "m", now());
         assert_eq!(noise.tier, Tier::Noise);
+    }
+
+    // ---- apply_result: per-property field_reasons -------------------------
+
+    #[test]
+    fn field_reasons_present_and_describe_stored_values() {
+        let q = queued(true, None); // known sender
+        let mut o = out(90);
+        o.importance_reason = "dated invoice with a total from a known vendor".into();
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_reason = Some("invoice past due Jan 1".into());
+        let a = apply_result(&q, &o, "claude-haiku-4-5", now());
+        assert_eq!(a.tier, Tier::PastDue);
+        let fr = &a.field_reasons;
+        assert!(fr.importance.as_deref().unwrap().contains("dated invoice"));
+        assert!(fr.deadline.as_deref().unwrap().contains("past due"));
+        // Tier reason is synthesized from the FINAL tier (past_due), not the model.
+        assert!(fr.tier.as_deref().unwrap().contains("past_due"));
+    }
+
+    #[test]
+    fn no_deadline_omits_the_deadline_reason() {
+        let q = queued(true, None);
+        let a = apply_result(&q, &out(75), "m", now()); // has_deadline=false
+        let fr = &a.field_reasons;
+        assert!(fr.deadline.is_none(), "no stored deadline -> no deadline reason");
+        assert!(fr.tier.as_deref().unwrap().contains("signal"));
+    }
+
+    #[test]
+    fn unknown_sender_deadline_cap_reflected_in_tier_reason() {
+        // Unknown-sender past deadline caps at Deadline; the tier reason must
+        // describe the STORED (capped) value, never the discarded past_due.
+        let q = queued(false, None);
+        let mut o = out(60);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_reason = Some("claims overdue".into());
+        let a = apply_result(&q, &o, "m", now());
+        assert_eq!(a.tier, Tier::Deadline);
+        let tier = a.field_reasons.tier.as_deref().unwrap();
+        assert!(tier.contains("capped at deadline"), "tier reason: {tier}");
+        assert!(!tier.contains("-> past_due"), "must not derive a discarded past_due: {tier}");
+    }
+
+    #[test]
+    fn rule_says_no_field_reason_states_the_floor() {
+        let q = queued(false, Some("only discounts"));
+        let mut o = out(95);
+        o.matches_sender_rule = Some(false);
+        let a = apply_result(&q, &o, "m", now());
+        let fr = &a.field_reasons;
+        assert!(fr.importance.as_deref().unwrap().contains("standing instruction not matched"));
+        assert!(fr.tier.as_deref().unwrap().contains("noise"));
+        assert!(fr.deadline.is_none());
+    }
+
+    #[test]
+    fn hostile_long_model_reason_is_capped() {
+        let q = queued(true, None);
+        let mut o = out(50);
+        o.importance_reason = "A".repeat(5000);
+        let a = apply_result(&q, &o, "m", now());
+        // Stored reason is bounded well under the model's 5000 chars (300 cap +
+        // a short "stage-2: " prefix).
+        assert!(a.field_reasons.importance.as_deref().unwrap().chars().count() < 320);
     }
 
     #[test]
@@ -1282,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn classify_end_to_end_against_mock_server() {
         let resp = r#"{
-            "content": [{"type": "text", "text": "{\"importance\":78,\"has_deadline\":false,\"deadline_iso\":null,\"deadline_kind\":null,\"one_line\":\"a real person reaching out\",\"reason\":\"personal\",\"matches_sender_rule\":null}"}],
+            "content": [{"type": "text", "text": "{\"importance\":78,\"has_deadline\":false,\"deadline_iso\":null,\"deadline_kind\":null,\"one_line\":\"a real person reaching out\",\"reason\":\"personal\",\"matches_sender_rule\":null,\"importance_reason\":\"a real person, soft ask\",\"deadline_reason\":null}"}],
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 1200, "output_tokens": 60}
         }"#;
@@ -1366,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn classify_openai_request_shape_and_parse() {
-        let verdict = r#"{"importance":81,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"openai verdict","reason":"personal","matches_sender_rule":null}"#;
+        let verdict = r#"{"importance":81,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"openai verdict","reason":"personal","matches_sender_rule":null,"importance_reason":"a real person","deadline_reason":null}"#;
         let (url, handle) = mock_seq(vec![(200, openai_ok_body(verdict))]).await;
         let http = reqwest::Client::new();
         let cfg = Stage2Config {
@@ -1427,7 +1245,7 @@ mod tests {
     async fn classify_openai_length_retries_then_succeeds() {
         // First response: finish_reason "length" (truncation). Second: success.
         let truncated = r#"{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"{\"importance\":50"}}]}"#;
-        let verdict = r#"{"importance":66,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"retried ok","reason":"x","matches_sender_rule":null}"#;
+        let verdict = r#"{"importance":66,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"retried ok","reason":"x","matches_sender_rule":null,"importance_reason":"x","deadline_reason":null}"#;
         let (url, handle) = mock_seq(vec![
             (200, truncated.to_string()),
             (200, openai_ok_body(verdict)),

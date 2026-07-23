@@ -32,21 +32,28 @@
 //! 6. **FALL-THROUGH** — unknown sender, no pattern -> the ambiguous middle:
 //!    Noise-ish importance but **not confident**, so Stage-2 gets a look.
 
+pub mod calendar;
 pub mod deadline;
+pub mod llm;
 pub mod receipt;
+pub mod receipt_match;
 pub mod rules;
 pub mod seal;
 pub mod shipment;
+pub mod stage1_llm;
 pub mod stage2;
 
+pub use calendar::{CalendarInfo, CalendarKind, detect_calendar};
 pub use deadline::DeadlineHit;
 pub use receipt::{ReceiptInfo, detect_receipt};
 pub use shipment::{ShipmentInfo, ShipmentStatus, detect_shipment};
 
 use crate::config::Stage1Config;
 use crate::error::CoreError;
-use crate::store::Stage2Queued;
-use crate::types::{Disposition, NewMessage, SealedKind, SenderRule, Sensitivity, Tier};
+use crate::store::{Stage1Queued, Stage2Queued};
+use crate::types::{
+    Disposition, FieldReasons, NewMessage, SealedKind, SenderRule, Sensitivity, Tier,
+};
 use chrono::{DateTime, Utc};
 
 /// Result of the Stage-1 rules engine for a single (non-sealed) message.
@@ -64,6 +71,11 @@ pub struct Stage1Result {
     pub matched_rule: Option<i64>,
     /// `true` => final; `false` => queue for Stage-2 LLM triage.
     pub confident: bool,
+    /// Per-property justifications for THIS row's importance / deadline / tier,
+    /// stated as the fact of the branch that produced them. Deterministic —
+    /// derived from the actual rung taken, never generic copy. Threaded to the
+    /// store and served HUMAN-DOOR ONLY (see [`crate::types::FieldReasons`]).
+    pub field_reasons: FieldReasons,
 }
 
 /// Legacy triage outcome kept for the store/upsert path. Prefer [`Stage1Result`].
@@ -194,6 +206,49 @@ pub fn stage1_with_config(
             reason.push_str("; screamy/scam phrasing dampener");
         }
 
+        // Per-property reasons, each derived from the branch's actual facts.
+        let importance_reason = if trusted {
+            let src = if surface_ruled {
+                "surface rule"
+            } else {
+                "known contact"
+            };
+            format!("trusted bill via {src} -> importance {importance}")
+        } else {
+            format!("bill from unknown, unruled sender -> capped importance {importance}")
+        };
+        let deadline_reason = format!(
+            "bill signal '{}' matched in {} (due {}, past_due={})",
+            hit.kind,
+            hit.source,
+            hit.due_at.format("%Y-%m-%d"),
+            hit.past_due
+        );
+        // "capped" wording only when a cap actually BIT (the bill was past due
+        // and would have surfaced past_due absent the trust/dampening rule) — a
+        // future-dated bill's natural tier is already deadline, no cap occurred.
+        let tier_reason = if tier == Tier::PastDue {
+            "overdue bill from trusted sender -> past_due".to_string()
+        } else if !trusted {
+            if hit.past_due {
+                "overdue claim from untrusted (unknown, unruled) sender capped at deadline, \
+                 never past_due"
+                    .to_string()
+            } else {
+                "future-dated bill from untrusted (unknown, unruled) sender -> deadline"
+                    .to_string()
+            }
+        } else if dampened {
+            if hit.past_due {
+                "trusted overdue bill dampened (absurd amount / scam phrasing) -> capped at deadline"
+                    .to_string()
+            } else {
+                "trusted bill dampened (absurd amount / scam phrasing) -> deadline".to_string()
+            }
+        } else {
+            "future-dated bill -> deadline".to_string()
+        };
+
         return Stage1Result {
             tier,
             importance,
@@ -202,6 +257,11 @@ pub fn stage1_with_config(
             deadline: Some(hit),
             matched_rule: None,
             confident,
+            field_reasons: FieldReasons {
+                importance: Some(importance_reason),
+                deadline: Some(deadline_reason),
+                tier: Some(tier_reason),
+            },
         };
     }
 
@@ -217,6 +277,14 @@ pub fn stage1_with_config(
                 deadline: None,
                 matched_rule: Some(rule.id),
                 confident: true,
+                field_reasons: FieldReasons {
+                    importance: Some(format!(
+                        "sender rule #{} (squelch) -> noise importance {}",
+                        rule.id, cfg.rule_squelch_importance
+                    )),
+                    deadline: None,
+                    tier: Some(format!("squelch rule #{} -> noise", rule.id)),
+                },
             },
             Disposition::Surface => Stage1Result {
                 tier: Tier::Signal,
@@ -226,6 +294,14 @@ pub fn stage1_with_config(
                 deadline: None,
                 matched_rule: Some(rule.id),
                 confident: true,
+                field_reasons: FieldReasons {
+                    importance: Some(format!(
+                        "sender rule #{} (surface) -> signal importance {}",
+                        rule.id, cfg.rule_surface_importance
+                    )),
+                    deadline: None,
+                    tier: Some(format!("surface rule #{} -> signal", rule.id)),
+                },
             },
             // Filtered: the rule's `want_text` is a natural-language predicate we
             // cannot evaluate without the LLM. Park it in Noise but mark it
@@ -246,6 +322,17 @@ pub fn stage1_with_config(
                 deadline: None,
                 matched_rule: Some(rule.id),
                 confident: false,
+                field_reasons: FieldReasons {
+                    importance: Some(format!(
+                        "filtered rule #{} -> provisional noise importance {} pending Stage-2 want_text eval",
+                        rule.id, cfg.rule_filtered_importance
+                    )),
+                    deadline: None,
+                    tier: Some(format!(
+                        "filtered rule #{} -> noise (deferred to Stage-2)",
+                        rule.id
+                    )),
+                },
             },
         };
     }
@@ -260,6 +347,14 @@ pub fn stage1_with_config(
             deadline: None,
             matched_rule: None,
             confident: true,
+            field_reasons: FieldReasons {
+                importance: Some(format!(
+                    "known contact (appears in your Sent mail) -> signal importance {}",
+                    cfg.known_contact_importance
+                )),
+                deadline: None,
+                tier: Some("known contact -> signal".to_string()),
+            },
         };
     }
 
@@ -273,6 +368,14 @@ pub fn stage1_with_config(
             deadline: None,
             matched_rule: None,
             confident: true,
+            field_reasons: FieldReasons {
+                importance: Some(format!(
+                    "automated alert (build/outage/incident language) -> signal importance {}",
+                    cfg.alert_importance
+                )),
+                deadline: None,
+                tier: Some("automated alert -> signal".to_string()),
+            },
         };
     }
 
@@ -298,6 +401,14 @@ pub fn stage1_with_config(
         deadline: None,
         matched_rule: None,
         confident: false,
+        field_reasons: FieldReasons {
+            importance: Some(format!(
+                "unknown sender fell through to ambiguous band -> provisional importance {} pending Stage-2",
+                cfg.fallthrough_importance
+            )),
+            deadline: None,
+            tier: Some("ambiguous fall-through -> noise (deferred to Stage-2)".to_string()),
+        },
     }
 }
 
@@ -310,6 +421,11 @@ fn noise(cfg: &Stage1Config, subject: &str, reason: &str) -> Stage1Result {
         deadline: None,
         matched_rule: None,
         confident: true,
+        field_reasons: FieldReasons {
+            importance: Some(format!("{reason} -> noise importance {}", cfg.noise_importance)),
+            deadline: None,
+            tier: Some(format!("{reason} -> noise")),
+        },
     }
 }
 
@@ -356,6 +472,23 @@ pub fn stage2_sealed_guard(row: &Stage2Queued) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// The SEALED GUARD for Stage-1 (defense in depth), mirroring
+/// [`stage2_sealed_guard`]. The Stage-1 queue predicate already excludes sealed
+/// rows in SQL (`sensitivity='normal'`); this is the second layer — a REAL
+/// release-mode check that refuses to let any sealed row cross into the Stage-1
+/// LLM path. Call it on every queued row immediately before building the API
+/// request. Returns `Err(CoreError::InvalidInput)` on a sealed row (redacted: no
+/// subject/body/sender — just the invariant and the id).
+pub fn stage1_sealed_guard(row: &Stage1Queued) -> crate::error::Result<()> {
+    if matches!(row.sensitivity, Sensitivity::Sealed) {
+        return Err(CoreError::InvalidInput(format!(
+            "stage-1 sealed guard: message {} is sealed and must never reach the LLM",
+            row.message_id
+        )));
+    }
+    Ok(())
+}
+
 /// Back-compat guard entry kept for callers that only have a [`Sensitivity`].
 /// Replaces the old `debug_assert!`-only stub with a REAL release-mode check:
 /// returns an error for sealed input instead of compiling the assertion out.
@@ -394,6 +527,8 @@ mod tests {
             body: body.into(),
             body_html: None,
             is_sent: false,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
         }
     }
 
@@ -783,6 +918,84 @@ mod tests {
         let _ = stage1(&m, true, &[]);
     }
 
+    // ---- Per-property field_reasons (branch-accurate) -------------------
+
+    #[test]
+    fn field_reasons_for_known_contact_branch() {
+        let m = msg("alice@friends.com", "dinner", "friday?");
+        let r = run(&m, true, &[]);
+        let fr = &r.field_reasons;
+        let imp = fr.importance.as_deref().unwrap();
+        assert!(imp.contains("known contact"), "importance reason: {imp}");
+        assert!(imp.contains("70"), "states the actual importance: {imp}");
+        assert_eq!(fr.tier.as_deref(), Some("known contact -> signal"));
+        // A known-contact row carries no deadline, so no deadline reason.
+        assert!(fr.deadline.is_none());
+    }
+
+    #[test]
+    fn field_reasons_for_sender_rule_branch() {
+        let m = msg("promo@shop.com", "50% off", "buy");
+        let rules = vec![rule(4, "*@shop.com", Disposition::Squelch, "")];
+        let r = run(&m, false, &rules);
+        let fr = &r.field_reasons;
+        let imp = fr.importance.as_deref().unwrap();
+        assert!(imp.contains("sender rule #4"), "names the rule id: {imp}");
+        assert!(imp.contains("squelch"), "names the disposition: {imp}");
+        assert_eq!(fr.tier.as_deref(), Some("squelch rule #4 -> noise"));
+        assert!(fr.deadline.is_none());
+    }
+
+    #[test]
+    fn field_reasons_for_deadline_hit_branch() {
+        // Known sender past-due bill: importance/deadline/tier reasons all present
+        // and describe the STORED values.
+        let m = msg(
+            "billing@utilityco.com",
+            "PAST DUE: Your electric bill",
+            "Amount due $84.20. This payment is overdue.",
+        );
+        let r = run(&m, true, &[]);
+        assert_eq!(r.tier, Tier::PastDue);
+        let fr = &r.field_reasons;
+        let dl = fr.deadline.as_deref().expect("deadline reason present");
+        assert!(dl.contains("past_due=true"), "deadline reason states past-due: {dl}");
+        assert!(dl.contains("bill signal"), "deadline reason names the matched signal: {dl}");
+        let tier = fr.tier.as_deref().unwrap();
+        assert!(tier.contains("past_due"), "tier reason states the stored tier: {tier}");
+        let imp = fr.importance.as_deref().unwrap();
+        assert!(imp.contains("trusted bill"), "importance reason: {imp}");
+    }
+
+    #[test]
+    fn field_reasons_for_untrusted_bill_states_the_cap() {
+        // Unknown-sender bill: tier reason must describe the WINNING value
+        // (capped at deadline), never the discarded past_due it might have looked like.
+        let m = msg(
+            "billing@unknown-vendor.example",
+            "Invoice past due",
+            "Your invoice for $120.00 is past due.",
+        );
+        let r = run(&m, false, &[]);
+        assert_eq!(r.tier, Tier::Deadline);
+        let tier = r.field_reasons.tier.as_deref().unwrap();
+        assert!(tier.contains("capped at deadline"), "tier reason: {tier}");
+        assert!(!tier.contains("-> past_due"), "must not derive a discarded past_due: {tier}");
+    }
+
+    #[test]
+    fn field_reasons_for_ambiguous_fallthrough_branch() {
+        let m = msg("random@nowhere.org", "hey", "reaching out about something");
+        let r = run(&m, false, &[]);
+        assert!(!r.confident);
+        let fr = &r.field_reasons;
+        let imp = fr.importance.as_deref().unwrap();
+        assert!(imp.contains("fell through"), "importance reason: {imp}");
+        assert!(imp.contains("Stage-2"), "notes the deferral: {imp}");
+        assert!(fr.tier.as_deref().unwrap().contains("ambiguous"));
+        assert!(fr.deadline.is_none());
+    }
+
     // ---- Stage-2 sealed guard (real, release-mode) ----------------------
 
     fn queued_row(sensitivity: Sensitivity) -> Stage2Queued {
@@ -811,6 +1024,31 @@ mod tests {
     fn sealed_guard_allows_normal_row() {
         let row = queued_row(Sensitivity::Normal);
         assert!(stage2_sealed_guard(&row).is_ok());
+    }
+
+    fn stage1_queued_row(sensitivity: Sensitivity) -> Stage1Queued {
+        Stage1Queued {
+            message_id: 7,
+            account_id: 1,
+            thread_id: "t".into(),
+            from_addr: "x@y.com".into(),
+            subject: "s".into(),
+            body: "b".into(),
+            received_at: Utc::now(),
+            is_known_contact: false,
+            sensitivity,
+        }
+    }
+
+    #[test]
+    fn stage1_sealed_guard_rejects_sealed_allows_normal() {
+        let sealed = stage1_queued_row(Sensitivity::Sealed);
+        assert!(matches!(
+            stage1_sealed_guard(&sealed).unwrap_err(),
+            CoreError::InvalidInput(_)
+        ));
+        let normal = stage1_queued_row(Sensitivity::Normal);
+        assert!(stage1_sealed_guard(&normal).is_ok());
     }
 
     #[test]

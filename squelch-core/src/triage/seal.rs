@@ -32,6 +32,16 @@ struct Detector {
     /// Weaker login-ish phrasing that only seals when corroborated by a
     /// security-shaped sender.
     login_soft: Vec<Regex>,
+    /// Concrete, reader-addressed OTP codes (digits or "your code is"). These
+    /// seal even when the email otherwise looks like marketing — a genuine code
+    /// leak is the highest-stakes miss.
+    otp_code: Vec<Regex>,
+    /// Marketing / newsletter markers (unsubscribe, "view in browser", …). An
+    /// auth-as-a-service vendor (WorkOS, Auth0, Clerk, …) sends newsletters that
+    /// talk about 2FA/SSO/magic-links as PRODUCTS; those must NOT be sealed.
+    /// When these fire, topical auth mentions are ignored (a real 2FA/reset
+    /// email is transactional, never a marketing blast).
+    marketing: Vec<Regex>,
 }
 
 fn rx(p: &str) -> Regex {
@@ -104,6 +114,22 @@ fn detector() -> &'static Detector {
             rx(r"\bsign(ed)?[-\s]?in\b"),
             rx(r"\baccount (access|activity)\b"),
         ],
+        otp_code: vec![
+            // Reader-addressed codes — a newsletter never says these TO you.
+            rx(r"\bcode[:\s]+\d{4,8}\b"),
+            rx(r"\b\d{4,8}\s+is your\b"),
+            rx(r"\byour code is\b"),
+            rx(r"\benter (this|the following) code\b"),
+        ],
+        marketing: vec![
+            rx(r"\bunsubscribe\b"),
+            rx(r"\bview (this )?(email|message)?\s*in (your )?browser\b"),
+            rx(r"\bmanage (your )?(email |notification )?preferences\b"),
+            rx(r"\b(email|notification) preferences\b"),
+            rx(r"\byou('?re| are) receiving this (email|message)\b"),
+            rx(r"\bwebinar\b"),
+            rx(r"\bnewsletter\b"),
+        ],
     })
 }
 
@@ -118,6 +144,20 @@ fn any_match(regexes: &[Regex], haystacks: &[&str]) -> bool {
 pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
     let d = detector();
     let hay = [input.subject, input.body];
+
+    // A concrete, reader-addressed OTP code always seals — even if the email
+    // otherwise looks like marketing. This is the highest-stakes leak.
+    if any_match(&d.otp_code, &hay) {
+        return Some(SealedKind::Otp);
+    }
+
+    // Marketing / newsletter blast: an auth-as-a-service vendor's newsletter
+    // talks about 2FA / SSO / magic-links as PRODUCT features. Those topical
+    // mentions must NOT seal it (a genuine auth email is transactional, never a
+    // marketing blast). The concrete-code check above still wins over this.
+    if any_match(&d.marketing, &hay) {
+        return None;
+    }
 
     if any_match(&d.otp, &hay) {
         return Some(SealedKind::Otp);
@@ -299,6 +339,51 @@ mod tests {
                 "Sign in to see 20% off. Unsubscribe anytime.",
             )),
             None,
+        );
+    }
+
+    #[test]
+    fn auth_vendor_newsletter_does_not_seal() {
+        // WorkOS et al. sell auth; their newsletters talk about 2FA / SSO /
+        // magic links as PRODUCTS. With marketing markers present, topical auth
+        // mentions must NOT seal.
+        let cases = [
+            (
+                "marketing@workos.com",
+                "Ship SSO and 2FA faster",
+                "Our new magic link and two-factor APIs are live. Read the blog. Unsubscribe.",
+            ),
+            (
+                "hello@auth0.com",
+                "The passwordless newsletter",
+                "Everything about OTP and magic links this month. Manage your email preferences.",
+            ),
+            (
+                "team@clerk.com",
+                "Add authentication in minutes",
+                "New: verify your users with a one-time passcode flow. View this email in your browser.",
+            ),
+        ];
+        for (f, s, b) in cases {
+            assert_eq!(
+                detect_sealed(&inp_from(f, s, b)),
+                None,
+                "auth-vendor newsletter wrongly sealed: {f:?} {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_code_seals_even_with_marketing_footer() {
+        // A genuine OTP with a footer must still seal — the concrete-code check
+        // wins over the marketing guard.
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "noreply@service.com",
+                "Your verification code",
+                "Your code is 448201. If this wasn't you, ignore. Unsubscribe.",
+            )),
+            Some(SealedKind::Otp),
         );
     }
 

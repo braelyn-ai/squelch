@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS messages (
     -- serving is guarded — sealed threads are NotFound on every non-local door).
     body_html   TEXT,
     is_sent     INTEGER NOT NULL DEFAULT 0,
+    -- Raw `List-Unsubscribe` header value (comma-separated <mailto:…>/<https:…>
+    -- entries), NULL when the mail carried no such header. Captured at ingest;
+    -- consumed ONLY by the human door's unsubscribe endpoint (never /mcp).
+    list_unsubscribe TEXT,
+    -- 1 when the mail advertised RFC 8058 one-click unsubscribe
+    -- (`List-Unsubscribe-Post: List-Unsubscribe=One-Click`).
+    list_unsub_one_click INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, gmail_msg_id)
 );
 
@@ -71,8 +78,26 @@ CREATE TABLE IF NOT EXISTS triage (
     sealed_kind     TEXT,
     one_line        TEXT NOT NULL DEFAULT '',
     reason          TEXT NOT NULL DEFAULT '',
+    -- Per-property triage justifications, a JSON object
+    -- {importance?,deadline?,tier?} of short human-readable reasons for each
+    -- property's value. NULL for rows written before this feature. HUMAN-DOOR
+    -- ONLY: served flattened into GET /client/updates; NEVER crosses /mcp (the
+    -- agent-door read path leaves it unset).
+    field_reasons   TEXT,
     deadline        TEXT,
     matched_rule_id INTEGER,
+    -- STAGE-1 LLM marker. NULL = this row still needs the Stage-1 LLM refine
+    -- pass (its heuristic seed values are provisional). Stamped with the Stage-1
+    -- model id once refined, 'rule' for a row an explicit/Filtered sender rule
+    -- already decided (no Stage-1 model spend), or 'heuristic-only' when the
+    -- Stage-1 pass fell back to the seed (API down / refusal / permanent error).
+    stage1_model_used TEXT,
+    -- Set to 1 by the Stage-1 pass (confident=false), or at ingest for a Filtered
+    -- rule needing want_text evaluation, to mark the row for Stage-2 escalation.
+    needs_stage2    INTEGER NOT NULL DEFAULT 0,
+    -- STAGE-2 LLM marker. NULL = not yet Stage-2 processed. The Stage-2 queue
+    -- predicate is `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
+    -- model_used IS NULL AND sensitivity='normal'`.
     model_used      TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
@@ -136,7 +161,9 @@ CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status)
 -- `amount`/`currency` are best-effort — a receipt with no parseable total is
 -- still a receipt (amount NULL). A receipt and a shipment can COEXIST (an order
 -- confirmation with a total AND tracking is both); receipt detection is
--- independent of shipment detection.
+-- independent of shipment detection. A landing receipt may also AUTO-CLOSE one
+-- matching open bill (conservative merchant+amount+recency rules, audited as
+-- bill.auto_close — see triage/receipt_match.rs).
 --
 -- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A RECEIPT. The
 -- ingest path runs receipt detection ONLY for sensitivity='normal' mail, so this
@@ -155,6 +182,69 @@ CREATE TABLE IF NOT EXISTS receipts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_receipts_received ON receipts(account_id, received_at);
+
+-- CALENDAR UPDATES. One row per (account, message): an invite / updated
+-- invitation / cancellation / RSVP response, extracted from NON-SEALED calendar
+-- mail (Google Calendar notification subjects, Outlook invite shapes,
+-- ics-bearing mail) by the ingest pipeline. Like receipts, these are RECORDS of
+-- scheduling state (the user's real calendar is the source of truth) — they
+-- live ONLY in the desktop "Calendar" zone and are auto-resolved
+-- (triage.status='done') at ingest so they never surface as New/Attention/Aging
+-- clutter. `kind` is invite|update|cancellation|response;
+-- `event_title`/`starts_at`/`organizer` are best-effort (NULL is fine — the
+-- classification is driven by the structural subject shape, not extraction).
+-- The /client/calendar window filters on received_at (mail arrival), NOT
+-- starts_at (event time).
+--
+-- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A CALENDAR
+-- UPDATE. The ingest path runs calendar detection ONLY for sensitivity='normal'
+-- mail, so this table has no sealed rows BY CONSTRUCTION — there is nothing to
+-- leak and no sealed join is needed on read.
+CREATE TABLE IF NOT EXISTS calendar_updates (
+    id          INTEGER PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    event_title TEXT,
+    starts_at   TEXT,
+    organizer   TEXT,
+    received_at TEXT NOT NULL,
+    UNIQUE(account_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_received ON calendar_updates(account_id, received_at);
+
+-- UNSUBSCRIBES. One row per (account, sender_addr): the human-door record that
+-- the user asked to stop hearing from a sender, plus the "did they honor it?"
+-- violation ledger. Created/updated by POST /client/unsubscribe (upsert: a fresh
+-- request RESETS violation_count/last_violation_at/resolution — the user
+-- re-asked, so the 72h grace clock restarts). `method` is always 'browser' —
+-- the client opens the unsubscribe link; the server never delivers anything
+-- itself (legacy one_click/mailto values can only exist in pre-revision dev
+-- DBs). `source_message_id` is the message the unsubscribe was actioned from
+-- (nullable; the message may later be deleted). `resolution` is blocked|
+-- dismissed|NULL — NULL means the request is still outstanding and the violation
+-- detector is armed.
+--
+-- VIOLATION SEMANTICS (applied in the ingest transaction, store side): when a
+-- NON-SENT inbound message is stored, if an unsubscribes row exists for
+-- (account_id, lower(from_addr)) with resolution IS NULL and the message's
+-- received_at is more than 72h after requested_at, violation_count is
+-- incremented and last_violation_at set to that received_at.
+CREATE TABLE IF NOT EXISTS unsubscribes (
+    id                INTEGER PRIMARY KEY,
+    account_id        INTEGER NOT NULL,
+    sender_addr       TEXT NOT NULL,
+    requested_at      TEXT NOT NULL,
+    method            TEXT NOT NULL,
+    source_message_id INTEGER,
+    violation_count   INTEGER NOT NULL DEFAULT 0,
+    last_violation_at TEXT,
+    resolution        TEXT,
+    UNIQUE(account_id, sender_addr)
+);
+
+CREATE INDEX IF NOT EXISTS idx_unsubscribes_requested ON unsubscribes(account_id, requested_at);
 
 -- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
 -- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
@@ -186,20 +276,37 @@ CREATE TABLE IF NOT EXISTS wake_budget (
     PRIMARY KEY(account_id, thread_id, day)
 );
 
--- STAGE-2 USAGE LEDGER. One row per (account, UTC day): running totals of the
--- Anthropic Messages API usage the Stage-2 pass consumed. `calls` counts
--- SUCCESSFUL classify responses that carried a usage block; input/output tokens
--- are summed from each response's usage. Read by GET /client/stats to surface
--- today's usage + an estimated cost (cost is computed at read time from the
--- config-driven per-MTok prices, so it is NOT stored here). Schema applies fresh
--- on open; dev dbs get reset.
+-- LLM USAGE LEDGER. One row per (account, UTC day, category): running totals of
+-- the Messages API usage each triage stage consumed. `category` is 'stage1' or
+-- 'stage2' — the two stages are SEPARATE categories the client renders
+-- independently. `calls` counts SUCCESSFUL classify responses that carried a
+-- usage block; input/output tokens are summed from each response's usage. Read
+-- by GET /client/stats + /client/usage to surface usage + an estimated cost
+-- (cost is computed at read time from the config-driven per-MTok prices, so it
+-- is NOT stored here). Schema applies fresh on open; dev dbs get reset.
 CREATE TABLE IF NOT EXISTS stage2_usage (
     account_id    INTEGER NOT NULL,
     day           TEXT NOT NULL,
+    category      TEXT NOT NULL DEFAULT 'stage2',
     calls         INTEGER NOT NULL DEFAULT 0,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY(account_id, day)
+    PRIMARY KEY(account_id, day, category)
+);
+
+-- RUNTIME APP SETTINGS. A tiny per-account key/value table for operator knobs a
+-- client can change at runtime WITHOUT editing config.toml or restarting the
+-- daemon. Currently holds the Stage-2 daily-cap overrides
+-- (stage2_thread_daily_cap / stage2_sender_daily_cap / stage2_global_daily_cap),
+-- set via the human door's POST /client/triage-config. Precedence at read time:
+-- an app_settings OVERRIDE wins over the config/env value, which wins over the
+-- built-in default. `value` is stored as TEXT (parsed by the reader). Schema
+-- applies fresh on open; dev dbs get reset.
+CREATE TABLE IF NOT EXISTS app_settings (
+    account_id INTEGER NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    UNIQUE(account_id, key)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
@@ -229,8 +336,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vecs USING vec0(
 
 -- Audit log for the HUMAN DOOR (squelch-api /client/*). Every sealed-body
 -- reveal (and, later, every write action) appends a row here BEFORE returning.
--- This table is human-door-only; it is never read or written by MCP, sync, or
--- triage. account_id scopes rows to an account like every other owned table.
+-- This table is never read or written by MCP. Besides the human door, ONE
+-- internal writer exists: the ingest receipt->bill auto-close appends a row
+-- (actor='ingest', action='bill.auto_close') when a receipt resolves an open
+-- bill, so that state change is always explainable to the user. account_id
+-- scopes rows to an account like every other owned table.
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY,
     account_id INTEGER NOT NULL,

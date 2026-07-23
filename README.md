@@ -10,7 +10,7 @@ The name comes from the radio control that mutes everything below a signal thres
 Gmail (REST API, gmail.readonly OAuth)
         |  polling via history.list
         v
-squelchd ── sync ──> SQLite ──> triage (rules first, LLM later)
+squelchd ── sync ──> SQLite ──> triage (seal -> rules -> 2-stage LLM)
         |
         ├── /mcp      agent door: 7 read tools, no writes,
         |             auth emails (2FA, resets) structurally absent
@@ -19,7 +19,7 @@ squelchd ── sync ──> SQLite ──> triage (rules first, LLM later)
 ```
 
 - **Sync**: polls Gmail every 45s with a read-only token. Sent mail seeds a "people I know" contact list, which is the strongest cheap triage signal.
-- **Triage**: a rules ladder decides most mail with no model call (bills, known contacts, alerts, newsletters, cold sales). The ambiguous middle is queued for a budgeted LLM pass.
+- **Triage**: deterministic first, models second. Seal detection runs before anything else — auth mail is sealed at ingest and never reaches any LLM. Your sender rules also decide deterministically: a squelch/surface rule settles that sender with zero model spend. Everything else is stored with heuristic seed values (the rules ladder: bills, known contacts, alerts, newsletters, cold sales), then refined within the sync cycle by a small Stage-1 model (default `claude-haiku-4-5`) that scores every one of those emails: importance, tier, deadline, one-liner, plus a per-property "why". Rows the small model isn't confident about — and filtered-rule mail whose natural-language `want_text` needs actual judgment — escalate to a more capable Stage-2 model (default `claude-sonnet-5`). Each stage has its own daily budget caps (one global cap for Stage-1, which sees nearly everything; per-thread, per-sender, and global caps for Stage-2) and its own token/cost ledger; no API key or an exhausted budget just means rows keep their heuristic values.
 - **Two doors**: agents connect to `/mcp` and get ranked summaries. They cannot send, archive, delete, or see auth-related mail. Your own clients connect to `/client` with a bearer token and get search, threads, sender rules, the sitrep lifecycle, and gated actions (archive, label, send) backed by a separate write-scoped token that only the action handlers can load.
 
 ## Getting started
@@ -43,6 +43,8 @@ SQUELCH_API_TOKEN=$(openssl rand -hex 32)   # for the human door
 ```
 
 Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`.
+
+To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key/provider; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be overridden at runtime (no restart) from the desktop app's Settings.
 
 ### 3. Authorize and run
 
@@ -79,11 +81,12 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 
 | Crate | What it is |
 |---|---|
-| `squelch-core` | types, SQLite store, triage rules, seal detection, Gmail sync, OAuth |
-| `squelch-mcp` | the agent door (rmcp server, stdio or HTTP) |
-| `squelch-api` | the human door (axum, bearer auth, actions, audit log) |
-| `squelchd` | the daemon binary: `auth`, `run`, `serve` |
-| `squelch-tui` | local ratatui viewer for setup and debugging |
+| `squelch-core` | types, SQLite store, seal detection, two-stage triage (rules + LLM), Gmail sync, OAuth |
+| [`squelch-mcp`](squelch-mcp/README.md) | the agent door (rmcp server, stdio or HTTP) |
+| [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) |
+| [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
+| [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
+| [`squelch-desktop`](squelch-desktop/README.md) | the Tauri desktop client over the human door |
 
 Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
 

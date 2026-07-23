@@ -12,13 +12,14 @@ use zerocopy::AsBytes;
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    MissingVector, NewAuditEntry, SealedBody, SealedMessage, SitrepBand, Stage2Applied,
-    Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
+    MessageUnsub, MissingVector, NewAuditEntry, SealedBody, SealedMessage, SitrepBand,
+    Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage,
+    Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, ClientMessage,
-    ClientThreadView, Deadline, Disposition, NewMessage, Receipt, SanitizedMessage, SearchHit,
-    SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, CalendarUpdate,
+    ClientMessage, ClientThreadView, Deadline, Disposition, NewMessage, Receipt, SanitizedMessage,
+    SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -89,6 +90,11 @@ impl SqliteStore {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        // SCHEMA is all `CREATE TABLE IF NOT EXISTS`, so a pre-existing DB keeps
+        // its old `messages` shape and never picks up freshly-added columns from
+        // the CREATE. Run the additive column migrations so existing installs
+        // upgrade cleanly (new tables/indexes are covered by IF NOT EXISTS).
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             embedder: RwLock::new(None),
@@ -224,10 +230,15 @@ impl SqliteStore {
         deadline: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let conn = self.lock()?;
+        // TEST HELPER: rows created here are treated as Stage-1-finished and
+        // escalated (`stage1_model_used='rule'`, `needs_stage2=1`) so they land in
+        // the Stage-2 queue exactly as the old `model_used IS NULL` rows did —
+        // this is the migration of the pre-two-stage queue semantics.
         conn.execute(
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
-                 sealed_kind, one_line, reason, deadline, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                 sealed_kind, one_line, reason, deadline,
+                 stage1_model_used, needs_stage2, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'rule',1,?10)
              ON CONFLICT(message_id) DO UPDATE SET
                  importance=excluded.importance, tier=excluded.tier,
                  sensitivity=excluded.sensitivity, sealed_kind=excluded.sealed_kind,
@@ -245,6 +256,25 @@ impl SqliteStore {
                 deadline.map(|d| d.to_rfc3339()),
                 Utc::now().to_rfc3339(),
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Test/local helper: set the per-property `field_reasons` JSON blob on an
+    /// existing triage row. Real reasons are written by the triage pipeline;
+    /// this lets tests seed the human-door insight column directly.
+    pub fn set_field_reasons(
+        &self,
+        message_id: i64,
+        account_id: AccountId,
+        field_reasons: &crate::types::FieldReasons,
+    ) -> Result<()> {
+        let json = serde_json::to_string(field_reasons).ok();
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE triage SET field_reasons = ?3
+             WHERE message_id = ?1 AND account_id = ?2",
+            params![message_id, account_id, json],
         )?;
         Ok(())
     }
@@ -480,19 +510,155 @@ impl SqliteStore {
 }
 
 
+/// Add `column` (`decl` = its type + constraints) to `table` if the table does
+/// not already have it. Idempotent: the codebase has no schema-version counter,
+/// so we detect the existing columns via `PRAGMA table_info` and only `ALTER
+/// TABLE ADD COLUMN` when the column is genuinely missing. This upgrades
+/// pre-existing installs (whose `CREATE TABLE IF NOT EXISTS` left the old shape
+/// in place) without disturbing fresh DBs that already carry the column.
+///
+/// Returns `true` iff the column was actually added this call (i.e. the DB was a
+/// pre-existing install missing it). Callers use that to run a ONE-TIME backfill
+/// only on the open that first introduces the column — never on fresh DBs (where
+/// `schema.sql` already carries it) and never on subsequent opens.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    let mut present = false;
+    let mut any = false;
+    for c in cols {
+        any = true;
+        if c? == column {
+            present = true;
+            break;
+        }
+    }
+    // An empty `table_info` means the table does not exist yet (every real table
+    // has >= 1 column). The real open path applies `schema.sql` before `migrate`,
+    // so the table is always present there; skipping when absent just keeps this
+    // seam robust to partial schemas (and independent per-table in tests).
+    if any && !present {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Additive, idempotent column migrations for pre-existing DBs. New tables and
+/// indexes are handled by `CREATE ... IF NOT EXISTS` in `schema.sql`; only new
+/// COLUMNS on an existing table need this seam.
+fn migrate(conn: &Connection) -> Result<()> {
+    // Unsubscribe capture (added with the unsubscribe feature).
+    add_column_if_missing(conn, "messages", "list_unsubscribe", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "list_unsub_one_click",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Per-property triage reasons (JSON object). NULL on pre-existing rows.
+    add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
+
+    // Two-stage triage split markers. `stage1_model_used` gates the Stage-1 LLM
+    // queue (NULL == still needs Stage-1); `needs_stage2` is the escalation flag.
+    // A pre-existing `triage` table predates BOTH, so the first INSERT/queue SQL
+    // that names them would fail with "no such column" until they are added.
+    let added_stage1 = add_column_if_missing(conn, "triage", "stage1_model_used", "TEXT")?;
+    add_column_if_missing(conn, "triage", "needs_stage2", "INTEGER NOT NULL DEFAULT 0")?;
+
+    // BACKFILL (runs ONCE, the open that first introduces `stage1_model_used`).
+    // The column add leaves `stage1_model_used = NULL` on EVERY historical row —
+    // which is exactly the Stage-1 LLM queue predicate — so without this the whole
+    // mailbox history would re-classify through the (paid) Stage-1 model. Mark
+    // every row the OLD single-stage pipeline already classified (`model_used`
+    // set) OR that the user has already seen/acted on (`status != 'new'`) as
+    // 'migrated' so it stays OUT of the Stage-1 queue.
+    //
+    // The residual set — `status='new' AND model_used IS NULL` — keeps
+    // `stage1_model_used = NULL` and DOES re-enter Stage-1. That is correct: these
+    // are genuinely-unprocessed recent rows that were awaiting the OLD stage-2
+    // anyway. Their `needs_stage2` stays at the column-add default (0); Stage-1's
+    // apply recomputes it from model confidence when the row is classified, so the
+    // default is merely the pre-Stage-1 resting value, not a lost escalation.
+    //
+    // Guarded by `added_stage1` so it fires exactly once at introduction — NOT on
+    // fresh DBs (schema.sql already carries the column) and NOT on later opens
+    // (which would wrongly 'migrate' rows legitimately queued for Stage-1 that a
+    // read door had promoted past 'new').
+    if added_stage1 {
+        conn.execute(
+            "UPDATE triage SET stage1_model_used = 'migrated'
+             WHERE stage1_model_used IS NULL
+               AND (model_used IS NOT NULL OR status != 'new')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Apply the unsubscribe VIOLATION bump for a just-stored inbound message, in
+/// the caller's transaction. Contract: for a NON-SENT message, if an
+/// `unsubscribes` row exists for `(account_id, lower(from_addr))` with
+/// `resolution IS NULL` and the message's `received_at` is more than 72h after
+/// the request, increment `violation_count` and set `last_violation_at` to that
+/// `received_at`. A no-match (no row / already resolved / still within grace)
+/// is a silent no-op.
+fn bump_unsub_violation_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    from_addr: &str,
+    received_at: DateTime<Utc>,
+) -> Result<()> {
+    let sender = from_addr.trim().to_ascii_lowercase();
+    if sender.is_empty() {
+        return Ok(());
+    }
+    // Read the outstanding request (if any) to run the grace comparison in Rust
+    // against real timestamps rather than lexical string math.
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT requested_at FROM unsubscribes
+             WHERE account_id = ?1 AND sender_addr = ?2 AND resolution IS NULL",
+            params![account_id, sender],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(requested_s) = row else {
+        return Ok(());
+    };
+    let requested_at = parse_dt(&requested_s)?;
+    if received_at > requested_at + chrono::Duration::hours(72) {
+        conn.execute(
+            "UPDATE unsubscribes
+             SET violation_count = violation_count + 1, last_violation_at = ?3
+             WHERE account_id = ?1 AND sender_addr = ?2 AND resolution IS NULL",
+            params![account_id, sender, received_at.to_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
 /// Upsert a message + FTS + Sent-derived contacts against an explicit
 /// connection/transaction handle. Shared by [`SqliteStore::upsert_message`] and
 /// the transactional [`Store::ingest_message`] path so both stay in sync.
 fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
-             subject, received_at, snippet, body, body_html, is_sent)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             subject, received_at, snippet, body, body_html, is_sent,
+             list_unsubscribe, list_unsub_one_click)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
              thread_id=excluded.thread_id, from_addr=excluded.from_addr,
              from_name=excluded.from_name, subject=excluded.subject,
              received_at=excluded.received_at, snippet=excluded.snippet,
-             body=excluded.body, body_html=excluded.body_html, is_sent=excluded.is_sent",
+             body=excluded.body, body_html=excluded.body_html, is_sent=excluded.is_sent,
+             list_unsubscribe=excluded.list_unsubscribe,
+             list_unsub_one_click=excluded.list_unsub_one_click",
         params![
             msg.account_id,
             msg.gmail_msg_id,
@@ -505,6 +671,8 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.body,
             msg.body_html,
             msg.is_sent as i64,
+            msg.list_unsubscribe,
+            msg.list_unsub_one_click as i64,
         ],
     )?;
     let id: i64 = conn.query_row(
@@ -705,10 +873,258 @@ fn upsert_receipt_conn(
     Ok(id)
 }
 
+/// Upsert a calendar update keyed by `(account_id, message_id)`. Idempotent: a
+/// re-ingest of the same message overwrites kind/title/start/organizer/
+/// received_at. Runs in the caller's connection/transaction.
+///
+/// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
+fn upsert_calendar_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+    c: &crate::triage::CalendarInfo,
+    received_at: DateTime<Utc>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO calendar_updates(account_id, message_id, kind, event_title,
+             starts_at, organizer, received_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+             kind=excluded.kind, event_title=excluded.event_title,
+             starts_at=excluded.starts_at, organizer=excluded.organizer,
+             received_at=excluded.received_at",
+        params![
+            account_id,
+            message_id,
+            c.kind.as_str(),
+            c.event_title,
+            c.starts_at.map(|d| d.to_rfc3339()),
+            c.organizer,
+            received_at.to_rfc3339(),
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM calendar_updates WHERE account_id=?1 AND message_id=?2",
+        params![account_id, message_id],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
+/// RECEIPT -> OPEN-BILL AUTO-CLOSE. Given a just-ingested receipt, find the one
+/// OPEN bill (a `deadlines` row whose triage status != 'done') this payment
+/// plausibly settles and resolve it to 'done'. Runs in the caller's ingest
+/// transaction so the receipt and the bill closure land atomically.
+///
+/// The matching rules are the PURE logic in [`crate::triage::receipt_match`]
+/// (precision over recall — a false auto-close hides an unpaid bill):
+///   * merchant identity: same registrable domain or same normalized display
+///     name ([`receipt_match::merchant_matches`]);
+///   * amounts: both parsed => must agree within a couple cents; bill parsed
+///     but receipt not => refuse; bill unparsed => merchant + recency alone
+///     ([`receipt_match::amounts_permit_close`]), each with its recency window
+///     anchored on the two messages' `received_at` (bill before receipt);
+///   * at most ONE bill closes per receipt — the EARLIEST-due match. Recurring
+///     bills can leave two identical open months; one payment settles one, and
+///     you pay the oldest first. Closing both would hide an unpaid month.
+///
+/// The close uses the same status-transition shape as `set_attention_status`
+/// ('done' stamps `resolved_at`, sealed rows excluded in SQL) and appends an
+/// `audit_log` row (actor="ingest", action="bill.auto_close") recording WHY, so
+/// the human door can always answer "where did my bill go?". Idempotent: a
+/// re-ingest finds the bill already 'done' and does nothing (no audit spam).
+///
+/// SECURITY: receipts and deadlines are both structurally sealed-free, and the
+/// UPDATE re-excludes `sensitivity='sealed'` anyway (belt-and-suspenders).
+/// This is internal ingest logic — nothing here crosses the MCP surface.
+fn auto_close_bill_for_receipt_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    receipt_message_id: i64,
+    from_addr: &str,
+    from_name: Option<&str>,
+    r: &crate::triage::ReceiptInfo,
+    received_at: DateTime<Utc>,
+) -> Result<Option<i64>> {
+    use crate::triage::receipt_match;
+
+    // Candidate OPEN bills: every deadline whose triage row is not yet done.
+    // The message join supplies the biller identity + recency anchor. The open
+    // set is small, so filtering happens in Rust against the pure rules.
+    let mut stmt = conn.prepare(
+        "SELECT d.message_id, d.amount, d.currency, d.due_at,
+                m.from_addr, m.from_name, m.received_at
+         FROM deadlines d
+         JOIN triage t ON t.message_id = d.message_id
+         JOIN messages m ON m.id = d.message_id
+         WHERE d.account_id = ?1
+           AND t.status != 'done'
+           AND t.sensitivity != 'sealed'
+           AND d.message_id != ?2",
+    )?;
+    let rows = stmt.query_map(params![account_id, receipt_message_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<f64>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+
+    // Best match = the EARLIEST-due bill that passes every rule.
+    let mut best: Option<(i64, DateTime<Utc>, Option<f64>)> = None;
+    for row in rows {
+        let (bill_id, bill_amount, bill_currency, due_s, bill_addr, bill_name, bill_recv_s) = row?;
+
+        // Currency sanity (v0 is USD-only, but never compare across currencies).
+        if let (Some(rc), Some(bc)) = (r.currency.as_deref(), bill_currency.as_deref())
+            && rc != bc
+        {
+            continue;
+        }
+        // Merchant identity is mandatory.
+        if !receipt_match::merchant_matches(
+            from_addr,
+            from_name,
+            &bill_addr,
+            bill_name.as_deref(),
+        ) {
+            continue;
+        }
+        // Amount rule picks the recency window (or refuses outright).
+        let Some(window_days) = receipt_match::amounts_permit_close(r.amount, bill_amount) else {
+            continue;
+        };
+        // Recency: the bill must PRECEDE the receipt (a payment follows its
+        // bill), within the rule's window.
+        let bill_recv = parse_dt(&bill_recv_s)?;
+        let age = received_at - bill_recv;
+        if age < chrono::Duration::zero() || age > chrono::Duration::days(window_days) {
+            continue;
+        }
+
+        let due_at = parse_dt(&due_s)?;
+        if best.as_ref().is_none_or(|(_, best_due, _)| due_at < *best_due) {
+            best = Some((bill_id, due_at, bill_amount));
+        }
+    }
+    let Some((bill_id, _, bill_amount)) = best else {
+        return Ok(None);
+    };
+
+    // Same transition shape as set_attention_status: 'done' stamps resolved_at;
+    // sealed excluded; the status guard makes a re-run a no-op.
+    let n = conn.execute(
+        "UPDATE triage
+         SET status = 'done', resolved_at = ?1
+         WHERE account_id = ?2 AND message_id = ?3
+           AND sensitivity != 'sealed' AND status != 'done'",
+        params![Utc::now().to_rfc3339(), account_id, bill_id],
+    )?;
+    if n == 0 {
+        return Ok(None); // raced/no-op — nothing closed, nothing to audit
+    }
+
+    // Record WHY in the audit log so the resolution is always explainable.
+    let fmt_amt = |a: Option<f64>| a.map_or("unparsed".to_string(), |v| format!("${v:.2}"));
+    conn.execute(
+        "INSERT INTO audit_log(account_id, ts, actor, action, target, detail)
+         VALUES(?1,?2,'ingest','bill.auto_close',?3,?4)",
+        params![
+            account_id,
+            Utc::now().to_rfc3339(),
+            bill_id.to_string(),
+            format!(
+                "receipt message {} from {} ({}) matched open bill (bill {})",
+                receipt_message_id,
+                from_addr,
+                fmt_amt(r.amount),
+                fmt_amt(bill_amount),
+            ),
+        ],
+    )?;
+    Ok(Some(bill_id))
+}
+
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| CoreError::InvalidInput(format!("bad datetime {s:?}: {e}")))
+}
+
+// ---- LLM usage ledger helpers (shared by the stage-1 and stage-2 categories) --
+
+/// Bump the `stage2_usage` ledger for `(account, day, category)`: +1 call and add
+/// the token counts. Both triage stages share this table keyed by `category`.
+fn bump_usage_category(
+    conn: &Connection,
+    account_id: AccountId,
+    day: &str,
+    category: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens)
+         VALUES(?1, ?2, ?3, 1, ?4, ?5)
+         ON CONFLICT(account_id, day, category) DO UPDATE SET
+             calls = calls + 1,
+             input_tokens = input_tokens + excluded.input_tokens,
+             output_tokens = output_tokens + excluded.output_tokens",
+        params![account_id, day, category, input_tokens as i64, output_tokens as i64],
+    )?;
+    Ok(())
+}
+
+/// Sum the ledger for `(account, category)` over every day `>= since_day`.
+fn usage_since_category(
+    conn: &Connection,
+    account_id: AccountId,
+    since_day: &str,
+    category: &str,
+) -> Result<Stage2Usage> {
+    let row = conn.query_row(
+        "SELECT COALESCE(SUM(calls), 0), COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0)
+         FROM stage2_usage
+         WHERE account_id = ?1 AND day >= ?2 AND category = ?3",
+        params![account_id, since_day, category],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+    )?;
+    Ok(Stage2Usage {
+        calls: row.0.max(0) as u64,
+        input_tokens: row.1.max(0) as u64,
+        output_tokens: row.2.max(0) as u64,
+    })
+}
+
+/// The most recent `days` rows for `(account, category)`, newest-first (sparse).
+fn list_usage_category(
+    conn: &Connection,
+    account_id: AccountId,
+    days: u32,
+    category: &str,
+) -> Result<Vec<Stage2UsageDay>> {
+    let mut stmt = conn.prepare(
+        "SELECT day, calls, input_tokens, output_tokens FROM stage2_usage
+         WHERE account_id = ?1 AND category = ?3
+         ORDER BY day DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id, days as i64, category], |r| {
+            Ok(Stage2UsageDay {
+                day: r.get::<_, String>(0)?,
+                calls: r.get::<_, i64>(1)?.max(0) as u64,
+                input_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                output_tokens: r.get::<_, i64>(3)?.max(0) as u64,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 impl Store for SqliteStore {
@@ -775,6 +1191,9 @@ impl Store for SqliteStore {
                 reason,
                 deadline,
                 matched_rule: rule,
+                // AGENT DOOR: never carries field_reasons — the human-door insight
+                // feature stays absent from the MCP payload (skip_serializing_if).
+                field_reasons: None,
             });
         }
         Ok(out)
@@ -1139,6 +1558,61 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn upsert_calendar_update(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        calendar: &crate::triage::CalendarInfo,
+        received_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let conn = self.lock()?;
+        upsert_calendar_conn(&conn, account_id, message_id, calendar, received_at)
+    }
+
+    fn list_calendar_updates(
+        &self,
+        account_id: AccountId,
+        hours: u32,
+    ) -> Result<Vec<CalendarUpdate>> {
+        let conn = self.lock()?;
+        // Newest-RECEIVED first, within the last `hours` of mail arrival (the
+        // window is on received_at, NOT the event's starts_at). No sealed filter
+        // needed: the table holds no sealed rows by construction (detection
+        // never runs on sealed mail).
+        let since = (Utc::now() - chrono::Duration::hours(hours as i64)).to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, kind, event_title, starts_at, organizer, received_at
+             FROM calendar_updates
+             WHERE account_id=?1 AND received_at >= ?2
+             ORDER BY received_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id, since], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, message_id, kind, event_title, starts_at, organizer, received_at) = row?;
+            out.push(CalendarUpdate {
+                id,
+                message_id,
+                kind,
+                event_title,
+                starts_at: starts_at.as_deref().map(parse_dt).transpose()?,
+                organizer,
+                received_at: parse_dt(&received_at)?,
+            });
+        }
+        Ok(out)
+    }
+
     fn set_sender_rule(
         &self,
         account_id: AccountId,
@@ -1291,6 +1765,21 @@ impl Store for SqliteStore {
             &triaged.message.received_at.to_rfc3339(),
         )?;
 
+        // 1c. UNSUBSCRIBE VIOLATION LEDGER: a NON-SENT inbound message from a
+        //     sender the user asked to unsubscribe from — arriving past the 72h
+        //     grace, with the request still unresolved — bumps that sender's
+        //     violation_count. In the SAME transaction as the message insert so
+        //     the ledger can never drift from the mail that drives it. No-op when
+        //     there is no outstanding unsubscribe for this sender.
+        if !triaged.message.is_sent {
+            bump_unsub_violation_conn(
+                &tx,
+                triaged.message.account_id,
+                &triaged.message.from_addr,
+                triaged.message.received_at,
+            )?;
+        }
+
         // 2. Write the triage row IN THE SAME TRANSACTION. For sealed mail this
         //    is the whole point: sensitivity='sealed' is committed atomically
         //    with the message so there is no window where it is queryable as
@@ -1298,39 +1787,90 @@ impl Store for SqliteStore {
         //    sensitivity='normal' that is the Stage-2 queue predicate for
         //    non-confident rows.
         let deadline_dt = triaged.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
-        // AUTO-RESOLVE receipts: a receipt-classified message is a RECORD, not
-        // something the user must act on. We set its attention-lifecycle status to
-        // the terminal 'done' at ingest (stamping resolved_at) so it is excluded
+        // AUTO-RESOLVE receipts and calendar updates: both are RECORDS, not
+        // something the user must act on (money already moved; the real calendar
+        // is the source of truth). We set the attention-lifecycle status to the
+        // terminal 'done' at ingest (stamping resolved_at) so the row is excluded
         // from the New/Attention/Aging bands and never becomes inbox clutter — it
-        // lives ONLY in the Receipts category. Non-receipt rows start 'new' as
-        // usual. Sealed mail never carries a receipt, so this only ever fires on
-        // non-sealed receipt-classified rows.
+        // lives ONLY in its category (Receipts / Calendar). Other rows start
+        // 'new' as usual. Sealed mail never carries a receipt or calendar update,
+        // so this only ever fires on non-sealed rows.
         let now_s = Utc::now().to_rfc3339();
-        let is_receipt = triaged.sensitivity != Sensitivity::Sealed && triaged.receipt.is_some();
-        let (status, resolved_at) = if is_receipt {
+        let auto_resolved = triaged.sensitivity != Sensitivity::Sealed
+            && (triaged.receipt.is_some() || triaged.calendar.is_some());
+        let (status, resolved_at) = if auto_resolved {
             ("done", Some(now_s.clone()))
         } else {
             ("new", None)
         };
-        // On re-ingest of a NON-receipt row we must PRESERVE the existing
+        // On re-ingest of a non-auto-resolved row we must PRESERVE the existing
         // attention lifecycle (status/resolved_at) — a re-sync must not reopen an
-        // item the user dismissed. A receipt row, however, is force-resolved to
-        // 'done' on every ingest (a receipt is always a record). The CASE keys off
-        // `excluded.status`: 'done' (only receipts pass 'done' in) overwrites;
-        // otherwise the existing lifecycle is kept.
-        tx.execute(
+        // item the user dismissed. A receipt/calendar row, however, is
+        // force-resolved to 'done' on every ingest (a record is always a record).
+        // The CASE keys off `excluded.status`: 'done' (only auto-resolved rows
+        // pass 'done' in) overwrites; otherwise the existing lifecycle is kept.
+        // Per-property Stage-1 reasons as a JSON blob (NULL when empty — sealed /
+        // sent mail carry none). HUMAN-DOOR ONLY on read.
+        let field_reasons_json = if triaged.field_reasons.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&triaged.field_reasons).ok()
+        };
+        // STAGE-1/STAGE-2 QUEUE MARKERS. `stage1_model_used` decides whether the
+        // Stage-1 LLM refine pass will look at this row; `needs_stage2` is the
+        // escalation seed. See the module docs in `triage/stage1_llm.rs`.
+        //   * Sealed / Sent mail: never queued for any LLM (marked 'n/a').
+        //   * Explicit Squelch/Surface rule (matched_rule set, confident): the
+        //     user already ruled on this sender — NO Stage-1 model spend and no
+        //     Stage-2 ('rule', needs_stage2=0).
+        //   * Filtered rule (matched_rule set, NOT confident): skip Stage-1, go
+        //     straight to Stage-2 for want_text ('rule', needs_stage2=1).
+        //   * Everything else (matched_rule NONE): enter the Stage-1 LLM queue
+        //     (stage1_model_used NULL); the `needs_stage2` seed = !confident is
+        //     preserved on a heuristic-only fallback and overwritten by the LLM
+        //     apply otherwise.
+        let (stage1_model_used, needs_stage2): (Option<&str>, i64) =
+            if triaged.sensitivity != Sensitivity::Normal || triaged.message.is_sent {
+                (Some("n/a"), 0)
+            } else if triaged.matched_rule.is_some() {
+                (Some("rule"), if triaged.confident { 0 } else { 1 })
+            } else {
+                (None, if triaged.confident { 0 } else { 1 })
+            };
+        // RE-INGEST CLASSIFICATION GUARD. A re-delivery / backfill re-ingest carries
+        // only the HEURISTIC SEED values (the LLM stages do not re-run at ingest).
+        // If the existing row was already LLM-classified — Stage-2 stamped
+        // `model_used`, or Stage-1 stamped a real model id (anything other than the
+        // 'rule'/'n/a' sentinels) — clobbering importance/tier/one_line/reason/
+        // field_reasons/deadline back to the seed would silently discard paid
+        // classification while the model markers (untouched by this SET) stay put,
+        // so the row would never re-queue to recover it. This predicate keeps the
+        // paid columns on conflict for such rows; a genuinely-new or
+        // still-heuristic-seed row (markers NULL) refreshes exactly as before.
+        const PROCESSED: &str = "(triage.model_used IS NOT NULL \
+             OR (triage.stage1_model_used IS NOT NULL \
+                 AND triage.stage1_model_used NOT IN ('rule', 'n/a')))";
+        let triage_upsert = format!(
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
-                 sealed_kind, one_line, reason, deadline, matched_rule_id, model_used,
-                 status, resolved_at, created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11,?12,?13)
+                 sealed_kind, one_line, reason, deadline, matched_rule_id,
+                 stage1_model_used, needs_stage2, model_used,
+                 status, resolved_at, created_at, field_reasons)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16)
              ON CONFLICT(message_id) DO UPDATE SET
-                 importance=excluded.importance, tier=excluded.tier,
+                 importance=CASE WHEN {PROCESSED} THEN triage.importance ELSE excluded.importance END,
+                 tier=CASE WHEN {PROCESSED} THEN triage.tier ELSE excluded.tier END,
                  sensitivity=excluded.sensitivity, sealed_kind=excluded.sealed_kind,
-                 one_line=excluded.one_line, reason=excluded.reason,
-                 deadline=excluded.deadline, matched_rule_id=excluded.matched_rule_id,
+                 one_line=CASE WHEN {PROCESSED} THEN triage.one_line ELSE excluded.one_line END,
+                 reason=CASE WHEN {PROCESSED} THEN triage.reason ELSE excluded.reason END,
+                 field_reasons=CASE WHEN {PROCESSED} THEN triage.field_reasons ELSE excluded.field_reasons END,
+                 deadline=CASE WHEN {PROCESSED} THEN triage.deadline ELSE excluded.deadline END,
+                 matched_rule_id=excluded.matched_rule_id,
                  status=CASE WHEN excluded.status='done' THEN 'done' ELSE triage.status END,
                  resolved_at=CASE WHEN excluded.status='done'
-                     THEN excluded.resolved_at ELSE triage.resolved_at END",
+                     THEN excluded.resolved_at ELSE triage.resolved_at END"
+        );
+        tx.execute(
+            &triage_upsert,
             params![
                 id,
                 triaged.message.account_id,
@@ -1342,9 +1882,12 @@ impl Store for SqliteStore {
                 triaged.reason,
                 deadline_dt,
                 triaged.matched_rule,
+                stage1_model_used,
+                needs_stage2,
                 status,
                 resolved_at,
                 now_s,
+                field_reasons_json,
             ],
         )?;
 
@@ -1411,6 +1954,44 @@ impl Store for SqliteStore {
                 &triaged.message.from_addr,
                 triaged.message.from_name.as_deref(),
                 r,
+                triaged.message.received_at,
+            )?;
+
+            // 5b. RECEIPT -> OPEN-BILL AUTO-CLOSE, in the SAME transaction: if
+            //     this payment plausibly settles an open bill (conservative
+            //     merchant + amount + recency rules, see
+            //     `auto_close_bill_for_receipt_conn`), resolve that bill's
+            //     triage row to 'done' and audit why. A missed match is fine;
+            //     a false close would hide an unpaid bill, so the rules prefer
+            //     precision.
+            auto_close_bill_for_receipt_conn(
+                &tx,
+                triaged.message.account_id,
+                id,
+                &triaged.message.from_addr,
+                triaged.message.from_name.as_deref(),
+                r,
+                triaged.message.received_at,
+            )?;
+        }
+
+        // 6. Calendar update: only ever present for NON-SEALED mail (detection
+        //    is not run on sealed content). Insert into the calendar category in
+        //    the SAME transaction. Independent of the other detectors, exactly
+        //    like receipts. The triage row was already force-resolved to
+        //    status='done' above so a calendar notification never surfaces as
+        //    inbox clutter — it lives only in the Calendar zone. Sealed mail
+        //    carries `calendar == None`, so this branch never runs for it — the
+        //    `calendar_updates` table is sealed-free by construction. NOTE:
+        //    nothing is written back to Gmail; "resolved" is squelch-internal.
+        if triaged.sensitivity != Sensitivity::Sealed
+            && let Some(c) = &triaged.calendar
+        {
+            upsert_calendar_conn(
+                &tx,
+                triaged.message.account_id,
+                id,
+                c,
                 triaged.message.received_at,
             )?;
         }
@@ -1590,7 +2171,7 @@ impl Store for SqliteStore {
         let mut sql = String::from(
             "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
                     t.reason, t.deadline, t.matched_rule_id,
-                    t.status, t.surfaced_at, t.resolved_at
+                    t.status, t.surfaced_at, t.resolved_at, t.field_reasons
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
@@ -1637,6 +2218,7 @@ impl Store for SqliteStore {
             let status_s: String = r.get(9)?;
             let surfaced_s: Option<String> = r.get(10)?;
             let resolved_s: Option<String> = r.get(11)?;
+            let field_reasons_s: Option<String> = r.get(12)?;
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -1650,6 +2232,7 @@ impl Store for SqliteStore {
                 status_s,
                 surfaced_s,
                 resolved_s,
+                field_reasons_s,
             ))
         };
         let rows = if band == Some(SitrepBand::Open) {
@@ -1673,11 +2256,18 @@ impl Store for SqliteStore {
                 status_s,
                 surfaced_s,
                 resolved_s,
+                field_reasons_s,
             ) = row?;
             let deadline = match deadline_s {
                 Some(s) => Some(parse_dt(&s)?),
                 None => None,
             };
+            // Parse the per-property reasons JSON. A NULL column (row predates the
+            // feature) or a malformed value yields None — defensive: a bad blob
+            // must never fail the whole updates read.
+            let field_reasons: Option<crate::types::FieldReasons> = field_reasons_s
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
             let surfaced_at = match surfaced_s {
                 Some(s) => Some(parse_dt(&s)?),
                 None => None,
@@ -1697,6 +2287,7 @@ impl Store for SqliteStore {
                     reason,
                     deadline,
                     matched_rule: rule,
+                    field_reasons,
                 },
                 status: AttentionStatus::parse(&status_s).unwrap_or(AttentionStatus::New),
                 surfaced_at,
@@ -1824,11 +2415,136 @@ impl Store for SqliteStore {
         Ok(conn.last_insert_rowid())
     }
 
-    fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>> {
+    fn message_unsub_fields(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<MessageUnsub>> {
+        let conn = self.lock()?;
+        // SECURITY: exclude sealed rows in SQL so an unsubscribe against a sealed
+        // message resolves to `None` (=> 404) exactly like an unknown id. A
+        // message with no triage row is treated as non-sealed (COALESCE).
+        let row = conn
+            .query_row(
+                "SELECT m.from_addr, m.list_unsubscribe, m.list_unsub_one_click
+                 FROM messages m
+                 LEFT JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1 AND m.id = ?2
+                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'",
+                params![account_id, message_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(|(from_addr, list_unsubscribe, one_click)| MessageUnsub {
+            from_addr,
+            list_unsubscribe,
+            list_unsub_one_click: one_click != 0,
+        }))
+    }
+
+    fn upsert_unsubscribe(
+        &self,
+        account_id: AccountId,
+        sender: &str,
+        method: &str,
+        source_message_id: Option<i64>,
+        requested_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        // A fresh request RESETS the ledger: the user re-asked, so violation_count
+        // -> 0, last_violation_at -> NULL, resolution -> NULL (the 72h grace clock
+        // restarts from this requested_at).
+        conn.execute(
+            "INSERT INTO unsubscribes(account_id, sender_addr, requested_at, method,
+                 source_message_id, violation_count, last_violation_at, resolution)
+             VALUES(?1,?2,?3,?4,?5,0,NULL,NULL)
+             ON CONFLICT(account_id, sender_addr) DO UPDATE SET
+                 requested_at=excluded.requested_at, method=excluded.method,
+                 source_message_id=excluded.source_message_id,
+                 violation_count=0, last_violation_at=NULL, resolution=NULL",
+            params![
+                account_id,
+                sender,
+                requested_at.to_rfc3339(),
+                method,
+                source_message_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_unsubscribes(&self, account_id: AccountId) -> Result<Vec<UnsubscribeRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, ts, actor, action, target, detail
-             FROM audit_log WHERE account_id=?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT sender_addr, requested_at, method, violation_count,
+                    last_violation_at, resolution
+             FROM unsubscribes
+             WHERE account_id = ?1
+             ORDER BY requested_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (sender, requested_at, method, violation_count, last_violation_at, resolution) =
+                row?;
+            out.push(UnsubscribeRecord {
+                sender,
+                requested_at: parse_dt(&requested_at)?,
+                method,
+                violation_count,
+                last_violation_at: last_violation_at.as_deref().map(parse_dt).transpose()?,
+                resolution,
+            });
+        }
+        Ok(out)
+    }
+
+    fn set_unsubscribe_resolution(
+        &self,
+        account_id: AccountId,
+        sender: &str,
+        resolution: &str,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE unsubscribes SET resolution = ?3
+             WHERE account_id = ?1 AND sender_addr = ?2",
+            params![account_id, sender, resolution],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>> {
+        let conn = self.lock()?;
+        // Enrich each row with the targeted message's sender/subject when `target`
+        // parses as a message id that exists for this account. `target` is TEXT and
+        // often holds non-numeric values (rule patterns, senders); CAST of such a
+        // value yields 0 in SQLite (never errors), which cannot match a real id
+        // (message ids are positive), so the LEFT JOIN just yields NULLs. Sealed
+        // messages ARE included (human door): their sender/subject already show on
+        // the Auth tab; sealed CONTENT is never selected here.
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.account_id, a.ts, a.actor, a.action, a.target, a.detail,
+                    m.from_addr, m.from_name, m.subject
+             FROM audit_log a
+             LEFT JOIN messages m
+               ON m.id = CAST(a.target AS INTEGER) AND m.account_id = a.account_id
+             WHERE a.account_id=?1 ORDER BY a.id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![account_id, limit as i64], |r| {
             Ok((
@@ -1839,11 +2555,17 @@ impl Store for SqliteStore {
                 r.get::<_, String>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, acct, ts, actor, action, target, detail) = row?;
+            let (id, acct, ts, actor, action, target, detail, from_addr, from_name, subject) = row?;
+            // Sender = from_name if present, else from_addr. Both are None when the
+            // join found no message (non-numeric target or unknown id).
+            let target_sender = from_name.filter(|s| !s.is_empty()).or(from_addr);
             out.push(AuditEntry {
                 id,
                 account_id: acct,
@@ -1852,6 +2574,8 @@ impl Store for SqliteStore {
                 action,
                 target,
                 detail,
+                target_sender,
+                target_subject: subject,
             });
         }
         Ok(out)
@@ -1932,14 +2656,166 @@ impl Store for SqliteStore {
 
     // ---- STAGE-2 ----------------------------------------------------------
 
+    fn stage1_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage1Queued>> {
+        let conn = self.lock()?;
+        // Rows still needing the Stage-1 LLM refine pass: heuristic seed values
+        // in place (stage1_model_used IS NULL), non-sealed, non-sent. Rows a
+        // sender rule decided carry stage1_model_used='rule' and are excluded.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
+                    m.received_at,
+                    EXISTS(
+                        SELECT 1 FROM contacts c
+                        WHERE c.account_id = m.account_id
+                          AND c.addr = m.from_addr COLLATE NOCASE
+                          AND c.sent_count > 0
+                    ) AS is_known
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1
+               AND t.stage1_model_used IS NULL
+               AND t.sensitivity = 'normal'
+               AND m.is_sent = 0
+             ORDER BY m.received_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit as i64], |r| {
+            let sensitivity: String = r.get(5)?;
+            let received_at: String = r.get(6)?;
+            let is_known: i64 = r.get(7)?;
+            Ok((
+                Stage1Queued {
+                    message_id: r.get(0)?,
+                    account_id,
+                    thread_id: r.get(1)?,
+                    from_addr: r.get(2)?,
+                    subject: r.get(3)?,
+                    body: r.get(4)?,
+                    received_at: Utc::now(), // replaced below after parse
+                    is_known_contact: is_known != 0,
+                    sensitivity: Sensitivity::parse(&sensitivity),
+                },
+                received_at,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut q, received_at) = row?;
+            q.received_at = parse_dt(&received_at)?;
+            out.push(q);
+        }
+        Ok(out)
+    }
+
+    fn stage1_apply(&self, applied: &Stage1Applied) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
+        let field_reasons_json = if applied.field_reasons.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&applied.field_reasons).ok()
+        };
+        // Overwrite the heuristic seed values, stamp stage1_model_used (leaving
+        // the Stage-1 queue), and set the escalation flag. `model_used` (the
+        // Stage-2 marker) is left untouched. Guarded by sensitivity='normal'.
+        tx.execute(
+            "UPDATE triage SET
+                 importance = ?3,
+                 tier = ?4,
+                 one_line = ?5,
+                 reason = ?6,
+                 deadline = ?7,
+                 stage1_model_used = ?8,
+                 needs_stage2 = ?9,
+                 field_reasons = ?10
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.importance as i64,
+                applied.tier.as_str(),
+                applied.one_line,
+                applied.reason,
+                deadline_dt,
+                applied.stage1_model_used,
+                applied.needs_stage2 as i64,
+                field_reasons_json,
+            ],
+        )?;
+        // (Re)write the deadlines row idempotently.
+        tx.execute(
+            "DELETE FROM deadlines WHERE message_id=?1",
+            params![applied.message_id],
+        )?;
+        if let Some(d) = &applied.deadline {
+            tx.execute(
+                "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
+                     due_at, past_due, source)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    applied.account_id,
+                    applied.message_id,
+                    d.kind,
+                    d.amount,
+                    d.currency,
+                    d.due_at.to_rfc3339(),
+                    d.past_due as i64,
+                    d.source,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn stage1_mark_processed(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        stage1_model_used: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        // Stamp only the Stage-1 marker; PRESERVE the needs_stage2 seed so the
+        // heuristic-confidence decision still drives escalation.
+        conn.execute(
+            "UPDATE triage SET stage1_model_used = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![message_id, account_id, stage1_model_used],
+        )?;
+        Ok(())
+    }
+
+    fn stage1_bump_usage(
+        &self,
+        account_id: AccountId,
+        day: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        bump_usage_category(&conn, account_id, day, "stage1", input_tokens, output_tokens)
+    }
+
+    fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
+        let conn = self.lock()?;
+        usage_since_category(&conn, account_id, since_day, "stage1")
+    }
+
+    fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
+        let conn = self.lock()?;
+        list_usage_category(&conn, account_id, days, "stage1")
+    }
+
     fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>> {
         let conn = self.lock()?;
-        // The Stage-2 queue predicate, verbatim: non-confident Stage-1 rows are
-        // left with model_used IS NULL; sealed rows carry sensitivity='sealed'
-        // and are structurally excluded. Join the message for context and
-        // LEFT JOIN the matched sender rule for its want_text. is_known_contact
-        // is derived from a correlated EXISTS against contacts (mirrors
-        // `is_known_contact`).
+        // The Stage-2 queue predicate: Stage-1 finished with the row
+        // (stage1_model_used IS NOT NULL) AND flagged it for escalation
+        // (needs_stage2=1) AND Stage-2 hasn't processed it yet (model_used IS
+        // NULL). Sealed rows carry sensitivity='sealed' and are structurally
+        // excluded. Join the message for context and LEFT JOIN the matched sender
+        // rule for its want_text (Filtered rules escalate here). is_known_contact
+        // is derived from a correlated EXISTS against contacts.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
                     sr.want_text, m.received_at,
@@ -1953,6 +2829,8 @@ impl Store for SqliteStore {
              JOIN messages m ON m.id = t.message_id
              LEFT JOIN sender_rules sr ON sr.id = t.matched_rule_id
              WHERE t.account_id = ?1
+               AND t.stage1_model_used IS NOT NULL
+               AND t.needs_stage2 = 1
                AND t.model_used IS NULL
                AND t.sensitivity = 'normal'
                AND m.is_sent = 0
@@ -2039,6 +2917,13 @@ impl Store for SqliteStore {
         // a caller mis-targets one (defense in depth; the queue already excludes
         // sealed rows).
         let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
+        // Stage-2 owns all three properties on apply, so its reasons fully replace
+        // any Stage-1 blob. NULL when empty (defensive; apply always sets some).
+        let field_reasons_json = if applied.field_reasons.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&applied.field_reasons).ok()
+        };
         tx.execute(
             "UPDATE triage SET
                  importance = ?3,
@@ -2046,7 +2931,8 @@ impl Store for SqliteStore {
                  one_line = ?5,
                  reason = ?6,
                  deadline = ?7,
-                 model_used = ?8
+                 model_used = ?8,
+                 field_reasons = ?9
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
             params![
                 applied.message_id,
@@ -2057,6 +2943,7 @@ impl Store for SqliteStore {
                 applied.reason,
                 deadline_dt,
                 applied.model_used,
+                field_reasons_json,
             ],
         )?;
         // (Re)write the deadlines row idempotently.
@@ -2108,16 +2995,7 @@ impl Store for SqliteStore {
         output_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO stage2_usage(account_id, day, calls, input_tokens, output_tokens)
-             VALUES(?1, ?2, 1, ?3, ?4)
-             ON CONFLICT(account_id, day) DO UPDATE SET
-                 calls = calls + 1,
-                 input_tokens = input_tokens + excluded.input_tokens,
-                 output_tokens = output_tokens + excluded.output_tokens",
-            params![account_id, day, input_tokens as i64, output_tokens as i64],
-        )?;
-        Ok(())
+        bump_usage_category(&conn, account_id, day, "stage2", input_tokens, output_tokens)
     }
 
     fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage> {
@@ -2125,7 +3003,7 @@ impl Store for SqliteStore {
         let row = conn
             .query_row(
                 "SELECT calls, input_tokens, output_tokens FROM stage2_usage
-                 WHERE account_id = ?1 AND day = ?2",
+                 WHERE account_id = ?1 AND day = ?2 AND category = 'stage2'",
                 params![account_id, day],
                 |r| {
                     Ok((
@@ -2147,23 +3025,93 @@ impl Store for SqliteStore {
 
     fn list_usage(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT day, calls, input_tokens, output_tokens FROM stage2_usage
-             WHERE account_id = ?1
-             ORDER BY day DESC
-             LIMIT ?2",
+        list_usage_category(&conn, account_id, days, "stage2")
+    }
+
+    fn stage2_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
+        let conn = self.lock()?;
+        usage_since_category(&conn, account_id, since_day, "stage2")
+    }
+
+    fn get_app_setting(&self, account_id: AccountId, key: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
+                params![account_id, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    fn set_app_setting(&self, account_id: AccountId, key: &str, value: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO app_settings(account_id, key, value)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value",
+            params![account_id, key, value],
         )?;
-        let rows = stmt
-            .query_map(params![account_id, days as i64], |r| {
-                Ok(Stage2UsageDay {
-                    day: r.get::<_, String>(0)?,
-                    calls: r.get::<_, i64>(1)?.max(0) as u64,
-                    input_tokens: r.get::<_, i64>(2)?.max(0) as u64,
-                    output_tokens: r.get::<_, i64>(3)?.max(0) as u64,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(())
+    }
+
+    fn stage2_cap_overrides(&self, account_id: AccountId) -> Result<Stage2CapOverrides> {
+        let conn = self.lock()?;
+        // One SELECT pulls all four cap rows (only those that exist come back).
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM app_settings
+             WHERE account_id = ?1 AND key IN (?2, ?3, ?4, ?5)",
+        )?;
+        // A stored value only counts if it parses as an integer in the valid
+        // range; anything else is treated as absent (fall back to config/default).
+        let valid = |s: String| -> Option<u32> {
+            s.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (crate::config::STAGE2_CAP_MIN..=crate::config::STAGE2_CAP_MAX).contains(n))
+        };
+        let mut out = Stage2CapOverrides::default();
+        let rows = stmt.query_map(
+            params![
+                account_id,
+                crate::config::APP_SETTING_THREAD_DAILY_CAP,
+                crate::config::APP_SETTING_SENDER_DAILY_CAP,
+                crate::config::APP_SETTING_GLOBAL_DAILY_CAP,
+                crate::config::APP_SETTING_STAGE1_GLOBAL_DAILY_CAP,
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        for row in rows {
+            let (key, value) = row?;
+            match key.as_str() {
+                k if k == crate::config::APP_SETTING_THREAD_DAILY_CAP => {
+                    out.thread_daily_cap = valid(value)
+                }
+                k if k == crate::config::APP_SETTING_SENDER_DAILY_CAP => {
+                    out.sender_daily_cap = valid(value)
+                }
+                k if k == crate::config::APP_SETTING_GLOBAL_DAILY_CAP => {
+                    out.global_daily_cap = valid(value)
+                }
+                k if k == crate::config::APP_SETTING_STAGE1_GLOBAL_DAILY_CAP => {
+                    out.stage1_global_daily_cap = valid(value)
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn count_inbound_since(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<u64> {
+        let conn = self.lock()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE account_id = ?1 AND is_sent = 0 AND received_at >= ?2",
+            params![account_id, since.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
     }
 
     fn upsert_message_vector(
@@ -2237,6 +3185,7 @@ impl Store for SqliteStore {
 mod tests {
     use super::*;
     use crate::types::{SealedKind, Sensitivity, Tier};
+    use chrono::TimeZone;
 
     fn sample_msg(account_id: AccountId, gmail_id: &str, thread: &str) -> NewMessage {
         NewMessage {
@@ -2251,6 +3200,8 @@ mod tests {
             body: "Hey, want to grab lunch tomorrow?".to_string(),
             body_html: None,
             is_sent: false,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
         }
     }
 
@@ -2276,14 +3227,367 @@ mod tests {
             one_line: "Your Bay Wheels ride receipt".into(),
             reason: "receipt".into(),
             matched_rule: None,
+            field_reasons: crate::types::FieldReasons::default(),
             deadline: None,
             shipment: None,
             receipt: Some(crate::triage::ReceiptInfo {
                 amount,
                 currency: amount.map(|_| "USD".into()),
             }),
+            calendar: None,
             confident: true,
         }
+    }
+
+    /// A plain, normal, non-receipt inbound (or sent) TriagedMessage with an
+    /// explicit sender + received_at, for the unsubscribe violation tests.
+    fn inbound_triaged(
+        acct: AccountId,
+        gmail: &str,
+        thread: &str,
+        from: &str,
+        received_at: DateTime<Utc>,
+        is_sent: bool,
+    ) -> TriagedMessage {
+        let mut m = sample_msg(acct, gmail, thread);
+        m.from_addr = from.into();
+        m.from_name = None;
+        m.received_at = received_at;
+        m.is_sent = is_sent;
+        TriagedMessage {
+            message: m,
+            recipients: vec![],
+            sensitivity: Sensitivity::Normal,
+            sealed_kind: None,
+            importance: 10,
+            tier: Tier::Noise,
+            one_line: String::new(),
+            reason: String::new(),
+            matched_rule: None,
+            field_reasons: crate::types::FieldReasons::default(),
+            deadline: None,
+            shipment: None,
+            receipt: None,
+            calendar: None,
+            confident: true,
+        }
+    }
+
+    #[test]
+    fn migrate_adds_unsub_columns_to_a_preexisting_messages_table() {
+        // Simulate an existing install whose `messages` predates the unsubscribe
+        // columns. The migration must add them, and be idempotent on re-open.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages(
+                 id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 gmail_msg_id TEXT NOT NULL, body TEXT);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "list_unsubscribe"));
+        assert!(cols.iter().any(|c| c == "list_unsub_one_click"));
+    }
+
+    #[test]
+    fn migrate_adds_field_reasons_to_a_preexisting_triage_table() {
+        // Simulate an existing install whose `triage` predates field_reasons.
+        // `model_used`/`status` are original triage columns (they predate this
+        // feature and the two-stage split), so a realistic pre-existing table
+        // carries them — the two-stage backfill in migrate() reads them.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE triage(
+                 message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 importance INTEGER NOT NULL DEFAULT 0, reason TEXT,
+                 model_used TEXT, status TEXT NOT NULL DEFAULT 'new');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        let mut stmt = conn.prepare("PRAGMA table_info(triage)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "field_reasons"));
+    }
+
+    #[test]
+    fn migrate_adds_two_stage_columns_so_ingest_and_both_queues_work() {
+        // Simulate a PRE-TWO-STAGE install: a `triage` table that predates
+        // stage1_model_used / needs_stage2 (and field_reasons). The additive
+        // migration must add them so the first ingest + both queue SELECTs (which
+        // NAME those columns) don't fail with "no such column".
+        register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE triage(
+                 message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 importance INTEGER NOT NULL DEFAULT 0, tier TEXT NOT NULL DEFAULT 'noise',
+                 sensitivity TEXT NOT NULL DEFAULT 'normal', sealed_kind TEXT,
+                 one_line TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+                 deadline TEXT, matched_rule_id INTEGER, model_used TEXT,
+                 status TEXT NOT NULL DEFAULT 'new', surfaced_at TEXT, resolved_at TEXT,
+                 created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        // init applies SCHEMA (IF NOT EXISTS keeps the old triage shape) then
+        // migrate() (adds the two columns + backfill).
+        let store = SqliteStore::init(conn).unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let id = store
+            .ingest_message(&triaged_row(acct, "g-x", "t-x", None, false, Sensitivity::Normal))
+            .unwrap();
+        // Both queue SELECTs run cleanly on the upgraded table.
+        let s1 = store.stage1_queue(acct, 10).unwrap();
+        assert_eq!(s1.len(), 1, "the fresh normal row enters Stage-1");
+        assert_eq!(s1[0].message_id, id);
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_backfill_keeps_only_processed_history_out_of_stage1() {
+        // Old-semantics rows on a pre-two-stage `triage` table; the backfill must
+        // mark ONLY genuinely-processed history 'migrated' (out of the Stage-1
+        // queue) and leave genuinely-unprocessed recent rows to re-queue.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE triage(
+                 message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 model_used TEXT, status TEXT NOT NULL DEFAULT 'new');
+             INSERT INTO triage(message_id, account_id, model_used, status) VALUES
+                 (1, 1, NULL, 'open'),       -- finalized/seen (past 'new')
+                 (2, 1, 'claude-x', 'new'),  -- old stage-2 processed
+                 (3, 1, NULL, 'new');        -- genuinely new & unprocessed",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent: backfill fires ONCE at column add
+
+        let get = |mid: i64| -> (Option<String>, i64) {
+            conn.query_row(
+                "SELECT stage1_model_used, needs_stage2 FROM triage WHERE message_id=?1",
+                [mid],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(get(1).0.as_deref(), Some("migrated"), "seen/finalized row out of Stage-1");
+        assert_eq!(get(2).0.as_deref(), Some("migrated"), "old stage-2 processed row out");
+        assert_eq!(get(3).0, None, "genuinely-new unprocessed row re-enters Stage-1");
+        assert_eq!(get(3).1, 0, "residual row's needs_stage2 rests at 0 (Stage-1 recomputes)");
+    }
+
+    #[test]
+    fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
+        use crate::types::FieldReasons;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Build a normal inbound TriagedMessage carrying per-property reasons.
+        let mut t = inbound_triaged(acct, "g1", "t1", "boss@work.com", Utc::now(), false);
+        t.importance = 72;
+        t.tier = Tier::Signal;
+        t.reason = "known contact".into();
+        t.field_reasons = FieldReasons {
+            importance: Some("known contact -> signal importance 72".into()),
+            deadline: None,
+            tier: Some("known contact -> signal".into()),
+        };
+        let id = store.ingest_message(&t).unwrap();
+
+        // HUMAN DOOR: attention_updates carries the parsed field_reasons.
+        let ups = store
+            .attention_updates(acct, Utc::now() - chrono::Duration::days(1), None, None, None)
+            .unwrap();
+        let u = ups.iter().find(|u| u.update.id == id).expect("row present");
+        let fr = u.update.field_reasons.as_ref().expect("field_reasons present");
+        assert_eq!(fr.importance.as_deref(), Some("known contact -> signal importance 72"));
+        assert_eq!(fr.tier.as_deref(), Some("known contact -> signal"));
+        assert!(fr.deadline.is_none());
+        // And it serializes into the /client/updates JSON as an object.
+        let v = serde_json::to_value(&u.update).unwrap();
+        assert_eq!(v["field_reasons"]["tier"], serde_json::json!("known contact -> signal"));
+
+        // AGENT DOOR: ranked_updates (MCP) never carries field_reasons — the key
+        // is absent from the serialized Update.
+        let ranked = store
+            .ranked_updates(acct, Utc::now() - chrono::Duration::days(1), None)
+            .unwrap();
+        let r = ranked.iter().find(|u| u.id == id).expect("row present");
+        assert!(r.field_reasons.is_none());
+        let rv = serde_json::to_value(r).unwrap();
+        assert!(rv.get("field_reasons").is_none(), "MCP payload must omit field_reasons: {rv}");
+    }
+
+    #[test]
+    fn predating_triage_row_reads_back_as_none() {
+        // A row written with no field_reasons (NULL column) reads back as None.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let mid = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+        store
+            .set_triage(mid, acct, 60, Tier::Signal, Sensitivity::Normal, None, "x", "y", None)
+            .unwrap();
+        let ups = store
+            .attention_updates(acct, Utc::now() - chrono::Duration::days(1), None, None, None)
+            .unwrap();
+        let u = ups.iter().find(|u| u.update.id == mid).unwrap();
+        assert!(u.update.field_reasons.is_none());
+    }
+
+    #[test]
+    fn unsub_violation_bumps_only_after_grace_and_resets_on_rerequest() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .upsert_unsubscribe(acct, "news@x.com", "browser", None, t0)
+            .unwrap();
+
+        // Within the 72h grace => no violation.
+        store
+            .ingest_message(&inbound_triaged(
+                acct,
+                "g1",
+                "t1",
+                "news@x.com",
+                t0 + chrono::Duration::hours(1),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 0);
+
+        // Past the grace => first violation, last_violation_at stamped.
+        let v1_at = t0 + chrono::Duration::hours(80);
+        store
+            .ingest_message(&inbound_triaged(acct, "g2", "t2", "news@x.com", v1_at, false))
+            .unwrap();
+        let rec = &store.list_unsubscribes(acct).unwrap()[0];
+        assert_eq!(rec.violation_count, 1);
+        assert_eq!(rec.last_violation_at, Some(v1_at));
+
+        // Another past-grace message => second violation.
+        store
+            .ingest_message(&inbound_triaged(
+                acct,
+                "g3",
+                "t3",
+                "news@x.com",
+                t0 + chrono::Duration::hours(100),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 2);
+
+        // A FRESH request resets the ledger (clock restarts).
+        let t_re = t0 + chrono::Duration::hours(200);
+        store
+            .upsert_unsubscribe(acct, "news@x.com", "browser", None, t_re)
+            .unwrap();
+        let rec = &store.list_unsubscribes(acct).unwrap()[0];
+        assert_eq!(rec.violation_count, 0);
+        assert!(rec.last_violation_at.is_none());
+        assert!(rec.resolution.is_none());
+    }
+
+    #[test]
+    fn unsub_violation_ignores_resolved_and_sent_and_is_case_insensitive() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .upsert_unsubscribe(acct, "news@x.com", "browser", None, t0)
+            .unwrap();
+
+        // A SENT message past the grace never counts as a violation.
+        store
+            .ingest_message(&inbound_triaged(
+                acct,
+                "gs",
+                "ts",
+                "news@x.com",
+                t0 + chrono::Duration::hours(80),
+                true,
+            ))
+            .unwrap();
+        assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 0);
+
+        // Mixed-case sender still matches the lowercased ledger key.
+        store
+            .ingest_message(&inbound_triaged(
+                acct,
+                "g1",
+                "t1",
+                "News@X.com",
+                t0 + chrono::Duration::hours(80),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 1);
+
+        // Once resolved, the detector is disarmed.
+        assert!(store.set_unsubscribe_resolution(acct, "news@x.com", "blocked").unwrap());
+        store
+            .ingest_message(&inbound_triaged(
+                acct,
+                "g2",
+                "t2",
+                "news@x.com",
+                t0 + chrono::Duration::hours(100),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 1);
+    }
+
+    #[test]
+    fn message_unsub_fields_reads_stored_headers_and_hides_sealed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Normal message carrying unsubscribe headers.
+        let mut normal = sample_msg(acct, "g1", "t1");
+        normal.from_addr = "News@Sub.com".into();
+        normal.list_unsubscribe = Some("<https://sub.com/u/1>".into());
+        normal.list_unsub_one_click = true;
+        let nid = store.upsert_message(&normal).unwrap();
+        store
+            .set_triage(nid, acct, 10, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        let f = store.message_unsub_fields(acct, nid).unwrap().expect("present");
+        assert_eq!(f.from_addr, "News@Sub.com");
+        assert_eq!(f.list_unsubscribe.as_deref(), Some("<https://sub.com/u/1>"));
+        assert!(f.list_unsub_one_click);
+
+        // Sealed message => None (indistinguishable from unknown).
+        let mut sealed = sample_msg(acct, "g2", "t2");
+        sealed.list_unsubscribe = Some("<https://sub.com/u/2>".into());
+        let sid = store.upsert_message(&sealed).unwrap();
+        store
+            .set_triage(
+                sid, acct, 90, Tier::Noise, Sensitivity::Sealed,
+                Some(crate::types::SealedKind::Otp), "", "", None,
+            )
+            .unwrap();
+        assert!(store.message_unsub_fields(acct, sid).unwrap().is_none());
+
+        // Unknown id => None.
+        assert!(store.message_unsub_fields(acct, 999_999).unwrap().is_none());
     }
 
     #[test]
@@ -2335,6 +3639,570 @@ mod tests {
         let receipts = store.list_receipts(acct, 30).unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].amount, None, "a receipt with no total is still a receipt");
+    }
+
+    // ---- calendar updates --------------------------------------------------
+
+    /// Build a store-ready TriagedMessage carrying a calendar update (noise
+    /// tier), for the auto-resolve/listing tests.
+    fn calendar_triaged(
+        acct: AccountId,
+        gmail: &str,
+        kind: crate::triage::CalendarKind,
+        received_at: DateTime<Utc>,
+    ) -> TriagedMessage {
+        let mut m = sample_msg(acct, gmail, &format!("t-{gmail}"));
+        m.from_addr = "sam@gmail.com".into();
+        m.from_name = Some("Sam Doe".into());
+        m.subject = "Invitation: Design review @ Wed Jul 22, 2026 10am".into();
+        m.received_at = received_at;
+        TriagedMessage {
+            message: m,
+            recipients: vec![],
+            sensitivity: Sensitivity::Normal,
+            sealed_kind: None,
+            importance: 15,
+            tier: Tier::Noise,
+            one_line: "Invitation: Design review".into(),
+            reason: "calendar".into(),
+            matched_rule: None,
+            field_reasons: crate::types::FieldReasons::default(),
+            deadline: None,
+            shipment: None,
+            receipt: None,
+            calendar: Some(crate::triage::CalendarInfo {
+                kind,
+                event_title: Some("Design review".into()),
+                starts_at: Some(Utc.with_ymd_and_hms(2026, 7, 22, 10, 0, 0).unwrap()),
+                organizer: Some("Sam Doe".into()),
+            }),
+            confident: true,
+        }
+    }
+
+    #[test]
+    fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(30);
+
+        let id = store
+            .ingest_message(&calendar_triaged(
+                acct,
+                "g-cal1",
+                crate::triage::CalendarKind::Invite,
+                Utc::now(),
+            ))
+            .unwrap();
+
+        // 1. The calendar row exists with its extracted fields.
+        let items = store.list_calendar_updates(acct, 24).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message_id, id);
+        assert_eq!(items[0].kind, "invite");
+        assert_eq!(items[0].event_title.as_deref(), Some("Design review"));
+        assert_eq!(
+            items[0].starts_at,
+            Some(Utc.with_ymd_and_hms(2026, 7, 22, 10, 0, 0).unwrap())
+        );
+        assert_eq!(items[0].organizer.as_deref(), Some("Sam Doe"));
+
+        // 2. AUTO-RESOLVE: the triage row is status='done' with resolved_at set
+        //    (same mechanism as receipts — squelch-internal only; nothing is
+        //    written back to Gmail).
+        let done = store
+            .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+            .unwrap();
+        assert_eq!(done.len(), 1, "calendar update is auto-resolved to done");
+        assert_eq!(done[0].update.id, id);
+        assert!(done[0].resolved_at.is_some());
+
+        // 3. ABSENT from the New band (never inbox clutter).
+        let fresh = store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .unwrap();
+        assert!(fresh.is_empty(), "auto-done calendar update must not be in New");
+        let stats = store.stats(acct).unwrap();
+        assert_eq!(stats.bands.new, 0);
+        assert_eq!(stats.bands.standing, 0);
+    }
+
+    #[test]
+    fn calendar_list_windows_on_received_at_hours() {
+        // The window is mail-ARRIVAL time (received_at), not event start.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        store
+            .ingest_message(&calendar_triaged(
+                acct,
+                "g-cal-new",
+                crate::triage::CalendarKind::Update,
+                now - chrono::Duration::hours(2),
+            ))
+            .unwrap();
+        store
+            .ingest_message(&calendar_triaged(
+                acct,
+                "g-cal-old",
+                crate::triage::CalendarKind::Cancellation,
+                now - chrono::Duration::hours(30),
+            ))
+            .unwrap();
+
+        // Default-ish 24h window: only the 2h-old row.
+        let items = store.list_calendar_updates(acct, 24).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "update");
+        // Wider window: both, newest-received first.
+        let items = store.list_calendar_updates(acct, 48).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, "update", "newest-received first");
+        assert_eq!(items[1].kind, "cancellation");
+    }
+
+    #[test]
+    fn calendar_upsert_is_idempotent_per_message() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t = calendar_triaged(acct, "g-cal-i", crate::triage::CalendarKind::Invite, Utc::now());
+        let id1 = store.ingest_message(&t).unwrap();
+        let id2 = store.ingest_message(&t).unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(
+            store.list_calendar_updates(acct, 24).unwrap().len(),
+            1,
+            "re-ingest updates the same row"
+        );
+    }
+
+    // ---- receipt -> open-bill auto-close ----------------------------------
+
+    /// Build a store-ready TriagedMessage carrying a BILL (deadline tier) from
+    /// the given sender, for the receipt->bill auto-close tests.
+    fn bill_triaged(
+        acct: AccountId,
+        gmail: &str,
+        from_addr: &str,
+        from_name: Option<&str>,
+        amount: Option<f64>,
+        received_at: DateTime<Utc>,
+        due_at: DateTime<Utc>,
+    ) -> TriagedMessage {
+        let mut m = sample_msg(acct, gmail, &format!("t-{gmail}"));
+        m.from_addr = from_addr.into();
+        m.from_name = from_name.map(Into::into);
+        m.subject = "Your statement is ready".into();
+        m.received_at = received_at;
+        TriagedMessage {
+            message: m,
+            recipients: vec![],
+            sensitivity: Sensitivity::Normal,
+            sealed_kind: None,
+            importance: 200,
+            tier: Tier::Deadline,
+            one_line: "Payment due".into(),
+            reason: "bill".into(),
+            matched_rule: None,
+            field_reasons: crate::types::FieldReasons::default(),
+            deadline: Some(crate::triage::DeadlineHit {
+                kind: "payment_due".into(),
+                amount,
+                currency: amount.map(|_| "USD".into()),
+                due_at,
+                past_due: false,
+                source: "test".into(),
+            }),
+            shipment: None,
+            receipt: None,
+            calendar: None,
+            confident: true,
+        }
+    }
+
+    /// Build a store-ready receipt TriagedMessage from the given sender.
+    fn receipt_from(
+        acct: AccountId,
+        gmail: &str,
+        from_addr: &str,
+        from_name: Option<&str>,
+        amount: Option<f64>,
+        received_at: DateTime<Utc>,
+    ) -> TriagedMessage {
+        let mut t = receipt_triaged(acct, gmail, &format!("t-{gmail}"), amount);
+        t.message.from_addr = from_addr.into();
+        t.message.from_name = from_name.map(Into::into);
+        t.message.received_at = received_at;
+        t
+    }
+
+    /// Read (status, resolved_at) straight off a triage row.
+    fn triage_status(store: &SqliteStore, acct: AccountId, id: i64) -> (String, Option<String>) {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT status, resolved_at FROM triage WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn auto_close_audits(store: &SqliteStore, acct: AccountId) -> Vec<AuditEntry> {
+        store
+            .list_audit(acct, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "bill.auto_close")
+            .collect()
+    }
+
+    #[test]
+    fn receipt_matching_merchant_and_amount_closes_open_bill() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        // An open PG&E bill for $84.20, received 10 days ago.
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill1",
+                "billing@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now - chrono::Duration::days(10),
+                now + chrono::Duration::days(5),
+            ))
+            .unwrap();
+
+        // The payment receipt: different mailbox + subdomain, name spelled
+        // "PGE", same amount.
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay1",
+                "receipts@billing.pge.com",
+                Some("PGE"),
+                Some(84.20),
+                now,
+            ))
+            .unwrap();
+
+        // The bill's triage row is resolved through the standard transition
+        // (done + resolved_at), so it leaves the standing/obligations band.
+        let (status, resolved_at) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "done", "matched bill auto-closes");
+        assert!(resolved_at.is_some(), "done stamps resolved_at");
+        assert_eq!(store.stats(acct).unwrap().bands.standing, 0);
+
+        // The WHY is on the audit trail, targeting the bill's message id.
+        let audits = auto_close_audits(&store, acct);
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].actor, "ingest");
+        assert_eq!(audits[0].target.as_deref(), Some(bill_id.to_string().as_str()));
+    }
+
+    #[test]
+    fn receipt_amount_mismatch_does_not_close_bill() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill2",
+                "billing@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now - chrono::Duration::days(10),
+                now + chrono::Duration::days(5),
+            ))
+            .unwrap();
+        // Same merchant, WRONG amount (a small partial charge, not the bill).
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay2",
+                "receipts@pge.com",
+                Some("PG&E"),
+                Some(12.00),
+                now,
+            ))
+            .unwrap();
+
+        let (status, _) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "new", "amount mismatch must NOT close the bill");
+        assert!(auto_close_audits(&store, acct).is_empty());
+    }
+
+    #[test]
+    fn receipt_without_amount_never_closes_an_amounted_bill() {
+        // The bill has a verifiable amount but the receipt parsed none: the one
+        // number we could check is missing — refuse (a false close hides an
+        // unpaid bill).
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill3",
+                "billing@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now - chrono::Duration::days(3),
+                now + chrono::Duration::days(12),
+            ))
+            .unwrap();
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay3",
+                "receipts@pge.com",
+                Some("PG&E"),
+                None,
+                now,
+            ))
+            .unwrap();
+
+        let (status, _) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "new");
+        assert!(auto_close_audits(&store, acct).is_empty());
+    }
+
+    #[test]
+    fn merchant_name_normalization_matches_across_domains() {
+        // Different domains entirely; identity carried by the normalized
+        // display name ("PG&E" == "PGE" after case/punctuation folding).
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill4",
+                "billing@pacificgas.com",
+                Some("PG&E"),
+                Some(84.20),
+                now - chrono::Duration::days(7),
+                now + chrono::Duration::days(7),
+            ))
+            .unwrap();
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay4",
+                "no-reply@pge.com",
+                Some("pge"),
+                Some(84.20),
+                now,
+            ))
+            .unwrap();
+
+        let (status, _) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "done", "normalized names establish the merchant");
+    }
+
+    #[test]
+    fn already_done_bill_is_not_touched() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill5",
+                "billing@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now - chrono::Duration::days(10),
+                now + chrono::Duration::days(5),
+            ))
+            .unwrap();
+        // The user already dismissed it.
+        assert!(store
+            .set_attention_status(acct, bill_id, AttentionStatus::Done)
+            .unwrap());
+
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay5",
+                "receipts@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now,
+            ))
+            .unwrap();
+
+        // Still done, and the auto-closer left no audit row (it never fired —
+        // a done bill is not an open candidate, so no double-resolution).
+        let (status, resolved_at) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "done");
+        assert!(resolved_at.is_some());
+        assert!(auto_close_audits(&store, acct).is_empty());
+    }
+
+    #[test]
+    fn receipt_with_no_matching_bill_does_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        // An open Comcast bill; the receipt is from an unrelated merchant.
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill6",
+                "billing@comcast.com",
+                Some("Comcast"),
+                Some(89.99),
+                now - chrono::Duration::days(5),
+                now + chrono::Duration::days(10),
+            ))
+            .unwrap();
+        let receipt_id = store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay6",
+                "no-reply@baywheels.com",
+                Some("Bay Wheels"),
+                Some(3.49),
+                now,
+            ))
+            .unwrap();
+
+        let (status, _) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "new", "unrelated bill stays open");
+        assert!(auto_close_audits(&store, acct).is_empty());
+        // The receipt itself is still auto-resolved + listed as usual.
+        let (rstatus, _) = triage_status(&store, acct, receipt_id);
+        assert_eq!(rstatus, "done");
+        assert_eq!(store.list_receipts(acct, 30).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn amountless_bill_closes_on_merchant_match_within_tight_window() {
+        // The bill parsed no amount: merchant identity + the tight recency
+        // window carry the match alone.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill7",
+                "billing@pge.com",
+                Some("PG&E"),
+                None,
+                now - chrono::Duration::days(10),
+                now + chrono::Duration::days(5),
+            ))
+            .unwrap();
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay7",
+                "receipts@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now,
+            ))
+            .unwrap();
+
+        let (status, _) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "done");
+        assert_eq!(auto_close_audits(&store, acct).len(), 1);
+    }
+
+    #[test]
+    fn stale_bill_outside_recency_window_is_not_closed() {
+        // Same merchant + amount, but the bill is 90 days old — outside even
+        // the wide amount-verified window, so it stays open (stale history must
+        // not be silently swept by a coincidental amount).
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let bill_id = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill8",
+                "billing@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now - chrono::Duration::days(90),
+                now - chrono::Duration::days(75),
+            ))
+            .unwrap();
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay8",
+                "receipts@pge.com",
+                Some("PG&E"),
+                Some(84.20),
+                now,
+            ))
+            .unwrap();
+
+        let (status, _) = triage_status(&store, acct, bill_id);
+        assert_eq!(status, "new");
+        assert!(auto_close_audits(&store, acct).is_empty());
+    }
+
+    #[test]
+    fn one_receipt_closes_only_the_earliest_due_of_identical_bills() {
+        // Two open months of the same $15.49 subscription: one payment settles
+        // ONE month — the earliest due. Closing both would hide the unpaid one.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let june = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill-jun",
+                "billing@streamco.com",
+                Some("StreamCo"),
+                Some(15.49),
+                now - chrono::Duration::days(40),
+                now - chrono::Duration::days(25),
+            ))
+            .unwrap();
+        let july = store
+            .ingest_message(&bill_triaged(
+                acct,
+                "g-bill-jul",
+                "billing@streamco.com",
+                Some("StreamCo"),
+                Some(15.49),
+                now - chrono::Duration::days(10),
+                now + chrono::Duration::days(5),
+            ))
+            .unwrap();
+        store
+            .ingest_message(&receipt_from(
+                acct,
+                "g-pay-jun",
+                "receipts@streamco.com",
+                Some("StreamCo"),
+                Some(15.49),
+                now,
+            ))
+            .unwrap();
+
+        let (june_status, _) = triage_status(&store, acct, june);
+        let (july_status, _) = triage_status(&store, acct, july);
+        assert_eq!(june_status, "done", "earliest-due month is the one paid");
+        assert_eq!(july_status, "new", "the newer month must stay open");
+        assert_eq!(auto_close_audits(&store, acct).len(), 1);
     }
 
     #[test]
@@ -2864,6 +4732,226 @@ mod tests {
         assert_eq!(rules[0].disposition, Disposition::Squelch);
     }
 
+    // ---- Stage-1 LLM queue / markers -------------------------------------
+
+    /// Build a store-ready TriagedMessage with controllable rule/confidence so
+    /// the queue-marker logic in `ingest_message` is testable directly.
+    fn triaged_row(
+        acct: AccountId,
+        gmail: &str,
+        thread: &str,
+        matched_rule: Option<i64>,
+        confident: bool,
+        sensitivity: Sensitivity,
+    ) -> TriagedMessage {
+        TriagedMessage {
+            message: sample_msg(acct, gmail, thread),
+            recipients: vec![],
+            sensitivity,
+            sealed_kind: if sensitivity == Sensitivity::Sealed {
+                Some(crate::types::SealedKind::Otp)
+            } else {
+                None
+            },
+            importance: 40,
+            tier: Tier::Noise,
+            one_line: "seed".into(),
+            reason: "seed".into(),
+            field_reasons: crate::types::FieldReasons::default(),
+            matched_rule,
+            deadline: None,
+            shipment: None,
+            receipt: None,
+            calendar: None,
+            confident,
+        }
+    }
+
+    #[test]
+    fn stage1_queue_selects_normal_unrefined_excludes_rule_and_sealed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Normal, non-rule row -> enters the Stage-1 LLM queue.
+        let normal = store
+            .ingest_message(&triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal))
+            .unwrap();
+        // Explicit rule (confident) -> decided; NO Stage-1 model spend.
+        store
+            .ingest_message(&triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal))
+            .unwrap();
+        // Sealed -> never queued for any LLM.
+        store
+            .ingest_message(&triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed))
+            .unwrap();
+
+        let q = store.stage1_queue(acct, 10).unwrap();
+        assert_eq!(q.len(), 1, "only the normal, non-rule row needs Stage-1");
+        assert_eq!(q[0].message_id, normal);
+        assert_eq!(q[0].sensitivity, Sensitivity::Normal);
+    }
+
+    #[test]
+    fn explicit_rule_row_skips_both_llm_queues() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        // A Squelch/Surface rule row is final: not in Stage-1, not in Stage-2.
+        store
+            .ingest_message(&triaged_row(acct, "g-r", "t-r", Some(9), true, Sensitivity::Normal))
+            .unwrap();
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn filtered_rule_row_goes_straight_to_stage2() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        // A Filtered rule (matched_rule set, NOT confident) skips Stage-1 and
+        // escalates directly to Stage-2 for want_text evaluation.
+        let id = store
+            .ingest_message(&triaged_row(acct, "g-f", "t-f", Some(3), false, Sensitivity::Normal))
+            .unwrap();
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty(), "no Stage-1 spend");
+        let s2 = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].message_id, id);
+    }
+
+    #[test]
+    fn stage1_apply_confident_false_escalates_true_does_not() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let a = store
+            .ingest_message(&triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal))
+            .unwrap();
+        let b = store
+            .ingest_message(&triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal))
+            .unwrap();
+
+        let applied = |mid: i64, needs_stage2: bool| Stage1Applied {
+            message_id: mid,
+            account_id: acct,
+            importance: 60,
+            tier: Tier::Noise,
+            one_line: "refined".into(),
+            reason: "stage-1".into(),
+            field_reasons: crate::types::FieldReasons::default(),
+            stage1_model_used: "claude-haiku-4-5".into(),
+            needs_stage2,
+            deadline: None,
+        };
+        store.stage1_apply(&applied(a, false)).unwrap(); // confident -> final
+        store.stage1_apply(&applied(b, true)).unwrap(); // not confident -> escalate
+
+        // Both left the Stage-1 queue.
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+        // Only `b` is now in the Stage-2 queue.
+        let s2 = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].message_id, b);
+    }
+
+    #[test]
+    fn stage1_mark_processed_preserves_needs_stage2_seed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        // Ambiguous seed (confident=false => needs_stage2 seed = 1).
+        let amb = store
+            .ingest_message(&triaged_row(acct, "g-amb", "t-amb", None, false, Sensitivity::Normal))
+            .unwrap();
+        // Confident seed (confident=true => needs_stage2 seed = 0).
+        let sure = store
+            .ingest_message(&triaged_row(acct, "g-sure", "t-sure", None, true, Sensitivity::Normal))
+            .unwrap();
+
+        // Heuristic-only fallback stamps the marker but PRESERVES the seed.
+        store.stage1_mark_processed(acct, amb, HEURISTIC_ONLY_MARKER).unwrap();
+        store.stage1_mark_processed(acct, sure, HEURISTIC_ONLY_MARKER).unwrap();
+
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+        let s2 = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(s2.len(), 1, "only the ambiguous seed escalates");
+        assert_eq!(s2[0].message_id, amb);
+    }
+
+    #[test]
+    fn stage1_usage_ledger_is_a_separate_category() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        store.stage1_bump_usage(acct, "2026-07-09", 100, 20).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-09", 500, 90).unwrap();
+
+        let s1 = store.stage1_usage_since(acct, "2026-07-01").unwrap();
+        assert_eq!(s1.calls, 1);
+        assert_eq!(s1.input_tokens, 100);
+        assert_eq!(s1.output_tokens, 20);
+        let s2 = store.stage2_usage_since(acct, "2026-07-01").unwrap();
+        assert_eq!(s2.calls, 1);
+        assert_eq!(s2.input_tokens, 500);
+
+        let rows1 = store.list_usage_stage1(acct, 30).unwrap();
+        assert_eq!(rows1.len(), 1);
+        assert_eq!(rows1[0].input_tokens, 100);
+        // The stage-2 list is unaffected by the stage-1 row.
+        let rows2 = store.list_usage(acct, 30).unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].input_tokens, 500);
+    }
+
+    /// Local mirror of `triage::stage1_llm::HEURISTIC_ONLY` for the tests above.
+    const HEURISTIC_ONLY_MARKER: &str = "heuristic-only";
+
+    #[test]
+    fn reingest_preserves_llm_classification_but_refreshes_heuristic_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let since = Utc::now() - chrono::Duration::days(3650);
+
+        // --- Row A: LLM-classified, then re-delivered. ---
+        let a = store
+            .ingest_message(&triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal))
+            .unwrap();
+        // Stage-1 refines it with a REAL model id + distinctive values.
+        store
+            .stage1_apply(&Stage1Applied {
+                message_id: a,
+                account_id: acct,
+                importance: 88,
+                tier: Tier::Signal,
+                one_line: "LLM verdict".into(),
+                reason: "stage-1 refined".into(),
+                field_reasons: crate::types::FieldReasons::default(),
+                stage1_model_used: "claude-haiku-4-5".into(),
+                needs_stage2: false,
+                deadline: None,
+            })
+            .unwrap();
+        // Re-deliver the SAME message (heuristic seed carries importance 40).
+        store
+            .ingest_message(&triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal))
+            .unwrap();
+        let ups = store.ranked_updates(acct, since, None).unwrap();
+        let ua = ups.iter().find(|u| u.id == a).expect("row A present");
+        assert_eq!(ua.importance, 88, "paid LLM importance preserved on re-ingest");
+        assert_eq!(ua.one_line, "LLM verdict", "paid LLM one_line preserved");
+        assert_eq!(ua.tier, Tier::Signal, "paid LLM tier preserved");
+
+        // --- Row B: still heuristic-only -> re-ingest refreshes the seed. ---
+        let b = store
+            .ingest_message(&triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal))
+            .unwrap();
+        let mut refreshed = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal);
+        refreshed.importance = 71;
+        refreshed.tier = Tier::Signal;
+        refreshed.one_line = "fresh seed".into();
+        store.ingest_message(&refreshed).unwrap();
+        let ups = store.ranked_updates(acct, since, None).unwrap();
+        let ub = ups.iter().find(|u| u.id == b).expect("row B present");
+        assert_eq!(ub.importance, 71, "still-heuristic row adopts the new seed");
+        assert_eq!(ub.one_line, "fresh seed");
+    }
+
     // ---- Stage-2 store methods -------------------------------------------
 
     /// Insert a message + a triage row with model_used NULL (queued) or set
@@ -3176,6 +5264,161 @@ mod tests {
     }
 
     #[test]
+    fn app_settings_get_set_roundtrip_and_scoping() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let a = store.ensure_account("a@example.com").unwrap();
+        let b = store.ensure_account("b@example.com").unwrap();
+
+        // Unset key reads None.
+        assert!(store.get_app_setting(a, "k").unwrap().is_none());
+
+        // Set, read back, and overwrite (upsert).
+        store.set_app_setting(a, "k", "v1").unwrap();
+        assert_eq!(store.get_app_setting(a, "k").unwrap().as_deref(), Some("v1"));
+        store.set_app_setting(a, "k", "v2").unwrap();
+        assert_eq!(store.get_app_setting(a, "k").unwrap().as_deref(), Some("v2"));
+
+        // Per-account scoped: b's key is independent.
+        assert!(store.get_app_setting(b, "k").unwrap().is_none());
+    }
+
+    #[test]
+    fn stage2_cap_overrides_reads_and_precedence() {
+        use crate::config::{
+            APP_SETTING_GLOBAL_DAILY_CAP, APP_SETTING_SENDER_DAILY_CAP,
+            APP_SETTING_THREAD_DAILY_CAP,
+        };
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // No rows => all None (caller falls back to config/env then default).
+        assert_eq!(store.stage2_cap_overrides(acct).unwrap(), Default::default());
+
+        // A set thread cap surfaces; the others stay None (so the effective cap
+        // is the override where present, config/default elsewhere — precedence).
+        store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "5").unwrap();
+        let o = store.stage2_cap_overrides(acct).unwrap();
+        assert_eq!(o.thread_daily_cap, Some(5));
+        assert_eq!(o.sender_daily_cap, None);
+        assert_eq!(o.global_daily_cap, None);
+
+        // Set the remaining two.
+        store.set_app_setting(acct, APP_SETTING_SENDER_DAILY_CAP, "9").unwrap();
+        store.set_app_setting(acct, APP_SETTING_GLOBAL_DAILY_CAP, "300").unwrap();
+        let o = store.stage2_cap_overrides(acct).unwrap();
+        assert_eq!(o.thread_daily_cap, Some(5));
+        assert_eq!(o.sender_daily_cap, Some(9));
+        assert_eq!(o.global_daily_cap, Some(300));
+
+        // A malformed OR out-of-range stored value is ignored (treated as absent),
+        // so a corrupt row can never remove the cap entirely.
+        store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "not-a-number").unwrap();
+        assert_eq!(store.stage2_cap_overrides(acct).unwrap().thread_daily_cap, None);
+        store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "0").unwrap();
+        assert_eq!(store.stage2_cap_overrides(acct).unwrap().thread_daily_cap, None);
+        store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "100001").unwrap();
+        assert_eq!(store.stage2_cap_overrides(acct).unwrap().thread_daily_cap, None);
+    }
+
+    #[test]
+    fn override_cap_binds_below_config_default() {
+        // The Stage-2 pass reads stage2_cap_overrides at the START of each cycle
+        // and uses override > config/env > default. Here a runtime override of 1
+        // caps a thread that the config default (3) would have allowed 3 calls on.
+        // Models the exact check-BEFORE-increment discipline stage2_pass runs,
+        // driving the effective cap the same way the pass computes it.
+        use crate::config::APP_SETTING_THREAD_DAILY_CAP;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let day = "2026-07-09";
+        let thread = "t-override";
+        let config_default_cap: u32 = 3; // Stage2Config default
+
+        // Client lowers the per-thread cap to 1 at runtime.
+        store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "1").unwrap();
+
+        // Effective cap = override (1), NOT the config default (3) — precedence.
+        let overrides = store.stage2_cap_overrides(acct).unwrap();
+        let effective = overrides.thread_daily_cap.unwrap_or(config_default_cap);
+        assert_eq!(effective, 1);
+
+        // Same check-before-increment loop the pass runs, using the effective cap.
+        let mut calls = 0u32;
+        for _ in 0..10 {
+            let used = store.stage2_budget_used(acct, thread, day).unwrap();
+            if used >= effective {
+                continue;
+            }
+            store.stage2_increment_budget(acct, thread, day).unwrap();
+            calls += 1;
+        }
+        assert_eq!(calls, 1, "override cap of 1 must bind below the config default of 3");
+    }
+
+    #[test]
+    fn stage2_usage_since_sums_window_inclusively() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Empty ledger => zeros.
+        assert_eq!(
+            store.stage2_usage_since(acct, "2026-07-01").unwrap(),
+            Stage2Usage::default()
+        );
+
+        store.stage2_bump_usage(acct, "2026-07-05", 100, 10).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-08", 200, 20).unwrap();
+        store.stage2_bump_usage(acct, "2026-07-08", 300, 30).unwrap();
+
+        // since_day <= earliest => everything summed (2 days, 3 calls).
+        let all = store.stage2_usage_since(acct, "2026-07-05").unwrap();
+        assert_eq!(all.calls, 3);
+        assert_eq!(all.input_tokens, 600);
+        assert_eq!(all.output_tokens, 60);
+
+        // Window boundary is inclusive on since_day and excludes older rows.
+        let recent = store.stage2_usage_since(acct, "2026-07-08").unwrap();
+        assert_eq!(recent.calls, 2);
+        assert_eq!(recent.input_tokens, 500);
+        assert_eq!(recent.output_tokens, 50);
+    }
+
+    #[test]
+    fn count_inbound_since_counts_only_received_in_window() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let inbound = |gmail: &str, sent: bool, received: DateTime<Utc>| {
+            let m = NewMessage {
+                account_id: acct,
+                gmail_msg_id: gmail.to_string(),
+                thread_id: gmail.to_string(),
+                from_addr: "x@y.com".to_string(),
+                from_name: None,
+                subject: "s".to_string(),
+                received_at: received,
+                snippet: String::new(),
+                body: String::new(),
+                body_html: None,
+                is_sent: sent,
+                list_unsubscribe: None,
+                list_unsub_one_click: false,
+            };
+            store.upsert_message(&m).unwrap();
+        };
+
+        // Two recent inbound, one old inbound, one recent SENT (excluded).
+        inbound("m1", false, now - chrono::Duration::days(1));
+        inbound("m2", false, now - chrono::Duration::days(10));
+        inbound("m3", false, now - chrono::Duration::days(30));
+        inbound("m4", true, now - chrono::Duration::days(1));
+
+        let since = now - chrono::Duration::days(14);
+        assert_eq!(store.count_inbound_since(acct, since).unwrap(), 2);
+    }
+
+    #[test]
     fn update_sender_rule_edits_by_id_and_404s_unknown() {
         // TASK 6 (store layer): update_sender_rule overwrites pattern/want/disp by
         // id, returns false for an unknown id.
@@ -3300,6 +5543,11 @@ mod tests {
             tier: Tier::Deadline,
             one_line: "invoice due sep 1".into(),
             reason: "stage-2 (m): real bill".into(),
+            field_reasons: crate::types::FieldReasons {
+                importance: Some("stage-2: real bill".into()),
+                deadline: Some("stage-2: invoice due sep 1".into()),
+                tier: Some("stage-2: future deadline -> deadline".into()),
+            },
             model_used: "claude-haiku-4-5".into(),
             deadline: Some(DeadlineHit {
                 kind: "invoice".into(),
@@ -3339,6 +5587,7 @@ mod tests {
             tier: Tier::Signal,
             one_line: "leak".into(),
             reason: "should not apply".into(),
+            field_reasons: crate::types::FieldReasons::default(),
             model_used: "m".into(),
             deadline: None,
         };
@@ -3380,6 +5629,71 @@ mod tests {
         assert_eq!(log[0].actor, "agent");
         assert_eq!(log[0].action, "rule.set");
         assert_eq!(log[0].target.as_deref(), Some("*@spam.com"));
+    }
+
+    #[test]
+    fn list_audit_enriches_message_target_and_nulls_non_numeric() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // A stored message: from_name present => sender is the name; subject verbatim.
+        let mut m = sample_msg(acct, "g-audit", "t-audit");
+        m.from_addr = "news@sub.com".into();
+        m.from_name = Some("Newsletter Co".into());
+        m.subject = "Weekly digest".into();
+        let mid = store.upsert_message(&m).unwrap();
+
+        // Row 1: target is the message id -> enriched.
+        store
+            .append_audit(
+                acct,
+                &NewAuditEntry {
+                    actor: "client-api".into(),
+                    action: "unsubscribe".into(),
+                    target: Some(mid.to_string()),
+                    detail: Some("browser:news@sub.com".into()),
+                },
+            )
+            .unwrap();
+        // Row 2: non-numeric target (a rule pattern) -> nulls, no error.
+        store
+            .append_audit(
+                acct,
+                &NewAuditEntry {
+                    actor: "client-api".into(),
+                    action: "rule.create".into(),
+                    target: Some("*@spam.com".into()),
+                    detail: Some("42".into()),
+                },
+            )
+            .unwrap();
+        // Row 3: numeric target that is NOT a known message id -> nulls.
+        store
+            .append_audit(
+                acct,
+                &NewAuditEntry {
+                    actor: "client-api".into(),
+                    action: "archive".into(),
+                    target: Some("999999".into()),
+                    detail: Some("ok".into()),
+                },
+            )
+            .unwrap();
+
+        let log = store.list_audit(acct, 10).unwrap();
+        assert_eq!(log.len(), 3);
+
+        let unsub = log.iter().find(|a| a.action == "unsubscribe").unwrap();
+        assert_eq!(unsub.target_sender.as_deref(), Some("Newsletter Co"));
+        assert_eq!(unsub.target_subject.as_deref(), Some("Weekly digest"));
+
+        let rule = log.iter().find(|a| a.action == "rule.create").unwrap();
+        assert!(rule.target_sender.is_none(), "non-numeric target yields no enrichment");
+        assert!(rule.target_subject.is_none());
+
+        let arch = log.iter().find(|a| a.action == "archive").unwrap();
+        assert!(arch.target_sender.is_none(), "unknown message id yields no enrichment");
+        assert!(arch.target_subject.is_none());
     }
 
     #[test]

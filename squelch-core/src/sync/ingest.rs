@@ -14,11 +14,12 @@
 use crate::config::Stage1Config;
 use crate::store::TriagedMessage;
 use crate::sync::html::sanitize_email_html;
+use crate::triage::calendar;
 use crate::triage::receipt;
 use crate::triage::seal::{self, SealInput};
 use crate::triage::shipment;
 use crate::triage::stage1_with_config;
-use crate::types::{AccountId, NewMessage, Sensitivity, Tier};
+use crate::types::{AccountId, FieldReasons, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
 use mail_parser::{Address, MessageParser};
 
@@ -226,6 +227,31 @@ fn is_hex_blob(s: &str) -> bool {
     s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
+/// Extract the unsubscribe intent from a parsed message:
+///   * the raw `List-Unsubscribe` header value (comma-separated `<mailto:…>` /
+///     `<https:…>` entries), trimmed — `None` when absent or blank;
+///   * whether RFC 8058 one-click is advertised: a `List-Unsubscribe-Post`
+///     header whose value contains `List-Unsubscribe=One-Click`
+///     (case-insensitive). One-click is only meaningful alongside a
+///     `List-Unsubscribe` header, so the flag is forced `false` when the latter
+///     is absent.
+///
+/// Header selection/parsing is left to the human-door endpoint; here we only
+/// capture the raw material so triage/FTS/MCP are never affected.
+pub fn extract_unsub_headers(msg: &mail_parser::Message) -> (Option<String>, bool) {
+    let list_unsub = msg
+        .header_raw("List-Unsubscribe")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let one_click = list_unsub.is_some()
+        && msg
+            .header_raw("List-Unsubscribe-Post")
+            .map(|v| v.to_ascii_lowercase().contains("list-unsubscribe=one-click"))
+            .unwrap_or(false);
+    (list_unsub, one_click)
+}
+
 /// Derive a stable thread key from headers when X-GM-THRID is unavailable.
 /// Uses the root References id, else In-Reply-To, else this message's own
 /// Message-ID. This keeps a reply chain grouped without Gmail's THRID.
@@ -278,8 +304,18 @@ pub fn ingest(
 
     // Extract fields with graceful fallbacks for malformed mail.
     #[allow(clippy::type_complexity)]
-    let (from_addr, from_name, subject, received_at, thread_id, msg_id_hdr, text, body_html) =
-        match &parsed {
+    let (
+        from_addr,
+        from_name,
+        subject,
+        received_at,
+        thread_id,
+        msg_id_hdr,
+        text,
+        body_html,
+        list_unsubscribe,
+        list_unsub_one_click,
+    ) = match &parsed {
             Some(m) => {
                 let (fa, fname) = m.from().map(first_addr).unwrap_or_default();
                 let subject = m.subject().unwrap_or("").to_string();
@@ -322,6 +358,7 @@ pub fn ingest(
                     .gmail_thread_id
                     .clone()
                     .or_else(|| fallback_thread_id(m));
+                let (list_unsub, one_click) = extract_unsub_headers(m);
                 (
                     fa,
                     fname,
@@ -331,6 +368,8 @@ pub fn ingest(
                     m.message_id().map(|s| s.to_string()),
                     text,
                     body_html,
+                    list_unsub,
+                    one_click,
                 )
             }
             None => (
@@ -342,6 +381,8 @@ pub fn ingest(
                 None,
                 String::new(),
                 None,
+                None,
+                false,
             ),
         };
 
@@ -393,6 +434,8 @@ pub fn ingest(
         body: text.clone(),
         body_html,
         is_sent: fetched.is_sent,
+        list_unsubscribe,
+        list_unsub_one_click,
     };
 
     // ---- SEAL DETECTION FIRST (security invariant) ----------------------
@@ -413,10 +456,12 @@ pub fn ingest(
             tier: Tier::Noise,
             one_line: String::new(),
             reason: format!("sealed at ingest ({})", kind.as_str()),
+            field_reasons: FieldReasons::default(),
             matched_rule: None,
             deadline: None,
             shipment: None,
             receipt: None,
+            calendar: None,
             confident: true,
         };
     }
@@ -436,10 +481,12 @@ pub fn ingest(
             tier: Tier::Noise,
             one_line: String::new(),
             reason: "sent mail (contacts seeded; not triaged)".to_string(),
+            field_reasons: FieldReasons::default(),
             matched_rule: None,
             deadline: None,
             shipment: None,
             receipt: None,
+            calendar: None,
             confident: true,
         };
     }
@@ -466,6 +513,20 @@ pub fn ingest(
     // (status='done') so it never surfaces as inbox clutter.
     let receipt = receipt::detect_receipt(&from_addr, &subject, &text);
 
+    // CALENDAR DETECTION runs INDEPENDENTLY of the triage tier, exactly like
+    // receipts: an invite/cancellation/RSVP is a record of scheduling state
+    // that feeds the Calendar category (and is auto-resolved to 'done' by the
+    // store's ingest write). Only ever runs here, on the NON-SEALED path — a
+    // sealed OTP short-circuited above and never reaches this line, so a
+    // calendar update can never carry sealed data.
+    let calendar = calendar::detect_calendar(
+        &from_addr,
+        message.from_name.as_deref(),
+        &subject,
+        &text,
+        received_at,
+    );
+
     TriagedMessage {
         message,
         recipients,
@@ -475,10 +536,12 @@ pub fn ingest(
         tier: result.tier,
         one_line: result.one_line,
         reason: result.reason,
+        field_reasons: result.field_reasons,
         matched_rule: result.matched_rule,
         deadline: result.deadline,
         shipment,
         receipt,
+        calendar,
         confident: result.confident,
     }
 }
@@ -509,6 +572,7 @@ pub fn ingest_with_rules(
     triaged.tier = result.tier;
     triaged.one_line = result.one_line;
     triaged.reason = result.reason;
+    triaged.field_reasons = result.field_reasons;
     triaged.matched_rule = result.matched_rule;
     triaged.deadline = result.deadline;
     triaged.confident = result.confident;
@@ -849,6 +913,54 @@ mod tests {
     }
 
     #[test]
+    fn google_invite_produces_a_calendar_update_at_ingest() {
+        // A Google Calendar invite: classified as a calendar update (with title
+        // + start extracted) so the ingest write auto-resolves it out of the
+        // attention bands and into the Calendar category.
+        let eml = "From: Sam Doe <sam@gmail.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Invitation: Design review @ Wed Jul 22, 2026 10am - 11am (PDT) (me@example.com)\r\n\
+                   Date: Mon, 20 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Sam Doe has invited you. View on Google Calendar.\r\n";
+        let f = raw(1, "g-cal-inv", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        let c = t.calendar.expect("calendar update detected");
+        assert_eq!(c.kind, crate::triage::CalendarKind::Invite);
+        assert_eq!(c.event_title.as_deref(), Some("Design review"));
+        assert!(c.starts_at.is_some());
+    }
+
+    #[test]
+    fn newsletter_mentioning_calendar_is_not_a_calendar_update_at_ingest() {
+        let eml = "From: Shop News <news@shop.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your July events calendar is here!\r\n\
+                   Date: Mon, 20 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Check our calendar of sales events. Unsubscribe here.\r\n";
+        let f = raw(1, "g-cal-news", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.calendar.is_none(), "topical calendar prose must not classify");
+    }
+
+    #[test]
+    fn sealed_otp_never_produces_a_calendar_update() {
+        // A sealed OTP short-circuits before calendar detection ever runs, even
+        // with an invitation-shaped subject.
+        let eml = "From: Bank <noreply@bank.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your verification code\r\n\
+                   Date: Mon, 20 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   Your one-time passcode is 483920. Invitation: security review @ Wed Jul 22, 2026 10am.\r\n";
+        let f = raw(1, "g-otp-cal", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.sensitivity, Sensitivity::Sealed);
+        assert!(t.calendar.is_none(), "sealed mail must never yield a calendar update");
+    }
+
+    #[test]
     fn sealed_otp_never_produces_a_shipment() {
         // A sealed OTP short-circuits before shipment detection ever runs.
         let eml = "From: Bank <noreply@bank.com>\r\n\
@@ -861,6 +973,54 @@ mod tests {
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.sensitivity, Sensitivity::Sealed);
         assert!(t.shipment.is_none(), "sealed mail must never yield a shipment");
+    }
+
+    #[test]
+    fn list_unsubscribe_headers_land_on_the_message() {
+        // A newsletter advertising both a mailto and an https one-click endpoint,
+        // with RFC 8058 List-Unsubscribe-Post. Both fields must be captured.
+        let eml = "From: News <news@substack.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: The Weekly Roundup\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   List-Unsubscribe: <mailto:unsub@substack.com?subject=bye>, <https://substack.com/u/9?x=1>\r\n\
+                   List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+                   \r\n\
+                   Great stuff this week.\r\n";
+        let f = raw(1, "g-unsub", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        let lu = t.message.list_unsubscribe.expect("list-unsubscribe captured");
+        assert!(lu.contains("mailto:unsub@substack.com"));
+        assert!(lu.contains("https://substack.com/u/9"));
+        assert!(t.message.list_unsub_one_click, "RFC 8058 one-click detected");
+    }
+
+    #[test]
+    fn list_unsubscribe_without_post_is_not_one_click() {
+        let eml = "From: News <news@substack.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Roundup\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   List-Unsubscribe: <https://substack.com/u/9>\r\n\
+                   \r\n\
+                   body\r\n";
+        let f = raw(1, "g-unsub2", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.message.list_unsubscribe.is_some());
+        assert!(!t.message.list_unsub_one_click, "no List-Unsubscribe-Post => not one-click");
+    }
+
+    #[test]
+    fn no_unsub_header_leaves_fields_empty() {
+        let eml = "From: Alice <alice@friends.com>\r\n\
+                   Subject: dinner\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   friday?\r\n";
+        let f = raw(1, "g-plain-unsub", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.message.list_unsubscribe.is_none());
+        assert!(!t.message.list_unsub_one_click);
     }
 
     #[test]
