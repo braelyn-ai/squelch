@@ -6,7 +6,16 @@
 // "sitrep" is the Sitrep dashboard's own minimal context (obligation j/k, d,
 // Enter/v). Like "list"/"modal" it composes with "global" (see dispatchCore),
 // so the global 1..5 view-nav keys keep firing while it's active.
-export type KeyContext = "list" | "sitrep" | "modal" | "input" | "global";
+// "thread" is the fullscreen email viewer's context — its own layer ABOVE
+// "modal" so a thread opened from an open search/browse panel gates that
+// panel's keys (and its Esc) until the viewer closes.
+export type KeyContext =
+  | "list"
+  | "sitrep"
+  | "modal"
+  | "thread"
+  | "input"
+  | "global";
 
 export interface KeyBinding {
   key: string;

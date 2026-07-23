@@ -1,8 +1,9 @@
 // One dense update row: importance · sender · one_line · relative time ·
-// matched-rule hint · deadline chip. Used by every band. Mouse click selects;
-// double-click drills in. All action affordances remain keyboard-first — the
-// [r][e][d] verb hint only shows on the selected row.
+// matched-rule hint · deadline chip. Mouse click selects AND opens the thread
+// (gmail semantics). Action affordances remain keyboard-first — the [r][e][d]
+// verb hint only shows on the selected row.
 
+import { memo } from "react";
 import type { AttentionUpdate } from "../api";
 import {
   relAge,
@@ -14,6 +15,7 @@ import {
 } from "../lib/format";
 import { Avatar } from "./Avatar";
 import { senderDisplayName } from "../lib/avatar";
+import { reasonFor } from "../lib/reasons";
 
 export interface UpdateRowProps {
   update: AttentionUpdate;
@@ -26,7 +28,10 @@ export interface UpdateRowProps {
   onOpen: (u: AttentionUpdate) => void;
 }
 
-export function UpdateRow({
+// Memoized: the inbox renders up to ~500 of these and moves the selection on
+// every hover — without memo each hover re-rendered the whole list. Parents
+// must pass identity-stable onSelect/onOpen for this to bite.
+export const UpdateRow = memo(function UpdateRow({
   update: u,
   selected,
   aging,
@@ -35,6 +40,12 @@ export function UpdateRow({
   onOpen,
 }: UpdateRowProps) {
   const chip = deadlineChip(u.deadline);
+  // Per-property triage reasons surface as hover tooltips. The importance title
+  // keeps its "importance N" context and appends the reason when one exists.
+  const impReason = reasonFor(u, "importance", "");
+  const impTitle = impReason
+    ? `importance ${u.importance} — ${impReason}`
+    : `importance ${u.importance}`;
   // The aging BADGE ("← 2 WEEKS") only earns its place once an item is genuinely
   // aging (age > 48h). Under that, the STILL OPEN row is still "open" but shows
   // the plain relative time like any other band — no shouty badge on fresh items.
@@ -49,17 +60,20 @@ export function UpdateRow({
 
   return (
     <div
-      className={`row num${selected ? " sel" : ""}${showAgeBadge ? " aging" : ""}`}
+      className={`row${selected ? " sel" : ""}${showAgeBadge ? " aging" : ""}`}
       style={showAgeBadge ? { borderLeftWidth: railWidth } : undefined}
-      onClick={() => onSelect(u.id)}
-      onDoubleClick={() => onOpen(u)}
+      onMouseEnter={() => onSelect(u.id)}
+      onClick={() => {
+        onSelect(u.id);
+        onOpen(u);
+      }}
       role="button"
       tabIndex={-1}
     >
       <span
         className="imp meter"
         style={{ color: importanceColor(u.importance) }}
-        title={`importance ${u.importance}`}
+        title={impTitle}
         aria-label={`importance ${u.importance}`}
       >
         {importanceMeter(u.importance)}
@@ -80,7 +94,10 @@ export function UpdateRow({
         )}
 
         {chip && (
-          <span className={`chip ${chip.overdue ? "overdue" : "upcoming"}`}>
+          <span
+            className={`chip ${chip.overdue ? "overdue" : "upcoming"}`}
+            title={reasonFor(u, "deadline", chip.text)}
+          >
             {chip.text}
           </span>
         )}
@@ -97,4 +114,4 @@ export function UpdateRow({
       </span>
     </div>
   );
-}
+});

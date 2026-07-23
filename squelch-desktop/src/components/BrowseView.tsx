@@ -9,9 +9,10 @@ import type { AttentionUpdate } from "../api";
 import { useStore } from "../state";
 import { useKeys } from "../keys";
 import { relAge, tierColor, importanceColor } from "../lib/format";
+import { reasonFor } from "../lib/reasons";
 
 export function BrowseView() {
-  const openSide = useStore((s) => s.openSide);
+  const openThreadView = useStore((s) => s.openThread);
   const [all, setAll] = useState<AttentionUpdate[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -55,7 +56,7 @@ export function BrowseView() {
   }, [visible.length]);
 
   const openThread = (u: AttentionUpdate | undefined) => {
-    if (u) openSide({ kind: "thread", threadId: u.thread_id });
+    if (u) openThreadView(u.thread_id);
   };
 
   const bindings = useMemo(
@@ -127,9 +128,13 @@ export function BrowseView() {
           <span
             className="tier-dot"
             style={{ background: tierColor(u.tier) }}
-            title={u.tier}
+            title={reasonFor(u, "tier", u.tier)}
           />
-          <span className="imp" style={{ color: importanceColor(u.importance) }}>
+          <span
+            className="imp"
+            style={{ color: importanceColor(u.importance) }}
+            title={reasonFor(u, "importance", `importance ${u.importance}`)}
+          >
             {u.importance}
           </span>
           <span className="sender" title={u.sender}>
