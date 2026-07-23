@@ -1,8 +1,11 @@
 //! The BANKING specialist extractor.
 //!
 //! Runs on rows the LLM categorized `banking_statement` (a periodic account /
-//! credit-card statement — a RECORD) or `transaction_alert` (a "you spent" /
-//! deposit / low-balance activity notice). It pulls a small structured record —
+//! credit-card statement — a RECORD), `transaction_alert` (a "you spent" /
+//! deposit / low-balance activity notice), or `autopay_bill` (a bill the email
+//! explicitly says will be paid automatically — a record, it handles itself;
+//! bills NEEDING action are `invoice` and never reach this pass). It pulls a
+//! small structured record —
 //! institution, amount, currency, and a MASKED account tail — and the store write
 //! ([`crate::store::Store::banking_apply`]) upserts a `banking` row and
 //! AUTO-RESOLVES the triage row (`status='done'`) so the record leaves the
@@ -29,8 +32,8 @@ use crate::triage::extract::{ExtractContext, build_extract_user_message};
 use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, Usage};
 use serde::{Deserialize, Serialize};
 
-/// The categories this extractor handles. Both are RECORDS (they auto-resolve).
-pub const CATEGORIES: &[&str] = &["banking_statement", "transaction_alert"];
+/// The categories this extractor handles. All are RECORDS (they auto-resolve).
+pub const CATEGORIES: &[&str] = &["banking_statement", "transaction_alert", "autopay_bill"];
 
 /// The usage-ledger category this extractor bills its token usage to (distinct
 /// from `stage1`/`stage2` so per-specialist cost stays visible).
@@ -45,9 +48,10 @@ pub const LEDGER_CATEGORY: &str = "extract_banking";
 /// one `&'static str` so callers hand identical bytes to the API every time.
 pub const SYSTEM_PROMPT: &str = "\
 You are a banking-detail extractor for a personal inbox assistant. The email \
-below has already been classified as either a bank/credit-card STATEMENT or a \
-bank/card TRANSACTION ALERT. Extract a small structured record and return a \
-single JSON object matching the provided schema. Return only that object.
+below has already been classified as a bank/credit-card STATEMENT, a bank/card \
+TRANSACTION ALERT, or an AUTOPAY BILL (a bill the email says will be paid \
+automatically - a record, since it handles itself). Extract a small structured \
+record and return a single JSON object matching the provided schema. Return only that object.
 
 FIELDS:
 - institution: the bank or card issuer's clean DISPLAY name (e.g. \"Chase\", \
@@ -56,7 +60,8 @@ name. null if you cannot tell.
 - amount: a single number (no currency symbol, no thousands separators). For a \
 credit-card or account STATEMENT, report the TOTAL statement balance, NEVER the \
 minimum payment or the amount due. For a TRANSACTION ALERT, report the \
-transaction amount (the amount spent, deposited, or withdrawn). null if none is \
+transaction amount (the amount spent, deposited, or withdrawn). For an AUTOPAY \
+BILL, report the amount that will be automatically charged. null if none is \
 present.
 - currency: the ISO currency code for amount (e.g. \"USD\"), or null.
 - account_hint: AT MOST the LAST FOUR DIGITS of the account or card, as a short \
@@ -129,12 +134,13 @@ pub fn sanitize_account_hint(raw: Option<&str>) -> Option<String> {
 }
 
 /// Map a routing category to the stored `banking.kind` value. `banking_statement`
-/// -> `statement`; `transaction_alert` -> `transaction_alert`. Any other value
-/// (should be unreachable — the queue only ever hands us these two) maps to
-/// `statement` defensively.
+/// -> `statement`; `transaction_alert` -> `transaction_alert`; `autopay_bill`
+/// -> `autopay`. Any other value (should be unreachable — the queue only ever
+/// hands us these three) maps to `statement` defensively.
 pub fn kind_for_category(category: &str) -> &'static str {
     match category {
         "transaction_alert" => "transaction_alert",
+        "autopay_bill" => "autopay",
         _ => "statement",
     }
 }
@@ -353,6 +359,20 @@ mod tests {
     fn kind_maps_from_category() {
         assert_eq!(kind_for_category("banking_statement"), "statement");
         assert_eq!(kind_for_category("transaction_alert"), "transaction_alert");
+        assert_eq!(kind_for_category("autopay_bill"), "autopay");
+    }
+
+    #[test]
+    fn autopay_bill_is_registered_but_invoice_is_not() {
+        // autopay bills route to this extractor (record: auto-resolves out of
+        // the bands into Banking); invoices must NEVER be extractable — they
+        // need action and stay in For your eyes.
+        assert!(CATEGORIES.contains(&"autopay_bill"));
+        assert!(!CATEGORIES.contains(&"invoice"));
+        assert!(
+            !crate::triage::extract::extractable_categories().contains(&"invoice"),
+            "invoice must never gain an extractor that auto-resolves it"
+        );
     }
 
     #[test]

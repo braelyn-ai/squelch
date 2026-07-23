@@ -92,6 +92,12 @@ CATEGORY: assign exactly one coarse category, used to route the email to a \
 specialist. Choose the single best fit:
 - invoice = a bill or invoice that NEEDS PAYING (an action). It stays in the \
 attention bands so the user does not miss it.
+- autopay_bill = a bill the email EXPLICITLY says will be paid automatically: \
+autopay/automatic payment is enabled, the amount will be charged on a date, no \
+action is needed. This is a RECORD (it handles itself). Use it ONLY when the \
+email clearly states automatic payment is on; if there is any doubt, or any \
+action is requested, use invoice - burying a bill that needed paying is the \
+worst possible mistake.
 - banking_statement = a periodic bank or credit-card STATEMENT (a record). Even \
 though a statement carries a due date, it is a RECORD, not an obligation — never \
 treat it as an invoice.
@@ -148,7 +154,7 @@ pub fn output_schema() -> serde_json::Value {
             "confident": { "type": "boolean" },
             "category": {
                 "type": "string",
-                "enum": ["general", "invoice", "banking_statement", "transaction_alert"]
+                "enum": ["general", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
             }
         }
     })
@@ -173,7 +179,7 @@ pub struct Stage1Output {
     pub deadline_reason: Option<String>,
     /// `false` => escalate to the more capable Stage-2 model.
     pub confident: bool,
-    /// Coarse routing category: `general` | `invoice` | `banking_statement` |
+    /// Coarse routing category: `general` | `invoice` | `autopay_bill` | `banking_statement` |
     /// `transaction_alert`. Constrained by the schema enum; normalized on apply
     /// (an unknown value falls back to `general`) before it is stored on the row.
     /// `#[serde(default)]` so a pre-category model response still parses.
@@ -191,6 +197,7 @@ pub fn default_category() -> String {
 pub const CATEGORIES: &[&str] = &[
     "general",
     "invoice",
+    "autopay_bill",
     "banking_statement",
     "transaction_alert",
 ];
@@ -402,10 +409,10 @@ mod tests {
         for k in ["tier", "confident", "importance", "one_line", "category"] {
             assert!(req.iter().any(|v| v == k), "missing required {k}");
         }
-        // The category property is a closed enum of exactly the four routes.
+        // The category property is a closed enum of exactly the five routes.
         let en = s["properties"]["category"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), 4);
-        for c in ["general", "invoice", "banking_statement", "transaction_alert"] {
+        assert_eq!(en.len(), 5);
+        for c in ["general", "invoice", "autopay_bill", "banking_statement", "transaction_alert"] {
             assert!(en.iter().any(|v| v == c), "missing category enum {c}");
         }
     }

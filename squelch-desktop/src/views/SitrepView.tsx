@@ -762,6 +762,7 @@ function ReceiptsZone() {
 const BANK_KIND_TAG: Record<BankingRecord["kind"], string> = {
   statement: "statement",
   transaction_alert: "alert",
+  autopay: "autopay",
 };
 
 /** Format a banking amount: record currency (fallback USD), two decimals; a

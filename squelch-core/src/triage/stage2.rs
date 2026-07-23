@@ -90,6 +90,12 @@ CATEGORY: assign exactly one coarse category, used to route the email to a \
 specialist. Choose the single best fit:
 - invoice = a bill or invoice that NEEDS PAYING (an action). It stays in the \
 attention bands so the user does not miss it.
+- autopay_bill = a bill the email EXPLICITLY says will be paid automatically: \
+autopay/automatic payment is enabled, the amount will be charged on a date, no \
+action is needed. This is a RECORD (it handles itself). Use it ONLY when the \
+email clearly states automatic payment is on; if there is any doubt, or any \
+action is requested, use invoice - burying a bill that needed paying is the \
+worst possible mistake.
 - banking_statement = a periodic bank or credit-card STATEMENT (a record). Even \
 though a statement carries a due date, it is a RECORD, not an obligation — never \
 treat it as an invoice.
@@ -244,7 +250,7 @@ pub fn output_schema() -> serde_json::Value {
             "deadline_reason": { "type": ["string", "null"] },
             "category": {
                 "type": "string",
-                "enum": ["general", "invoice", "banking_statement", "transaction_alert"]
+                "enum": ["general", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
             }
         }
     })
@@ -270,7 +276,7 @@ pub struct Stage2Output {
     #[serde(default)]
     pub deadline_reason: Option<String>,
     /// Coarse routing category (parity with Stage-1): `general` | `invoice` |
-    /// `banking_statement` | `transaction_alert`. Normalized on apply. `#[serde(
+    /// `autopay_bill` | `banking_statement` | `transaction_alert`. Normalized on apply. `#[serde(
     /// default)]` so a pre-category response still parses.
     #[serde(default = "crate::triage::stage1_llm::default_category")]
     pub category: String,

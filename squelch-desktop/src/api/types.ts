@@ -166,7 +166,7 @@ export interface CalendarUpdate {
 
 /** What a banking notification IS: a periodic statement (a balance to review)
  *  or a per-transaction alert (a charge/debit notice). */
-export type BankingKind = "statement" | "transaction_alert";
+export type BankingKind = "statement" | "transaction_alert" | "autopay";
 
 /**
  * GET /client/banking — a banking-notification record (statement-ready / balance
