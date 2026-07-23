@@ -72,6 +72,11 @@ the TRUSTED CONTEXT is a strong signal for a higher tier.
 DEADLINES: set has_deadline=true only for a concrete bill, payment, or dated \
 obligation. When true, extract deadline_iso as an RFC3339 timestamp (UTC) and \
 deadline_kind as a short label (e.g. \"invoice\", \"payment_due\", \"renewal\"). \
+YEAR RULE: when the email states a date WITHOUT a year, infer the year from the \
+email's received date - these dates are forward-looking (the next occurrence on \
+or after receipt). NEVER emit a deadline in the past year: a just-received \
+email is not announcing something 12 months overdue; if your date lands far in \
+the past, you picked the wrong year. \
 If no concrete date is present but a bill clearly exists, still set \
 has_deadline=true with deadline_iso=null.
 
@@ -454,7 +459,7 @@ mod tests {
     fn known_sender_past_deadline_is_pastdue() {
         let mut o = out(90, true);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         let a = apply_result(&queued(true), &o, "m", now());
         assert_eq!(a.tier, Tier::PastDue);
         assert!(a.deadline.unwrap().past_due);
@@ -464,7 +469,7 @@ mod tests {
     fn unknown_sender_past_deadline_caps_at_deadline() {
         let mut o = out(90, false);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         let a = apply_result(&queued(false), &o, "m", now());
         assert_eq!(a.tier, Tier::Deadline, "unknown-sender past-due caps at Deadline");
         assert!(!a.deadline.unwrap().past_due);

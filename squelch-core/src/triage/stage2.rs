@@ -70,6 +70,11 @@ SCORING (importance is an integer 0-100, aligned with these anchors):
 DEADLINES: set has_deadline=true only for a concrete bill, payment, or dated \
 obligation. When true, extract deadline_iso as an RFC3339 timestamp (UTC) and \
 deadline_kind as a short label (e.g. \"invoice\", \"payment_due\", \"renewal\"). \
+YEAR RULE: when the email states a date WITHOUT a year, infer the year from the \
+email's received date - these dates are forward-looking (the next occurrence on \
+or after receipt). NEVER emit a deadline in the past year: a just-received \
+email is not announcing something 12 months overdue; if your date lands far in \
+the past, you picked the wrong year. \
 If no concrete date is present but a bill clearly exists, still set \
 has_deadline=true with deadline_iso=null.
 
@@ -501,9 +506,15 @@ pub(crate) fn derive_deadline_and_tier(
     importance: u8,
     now: DateTime<Utc>,
 ) -> (Tier, Option<DeadlineHit>, Option<String>, String) {
-    // Receipt-relative sanity bounds: a model date more than ~1 year before, or
-    // ~3 years after, the message's receipt is a bad extraction and is dropped.
-    const MAX_DAYS_PAST: i64 = 365;
+    // Receipt-relative sanity bounds. PAST is deliberately tight (45 days): a
+    // freshly received email is essentially never announcing something months
+    // overdue, and the dominant model failure is a HALLUCINATED YEAR — "July 24"
+    // emitted as last year's date lands ~364 days past, which the old 365-day
+    // bound accepted by one day (the "54 weeks past due" dental-confirmation
+    // bug, 2026-07-23). Genuinely late bills are days-to-weeks late; 45 keeps
+    // those and rejects every year-slip. (The deterministic parser keeps its
+    // looser bound — explicit year text in an email is data, not a guess.)
+    const MAX_DAYS_PAST: i64 = 45;
     const MAX_DAYS_FUTURE: i64 = 365 * 3;
     let due_at: Option<DateTime<Utc>> = inp
         .deadline_iso
@@ -861,7 +872,7 @@ mod tests {
         let q = queued(false, None); // unknown sender
         let mut o = out(60);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         let a = apply_result(&q, &o, "m", now());
         assert_eq!(a.tier, Tier::Deadline, "unknown-sender past-due caps at Deadline");
         let d = a.deadline.expect("deadline row");
@@ -873,10 +884,27 @@ mod tests {
         let q = queued(true, None); // known sender
         let mut o = out(90);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         let a = apply_result(&q, &o, "m", now());
         assert_eq!(a.tier, Tier::PastDue);
         assert!(a.deadline.unwrap().past_due);
+    }
+
+    #[test]
+    fn year_slipped_model_deadline_is_dropped() {
+        // THE "54 WEEKS PAST DUE" BUG (2026-07-23): "July 24" with no year,
+        // emitted by the model as LAST year's date — 364 days past receipt.
+        // The old 365-day bound accepted it by one day; the 45-day bound must
+        // reject it, keep the bill dateless, and say why in the reason.
+        let q = queued(true, None); // received 2026-07-09
+        let mut o = out(80);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2025-07-10T00:00:00Z".into()); // 364d before receipt
+        let a = apply_result(&q, &o, "m", now());
+        assert!(a.deadline.is_none(), "year-slipped date must not persist");
+        assert_ne!(a.tier, Tier::PastDue, "no phantom past_due from a year slip");
+        let dr = a.field_reasons.deadline.as_deref().unwrap_or("");
+        assert!(dr.contains("sanity bounds"), "reason must state the drop: {dr}");
     }
 
     #[test]
@@ -898,7 +926,7 @@ mod tests {
         let q = queued(false, Some("only real bills")); // unknown, but rule match
         let mut o = out(90);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.matches_sender_rule = Some(true);
         let a = apply_result(&q, &o, "m", now());
         assert_eq!(a.tier, Tier::PastDue, "rule-match trusts the deadline claim");
@@ -913,7 +941,7 @@ mod tests {
         let q = queued(false, None);
         let mut o = out(60);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.matches_sender_rule = Some(true); // unverifiable trust claim
         let a = apply_result(&q, &o, "m", now());
         assert_eq!(a.tier, Tier::Deadline, "no-rule row stays capped at Deadline");
@@ -973,7 +1001,7 @@ mod tests {
         let mut o = out(90);
         o.importance_reason = "dated invoice with a total from a known vendor".into();
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.deadline_reason = Some("invoice past due Jan 1".into());
         let a = apply_result(&q, &o, "claude-haiku-4-5", now());
         assert_eq!(a.tier, Tier::PastDue);
@@ -1000,7 +1028,7 @@ mod tests {
         let q = queued(false, None);
         let mut o = out(60);
         o.has_deadline = true;
-        o.deadline_iso = Some("2026-01-01T00:00:00Z".into()); // past
+        o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.deadline_reason = Some("claims overdue".into());
         let a = apply_result(&q, &o, "m", now());
         assert_eq!(a.tier, Tier::Deadline);

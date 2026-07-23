@@ -608,6 +608,52 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+
+    // ONE-SHOT CLEANUP (2026-07-23, the "54 weeks past due" year-slip bug):
+    // guarded on table existence — migration unit tests build partial schemas.
+    let cleanup_tables_exist: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('triage','deadlines','messages')",
+        )?;
+        let n: i64 = stmt.query_row([], |r| r.get(0))?;
+        n == 3
+    };
+    if !cleanup_tables_exist {
+        return Ok(());
+    }
+    //
+    // model-sourced deadlines whose date is far before the message's own
+    // receipt are hallucinated years ("July 24" emitted as LAST year's date —
+    // 364 days past slipped through the old 365-day sanity bound). The bound is
+    // now 45 days at apply time; retro-clean rows the old bound let through:
+    // null the bad deadline (the mail stays surfaced, just dateless), demote a
+    // stranded past_due tier to deadline, and drop the matching deadlines rows.
+    // Deterministic parses (source not stage1/stage2) are untouched — explicit
+    // year text in an email is data. Idempotent by construction (the predicate
+    // can't re-match once cleared).
+    conn.execute(
+        "UPDATE triage SET deadline = NULL,
+                tier = CASE WHEN tier = 'past_due' THEN 'deadline' ELSE tier END
+         WHERE deadline IS NOT NULL
+           AND message_id IN (
+             SELECT d.message_id FROM deadlines d
+             JOIN messages m ON m.id = d.message_id
+             WHERE d.source IN ('stage1', 'stage2')
+               AND julianday(m.received_at) - julianday(d.due_at) > 45
+           )",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM deadlines
+         WHERE source IN ('stage1', 'stage2')
+           AND id IN (
+             SELECT d.id FROM deadlines d
+             JOIN messages m ON m.id = d.message_id
+             WHERE julianday(m.received_at) - julianday(d.due_at) > 45
+           )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -3575,6 +3621,49 @@ mod tests {
         assert_eq!(s1.len(), 1, "the fresh normal row enters Stage-1");
         assert_eq!(s1[0].message_id, id);
         assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_cleans_year_slipped_stage_deadlines() {
+        // The "54 weeks past due" retro-clean: a stage-sourced deadline far
+        // before its message's receipt is nulled (tier demoted from past_due),
+        // the deadlines row deleted; deterministic-source rows are untouched.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(id, email, created_at) VALUES (1, 'a@b', '2026-01-01T00:00:00Z');
+             INSERT INTO messages(id, account_id, gmail_msg_id, thread_id, from_addr, subject,
+                                  received_at, snippet)
+                 VALUES (1, 1, 'g1', 't1', 'x@y', 's', '2026-07-23T00:00:00Z', ''),
+                        (2, 1, 'g2', 't2', 'x@y', 's', '2026-07-23T00:00:00Z', '');
+             INSERT INTO triage(message_id, account_id, tier, deadline, created_at, status)
+                 VALUES (1, 1, 'past_due', '2025-07-24T00:00:00Z', '2026-07-23T00:00:00Z', 'new'),
+                        (2, 1, 'past_due', '2025-07-24T00:00:00Z', '2026-07-23T00:00:00Z', 'new');
+             INSERT INTO deadlines(account_id, message_id, kind, due_at, past_due, source)
+                 VALUES (1, 1, 'bill', '2025-07-24T00:00:00Z', 1, 'stage1'),
+                        (1, 2, 'bill', '2025-07-24T00:00:00Z', 1, 'subject');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // Stage-sourced year-slip: deadline nulled, tier demoted, row gone.
+        let (dl1, tier1): (Option<String>, String) = conn
+            .query_row(
+                "SELECT deadline, tier FROM triage WHERE message_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dl1, None);
+        assert_eq!(tier1, "deadline");
+        let n1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deadlines WHERE message_id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n1, 0);
+        // Deterministic source ('subject'): untouched (explicit text is data).
+        let dl2: Option<String> = conn
+            .query_row("SELECT deadline FROM triage WHERE message_id=2", [], |r| r.get(0))
+            .unwrap();
+        assert!(dl2.is_some(), "deterministic-source deadline must survive");
     }
 
     #[test]
