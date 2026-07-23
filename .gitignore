@@ -6,3 +6,5 @@ target/
 .env
 node_modules
 scripts/rules.backup.json
+.atuin/
+*.tsbuildinfo
