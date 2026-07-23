@@ -2,9 +2,9 @@
 //
 // ZERO individual email rows: this is the situation report, not the mailbox.
 // Four soft-card zones, light/dark aware:
-//   a. OBLIGATIONS — deadline-centric cards from band=standing (avatar + sender,
-//      amount + due date, past-due loud). Actions: done (d / button), view
-//      (hands off to the Emails view with the item selected).
+//   a. OBLIGATIONS — deadline-centric rows from band=standing (avatar + sender,
+//      one-line + amount + due date, past-due loud). Actions: done (d / button),
+//      open email (opens the obligation's thread fullscreen in the ThreadViewer).
 //   b. ATTENTION — aggregate only: "N new since <relative last check>" +
 //      deduped sender chips (from band=new). Click → Emails.
 //   c. AGING — band=open filtered age>7d: "N items sitting over a week" + per
@@ -13,16 +13,14 @@
 //      rules count.
 //
 // Minimal keymap in its own "sitrep" KeyContext: j/k move between obligation
-// cards, d marks the focused obligation done, Enter/v views it in Emails. The
-// global 1..5 nav (App) works here too. Everything drilling into an actual
-// email is deliberately absent — the "view" hand-off is the escape hatch.
+// rows, d marks the focused obligation done, Enter/v opens it fullscreen. The
+// global 1..5 nav (App) works here too. Obligations + aging rows open the email
+// fullscreen (ThreadViewer); the Attention zone still routes to the Emails list.
 
 import { useEffect, useMemo, useState } from "react";
 import {
   KeyRound,
-  Clock,
   SlidersHorizontal,
-  Check,
   ArrowUpRight,
   TriangleAlert,
   Bell,
@@ -33,27 +31,25 @@ import {
   Package,
   Truck,
   PackageCheck,
+  RefreshCw,
+  CalendarDays,
 } from "lucide-react";
 import { api, ApiError } from "../api";
 import type {
   AttentionUpdate,
+  CalendarUpdate,
   Receipt as ReceiptRecord,
   SenderRule,
   Shipment,
   ShipmentStatus,
 } from "../api";
 import { openExternal } from "../lib/opener";
-import { useStore } from "../state";
+import { useStore, triggerMailRefresh } from "../state";
 import { useKeys, useKeyContext } from "../keys";
-import {
-  deadlineChip,
-  lastChecked,
-  loudAge,
-  relAge,
-  importanceColor,
-  importanceMeter,
-} from "../lib/format";
+import { deadlineChip, lastChecked, loudAge, relAge } from "../lib/format";
 import { senderDisplayName, faviconUrl } from "../lib/avatar";
+import { getUserName } from "../lib/identity";
+import { reasonFor } from "../lib/reasons";
 import { Avatar } from "../components/Avatar";
 import { dispatchDone } from "../lib/dispatch";
 import {
@@ -84,20 +80,84 @@ function amountFrom(u: AttentionUpdate): string | null {
   return m ? m[0].replace(/\s/, "") : null;
 }
 
+const SMALL_WORDS = [
+  "Zero",
+  "One",
+  "Two",
+  "Three",
+  "Four",
+  "Five",
+  "Six",
+  "Seven",
+  "Eight",
+  "Nine",
+];
+/** Spell small counts for the editorial hero ("Two obligations…"). */
+function spell(n: number): string {
+  return n >= 0 && n < SMALL_WORDS.length ? SMALL_WORDS[n] : String(n);
+}
+
+/** Obligations that are overdue or due by end of today — the "need you" set. */
+function needTodayCount(items: AttentionUpdate[]): number {
+  const end = new Date();
+  end.setHours(23, 59, 59, 999);
+  const cutoff = end.getTime();
+  return items.filter((u) => {
+    if (!u.deadline) return false;
+    const t = new Date(u.deadline).getTime();
+    return !Number.isNaN(t) && t <= cutoff;
+  }).length;
+}
+
+function greeting(): string {
+  const h = new Date().getHours();
+  if (h < 12) return "Good morning";
+  if (h < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+/**
+ * DASH HERO — the editorial centerpiece (design concept): a tiny greeting label
+ * (with the human's name), and a big Newsreader-serif headline stating what
+ * needs them today.
+ */
+function DashHero({ standing }: { standing: AttentionUpdate[] }) {
+  const today = needTodayCount(standing);
+  const total = standing.length;
+  const name = getUserName();
+
+  let title: string;
+  if (today > 0) {
+    title = `${spell(today)} obligation${today === 1 ? "" : "s"} need${
+      today === 1 ? "s" : ""
+    } you today.`;
+  } else if (total > 0) {
+    title = `${spell(total)} obligation${total === 1 ? "" : "s"} on your plate.`;
+  } else {
+    title = "You're all clear.";
+  }
+
+  return (
+    <div className="dash-hero">
+      <span className="hero-greeting">
+        {greeting()}
+        {name ? `, ${name}` : ""}
+      </span>
+      <h1 className="hero-title">{title}</h1>
+    </div>
+  );
+}
+
 export function SitrepView() {
   const setView = useStore((s) => s.setView);
-  const viewInEmails = useStore((s) => s.viewInEmails);
+  const openThread = useStore((s) => s.openThread);
 
   return (
     <div className="sitrep-dash">
-      <header className="dash-header">
-        <span className="brand">
-          squelch <span className="dim">· sitrep</span>
-        </span>
-        <span className="dash-sub">the situation, abstracted</span>
-      </header>
-
-      <SitrepBody onView={viewInEmails} onGoto={setView} />
+      <SitrepBody
+        onView={(u) => openThread(u.thread_id)}
+        onGoto={setView}
+      />
     </div>
   );
 }
@@ -106,7 +166,7 @@ function SitrepBody({
   onView,
   onGoto,
 }: {
-  onView: (id: number) => void;
+  onView: (u: AttentionUpdate) => void;
   onGoto: (v: "emails" | "auth" | "rules") => void;
 }) {
   const sitrep = useStore((s) => s.sitrep);
@@ -170,19 +230,27 @@ function SitrepBody({
         },
       },
       {
-        key: "Enter",
-        description: "view in Emails",
+        key: "e",
+        description: "mark done",
         handler: () => {
           const u = standing[obIdx];
-          if (u) onView(u.id);
+          if (u) void dispatchDone(u);
+        },
+      },
+      {
+        key: "Enter",
+        description: "open email",
+        handler: () => {
+          const u = standing[obIdx];
+          if (u) onView(u);
         },
       },
       {
         key: "v",
-        description: "view in Emails",
+        description: "open email",
         handler: () => {
           const u = standing[obIdx];
-          if (u) onView(u.id);
+          if (u) onView(u);
         },
       },
     ],
@@ -191,101 +259,130 @@ function SitrepBody({
   );
   useKeys("sitrep", bindings, [bindings]);
 
+  const needNow = needTodayCount(standing);
+  const today = new Date().toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  const syncedIso = lastRefresh ? new Date(lastRefresh).toISOString() : null;
+  const rel = syncedIso ? relAge(syncedIso) : "";
+  const syncLabel = !syncedIso
+    ? "syncing…"
+    : rel === "now" || rel === ""
+      ? "synced just now"
+      : `synced ${rel} ago`;
+
   return (
-    <div className="dash-zones">
-      <div className="dash-main">
-      {/* ---- (a) OBLIGATIONS ---- */}
-      <section className="zone zone-obligations">
-        <div className="zone-head">
-          <span className="glyph">
-            <TriangleAlert size={15} />
-          </span>
-          <h2>Obligations</h2>
-          <span className="zone-count">{standing.length}</span>
-          <span className="zone-sub">deadlines · immune to time</span>
+    <>
+      {/* Pinned masthead (top-left brand + top-right status) — static. The
+          drag-region attribute makes its EMPTY space a window-drag handle
+          (Tauri only drags when the mousedown target is this element itself,
+          so the brand/status children stay click-through-free). */}
+      <header className="dash-header" data-tauri-drag-region>
+        <div className="hdr-brand">
+          <span className="brand">squelch</span>
+          <span className="dash-sub">sitrep</span>
         </div>
-        {standing.length === 0 ? (
-          <p className="zone-empty">Nothing standing — clear board.</p>
-        ) : (
-          <div className="ob-grid">
+        <div className="hdr-status">
+          {needNow > 0 && (
+            <span className="need-pill" title="obligations that need you today">
+              <span className="need-dot" />
+              {needNow} need you now
+            </span>
+          )}
+          <span className="hdr-date">{today}</span>
+          <span className="hdr-sync">{syncLabel}</span>
+        </div>
+      </header>
+
+      {/* Body: the LEFT column (hero + main zones) scrolls; the right bar is
+          static. The vertical separator sits between them. */}
+      <div className="dash-body">
+      <div className="dash-left">
+      <DashHero standing={standing} />
+      <div className="dash-main">
+      {/* ---- (a) OBLIGATIONS — hidden entirely when empty ---- */}
+      {standing.length > 0 && (
+        <section className="zone zone-obligations">
+          <div className="zone-head">
+            <span className="glyph">
+              <TriangleAlert size={15} />
+            </span>
+            <h2>Obligations</h2>
+            <span className="zone-count">{standing.length}</span>
+            <span className="zone-sub">deadlines · immune to time</span>
+          </div>
+          <div className="ob-list">
             {standing.map((u, i) => (
-              <ObligationCard
+              <ObligationRow
                 key={u.id}
                 update={u}
                 focused={i === obIdx}
                 onFocus={() => setObIdx(i)}
-                onDone={() => void dispatchDone(u)}
-                onView={() => onView(u.id)}
+                onView={() => onView(u)}
               />
             ))}
           </div>
-        )}
-      </section>
+        </section>
+      )}
 
-      {/* ---- (b) ATTENTION ---- */}
-      <section
-        className={`zone zone-attention${fresh.length ? " clickable" : ""}`}
-        onClick={fresh.length ? () => onGoto("emails") : undefined}
-        role={fresh.length ? "button" : undefined}
-        tabIndex={fresh.length ? -1 : undefined}
-      >
-        <div className="zone-head">
-          <span className="glyph">
-            <Bell size={15} />
-          </span>
-          <h2>Attention</h2>
-          {fresh.length > 0 && <ArrowUpRight size={14} className="goto-hint" />}
-        </div>
-        {fresh.length === 0 ? (
-          <p className="zone-empty">Nothing new since anyone last looked.</p>
-        ) : (
-          <>
-            <p className="attn-lead">
-              <b>{fresh.length}</b> new since{" "}
-              {lastChecked(stats?.last_surfaced_at)}
-            </p>
-            <SenderChips items={fresh} />
-          </>
-        )}
-      </section>
+      {/* ---- (b) ATTENTION — hidden entirely when empty ---- */}
+      {fresh.length > 0 && (
+        <section
+          className="zone zone-attention clickable"
+          onClick={() => onGoto("emails")}
+          role="button"
+          tabIndex={-1}
+        >
+          <div className="zone-head">
+            <span className="glyph">
+              <Bell size={15} />
+            </span>
+            <h2>Attention</h2>
+            <ArrowUpRight size={14} className="goto-hint" />
+          </div>
+          <p className="attn-lead">
+            <b>{fresh.length}</b> new since{" "}
+            {lastChecked(stats?.last_surfaced_at)}
+          </p>
+          <SenderChips items={fresh} />
+        </section>
+      )}
 
-      {/* ---- (c) AGING ---- */}
-      <section className="zone zone-aging">
-        <div className="zone-head">
-          <span className="glyph">
-            <Hourglass size={15} />
-          </span>
-          <h2>Aging</h2>
-          {aging.length > 0 && <span className="zone-count">{aging.length}</span>}
-        </div>
-        {aging.length === 0 ? (
-          <p className="zone-empty">Nothing left rotting — nice.</p>
-        ) : (
-          <>
-            <p className="aging-lead">
-              <b>{aging.length}</b>{" "}
-              {aging.length === 1 ? "item" : "items"} sitting over a week
-            </p>
-            <div className="aging-list">
-              {aging.map((u) => (
-                <button
-                  key={u.id}
-                  type="button"
-                  className="aging-row"
-                  onClick={() => onView(u.id)}
-                  title="view in Emails"
-                >
-                  <Avatar sender={u.sender} size={20} />
-                  <span className="sender">{senderDisplayName(u.sender)}</span>
-                  <span className="dur">
-                    {loudAge(u.surfaced_at ?? u.resolved_at).toLowerCase()}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </>
-        )}
-      </section>
+      {/* ---- (c) AGING — hidden entirely when empty ---- */}
+      {aging.length > 0 && (
+        <section className="zone zone-aging">
+          <div className="zone-head">
+            <span className="glyph">
+              <Hourglass size={15} />
+            </span>
+            <h2>Aging</h2>
+            <span className="zone-count">{aging.length}</span>
+          </div>
+          <p className="aging-lead">
+            <b>{aging.length}</b> {aging.length === 1 ? "item" : "items"} sitting
+            over a week
+          </p>
+          <div className="aging-list">
+            {aging.map((u) => (
+              <button
+                key={u.id}
+                type="button"
+                className="aging-row"
+                onClick={() => onView(u)}
+                title="open email"
+              >
+                <Avatar sender={u.sender} size={20} />
+                <span className="sender">{senderDisplayName(u.sender)}</span>
+                <span className="dur">
+                  {loudAge(u.surfaced_at ?? u.resolved_at).toLowerCase()}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* ---- NEWSLETTERS (rule-onboarding surface) ---- */}
       <NewslettersZone />
@@ -301,101 +398,77 @@ function SitrepBody({
         onRules={() => onGoto("rules")}
       />
       </div>
+      </div>
 
-      {/* ---- SHIPMENTS + RECEIPTS (tall right-hand column) ---- */}
+      {/* ---- CALENDAR + SHIPMENTS + RECEIPTS (static right-hand column) ---- */}
       <aside className="dash-right">
+        <CalendarZone />
         <ShipmentsColumn />
         <ReceiptsZone />
       </aside>
-    </div>
+      </div>
+    </>
   );
 }
 
-// ---- zone (a): a single obligation card ------------------------------------
+// ---- zone (a): a single obligation row -------------------------------------
 
-function ObligationCard({
+function ObligationRow({
   update: u,
   focused,
   onFocus,
-  onDone,
   onView,
 }: {
   update: AttentionUpdate;
   focused: boolean;
   onFocus: () => void;
-  onDone: () => void;
   onView: () => void;
 }) {
   const chip = deadlineChip(u.deadline);
   const overdue = chip?.overdue ?? false;
   const amount = amountFrom(u);
 
+  // Click anywhere on the row opens the email; done is keyboard-only (e/d),
+  // same as the inbox — no per-row checkmark button.
   return (
     <div
-      className={`ob-card${focused ? " focused" : ""}${overdue ? " overdue" : ""}`}
-      onClick={onFocus}
+      className={`ob-row${focused ? " focused" : ""}${overdue ? " overdue" : ""}`}
+      onClick={() => {
+        onFocus();
+        onView();
+      }}
       role="button"
       tabIndex={-1}
+      title="open email"
     >
-      <div className="ob-top">
-        <Avatar sender={u.sender} size={26} />
-        <span className="ob-sender" title={u.sender}>
-          {senderDisplayName(u.sender)}
+      <Avatar sender={u.sender} size={22} />
+      <span className="ob-sender" title={u.sender}>
+        {senderDisplayName(u.sender)}
+      </span>
+      {/* The abstracted one-liner carries the meaning; it truncates first. */}
+      <p className="ob-line" title={u.one_line}>
+        {u.one_line}
+      </p>
+      {amount && (
+        <span className="ob-amount">
+          <Receipt size={13} /> {amount}
         </span>
-        {amount && (
-          <span className="ob-amount">
-            <Receipt size={13} /> {amount}
-          </span>
-        )}
-      </div>
-
-      {/* If we couldn't extract an amount, the one_line carries the meaning —
-          it's abstracted (a digest line), not the raw email. */}
-      {!amount && <p className="ob-line" title={u.one_line}>{u.one_line}</p>}
-
-      <div className="ob-bottom">
-        <span className="ob-lead">
-          <span
-            className="ob-meter"
-            style={{ color: importanceColor(u.importance) }}
-            title={`importance ${u.importance}`}
-            aria-label={`importance ${u.importance}`}
-          >
-            {importanceMeter(u.importance)}
-          </span>
-          {chip ? (
-            <span className={`chip ${overdue ? "overdue" : "upcoming"}`}>
-              {chip.text}
-            </span>
-          ) : (
-            <span className="ob-nodate">no due date</span>
-          )}
+      )}
+      {chip ? (
+        <span
+          className={`chip ${overdue ? "overdue" : "upcoming"}`}
+          title={reasonFor(u, "deadline", chip.text)}
+        >
+          {chip.text}
         </span>
-        <span className="ob-actions">
-          <button
-            type="button"
-            className="ob-btn"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDone();
-            }}
-            title="mark done (d)"
-          >
-            <Check size={14} /> done
-          </button>
-          <button
-            type="button"
-            className="ob-btn"
-            onClick={(e) => {
-              e.stopPropagation();
-              onView();
-            }}
-            title="view in Emails"
-          >
-            <ArrowUpRight size={14} /> view
-          </button>
+      ) : (
+        <span
+          className="ob-nodate"
+          title={u.field_reasons?.deadline ?? undefined}
+        >
+          no due date
         </span>
-      </div>
+      )}
     </div>
   );
 }
@@ -518,6 +591,8 @@ function ShipmentsColumn() {
     [shipments],
   );
 
+  // The right rail always shows its cards (unlike the left zones, which hide
+  // when empty) — so an empty state stands in when there's nothing en route.
   return (
     <section className="zone zone-transit">
       <div className="zone-head">
@@ -526,15 +601,104 @@ function ShipmentsColumn() {
         </span>
         <h2>Shipments</h2>
         {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
-        <span className="zone-sub">en route · delivered today</span>
       </div>
       {rows.length === 0 ? (
-        <p className="zone-empty">No shipments.</p>
+        <p className="zone-empty">Nothing en route.</p>
       ) : (
         <div className="transit-grid">
           {rows.map((s) => (
             <ShipmentCard key={s.id} shipment={s} />
           ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---- CALENDAR zone: today's invite/update/cancellation mail ----------------
+
+/** Compact when-column for a calendar row: time if the event is today
+ *  ("3:00 PM"), short date otherwise, empty when no start parsed. */
+function calWhen(c: CalendarUpdate): string {
+  if (!c.starts_at) return "";
+  const d = new Date(c.starts_at);
+  if (Number.isNaN(d.getTime())) return "";
+  if (isToday(c.starts_at)) {
+    return d.toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+/** Row tag for the non-default kinds; a plain invite needs no label. */
+const CAL_KIND_TAG: Partial<Record<CalendarUpdate["kind"], string>> = {
+  update: "updated",
+  cancellation: "canceled",
+  response: "rsvp",
+};
+
+/**
+ * CALENDAR zone, at the top of the right-hand column: calendar mail from the
+ * last 24h (server window). Same abstraction as Receipts — these messages are
+ * auto-resolved out of the attention bands at ingest, so this rail is the ONLY
+ * place they surface; clicking a row opens the underlying email. Records, not
+ * an agenda: rows are ordered by arrival, cancellations strike through.
+ */
+function CalendarZone() {
+  const [updates, setUpdates] = useState<CalendarUpdate[] | null>(null);
+  const viewInEmails = useStore((s) => s.viewInEmails);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getCalendar()
+      .then((c) => alive && setUpdates(c))
+      .catch(() => {
+        // Non-fatal: leave the zone empty rather than surface token/url.
+        if (alive) setUpdates([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const rows = updates ?? [];
+
+  // The right rail always shows its cards — an empty state stands in when no
+  // calendar mail arrived in the window (no hiding like the left zones).
+  return (
+    <section className="zone zone-calendar">
+      <div className="zone-head">
+        <span className="glyph">
+          <CalendarDays size={15} />
+        </span>
+        <h2>Calendar</h2>
+        {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
+      </div>
+      {rows.length === 0 ? (
+        <p className="zone-empty">No calendar updates.</p>
+      ) : (
+        <div className="cal-list">
+          {rows.map((c) => {
+            const tag = CAL_KIND_TAG[c.kind];
+            return (
+              <button
+                type="button"
+                className={`cal-row${c.kind === "cancellation" ? " canceled" : ""}`}
+                key={c.id}
+                onClick={() => viewInEmails(c.message_id)}
+                title="view this email"
+              >
+                <span className="cal-title">
+                  {c.event_title ?? c.organizer ?? "calendar event"}
+                </span>
+                {tag && <span className="cal-tag">{tag}</span>}
+                <span className="cal-when">{calWhen(c)}</span>
+              </button>
+            );
+          })}
         </div>
       )}
     </section>
@@ -557,12 +721,13 @@ function receiptAmount(r: ReceiptRecord): string {
 
 /**
  * RECEIPTS zone, stacked under Shipments in the right-hand column. Records, not
- * actions — deliberately the densest zone: each row is JUST the clean merchant
- * name (left) and the total (right, Plex Mono). No subject, no body, no
- * affordances. A running count sits in the header ("RECEIPTS · 6").
+ * actions — each row is the clean merchant name (left) and the total (right,
+ * Plex Mono). Only TODAY's receipts show (a fresh daily digest, like a paper
+ * receipt you'd glance at and file); clicking a row opens that email.
  */
 function ReceiptsZone() {
   const [receipts, setReceipts] = useState<ReceiptRecord[] | null>(null);
+  const viewInEmails = useStore((s) => s.viewInEmails);
 
   useEffect(() => {
     let alive = true;
@@ -578,8 +743,11 @@ function ReceiptsZone() {
     };
   }, []);
 
-  const rows = receipts ?? [];
+  // Only receipts that arrived today (the abstraction: a daily receipts digest).
+  const rows = (receipts ?? []).filter((r) => isToday(r.received_at));
 
+  // The right rail always shows this card — an empty state stands in when no
+  // receipts came in today (it does not hide like the left-column zones).
   return (
     <section className="zone zone-receipts">
       <div className="zone-head">
@@ -588,26 +756,31 @@ function ReceiptsZone() {
         </span>
         <h2>Receipts</h2>
         {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
-        <span className="zone-sub">paid · records</span>
       </div>
       {rows.length === 0 ? (
-        <p className="zone-empty">No receipts.</p>
+        <p className="zone-empty">No receipts today.</p>
       ) : (
-        <div className="receipts-list">
-          {rows.map((r) => {
-            const sender = r.from_name
-              ? `${r.from_name} <${r.from_addr}>`
-              : r.from_addr;
-            return (
-              <div className="receipt-row" key={r.id}>
-                <span className="receipt-sender" title={r.from_addr}>
-                  {senderDisplayName(sender)}
-                </span>
-                <span className="receipt-amount">{receiptAmount(r)}</span>
-              </div>
-            );
-          })}
-        </div>
+      <div className="receipts-list">
+        {rows.map((r) => {
+          const sender = r.from_name
+            ? `${r.from_name} <${r.from_addr}>`
+            : r.from_addr;
+          return (
+            <button
+              type="button"
+              className="receipt-row"
+              key={r.id}
+              onClick={() => viewInEmails(r.message_id)}
+              title="view this email"
+            >
+              <span className="receipt-sender" title={r.from_addr}>
+                {senderDisplayName(sender)}
+              </span>
+              <span className="receipt-amount">{receiptAmount(r)}</span>
+            </button>
+          );
+        })}
+      </div>
       )}
     </section>
   );
@@ -729,6 +902,9 @@ function NewslettersZone() {
     });
   }
 
+  // Hidden entirely when there are no newsletters (and while still loading).
+  if (newsletters.length === 0) return null;
+
   return (
     <section className="zone zone-newsletters">
       <div className="zone-head">
@@ -736,25 +912,19 @@ function NewslettersZone() {
           <Mails size={15} />
         </span>
         <h2>Newsletters</h2>
-        {newsletters.length > 0 && (
-          <span className="zone-count">{newsletters.length}</span>
-        )}
+        <span className="zone-count">{newsletters.length}</span>
         <span className="zone-sub">recurring noise · choose what you want</span>
       </div>
-      {newsletters.length === 0 ? (
-        <p className="zone-empty">No newsletters this week.</p>
-      ) : (
-        <div className="nl-grid">
-          {newsletters.map((nl) => (
-            <NewsletterCard
-              key={nl.address}
-              nl={nl}
-              onEdit={() => editRule(nl)}
-              onCreate={() => createRule(nl)}
-            />
-          ))}
-        </div>
-      )}
+      <div className="nl-grid">
+        {newsletters.map((nl) => (
+          <NewsletterCard
+            key={nl.address}
+            nl={nl}
+            onEdit={() => editRule(nl)}
+            onCreate={() => createRule(nl)}
+          />
+        ))}
+      </div>
     </section>
   );
 }
@@ -840,6 +1010,16 @@ function StatusStrip({
   onRules: () => void;
 }) {
   const syncedIso = lastRefresh ? new Date(lastRefresh).toISOString() : null;
+  const [refreshing, setRefreshing] = useState(false);
+  const onRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await triggerMailRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
   return (
     <div className="status-strip">
       {authCount > 0 && (
@@ -847,9 +1027,18 @@ function StatusStrip({
           <KeyRound size={13} /> {authCount} auth
         </button>
       )}
-      <span className="status-item" title="last check by any door">
-        <Clock size={13} /> synced {relAge(syncedIso ?? lastCheckIso) || "just now"} ago
-      </span>
+      <button
+        type="button"
+        className="status-chip refresh"
+        onClick={() => void onRefresh()}
+        disabled={refreshing}
+        title="check for new mail now"
+      >
+        <RefreshCw size={13} className={refreshing ? "spin" : undefined} />
+        <span className="status-item" title="last check by any door">
+          synced {relAge(syncedIso ?? lastCheckIso) || "just now"} ago
+        </span>
+      </button>
       {typeof costUsd === "number" && (
         <span className="status-item" title="today's stage-2 triage cost estimate">
           triage: ${costUsd.toFixed(2)} today

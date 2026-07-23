@@ -1,7 +1,7 @@
-/* Sitrep dashboard — the fully-abstracted default surface. Four soft-card
-   zones (obligations / attention / aging / status strip). Light/dark aware:
-   every color flows through the shared theme vars from global.css. No email
-   rows live here by design — this is the situation, not the mailbox. */
+/* Sitrep dashboard — the fully-abstracted default surface. Flat: solid cards
+   on the flat blue canvas. Light/dark aware: every color flows through the
+   shared theme vars from global.css. No email rows live here by design — this
+   is the situation, not the mailbox. */
 
 .sitrep-dash {
   flex: 1;
@@ -9,67 +9,155 @@
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-  padding: 12px 20px 0;
+  /* top clearance matches the rail's --chrome-top so the masthead sits below
+     the macOS traffic lights, not bunched against them. */
+  padding: var(--chrome-top) 20px 0;
+  position: relative;
 }
 
-.dash-header {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 4px 4px 14px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 16px;
-}
-.dash-header .brand {
-  color: var(--fg);
-  font-size: 16px;
-  font-weight: 650;
-  letter-spacing: -0.2px;
-}
-.dash-header .brand .dim {
-  color: var(--fg-faint);
-  font-weight: 400;
-}
-.dash-header .dash-sub {
-  color: var(--fg-faint);
-  font-size: 12.5px;
-}
-
-/* Two-column dashboard: a flexible MAIN column (obligations / attention / aging
-   / newsletters / status strip) and a fixed-width TALL right column for
-   SHIPMENTS. A hairline divider sits between them (not a heavy border). The
-   grid fills the remaining height so the right column can own its own scroll. */
-.dash-zones {
+/* Body below the pinned masthead: a flex row. The LEFT column scrolls; the
+   RIGHT bar is static. The outer .sitrep-dash stays clipped so the corner
+   brackets + masthead stay pinned. */
+.dash-body {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 0;
+  display: flex;
+  flex-direction: row;
 }
 
-/* MAIN column: the original vertical stack, now scrolling independently. */
+/* Masthead — brand left, status cluster right; sits on the sky (white text). */
+.dash-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 4px 8px;
+  margin-bottom: 4px;
+}
+.hdr-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dash-header .brand {
+  font-family: var(--serif);
+  font-style: italic;
+  color: var(--on-sky);
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.dash-header .dash-sub {
+  color: var(--on-sky-faint);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em; /* design uses wide .2em tracking on the sub-label */
+}
+/* Top-right status: "● N need you now" pill + date + last-sync. */
+.hdr-status {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-top: 2px;
+}
+.need-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--on-sky);
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--radius-pill);
+  padding: 3px 10px 3px 8px;
+}
+.need-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 0 3px rgba(217, 92, 80, 0.28);
+}
+.hdr-date {
+  font-size: 11px;
+  color: var(--on-sky-dim);
+  font-variant-numeric: tabular-nums;
+}
+.hdr-sync {
+  font-size: 11px;
+  color: var(--on-sky-faint);
+}
+
+/* ---- DASH HERO — the editorial centerpiece (on the sky, white) ---- */
+.dash-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 4px 24px;
+}
+.hero-greeting {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.18em; /* design: wide-tracked greeting label */
+  color: var(--on-sky-dim);
+}
+.hero-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 50px;
+  line-height: 1.04;
+  letter-spacing: -0.6px;
+  color: var(--on-sky);
+  max-width: 20ch;
+}
+
+/* LEFT column — the ONLY scrolling region: hero + main zones. Everything left
+   of the vertical separator. */
+.dash-left {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 0 22px 40px 0;
+}
+
+/* MAIN column: the vertical stack of left-side zones (inside .dash-left). */
 .dash-main {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 18px;
   max-width: 960px;
   min-width: 0;
-  overflow-y: auto;
-  padding-bottom: 48px;
-  padding-right: 20px;
 }
 
-/* RIGHT column: full available height, hairline divider on the left, its own
-   scroll when the shipment list runs long. */
+/* RIGHT bar — STATIC. Fixed width, hairline divider on the left, full height of
+   the body. Does not move when the left column scrolls (its own overflow is a
+   safety net for very long lists; the scrollbar is hidden globally). */
 .dash-right {
+  flex: 0 0 320px;
   min-width: 0;
   border-left: 1px solid var(--border);
-  padding-left: 20px;
-  padding-bottom: 48px;
+  padding-left: 22px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 18px;
+}
+/* Shipment cards inside the white panel: drop their own fill/border so they
+   don't double up (white-on-white); a hairline divider separates stacked ones. */
+.dash-right .transit-card {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 10px 0;
+}
+.dash-right .transit-card + .transit-card {
+  border-top: 1px solid var(--border);
 }
 .dash-right .zone-transit {
   display: flex;
@@ -80,23 +168,23 @@
   grid-template-columns: 1fr;
 }
 
-/* Responsive fallback: on a narrow window collapse to a single column so the
-   right column drops below the main stack (no divider, normal stacked zone). */
+/* Responsive fallback: on a narrow window stack the body vertically — the left
+   column on top (still scrolls), the right bar below it (no divider). */
 @media (max-width: 900px) {
-  .dash-zones {
-    grid-template-columns: 1fr;
+  .dash-body {
+    flex-direction: column;
     overflow-y: auto;
   }
-  .dash-main {
-    overflow-y: visible;
+  .dash-left {
+    overflow: visible;
+    flex: 0 0 auto;
     padding-right: 0;
-    padding-bottom: 14px;
-    max-width: 960px;
   }
   .dash-right {
+    flex: 0 0 auto;
     border-left: none;
     padding-left: 0;
-    overflow-y: visible;
+    overflow: visible;
   }
   .dash-right .transit-grid {
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -105,11 +193,11 @@
 
 /* ---- shared zone card ---- */
 .zone {
-  background: var(--bg-raised);
+  background: var(--zone-wash); /* solid card */
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
-  padding: 14px 16px;
+  padding: 18px;
 }
 .zone.clickable {
   cursor: pointer;
@@ -121,8 +209,9 @@
   display: flex;
   align-items: center;
   gap: 9px;
-  margin-bottom: 12px;
+  margin-bottom: 15px;
 }
+/* Zones are solid cards → dark ink throughout. */
 .zone-head .glyph {
   display: inline-flex;
   align-items: center;
@@ -171,54 +260,57 @@
   color: var(--amber);
 }
 
-/* ---- (a) obligations ---- */
-.ob-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 10px;
-}
-.ob-card {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  padding: 11px 12px;
-  cursor: default;
+/* ---- (a) obligations — single-line rows, hairline-divided ---- */
+.ob-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
 }
-.ob-card:hover {
-  background: var(--bg-row);
-}
-.ob-card.focused {
-  border-color: var(--accent);
-  border-left-color: var(--accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
-}
-.ob-card.overdue {
-  border-left-color: var(--red);
-  background: var(--red-soft);
-}
-.ob-card.overdue.focused {
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 35%, transparent);
-}
-.ob-top {
+.ob-row {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
+  padding: 8px 8px;
+  margin: 0 -6px;
+  width: calc(100% + 12px);
+  border-bottom: 1px solid var(--card-line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
 }
-.ob-top .ob-sender {
+.ob-row:last-child {
+  border-bottom: none;
+}
+.ob-row:hover {
+  background: var(--bg-row);
+  border-bottom-color: transparent;
+}
+/* Overdue rows stay visually calm — urgency lives in the deadline chip, not a
+   red row wash (too aggressive as a background, even for past-due). */
+.ob-row.focused {
+  background: var(--bg-row-sel);
+  border-bottom-color: transparent;
+  box-shadow: inset 0 0 0 1px var(--brass);
+}
+.ob-row .ob-sender {
+  flex: 0 0 auto;
+  max-width: 180px;
   color: var(--fg);
   font-weight: 600;
-  font-size: 13.5px;
+  font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.ob-line {
   flex: 1 1 auto;
   min-width: 0;
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.ob-top .ob-amount {
+.ob-amount {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -226,58 +318,19 @@
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   font-weight: 650;
-  font-size: 13px;
-  color: var(--fg);
-}
-.ob-line {
-  margin: 0;
-  color: var(--fg-dim);
   font-size: 12.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-.ob-bottom {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.ob-lead {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-/* 5-block importance meter — the same glyph the email rows use, in Plex Mono. */
-.ob-meter {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.05em;
-  color: var(--fg-dim);
-  flex: 0 0 auto;
+  color: var(--brass-ink);
 }
 .ob-nodate {
+  flex: 0 0 auto;
   color: var(--fg-faint);
   font-size: 11.5px;
   font-style: italic;
 }
-.ob-actions {
-  display: flex;
-  gap: 6px;
+.ob-row .chip {
   flex: 0 0 auto;
 }
-.ob-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 9px;
-  font-size: 11.5px;
-  border-radius: 999px;
-  background: var(--bg-raised);
-}
+/* (No per-row done button — marking done is keyboard-only, e/d, like the inbox.) */
 
 /* ---- (b) attention ---- */
 .attn-lead {
@@ -369,7 +422,7 @@
 .transit-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 .transit-card {
   background: var(--bg);
@@ -379,6 +432,8 @@
   display: flex;
   flex-direction: column;
   gap: 9px;
+  min-width: 0; /* let the name ellipsis instead of forcing horizontal overflow */
+  overflow: hidden;
 }
 .transit-card:hover {
   background: var(--bg-row);
@@ -395,6 +450,7 @@
   display: flex;
   align-items: center;
   gap: 9px;
+  min-width: 0; /* required for the child .transit-name ellipsis to engage */
 }
 .transit-carrier-icon {
   flex: 0 0 auto;
@@ -498,7 +554,7 @@
 .nl-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 .nl-card {
   background: var(--bg);
@@ -543,9 +599,10 @@
 }
 .nl-summary {
   margin: 0;
-  color: var(--fg-dim);
-  font-size: 12.5px;
-  line-height: 1.35;
+  font-family: var(--serif); /* editorial serif for newsletter copy */
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.4;
   overflow: hidden;
   text-overflow: ellipsis;
   display: -webkit-box;
@@ -643,6 +700,92 @@
 .status-strip .status-chip.auth:hover {
   border-color: var(--lock);
 }
+/* Manual "check for new mail now" chip. Wraps the synced-ago text so the whole
+   pill is the hit target; the icon spins while a poke+pull is in flight. */
+.status-strip .status-chip.refresh {
+  gap: 6px;
+}
+.status-strip .status-chip.refresh .status-item {
+  color: inherit;
+}
+.status-strip .status-chip.refresh:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+.status-strip .status-chip.refresh .spin {
+  animation: sitrep-spin 0.8s linear infinite;
+}
+@keyframes sitrep-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- CALENDAR zone: today's invite/update mail (right column, top) -------- */
+/* Same dense record language as Receipts: hairline dividers, no row chrome. */
+.zone-calendar .zone-head .glyph {
+  color: var(--fg-dim);
+}
+.cal-list {
+  display: flex;
+  flex-direction: column;
+}
+.cal-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 6px;
+  margin: 0 -6px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  width: calc(100% + 12px);
+  cursor: pointer;
+}
+.cal-row:hover {
+  background: var(--bg-row);
+  border-bottom-color: transparent;
+}
+.cal-row:last-child {
+  border-bottom: none;
+}
+.cal-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-weight: 600;
+}
+/* A canceled event stays listed (you want to KNOW it died) but reads as dead. */
+.cal-row.canceled .cal-title {
+  text-decoration: line-through;
+  color: var(--fg-faint);
+  font-weight: 500;
+}
+/* Kind tag (updated/canceled/rsvp) — quiet, lowercase, never louder than the title. */
+.cal-tag {
+  color: var(--fg-faint);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+/* Start time/date — right-aligned mono, same column rhythm as receipt totals. */
+.cal-when {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--brass-ink);
+  white-space: nowrap;
+}
 
 /* ---- RECEIPTS zone: thin, dense records (right column, under Shipments) ---- */
 .zone-receipts .zone-head .glyph {
@@ -658,9 +801,21 @@
   display: flex;
   align-items: baseline;
   gap: 10px;
-  padding: 5px 0;
+  padding: 7px 6px;
+  margin: 0 -6px;
+  border: none;
   border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
   font-size: 12.5px;
+  text-align: left;
+  width: calc(100% + 12px);
+  cursor: pointer;
+}
+.receipt-row:hover {
+  background: var(--bg-row);
+  border-bottom-color: transparent;
 }
 .receipt-row:last-child {
   border-bottom: none;
@@ -673,13 +828,16 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--fg);
+  font-weight: 600;
 }
-/* Total — right-aligned, Plex Mono, tabular so decimals line up. */
+/* Total — right-aligned, Plex Mono, tabular so decimals line up. Deeper design
+   blue for real money; a dash (no parseable total) stays faint. */
 .receipt-amount {
   margin-left: auto;
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   font-size: 12px;
-  color: var(--fg-dim);
+  font-weight: 650;
+  color: var(--brass-ink);
   white-space: nowrap;
 }

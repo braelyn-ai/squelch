@@ -20,14 +20,16 @@
   border-bottom: 1px solid var(--border);
   margin-bottom: 14px;
 }
+/* The header sits directly on the blue canvas → white on-sky ink (same as the
+   sitrep dash masthead), never the dark in-card ladder. */
 .sitrep-header .brand {
-  color: var(--fg);
+  color: var(--on-sky);
   font-size: 16px;
   font-weight: 650;
   letter-spacing: -0.2px;
 }
 .sitrep-header .brand .dim {
-  color: var(--fg-faint);
+  color: var(--on-sky-faint);
   font-weight: 400;
 }
 .sitrep-header .head-right {
@@ -36,24 +38,37 @@
   gap: 12px;
 }
 .sitrep-header .stat-line {
-  color: var(--fg-dim);
+  color: var(--on-sky-dim);
   font-size: 12.5px;
   display: flex;
   gap: 14px;
   align-items: center;
 }
 .sitrep-header .stat-line b {
-  color: var(--fg);
+  color: var(--on-sky);
   font-weight: 650;
 }
 .sitrep-header .signal {
-  color: var(--accent);
+  color: var(--on-sky);
 }
 .sitrep-header .noise {
-  color: var(--fg-faint);
+  color: var(--on-sky-faint);
 }
 .sitrep-header .refresh-err {
-  color: var(--red);
+  color: #ffd9d3;
+}
+/* Header controls (theme toggle / help / audit hint) — white icons on blue. */
+.sitrep-header .theme-toggle {
+  color: var(--on-sky-dim);
+}
+.sitrep-header .theme-toggle:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.28);
+  color: var(--on-sky);
+}
+.sitrep-header .help-hint {
+  border-color: rgba(255, 255, 255, 0.35);
+  color: var(--on-sky-dim);
 }
 
 /* ---- band (soft card) ---- */
@@ -86,17 +101,8 @@
   color: var(--fg-dim);
   font-weight: 600;
 }
-.band-standing .band-head {
-  color: var(--red);
-  background: var(--red-soft);
-}
-.band-new .band-head {
-  color: var(--blue);
-}
-.band-open .band-head {
-  color: var(--amber);
-  background: var(--amber-soft);
-}
+/* (The color-tinted band-standing/band-new/band-open header variants died with
+   the banded view — the flat inbox uses the plain .band-head.) */
 .band-head .sub {
   color: var(--fg-faint);
   text-transform: none;
@@ -199,10 +205,12 @@
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
 }
+/* Overdue reads in red INK only — no red fill; a red-washed pill on every
+   past-due row was too aggressive (owner call, 2026-07-22). */
 .chip.overdue {
-  color: var(--red);
-  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
-  background: var(--red-soft);
+  color: var(--red-ink);
+  border-color: var(--border-strong);
+  background: transparent;
 }
 .chip.upcoming {
   color: var(--amber);
@@ -227,11 +235,12 @@
 }
 
 /* ---- noise divider line (the squelch line) ---- */
+/* Sits on the blue canvas below the bands → white on-sky ink + white hairline. */
 .noise-line {
   display: flex;
   align-items: center;
   gap: 10px;
-  color: var(--fg-dim);
+  color: var(--on-sky-dim);
   font-size: 12.5px;
   padding: 10px 6px 6px;
   margin-top: 10px;
@@ -244,7 +253,7 @@
   right: 0;
   top: 0;
   height: 1px;
-  background: var(--squelch-line);
+  background: rgba(255, 255, 255, 0.4);
 }
 .noise-line .knob {
   margin-left: auto;
@@ -267,6 +276,8 @@
    chip. Both open the Auth tab (login codes / password resets / sign-in
    alerts). Lock-purple accent carries the "auth-related" meaning without the
    internal "sealed" jargon. ---- */
+/* These pills sit on the blue canvas → solid card fill so they stay legible
+   (the translucent lock-purple wash disappears against the blue). */
 .noise-line .auth-pill {
   display: inline-flex;
   align-items: center;
@@ -274,13 +285,12 @@
   padding: 3px 10px;
   font-size: 12px;
   color: var(--lock);
-  background: var(--lock-soft);
+  background: var(--bg);
   border: 1px solid color-mix(in srgb, var(--lock) 40%, var(--border));
   border-radius: 999px;
 }
 .noise-line .auth-pill:hover {
   border-color: var(--lock);
-  background: color-mix(in srgb, var(--lock-soft) 75%, var(--bg-row));
 }
 .sitrep-header .auth-chip {
   display: inline-flex;
@@ -290,7 +300,7 @@
   font-size: 12px;
   font-weight: 600;
   color: var(--lock);
-  background: var(--lock-soft);
+  background: var(--bg);
   border: 1px solid color-mix(in srgb, var(--lock) 40%, var(--border));
   border-radius: 999px;
 }
@@ -441,26 +451,35 @@
   display: flex;
   flex-direction: column;
 }
+/* Blue canvas band, continuous with the icon rail (same treatment as .tv-head)
+   — the traffic lights sit on solid blue instead of a light/blue seam. */
 .routed-head {
   display: flex;
   align-items: center;
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  /* top clearance for the macOS traffic lights (aligns with the rail) */
+  padding: calc(var(--chrome-top) - 8px) 20px 12px;
+  background: var(--canvas-top);
 }
 .routed-head h2 {
   font-size: 14px;
   font-weight: 650;
   margin: 0;
-  color: var(--fg);
+  color: var(--on-sky);
   letter-spacing: -0.1px;
 }
+/* The list lives on a solid card (same language as the sitrep zones) — rows
+   were unreadable floating directly on the blue canvas. */
 .routed-body {
   flex: 1;
+  min-height: 0;
   overflow: auto;
-  padding: 14px 20px;
+  margin: 14px 20px 20px;
+  padding: 12px 18px;
   max-width: 960px;
-  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
 }
 
 /* ---- side panel (thread / browse / search) ---- */
@@ -520,6 +539,105 @@
   color: var(--red);
 }
 
+/* ---- fullscreen thread viewer ---- */
+/* Layered above the side panels (z 40) and below ActionLayer overlays
+   (z 120+): opening a thread from search/browse covers the panel; compose,
+   undo toasts and the palette still win. */
+.thread-view {
+  position: fixed;
+  /* Leave the 52px icon rail (z 20) visible + clickable to its left; the viewer
+     (z 60) still covers everything else. */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 52px;
+  z-index: 60;
+  /* OPAQUE by design: reading a long email over a live translucent sitrep is
+     visual noise. --reader-bg is the solid per-theme page color. */
+  background: var(--reader-bg);
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+/* The header band is the CANVAS BLUE, continuous with the icon rail on its
+   left — together they form one blue L around the reading surface, so the
+   macOS traffic lights sit on blue instead of straddling a light/blue seam.
+   Ink on the band is white on-sky, same as every on-canvas surface. */
+.tv-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  /* top clearance for the macOS traffic lights (matches .routed-head) */
+  padding: calc(var(--chrome-top) - 8px) 20px 12px;
+  background: var(--canvas-top);
+}
+.tv-title { flex: 1; min-width: 0; }
+.tv-title h2 { font-size: 14px; font-weight: 650; margin: 0; color: var(--on-sky); letter-spacing: -0.1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-view .close { color: var(--on-sky-faint); font-size: 11px; display: flex; align-items: center; gap: 5px; }
+/* The unsubscribe hint is a real <button> for click + a11y, but wears the same
+   quiet kbd+label look as the Esc hint — strip the default button chrome. */
+.thread-view .tv-unsub {
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+  font-family: var(--sans);
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--on-sky-faint); /* sits on the blue header band */
+}
+.thread-view .tv-unsub:hover {
+  color: var(--on-sky);
+  background: rgba(255, 255, 255, 0.15);
+}
+/* THE single scroll surface: message cards stack in plain block flow and the
+   column scrolls; frames auto-size to content (EmailFrame) so nothing nests. */
+.tv-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 20px 16px; max-width: 1100px; width: 100%; margin: 0 auto; }
+
+/* ---- unsubscribe confirm card (flat modal over the thread viewer) ---- */
+/* Same language as the authcode-card / block-prompt: a dim backdrop + a small
+   flat card. Scoped to the thread-view so it sits over the reading surface. */
+.unsub-confirm-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5; /* above the thread body, within .thread-view's stacking context */
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.unsub-confirm {
+  width: 340px;
+  max-width: 100%;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-float);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.unsub-confirm-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--fg);
+}
+.unsub-confirm-text strong {
+  font-weight: 650;
+  color: var(--fg);
+}
+.unsub-confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.unsub-confirm-actions button {
+  font-size: 12px;
+  padding: 5px 14px;
+}
+
 /* thread messages */
 .msg {
   border: 1px solid var(--border);
@@ -556,6 +674,31 @@
   line-height: 1.6;
 }
 
+/* collapsed quoted reply history (both body types) */
+.quote-toggle {
+  display: block;
+  margin: 8px 0 2px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.quote-toggle:hover {
+  color: var(--fg-dim);
+  background: var(--bg-row);
+}
+/* the expanded plain-text history keeps its indented, dimmed look */
+.msg .msg-quoted {
+  margin-top: 8px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--fg-faint);
+}
+
 /* html email rendered in a hard-sandboxed iframe. The email keeps its own
    (usually light) background inside the frame; the frame border must read in
    both themes so the content boundary is always visible. */
@@ -565,9 +708,13 @@
   gap: 6px;
 }
 .email-iframe {
+  display: block;
   width: 100%;
-  height: 320px;
-  max-height: 65vh;
+  /* height is inline-set by EmailFrame: it measures the same-origin
+     contentDocument and sizes the frame to its exact content, so the frame
+     NEVER scrolls internally — hidden keeps a mid-measure frame from flashing
+     a scrollbar. (The measure-failed fallback overrides this inline.) */
+  overflow: hidden;
   /* The frame content is (usually) light, and in light mode it sits on a light
      card — so give the boundary a slightly heavier, always-visible edge plus a
      faint inset so the email region reads as its own surface in both themes. */
@@ -575,8 +722,6 @@
   border-radius: var(--radius-sm);
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
   background: #fff;
-  /* internal scroll: the frame can't self-size (opaque, script-less). */
-  overflow: auto;
 }
 /* clickable "remote images blocked" affordance; hidden when no remote refs. */
 .remote-bar {
@@ -837,6 +982,10 @@
 .audit-row .act {
   color: var(--fg);
   flex: 0 0 auto;
+  /* action slugs (reveal_sealed, set_status) are code — mono; the rest of the
+     row stays sans for readability. */
+  font-family: var(--mono);
+  font-size: 12px;
 }
 .audit-row .tgt {
   color: var(--fg-dim);
@@ -848,6 +997,34 @@
 }
 .audit-row .tgt .detail {
   color: var(--fg-faint);
+}
+/* resolved sender · subject: the sender reads a touch stronger than the subject
+   so the eye lands on "who" first. */
+.audit-row .tgt .tgt-sender {
+  color: var(--fg);
+}
+.audit-row .tgt .tgt-sep {
+  color: var(--fg-faint);
+}
+.audit-row .tgt .tgt-subject {
+  color: var(--fg-dim);
+}
+/* undo affordance: a quiet trailing button, only on reversible+successful rows.
+   Sits between the target and the timestamp. */
+.audit-row .audit-undo {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 8px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+.audit-row .audit-undo:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--accent-soft);
 }
 .audit-foot {
   position: sticky;

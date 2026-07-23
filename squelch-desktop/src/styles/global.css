@@ -1,144 +1,229 @@
-/* squelch-desktop global styles — "PRECISION INSTRUMENT" visual identity.
-   Committed 2026-07-09 (see docs/UX-DIRECTIONS.md). The brand anchor is the app
-   icon: a machined brass radio squelch knob. Warm-paper light default + a warm
-   near-black dark, translated (not redesigned) through one CSS-var system keyed
-   on data-theme="light"|"dark".
+/* squelch-desktop global styles — FLAT visual identity.
+   Simplified 2026-07-22: no gradients, no frosted glass, no sky decoration.
+   A flat blue canvas with solid white (light) / solid navy (dark) cards on
+   top. ONE CSS-var system keyed on data-theme="light"|"dark". The variable
+   NAMES are unchanged from the prior frosted look, so every component
+   inherits the flat palette without edits. (Legacy note: `--brass` is
+   retained as the NAME of THE primary accent; its value is blue #2b7fd4.)
 
-   THE ONE ACCENT is brass (--brass #a8834a): focus rings, selection, the active
-   sidebar item, primary buttons, the noise-filter knob, the auth ring. RESTRAINT
-   RULE — brass marks state, never decorates; it stays under ~10% of any screen.
-   The failure mode of this direction is steampunk; restraint is the spec. */
+   THE ONE ACCENT is blue (--brass #2b7fd4): focus rings, selection, the active
+   rail item, primary buttons, the auth ring. Tier semantics: coral = overdue
+   (--red #e07064), amber = deadline (--amber), green = positive/synced
+   (--accent), purple = auth/sealed (--lock). Accent marks state, not decoration.
 
-/* ---- LIGHT PALETTE (default) --------------------------------------------- */
-:root,
-:root[data-theme="light"] {
-  /* surfaces: warm paper, layered by a hairline's worth of tone */
-  --bg: #f7f4ee; /* warm paper base */
-  --bg-raised: #fffdf9; /* raised card, a shade lighter */
-  --bg-row: #efece4; /* hover row */
-  --bg-row-sel: #f0e6d4; /* selection — a faint brass wash */
-  --bg-sunken: #f1ede4; /* code/preview wells, a shade deeper */
-  --border: #e3ded2; /* hairline — low contrast, 1px */
-  --border-strong: #d2ccbd;
+   Fonts self-hosted (mockup's exact latin variable subsets) — no CDNs. */
 
-  /* ink: warm near-black on paper, with dim/faint steps */
-  --fg: #26231e;
-  --fg-dim: #5f5a50;
-  --fg-faint: #918b7d;
-
-  /* THE accent — machined brass */
-  --brass: #a8834a;
-  --brass-soft: #f0e6d4;
-  --brass-line: #c8ab7d; /* brass-tinted hairline (noise divider) */
-
-  /* tier semantics, tuned onto the warm-paper palette */
-  --accent: #5c7a4e; /* signal — desaturated bronze-green */
-  --accent-soft: #e7ecdf;
-  --red: #b3392f; /* past-due */
-  --red-soft: #f6e4e1;
-  --amber: #a8710a; /* deadline — warm amber */
-  --amber-soft: #f4e8d4;
-  --yellow: #a07d00;
-  --blue: #3f6690;
-  --lock: #7a5a86; /* sealed/auth — distinct, tuned into the palette */
-  --lock-soft: #ece3ef;
-
-  /* shadows nearly absent — hairlines carry the structure */
-  --shadow-card: 0 1px 1px rgba(38, 35, 30, 0.03);
-  --shadow-panel: -8px 0 30px rgba(38, 35, 30, 0.1);
-  --shadow-modal: 0 12px 48px rgba(38, 35, 30, 0.2);
-  --overlay: rgba(38, 35, 30, 0.28);
-
-  /* top-light gradient for machined-flat buttons */
-  --btn-topfill: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.5),
-    rgba(255, 255, 255, 0) 55%
-  );
-
-  /* the squelch line — brass-tinted hairline gradient (the noise divider) */
-  --squelch-line: linear-gradient(
-    90deg,
-    transparent,
-    var(--brass-line) 14%,
-    var(--brass-line) 86%,
-    transparent
-  );
+/* ---- BUNDLED FONTS (mockup's latin variable woff2, self-hosted) ----------- */
+/* Vite fingerprints + bundles these via the relative url() (no network at
+   runtime). Variable files cover the whole weight range in one face each. */
+@font-face {
+  font-family: "Hanken Grotesk";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("../assets/fonts/hanken-grotesk-var.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Newsreader";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("../assets/fonts/newsreader-var.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Newsreader";
+  font-style: italic;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("../assets/fonts/newsreader-italic-var.woff2") format("woff2");
 }
 
-/* ---- DARK PALETTE (translation, not redesign) ---------------------------- */
+/* ---- LIGHT PALETTE (default) ---------------------------------------------- */
+:root,
+:root[data-theme="light"] {
+  /* the flat blue canvas — the app's basic blue, full stop */
+  --canvas-solid: #2b7fd4;
+  /* opaque reading surface (thread viewer): long-form reading page */
+  --reader-bg: #eef5fc;
+
+  /* SURFACES — solid. --bg = card, --bg-raised = modal/rail,
+     --zone-wash = zone card, --glass-legible = inputs/wells. The old glass
+     names survive so components don't need edits; the values are opaque. */
+  --glass: #ffffff; /* card */
+  --glass-strong: #ffffff; /* modal / raised */
+  --zone-wash: #ffffff; /* zone card */
+  --glass-legible: #ffffff; /* inputs / code wells */
+  --glass-border: #d8e2ec; /* solid hairline */
+  --glass-border-strong: #c2d2e0;
+
+  --bg: var(--glass);
+  --bg-raised: var(--glass-strong);
+  --bg-row: #eef4fa; /* hover */
+  --bg-row-sel: rgba(43, 127, 212, 0.14); /* selection — blue wash */
+  --bg-sunken: #f2f6fb; /* wells */
+  --border: var(--glass-border);
+  --border-strong: var(--glass-border-strong);
+  /* hairline divider inside a card */
+  --card-line: rgba(30, 50, 70, 0.1);
+
+  /* ink: the mockup's blue-slate ladder (#1e2a36 → #54626e → #7c8894 → #9aa6b1) */
+  --fg: #1e2a36;
+  --fg-dim: #54626e;
+  --fg-faint: #7c8894;
+  --fg-faintest: #9aa6b1;
+
+  /* THE accent — dashboard blue (var NAME kept as --brass; value blue #2b7fd4).
+     --brass-ink is the deeper blue the mockup uses for amounts/links. */
+  --brass: #2b7fd4;
+  --brass-ink: #1e6fbf;
+  --brass-soft: rgba(43, 127, 212, 0.1); /* CTA fill */
+  --brass-line: rgba(30, 50, 70, 0.12); /* divider on white cards */
+
+  /* tier semantics (mockup) */
+  --accent: #3f8f6b; /* signal / positive / synced — green */
+  --accent-soft: rgba(79, 157, 127, 0.14);
+  --red: #e07064; /* overdue / urgent — coral (mockup --urgent) */
+  --red-ink: #bd4f44; /* overdue TEXT on light frost (mockup) */
+  --red-soft: rgba(224, 112, 100, 0.14);
+  --amber: #c99a3a; /* deadline — amber */
+  --amber-soft: rgba(201, 154, 58, 0.14);
+  --yellow: #b8912a;
+  --blue: #1e6fbf;
+  --lock: #7b6cd8; /* sealed/auth — periwinkle (mockup) */
+  --lock-soft: rgba(123, 108, 216, 0.12);
+
+  /* shadows — the mockup's soft, deep, wide drops (cards lift off the sky). */
+  --shadow-card: 0 16px 46px -16px rgba(40, 70, 110, 0.32);
+  --shadow-card-sm: 0 16px 40px -18px rgba(40, 70, 110, 0.3);
+  --shadow-receipt: 0 12px 30px -16px rgba(40, 70, 110, 0.28);
+  --shadow-float: 0 6px 20px -8px rgba(40, 70, 110, 0.35); /* glass pills / rail */
+  --shadow-panel: -18px 0 50px rgba(40, 70, 110, 0.22);
+  --shadow-modal: 0 22px 60px -18px rgba(40, 70, 110, 0.4);
+  /* modal/side backdrop */
+  --overlay: rgba(120, 160, 210, 0.22);
+
+  /* the squelch line — flat hairline (the noise divider) */
+  --squelch-line: var(--brass-line);
+}
+
+/* ---- DARK PALETTE — the same flat language after dark --------------------- */
+/* Flat deep-navy canvas, solid navy cards, light in-card ink. */
 :root[data-theme="dark"] {
-  --bg: #17150f; /* warm near-black base */
-  --bg-raised: #201d16; /* charcoal raised */
-  --bg-row: #262218;
-  --bg-row-sel: #322a1b; /* faint brass wash */
-  --bg-sunken: #131109;
-  --border: #322d22;
-  --border-strong: #46402f;
+  --canvas-solid: hsl(215, 43%, 12%);
+  /* opaque reading surface */
+  --reader-bg: hsl(215, 40%, 10%);
 
-  --fg: #ece6d8;
-  --fg-dim: #a49d8c;
-  --fg-faint: #6f6857;
+  /* SURFACES — solid navy. */
+  --glass: #16202f;
+  --glass-strong: #141c2a;
+  --zone-wash: #16202f;
+  --glass-legible: #101827;
+  --glass-border: rgba(150, 190, 230, 0.16);
+  --glass-border-strong: rgba(150, 190, 230, 0.26);
 
-  --brass: #c19a5b; /* brass, lifted for contrast on near-black */
-  --brass-soft: #322a1b;
-  --brass-line: #6e5a34;
+  --bg: var(--glass);
+  --bg-raised: var(--glass-strong);
+  --bg-row: #1d2938;
+  --bg-row-sel: rgba(106, 176, 234, 0.2);
+  --bg-sunken: var(--glass-legible);
+  --border: var(--glass-border);
+  --border-strong: var(--glass-border-strong);
+  --card-line: rgba(150, 190, 230, 0.12);
 
-  --accent: #8aa374; /* signal bronze-green, lifted */
-  --accent-soft: #23281c;
-  --red: #d9635a;
-  --red-soft: #331c19;
-  --amber: #d29a4a;
-  --amber-soft: #2e2415;
-  --yellow: #d6c46a;
-  --blue: #7fa2cc;
-  --lock: #b295bd;
-  --lock-soft: #251d28;
+  --fg: #e6eef7;
+  --fg-dim: #a9b7c6;
+  --fg-faint: #8496a8;
+  --fg-faintest: #6d7d8e;
 
-  --shadow-card: none;
-  --shadow-panel: -8px 0 30px rgba(0, 0, 0, 0.5);
-  --shadow-modal: 0 12px 40px rgba(0, 0, 0, 0.6);
-  --overlay: rgba(0, 0, 0, 0.58);
+  /* on-canvas text shadows go darker on the navy canvas */
+  --on-sky-shadow: 0 1px 16px rgba(0, 0, 0, 0.45);
+  --on-sky-shadow-sm: 0 1px 10px rgba(0, 0, 0, 0.45);
 
-  --btn-topfill: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.06),
-    rgba(255, 255, 255, 0) 55%
-  );
+  --brass: #6ab0ea; /* dashboard blue, lifted for contrast on dark */
+  --brass-ink: #8fc4f0;
+  --brass-soft: rgba(106, 176, 234, 0.16);
+  --brass-line: rgba(150, 190, 230, 0.2);
 
-  --squelch-line: linear-gradient(
-    90deg,
-    transparent,
-    var(--brass-line) 14%,
-    var(--brass-line) 86%,
-    transparent
-  );
+  --accent: #58b389; /* signal green, lifted */
+  --accent-soft: rgba(88, 179, 137, 0.16);
+  --red: #e0736a;
+  --red-ink: #f0928a; /* overdue text on dark frost — lighter for contrast */
+  --red-soft: rgba(224, 115, 106, 0.18);
+  --amber: #d3a24f;
+  --amber-soft: rgba(211, 162, 79, 0.16);
+  --yellow: #d8c66e;
+  --blue: #8fc4f0;
+  --lock: #9d90e6;
+  --lock-soft: rgba(157, 144, 230, 0.16);
+
+  --shadow-card: 0 18px 50px -16px rgba(0, 0, 0, 0.6);
+  --shadow-card-sm: 0 16px 42px -18px rgba(0, 0, 0, 0.55);
+  --shadow-receipt: 0 12px 30px -16px rgba(0, 0, 0, 0.5);
+  --shadow-float: 0 6px 22px -8px rgba(0, 0, 0, 0.55);
+  --shadow-panel: -18px 0 50px rgba(0, 0, 0, 0.55);
+  --shadow-modal: 0 22px 60px -18px rgba(0, 0, 0, 0.66);
+  --overlay: rgba(6, 14, 24, 0.5);
+
+  --squelch-line: var(--brass-line);
 }
 
 /* ---- shared tokens (theme-independent) ----------------------------------- */
 :root {
   /* Bundled locally via @fontsource (main.tsx) — no CDNs. System fallbacks keep
      first paint sane if a weight is slow. */
-  --sans: "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont,
+  --sans: "Hanken Grotesk", system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* editorial serif for display headings + hero numbers (the airy accent). */
+  --serif: "Newsreader", Georgia, "Times New Roman", serif;
+
+  /* text that sits directly on the blue canvas (not inside a card): white, so
+     it reads against the saturated blue. Card-internal text keeps --fg. */
+  --on-sky: #ffffff;
+  --on-sky-dim: rgba(255, 255, 255, 0.85);
+  --on-sky-faint: rgba(255, 255, 255, 0.7);
+  --on-sky-shadow: 0 1px 14px rgba(40, 70, 110, 0.28); /* headings on sky */
+  --on-sky-shadow-sm: 0 1px 10px rgba(40, 70, 110, 0.3); /* labels on sky */
+
+  /* the CHROME BLUE — the icon rail + the top header bands (thread viewer,
+     routed views). Slightly lighter than the canvas so the window chrome reads
+     as its own layer; derived from --canvas-solid so both themes follow. */
+  --canvas-top: color-mix(in srgb, var(--canvas-solid) 88%, #ffffff);
 
   --row-h: 30px;
   --gap: 10px;
-  /* radii tighten to 4–6px everywhere — machined, not rounded */
-  --radius: 6px;
-  --radius-sm: 4px;
+  /* radii from the mockup: 24/20 cards, 16 sub-cards, 13 icons/tiles, 11 mid,
+     999 pills. */
+  --radius-card-lg: 24px;
+  --radius-card: 20px;
+  --radius-sub: 16px;
+  --radius: 13px; /* icon tiles */
+  --radius-sm: 11px;
+  --radius-pill: 999px;
 
-  /* engraved-label recipe: Plex Sans 600, uppercase, +0.08em, small, faint. */
+  /* micro-label recipe: 600 weight, uppercase, WIDE tracking (design .13–.2em),
+     small. Used for section labels + the greeting. */
   --label-size: 11px;
-  --label-track: 0.08em;
+  --label-track: 0.15em;
 
-  /* macOS traffic-light clearance for the top of the rail (see chrome below). */
-  --chrome-top: 28px;
+  /* macOS traffic-light clearance for the top of the rail (see chrome below).
+     Generous so the rail icon + masthead clear the window buttons cleanly. */
+  --chrome-top: 46px;
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* Hide scrollbars everywhere (scrolling still works) — the airy design has no
+   scrollbar chrome. Firefox + WebKit/Blink. */
+* {
+  scrollbar-width: none;
+}
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 html,
@@ -149,7 +234,8 @@ body,
 }
 
 body {
-  background: var(--bg);
+  /* the flat blue canvas — no gradient, no decoration */
+  background: var(--canvas-solid);
   color: var(--fg);
   font-family: var(--sans);
   font-size: 13.5px;
@@ -157,6 +243,16 @@ body {
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   user-select: none;
+}
+
+/* Editorial serif — the display accent. Applied to the HERO + body/content
+   copy, NOT to the tiny uppercase section labels (those stay sans). Opt in
+   via .display / .serif. */
+.display,
+.serif {
+  font-family: var(--serif);
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 /* Mono ONLY for genuinely tabular/data fragments: scores, timestamps,
@@ -176,16 +272,15 @@ body {
   margin: var(--gap) 0;
 }
 
-/* ---- real buttons — machined-flat --------------------------------------- */
-/* 1px border, a subtle top-light so the face reads slightly domed, and an
-   :active that translates down 0.5px like a keycap being pressed. */
+/* ---- real buttons — flat ------------------------------------------------- */
+/* 1px border, flat fill, and an :active that translates down 0.5px like a
+   keycap being pressed. */
 button {
   font-family: var(--sans);
   font-size: 13px;
   font-weight: 500;
   color: var(--fg);
   background-color: var(--bg-raised);
-  background-image: var(--btn-topfill);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   padding: 6px 12px;
@@ -217,19 +312,19 @@ textarea:focus-visible {
   background: var(--brass-soft);
 }
 
-/* Primary action button — brass-filled, the one loud control per surface. */
+/* Primary action button — blue-filled, the one loud control per surface. */
 button.primary {
   background-color: var(--brass);
-  background-image: var(--btn-topfill);
   border-color: color-mix(in srgb, var(--brass) 80%, #000);
-  color: #fffdf9;
+  color: #ffffff; /* white on the mid-strong blue */
 }
 button.primary:hover {
   filter: brightness(1.05);
   background-color: var(--brass);
 }
 :root[data-theme="dark"] button.primary {
-  color: #17150f;
+  /* dark-mode --brass is a lighter blue; dark ink reads better than white on it */
+  color: #0f1720;
 }
 
 input,
@@ -237,7 +332,7 @@ textarea {
   font-family: var(--sans);
   font-size: 13px;
   color: var(--fg);
-  background: var(--bg-raised);
+  background: var(--glass-legible); /* denser glass — keep typed text legible */
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   padding: 7px 9px;
@@ -268,28 +363,34 @@ kbd {
   display: flex;
   flex-direction: row;
   position: relative;
+  z-index: 1;
 }
-/* macOS window chrome: a slim OS drag region (data-tauri-drag-region). It covers
-   ONLY non-interactive top chrome — the rail top-padding and the left portion of
-   the header where the brand text sits. Its right edge stops short of the header
-   control cluster (theme/help/audit/auth on the far right) so it never swallows
-   a button click, and it starts at x=0 (the traffic lights float above it in the
-   native overlay layer and stay clickable). Any real control that ends up under
-   it can opt out with -webkit-app-region: no-drag. */
+/* macOS window chrome: the FULL-WIDTH top bar. The native title bar is hidden
+   (titleBarStyle:Overlay), so this transparent strip IS the draggable title bar
+   — it spans the whole top and blends with the sky (no fill of its own). The
+   traffic lights are native overlay buttons, so they stay clickable above it.
+
+   Dragging is wired by the data-tauri-drag-region ATTRIBUTE on the element
+   (App.tsx) — Tauri's injected handler calls startDragging on mousedown.
+   (-webkit-app-region is an Electron/Chromium thing; WKWebView ignores it,
+   which is why the old CSS-only approach never dragged.)
+
+   z-index must beat EVERY fullscreen layer — side panels (40), the thread
+   viewer (60), overlays/palette (120/130) — or dragging silently dies the
+   moment one of them is open, since they're fixed inset:0 surfaces that would
+   otherwise cover the strip. Claiming the top band at z 240 is safe because
+   every surface keeps its top --chrome-top clearance free of interactive
+   controls by design: headers pad their content below it (tv-head/routed-head
+   start at chrome-top - 8), modals center themselves, the ask bar starts at
+   14vh, and toasts live bottom-left. */
 .drag-strip {
-  position: absolute;
+  position: fixed;
   top: 0;
   left: 0;
-  right: 280px;
-  height: var(--chrome-top);
-  z-index: 5;
-  -webkit-app-region: drag;
-}
-/* Header controls opt out of drag as a belt-and-suspenders guard. */
-.sitrep-header .head-right button,
-.sitrep-header .auth-chip,
-.dash-header button {
-  -webkit-app-region: no-drag;
+  right: 0; /* full width — drag from anywhere along the top */
+  height: calc(var(--chrome-top) - 8px); /* stop where header text begins */
+  z-index: 240;
+  background: transparent; /* the blue canvas shows through */
 }
 /* The routed view fills the space to the right of the icon rail. */
 .app-main {
@@ -311,8 +412,14 @@ kbd {
   align-items: center;
   gap: 4px;
   padding: var(--chrome-top) 0 10px;
-  background: var(--bg-raised);
-  border-right: 1px solid var(--border);
+  /* the chrome blue — identical to the top header bands so the rail + top
+     strip read as ONE continuous L of window chrome; white icons read on it */
+  background: var(--canvas-top);
+  border-right: 1px solid rgba(255, 255, 255, 0.16);
+  /* stack above .app-main so hover tooltips (which overflow to the right into
+     the content area) paint over the content, not under it. */
+  position: relative;
+  z-index: 20;
 }
 /* Flex spacer: pushes the bottom rail group (Usage/Settings) to the floor. */
 .rail-spacer {
@@ -337,17 +444,17 @@ kbd {
   border-radius: var(--radius-sm);
   background: transparent;
   border: 1px solid transparent;
-  color: var(--fg-faint);
+  color: rgba(255, 255, 255, 0.85); /* white icons on the sky */
 }
 .rail-btn:hover {
-  background: var(--bg-row);
-  border-color: var(--border);
-  color: var(--fg-dim);
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.28);
+  color: #ffffff;
 }
-/* Active rail item — brass marks "you are here". */
+/* Active rail item — a white rounded square with the blue icon ("you are here"). */
 .rail-btn.active {
-  background: var(--brass-soft);
-  border-color: color-mix(in srgb, var(--brass) 45%, var(--border));
+  background: rgba(255, 255, 255, 0.92);
+  border-color: transparent;
   color: var(--brass);
 }
 .rail-btn .rail-badge {
@@ -405,7 +512,7 @@ kbd {
   transform: translateY(-50%);
   white-space: nowrap;
   background: var(--fg);
-  color: var(--bg-raised);
+  color: #ffffff; /* crisp on the dark tooltip (—bg-raised is translucent now) */
   font-size: 11.5px;
   font-weight: 550;
   padding: 4px 8px;
@@ -476,21 +583,25 @@ svg.lucide {
   height: 100%;
   display: grid;
   place-items: center;
-  background: var(--bg);
+  position: relative;
+  z-index: 1;
 }
 .connect-card {
   width: 400px;
   max-width: 90vw;
   background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-card);
   padding: 28px;
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--shadow-modal);
 }
 .connect-card h1 {
-  font-size: 22px;
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 500;
+  font-size: 30px;
   margin: 0 0 4px;
-  letter-spacing: -0.3px;
+  letter-spacing: 0.01em;
   color: var(--fg);
 }
 .connect-card .sub {
@@ -519,6 +630,109 @@ svg.lucide {
   font-size: 12.5px;
   padding: 7px 10px;
   margin: 6px 0 12px;
+}
+
+/* ---- daemon connection health -------------------------------------------- */
+/* Degraded-mode banner: pinned at the top of .app-main (a flex column) above
+   the routed view. Data below it is real but stale — red-tinted, unmissable,
+   but doesn't hide the mail. Top padding clears the drag strip. */
+.conn-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: calc(var(--chrome-top) - 8px) 16px 0;
+  padding: 7px 12px;
+  color: var(--red-ink);
+  background: var(--red-soft);
+  border: 1px solid color-mix(in srgb, var(--red) 30%, var(--border));
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+}
+.conn-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* The banner already cleared the traffic lights, so the routed view below it
+   doesn't need its own --chrome-top clearance — shrink it to avoid a double
+   gap. Scoped to in-flow siblings inside .app-main; fixed overlays (thread
+   viewer, panels) mount outside and keep the full value. */
+.conn-banner ~ * {
+  --chrome-top: 22px;
+}
+.conn-retry,
+.conn-settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.conn-retry:hover,
+.conn-settings:hover {
+  background: var(--bg-row);
+}
+.conn-retry:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.conn-retry .spin {
+  animation: conn-spin 0.9s linear infinite;
+}
+@keyframes conn-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Down pane: replaces the routed view when nothing ever loaded. Same centered
+   card language as the Connect screen. */
+.daemon-down {
+  flex: 1 1 auto;
+  display: grid;
+  place-items: center;
+}
+.daemon-down-card {
+  width: 400px;
+  max-width: 90vw;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-card);
+  padding: 28px;
+  box-shadow: var(--shadow-modal);
+  text-align: center;
+}
+.daemon-down-card .down-glyph {
+  display: inline-flex;
+  padding: 10px;
+  margin-bottom: 10px;
+  color: var(--red-ink);
+  background: var(--red-soft);
+  border-radius: 50%;
+}
+.daemon-down-card h1 {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 500;
+  font-size: 24px;
+  margin: 0 0 6px;
+  letter-spacing: 0.01em;
+  color: var(--fg);
+}
+.daemon-down-card .sub {
+  color: var(--fg-dim);
+  margin: 0 0 18px;
+  font-size: 13px;
+}
+.down-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
 }
 
 .placeholder-view {
@@ -718,4 +932,179 @@ svg.lucide {
   color: var(--fg-faint);
   font-size: 10.5px;
   text-align: center;
+}
+
+/* ---- unsubscribe block prompt (bottom-left action card) ------------------ */
+/* Flat white/navy card in the toast stack. Red left-edge marks the "they're
+   ignoring you" state without shouting. Matches the toast/undo card language. */
+.block-prompt {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--red);
+  border-radius: 3px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  box-shadow: var(--shadow-float);
+}
+.block-prompt-text {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg);
+}
+.block-prompt-text strong {
+  font-weight: 650;
+  color: var(--fg);
+}
+.block-prompt-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.block-prompt-actions button {
+  font-size: 12px;
+  padding: 4px 12px;
+}
+
+/* ---- ⌘K ask-your-inbox bar ---------------------------------------------- */
+.askbar-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 14vh;
+  z-index: 130; /* above side panels + 2FA rail, below nothing */
+}
+.askbar {
+  width: 560px;
+  max-width: calc(100vw - 48px);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-modal);
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.askbar-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--brass);
+}
+.askbar-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  flex: 1 1 auto;
+}
+.askbar-esc kbd {
+  font-size: 10px;
+  color: var(--fg-faint);
+}
+.askbar-inputrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-top: 2px solid color-mix(in srgb, var(--brass) 45%, var(--border));
+  border-radius: var(--radius-sm);
+  padding: 0 10px;
+}
+.askbar-input {
+  flex: 1 1 auto;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg);
+  font-size: 15px;
+  padding: 11px 0;
+}
+.askbar-input::placeholder {
+  color: var(--fg-faint);
+}
+.askbar-enter {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
+  opacity: 0.4;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+.askbar-enter.ready {
+  color: var(--brass);
+  opacity: 1;
+}
+.askbar-status {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  font-style: italic;
+  padding: 2px 2px;
+}
+.askbar-error {
+  font-size: 12.5px;
+  color: var(--red);
+  padding: 2px 2px;
+  line-height: 1.45;
+}
+.askbar-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.askbar-text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--fg);
+  white-space: pre-wrap;
+}
+.askbar-cites {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.askbar-cite {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.askbar-cite:hover {
+  background: var(--bg-row);
+  border-color: var(--border);
+}
+.askbar-cite-sender {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--fg-dim);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.askbar-cite-subject {
+  flex: 1 1 auto;
+  font-size: 12px;
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

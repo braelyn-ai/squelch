@@ -1,18 +1,19 @@
-// SIDE VIEWS — thread drill-in, rules audit, browse-all, search, audit log.
+// SIDE VIEWS — browse-all + search, as a right-hand panel.
 // OWNED BY: view-agent-1 (read side; shares the file-ownership map with agent-2's
 // ActionLayer for overlays).
 //
 // Renders whichever side view store.sideView selects as a right-hand panel and
 // owns the modal KeyContext + Esc-to-close for the whole panel. Each inner view
-// (ThreadPane/SearchView/BrowseView/RulesView/AuditView) registers its own
-// list-style keys into this same modal context via useKeys("modal", ...); they
-// must NOT push a second context.
+// (SearchView/BrowseView) registers its own list-style keys into this same modal
+// context via useKeys("modal", ...); they must NOT push a second context. The
+// thread drill-in is NO LONGER a side view — it's the fullscreen ThreadViewer
+// (store.threadId), layered ABOVE this panel, so opening a thread from search or
+// browse keeps this panel mounted underneath and Esc returns to it.
 
 import { useMemo } from "react";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import type { SideView } from "../state";
-import { ThreadPane } from "../components/ThreadPane";
 import { SearchView } from "../components/SearchView";
 import { BrowseView } from "../components/BrowseView";
 import "../styles/sitrep.css";
@@ -58,8 +59,6 @@ function SidePanel({ sideView }: { sideView: SideView }) {
 
 function SideBody({ view }: { view: SideView }) {
   switch (view.kind) {
-    case "thread":
-      return <ThreadPane threadId={view.threadId} />;
     case "search":
       return <SearchView initialQuery={view.query} />;
     case "browse":
@@ -71,8 +70,6 @@ function SideBody({ view }: { view: SideView }) {
 
 function titleFor(v: SideView): string {
   switch (v.kind) {
-    case "thread":
-      return "thread";
     case "browse":
       return "browse — all mail";
     case "search":

@@ -1,6 +1,7 @@
 // Search side view. Input debounced to GET /client/search?q=; results list with
-// j/k selection; Enter opens the selected hit's thread (replaces this side view
-// with the thread drill-in). The input auto-focuses so `/` lands ready to type.
+// j/k selection; Enter opens the selected hit fullscreen (the ThreadViewer layers
+// above this panel, which stays mounted underneath — Esc from the viewer returns
+// to these results). The input auto-focuses so `/` lands ready to type.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../api";
@@ -10,7 +11,7 @@ import { useKeys } from "../keys";
 import { dateTime } from "../lib/format";
 
 export function SearchView({ initialQuery }: { initialQuery: string }) {
-  const openSide = useStore((s) => s.openSide);
+  const openThread = useStore((s) => s.openThread);
   const [q, setQ] = useState(initialQuery);
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -57,7 +58,7 @@ export function SearchView({ initialQuery }: { initialQuery: string }) {
   }, [q]);
 
   const openHit = (hit: SearchHit | undefined) => {
-    if (hit) openSide({ kind: "thread", threadId: hit.thread_id });
+    if (hit) openThread(hit.thread_id);
   };
 
   const bindings = useMemo(
