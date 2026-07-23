@@ -159,6 +159,24 @@
   color: var(--fg-faint);
 }
 
+/* ---- range slider (the "For your eyes" ranking blend) ----
+   Brass thumb/track, same treatment as the browse noise-filter knob. */
+.set-range {
+  width: 100%;
+  max-width: 340px;
+  accent-color: var(--brass);
+  cursor: pointer;
+}
+.set-range-ends {
+  display: flex;
+  justify-content: space-between;
+  max-width: 340px;
+  font-size: 11px;
+  color: var(--fg-faint);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+}
+
 /* ---- APPEARANCE toggle ---- */
 .set-field-inline {
   display: flex;

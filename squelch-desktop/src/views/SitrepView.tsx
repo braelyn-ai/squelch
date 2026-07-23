@@ -1,30 +1,29 @@
 // SITREP VIEW — the fully-abstracted dashboard. THE DEFAULT SURFACE ON LAUNCH.
 //
 // ZERO individual email rows: this is the situation report, not the mailbox.
-// Four soft-card zones, light/dark aware:
-//   a. OBLIGATIONS — deadline-centric rows from band=standing (avatar + sender,
-//      one-line + amount + due date, past-due loud). Actions: done (d / button),
-//      open email (opens the obligation's thread fullscreen in the ThreadViewer).
+// Soft-card zones, light/dark aware:
+//   a. FOR YOUR EYES — the TOP-10 standing items, ranked by a configurable blend
+//      of urgency (time) + severity (importance) (lib/ranking.ts, rankWeight
+//      pref). Rows: avatar + sender, one-line + amount + due date. A quiet
+//      "{n} more" button expands the full ranked list in place. Actions: done
+//      (d/e), open email (Enter/v — opens the thread fullscreen in ThreadViewer).
 //   b. ATTENTION — aggregate only: "N new since <relative last check>" +
 //      deduped sender chips (from band=new). Click → Emails.
-//   c. AGING — band=open filtered age>7d: "N items sitting over a week" + per
-//      item sender + duration only (no subjects — abstraction). Click → Emails.
-//   d. STATUS STRIP — auth chip (→ Auth), last sync/check, today's triage cost,
+//   c. STATUS STRIP — auth chip (→ Auth), last sync/check, today's triage cost,
 //      rules count.
+// The long tail (aging/open items) lives on the Emails page now, not here.
 //
-// Minimal keymap in its own "sitrep" KeyContext: j/k move between obligation
-// rows, d marks the focused obligation done, Enter/v opens it fullscreen. The
-// global 1..5 nav (App) works here too. Obligations + aging rows open the email
-// fullscreen (ThreadViewer); the Attention zone still routes to the Emails list.
+// Minimal keymap in its own "sitrep" KeyContext: j/k move between the VISIBLE
+// ranked rows, d marks the focused item done, Enter/v opens it fullscreen. The
+// global 1..5 nav (App) works here too.
 
 import { useEffect, useMemo, useState } from "react";
 import {
   KeyRound,
   SlidersHorizontal,
   ArrowUpRight,
-  TriangleAlert,
+  Eye,
   Bell,
-  Hourglass,
   Receipt,
   Mails,
   Pencil,
@@ -46,7 +45,9 @@ import type {
 import { openExternal } from "../lib/opener";
 import { useStore, triggerMailRefresh } from "../state";
 import { useKeys, useKeyContext } from "../keys";
-import { deadlineChip, lastChecked, loudAge, relAge } from "../lib/format";
+import { deadlineChip, lastChecked, relAge } from "../lib/format";
+import { rankItems } from "../lib/ranking";
+import { usePref } from "../lib/prefs";
 import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { getUserName } from "../lib/identity";
 import { reasonFor } from "../lib/reasons";
@@ -61,18 +62,8 @@ import { DISPOSITION_LABEL } from "../components/RuleEditor";
 import { openRuleEditorRequest } from "../components/ruleEditorBus";
 import "../styles/sitrep-dash.css";
 
-// Aging threshold for zone (c): only items sitting longer than a week.
-const AGING_DAYS = 7;
-const AGING_MS = AGING_DAYS * 86_400_000;
-
-/** Whole ms since an ISO stamp, or 0 if missing/invalid/future. */
-function ageMs(iso: string | null | undefined): number {
-  if (!iso) return 0;
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return 0;
-  const d = Date.now() - t;
-  return d > 0 ? d : 0;
-}
+// How many ranked standing items show before the quiet "{n} more" expander.
+const EYES_VISIBLE = 10;
 
 /** Best-effort money amount pulled from an update's one_line (e.g. "$142.00"). */
 function amountFrom(u: AttentionUpdate): string | null {
@@ -128,11 +119,11 @@ function DashHero({ standing }: { standing: AttentionUpdate[] }) {
 
   let title: string;
   if (today > 0) {
-    title = `${spell(today)} obligation${today === 1 ? "" : "s"} need${
+    title = `${spell(today)} item${today === 1 ? "" : "s"} need${
       today === 1 ? "s" : ""
     } you today.`;
   } else if (total > 0) {
-    title = `${spell(total)} obligation${total === 1 ? "" : "s"} on your plate.`;
+    title = `${spell(total)} item${total === 1 ? "" : "s"} on your plate.`;
   } else {
     title = "You're all clear.";
   }
@@ -171,7 +162,19 @@ function SitrepBody({
 }) {
   const sitrep = useStore((s) => s.sitrep);
   const lastRefresh = useStore((s) => s.lastRefresh);
-  const { standing, new: fresh, open, stats, sealed } = sitrep;
+  const { standing, new: fresh, stats, sealed } = sitrep;
+
+  // --- "For your eyes" ranking: top-10 by a configurable urgency/severity blend.
+  // Re-ranks live when the rankWeight pref changes (Settings slider). The full
+  // ranked list expands in place behind the quiet "{n} more" button.
+  const rankWeight = usePref("rankWeight");
+  const ranked = useMemo(
+    () => rankItems(standing, rankWeight),
+    [standing, rankWeight],
+  );
+  const [eyesExpanded, setEyesExpanded] = useState(false);
+  const visibleEyes = eyesExpanded ? ranked : ranked.slice(0, EYES_VISIBLE);
+  const eyesOverflow = ranked.length - EYES_VISIBLE;
 
   // --- rules count (cheap, lazily fetched once) -----------------------------
   const [rulesCount, setRulesCount] = useState<number | null>(null);
@@ -189,43 +192,33 @@ function SitrepBody({
     };
   }, []);
 
-  // --- zone (c) aging items: open, sitting > a week -------------------------
-  const aging = useMemo(
-    () =>
-      open
-        .filter((u) => ageMs(u.surfaced_at ?? u.resolved_at) > AGING_MS)
-        .sort(
-          (a, b) =>
-            ageMs(b.surfaced_at ?? b.resolved_at) -
-            ageMs(a.surfaced_at ?? a.resolved_at),
-        ),
-    [open],
-  );
-
-  // --- zone (a) obligation keymap: j/k across cards, d done, Enter/v view ---
+  // --- "For your eyes" keymap: j/k across the VISIBLE ranked list only, d done,
+  // Enter/v view. The keyboard never reaches collapsed-away rows.
   const [obIdx, setObIdx] = useState(0);
   useEffect(() => {
-    setObIdx((i) => Math.max(0, Math.min(i, Math.max(0, standing.length - 1))));
-  }, [standing.length]);
+    setObIdx((i) =>
+      Math.max(0, Math.min(i, Math.max(0, visibleEyes.length - 1))),
+    );
+  }, [visibleEyes.length]);
 
   useKeyContext("sitrep");
   const bindings = useMemo(
     () => [
       {
         key: "j",
-        description: "next obligation",
-        handler: () => setObIdx((i) => Math.min(standing.length - 1, i + 1)),
+        description: "next item",
+        handler: () => setObIdx((i) => Math.min(visibleEyes.length - 1, i + 1)),
       },
       {
         key: "k",
-        description: "prev obligation",
+        description: "prev item",
         handler: () => setObIdx((i) => Math.max(0, i - 1)),
       },
       {
         key: "d",
         description: "mark done",
         handler: () => {
-          const u = standing[obIdx];
+          const u = visibleEyes[obIdx];
           if (u) void dispatchDone(u);
         },
       },
@@ -233,7 +226,7 @@ function SitrepBody({
         key: "e",
         description: "mark done",
         handler: () => {
-          const u = standing[obIdx];
+          const u = visibleEyes[obIdx];
           if (u) void dispatchDone(u);
         },
       },
@@ -241,7 +234,7 @@ function SitrepBody({
         key: "Enter",
         description: "open email",
         handler: () => {
-          const u = standing[obIdx];
+          const u = visibleEyes[obIdx];
           if (u) onView(u);
         },
       },
@@ -249,13 +242,13 @@ function SitrepBody({
         key: "v",
         description: "open email",
         handler: () => {
-          const u = standing[obIdx];
+          const u = visibleEyes[obIdx];
           if (u) onView(u);
         },
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [standing, obIdx],
+    [visibleEyes, obIdx],
   );
   useKeys("sitrep", bindings, [bindings]);
 
@@ -302,19 +295,18 @@ function SitrepBody({
       <div className="dash-left">
       <DashHero standing={standing} />
       <div className="dash-main">
-      {/* ---- (a) OBLIGATIONS — hidden entirely when empty ---- */}
+      {/* ---- (a) FOR YOUR EYES — ranked standing items, hidden when empty ---- */}
       {standing.length > 0 && (
         <section className="zone zone-obligations">
           <div className="zone-head">
             <span className="glyph">
-              <TriangleAlert size={15} />
+              <Eye size={15} />
             </span>
-            <h2>Obligations</h2>
+            <h2>For your eyes</h2>
             <span className="zone-count">{standing.length}</span>
-            <span className="zone-sub">deadlines · immune to time</span>
           </div>
           <div className="ob-list">
-            {standing.map((u, i) => (
+            {visibleEyes.map((u, i) => (
               <ObligationRow
                 key={u.id}
                 update={u}
@@ -324,6 +316,15 @@ function SitrepBody({
               />
             ))}
           </div>
+          {eyesOverflow > 0 && (
+            <button
+              type="button"
+              className="ob-more"
+              onClick={() => setEyesExpanded((v) => !v)}
+            >
+              {eyesExpanded ? "show less" : `${eyesOverflow} more`}
+            </button>
+          )}
         </section>
       )}
 
@@ -347,40 +348,6 @@ function SitrepBody({
             {lastChecked(stats?.last_surfaced_at)}
           </p>
           <SenderChips items={fresh} />
-        </section>
-      )}
-
-      {/* ---- (c) AGING — hidden entirely when empty ---- */}
-      {aging.length > 0 && (
-        <section className="zone zone-aging">
-          <div className="zone-head">
-            <span className="glyph">
-              <Hourglass size={15} />
-            </span>
-            <h2>Aging</h2>
-            <span className="zone-count">{aging.length}</span>
-          </div>
-          <p className="aging-lead">
-            <b>{aging.length}</b> {aging.length === 1 ? "item" : "items"} sitting
-            over a week
-          </p>
-          <div className="aging-list">
-            {aging.map((u) => (
-              <button
-                key={u.id}
-                type="button"
-                className="aging-row"
-                onClick={() => onView(u)}
-                title="open email"
-              >
-                <Avatar sender={u.sender} size={20} />
-                <span className="sender">{senderDisplayName(u.sender)}</span>
-                <span className="dur">
-                  {loudAge(u.surfaced_at ?? u.resolved_at).toLowerCase()}
-                </span>
-              </button>
-            ))}
-          </div>
         </section>
       )}
 

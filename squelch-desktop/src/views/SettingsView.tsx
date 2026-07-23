@@ -219,11 +219,12 @@ export function SettingsView() {
           {/* MAIL — remote images --------------------------------------- */}
           {section === "mail" && <MailSection />}
 
-          {/* TRIAGE — pipeline diagram + budget ------------------------- */}
+          {/* TRIAGE — pipeline diagram + budget + ranking blend --------- */}
           {section === "triage" && (
             <>
               <TriagePipelineSection />
               <TriageBudgetSection />
+              <RankingSection />
             </>
           )}
 
@@ -704,6 +705,45 @@ function TriageEstimator({ cfg }: { cfg: TriageConfig }) {
         <div>Not enough usage history to estimate a total yet.</div>
       )}
     </div>
+  );
+}
+
+/**
+ * RANKING — the blend that orders the Sitrep "For your eyes" zone. A single
+ * slider between time (urgency) and severity (importance). The stored pref
+ * `rankWeight` is the URGENCY share (0..1); the slider is inverted so dragging
+ * RIGHT toward "severity" lowers it — matching the "time ←→ severity" label.
+ * The Sitrep re-ranks live via usePref, no save button.
+ */
+function RankingSection() {
+  const rankWeight = usePref("rankWeight");
+  // Slider value = severity share (1 - urgency share) so left = time.
+  const value = 1 - rankWeight;
+  return (
+    <section className="set-section">
+      <div className="set-label">For your eyes</div>
+      <div className="set-field">
+        <label htmlFor="set-rank">Rank For your eyes by: time ←→ severity</label>
+        <input
+          id="set-rank"
+          className="set-range"
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={value}
+          onChange={(e) => setPref("rankWeight", 1 - Number(e.target.value))}
+        />
+        <div className="set-range-ends" aria-hidden="true">
+          <span>time</span>
+          <span>severity</span>
+        </div>
+      </div>
+      <div className="set-hint" style={{ marginTop: 6 }}>
+        Blends how soon something is due with how important it is. Overdue items
+        rank high; drag toward severity to let important undated mail compete.
+      </div>
+    </section>
   );
 }
 

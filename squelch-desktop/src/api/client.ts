@@ -14,6 +14,7 @@ import type {
   ArchiveBody,
   AttentionUpdate,
   AuditEntry,
+  BankingRecord,
   CalendarUpdate,
   CreateRuleBody,
   LabelBody,
@@ -236,6 +237,15 @@ export function getReceipts(days?: number): Promise<Receipt[]> {
  */
 export function getCalendar(hours?: number): Promise<CalendarUpdate[]> {
   return request<CalendarUpdate[]>("/client/calendar", { query: { hours } });
+}
+
+/**
+ * Banking notifications — statements (balance-ready) and transaction alerts,
+ * newest-received first. Sealed mail never produces a banking row, so these are
+ * structurally sealed-free (same guarantee as receipts).
+ */
+export function getBanking(): Promise<BankingRecord[]> {
+  return request<BankingRecord[]>("/client/banking");
 }
 
 // --- rules ------------------------------------------------------------------

@@ -164,6 +164,29 @@ export interface CalendarUpdate {
   received_at: string; // RFC3339
 }
 
+/** What a banking notification IS: a periodic statement (a balance to review)
+ *  or a per-transaction alert (a charge/debit notice). */
+export type BankingKind = "statement" | "transaction_alert";
+
+/**
+ * GET /client/banking — a banking-notification record (statement-ready / balance
+ * mail, or a transaction alert). Human door only: sealed mail can NEVER produce a
+ * banking row (structural, like receipts). `institution` is a clean display name
+ * ("Chase") or null; `amount` is the statement TOTAL balance for a statement, or
+ * the transaction amount for an alert (null when nothing parsed → render "—");
+ * `account_hint` is a masked tail like "…1234", never a full account number.
+ */
+export interface BankingRecord {
+  id: number;
+  message_id: number;
+  kind: BankingKind;
+  institution: string | null;
+  amount: number | null;
+  currency: string | null;
+  account_hint: string | null;
+  received_at: string; // RFC3339, newest first
+}
+
 /** core::types::SenderRule (GET /client/rules) */
 export interface SenderRule {
   id: number;

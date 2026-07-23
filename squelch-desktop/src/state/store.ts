@@ -89,6 +89,7 @@ export type ConnStatus =
 export type MainView =
   | "sitrep"
   | "emails"
+  | "banking"
   | "auth"
   | "rules"
   | "audit"
@@ -104,6 +105,7 @@ export type MainView =
 export const MAIN_VIEWS: MainView[] = [
   "sitrep",
   "emails",
+  "banking",
   "auth",
   "rules",
   "audit",

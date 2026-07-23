@@ -253,14 +253,9 @@
   font-style: italic;
 }
 
-.zone-obligations .zone-head .glyph {
-  color: var(--red);
-}
-.zone-aging .zone-head .glyph {
-  color: var(--amber);
-}
+/* "For your eyes" glyph stays calm — no red tint (the Eye is not an alarm). */
 
-/* ---- (a) obligations — single-line rows, hairline-divided ---- */
+/* ---- (a) for your eyes — single-line ranked rows, hairline-divided ---- */
 .ob-list {
   display: flex;
   flex-direction: column;
@@ -332,6 +327,29 @@
 }
 /* (No per-row done button — marking done is keyboard-only, e/d, like the inbox.) */
 
+/* Quiet "{n} more" expander under the ranked list — flat, no chrome, sits in
+   the zone's own language. Toggles the full ranked list in place. */
+/* "{n} more" — a real, centered button (owner call: pronounced, not a quiet
+   text link). Full-row hit target, solid fill, hairline border. */
+.ob-more {
+  display: block;
+  margin: 10px auto 2px;
+  padding: 6px 18px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.ob-more:hover {
+  background: var(--bg-row);
+  border-color: var(--fg-faint);
+  color: var(--fg);
+}
+
 /* ---- (b) attention ---- */
 .attn-lead {
   margin: 0 0 10px;
@@ -365,54 +383,6 @@
 .sender-chip.more {
   padding: 3px 10px;
   color: var(--fg-faint);
-}
-
-/* ---- (c) aging ---- */
-.aging-lead {
-  margin: 0 0 10px;
-  color: var(--fg-dim);
-  font-size: 13px;
-}
-.aging-lead b {
-  color: var(--amber);
-  font-weight: 700;
-}
-.aging-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.aging-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 8px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-  font: inherit;
-}
-.aging-row:hover {
-  background: var(--bg-row);
-  border-color: var(--border);
-}
-.aging-row .sender {
-  color: var(--fg);
-  font-weight: 550;
-  font-size: 13px;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.aging-row .dur {
-  flex: 0 0 auto;
-  color: var(--amber);
-  font-size: 11.5px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
 }
 
 /* ---- IN TRANSIT (shipment tracking) ---- */

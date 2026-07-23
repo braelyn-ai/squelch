@@ -170,6 +170,8 @@ function RouteBody({ view }: { view: ReturnType<typeof useStore.getState>["activ
       return <SitrepView />;
     case "emails":
       return <EmailsView />;
+    case "banking":
+      return <RoutedView view="banking" />;
     case "auth":
       return <RoutedView view="auth" />;
     case "rules":

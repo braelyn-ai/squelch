@@ -24,11 +24,16 @@ export interface Prefs {
   loadRemoteImages: boolean;
   /** Which Settings section was last open, so reopening restores it. */
   settingsSection: SettingsSection;
+  /** Blend weight (0..1) for the Sitrep "For your eyes" ranking: the urgency
+   *  (time) share of the score; the remainder is severity. 0 = rank purely by
+   *  severity, 1 = purely by time. See lib/ranking.ts. */
+  rankWeight: number;
 }
 
 const DEFAULTS: Prefs = {
   loadRemoteImages: true,
   settingsSection: "general",
+  rankWeight: 0.6,
 };
 
 function read(): Prefs {
