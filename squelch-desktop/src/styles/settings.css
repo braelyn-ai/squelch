@@ -3,9 +3,81 @@
    sparingly (est-cost figure, the daily bars, the connected dot). Inherits the
    app theme vars (--bg / --fg / --brass / --mono / --label-track ...). */
 
-.settings,
 .usage {
   max-width: 720px;
+}
+
+/* ---- SETTINGS sub-nav layout ----
+   The settings body is a flex row: a slim text nav on the left (one entry per
+   section), the active section's panel on the right. One section visible at a
+   time; the last-active section persists via lib/prefs. */
+.settings {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 26px;
+  max-width: 860px;
+}
+.set-nav {
+  flex: 0 0 148px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: sticky;
+  top: 0;
+}
+.set-nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  cursor: pointer;
+}
+.set-nav-item:hover {
+  background: var(--bg-row);
+  color: var(--fg);
+}
+/* Active section — the one brass accent on this surface. */
+.set-nav-item.active {
+  color: var(--brass);
+  font-weight: 600;
+  border-left-color: var(--brass);
+  background: var(--brass-soft);
+}
+.set-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 640px;
+}
+/* Narrow window: nav wraps above the panel as a horizontal row. */
+@media (max-width: 700px) {
+  .settings {
+    flex-direction: column;
+    gap: 10px;
+  }
+  .set-nav {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .set-nav-item {
+    width: auto;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  }
+  .set-nav-item.active {
+    border-left: none;
+    border-bottom-color: var(--brass);
+  }
 }
 
 /* ---- section scaffold (shared) ---- */
@@ -26,6 +98,16 @@
   text-transform: uppercase;
   letter-spacing: var(--label-track);
   margin-bottom: 12px;
+}
+
+/* Engraved sub-group label (e.g. the per-stage cap groups in Triage budget).
+   Lighter weight / smaller than .set-label so stage groups read as nested. */
+.set-subhead {
+  color: var(--fg-dim);
+  font-size: var(--label-size);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
 }
 
 /* ---- CONNECTION form ---- */
@@ -72,8 +154,7 @@
 .set-status.err {
   color: var(--red);
 }
-.set-hint,
-.set-sub {
+.set-hint {
   font-size: 12px;
   color: var(--fg-faint);
 }
@@ -154,6 +235,104 @@ button.danger:hover {
 }
 .brass {
   color: var(--brass);
+}
+
+/* ---- HOW TRIAGE WORKS — flat pipeline diagram ---- */
+/* Horizontal flow of small flat cards joined by arrow glyphs; wraps, then goes
+   fully vertical under 640px (arrows rotate). Theme tokens only — no gradients,
+   reads in both light and dark. */
+.tp-flow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 6px;
+}
+.tp-node {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px 8px;
+  min-width: 110px;
+  max-width: 210px;
+  flex: 0 1 auto;
+}
+.tp-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.tp-note {
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  line-height: 1.4;
+  margin-top: 3px;
+}
+/* Seal check — the sealed/auth purple accent, matching the lock semantics
+   everywhere else in the app. */
+.tp-node.lock {
+  border-color: color-mix(in srgb, var(--lock) 45%, var(--border-strong));
+}
+.tp-note.lock {
+  color: var(--lock);
+}
+/* Cap annotations — mono + brass, visually tied to the budget fields below. */
+.tp-caps {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--brass);
+  line-height: 1.4;
+  margin-top: 4px;
+}
+.tp-arrow {
+  color: var(--fg-faintest);
+  font-size: 13px;
+  flex: 0 0 auto;
+  display: inline-block;
+  user-select: none;
+}
+/* Stage 1 + its fallback branch stack as one flow item. */
+.tp-stage1-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 0 1 auto;
+  max-width: 210px;
+}
+.tp-branch {
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  margin: 6px 0 0 16px;
+  position: relative;
+  line-height: 1.4;
+}
+/* Dashed elbow connecting the branch back to the stage-1 card. */
+.tp-branch::before {
+  content: "";
+  position: absolute;
+  left: -9px;
+  top: -7px;
+  width: 8px;
+  height: 16px;
+  border-left: 1px dashed var(--border-strong);
+  border-bottom: 1px dashed var(--border-strong);
+  border-bottom-left-radius: 6px;
+}
+@media (max-width: 640px) {
+  .tp-flow {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .tp-node,
+  .tp-stage1-col {
+    max-width: none;
+  }
+  .tp-arrow {
+    align-self: center;
+    transform: rotate(90deg);
+  }
 }
 
 /* ============================ USAGE ============================ */
@@ -249,14 +428,17 @@ button.danger:hover {
   background: color-mix(in srgb, var(--brass) 78%, transparent);
 }
 
-/* ASSISTANT placeholder well. */
-.usage-placeholder {
-  font-size: 12.5px;
+/* Inline text button (e.g. "forget" the assistant key). Quiet until hovered. */
+.set-row button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11.5px;
   color: var(--fg-faint);
-  background: var(--bg-sunken);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-sm);
-  padding: 14px 16px;
-  max-width: 520px;
-  line-height: 1.5;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.set-row button.link:hover {
+  color: var(--red);
 }
