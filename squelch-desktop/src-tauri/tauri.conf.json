@@ -19,11 +19,11 @@
         "minHeight": 640,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "backgroundColor": "#f7f4ee"
+        "backgroundColor": "#6ba6e0"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://icons.duckduckgo.com; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* https://*.ts.net https:"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* https://*.ts.net https:"
     }
   },
   "bundle": {

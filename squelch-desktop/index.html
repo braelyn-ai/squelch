@@ -3,7 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* http://localhost:* https://*.ts.net https://*" />
+    <!-- img-src must permit http:/https: — email frames are srcdoc iframes and
+         INHERIT this document's CSP, so remote images in mail only load if the
+         parent allows them (the frame's own CSP is the per-message gate).
+         Keep in lockstep with app.security.csp in src-tauri/tauri.conf.json. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://*.ts.net https://*" />
     <title>squelch</title>
     <!-- Apply the persisted theme before first paint so there's no flash.
          Light is the default; "dark" is opt-in via the header toggle. -->

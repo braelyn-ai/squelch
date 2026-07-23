@@ -31,6 +31,19 @@ function isHttpUrl(url: string): boolean {
 }
 
 /**
+ * The URL's HOST only — never the path/query. Unsubscribe links are mail-derived
+ * and routinely carry per-recipient tokens in the path/query, so a failure log
+ * must never echo the full URL. Returns "?" if it won't parse.
+ */
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "?";
+  }
+}
+
+/**
  * Open `url` externally. No-op (resolves) for non-http(s) URLs so callers can
  * pass a possibly-null/odd tracking_url through a guard upstream and still be
  * safe here. Never throws for a bad scheme.
@@ -39,8 +52,20 @@ export async function openExternal(url: string): Promise<void> {
   if (!url || !isHttpUrl(url)) return;
 
   if (inTauri()) {
-    const { openUrl } = await import("@tauri-apps/plugin-opener");
-    await openUrl(url);
+    try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } catch (err) {
+      // Never swallow silently: a rejected openUrl (e.g. a ForbiddenUrl from a
+      // missing/mis-scoped `opener:allow-open-url` capability) looks like a
+      // dead button to the user. Surface it so it's diagnosable — but log a
+      // STATIC message + the error + at most the host, never the full (mail-
+      // derived, token-bearing) URL.
+      console.error(
+        `openExternal: failed to open external URL (host: ${safeHost(url)})`,
+        err,
+      );
+    }
     return;
   }
 
