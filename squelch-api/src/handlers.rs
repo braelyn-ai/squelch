@@ -470,6 +470,26 @@ pub async fn get_receipts(
     Ok(Json(items))
 }
 
+// --- GET /client/banking -----------------------------------------------------
+
+/// WIRE CONTRACT (the desktop Banking zone is built against exactly this): a JSON
+/// array, newest-received first, of
+/// `{id, message_id, kind, institution, amount, currency, account_hint,
+/// received_at}` where `kind` is "statement" | "transaction_alert" and every
+/// extracted field is nullable. `account_hint` is only ever a masked last-4 tail
+/// ("…1234") or null. The serialized shape is
+/// [`squelch_core::types::Banking`] — change that type and you change the
+/// contract. Sealed mail can never produce a banking row (structural, like
+/// receipts), so no sealed filtering is applied here.
+pub async fn get_banking(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let items = blocking(move || store.list_banking(account_id)).await?;
+    Ok(Json(items))
+}
+
 // --- GET /client/calendar ----------------------------------------------------
 
 /// Default look-back window (hours of MAIL ARRIVAL, not event start) for the

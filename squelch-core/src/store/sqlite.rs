@@ -12,12 +12,12 @@ use zerocopy::AsBytes;
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    MessageUnsub, MissingVector, NewAuditEntry, SealedBody, SealedMessage, SitrepBand,
-    Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage,
-    Stage2UsageDay, Store, SyncState, TriagedMessage,
+    BankingApplied, ExtractQueued, MessageUnsub, MissingVector, NewAuditEntry, SealedBody,
+    SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides,
+    Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, CalendarUpdate,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking, CalendarUpdate,
     ClientMessage, ClientThreadView, Deadline, Disposition, NewMessage, Receipt, SanitizedMessage,
     SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
 };
@@ -571,6 +571,16 @@ fn migrate(conn: &Connection) -> Result<()> {
     let added_stage1 = add_column_if_missing(conn, "triage", "stage1_model_used", "TEXT")?;
     add_column_if_missing(conn, "triage", "needs_stage2", "INTEGER NOT NULL DEFAULT 0")?;
 
+    // CATEGORIZE-THEN-EXTRACT markers. `category` is the LLM's coarse route
+    // (NULL == pre-feature / heuristic-only row, never categorized);
+    // `extractor_model_used` gates the specialist-extractor queue (NULL == not
+    // yet extracted). A pre-existing `triage` table predates both, so the queue /
+    // apply SQL that names them would fail with "no such column" until added. No
+    // backfill is needed: NULL is the correct resting value (no category => never
+    // queued for extraction), so historical rows simply never re-run an extractor.
+    add_column_if_missing(conn, "triage", "category", "TEXT")?;
+    add_column_if_missing(conn, "triage", "extractor_model_used", "TEXT")?;
+
     // BACKFILL (runs ONCE, the open that first introduces `stage1_model_used`).
     // The column add leaves `stage1_model_used = NULL` on EVERY historical row —
     // which is exactly the Stage-1 LLM queue predicate — so without this the whole
@@ -868,6 +878,42 @@ fn upsert_receipt_conn(
     let id: i64 = conn.query_row(
         "SELECT id FROM receipts WHERE account_id=?1 AND message_id=?2",
         params![account_id, message_id],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Upsert a banking row keyed by `(account_id, message_id)`. Idempotent: a
+/// re-run overwrites kind/institution/amount/currency/account_hint/received_at.
+/// Runs in the caller's connection/transaction.
+///
+/// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
+fn upsert_banking_conn(
+    conn: &Connection,
+    applied: &BankingApplied,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO banking(account_id, message_id, kind, institution, amount,
+             currency, account_hint, received_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+             kind=excluded.kind, institution=excluded.institution,
+             amount=excluded.amount, currency=excluded.currency,
+             account_hint=excluded.account_hint, received_at=excluded.received_at",
+        params![
+            applied.account_id,
+            applied.message_id,
+            applied.kind,
+            applied.institution,
+            applied.amount,
+            applied.currency,
+            applied.account_hint,
+            applied.received_at.to_rfc3339(),
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM banking WHERE account_id=?1 AND message_id=?2",
+        params![applied.account_id, applied.message_id],
         |row| row.get(0),
     )?;
     Ok(id)
@@ -1552,6 +1598,166 @@ impl Store for SqliteStore {
                 from_name,
                 amount,
                 currency,
+                received_at: parse_dt(&received_at)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn extract_queue(
+        &self,
+        account_id: AccountId,
+        categories: &[&str],
+        limit: usize,
+    ) -> Result<Vec<ExtractQueued>> {
+        if categories.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        // Rows the LLM categorized into an EXTRACTABLE category that have not yet
+        // been through their extractor (extractor_model_used IS NULL), non-sealed,
+        // non-sent. A message that already produced a RECEIPT is excluded — a
+        // receipt (money paid for a purchase) and a banking row must never
+        // double-create (the deterministic receipt detector runs at ingest, before
+        // this categorizer). The category IN (...) list is built from the caller's
+        // slice (bound params, never string-interpolated).
+        let placeholders = (0..categories.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject, m.body,
+                    t.category, t.sensitivity, m.received_at
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1
+               AND t.category IN ({placeholders})
+               AND t.extractor_model_used IS NULL
+               AND t.sensitivity = 'normal'
+               AND m.is_sent = 0
+               AND NOT EXISTS(
+                   SELECT 1 FROM receipts r
+                   WHERE r.account_id = t.account_id AND r.message_id = t.message_id
+               )
+             ORDER BY m.received_at DESC
+             LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        // Bind params: ?1 account_id, ?2 limit, ?3.. categories.
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(categories.len() + 2);
+        binds.push(Box::new(account_id));
+        binds.push(Box::new(limit as i64));
+        for c in categories {
+            binds.push(Box::new((*c).to_string()));
+        }
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            let category: String = r.get(6)?;
+            let sensitivity: String = r.get(7)?;
+            let received_at: String = r.get(8)?;
+            Ok((
+                ExtractQueued {
+                    message_id: r.get(0)?,
+                    account_id,
+                    thread_id: r.get(1)?,
+                    from_addr: r.get(2)?,
+                    from_name: r.get(3)?,
+                    subject: r.get(4)?,
+                    body: r.get(5)?,
+                    category,
+                    received_at: Utc::now(), // replaced below after parse
+                    sensitivity: Sensitivity::parse(&sensitivity),
+                },
+                received_at,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut q, received_at) = row?;
+            q.received_at = parse_dt(&received_at)?;
+            out.push(q);
+        }
+        Ok(out)
+    }
+
+    fn extract_mark_processed(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        extractor_model_used: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE triage SET extractor_model_used = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![message_id, account_id, extractor_model_used],
+        )?;
+        Ok(())
+    }
+
+    fn banking_apply(&self, applied: &BankingApplied) -> Result<i64> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        // 1. Upsert the banking row (keyed by account + message).
+        let id = upsert_banking_conn(&tx, applied)?;
+        // 2. Stamp the extractor marker (leaving the extract queue) and, for a
+        //    RECORD (statement/alert), resolve the triage row to 'done' so it
+        //    leaves the attention bands — same transition shape as
+        //    set_attention_status ('done' stamps resolved_at). Guarded by
+        //    sensitivity='normal' so a sealed row can never be mutated here.
+        let now_s = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE triage SET
+                 extractor_model_used = ?3,
+                 status = CASE WHEN ?4 = 1 THEN 'done' ELSE status END,
+                 resolved_at = CASE WHEN ?4 = 1 THEN ?5 ELSE resolved_at END
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.extractor_model_used,
+                applied.auto_resolve as i64,
+                now_s,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn list_banking(&self, account_id: AccountId) -> Result<Vec<Banking>> {
+        let conn = self.lock()?;
+        // Newest-received first. No sealed filter needed: the table holds no
+        // sealed rows by construction (extraction never runs on sealed mail).
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, kind, institution, amount, currency, account_hint, received_at
+             FROM banking
+             WHERE account_id=?1
+             ORDER BY received_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, message_id, kind, institution, amount, currency, account_hint, received_at) =
+                row?;
+            out.push(Banking {
+                id,
+                message_id,
+                kind,
+                institution,
+                amount,
+                currency,
+                account_hint,
                 received_at: parse_dt(&received_at)?,
             });
         }
@@ -2728,7 +2934,8 @@ impl Store for SqliteStore {
                  deadline = ?7,
                  stage1_model_used = ?8,
                  needs_stage2 = ?9,
-                 field_reasons = ?10
+                 field_reasons = ?10,
+                 category = COALESCE(?11, category)
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
             params![
                 applied.message_id,
@@ -2741,6 +2948,7 @@ impl Store for SqliteStore {
                 applied.stage1_model_used,
                 applied.needs_stage2 as i64,
                 field_reasons_json,
+                applied.category,
             ],
         )?;
         // (Re)write the deadlines row idempotently.
@@ -2800,6 +3008,18 @@ impl Store for SqliteStore {
     fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
         let conn = self.lock()?;
         usage_since_category(&conn, account_id, since_day, "stage1")
+    }
+
+    fn extract_bump_usage(
+        &self,
+        account_id: AccountId,
+        day: &str,
+        category: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        bump_usage_category(&conn, account_id, day, category, input_tokens, output_tokens)
     }
 
     fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
@@ -2932,7 +3152,8 @@ impl Store for SqliteStore {
                  reason = ?6,
                  deadline = ?7,
                  model_used = ?8,
-                 field_reasons = ?9
+                 field_reasons = ?9,
+                 category = COALESCE(?10, category)
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
             params![
                 applied.message_id,
@@ -2944,6 +3165,7 @@ impl Store for SqliteStore {
                 deadline_dt,
                 applied.model_used,
                 field_reasons_json,
+                applied.category,
             ],
         )?;
         // (Re)write the deadlines row idempotently.
@@ -3386,6 +3608,262 @@ mod tests {
         assert_eq!(get(2).0.as_deref(), Some("migrated"), "old stage-2 processed row out");
         assert_eq!(get(3).0, None, "genuinely-new unprocessed row re-enters Stage-1");
         assert_eq!(get(3).1, 0, "residual row's needs_stage2 rests at 0 (Stage-1 recomputes)");
+    }
+
+    // ---- categorize-then-extract: schema migration + extractor queue -------
+
+    #[test]
+    fn migrate_adds_category_and_extractor_columns_to_preexisting_triage() {
+        // A `triage` table predating the categorize-then-extract feature. The
+        // additive migration must add both columns so the queue/apply SQL that
+        // NAMES them doesn't fail with "no such column". Idempotent on re-open.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE triage(
+                 message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 model_used TEXT, status TEXT NOT NULL DEFAULT 'new');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        let mut stmt = conn.prepare("PRAGMA table_info(triage)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "category"), "category column added");
+        assert!(
+            cols.iter().any(|c| c == "extractor_model_used"),
+            "extractor_model_used column added"
+        );
+    }
+
+    #[test]
+    fn init_upgrades_old_db_with_banking_table_and_extract_flow() {
+        // OLD-shape triage (no category / extractor_model_used) and NO banking
+        // table. init() applies SCHEMA (creates the banking table IF NOT EXISTS)
+        // then migrate() (adds the two triage columns), so the whole extract flow
+        // works on the upgraded DB.
+        register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE triage(
+                 message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 importance INTEGER NOT NULL DEFAULT 0, tier TEXT NOT NULL DEFAULT 'noise',
+                 sensitivity TEXT NOT NULL DEFAULT 'normal', sealed_kind TEXT,
+                 one_line TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+                 deadline TEXT, matched_rule_id INTEGER, model_used TEXT,
+                 status TEXT NOT NULL DEFAULT 'new', surfaced_at TEXT, resolved_at TEXT,
+                 created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        let store = SqliteStore::init(conn).unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let id = store
+            .ingest_message(&triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, id, "banking_statement", false);
+
+        // The banking table exists and the extract queue + apply work end to end.
+        let cats = ["banking_statement", "transaction_alert"];
+        let q = store.extract_queue(acct, &cats, 10).unwrap();
+        assert_eq!(q.len(), 1);
+        let applied = BankingApplied {
+            message_id: id,
+            account_id: acct,
+            kind: "statement".into(),
+            institution: Some("Chase".into()),
+            amount: Some(1234.56),
+            currency: Some("USD".into()),
+            account_hint: Some("…1234".into()),
+            received_at: Utc::now(),
+            extractor_model_used: "claude-haiku-4-5".into(),
+            auto_resolve: true,
+        };
+        store.banking_apply(&applied).unwrap();
+        assert_eq!(store.list_banking(acct).unwrap().len(), 1);
+    }
+
+    /// Set a triage row's LLM category via the real Stage-1 apply path (the
+    /// categorizer). `needs_stage2` is irrelevant to extraction but honored.
+    fn apply_category(
+        store: &SqliteStore,
+        acct: AccountId,
+        message_id: i64,
+        category: &str,
+        needs_stage2: bool,
+    ) {
+        store
+            .stage1_apply(&Stage1Applied {
+                message_id,
+                account_id: acct,
+                importance: 40,
+                tier: Tier::Noise,
+                one_line: "categorized".into(),
+                reason: "stage-1".into(),
+                field_reasons: crate::types::FieldReasons::default(),
+                stage1_model_used: "claude-haiku-4-5".into(),
+                needs_stage2,
+                deadline: None,
+                category: Some(category.into()),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn extract_queue_selects_banking_only_excludes_others_sealed_and_receipts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // banking_statement + transaction_alert -> queued.
+        let stmt = store
+            .ingest_message(&triaged_row(acct, "g-stmt", "t1", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, stmt, "banking_statement", false);
+        let alert = store
+            .ingest_message(&triaged_row(acct, "g-alert", "t2", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, alert, "transaction_alert", false);
+
+        // invoice + general -> NOT queued (no extractor).
+        let inv = store
+            .ingest_message(&triaged_row(acct, "g-inv", "t3", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, inv, "invoice", false);
+        let genr = store
+            .ingest_message(&triaged_row(acct, "g-gen", "t4", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, genr, "general", false);
+
+        // A sealed row: category stays NULL (stage1_apply is guarded), excluded.
+        let sealed = store
+            .ingest_message(&triaged_row(acct, "g-seal", "t5", None, false, Sensitivity::Sealed))
+            .unwrap();
+        apply_category(&store, acct, sealed, "banking_statement", false); // no-op on sealed
+
+        // A banking-categorized message that ALSO produced a receipt: excluded
+        // (a receipt and a banking row must never double-create).
+        let dual = store
+            .ingest_message(&triaged_row(acct, "g-dual", "t6", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, dual, "banking_statement", false);
+        store
+            .upsert_receipt(
+                acct,
+                dual,
+                "orders@shop.com",
+                None,
+                &crate::triage::ReceiptInfo { amount: Some(5.0), currency: Some("USD".into()) },
+                Utc::now(),
+            )
+            .unwrap();
+
+        let cats = ["banking_statement", "transaction_alert"];
+        let q = store.extract_queue(acct, &cats, 20).unwrap();
+        let ids: Vec<i64> = q.iter().map(|r| r.message_id).collect();
+        assert_eq!(q.len(), 2, "only the two banking rows without a receipt: {ids:?}");
+        assert!(ids.contains(&stmt));
+        assert!(ids.contains(&alert));
+        assert!(!ids.contains(&inv), "invoice has no extractor");
+        assert!(!ids.contains(&genr), "general has no extractor");
+        assert!(!ids.contains(&sealed), "sealed row carries a NULL category");
+        assert!(!ids.contains(&dual), "receipt-bearing row is excluded");
+    }
+
+    fn triage_extract_status(store: &SqliteStore, message_id: i64) -> (String, Option<String>, Option<String>) {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT status, resolved_at, extractor_model_used FROM triage WHERE message_id=?1",
+            params![message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn banking_apply_writes_row_stamps_marker_and_auto_resolves() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let id = store
+            .ingest_message(&triaged_row(acct, "g-stmt", "t1", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, id, "banking_statement", false);
+
+        store
+            .banking_apply(&BankingApplied {
+                message_id: id,
+                account_id: acct,
+                kind: "statement".into(),
+                institution: Some("Chase".into()),
+                amount: Some(1234.56),
+                currency: Some("USD".into()),
+                account_hint: Some("…1234".into()),
+                received_at: Utc::now(),
+                extractor_model_used: "claude-haiku-4-5".into(),
+                auto_resolve: true,
+            })
+            .unwrap();
+
+        // The banking row landed with the extracted fields.
+        let b = store.list_banking(acct).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].kind, "statement");
+        assert_eq!(b[0].institution.as_deref(), Some("Chase"));
+        assert_eq!(b[0].amount, Some(1234.56));
+        assert_eq!(b[0].account_hint.as_deref(), Some("…1234"));
+
+        // The triage row was stamped (leaves the queue) AND auto-resolved.
+        let (status, resolved_at, marker) = triage_extract_status(&store, id);
+        assert_eq!(status, "done", "banking statement auto-resolves");
+        assert!(resolved_at.is_some(), "resolved_at stamped");
+        assert_eq!(marker.as_deref(), Some("claude-haiku-4-5"));
+        assert!(store.extract_queue(acct, &["banking_statement"], 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invoice_row_is_not_auto_resolved_and_stays_standing() {
+        // Parity guard: an invoice is categorized but has NO extractor, so it is
+        // never queued and never auto-resolved — it stays 'new' (standing).
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let id = store
+            .ingest_message(&triaged_row(acct, "g-inv", "t1", None, false, Sensitivity::Normal))
+            .unwrap();
+        apply_category(&store, acct, id, "invoice", false);
+
+        assert!(
+            store.extract_queue(acct, &["banking_statement", "transaction_alert"], 10).unwrap().is_empty(),
+            "invoice is never in the extract queue"
+        );
+        let (status, resolved_at, _) = triage_extract_status(&store, id);
+        assert_eq!(status, "new", "invoice stays standing (not auto-resolved)");
+        assert!(resolved_at.is_none());
+    }
+
+    #[test]
+    fn extract_bump_usage_records_its_own_ledger_category() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        store
+            .extract_bump_usage(acct, "2026-07-23", "extract_banking", 500, 20)
+            .unwrap();
+        store
+            .extract_bump_usage(acct, "2026-07-23", "extract_banking", 300, 10)
+            .unwrap();
+        let conn = store.lock().unwrap();
+        let (calls, in_tok, out_tok): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT calls, input_tokens, output_tokens FROM stage2_usage
+                 WHERE account_id=?1 AND day=?2 AND category='extract_banking'",
+                params![acct, "2026-07-23"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(in_tok, 800);
+        assert_eq!(out_tok, 30);
     }
 
     #[test]
@@ -4840,6 +5318,7 @@ mod tests {
             stage1_model_used: "claude-haiku-4-5".into(),
             needs_stage2,
             deadline: None,
+            category: Some("general".into()),
         };
         store.stage1_apply(&applied(a, false)).unwrap(); // confident -> final
         store.stage1_apply(&applied(b, true)).unwrap(); // not confident -> escalate
@@ -4925,6 +5404,7 @@ mod tests {
                 stage1_model_used: "claude-haiku-4-5".into(),
                 needs_stage2: false,
                 deadline: None,
+                category: Some("general".into()),
             })
             .unwrap();
         // Re-deliver the SAME message (heuristic seed carries importance 40).
@@ -5557,6 +6037,7 @@ mod tests {
                 past_due: false,
                 source: "stage2".into(),
             }),
+            category: Some("invoice".into()),
         };
         store.stage2_apply(&applied).unwrap();
 
@@ -5590,6 +6071,7 @@ mod tests {
             field_reasons: crate::types::FieldReasons::default(),
             model_used: "m".into(),
             deadline: None,
+            category: Some("general".into()),
         };
         store.stage2_apply(&applied).unwrap();
         // The sealed row's triage must be unchanged (guarded by sensitivity).

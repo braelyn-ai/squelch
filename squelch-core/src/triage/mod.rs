@@ -34,6 +34,7 @@
 
 pub mod calendar;
 pub mod deadline;
+pub mod extract;
 pub mod llm;
 pub mod receipt;
 pub mod receipt_match;

@@ -13,9 +13,9 @@ pub use sqlite::SqliteStore;
 use crate::error::Result;
 use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, CalendarUpdate, Deadline, Disposition,
-    FieldReasons, NewMessage, Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, StoreStats,
-    ThreadView, Tier, Update, UnsubscribeRecord,
+    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, Banking, CalendarUpdate, Deadline,
+    Disposition, FieldReasons, NewMessage, Receipt, SealedKind, SearchHit, SenderRule, Sensitivity,
+    StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
 
@@ -228,6 +228,9 @@ pub struct Stage2Applied {
     pub model_used: String,
     /// A deadline to (re)write for this message, if the model extracted one.
     pub deadline: Option<DeadlineHit>,
+    /// The coarse routing category to stamp `triage.category` with (parity with
+    /// Stage-1). `None` leaves the column untouched.
+    pub category: Option<String>,
 }
 
 /// One row queued for the Stage-1 LLM refine pass: an ingested, NON-SEALED,
@@ -281,6 +284,68 @@ pub struct Stage1Applied {
     pub needs_stage2: bool,
     /// A deadline to (re)write for this message, if the model extracted one.
     pub deadline: Option<DeadlineHit>,
+    /// The coarse routing category to stamp `triage.category` with (`general` |
+    /// `invoice` | `banking_statement` | `transaction_alert`). `None` leaves the
+    /// column untouched (heuristic-only rows never reach this apply path).
+    pub category: Option<String>,
+}
+
+/// One row queued for a specialist EXTRACTOR pass: a NON-SEALED triage row whose
+/// LLM-assigned `category` has a registered extractor and that has not yet been
+/// extracted (`extractor_model_used IS NULL`). Produced by [`Store::extract_queue`].
+///
+/// SECURITY: the query EXCLUDES sealed rows in SQL (`sensitivity='normal'`) and
+/// rows are only ever selected when a real LLM category is present (sealed rows
+/// carry `category=NULL`), so an `ExtractQueued` never represents sealed mail. The
+/// extract pass additionally re-checks [`crate::triage::extract::extract_sealed_guard`]
+/// before every classify call.
+#[derive(Debug, Clone)]
+pub struct ExtractQueued {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    /// Gmail thread id (carried for context/logging; the extract pass uses only
+    /// the shared Stage-1 GLOBAL budget scope).
+    pub thread_id: String,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+    pub body: String,
+    /// The LLM-assigned routing category that selected this row (one of the
+    /// extractable categories). Drives which specialist extractor runs.
+    pub category: String,
+    /// When the message was received (drives the stored `banking.received_at` and
+    /// the stale-skip check).
+    pub received_at: DateTime<Utc>,
+    /// Always `'normal'` for queued rows (sealed is excluded in SQL). Carried so
+    /// the sealed guard can assert.
+    pub sensitivity: Sensitivity,
+}
+
+/// The store-facing outcome of running the banking specialist extractor on a row.
+/// Pure mapping lives in [`crate::triage::extract::banking::apply_result`]; this
+/// is what the store persists: a `banking` row upsert PLUS the extractor marker
+/// and (for records) an auto-resolve of the triage row.
+#[derive(Debug, Clone)]
+pub struct BankingApplied {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    /// `statement` | `transaction_alert` — derived from the row's category, not
+    /// the model.
+    pub kind: String,
+    pub institution: Option<String>,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    /// Masked last-4 tail (`…1234`) or `None` — never a full account number
+    /// (post-validated in the extractor's apply).
+    pub account_hint: Option<String>,
+    pub received_at: DateTime<Utc>,
+    /// The extractor model id to stamp `triage.extractor_model_used` with (marks
+    /// the row done with extraction so the queue no longer selects it).
+    pub extractor_model_used: String,
+    /// `true` => also resolve the triage row to `status='done'` (banking
+    /// statements/alerts are RECORDS and must leave the attention bands). Invoice
+    /// rows are never handled by this extractor, so they are never auto-resolved.
+    pub auto_resolve: bool,
 }
 
 /// A day's Stage-2 API usage for one account, read from the `stage2_usage`
@@ -477,6 +542,48 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         hours: u32,
     ) -> Result<Vec<CalendarUpdate>>;
+
+    // ---------------------------------------------------------------------
+    // SPECIALIST EXTRACTORS (categorize-then-extract). The stage-1/stage-2 LLM
+    // assigns a `category`; a category with a registered extractor queues the
+    // row for a structured second pass. Sealed rows carry `category=NULL` and
+    // are structurally excluded from every extractor queue.
+    // ---------------------------------------------------------------------
+
+    /// Fetch up to `limit` rows queued for a specialist extractor: NON-SEALED,
+    /// non-sent rows whose `category` is in `categories` (the set of categories
+    /// with a registered extractor) and whose `extractor_model_used IS NULL`.
+    /// Rows that already produced a RECEIPT are excluded (a receipt and a banking
+    /// row must never double-create). Newest-first. Sealed rows are excluded in
+    /// SQL.
+    fn extract_queue(
+        &self,
+        account_id: AccountId,
+        categories: &[&str],
+        limit: usize,
+    ) -> Result<Vec<ExtractQueued>>;
+
+    /// Mark an extract-queued row PROCESSED without writing a specialist row —
+    /// stamp `extractor_model_used` only. Used on the skip / refusal / permanent-
+    /// error paths so the row does not loop. Guarded by `sensitivity='normal'`.
+    fn extract_mark_processed(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        extractor_model_used: &str,
+    ) -> Result<()>;
+
+    /// Apply a parsed banking extraction onto the store IN ONE TRANSACTION:
+    /// upsert the `banking` row (keyed by `(account_id, message_id)`), stamp
+    /// `triage.extractor_model_used` (leaving the extract queue), and — when
+    /// `auto_resolve` is set — resolve the triage row to `status='done'`
+    /// (stamping `resolved_at`) so the record leaves the attention bands. Guarded
+    /// by `sensitivity='normal'`. Returns the banking row id.
+    fn banking_apply(&self, applied: &BankingApplied) -> Result<i64>;
+
+    /// List banking records for the account, newest-received first. Sealed rows
+    /// are structurally absent (never inserted), so no sealed filter is required.
+    fn list_banking(&self, account_id: AccountId) -> Result<Vec<Banking>>;
 
     /// Upsert a sender rule. Returns the rule id.
     fn set_sender_rule(
@@ -709,6 +816,19 @@ pub trait Store: Send + Sync {
     /// Sum the Stage-1 usage ledger over every day `>= since_day`. Drives the
     /// trailing-window Stage-1 averages on `/client/triage-config`.
     fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage>;
+
+    /// Bump a SPECIALIST-EXTRACTOR usage ledger line for `(account_id, day,
+    /// category)`: +1 call and add the response's input/output token counts.
+    /// `category` is the extractor's own ledger label (e.g. `extract_banking`),
+    /// kept separate from `stage1`/`stage2` so per-specialist cost stays visible.
+    fn extract_bump_usage(
+        &self,
+        account_id: AccountId,
+        day: &str,
+        category: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()>;
 
     /// Stage-1 usage history: the most recent `days` rows, newest-first (sparse).
     fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>>;

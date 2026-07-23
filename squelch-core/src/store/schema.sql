@@ -99,6 +99,20 @@ CREATE TABLE IF NOT EXISTS triage (
     -- predicate is `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
     -- model_used IS NULL AND sensitivity='normal'`.
     model_used      TEXT,
+    -- CATEGORIZE-THEN-EXTRACT. The stage-1 (and, on escalation, stage-2) LLM
+    -- assigns one coarse category: 'general' | 'invoice' | 'banking_statement' |
+    -- 'transaction_alert'. NULL = a pre-feature or heuristic-only row (the LLM
+    -- never looked). A category with a registered SPECIALIST EXTRACTOR (see
+    -- triage/extract/) queues the row for a second, structured extraction pass.
+    -- Sealed rows never run the LLM stages, so their category stays NULL — which
+    -- is exactly what structurally excludes them from every extractor queue.
+    category        TEXT,
+    -- SPECIALIST-EXTRACTOR marker. NULL = this row has not yet been through its
+    -- category's extractor (or its category has no extractor). Stamped with the
+    -- extractor model id once run, or a sentinel ('skip-*') when deliberately
+    -- skipped. The extractor queue predicate is `category IN (<extractable>) AND
+    -- extractor_model_used IS NULL AND sensitivity='normal'`.
+    extractor_model_used TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,
@@ -214,6 +228,47 @@ CREATE TABLE IF NOT EXISTS calendar_updates (
 
 CREATE INDEX IF NOT EXISTS idx_calendar_received ON calendar_updates(account_id, received_at);
 
+-- BANKING. One row per (account, message): a bank/credit-card STATEMENT (a
+-- periodic record) or a TRANSACTION ALERT (a "you spent" / deposit / low-balance
+-- notice), extracted by the banking SPECIALIST EXTRACTOR (triage/extract/banking.rs)
+-- from a NON-SEALED row the LLM categorized 'banking_statement' or
+-- 'transaction_alert'. Like receipts, these are RECORDS, not obligations — the
+-- extractor auto-resolves the triage row (status='done') so they leave the
+-- attention bands and live only in the desktop "Banking" zone. `kind` is
+-- 'statement' | 'transaction_alert'. For a statement, `amount` is the TOTAL
+-- statement balance (never the minimum payment / amount due); for an alert it is
+-- the transaction amount. `institution` is a clean display name (e.g. "Chase").
+-- `account_hint` is ONLY ever a masked last-4 tail ("…1234") — a full account
+-- number is never stored (the extractor instructs the model AND post-validates,
+-- reducing anything longer to a "…NNNN" tail or NULL). All extracted fields are
+-- best-effort (NULL is fine).
+--
+-- Differentiation from receipts (documented invariant): a receipt (money paid
+-- for a purchase) and a banking row must never DOUBLE-CREATE. The deterministic
+-- receipt detector runs at INGEST, before the LLM categorizer; if a message
+-- already produced a receipt, the banking extractor SKIPS it (the extractor
+-- queue excludes messages that have a receipts row).
+--
+-- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A BANKING ROW.
+-- Sealed rows never run the LLM stages, so they carry category=NULL and are
+-- structurally absent from the extractor queue; the extractor additionally
+-- enforces the release-mode sealed guard. This table has no sealed rows BY
+-- CONSTRUCTION — no sealed join is needed on read.
+CREATE TABLE IF NOT EXISTS banking (
+    id           INTEGER PRIMARY KEY,
+    account_id   INTEGER NOT NULL,
+    message_id   INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    institution  TEXT,
+    amount       REAL,
+    currency     TEXT,
+    account_hint TEXT,
+    received_at  TEXT NOT NULL,
+    UNIQUE(account_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_banking_received ON banking(account_id, received_at);
+
 -- UNSUBSCRIBES. One row per (account, sender_addr): the human-door record that
 -- the user asked to stop hearing from a sender, plus the "did they honor it?"
 -- violation ledger. Created/updated by POST /client/unsubscribe (upsert: a fresh
@@ -277,9 +332,11 @@ CREATE TABLE IF NOT EXISTS wake_budget (
 );
 
 -- LLM USAGE LEDGER. One row per (account, UTC day, category): running totals of
--- the Messages API usage each triage stage consumed. `category` is 'stage1' or
--- 'stage2' — the two stages are SEPARATE categories the client renders
--- independently. `calls` counts SUCCESSFUL classify responses that carried a
+-- the Messages API usage each triage stage consumed. `category` is 'stage1',
+-- 'stage2', or a specialist-extractor line such as 'extract_banking' — each is a
+-- SEPARATE category the client renders independently (extractors run on the
+-- stage-1 model but bill to their own line for cost visibility). `calls` counts
+-- SUCCESSFUL classify responses that carried a
 -- usage block; input/output tokens are summed from each response's usage. Read
 -- by GET /client/stats + /client/usage to surface usage + an estimated cost
 -- (cost is computed at read time from the config-driven per-MTok prices, so it

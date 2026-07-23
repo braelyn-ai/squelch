@@ -252,6 +252,71 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
 }
 
 #[tokio::test]
+async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
+    use squelch_core::store::BankingApplied;
+    let (app, _s, _a) = app_with(|store, acct| {
+        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "statement", "b")).unwrap();
+        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "alert", "b")).unwrap();
+        // Older statement, then newer alert -> expect newest-first ordering.
+        store
+            .banking_apply(&BankingApplied {
+                message_id: m1,
+                account_id: acct,
+                kind: "statement".into(),
+                institution: Some("Chase".into()),
+                amount: Some(1234.56),
+                currency: Some("USD".into()),
+                account_hint: Some("…1234".into()),
+                received_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                extractor_model_used: "claude-haiku-4-5".into(),
+                auto_resolve: true,
+            })
+            .unwrap();
+        store
+            .banking_apply(&BankingApplied {
+                message_id: m2,
+                account_id: acct,
+                kind: "transaction_alert".into(),
+                institution: None,
+                amount: Some(42.10),
+                currency: Some("USD".into()),
+                account_hint: None,
+                received_at: chrono::Utc::now(),
+                extractor_model_used: "claude-haiku-4-5".into(),
+                auto_resolve: true,
+            })
+            .unwrap();
+    });
+
+    // Bearer-gated: no token => 401.
+    let unauth = Request::builder()
+        .uri("/client/banking")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauth).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Authed: newest-first, exact wire shape (no account_id), nulls preserved.
+    let resp = app.oneshot(authed("GET", "/client/banking")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    // Newest first: the transaction alert.
+    assert_eq!(items[0]["kind"], "transaction_alert");
+    assert_eq!(items[0]["institution"], Value::Null);
+    assert_eq!(items[0]["account_hint"], Value::Null);
+    assert_eq!(items[0]["amount"], 42.10);
+    assert!(items[0].get("account_id").is_none(), "account_id off the wire");
+    // Then the statement.
+    assert_eq!(items[1]["kind"], "statement");
+    assert_eq!(items[1]["institution"], "Chase");
+    assert_eq!(items[1]["amount"], 1234.56);
+    assert_eq!(items[1]["account_hint"], "…1234");
+    assert_eq!(items[1]["currency"], "USD");
+}
+
+#[tokio::test]
 async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::{CalendarInfo, CalendarKind};
     let (app, _s, _a) = app_with(|store, acct| {

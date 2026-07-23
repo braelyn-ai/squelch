@@ -336,6 +336,34 @@ pub struct Receipt {
     pub received_at: DateTime<Utc>,
 }
 
+/// A banking record: a bank/credit-card STATEMENT (a periodic record) or a
+/// TRANSACTION ALERT ("you spent" / deposit / low-balance notice), produced from
+/// a NON-SEALED row the LLM categorized `banking_statement` / `transaction_alert`
+/// by the banking specialist extractor (see `triage::extract::banking`) and stored
+/// in the `banking` table (keyed by message). Surfaced by the human door
+/// (`GET /client/banking`); deliberately NOT exposed on the agent door. Sealed
+/// mail never produces a banking row, so this type is structurally incapable of
+/// representing sealed content.
+///
+/// SERIALIZED SHAPE IS A WIRE CONTRACT: the desktop is built against exactly
+/// `{id, message_id, kind, institution, amount, currency, account_hint,
+/// received_at}` — no `account_id` on purpose (the endpoint is already
+/// account-scoped). `kind` is "statement" | "transaction_alert". For a statement
+/// `amount` is the TOTAL statement balance; for an alert it is the transaction
+/// amount. `account_hint` is only ever a masked last-4 tail ("…1234") or null —
+/// a full account number is never emitted. Every extracted field is nullable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Banking {
+    pub id: i64,
+    pub message_id: i64,
+    pub kind: String,
+    pub institution: Option<String>,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    pub account_hint: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
 /// A calendar update: an invite / updated invitation / cancellation / RSVP
 /// response, produced from NON-SEALED calendar mail (Google Calendar
 /// notifications, Outlook invites, ics-bearing mail) by the ingest pipeline and

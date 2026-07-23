@@ -38,6 +38,7 @@ use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules};
+use crate::triage::extract::{self, banking};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
@@ -409,9 +410,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
         if cursor.is_none() {
             self.backfill().await?;
             // Stage-1 LLM refine pass over the backfill batch, then Stage-2 over
-            // any rows Stage-1 escalated.
+            // any rows Stage-1 escalated, then the specialist-extractor pass over
+            // rows either stage categorized into an extractable category.
             self.stage1_pass().await;
             self.stage2_pass().await;
+            self.extract_pass().await;
         }
 
         // VECTOR BACKFILL: embed any NON-SEALED messages still missing a vector.
@@ -470,6 +473,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             // Never crashes the sync loop (all failures handled internally).
             self.stage1_pass().await;
             self.stage2_pass().await;
+            // Specialist-extractor pass runs AFTER both stages so it sees each
+            // row's FINAL category (Stage-2 may have overwritten Stage-1's).
+            self.extract_pass().await;
 
             // VECTOR BACKFILL each tick. Cheap no-op when no embedder is attached
             // or the queue is empty. This is what makes a BACKGROUND-attached
@@ -968,6 +974,185 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
             eprintln!(
                 "squelch: stage-1 refined {refined} rows (model={}, in_tok={in_tok}, \
                  out_tok={out_tok}); heuristic-fallback {fallback}; stale-skipped {stale_skipped}",
+                cfg.model
+            );
+        }
+    }
+
+    /// Run one SPECIALIST-EXTRACTOR pass over rows the LLM categorized into a
+    /// category that has a registered extractor (currently banking).
+    ///
+    /// Runs AFTER the stage passes so it sees each row's FINAL category. For each
+    /// queued row: enforce the sealed guard, skip stale rows, check + increment
+    /// the SHARED Stage-1 global daily budget (extractors run on the Stage-1
+    /// model and share its cap — simplest), dispatch to the category's extractor,
+    /// and apply the result (which writes the specialist row and auto-resolves the
+    /// triage row). Token usage bills to the extractor's OWN ledger category.
+    /// Budget exhaustion defers remaining rows without loss (they stay queued).
+    /// Any per-row failure is logged (redacted) and never crashes the sync loop.
+    ///
+    /// No-op when the LLM is disabled (no API key) or no category has an extractor.
+    async fn extract_pass(&self) {
+        let Some((api_key, provider)) = self.stage2_key.as_ref() else {
+            return; // disabled; notice already emitted at startup
+        };
+        let api_key = api_key.as_str();
+        let provider = *provider;
+        // Extractors run on the STAGE-1 (small) model and share its config + cap.
+        let cfg = &self.config.stage1;
+
+        let categories = extract::extractable_categories();
+        if categories.is_empty() {
+            return;
+        }
+
+        // Shared Stage-1 global cap (runtime override honored, exactly like the
+        // Stage-1 pass — extract calls count against the SAME daily counter).
+        let caps = self
+            .store
+            .stage2_cap_overrides(self.account_id)
+            .unwrap_or_default();
+        let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
+
+        let queued = match self
+            .store
+            .extract_queue(self.account_id, &categories, cfg.batch_per_cycle)
+        {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("squelch: extract queue read failed ({e}); skipping pass");
+                return;
+            }
+        };
+        if queued.is_empty() {
+            return;
+        }
+
+        let now = Utc::now();
+        let day = now.format("%Y-%m-%d").to_string();
+        let stale_cutoff = now - ChronoDuration::days(self.config.stage2.max_age_days as i64);
+        let mut extracted = 0usize;
+        let mut skipped = 0usize;
+        let mut in_tok = 0u64;
+        let mut out_tok = 0u64;
+
+        for row in &queued {
+            // SEALED GUARD (defense in depth): the queue excludes sealed rows in
+            // SQL (and sealed rows carry a NULL category), but re-check anyway.
+            if let Err(e) = extract::extract_sealed_guard(row) {
+                eprintln!("squelch: extract sealed guard tripped ({e}); skipping row");
+                continue;
+            }
+
+            // SKIP-STALE: an old row is marked extracted WITHOUT a model call so it
+            // neither spends budget nor sits queued forever.
+            if row.received_at < stale_cutoff {
+                let _ = self.store.extract_mark_processed(
+                    self.account_id,
+                    row.message_id,
+                    STALE_SKIP_MODEL,
+                );
+                skipped += 1;
+                continue;
+            }
+
+            // Dispatch by category. Only banking is registered today; a row whose
+            // category has no handler is marked processed so it cannot loop.
+            if !banking::CATEGORIES.contains(&row.category.as_str()) {
+                let _ = self.store.extract_mark_processed(
+                    self.account_id,
+                    row.message_id,
+                    "skip-no-extractor",
+                );
+                skipped += 1;
+                continue;
+            }
+
+            // SHARED Stage-1 global budget check. Once hit, every remaining row
+            // this cycle is deferred (stays queued) with no stamp.
+            match self
+                .store
+                .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
+            {
+                Ok(used) if used >= global_daily_cap => {
+                    if self.warn_once_per_day(CapKind::Stage1Global, &day) {
+                        eprintln!(
+                            "squelch: stage-1 global daily budget exhausted \
+                             ({used}/{global_daily_cap}); extract rows stay queued"
+                        );
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("squelch: extract budget read failed ({e}); skipping row");
+                    continue;
+                }
+            }
+            if let Err(e) =
+                self.store
+                    .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
+            {
+                eprintln!("squelch: extract budget increment failed ({e}); skipping row");
+                continue;
+            }
+
+            let outcome = banking::classify(&self.http, api_key, cfg, provider, row).await;
+            match outcome {
+                Ok(banking::ExtractOutcome::Ok(out, usage)) => {
+                    if let Some(u) = usage {
+                        in_tok += u.input_tokens;
+                        out_tok += u.output_tokens;
+                        if let Err(e) = self.store.extract_bump_usage(
+                            self.account_id,
+                            &day,
+                            banking::LEDGER_CATEGORY,
+                            u.input_tokens,
+                            u.output_tokens,
+                        ) {
+                            eprintln!("squelch: extract usage ledger bump failed ({e})");
+                        }
+                    }
+                    let applied = banking::apply_result(row, &out, &cfg.model);
+                    if let Err(e) = self.store.banking_apply(&applied) {
+                        // Mark processed with a failure sentinel: the model call
+                        // is already paid for, and leaving the row queued would
+                        // re-buy a call EVERY cycle until the daily cap absorbs
+                        // it (a store-level failure is unlikely to heal by
+                        // retrying with fresh spend). The email itself still
+                        // lives in the inbox; only the Banking record is lost.
+                        eprintln!("squelch: banking apply failed ({e}); row marked apply-failed");
+                        let _ = self.store.extract_mark_processed(
+                            self.account_id,
+                            row.message_id,
+                            "apply-failed",
+                        );
+                    } else {
+                        extracted += 1;
+                    }
+                }
+                Ok(banking::ExtractOutcome::Refused) | Ok(banking::ExtractOutcome::Failed(_)) => {
+                    // Mark processed so the row does not loop; no specialist row is
+                    // written (the record simply won't appear in the Banking zone).
+                    let _ = self.store.extract_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        "extract-failed",
+                    );
+                    skipped += 1;
+                }
+                Err(e) => {
+                    // Retryable class exhausted / transport error. Leave the row
+                    // queued (extractor_model_used stays NULL) for a future cycle.
+                    eprintln!("squelch: extract {e}; row stays queued");
+                }
+            }
+        }
+
+        if extracted > 0 || skipped > 0 {
+            eprintln!(
+                "squelch: extract processed {extracted} rows (model={}, in_tok={in_tok}, \
+                 out_tok={out_tok}); skipped {skipped}",
                 cfg.model
             );
         }
