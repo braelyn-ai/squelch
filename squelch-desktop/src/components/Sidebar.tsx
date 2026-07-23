@@ -9,7 +9,6 @@
 import {
   Gauge,
   Mail,
-  Landmark,
   KeyRound,
   SlidersHorizontal,
   ScrollText,
@@ -30,7 +29,6 @@ interface RailItem {
 const ITEMS: RailItem[] = [
   { view: "sitrep", label: "Sitrep", Icon: Gauge },
   { view: "emails", label: "Emails", Icon: Mail },
-  { view: "banking", label: "Banking", Icon: Landmark },
   { view: "auth", label: "Auth", Icon: KeyRound },
   { view: "rules", label: "Rules", Icon: SlidersHorizontal },
   { view: "audit", label: "Audit", Icon: ScrollText },

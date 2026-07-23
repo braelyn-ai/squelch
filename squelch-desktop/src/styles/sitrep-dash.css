@@ -811,3 +811,18 @@
   color: var(--brass-ink);
   white-space: nowrap;
 }
+
+/* ---- BANKING zone: statements & transaction alerts (right rail) ----
+   Same dense record rows as Receipts; the kind tag sits between the
+   institution and the amount, quiet lowercase like the calendar tags. */
+.zone-banking .zone-head .glyph {
+  color: var(--fg-dim);
+}
+.zone-banking .bank-tag {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}

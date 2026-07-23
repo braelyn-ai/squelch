@@ -24,6 +24,7 @@ import {
   ArrowUpRight,
   Eye,
   Bell,
+  Landmark,
   Receipt,
   Mails,
   Pencil,
@@ -36,6 +37,7 @@ import {
 import { api, ApiError } from "../api";
 import type {
   AttentionUpdate,
+  BankingRecord,
   CalendarUpdate,
   Receipt as ReceiptRecord,
   SenderRule,
@@ -371,6 +373,7 @@ function SitrepBody({
       <aside className="dash-right">
         <CalendarZone />
         <ShipmentsColumn />
+        <BankingZone />
         <ReceiptsZone />
       </aside>
       </div>
@@ -748,6 +751,101 @@ function ReceiptsZone() {
           );
         })}
       </div>
+      )}
+    </section>
+  );
+}
+
+// ---- BANKING zone: statements & transaction alerts (right rail) ------------
+
+/** Quiet lowercase tag for a banking record's kind. */
+const BANK_KIND_TAG: Record<BankingRecord["kind"], string> = {
+  statement: "statement",
+  transaction_alert: "alert",
+};
+
+/** Format a banking amount: record currency (fallback USD), two decimals; a
+ *  statement's amount is the TOTAL balance the extractor pulled. "—" if none. */
+function bankingAmount(r: BankingRecord): string {
+  if (r.amount === null || r.amount === undefined || Number.isNaN(r.amount)) {
+    return "—";
+  }
+  const currency = r.currency ?? "USD";
+  try {
+    return r.amount.toLocaleString("en-US", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+  } catch {
+    return `$${r.amount.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+  }
+}
+
+/** How many banking records the rail shows (statements are ~monthly, so a
+ *  short recency list beats a today-only filter that would sit empty). */
+const BANKING_SHOWN = 8;
+
+/**
+ * BANKING zone, in the right rail with the other records (calendar, shipments,
+ * receipts). Statements & transaction alerts — the latest few, dense record
+ * rows: institution + kind tag + masked account hint, amount right-aligned
+ * (a statement shows the TOTAL balance). Clicking opens the email.
+ */
+function BankingZone() {
+  const [records, setRecords] = useState<BankingRecord[] | null>(null);
+  const viewInEmails = useStore((s) => s.viewInEmails);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getBanking()
+      .then((r) => alive && setRecords(r))
+      .catch(() => {
+        // Non-fatal: leave the zone empty rather than surface token/url.
+        if (alive) setRecords([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const rows = (records ?? []).slice(0, BANKING_SHOWN);
+
+  return (
+    <section className="zone zone-banking">
+      <div className="zone-head">
+        <span className="glyph">
+          <Landmark size={15} />
+        </span>
+        <h2>Banking</h2>
+        {rows.length > 0 && <span className="zone-count">{rows.length}</span>}
+      </div>
+      {rows.length === 0 ? (
+        <p className="zone-empty">No statements or alerts.</p>
+      ) : (
+        <div className="receipts-list">
+          {rows.map((r) => (
+            <button
+              type="button"
+              className="receipt-row"
+              key={r.id}
+              onClick={() => viewInEmails(r.message_id)}
+              title="view this email"
+            >
+              <span className="receipt-sender">
+                {r.institution ?? "bank"}
+                {r.account_hint ? ` ${r.account_hint}` : ""}
+              </span>
+              <span className="bank-tag">{BANK_KIND_TAG[r.kind]}</span>
+              <span className="receipt-amount">{bankingAmount(r)}</span>
+            </button>
+          ))}
+        </div>
       )}
     </section>
   );

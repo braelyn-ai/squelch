@@ -16,16 +16,14 @@ import { useKeyContext } from "../keys";
 import { AuthView } from "../components/AuthView";
 import { RulesView } from "../components/RulesView";
 import { AuditView } from "../components/AuditView";
-import { BankingView } from "./BankingView";
 import "../styles/sitrep.css";
 
-type RoutedKind = "auth" | "rules" | "audit" | "banking";
+type RoutedKind = "auth" | "rules" | "audit";
 
 const TITLE: Record<RoutedKind, string> = {
   auth: "Auth — login codes & alerts",
   rules: "Rules — sender rules",
   audit: "Audit — agent & app actions",
-  banking: "Banking — statements & alerts",
 };
 
 export function RoutedView({ view }: { view: RoutedKind }) {
@@ -42,7 +40,6 @@ export function RoutedView({ view }: { view: RoutedKind }) {
         {view === "auth" && <AuthView />}
         {view === "rules" && <RulesView />}
         {view === "audit" && <AuditView />}
-        {view === "banking" && <BankingView />}
       </div>
     </div>
   );
