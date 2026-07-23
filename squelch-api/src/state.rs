@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use squelch_core::config::{CredentialBackend, OAuthClientConfig};
+use squelch_core::config::{CredentialBackend, OAuthClientConfig, Stage2CapSources};
 use squelch_core::credentials::{
     CredentialKind, CredentialStore, FileCredentialStore, KeyringCredentialStore,
 };
@@ -44,6 +44,31 @@ pub struct ApiState {
     /// The configured Stage-2 provider label (e.g. `anthropic`/`openai`), if
     /// known, surfaced on `/client/usage`. `None` when not explicitly configured.
     pub(crate) stage2_provider: Option<Arc<str>>,
+    /// The CONFIG/ENV-layer Stage-2 daily caps (already env-folded), reported by
+    /// `/client/triage-config` when no runtime override row exists. Default to
+    /// the Stage2Config defaults; wire the operator's config in with
+    /// [`ApiState::with_stage2_caps`].
+    pub(crate) stage2_thread_daily_cap: u32,
+    pub(crate) stage2_sender_daily_cap: u32,
+    pub(crate) stage2_global_daily_cap: u32,
+    /// Whether each config/env-layer cap came from the built-in default or from
+    /// config/env, so the triage-config endpoint can report "default" vs
+    /// "config" (the "override" case is decided at read time from `app_settings`).
+    pub(crate) stage2_cap_sources: Stage2CapSources,
+    /// The configured Stage-1 model id (small model), surfaced on
+    /// `/client/triage-config` and `/client/usage`.
+    pub(crate) stage1_model: Arc<str>,
+    /// Per-MTok Stage-1 prices for the triage-config estimator + usage cost.
+    pub(crate) stage1_price_in_per_mtok: f64,
+    pub(crate) stage1_price_out_per_mtok: f64,
+    /// The CONFIG/ENV-layer Stage-1 GLOBAL daily cap (Stage-1's only scope),
+    /// reported by `/client/triage-config` when no runtime override row exists.
+    pub(crate) stage1_global_daily_cap: u32,
+    /// Manual-refresh signal shared with the Gmail sync loop. `POST /client/refresh`
+    /// fires it to wake the poll loop for an immediate Gmail poll. `None` when no
+    /// sync loop is wired in (standalone `squelch-api` bin / tests): the endpoint
+    /// then reports `triggered: false` rather than pretending to have poked one.
+    pub(crate) refresh: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Why [`ApiState`] could not be constructed.
@@ -85,7 +110,32 @@ impl ApiState {
             stage2_price_out_per_mtok: s2.price_out_per_mtok,
             stage2_model: Arc::from(s2.model.as_str()),
             stage2_provider: None,
+            stage2_thread_daily_cap: s2.thread_daily_cap,
+            stage2_sender_daily_cap: s2.sender_daily_cap,
+            stage2_global_daily_cap: s2.global_daily_cap,
+            stage2_cap_sources: Stage2CapSources::default(),
+            stage1_model: {
+                let s1 = squelch_core::config::Stage1Config::default();
+                Arc::from(s1.model.as_str())
+            },
+            stage1_price_in_per_mtok: squelch_core::config::Stage1Config::default()
+                .price_in_per_mtok,
+            stage1_price_out_per_mtok: squelch_core::config::Stage1Config::default()
+                .price_out_per_mtok,
+            stage1_global_daily_cap: squelch_core::config::Stage1Config::default().global_daily_cap,
+            refresh: None,
         })
+    }
+
+    /// Share the sync loop's manual-refresh [`Notify`](tokio::sync::Notify) so
+    /// `POST /client/refresh` can wake it for an immediate Gmail poll. Wire the
+    /// SAME handle here that you pass to [`SyncEngine::with_refresh`]. Without it
+    /// the refresh endpoint is a no-op (`triggered: false`).
+    ///
+    /// [`SyncEngine::with_refresh`]: squelch_core::sync::SyncEngine::with_refresh
+    pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
+        self.refresh = Some(refresh);
+        self
     }
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`. Wire
@@ -107,6 +157,43 @@ impl ApiState {
     pub fn with_stage2_prices(mut self, price_in_per_mtok: f64, price_out_per_mtok: f64) -> Self {
         self.stage2_price_in_per_mtok = price_in_per_mtok;
         self.stage2_price_out_per_mtok = price_out_per_mtok;
+        self
+    }
+
+    /// Set the CONFIG/ENV-layer Stage-2 daily caps + their sources surfaced on
+    /// `/client/triage-config`. Wire these from
+    /// [`squelch_core::config::Config::load_with_cap_sources`] so the endpoint
+    /// reports the operator's config values (and "default" vs "config") until a
+    /// runtime override row is written.
+    pub fn with_stage2_caps(
+        mut self,
+        thread_daily_cap: u32,
+        sender_daily_cap: u32,
+        global_daily_cap: u32,
+        sources: Stage2CapSources,
+    ) -> Self {
+        self.stage2_thread_daily_cap = thread_daily_cap;
+        self.stage2_sender_daily_cap = sender_daily_cap;
+        self.stage2_global_daily_cap = global_daily_cap;
+        self.stage2_cap_sources = sources;
+        self
+    }
+
+    /// Set the Stage-1 model + per-MTok prices + config/env GLOBAL daily cap
+    /// surfaced on `/client/triage-config` and `/client/usage`. Wire this from the
+    /// loaded [`squelch_core::config::Stage1Config`] (the daily-cap SOURCE is
+    /// threaded via [`ApiState::with_stage2_caps`]'s `Stage2CapSources`).
+    pub fn with_stage1_config(
+        mut self,
+        model: impl Into<String>,
+        price_in_per_mtok: f64,
+        price_out_per_mtok: f64,
+        global_daily_cap: u32,
+    ) -> Self {
+        self.stage1_model = Arc::from(model.into().as_str());
+        self.stage1_price_in_per_mtok = price_in_per_mtok;
+        self.stage1_price_out_per_mtok = price_out_per_mtok;
+        self.stage1_global_daily_cap = global_daily_cap;
         self
     }
 

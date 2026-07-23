@@ -53,7 +53,9 @@ async fn main() -> anyhow::Result<()> {
     // The write credential store is bound to CredentialKind::Write inside
     // `with_write_credentials`; the sync/triage read path never touches it. If
     // the OAuth client isn't configured, actions return 403 with a hint.
-    let cfg = Config::load();
+    // Load config PLUS the config/env-layer Stage-2 cap sources so
+    // /client/triage-config can report "default" vs "config" per cap.
+    let (cfg, cap_sources) = Config::load_with_cap_sources();
     // Wire the Stage-2 per-MTok prices so /client/stats reports cost against the
     // configured model's pricing.
     state = state.with_stage2_prices(
@@ -64,6 +66,22 @@ async fn main() -> anyhow::Result<()> {
     state = state.with_stage2_model(
         cfg.stage2.model.clone(),
         cfg.stage2.stage2_provider.map(|p| p.as_str().to_string()),
+    );
+    // Surface the configured Stage-2 daily caps + their sources on
+    // /client/triage-config.
+    state = state.with_stage2_caps(
+        cfg.stage2.thread_daily_cap,
+        cfg.stage2.sender_daily_cap,
+        cfg.stage2.global_daily_cap,
+        cap_sources,
+    );
+    // Surface the Stage-1 (small model) config on /client/triage-config +
+    // /client/usage.
+    state = state.with_stage1_config(
+        cfg.stage1.model.clone(),
+        cfg.stage1.price_in_per_mtok,
+        cfg.stage1.price_out_per_mtok,
+        cfg.stage1.global_daily_cap,
     );
     match cfg.oauth_client() {
         Ok(client) => {

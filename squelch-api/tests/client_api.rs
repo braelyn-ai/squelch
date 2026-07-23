@@ -30,6 +30,8 @@ fn msg(account_id: i64, gmail: &str, thread: &str, subject: &str, body: &str) ->
         body: body.to_string(),
         body_html: None,
         is_sent: false,
+        list_unsubscribe: None,
+        list_unsub_one_click: false,
     }
 }
 
@@ -247,6 +249,122 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
     assert_eq!(items[1]["from_name"], "Bay Wheels");
     assert_eq!(items[1]["amount"], 3.49);
     assert_eq!(items[1]["currency"], "USD");
+}
+
+#[tokio::test]
+async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
+    use squelch_core::triage::{CalendarInfo, CalendarKind};
+    let (app, _s, _a) = app_with(|store, acct| {
+        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "invite", "b")).unwrap();
+        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "cancel", "b")).unwrap();
+        let m3 = store.upsert_message(&msg(acct, "g3", "t3", "old", "b")).unwrap();
+        // 2h old invite, 1h old cancellation, 30h old update (outside the
+        // default 24h received_at window).
+        store
+            .upsert_calendar_update(
+                acct,
+                m1,
+                &CalendarInfo {
+                    kind: CalendarKind::Invite,
+                    event_title: Some("Design review".into()),
+                    starts_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                    organizer: Some("Sam Doe".into()),
+                },
+                chrono::Utc::now() - chrono::Duration::hours(2),
+            )
+            .unwrap();
+        store
+            .upsert_calendar_update(
+                acct,
+                m2,
+                &CalendarInfo {
+                    kind: CalendarKind::Cancellation,
+                    event_title: None,
+                    starts_at: None,
+                    organizer: None,
+                },
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        store
+            .upsert_calendar_update(
+                acct,
+                m3,
+                &CalendarInfo {
+                    kind: CalendarKind::Update,
+                    event_title: Some("Old thing".into()),
+                    starts_at: None,
+                    organizer: None,
+                },
+                chrono::Utc::now() - chrono::Duration::hours(30),
+            )
+            .unwrap();
+    });
+
+    // Bearer-gated like every /client route: no token => 401.
+    let unauth = Request::builder()
+        .uri("/client/calendar")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauth).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Default 24h window: two rows, newest-RECEIVED first, exact wire shape.
+    let resp = app.clone().oneshot(authed("GET", "/client/calendar")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 2, "30h-old row outside the default 24h window");
+    assert_eq!(items[0]["kind"], "cancellation", "newest-received first");
+    assert_eq!(items[0]["event_title"], Value::Null, "nullable fields serialize as null");
+    assert_eq!(items[0]["starts_at"], Value::Null);
+    assert_eq!(items[0]["organizer"], Value::Null);
+    assert_eq!(items[1]["kind"], "invite");
+    assert_eq!(items[1]["event_title"], "Design review");
+    assert_eq!(items[1]["organizer"], "Sam Doe");
+    assert!(items[1]["starts_at"].is_string(), "iso8601 start");
+    // Contract shape: exactly these keys (account_id deliberately absent).
+    let keys: std::collections::BTreeSet<_> =
+        items[0].as_object().unwrap().keys().cloned().collect();
+    let expect: std::collections::BTreeSet<String> =
+        ["id", "message_id", "kind", "event_title", "starts_at", "organizer", "received_at"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+    assert_eq!(keys, expect, "wire contract keys");
+    assert!(items[0]["id"].is_i64());
+    assert!(items[0]["message_id"].is_i64());
+    assert!(items[0]["received_at"].is_string());
+
+    // Wider window picks up the 30h row.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/calendar?hours=48"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().unwrap().len(), 3);
+
+    // Out-of-range hours are CLAMPED, not rejected: hours=0 -> 1 (only the
+    // 1h-old row misses even that? no — 1h-old is exactly at the boundary; use
+    // presence of a 200 + subset semantics instead of exact count).
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/calendar?hours=0"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "clamped, not 400");
+    let json = body_json(resp).await;
+    assert!(json.as_array().unwrap().len() <= 1, "hours=0 clamps to 1h");
+
+    // Absurdly large hours clamp to a week (still 200, still all three rows).
+    let resp = app
+        .oneshot(authed("GET", "/client/calendar?hours=999999"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().unwrap().len(), 3, "clamped to 168h, rows within remain");
 }
 
 /// A garbage `mode` value is a 400.
@@ -840,6 +958,53 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
 }
 
 #[tokio::test]
+async fn updates_carry_field_reasons_object() {
+    use squelch_core::types::FieldReasons;
+    let (app, _s, _a) = app_with(|store, acct| {
+        let id = seed_one_signal(store, acct, "g1", "t1", "hi");
+        store
+            .set_field_reasons(
+                id,
+                acct,
+                &FieldReasons {
+                    importance: Some("known contact -> signal importance 80".into()),
+                    deadline: None,
+                    tier: Some("known contact -> signal".into()),
+                },
+            )
+            .unwrap();
+    });
+
+    let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let item = &json["items"][0];
+    // WIRE CONTRACT: field_reasons is an object with per-property string values;
+    // only the properties that carry a reason appear (deadline is absent here).
+    let fr = &item["field_reasons"];
+    assert!(fr.is_object(), "field_reasons must be an object: {item}");
+    assert_eq!(fr["importance"], Value::String("known contact -> signal importance 80".into()));
+    assert_eq!(fr["tier"], Value::String("known contact -> signal".into()));
+    assert!(fr.get("deadline").is_none(), "absent deadline reason must be omitted, not null");
+}
+
+#[tokio::test]
+async fn updates_without_reasons_omit_the_field_reasons_key() {
+    // A row with no recorded reasons (predates the feature / Stage-1 wrote none)
+    // omits the key entirely — the desktop treats absent the same as null.
+    let (app, _s, _a) = app_with(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+    });
+    let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    let json = body_json(resp).await;
+    assert!(
+        json["items"][0].get("field_reasons").is_none(),
+        "no reasons recorded -> no field_reasons key: {}",
+        json["items"][0]
+    );
+}
+
+#[tokio::test]
 async fn band_query_filters_server_side() {
     let (app, _s, _a) = app_with(|store, acct| {
         // A past_due bill (standing) + a plain signal.
@@ -1146,8 +1311,9 @@ async fn failed_rule_mutations_write_no_audit_row() {
 
 #[tokio::test]
 async fn stats_expose_stage2_usage_and_cost() {
-    // TASK 5: GET /client/stats surfaces a stage2 object with today's usage +
-    // an estimated cost from the default per-MTok prices (1.0 in / 5.0 out).
+    // GET /client/stats surfaces a stage2 object with today's usage + an
+    // estimated cost from the default Stage-2 (claude-sonnet-5) per-MTok prices
+    // (3.0 in / 15.0 out).
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let (app, _s, _a) = app_with(move |store, acct| {
         // 2 calls: 1_000_000 input tokens, 200_000 output tokens today.
@@ -1162,15 +1328,16 @@ async fn stats_expose_stage2_usage_and_cost() {
     assert_eq!(s2["calls_today"], 2);
     assert_eq!(s2["input_tokens_today"], 1_000_000);
     assert_eq!(s2["output_tokens_today"], 200_000);
-    // cost = 1.0*(1e6/1e6) + 5.0*(0.2e6/1e6) = 1.0 + 1.0 = 2.0
+    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6) = 3.0 + 3.0 = 6.0
     let cost = s2["est_cost_usd_today"].as_f64().unwrap();
-    assert!((cost - 2.0).abs() < 1e-9, "expected 2.0, got {cost}");
+    assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
 }
 
 #[tokio::test]
 async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // GET /client/usage: newest-first daily rows, aggregate totals with est cost
-    // from the default per-MTok prices (1.0 in / 5.0 out), and the model label.
+    // from the default Stage-2 (claude-sonnet-5) per-MTok prices (3.0 in / 15.0
+    // out), and the model label.
     let (app, _s, _a) = app_with(|store, acct| {
         store.stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000).unwrap();
         store.stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000).unwrap();
@@ -1195,12 +1362,15 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     assert_eq!(totals["calls"], 2);
     assert_eq!(totals["input_tokens"], 1_000_000);
     assert_eq!(totals["output_tokens"], 200_000);
-    // cost = 1.0*(1e6/1e6) + 5.0*(0.2e6/1e6) = 2.0
+    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6) = 6.0
     let cost = totals["est_cost_usd"].as_f64().unwrap();
-    assert!((cost - 2.0).abs() < 1e-9, "expected 2.0, got {cost}");
+    assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
 
-    // Default model label present.
-    assert_eq!(json["model"], "claude-haiku-4-5");
+    // Default Stage-2 model label present.
+    assert_eq!(json["model"], "claude-sonnet-5");
+    // Stage-1 and Stage-2 appear as separate usage categories.
+    assert_eq!(json["categories"]["stage2"]["model"], "claude-sonnet-5");
+    assert_eq!(json["categories"]["stage1"]["model"], "claude-haiku-4-5");
 
     // Bearer-gated: no token => 401.
     let req = Request::builder()
@@ -1282,6 +1452,230 @@ async fn thread_response_carries_html_field() {
     assert_eq!(msgs[0]["content"], "flattened text");
 }
 
+// --- UNSUBSCRIBE endpoints ---------------------------------------------------
+
+/// Seed a message carrying explicit List-Unsubscribe fields; return its id. The
+/// one-click flag is still stored (ingest keeps it) but no longer affects
+/// selection — the handler only extracts the first http(s) URL.
+fn seed_unsub_msg(
+    store: &SqliteStore,
+    acct: i64,
+    gmail: &str,
+    from: &str,
+    header: Option<&str>,
+    one_click: bool,
+) -> i64 {
+    let mut m = msg(acct, gmail, "t-unsub", "Newsletter", "body");
+    m.from_addr = from.to_string();
+    m.list_unsubscribe = header.map(|h| h.to_string());
+    m.list_unsub_one_click = one_click;
+    let id = store.upsert_message(&m).unwrap();
+    store
+        .set_triage(id, acct, 10, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn unsubscribe_returns_first_http_url_and_records_and_audits() {
+    // The server returns the first http(s) URL for the client to open; it makes
+    // no outbound request. A mailto ahead of the URL is skipped.
+    let (app, store, acct) = app_with(|store, acct| {
+        seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "News@Sub.com",
+            Some("<mailto:u@sub.com>, <https://sub.com/u/1?x=2>"),
+            true,
+        );
+    });
+    let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["method"], "browser");
+    assert_eq!(json["sender"], "news@sub.com", "sender is lowercased");
+    assert_eq!(json["url"], "https://sub.com/u/1?x=2");
+
+    // A ledger row exists for the lowercased sender, method 'browser'.
+    let recs = store.list_unsubscribes(acct).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].sender, "news@sub.com");
+    assert_eq!(recs[0].method, "browser");
+    assert_eq!(recs[0].violation_count, 0);
+
+    // Audited (method + sender), never the URL.
+    let audit = store.list_audit(acct, 10).unwrap();
+    let row = audit.iter().find(|a| a.action == "unsubscribe").unwrap();
+    assert_eq!(row.detail.as_deref(), Some("browser:news@sub.com"));
+    assert!(audit.iter().all(|a| a.detail.as_deref().map(|d| !d.contains("sub.com/u")).unwrap_or(true)));
+}
+
+#[tokio::test]
+async fn unsubscribe_browser_returns_url_and_does_not_fetch() {
+    let (app, store, acct) = app_with(|store, acct| {
+        seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<https://sub.com/u/9>"), false);
+    });
+    let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["method"], "browser");
+    assert_eq!(json["sender"], "news@sub.com");
+    assert_eq!(json["url"], "https://sub.com/u/9");
+    assert_eq!(store.list_unsubscribes(acct).unwrap()[0].method, "browser");
+}
+
+#[tokio::test]
+async fn unsubscribe_mailto_only_is_422() {
+    // A mailto-only List-Unsubscribe has no http(s) link => 422; the server never
+    // sends anything.
+    let (app, store, acct) = app_with(|store, acct| {
+        seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<mailto:unsub@sub.com?subject=Bye>"), false);
+    });
+    let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(store.list_unsubscribes(acct).unwrap().len(), 0, "no ledger row on 422");
+}
+
+#[tokio::test]
+async fn unsubscribe_no_info_is_422() {
+    let (app, store, acct) = app_with(|store, acct| {
+        seed_unsub_msg(store, acct, "g1", "news@sub.com", None, false);
+    });
+    let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn unsubscribe_unknown_and_sealed_are_404() {
+    let (app, store, acct) = app_with(|store, acct| {
+        // A sealed message that (defensively) carries an unsub header.
+        let s = store
+            .upsert_message(&{
+                let mut m = msg(acct, "g-otp", "t-otp", "verification code", "123456");
+                m.list_unsubscribe = Some("<https://sub.com/u/1>".into());
+                m
+            })
+            .unwrap();
+        store
+            .set_triage(s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None)
+            .unwrap();
+    });
+    let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
+
+    // Sealed => 404 (indistinguishable from unknown).
+    let resp = app
+        .clone()
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": sealed_id })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown id => 404.
+    let resp = app
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": 999999 })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn list_unsubscribes_newest_first_and_bearer_gated() {
+    let (app, _s, _a) = app_with(|store, acct| {
+        store
+            .upsert_unsubscribe(acct, "old@x.com", "browser", None, chrono::Utc::now() - chrono::Duration::hours(3))
+            .unwrap();
+        store
+            .upsert_unsubscribe(acct, "new@x.com", "one_click", None, chrono::Utc::now())
+            .unwrap();
+    });
+
+    // Bearer-gated.
+    let unauth = Request::builder().uri("/client/unsubscribes").body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(unauth).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app.oneshot(authed("GET", "/client/unsubscribes")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["sender"], "new@x.com", "newest requested_at first");
+    assert_eq!(items[0]["method"], "one_click");
+    assert_eq!(items[0]["violation_count"], 0);
+    assert_eq!(items[0]["last_violation_at"], Value::Null);
+    assert_eq!(items[0]["resolution"], Value::Null);
+    assert_eq!(items[1]["sender"], "old@x.com");
+}
+
+#[tokio::test]
+async fn unsubscribe_resolution_sets_blocked_and_404s_unknown_and_400s_bad_value() {
+    let (app, store, acct) = app_with(|store, acct| {
+        store
+            .upsert_unsubscribe(acct, "news@x.com", "browser", None, chrono::Utc::now())
+            .unwrap();
+    });
+
+    // blocked => 200, echoes sender + resolution.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribes/resolution",
+            serde_json::json!({ "sender": "News@X.com", "resolution": "blocked" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["sender"], "news@x.com");
+    assert_eq!(json["resolution"], "blocked");
+    assert_eq!(store.list_unsubscribes(acct).unwrap()[0].resolution.as_deref(), Some("blocked"));
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| a.action == "unsub_resolution" && a.detail.as_deref() == Some("news@x.com:blocked")));
+
+    // Unknown sender => 404.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribes/resolution",
+            serde_json::json!({ "sender": "nobody@x.com", "resolution": "dismissed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Bad resolution value => 400.
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribes/resolution",
+            serde_json::json!({ "sender": "news@x.com", "resolution": "nuke" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn thread_sealed_is_not_found_even_with_html() {
     let (app, _s, _a) = app_with(|store, acct| {
@@ -1308,4 +1702,190 @@ async fn thread_sealed_is_not_found_even_with_html() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// --- /client/triage-config --------------------------------------------------
+
+#[tokio::test]
+async fn triage_config_get_default_shape() {
+    // With no override rows and a default state, GET reports the built-in default
+    // caps, all sources "default", the price fields, and null tokens/call (the
+    // usage ledger is empty).
+    let (app, _s, _a) = app_with(|_, _| {});
+    let resp = app
+        .oneshot(authed("GET", "/client/triage-config"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    assert_eq!(json["thread_daily_cap"], 3);
+    assert_eq!(json["sender_daily_cap"], 5);
+    assert_eq!(json["global_daily_cap"], 200);
+    assert_eq!(json["sources"]["thread_daily_cap"], "default");
+    assert_eq!(json["sources"]["sender_daily_cap"], "default");
+    assert_eq!(json["sources"]["global_daily_cap"], "default");
+    // Empty ledger => tokens/call are null; calls/inbound averages are 0.
+    assert!(json["avg_tokens_in_per_call"].is_null());
+    assert!(json["avg_tokens_out_per_call"].is_null());
+    assert_eq!(json["avg_stage2_calls_per_day"], 0.0);
+    assert_eq!(json["avg_inbound_per_day"], 0.0);
+    // Prices are present (default Stage2Config values on ApiState::new).
+    assert!(json["price_in_per_mtok"].is_number());
+    assert!(json["price_out_per_mtok"].is_number());
+
+    // Stage-2 escalation model label.
+    assert_eq!(json["stage2_model"], "claude-sonnet-5");
+
+    // Stage-1 block: default small model, GLOBAL-only cap (default 1000),
+    // "default" source, null tokens/call (empty ledger), and prices.
+    let s1 = &json["stage1"];
+    assert_eq!(s1["model"], "claude-haiku-4-5");
+    assert_eq!(s1["global_daily_cap"], 1000);
+    assert_eq!(s1["source"], "default");
+    assert_eq!(s1["avg_calls_per_day"], 0.0);
+    assert!(s1["avg_tokens_in_per_call"].is_null());
+    assert!(s1["avg_tokens_out_per_call"].is_null());
+    assert!(s1["price_in_per_mtok"].is_number());
+    assert!(s1["price_out_per_mtok"].is_number());
+}
+
+#[tokio::test]
+async fn triage_config_post_persists_stage1_global_cap_override() {
+    let (app, store, acct) = app_with(|_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-config",
+            serde_json::json!({ "stage1_global_daily_cap": 750 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["stage1"]["global_daily_cap"], 750);
+    assert_eq!(json["stage1"]["source"], "override");
+
+    // Persisted where the Stage-1 pass re-reads it each cycle.
+    let o = store.stage2_cap_overrides(acct).unwrap();
+    assert_eq!(o.stage1_global_daily_cap, Some(750));
+}
+
+#[tokio::test]
+async fn triage_config_post_rejects_out_of_range_stage1_cap() {
+    let (app, store, acct) = app_with(|_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-config",
+            serde_json::json!({ "stage1_global_daily_cap": 0 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(store.stage2_cap_overrides(acct).unwrap().stage1_global_daily_cap, None);
+}
+
+#[tokio::test]
+async fn triage_config_get_computes_trailing_averages() {
+    // Seed 4 recent inbound messages + a usage ledger day, and confirm the
+    // trailing-14d averages and per-call token means.
+    let (app, _s, _a) = app_with(|store, acct| {
+        for i in 0..4 {
+            let m = msg(acct, &format!("g{i}"), &format!("t{i}"), "hi", "body");
+            store.upsert_message(&m).unwrap();
+        }
+        // One day with 2 calls, 1000 in / 200 out tokens.
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        store.stage2_bump_usage(acct, &day, 600, 120).unwrap();
+        store.stage2_bump_usage(acct, &day, 400, 80).unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/triage-config"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    // 4 inbound / 14 days.
+    assert!((json["avg_inbound_per_day"].as_f64().unwrap() - 4.0 / 14.0).abs() < 1e-9);
+    // 2 calls / 14 days.
+    assert!((json["avg_stage2_calls_per_day"].as_f64().unwrap() - 2.0 / 14.0).abs() < 1e-9);
+    // 1000 in / 2 calls = 500; 200 out / 2 calls = 100.
+    assert!((json["avg_tokens_in_per_call"].as_f64().unwrap() - 500.0).abs() < 1e-9);
+    assert!((json["avg_tokens_out_per_call"].as_f64().unwrap() - 100.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn triage_config_post_persists_override_and_reports_it() {
+    let (app, store, acct) = app_with(|_, _| {});
+    // Set thread + global (omit sender — subset allowed).
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-config",
+            serde_json::json!({ "thread_daily_cap": 5, "global_daily_cap": 300 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    // Response reflects the fresh effective values + "override" sources for the
+    // two set caps; the untouched sender cap stays default.
+    assert_eq!(json["thread_daily_cap"], 5);
+    assert_eq!(json["global_daily_cap"], 300);
+    assert_eq!(json["sender_daily_cap"], 5);
+    assert_eq!(json["sources"]["thread_daily_cap"], "override");
+    assert_eq!(json["sources"]["global_daily_cap"], "override");
+    assert_eq!(json["sources"]["sender_daily_cap"], "default");
+
+    // Persisted to the store (what the Stage-2 pass re-reads each cycle).
+    let o = store.stage2_cap_overrides(acct).unwrap();
+    assert_eq!(o.thread_daily_cap, Some(5));
+    assert_eq!(o.global_daily_cap, Some(300));
+    assert_eq!(o.sender_daily_cap, None);
+}
+
+#[tokio::test]
+async fn triage_config_post_rejects_out_of_range_and_non_integer() {
+    let (app, store, acct) = app_with(|_, _| {});
+
+    // Zero is below the min.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-config",
+            serde_json::json!({ "thread_daily_cap": 0 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Above the max.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-config",
+            serde_json::json!({ "global_daily_cap": 100001 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A non-integer (float) is rejected at deserialization.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-config",
+            serde_json::json!({ "thread_daily_cap": 5.5 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing was persisted by any rejected request.
+    assert_eq!(store.stage2_cap_overrides(acct).unwrap(), Default::default());
 }

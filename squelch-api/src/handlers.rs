@@ -267,6 +267,28 @@ pub async fn set_update_status(
     Ok(Json(json!({ "status": status.as_str(), "message_id": message_id })))
 }
 
+// --- POST /client/refresh ---------------------------------------------------
+
+/// Poke the Gmail sync loop to poll NOW instead of waiting out its interval.
+///
+/// Fire-and-forget: we wake the poll loop and return immediately — we do NOT
+/// block on the Gmail round trip. New mail lands in the store shortly after
+/// (typically under a second or two); the client re-reads the sitrep read model
+/// on its own cadence to pick it up. `triggered` is `false` only when no sync
+/// loop is wired to this door (standalone bin / tests), so the caller can tell a
+/// real poke from a no-op. This is a READ-path trigger — no write scope, no
+/// Gmail mutation, nothing to audit.
+pub async fn refresh_now(State(state): State<ApiState>) -> impl IntoResponse {
+    let triggered = match &state.refresh {
+        Some(notify) => {
+            notify.notify_one();
+            true
+        }
+        None => false,
+    };
+    Json(json!({ "triggered": triggered }))
+}
+
 // --- GET /client/thread/{thread_id} -----------------------------------------
 
 pub async fn get_thread(
@@ -445,6 +467,45 @@ pub async fn get_receipts(
     // construction (detection never runs on sealed mail), so there is no sealed
     // filtering to apply here.
     let items = blocking(move || store.list_receipts(account_id, days)).await?;
+    Ok(Json(items))
+}
+
+// --- GET /client/calendar ----------------------------------------------------
+
+/// Default look-back window (hours of MAIL ARRIVAL, not event start) for the
+/// calendar list, and the sane clamp bounds for the `hours` query param.
+const DEFAULT_CALENDAR_HOURS: u32 = 24;
+const MIN_CALENDAR_HOURS: u32 = 1;
+const MAX_CALENDAR_HOURS: u32 = 168; // one week
+
+#[derive(Debug, Deserialize)]
+pub struct CalendarQuery {
+    /// Look-back window in hours over `received_at`. Default 24, clamped to
+    /// 1..=168 (out-of-range values are clamped, not rejected).
+    hours: Option<u32>,
+}
+
+/// WIRE CONTRACT (the desktop sidebar is built against exactly this): a JSON
+/// array, newest-received first, of
+/// `{id, message_id, kind, event_title, starts_at, organizer, received_at}`
+/// where `kind` is "invite" | "update" | "cancellation" | "response" and every
+/// extracted field is nullable. The serialized shape is
+/// [`squelch_core::types::CalendarUpdate`] — change that type and you change
+/// the contract.
+pub async fn get_calendar(
+    State(state): State<ApiState>,
+    Query(q): Query<CalendarQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let hours = q
+        .hours
+        .unwrap_or(DEFAULT_CALENDAR_HOURS)
+        .clamp(MIN_CALENDAR_HOURS, MAX_CALENDAR_HOURS);
+    // Newest-received first. The calendar_updates table holds no sealed rows by
+    // construction (detection never runs on sealed mail), so there is no sealed
+    // filtering to apply here.
+    let items = blocking(move || store.list_calendar_updates(account_id, hours)).await?;
     Ok(Json(items))
 }
 
@@ -721,39 +782,284 @@ pub async fn get_usage(
     let days = q.days.unwrap_or(DEFAULT_USAGE_DAYS).clamp(1, MAX_USAGE_DAYS);
     let store = state.store.clone();
     let account_id = state.account_id;
-    let rows = blocking(move || store.list_usage(account_id, days)).await?;
+    let (s2_rows, s1_rows) = blocking(move || {
+        let s2 = store.list_usage(account_id, days)?;
+        let s1 = store.list_usage_stage1(account_id, days)?;
+        Ok((s2, s1))
+    })
+    .await?;
 
-    // Cost from the same config-driven per-MTok prices as /client/stats.
-    let (mut in_tok, mut out_tok, mut calls) = (0u64, 0u64, 0u64);
-    let out_rows: Vec<UsageRow> = rows
-        .into_iter()
-        .map(|r| {
-            calls += r.calls;
-            in_tok += r.input_tokens;
-            out_tok += r.output_tokens;
-            UsageRow {
-                day: r.day,
-                calls: r.calls,
-                input_tokens: r.input_tokens,
-                output_tokens: r.output_tokens,
-            }
-        })
-        .collect();
+    // Roll up per-category rows + totals + cost from that category's per-MTok
+    // prices. Stage-1 and Stage-2 are SEPARATE categories — the client renders
+    // whatever categories arrive.
+    let rollup = |rows: Vec<squelch_core::store::Stage2UsageDay>,
+                  price_in: f64,
+                  price_out: f64|
+     -> (Vec<UsageRow>, UsageTotals) {
+        let (mut in_tok, mut out_tok, mut calls) = (0u64, 0u64, 0u64);
+        let out_rows: Vec<UsageRow> = rows
+            .into_iter()
+            .map(|r| {
+                calls += r.calls;
+                in_tok += r.input_tokens;
+                out_tok += r.output_tokens;
+                UsageRow {
+                    day: r.day,
+                    calls: r.calls,
+                    input_tokens: r.input_tokens,
+                    output_tokens: r.output_tokens,
+                }
+            })
+            .collect();
+        let est_cost_usd = (in_tok as f64 / 1_000_000.0) * price_in
+            + (out_tok as f64 / 1_000_000.0) * price_out;
+        (
+            out_rows,
+            UsageTotals {
+                calls,
+                input_tokens: in_tok,
+                output_tokens: out_tok,
+                est_cost_usd,
+            },
+        )
+    };
 
-    let est_cost_usd = (in_tok as f64 / 1_000_000.0) * state.stage2_price_in_per_mtok
-        + (out_tok as f64 / 1_000_000.0) * state.stage2_price_out_per_mtok;
+    let (s2_out, s2_totals) = rollup(
+        s2_rows,
+        state.stage2_price_in_per_mtok,
+        state.stage2_price_out_per_mtok,
+    );
+    let (s1_out, s1_totals) = rollup(
+        s1_rows,
+        state.stage1_price_in_per_mtok,
+        state.stage1_price_out_per_mtok,
+    );
 
     Ok(Json(json!({
-        "rows": out_rows,
-        "totals": UsageTotals {
-            calls,
-            input_tokens: in_tok,
-            output_tokens: out_tok,
-            est_cost_usd,
-        },
+        // Top-level fields are Stage-2 (backward-compatible shape).
+        "rows": s2_out,
+        "totals": s2_totals,
         "provider": state.stage2_provider.as_deref(),
         "model": state.stage2_model.as_ref(),
+        // Per-category breakdown (stage-1 + stage-2 as separate categories).
+        "categories": {
+            "stage1": {
+                "model": state.stage1_model.as_ref(),
+                "rows": s1_out,
+                "totals": s1_totals,
+            },
+            "stage2": {
+                "model": state.stage2_model.as_ref(),
+                "rows": s2_out,
+                "totals": s2_totals,
+            },
+        },
     })))
+}
+
+// --- GET/POST /client/triage-config -----------------------------------------
+//
+// The Stage-2 (LLM triage) daily budget caps, configurable at runtime WITHOUT a
+// restart. GET reports the effective caps + where each came from + trailing-14d
+// volume/usage stats so the client can size them sensibly. POST persists a
+// runtime OVERRIDE (app_settings) that the sync engine's Stage-2 pass re-reads
+// at the start of each cycle. Precedence: override > config/env > default.
+
+/// Trailing window (days) for the volume/usage averages on the endpoint.
+const TRIAGE_CONFIG_TRAILING_DAYS: i64 = 14;
+
+/// Resolve one cap's wire "source": an override row wins; otherwise the
+/// config/env-layer source ("default" or "config") the state was built with.
+fn cap_source_str(
+    has_override: bool,
+    config_source: squelch_core::config::CapSource,
+) -> &'static str {
+    if has_override {
+        "override"
+    } else {
+        config_source.as_str()
+    }
+}
+
+/// Build the `/client/triage-config` response body: effective caps (override >
+/// config/env > default), per-cap sources, trailing-14d inbound/usage averages,
+/// and the per-MTok prices. Shared by GET and POST (POST returns the fresh shape
+/// after persisting). Does all store reads in one blocking closure.
+async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let now = Utc::now();
+    let since = now - chrono::Duration::days(TRIAGE_CONFIG_TRAILING_DAYS);
+    let since_day = since.format("%Y-%m-%d").to_string();
+
+    let (overrides, inbound, usage, s1_usage) = blocking(move || {
+        let overrides = store.stage2_cap_overrides(account_id)?;
+        let inbound = store.count_inbound_since(account_id, since)?;
+        let usage = store.stage2_usage_since(account_id, &since_day)?;
+        let s1_usage = store.stage1_usage_since(account_id, &since_day)?;
+        Ok((overrides, inbound, usage, s1_usage))
+    })
+    .await?;
+
+    // Effective cap = override if present, else the config/env-layer value.
+    let thread = overrides.thread_daily_cap.unwrap_or(state.stage2_thread_daily_cap);
+    let sender = overrides.sender_daily_cap.unwrap_or(state.stage2_sender_daily_cap);
+    let global = overrides.global_daily_cap.unwrap_or(state.stage2_global_daily_cap);
+    let stage1_global = overrides
+        .stage1_global_daily_cap
+        .unwrap_or(state.stage1_global_daily_cap);
+
+    let src = &state.stage2_cap_sources;
+    let days = TRIAGE_CONFIG_TRAILING_DAYS as f64;
+    let avg_inbound_per_day = inbound as f64 / days;
+    let avg_stage2_calls_per_day = usage.calls as f64 / days;
+    // Tokens/call are per-CALL means (null when the ledger has no calls yet).
+    let per_call = |u: &squelch_core::store::Stage2Usage| {
+        if u.calls == 0 {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        } else {
+            (
+                json!(u.input_tokens as f64 / u.calls as f64),
+                json!(u.output_tokens as f64 / u.calls as f64),
+            )
+        }
+    };
+    let (avg_tokens_in_per_call, avg_tokens_out_per_call) = per_call(&usage);
+    let (s1_tokens_in_per_call, s1_tokens_out_per_call) = per_call(&s1_usage);
+
+    Ok(json!({
+        "thread_daily_cap": thread,
+        "sender_daily_cap": sender,
+        "global_daily_cap": global,
+        "sources": {
+            "thread_daily_cap": cap_source_str(overrides.thread_daily_cap.is_some(), src.thread_daily_cap),
+            "sender_daily_cap": cap_source_str(overrides.sender_daily_cap.is_some(), src.sender_daily_cap),
+            "global_daily_cap": cap_source_str(overrides.global_daily_cap.is_some(), src.global_daily_cap),
+        },
+        "avg_inbound_per_day": avg_inbound_per_day,
+        "avg_stage2_calls_per_day": avg_stage2_calls_per_day,
+        "avg_tokens_in_per_call": avg_tokens_in_per_call,
+        "avg_tokens_out_per_call": avg_tokens_out_per_call,
+        "price_in_per_mtok": state.stage2_price_in_per_mtok,
+        "price_out_per_mtok": state.stage2_price_out_per_mtok,
+        // The escalation model id (Stage-2 runs on the more capable model).
+        "stage2_model": state.stage2_model.as_ref(),
+        // Stage-1 (the SMALL model run on every non-rule email). Its only cap is
+        // GLOBAL; averages come from the stage-1 usage ledger (trailing 14d).
+        "stage1": {
+            "model": state.stage1_model.as_ref(),
+            "global_daily_cap": stage1_global,
+            "source": cap_source_str(
+                overrides.stage1_global_daily_cap.is_some(),
+                src.stage1_global_daily_cap,
+            ),
+            "avg_calls_per_day": s1_usage.calls as f64 / days,
+            "avg_tokens_in_per_call": s1_tokens_in_per_call,
+            "avg_tokens_out_per_call": s1_tokens_out_per_call,
+            "price_in_per_mtok": state.stage1_price_in_per_mtok,
+            "price_out_per_mtok": state.stage1_price_out_per_mtok,
+        },
+    }))
+}
+
+pub async fn get_triage_config(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(triage_config_body(&state).await?))
+}
+
+/// POST body: any subset of the three caps. Fields are raw JSON values so a
+/// non-integer (float/string) is rejected with a 400 by our own validation
+/// rather than the extractor's 422 — the contract mandates 400 for any invalid
+/// value.
+#[derive(Debug, Deserialize)]
+pub struct TriageConfigBody {
+    #[serde(default)]
+    thread_daily_cap: Option<serde_json::Value>,
+    #[serde(default)]
+    sender_daily_cap: Option<serde_json::Value>,
+    #[serde(default)]
+    global_daily_cap: Option<serde_json::Value>,
+    /// The Stage-1 GLOBAL daily cap (same validation/400 semantics as the others;
+    /// persisted as an app_settings override).
+    #[serde(default)]
+    stage1_global_daily_cap: Option<serde_json::Value>,
+}
+
+pub async fn set_triage_config(
+    State(state): State<ApiState>,
+    Json(body): Json<TriageConfigBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Validate every PROVIDED cap up front (all-or-nothing: a bad value persists
+    // nothing). Each must be a JSON INTEGER in [STAGE2_CAP_MIN, STAGE2_CAP_MAX];
+    // a float/string/out-of-range value is a 400.
+    let min = squelch_core::config::STAGE2_CAP_MIN as i64;
+    let max = squelch_core::config::STAGE2_CAP_MAX as i64;
+    let bad = || {
+        ApiError::bad_request(format!("each cap must be an integer in {min}..={max}"))
+    };
+    let validate = |v: &serde_json::Value| -> Result<u32, ApiError> {
+        // `as_i64` is `Some` only for a JSON integer (5.5 / "5" => None).
+        let n = v.as_i64().ok_or_else(bad)?;
+        if (min..=max).contains(&n) {
+            Ok(n as u32)
+        } else {
+            Err(bad())
+        }
+    };
+
+    // Collect (app_settings key, validated value) for each present field.
+    let mut updates: Vec<(&'static str, u32)> = Vec::new();
+    if let Some(v) = &body.thread_daily_cap {
+        updates.push((squelch_core::config::APP_SETTING_THREAD_DAILY_CAP, validate(v)?));
+    }
+    if let Some(v) = &body.sender_daily_cap {
+        updates.push((squelch_core::config::APP_SETTING_SENDER_DAILY_CAP, validate(v)?));
+    }
+    if let Some(v) = &body.global_daily_cap {
+        updates.push((squelch_core::config::APP_SETTING_GLOBAL_DAILY_CAP, validate(v)?));
+    }
+    if let Some(v) = &body.stage1_global_daily_cap {
+        updates.push((
+            squelch_core::config::APP_SETTING_STAGE1_GLOBAL_DAILY_CAP,
+            validate(v)?,
+        ));
+    }
+
+    if !updates.is_empty() {
+        let store = state.store.clone();
+        let account_id = state.account_id;
+        let to_write = updates.clone();
+        blocking(move || {
+            for (key, value) in &to_write {
+                store.set_app_setting(account_id, key, &value.to_string())?;
+            }
+            Ok(())
+        })
+        .await?;
+
+        // Audit the change (actor="client-api"). detail names the caps set, e.g.
+        // "thread=5,global=300" — order follows thread, sender, global.
+        let detail = updates
+            .iter()
+            .map(|(key, value)| {
+                let name = match *key {
+                    k if k == squelch_core::config::APP_SETTING_THREAD_DAILY_CAP => "thread",
+                    k if k == squelch_core::config::APP_SETTING_SENDER_DAILY_CAP => "sender",
+                    k if k == squelch_core::config::APP_SETTING_STAGE1_GLOBAL_DAILY_CAP => {
+                        "stage1_global"
+                    }
+                    _ => "global",
+                };
+                format!("{name}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        audit_action(&state, "triage_config", None, &detail).await;
+    }
+
+    // Return the fresh GET shape (effective values after applying).
+    Ok(Json(triage_config_body(&state).await?))
 }
 
 // --- ACTIONS: the ONLY write capability in the system -----------------------
@@ -1109,4 +1415,130 @@ pub async fn action_send(
             Err(write_error(&e))
         }
     }
+}
+
+// --- UNSUBSCRIBE: human-door-only, no agent-door exposure --------------------
+//
+// POST /client/unsubscribe returns the message's first http(s) List-Unsubscribe
+// URL for the CLIENT to confirm with the user and open in their browser. The
+// server NEVER performs the unsubscribe itself (no outbound request). A sealed OR
+// unknown message is 404 (indistinguishable); a message with no http(s) link is
+// 422. GET /client/unsubscribes lists the ledger; POST .../resolution records the
+// user's blocked|dismissed decision on a repeat offender.
+
+/// Upsert the unsubscribe ledger row for a 200 outcome (resets the violation
+/// clock — a fresh request restarts the 72h grace). Bubbles a store failure as
+/// a 500; the row write is the durable record the GET endpoint reads.
+async fn record_unsub(
+    state: &ApiState,
+    sender: &str,
+    method: &'static str,
+    source_message_id: i64,
+) -> Result<(), ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let sender = sender.to_string();
+    blocking(move || {
+        store.upsert_unsubscribe(account_id, &sender, method, Some(source_message_id), Utc::now())
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnsubscribeBody {
+    message_id: i64,
+}
+
+pub async fn unsubscribe(
+    State(state): State<ApiState>,
+    Json(body): Json<UnsubscribeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let message_id = body.message_id;
+    let target = Some(message_id.to_string());
+
+    // Load the stored unsubscribe fields. `None` => missing OR sealed message,
+    // indistinguishable, both 404 (mirrors GET /client/thread's sealed handling).
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let fields = blocking(move || store.message_unsub_fields(account_id, message_id))
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+
+    let sender = fields.from_addr.trim().to_ascii_lowercase();
+    let plan = crate::unsubscribe::classify_unsubscribe(fields.list_unsubscribe.as_deref());
+
+    match plan {
+        crate::unsubscribe::UnsubPlan::None => {
+            // No http(s) unsubscribe URL to hand the client.
+            Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "message has no http(s) unsubscribe link",
+            ))
+        }
+        crate::unsubscribe::UnsubPlan::Browser { url } => {
+            // The client confirms with the user and opens the URL; the server makes
+            // no outbound request. Record the ledger row + audit the sender only
+            // (never the URL).
+            record_unsub(&state, &sender, "browser", message_id).await?;
+            audit_action(&state, "unsubscribe", target, &format!("browser:{sender}")).await;
+            Ok(Json(json!({ "method": "browser", "sender": sender, "url": url })))
+        }
+    }
+}
+
+// --- GET /client/unsubscribes -----------------------------------------------
+
+pub async fn list_unsubscribes(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    // Newest requested_at first; the store type serializes to the wire contract.
+    let items = blocking(move || store.list_unsubscribes(account_id)).await?;
+    Ok(Json(items))
+}
+
+// --- POST /client/unsubscribes/resolution -----------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ResolutionBody {
+    sender: String,
+    resolution: String,
+}
+
+pub async fn unsubscribe_resolution(
+    State(state): State<ApiState>,
+    Json(body): Json<ResolutionBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let resolution = match body.resolution.as_str() {
+        "blocked" | "dismissed" => body.resolution.clone(),
+        _ => {
+            return Err(ApiError::bad_request(
+                "resolution must be one of: blocked, dismissed",
+            ));
+        }
+    };
+    let sender = body.sender.trim().to_ascii_lowercase();
+    if sender.is_empty() {
+        return Err(ApiError::bad_request("sender must not be empty"));
+    }
+
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let s = sender.clone();
+    let r = resolution.clone();
+    let updated = blocking(move || store.set_unsubscribe_resolution(account_id, &s, &r)).await?;
+    if !updated {
+        // No unsubscribe record for that sender.
+        return Err(ApiError::not_found());
+    }
+
+    audit_action(
+        &state,
+        "unsub_resolution",
+        Some(sender.clone()),
+        &format!("{sender}:{resolution}"),
+    )
+    .await;
+    Ok(Json(json!({ "sender": sender, "resolution": resolution })))
 }

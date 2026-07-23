@@ -23,6 +23,7 @@ pub mod guard;
 pub mod gmail_write;
 mod handlers;
 mod state;
+pub mod unsubscribe;
 
 pub use auth::require_bearer;
 pub use error::ApiError;
@@ -49,9 +50,11 @@ pub fn router(state: ApiState) -> Router {
             "/client/updates/{message_id}/status",
             post(handlers::set_update_status),
         )
+        .route("/client/refresh", post(handlers::refresh_now))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         .route("/client/shipments", get(handlers::get_shipments))
         .route("/client/receipts", get(handlers::get_receipts))
+        .route("/client/calendar", get(handlers::get_calendar))
         .route("/client/search", get(handlers::search))
         .route("/client/rules", get(handlers::list_rules))
         .route("/client/rules", post(handlers::create_rule))
@@ -65,6 +68,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/client/audit", get(handlers::get_audit))
         .route("/client/stats", get(handlers::get_stats))
         .route("/client/usage", get(handlers::get_usage))
+        .route(
+            "/client/triage-config",
+            get(handlers::get_triage_config).post(handlers::set_triage_config),
+        )
+        // Unsubscribe: human-door only (never exposed on the agent door).
+        .route("/client/unsubscribe", post(handlers::unsubscribe))
+        .route("/client/unsubscribes", get(handlers::list_unsubscribes))
+        .route(
+            "/client/unsubscribes/resolution",
+            post(handlers::unsubscribe_resolution),
+        )
         // Action STUBS. Another agent implements these THIS SESSION on top of
         // this router; they slot in by replacing the stub handlers. Each returns
         // 501 with {"error":"actions not yet wired"} for now.
