@@ -54,6 +54,7 @@ import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { getUserName } from "../lib/identity";
 import { reasonFor } from "../lib/reasons";
 import { Avatar } from "../components/Avatar";
+import { RetriageButton } from "../components/RetriageButton";
 import { dispatchDone } from "../lib/dispatch";
 import {
   deriveNewsletters,
@@ -280,6 +281,7 @@ function SitrepBody({
           <span className="dash-sub">sitrep</span>
         </div>
         <div className="hdr-status">
+          <RetriageButton onSky />
           {needNow > 0 && (
             <span className="need-pill" title="obligations that need you today">
               <span className="need-dot" />

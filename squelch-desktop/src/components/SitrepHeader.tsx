@@ -8,6 +8,7 @@ import { KeyRound, ScrollText } from "lucide-react";
 import type { StoreStats } from "../api";
 import { lastChecked } from "../lib/format";
 import { ThemeToggle } from "./ThemeToggle";
+import { RetriageButton } from "./RetriageButton";
 
 export interface SitrepHeaderProps {
   stats: StoreStats | null;
@@ -41,6 +42,7 @@ export function SitrepHeader({
         squelch <span className="dim">· sitrep</span>
       </span>
       <span className="head-right">
+        <RetriageButton onSky />
         <span className="stat-line">
           <span className="signal">
             <b>{signal}</b> signal

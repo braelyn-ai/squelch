@@ -145,6 +145,24 @@ export function getUpdates(
  * model a beat later (the 10s poller also backstops it). `triggered` is false
  * when the server has no sync loop wired (shouldn't happen for `squelchd serve`).
  */
+/**
+ * DEV RE-TRIAGE (POST /client/retriage): reset the LLM verdicts on the scoped
+ * rows so the stage-1/stage-2/extractor pipeline re-runs. Scope is one message
+ * or the trailing-days window (default 7 server-side). Returns rows reset.
+ */
+export function retriage(
+  scope: { messageId: number } | { days: number },
+): Promise<{ reset: number }> {
+  const body =
+    "messageId" in scope
+      ? { message_id: scope.messageId }
+      : { days: scope.days };
+  return request<{ reset: number }>("/client/retriage", {
+    method: "POST",
+    body,
+  });
+}
+
 export function refreshMail(): Promise<{ triggered: boolean }> {
   return request<{ triggered: boolean }>("/client/refresh", { method: "POST" });
 }

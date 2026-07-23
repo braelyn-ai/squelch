@@ -197,6 +197,11 @@ export function SettingsView() {
               </section>
 
               <section className="set-section">
+                <div className="set-label">Developer</div>
+                <DeveloperSection />
+              </section>
+
+              <section className="set-section">
                 <div className="set-label">You</div>
                 <div className="set-field">
                   <label htmlFor="set-name">name</label>
@@ -780,5 +785,42 @@ function MailSection() {
         Tracking pixels are removed either way; images load with no referrer.
       </div>
     </section>
+  );
+}
+
+// DEVELOPER — dev-mode toggle. When on, re-triage affordances appear in the
+// sitrep masthead (last-7-days) and the thread viewer (this email): they reset
+// the LLM verdicts so the stage-1/stage-2/extractor pipeline re-runs — the
+// prompt-iteration loop. Rule-decided and sealed rows are never touched.
+function DeveloperSection() {
+  const dev = usePref("developerMode");
+  return (
+    <>
+      <div className="set-field-inline">
+        <span className="set-key">dev mode</span>
+        <div className="set-toggle" role="group" aria-label="developer mode">
+          <button
+            type="button"
+            className={!dev ? "active" : ""}
+            aria-pressed={!dev}
+            onClick={() => setPref("developerMode", false)}
+          >
+            Off
+          </button>
+          <button
+            type="button"
+            className={dev ? "active" : ""}
+            aria-pressed={dev}
+            onClick={() => setPref("developerMode", true)}
+          >
+            On
+          </button>
+        </div>
+      </div>
+      <div className="set-hint" style={{ marginTop: 8 }}>
+        Adds re-triage buttons (sitrep masthead + open email) that re-run the
+        triage pipeline. Re-triaging spends model budget.
+      </div>
+    </>
   );
 }

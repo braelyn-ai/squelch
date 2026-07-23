@@ -1726,6 +1726,54 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn retriage_reset(
+        &self,
+        account_id: AccountId,
+        message_id: Option<i64>,
+        days: u32,
+    ) -> Result<u64> {
+        let conn = self.lock()?;
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        // Scope: one message, or the trailing-days inbound window. Guards mirror
+        // the stage-1 queue: normal sensitivity only, and never rule-decided
+        // ('rule') or sealed/sent ('n/a') markers — rules are authoritative and
+        // sealed mail re-enters no queue.
+        let scope_sql = match message_id {
+            Some(_) => "m.id = ?2",
+            None => "m.received_at >= ?2",
+        };
+        let scope_param: String = match message_id {
+            Some(id) => id.to_string(),
+            None => cutoff,
+        };
+        let update = format!(
+            "UPDATE triage SET stage1_model_used = NULL, model_used = NULL,
+                    needs_stage2 = 0, extractor_model_used = NULL
+             WHERE account_id = ?1
+               AND COALESCE(sensitivity, 'normal') = 'normal'
+               AND COALESCE(stage1_model_used, '') NOT IN ('rule', 'n/a')
+               AND message_id IN (
+                   SELECT m.id FROM messages m
+                   WHERE m.account_id = ?1 AND m.is_sent = 0 AND {scope_sql}
+               )"
+        );
+        let n = conn.execute(&update, rusqlite::params![account_id, scope_param])?;
+        // Drop stale specialist rows for the reset messages — re-extraction
+        // recreates them (possibly under a different category verdict).
+        let del = format!(
+            "DELETE FROM banking
+             WHERE account_id = ?1
+               AND message_id IN (
+                   SELECT t.message_id FROM triage t
+                   JOIN messages m ON m.id = t.message_id
+                   WHERE t.account_id = ?1 AND t.stage1_model_used IS NULL
+                     AND m.is_sent = 0 AND {scope_sql}
+               )"
+        );
+        conn.execute(&del, rusqlite::params![account_id, scope_param])?;
+        Ok(n as u64)
+    }
+
     fn extract_mark_processed(
         &self,
         account_id: AccountId,
@@ -5356,6 +5404,59 @@ mod tests {
         assert_eq!(q.len(), 1, "only the normal, non-rule row needs Stage-1");
         assert_eq!(q[0].message_id, normal);
         assert_eq!(q[0].sensitivity, Sensitivity::Normal);
+    }
+
+    #[test]
+    fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let normal = store
+            .ingest_message(&triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal))
+            .unwrap();
+        store
+            .ingest_message(&triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal))
+            .unwrap();
+        store
+            .ingest_message(&triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed))
+            .unwrap();
+
+        // Simulate the LLM having classified the normal row (leaves the queue).
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1,
+                        extractor_model_used='claude-x'
+                 WHERE message_id=?1",
+                rusqlite::params![normal],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.stage1_queue(acct, 10).unwrap().len(), 0);
+
+        // Window re-triage: only the LLM-classified normal row resets.
+        let n = store.retriage_reset(acct, None, 7).unwrap();
+        assert_eq!(n, 1, "rule + sealed rows must never reset");
+        let q = store.stage1_queue(acct, 10).unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].message_id, normal);
+        // The escalation + extractor markers were cleared too.
+        {
+            let conn = store.lock().unwrap();
+            let (needs, ext): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT needs_stage2, extractor_model_used FROM triage WHERE message_id=?1",
+                    rusqlite::params![normal],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(needs, 0);
+            assert_eq!(ext, None);
+        }
+
+        // Single-message scope on a sealed message: resets nothing.
+        let sealed_reset = store.retriage_reset(acct, Some(999_999), 7).unwrap();
+        assert_eq!(sealed_reset, 0);
     }
 
     #[test]

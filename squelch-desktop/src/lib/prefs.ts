@@ -28,12 +28,15 @@ export interface Prefs {
    *  (time) share of the score; the remainder is severity. 0 = rank purely by
    *  severity, 1 = purely by time. See lib/ranking.ts. */
   rankWeight: number;
+  /** Developer mode: exposes re-triage affordances (masthead + thread viewer). */
+  developerMode: boolean;
 }
 
 const DEFAULTS: Prefs = {
   loadRemoteImages: true,
   settingsSection: "general",
   rankWeight: 0.6,
+  developerMode: false,
 };
 
 function read(): Prefs {

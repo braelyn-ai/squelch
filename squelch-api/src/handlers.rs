@@ -289,6 +289,51 @@ pub async fn refresh_now(State(state): State<ApiState>) -> impl IntoResponse {
     Json(json!({ "triggered": triggered }))
 }
 
+// --- POST /client/retriage (developer tool) ----------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RetriageBody {
+    /// Re-triage just this message. When absent, the trailing-`days` window.
+    #[serde(default)]
+    message_id: Option<i64>,
+    /// Trailing window in days (default 7, clamped 1..=90). Ignored when
+    /// `message_id` is set.
+    #[serde(default)]
+    days: Option<u32>,
+}
+
+/// DEV RE-TRIAGE: reset the LLM markers on the scoped non-sealed inbound rows so
+/// the stage-1 → stage-2 → extractor pipeline re-runs on them (fresh prompts,
+/// fresh verdicts). Rule-decided and sealed rows are never touched (store-level
+/// guard). Wakes the sync loop so the passes run immediately. Audited. A sealed
+/// or unknown `message_id` simply resets 0 rows — indistinguishable by design.
+pub async fn retriage(
+    State(state): State<ApiState>,
+    Json(body): Json<RetriageBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let days = body.days.unwrap_or(7).clamp(1, 90);
+    let target = body.message_id.map(|id| id.to_string());
+
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let msg_id = body.message_id;
+    let reset = blocking(move || store.retriage_reset(account_id, msg_id, days)).await?;
+
+    audit_action(
+        &state,
+        "retriage",
+        target,
+        &format!("days={days},reset={reset}"),
+    )
+    .await;
+
+    // Wake the sync loop so the LLM passes pick the rows up now, not next cycle.
+    if let Some(notify) = &state.refresh {
+        notify.notify_one();
+    }
+    Ok(Json(json!({ "reset": reset })))
+}
+
 // --- GET /client/thread/{thread_id} -----------------------------------------
 
 pub async fn get_thread(

@@ -73,6 +73,8 @@ pub fn router(state: ApiState) -> Router {
             "/client/triage-config",
             get(handlers::get_triage_config).post(handlers::set_triage_config),
         )
+        // Dev re-triage: human-door only, audited.
+        .route("/client/retriage", post(handlers::retriage))
         // Unsubscribe: human-door only (never exposed on the agent door).
         .route("/client/unsubscribe", post(handlers::unsubscribe))
         .route("/client/unsubscribes", get(handlers::list_unsubscribes))

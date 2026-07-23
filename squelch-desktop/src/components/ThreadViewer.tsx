@@ -36,6 +36,7 @@ import { dateTime, relAge } from "../lib/format";
 import { senderDisplayName } from "../lib/avatar";
 import { splitQuotedText } from "../lib/quotes";
 import { openExternal } from "../lib/opener";
+import { usePref } from "../lib/prefs";
 import { dispatchDone } from "../lib/dispatch";
 import { createBlockRule } from "../actions/blockSender";
 import { EmailFrame } from "./EmailFrame";
@@ -101,6 +102,26 @@ function ViewerBody({ threadId }: { threadId: string }) {
   // that gates the thread keys while open.
   const [confirmMode, setConfirmMode] = useState<null | "ask" | "noLink">(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  // DEV re-triage (developerMode pref): reset THIS email's LLM verdicts and
+  // re-run the pipeline. Uses the newest message id (same target as unsubscribe).
+  const devMode = usePref("developerMode");
+  const [retriaging, setRetriaging] = useState(false);
+  const retriageThis = async () => {
+    const newest = thread?.messages[thread.messages.length - 1];
+    if (!newest || retriaging) return;
+    setRetriaging(true);
+    try {
+      const { reset } = await api.retriage({ messageId: newest.id });
+      pushToast(
+        reset > 0 ? "re-triaging this email…" : "nothing to re-triage here",
+        "info",
+      );
+    } catch (e) {
+      pushToast(e instanceof ApiError ? e.message : "re-triage failed", "error");
+    } finally {
+      setRetriaging(false);
+    }
+  };
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -371,6 +392,17 @@ function ViewerBody({ threadId }: { threadId: string }) {
                 </>
               )}
             </button>
+            {devMode && (
+              <button
+                type="button"
+                className="close tv-unsub"
+                onClick={() => void retriageThis()}
+                disabled={retriaging}
+                title="dev: reset this email's LLM verdicts and re-run triage"
+              >
+                {retriaging ? "re-triaging…" : "re-triage"}
+              </button>
+            )}
             <span className="close">
               <kbd>Esc</kbd> back
             </span>

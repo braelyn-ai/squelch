@@ -563,6 +563,22 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ExtractQueued>>;
 
+    /// DEV RE-TRIAGE: reset the LLM markers on non-sealed, non-sent inbound rows
+    /// so they re-enter the Stage-1 queue (and re-escalate / re-extract from
+    /// scratch): `stage1_model_used=NULL`, `model_used=NULL`, `needs_stage2=0`,
+    /// `extractor_model_used=NULL`, plus stale `banking` rows for the affected
+    /// messages are deleted (extraction recreates them). Rows a sender rule
+    /// decided (`stage1_model_used='rule'`) and sealed/sent rows (`'n/a'`) are
+    /// NEVER touched — rules are authoritative and sealed mail re-enters no
+    /// queue. `message_id=None` scopes to inbound mail received in the trailing
+    /// `days`; `Some(id)` scopes to that one message. Returns rows reset.
+    fn retriage_reset(
+        &self,
+        account_id: AccountId,
+        message_id: Option<i64>,
+        days: u32,
+    ) -> Result<u64>;
+
     /// Mark an extract-queued row PROCESSED without writing a specialist row —
     /// stamp `extractor_model_used` only. Used on the skip / refusal / permanent-
     /// error paths so the row does not loop. Guarded by `sensitivity='normal'`.

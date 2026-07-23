@@ -1211,3 +1211,39 @@
   font-size: 11px;
   text-align: right;
 }
+
+/* ---- DEV re-triage button (masthead, dev-mode only) ---- */
+.retriage-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  color: var(--fg-dim);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+}
+.retriage-btn:hover {
+  color: var(--fg);
+  border-color: var(--fg-faint);
+}
+.retriage-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.retriage-btn .spin {
+  animation: conn-spin 0.9s linear infinite;
+}
+/* On the blue canvas mastheads the pill reads like the other on-sky pills. */
+.retriage-btn.on-sky {
+  color: var(--on-sky);
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+.retriage-btn.on-sky:hover {
+  background: rgba(255, 255, 255, 0.24);
+  border-color: rgba(255, 255, 255, 0.4);
+}
