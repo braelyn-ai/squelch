@@ -252,6 +252,54 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
 }
 
 #[tokio::test]
+async fn retriage_route_exists_resets_and_audits() {
+    let (app, store, acct) = app_with(|store, acct| {
+        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        store
+            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        // Simulate an LLM-classified row (via the public apply path) so there is
+        // something to reset.
+        store
+            .stage1_apply(&squelch_core::store::Stage1Applied {
+                message_id: m,
+                account_id: acct,
+                importance: 50,
+                tier: squelch_core::types::Tier::Signal,
+                one_line: "x".into(),
+                reason: "x".into(),
+                field_reasons: Default::default(),
+                stage1_model_used: "claude-x".into(),
+                needs_stage2: false,
+                deadline: None,
+                category: Some("general".into()),
+            })
+            .unwrap();
+    });
+
+    // Route exists (the 404 class of regression) + resets the window.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/retriage",
+            serde_json::json!({ "days": 7 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["reset"], 1);
+
+    // Audited.
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit.iter().any(|e| e.action == "retriage"),
+        "retriage must land an audit row"
+    );
+}
+
+#[tokio::test]
 async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::store::BankingApplied;
     let (app, _s, _a) = app_with(|store, acct| {
