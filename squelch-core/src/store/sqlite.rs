@@ -578,6 +578,39 @@ fn migrate(conn: &Connection) -> Result<()> {
     // apply SQL that names them would fail with "no such column" until added. No
     // backfill is needed: NULL is the correct resting value (no category => never
     // queued for extraction), so historical rows simply never re-run an extractor.
+    // stage2_usage grew a `category` column INSIDE ITS PRIMARY KEY (per-stage /
+    // per-extractor ledger lines). ALTER ADD COLUMN cannot change a PK, and the
+    // bump upsert's ON CONFLICT(account_id, day, category) needs that exact
+    // unique index — so an old table must be REBUILT (rename, create per
+    // schema.sql, copy with category='stage2', drop). Without this every ledger
+    // bump on a pre-existing DB fails ("no column named category") and LLM
+    // spend goes unrecorded.
+    let usage_has_category: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(stage2_usage)")?;
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        cols.is_empty() || cols.iter().any(|c| c == "category")
+    };
+    if !usage_has_category {
+        conn.execute_batch(
+            "ALTER TABLE stage2_usage RENAME TO stage2_usage_old;
+             CREATE TABLE stage2_usage (
+                 account_id    INTEGER NOT NULL,
+                 day           TEXT NOT NULL,
+                 category      TEXT NOT NULL DEFAULT 'stage2',
+                 calls         INTEGER NOT NULL DEFAULT 0,
+                 input_tokens  INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(account_id, day, category)
+             );
+             INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens)
+                 SELECT account_id, day, 'stage2', calls, input_tokens, output_tokens
+                 FROM stage2_usage_old;
+             DROP TABLE stage2_usage_old;",
+        )?;
+    }
+
     add_column_if_missing(conn, "triage", "category", "TEXT")?;
     add_column_if_missing(conn, "triage", "extractor_model_used", "TEXT")?;
 
@@ -3669,6 +3702,54 @@ mod tests {
         assert_eq!(s1.len(), 1, "the fresh normal row enters Stage-1");
         assert_eq!(s1[0].message_id, id);
         assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_rebuilds_stage2_usage_with_category_pk() {
+        // A pre-category stage2_usage table (PK account_id+day) must be rebuilt
+        // — ALTER ADD COLUMN can't extend a PK, and the bump upsert's
+        // ON CONFLICT(account_id, day, category) needs the new unique index.
+        // Existing rows land under category='stage2'; bumps work after.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stage2_usage (
+                 account_id INTEGER NOT NULL, day TEXT NOT NULL,
+                 calls INTEGER NOT NULL DEFAULT 0,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(account_id, day));
+             INSERT INTO stage2_usage VALUES (1, '2026-07-01', 3, 100, 50);
+             CREATE TABLE triage(message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 model_used TEXT, status TEXT NOT NULL DEFAULT 'new',
+                 tier TEXT NOT NULL DEFAULT 'noise', deadline TEXT);
+             CREATE TABLE deadlines(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 message_id INTEGER NOT NULL, kind TEXT NOT NULL, due_at TEXT NOT NULL,
+                 past_due INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL);
+             CREATE TABLE messages(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+                 received_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // Old row preserved under the default category.
+        let (cat, calls): (String, i64) = conn
+            .query_row(
+                "SELECT category, calls FROM stage2_usage WHERE account_id=1 AND day='2026-07-01'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cat, "stage2");
+        assert_eq!(calls, 3);
+        // The category-keyed upsert now works (this was the failing bump).
+        conn.execute(
+            "INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens)
+             VALUES (1, '2026-07-01', 'stage1', 1, 10, 5)
+             ON CONFLICT(account_id, day, category) DO UPDATE SET calls = calls + 1",
+            [],
+        )
+        .unwrap();
+        // Idempotent: migrate again is a no-op.
+        migrate(&conn).unwrap();
     }
 
     #[test]

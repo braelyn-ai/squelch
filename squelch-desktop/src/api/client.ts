@@ -94,9 +94,15 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
       method: opts.method ?? "GET",
       headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      // HARD TIMEOUT: without one, a daemon dying mid-request leaves this fetch
+      // hanging forever — which wedged the sitrep poller's in-flight guard and
+      // made the "connection lost" banner immortal (retry + polls silently
+      // no-oped behind the stuck pull). 15s is generous for a local daemon.
+      signal: AbortSignal.timeout(15_000),
     });
   } catch {
-    // fetch throwing means transport failure — never echo the token/url detail.
+    // fetch throwing means transport failure OR timeout — never echo the
+    // token/url detail.
     throw new ApiError("network", 0, "cannot reach squelch server");
   }
 

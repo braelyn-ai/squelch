@@ -636,6 +636,9 @@ svg.lucide {
 /* Degraded-mode banner: pinned at the top of .app-main (a flex column) above
    the routed view. Data below it is real but stale — red-tinted, unmissable,
    but doesn't hide the mail. Top padding clears the drag strip. */
+/* SOLID card fill — the banner floats on the blue canvas, and the old
+   translucent red wash left red-on-blue text (unreadable). White card, dark
+   ink, the red confined to the icon + a left accent bar. */
 .conn-banner {
   flex: 0 0 auto;
   display: flex;
@@ -643,11 +646,17 @@ svg.lucide {
   gap: 8px;
   margin: calc(var(--chrome-top) - 8px) 16px 0;
   padding: 7px 12px;
-  color: var(--red-ink);
-  background: var(--red-soft);
-  border: 1px solid color-mix(in srgb, var(--red) 30%, var(--border));
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--red);
   border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-card-sm);
   font-size: 12.5px;
+}
+.conn-banner > svg {
+  color: var(--red-ink);
+  flex: 0 0 auto;
 }
 .conn-banner-text {
   flex: 1 1 auto;
