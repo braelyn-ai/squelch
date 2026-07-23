@@ -18,6 +18,7 @@
 
 import { useMemo } from "react";
 import { api, ApiError } from "../api";
+import { clearFrameHeight } from "../lib/frameHeights";
 import type { AttentionUpdate } from "../api";
 import { useStore } from "../state";
 import { openRuleEditor } from "../components/ruleEditorBus";
@@ -106,6 +107,8 @@ async function dispatchDone(u: AttentionUpdate): Promise<void> {
   const restore = removeFromBands(u.id);
   try {
     await api.setStatus(u.id, "done");
+    // The message leaves the working set — drop its remembered frame height.
+    clearFrameHeight(String(u.id));
     store.pushUndo({
       kind: "done",
       messageId: u.id,

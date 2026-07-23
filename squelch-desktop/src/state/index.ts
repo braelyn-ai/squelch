@@ -7,13 +7,14 @@ export type {
   PendingUndo,
   UndoKind,
   ConnStatus,
+  RefreshError,
   SideView,
   Toast,
   ComposeState,
   AuthRing,
   AuthCodeEntry,
 } from "./store";
-export { useSitrep } from "./useSitrep";
+export { useSitrep, pullSitrep, triggerMailRefresh } from "./useSitrep";
 export type { SitrepController } from "./useSitrep";
 export { useAuthArrival } from "./useAuthArrival";
 export {

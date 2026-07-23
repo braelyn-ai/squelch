@@ -1,30 +1,50 @@
 // Renders ONE message's server-sanitized HTML in a hard-sandboxed iframe.
 //
-// SECURITY MODEL (locked design):
+// SECURITY MODEL:
 //   - The HTML was already sanitized server-side (ammonia) at ingest: no
 //     <script>, on* handlers, javascript:/data:text URLs, forms, iframes, etc.
-//     img src is KEPT deliberately — the CLIENT is the boundary that blocks it
-//     from loading, via CSP below.
-//   - The iframe is the real jail: sandbox="" (empty) grants NOTHING. In
-//     particular NO allow-scripts (so no JS runs even if sanitization missed
-//     something) and NO allow-same-origin (opaque origin — the frame cannot
-//     touch parent DOM, cookies, or storage). Content is delivered via srcdoc.
+//   - sandbox="allow-same-origin" and NOTHING else. Crucially allow-scripts is
+//     ABSENT, and that is the property that matters: with it absent the browser
+//     refuses to EXECUTE script in the frame no matter what the document
+//     contains or what origin it has. Three independent layers keep the frame
+//     script-free: (1) the sandbox execution block, (2) ammonia stripped every
+//     script vector server-side, (3) the frame CSP is default-src 'none' with
+//     no script-src. Content is delivered via srcdoc.
+//   - WHAT WAS TRADED (owner decision, 2026-07): the frame used to be
+//     sandbox="" — an OPAQUE origin, so even our own parent code could not see
+//     inside it. That opacity was belt-and-suspenders, not a load-bearing
+//     layer, and it made the frame unmeasurable: it forced fixed-height boxes
+//     with internal scrollbars. allow-same-origin makes the srcdoc document
+//     same-origin with the app so the PARENT can read contentDocument and size
+//     each frame to its exact content height — which is what enables the
+//     stacked, single-scroll thread view. The frame content still cannot act
+//     on that shared origin itself, because nothing inside it can ever run.
 //   - A <meta http-equiv="Content-Security-Policy"> is injected as the FIRST
 //     child of <head> so it applies before any resource is fetched:
-//       default-src 'none'; style-src 'unsafe-inline'
-//     Remote content is off by default. When `allowRemote` is true we add
-//       img-src http: https: data:
-//     for THIS message only — inline style url() fetches would need img-src too
-//     (they resolve under img-src per CSP), so the same relaxation covers both.
-//     http: is included because a lot of real-world marketing mail references
-//     plain http:// image hosts (and protocol-relative //host paths, which under
-//     the opaque srcdoc origin resolve against http/https); https:-only silently
-//     blocked those, which is what made "load images" appear to do nothing.
+//       default-src 'none'; style-src 'unsafe-inline'; img-src http: https: data:
+//     REMOTE IMAGES LOAD BY DEFAULT (product decision, 2026-07): real images are
+//     the point of HTML mail, so img-src permits http:/https:/data: unless the
+//     Settings "load on demand" pref is on — then network images are cut from
+//     the frame CSP until the reader opts in per message (the remote-bar).
+//     NOTE: srcdoc frames INHERIT the parent app CSP, so tauri.conf.json's
+//     img-src must (and does) permit http:/https: for any of this to work —
+//     the frame's own CSP line is the per-message gate.
+//     Inline style url() fetches resolve under img-src per CSP, so the same
+//     grant covers both. http: is included because a lot of real-world marketing
+//     mail references plain http:// image hosts (and protocol-relative //host
+//     paths, which under the srcdoc origin resolve against http/https).
+//   - CSP is host-agnostic — it can't tell a tracking pixel from a hero image.
+//     So trackers are stripped in a PREPROCESSING pass (src/lib/trackers) BEFORE
+//     the srcdoc is built, and referrerPolicy="no-referrer" (below) suppresses
+//     the Referer on every remote fetch. The bias is deliberately toward keeping
+//     images: a missed tracker is a bounded, referrer-less GET; a wrongly-nuked
+//     image visibly breaks the mail. When blocked > 0 we show a passive chip.
 //
 // LINKS: because the sandbox omits allow-popups AND allow-top-navigation (and
 // has no allow-scripts), a link click INSIDE the frame is INERT — it cannot
-// navigate the opaque frame, open a window, or postMessage out. We still set
-// <base target="_blank"> as belt-and-suspenders.
+// navigate the top page or open a window. We still set <base target="_blank">
+// as belt-and-suspenders (it turns any in-frame navigation attempt into a
+// popup attempt, which the sandbox denies).
 //
 // CHOSEN FIX (2026-07): extract the http(s) hrefs from the sanitized html and
 // render them as a compact list BELOW the frame — real <button>s that call
@@ -36,20 +56,32 @@
 // the shell. We de-dupe + cap the list so a marketing mail with 40 tracking
 // links doesn't swamp the pane. If the html has no links, nothing renders.
 //
-// FOCUS/KEYS: an opaque, script-less iframe still steals keyboard focus if it
-// is tabbable, and keydowns landing inside it never reach the parent window's
+// FOCUS/KEYS: a script-less iframe still steals keyboard focus if it is
+// tabbable, and keydowns landing inside it never reach the parent window's
 // listener (the keymap in ../keys). We keep the iframe OUT of the tab order and
 // non-focusable-by-pointer as much as the platform allows (tabIndex={-1}); the
-// message row around it stays the focus/selection target. See ThreadPane for
+// message card around it stays the focus/selection target. See ThreadViewer for
 // the j/k/Esc guarantee — those keys are handled on window and never enter the
 // frame because the frame is never focused programmatically.
 //
-// HEIGHT: no postMessage is possible (opaque origin, no scripts), so the frame
-// cannot report its content height. We give it a fixed viewport-relative box
-// that grows to a max and scrolls internally. Good enough; documented.
+// HEIGHT: allow-same-origin (above) lets the parent read contentDocument, so
+// on the iframe's load event we measure documentElement.scrollHeight (body as
+// fallback) and inline-set it as the frame's height — the frame is always
+// EXACTLY content-height and NEVER scrolls itself (scrolling="no" + CSS
+// overflow: hidden hide any mid-measure scrollbar). Scripts can't run inside,
+// so the only thing that changes content height after load is images arriving:
+// we attach load/error listeners to every <img> in the contentDocument and
+// re-measure on each, plus one requestAnimationFrame settle pass after load.
+// The stacked column in ThreadViewer is then the single scroll surface. If
+// contentDocument is somehow unreadable we fall back to a fixed 65vh scrolling
+// box so the mail is still readable.
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openExternal } from "../lib/opener";
+import { usePref } from "../lib/prefs";
+import { stripTrackers } from "../lib/trackers";
+import { findQuoteNodes } from "../lib/quotes";
+import { getFrameHeight, setFrameHeight } from "../lib/frameHeights";
 
 /** An extracted, de-duped outbound link: the http(s) href + its visible text. */
 interface EmailLink {
@@ -107,29 +139,21 @@ function hostOf(url: string): string {
   }
 }
 
-/** Cheap scan: does this html reference any remote/network content? */
-export function hasRemoteRefs(html: string): boolean {
-  // remote <img src="http(s)/protocol-relative"> or any url(...) in styles.
-  return (
-    /<img\b[^>]*\bsrc\s*=\s*["']?(?:https?:|\/\/)/i.test(html) ||
-    /\burl\(\s*["']?(?:https?:|\/\/|data:)/i.test(html) ||
-    // data: images are also "remote content" for gating purposes.
-    /<img\b[^>]*\bsrc\s*=\s*["']?data:/i.test(html)
-  );
-}
-
-/** Count remote img refs for the "N blocked" affordance (approximate). */
-function countRemoteImgs(html: string): number {
-  const m = html.match(
-    /<img\b[^>]*\bsrc\s*=\s*["']?(?:https?:|\/\/|data:)/gi,
-  );
-  return m ? m.length : 0;
+/** True when the sanitized html references at least one network image. */
+function hasRemoteImages(html: string): boolean {
+  return /<img\b[^>]*\bsrc\s*=\s*["'](?:https?:)?\/\//i.test(html);
 }
 
 function buildSrcdoc(html: string, allowRemote: boolean): string {
+  // The frame's meta CSP is the per-message image gate. NOTE the parent app
+  // CSP is inherited by srcdoc frames, so the effective policy is the
+  // intersection — the app CSP (tauri.conf.json) permits http:/https: images
+  // precisely so this per-frame line is the deciding one. When remote is off
+  // (Settings → load on demand, before the per-email opt-in) only embedded
+  // data: images render. Trackers are stripped upstream, not here.
   const csp = allowRemote
     ? "default-src 'none'; style-src 'unsafe-inline'; img-src http: https: data:"
-    : "default-src 'none'; style-src 'unsafe-inline'";
+    : "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
   // The CSP meta MUST be the first thing in <head> so it governs every
   // subsequent resource. <base target="_blank"> keeps any (currently inert)
   // link from trying to navigate the frame itself.
@@ -152,81 +176,222 @@ function buildSrcdoc(html: string, allowRemote: boolean): string {
   );
 }
 
+/** Frame height (px) shown before the first successful measurement. */
+const PLACEHOLDER_HEIGHT = 120;
+
 export function EmailFrame({
   html,
-  selected,
-  // Parent-controlled remote-content gate (so the 'i' keybind on the selected
-  // message can flip it). Falls back to a local toggle if not provided.
-  remoteAllowed,
-  onAllowRemote,
+  cacheKey,
 }: {
   html: string;
-  selected: boolean;
-  remoteAllowed?: boolean;
-  onAllowRemote?: () => void;
+  /** Stable id (message id) for the height memory — a frame with a remembered
+   *  height renders at its final size instantly, zero resize on reopen. */
+  cacheKey?: string;
 }) {
-  const [localAllow, setLocalAllow] = useState(false);
-  const allowRemote = remoteAllowed ?? localAllow;
+  // Strip tracking pixels before render; keep the count for the passive chip.
+  const { html: cleaned, blocked } = useMemo(() => stripTrackers(html), [html]);
 
-  const remoteRefs = useMemo(() => hasRemoteRefs(html), [html]);
-  const blockedCount = useMemo(
-    () => (remoteRefs ? countRemoteImgs(html) : 0),
-    [html, remoteRefs],
-  );
+  // Remote images: the Settings pref is the default; when it's off, a
+  // per-message opt-in flips this frame only.
+  const autoImages = usePref("loadRemoteImages");
+  const [optedIn, setOptedIn] = useState(false);
+  const allowRemote = autoImages || optedIn;
+  const remoteCandidates = useMemo(() => hasRemoteImages(cleaned), [cleaned]);
+
   const srcdoc = useMemo(
-    () => buildSrcdoc(html, allowRemote),
-    [html, allowRemote],
+    () => buildSrcdoc(cleaned, allowRemote),
+    [cleaned, allowRemote],
   );
   // Links can't navigate out of the sandbox (see header) — surface them below
-  // the frame as openExternal buttons instead.
-  const links = useMemo(() => extractLinks(html), [html]);
+  // the frame as openExternal buttons instead. Extract from the cleaned html so
+  // stripped trackers don't contribute (they're <img>, not <a>, but stay tidy).
+  const links = useMemo(() => extractLinks(cleaned), [cleaned]);
   const shownLinks = links.slice(0, MAX_LINKS);
   const extraLinks = links.length - shownLinks.length;
 
-  const allow = () => {
-    if (onAllowRemote) onAllowRemote();
-    else setLocalAllow(true);
-  };
+  // ---- auto-sizing (see HEIGHT in the file header) ----
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  // Seed from the height memory: a previously-measured message renders at its
+  // final size on the FIRST paint. null => never measured (paint-held below).
+  const [height, setHeight] = useState<number | null>(() =>
+    cacheKey ? getFrameHeight(cacheKey) : null,
+  );
+  // contentDocument unreadable => fixed 65vh scrolling fallback.
+  const [measureFailed, setMeasureFailed] = useState(false);
+  // Teardown for the listeners of the CURRENT load; replaced on reload,
+  // invoked on unmount.
+  const teardownRef = useRef<(() => void) | null>(null);
+
+  // ---- quoted-history collapse ----
+  // The frame can never run script (sandbox), so the PARENT hides/shows the
+  // quoted-history nodes directly in contentDocument (same-origin, see header)
+  // and re-measures. Collapsed by default; a chip below the frame toggles it.
+  const quoteNodesRef = useRef<HTMLElement[]>([]);
+  const [hasQuoted, setHasQuoted] = useState(false);
+  const [quotedHidden, setQuotedHidden] = useState(true);
+  // The height memory stores the DEFAULT (collapsed) state only; this ref lets
+  // measure() know the live state without going stale in the callback.
+  const quotedHiddenRef = useRef(true);
+  quotedHiddenRef.current = quotedHidden;
+
+  const measure = useCallback(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    try {
+      const doc = frame.contentDocument;
+      if (!doc) {
+        setMeasureFailed(true);
+        return;
+      }
+      const h =
+        doc.documentElement?.scrollHeight || doc.body?.scrollHeight || 0;
+      if (h > 0) {
+        setHeight(h);
+        if (cacheKey && quotedHiddenRef.current) setFrameHeight(cacheKey, h);
+      }
+    } catch {
+      setMeasureFailed(true);
+    }
+  }, [cacheKey]);
+
+  const onFrameLoad = useCallback(() => {
+    // A reload replaces the contentDocument — drop listeners bound to the
+    // previous one before wiring the new one.
+    teardownRef.current?.();
+    teardownRef.current = null;
+
+    let doc: Document | null = null;
+    try {
+      doc = frameRef.current?.contentDocument ?? null;
+    } catch {
+      doc = null;
+    }
+    if (!doc) {
+      setMeasureFailed(true);
+      return;
+    }
+
+    // Hide the quoted history BEFORE the first measure so the frame sizes to
+    // the collapsed content and never flashes the full chain.
+    const quotes = findQuoteNodes(doc);
+    quoteNodesRef.current = quotes;
+    if (quotes.length > 0) {
+      for (const n of quotes) n.style.display = "none";
+      setHasQuoted(true);
+      setQuotedHidden(true);
+    }
+
+    measure();
+    // Images arriving are the ONLY post-load height change (no scripts can
+    // run inside) — re-measure as they load, BATCHED to one measure per frame
+    // (a burst of cached images landing together must cause at most one
+    // layout pass, not one per image).
+    let imgRaf = 0;
+    const onImg = () => {
+      if (imgRaf) return;
+      imgRaf = requestAnimationFrame(() => {
+        imgRaf = 0;
+        measure();
+      });
+    };
+    const imgs = Array.from(doc.querySelectorAll("img"));
+    for (const img of imgs) {
+      // Async decode keeps a large image's decode off the main thread so the
+      // (single) height adjustment doesn't stutter.
+      img.decoding = "async";
+      img.addEventListener("load", onImg);
+      img.addEventListener("error", onImg);
+    }
+    // One settle pass after layout (fonts/first paint can nudge the height).
+    const raf = requestAnimationFrame(measure);
+
+    teardownRef.current = () => {
+      cancelAnimationFrame(raf);
+      if (imgRaf) cancelAnimationFrame(imgRaf);
+      for (const img of imgs) {
+        img.removeEventListener("load", onImg);
+        img.removeEventListener("error", onImg);
+      }
+    };
+  }, [measure]);
+
+  // Unmount: release whatever the last load wired up.
+  useEffect(() => () => teardownRef.current?.(), []);
+
+  // DOM writes + re-measure live OUTSIDE the state updater: updaters can be
+  // double-invoked (StrictMode), and a double display-flip would desync the
+  // frame from the chip label.
+  const toggleQuoted = useCallback(() => {
+    const next = !quotedHidden;
+    for (const n of quoteNodesRef.current) {
+      n.style.display = next ? "none" : "";
+    }
+    setQuotedHidden(next);
+    measure();
+  }, [quotedHidden, measure]);
 
   return (
     <div className="email-frame">
-      {remoteRefs &&
-        (allowRemote ? (
-          <div className="remote-bar loaded" aria-live="polite">
-            remote images loaded
-          </div>
-        ) : (
-          <button
-            type="button"
-            className="remote-bar"
-            onClick={allow}
-            title={
-              selected
-                ? "press i to load remote images for this message"
-                : "load remote images for this message"
-            }
-          >
-            remote images blocked
-            {blockedCount > 0 ? ` (${blockedCount})` : ""} — load
-            {selected ? " (i)" : ""}
-          </button>
-        ))}
+      {!allowRemote && remoteCandidates ? (
+        <button
+          type="button"
+          className="remote-bar"
+          onClick={() => setOptedIn(true)}
+          title="remote images are off by default (Settings → Mail); load them for this email only"
+        >
+          remote images blocked — load for this email
+        </button>
+      ) : blocked > 0 ? (
+        <div
+          className="remote-bar loaded"
+          aria-live="polite"
+          title="tracking pixels removed before render; links stay inert and no referrer is ever sent"
+        >
+          {blocked} tracker{blocked === 1 ? "" : "s"} blocked
+        </div>
+      ) : null}
       <iframe
-        // Force a full remount when the allow state flips so the browser reloads
-        // the srcdoc under the new CSP (updating srcDoc in place is enough in
-        // practice, but a keyed remount removes any ambiguity about stale frames).
-        key={String(allowRemote)}
-        // sandbox="" => no capabilities at all (opaque origin, no scripts).
-        sandbox=""
+        ref={frameRef}
+        // allow-same-origin ONLY — allow-scripts stays absent, so nothing can
+        // ever execute inside; same-origin is what lets us measure. See header.
+        sandbox="allow-same-origin"
         // Kept out of the tab order so it never steals keyboard focus from the
         // parent window keymap (j/k/Esc). See file header.
         tabIndex={-1}
         title="email content"
         className="email-iframe"
         srcDoc={srcdoc}
-        // referrerPolicy hardens remote fetches once the user opts in.
+        onLoad={onFrameLoad}
+        // The frame never scrolls itself: it is sized to its exact content.
+        // (In the measure-failed fallback we re-enable scrolling so a long
+        // mail is still fully readable inside the fixed 65vh box.)
+        scrolling={measureFailed ? "yes" : "no"}
+        // PAINT-HOLD: an unmeasured frame keeps its placeholder space but stays
+        // invisible until the first measurement lands (same tick as load), so
+        // the reader never sees a half-laid-out document snap to size. A frame
+        // with a remembered height paints immediately at its final size.
+        style={
+          measureFailed
+            ? { height: "65vh", overflowY: "auto" }
+            : {
+                height: `${height ?? PLACEHOLDER_HEIGHT}px`,
+                visibility: height === null ? "hidden" : "visible",
+              }
+        }
+        // referrerPolicy suppresses the Referer on every remote image fetch, so
+        // hosts learn nothing about which mail (or reader) requested the image.
         referrerPolicy="no-referrer"
       />
+      {hasQuoted && (
+        <button
+          type="button"
+          className="quote-toggle"
+          onClick={toggleQuoted}
+          title="the quoted reply chain below this message"
+        >
+          {quotedHidden ? "··· show quoted history" : "hide quoted history"}
+        </button>
+      )}
       {shownLinks.length > 0 && (
         <div className="email-links" aria-label="links in this message">
           <span className="email-links-label">links open externally</span>

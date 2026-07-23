@@ -12,6 +12,7 @@ import { create } from "zustand";
 import { api } from "../api";
 import { ApiError } from "../api";
 import type {
+  ApiErrorKind,
   AttentionUpdate,
   SealedMeta,
   StoreStats,
@@ -35,6 +36,16 @@ export interface SitrepData {
   open: AttentionUpdate[];
   stats: StoreStats | null;
   sealed: SealedMeta[];
+}
+
+/**
+ * Why a refresh failed, kept alongside the message so the UI can distinguish
+ * "daemon unreachable" (fix: start squelchd) from "token rejected" (fix: open
+ * Settings) rather than lumping every failure into one vague state.
+ */
+export interface RefreshError {
+  message: string;
+  kind: ApiErrorKind;
 }
 
 // --- undo model -------------------------------------------------------------
@@ -123,10 +134,12 @@ export const HISTORY_CAP = 50;
 // --- transient side views ---------------------------------------------------
 
 // Side panels remaining after Auth/Rules/Audit were promoted to routed main
-// views (see MainView): thread drill-in, browse-all, and search.
+// views (see MainView): browse-all and search. The thread drill-in is NOT a
+// side view anymore — it's the fullscreen viewer (store.threadId), layered
+// ABOVE these panels so opening a thread from search/browse keeps the panel
+// mounted underneath and Esc returns to it.
 export type SideView =
   | { kind: "none" }
-  | { kind: "thread"; threadId: string }
   | { kind: "browse" }
   | { kind: "search"; query: string };
 
@@ -212,9 +225,9 @@ export interface AppState {
   // sitrep slice
   sitrep: SitrepData;
   lastRefresh: number | null;
-  refreshError: string | null;
+  refreshError: RefreshError | null;
   setSitrep: (partial: Partial<SitrepData>) => void;
-  setRefreshError: (msg: string | null) => void;
+  setRefreshError: (err: RefreshError | null) => void;
   markRefreshed: () => void;
 
   // selection slice — stable by message id
@@ -253,6 +266,21 @@ export interface AppState {
   sideView: SideView;
   openSide: (view: SideView) => void;
   closeSide: () => void;
+
+  // thread viewer slice — the fullscreen email viewer. Orthogonal to sideView
+  // (it layers above it), so closing the viewer restores whatever was
+  // underneath: a routed view or an open browse/search panel.
+  threadId: string | null;
+  /**
+   * The ordered list the viewer was opened FROM (EmailsView's flat inbox rows),
+   * so the viewer's "done + next" (e/d) can advance to the next update in place.
+   * Empty when a thread is opened from a surface without a queue (Sitrep/search/
+   * browse) — done+advance then just closes the viewer. Passing a new queue on
+   * openThread replaces it; omitting it clears the queue.
+   */
+  threadQueue: AttentionUpdate[];
+  openThread: (threadId: string, queue?: AttentionUpdate[]) => void;
+  closeThread: () => void;
 
   // compose slice (send ceremony lives in ActionLayer; state is shared here)
   compose: ComposeState | null;
@@ -343,6 +371,10 @@ export const useStore = create<AppState>((set, get) => ({
         settings: { server_url: serverUrl, api_token: apiToken },
         connStatus: "connected",
         connError: null,
+        // Fresh connection = fresh sync history; a stale lastRefresh from a
+        // prior session must not make a failing daemon look "recently synced".
+        lastRefresh: null,
+        refreshError: null,
       });
       return true;
     } catch (e) {
@@ -394,8 +426,12 @@ export const useStore = create<AppState>((set, get) => ({
       connStatus: "disconnected",
       settings: null,
       sitrep: emptySitrep,
+      lastRefresh: null,
+      refreshError: null,
       selectedId: null,
       activeView: "sitrep",
+      threadId: null,
+      threadQueue: [],
       history: [{ view: "sitrep", selectedId: null }],
       historyIndex: 0,
     });
@@ -410,14 +446,19 @@ export const useStore = create<AppState>((set, get) => ({
 
   setView: (view) => {
     set((s) => {
+      // Navigating ANYWHERE dismisses an open thread viewer — the rail is
+      // visible beside it, and a rail click means "leave this email and go
+      // there", not "change the page underneath the overlay".
+      const closeViewer = { threadId: null, threadQueue: [] as AttentionUpdate[] };
       // No-op if we're already on this exact view+selection at the cursor — a
       // repeat click/press shouldn't spam identical history entries.
       const cur = s.history[s.historyIndex];
       if (cur && cur.view === view && cur.selectedId === s.selectedId) {
-        return { activeView: view };
+        return { activeView: view, ...closeViewer };
       }
       return {
         activeView: view,
+        ...closeViewer,
         ...pushHistory(s.history, s.historyIndex, {
           view,
           selectedId: s.selectedId,
@@ -429,6 +470,8 @@ export const useStore = create<AppState>((set, get) => ({
     set((s) => ({
       activeView: "emails",
       selectedId: id,
+      threadId: null,
+      threadQueue: [],
       ...pushHistory(s.history, s.historyIndex, {
         view: "emails",
         selectedId: id,
@@ -465,7 +508,7 @@ export const useStore = create<AppState>((set, get) => ({
   refreshError: null,
   setSitrep: (partial) =>
     set((s) => ({ sitrep: { ...s.sitrep, ...partial } })),
-  setRefreshError: (msg) => set({ refreshError: msg }),
+  setRefreshError: (err) => set({ refreshError: err }),
   markRefreshed: () => set({ lastRefresh: Date.now() }),
 
   // --- selection ------------------------------------------------------------
@@ -566,6 +609,12 @@ export const useStore = create<AppState>((set, get) => ({
   sideView: { kind: "none" },
   openSide: (view) => set({ sideView: view }),
   closeSide: () => set({ sideView: { kind: "none" } }),
+
+  // --- thread viewer --------------------------------------------------------
+  threadId: null,
+  threadQueue: [],
+  openThread: (threadId, queue) => set({ threadId, threadQueue: queue ?? [] }),
+  closeThread: () => set({ threadId: null, threadQueue: [] }),
 
   // --- compose --------------------------------------------------------------
   compose: null,
