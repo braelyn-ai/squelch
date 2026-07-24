@@ -4,6 +4,7 @@
 // verb hint only shows on the selected row.
 
 import { memo } from "react";
+import { Paperclip } from "lucide-react";
 import type { AttentionUpdate } from "../api";
 import {
   relAge,
@@ -82,6 +83,13 @@ export const UpdateRow = memo(function UpdateRow({
       <span className="sender" title={u.sender}>
         {senderDisplayName(u.sender)}
       </span>
+      {u.has_attachments && (
+        <Paperclip
+          size={12}
+          className="att-clip"
+          aria-label="has attachments"
+        />
+      )}
       <span className="one-line" style={{ color: oneLineColor }} title={u.one_line}>
         {u.one_line}
       </span>

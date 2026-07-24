@@ -43,6 +43,9 @@ export interface Update {
    *  agent-door byte-absence guarantee depends on skip_serializing_if). Always
    *  access via `u.field_reasons?.<key>`. */
   field_reasons?: FieldReasons | null;
+  /** True when the message carries stored attachments (paperclip glyph).
+   *  ABSENT on rows served by a pre-attachment daemon — treat as false. */
+  has_attachments?: boolean;
 }
 
 /**

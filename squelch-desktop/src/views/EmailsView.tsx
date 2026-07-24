@@ -18,11 +18,7 @@ import { SitrepHeader } from "../components/SitrepHeader";
 import { UpdateRow } from "../components/UpdateRow";
 import { flipTheme } from "../components/ThemeToggle";
 import { ShortcutsOverlay } from "../components/ShortcutsOverlay";
-import {
-  dispatchArchive,
-  dispatchDone,
-  dispatchReply,
-} from "../lib/dispatch";
+import { dispatchDone, dispatchReply } from "../lib/dispatch";
 import { prefetchThread } from "../lib/threadPrefetch";
 import "../styles/sitrep.css";
 
@@ -199,10 +195,11 @@ export function EmailsView() {
       },
       {
         key: "e",
-        description: "archive",
+        description: "done",
         handler: () => {
+          // e = done everywhere (sitrep parity — owner call, 2026-07-23).
           if (selected) {
-            void dispatchArchive(selected);
+            void dispatchDone(selected);
             removeRow(selected.id);
           }
         },

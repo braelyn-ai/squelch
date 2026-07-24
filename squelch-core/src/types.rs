@@ -171,6 +171,13 @@ pub struct Update {
     /// `field_reasons` key appears unless a reason was actually recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_reasons: Option<FieldReasons>,
+    /// Whether the message carries stored attachments — drives the paperclip
+    /// glyph in the client lists. HUMAN-DOOR ONLY, same discipline as
+    /// `field_reasons`: `attention_updates` computes it, `ranked_updates`
+    /// (the /mcp door) always leaves it `None` so the agent payload is
+    /// byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_attachments: Option<bool>,
 }
 
 /// The attention-lifecycle status of a triage row (sitrep seen-ledger).
@@ -650,6 +657,7 @@ mod tests {
             deadline: None,
             matched_rule: None,
             field_reasons: None,
+            has_attachments: None,
         }
     }
 

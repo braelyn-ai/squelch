@@ -1410,6 +1410,7 @@ impl Store for SqliteStore {
                 // AGENT DOOR: never carries field_reasons — the human-door insight
                 // feature stays absent from the MCP payload (skip_serializing_if).
                 field_reasons: None,
+                has_attachments: None,
             });
         }
         Ok(out)
@@ -2655,7 +2656,10 @@ impl Store for SqliteStore {
         let mut sql = String::from(
             "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
                     t.reason, t.deadline, t.matched_rule_id,
-                    t.status, t.surfaced_at, t.resolved_at, t.field_reasons
+                    t.status, t.surfaced_at, t.resolved_at, t.field_reasons,
+                    EXISTS(SELECT 1 FROM attachments a
+                           WHERE a.account_id = m.account_id
+                             AND a.message_id = m.id) AS has_atts
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
@@ -2703,6 +2707,7 @@ impl Store for SqliteStore {
             let surfaced_s: Option<String> = r.get(10)?;
             let resolved_s: Option<String> = r.get(11)?;
             let field_reasons_s: Option<String> = r.get(12)?;
+            let has_atts: bool = r.get::<_, i64>(13)? != 0;
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -2717,6 +2722,7 @@ impl Store for SqliteStore {
                 surfaced_s,
                 resolved_s,
                 field_reasons_s,
+                has_atts,
             ))
         };
         let rows = if band == Some(SitrepBand::Open) {
@@ -2741,6 +2747,7 @@ impl Store for SqliteStore {
                 surfaced_s,
                 resolved_s,
                 field_reasons_s,
+                has_atts,
             ) = row?;
             let deadline = match deadline_s {
                 Some(s) => Some(parse_dt(&s)?),
@@ -2772,6 +2779,7 @@ impl Store for SqliteStore {
                     deadline,
                     matched_rule: rule,
                     field_reasons,
+                    has_attachments: Some(has_atts),
                 },
                 status: AttentionStatus::parse(&status_s).unwrap_or(AttentionStatus::New),
                 surfaced_at,
@@ -4437,6 +4445,12 @@ mod tests {
         assert!(r.field_reasons.is_none());
         let rv = serde_json::to_value(r).unwrap();
         assert!(rv.get("field_reasons").is_none(), "MCP payload must omit field_reasons: {rv}");
+        // Same byte-absence discipline for the paperclip flag.
+        assert!(r.has_attachments.is_none());
+        assert!(
+            rv.get("has_attachments").is_none(),
+            "MCP payload must omit has_attachments: {rv}"
+        );
     }
 
     #[test]

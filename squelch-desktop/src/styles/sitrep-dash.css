@@ -131,7 +131,8 @@
   display: flex;
   flex-direction: column;
   gap: 18px;
-  max-width: 960px;
+  /* no max-width: the left column fills whatever the window gives it (the
+     960px cap left a dead gutter between the list and the right rail). */
   min-width: 0;
 }
 
@@ -825,4 +826,10 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   white-space: nowrap;
+}
+
+/* Paperclip — quiet attachment marker on list rows. */
+.att-clip {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
 }

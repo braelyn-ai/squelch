@@ -475,6 +475,7 @@ mod tests {
             deadline: None,
             matched_rule: None,
             field_reasons: None,
+            has_attachments: None,
         }
     }
 

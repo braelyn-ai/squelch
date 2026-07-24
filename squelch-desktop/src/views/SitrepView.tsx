@@ -25,6 +25,7 @@ import {
   Eye,
   Bell,
   Landmark,
+  Paperclip,
   Receipt,
   Mails,
   Pencil,
@@ -441,6 +442,9 @@ function ObligationRow({
       <span className="ob-sender" title={u.sender}>
         {senderDisplayName(u.sender)}
       </span>
+      {u.has_attachments && (
+        <Paperclip size={12} className="att-clip" aria-label="has attachments" />
+      )}
       {/* The abstracted one-liner carries the meaning; it truncates first. */}
       <p className="ob-line" title={u.one_line}>
         {u.one_line}

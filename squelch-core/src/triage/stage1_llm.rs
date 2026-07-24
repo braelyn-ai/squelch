@@ -70,7 +70,12 @@ signal for mail worth surfacing; noise otherwise. The is_known_contact flag in \
 the TRUSTED CONTEXT is a strong signal for a higher tier.
 
 DEADLINES: set has_deadline=true only for a concrete bill, payment, or dated \
-obligation. When true, extract deadline_iso as an RFC3339 timestamp (UTC) and \
+obligation THAT BELONGS TO THE USER - an invoice addressed to them, a payment \
+they owe, an appointment they booked. Marketing, newsletters, product \
+announcements, and promotions are NEVER bills, no matter what products, prices, \
+or urgency language they contain. If the email states no actual date, \
+deadline_iso MUST be null - never invent or infer a date that is not written in \
+the email. When true, extract deadline_iso as an RFC3339 timestamp (UTC) and \
 deadline_kind as a short label (e.g. \"invoice\", \"payment_due\", \"renewal\"). \
 YEAR RULE: when the email states a date WITHOUT a year, infer the year from the \
 email's received date - these dates are forward-looking (the next occurrence on \
