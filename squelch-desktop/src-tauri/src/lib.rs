@@ -182,6 +182,73 @@ async fn llm_complete(body: serde_json::Value) -> Result<LlmResponse, String> {
     Ok(LlmResponse { status, json })
 }
 
+/// Fetch one remote image's raw bytes in RUST (no webview, no CORS taint) so
+/// React can read its pixels for the newsletter-thumb fill color. Guards:
+/// http/https only, 10s timeout, 8MB cap, image/* content-type, no
+/// credentials/cookies (a bare client has none). Exposure is equivalent to the
+/// <img> fetches the webview already makes for the same mail-derived URLs —
+/// this just returns the bytes to same-origin JS instead of painting them.
+/// Returned base64 so the IPC payload is one string, not a JSON byte array.
+#[tauri::command]
+async fn fetch_image(url: String) -> Result<String, String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("only http(s) urls".into());
+    }
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| "client build failed".to_string())?;
+    // Redacted errors: never echo the (mail-derived) URL back into JS logs.
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|_| "image fetch failed".to_string())?;
+    if !resp.status().is_success() {
+        return Err("image fetch failed".into());
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ct.starts_with("image/") {
+        return Err("not an image".into());
+    }
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_BYTES {
+            return Err("image too large".into());
+        }
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|_| "image fetch failed".to_string())?;
+    if bytes.len() > MAX_BYTES {
+        return Err("image too large".into());
+    }
+    Ok(b64_encode(&bytes))
+}
+
+/// Minimal dependency-free base64 (standard alphabet, padded).
+fn b64_encode(input: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(A[((n >> 18) & 63) as usize] as char);
+        out.push(A[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { A[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -195,7 +262,8 @@ pub fn run() {
             assistant_key_status,
             set_assistant_key,
             clear_assistant_key,
-            llm_complete
+            llm_complete,
+            fetch_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running squelch-desktop");

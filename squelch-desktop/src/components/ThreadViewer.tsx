@@ -327,6 +327,13 @@ function ViewerBody({ threadId }: { threadId: string }) {
         handler: () => closeThread(),
       },
       {
+        // cmd+[ = back, same as Esc — the viewer is a page you navigated into.
+        key: "[",
+        meta: true,
+        description: "back",
+        handler: () => closeThread(),
+      },
+      {
         key: "j",
         description: "older message",
         handler: () => setIdx((i) => Math.min(count - 1, i + 1)),

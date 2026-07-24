@@ -51,6 +51,7 @@ import { useKeys, useKeyContext } from "../keys";
 import { deadlineChip, lastChecked, relAge } from "../lib/format";
 import { rankItems } from "../lib/ranking";
 import { fetchThreadCached, prefetchThread } from "../lib/threadPrefetch";
+import { heroFillHex } from "../lib/imageFill";
 import { usePref } from "../lib/prefs";
 import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { getUserName } from "../lib/identity";
@@ -1088,47 +1089,15 @@ function NewsletterHero({ threadId }: { threadId: string }) {
     };
   }, [threadId, imagesOn]);
 
-  // PRIMARY-COLOR sampling: draw the image tiny on a canvas and average the
-  // opaque pixels. Needs a CORS-clean load (crossOrigin=anonymous) — most
-  // newsletter CDNs won't grant it, in which case getImageData throws on the
-  // tainted canvas and we quietly keep the neutral fill.
+  // PRIMARY-COLOR fill: bytes fetched through the Tauri shell (Rust — no
+  // webview CORS), pixels averaged in JS from a same-origin blob. Best-effort;
+  // null keeps the neutral well fill.
   useEffect(() => {
     if (!src) return;
     let alive = true;
-    const probe = new Image();
-    probe.crossOrigin = "anonymous";
-    probe.referrerPolicy = "no-referrer";
-    probe.onload = () => {
-      if (!alive) return;
-      try {
-        const c = document.createElement("canvas");
-        c.width = 8;
-        c.height = 8;
-        const ctx = c.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(probe, 0, 0, 8, 8);
-        const d = ctx.getImageData(0, 0, 8, 8).data;
-        let r = 0,
-          g = 0,
-          b = 0,
-          n = 0;
-        for (let i = 0; i < d.length; i += 4) {
-          if (d[i + 3] < 128) continue;
-          r += d[i];
-          g += d[i + 1];
-          b += d[i + 2];
-          n += 1;
-        }
-        if (n > 0) {
-          setFill(
-            `rgb(${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)})`,
-          );
-        }
-      } catch {
-        // Tainted canvas (no CORS) — neutral fill stays.
-      }
-    };
-    probe.src = src;
+    void heroFillHex(src).then((hex) => {
+      if (alive && hex) setFill(hex);
+    });
     return () => {
       alive = false;
     };
