@@ -232,6 +232,16 @@ function SitrepBody({
         handler: () => setObIdx((i) => Math.max(0, i - 1)),
       },
       {
+        key: "ArrowDown",
+        description: "next item",
+        handler: () => setObIdx((i) => Math.min(visibleEyes.length - 1, i + 1)),
+      },
+      {
+        key: "ArrowUp",
+        description: "prev item",
+        handler: () => setObIdx((i) => Math.max(0, i - 1)),
+      },
+      {
         key: "d",
         description: "mark done",
         handler: () => {
