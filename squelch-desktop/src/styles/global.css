@@ -49,16 +49,16 @@
   /* SURFACES — solid. --bg = card, --bg-raised = modal/rail,
      --zone-wash = zone card, --glass-legible = inputs/wells. The old glass
      names survive so components don't need edits; the values are opaque. */
-  --glass: #ffffff; /* card */
-  --glass-strong: #ffffff; /* modal / raised */
-  --zone-wash: #ffffff; /* zone card */
-  --glass-legible: #ffffff; /* inputs / code wells */
+  --glass: #f6f9fd; /* card — a whisper of blue, not stark white */
+  --glass-strong: #f8fafd; /* modal / raised */
+  --zone-wash: #f6f9fd; /* zone card */
+  --glass-legible: #ffffff; /* inputs / code wells stay true white (contrast) */
   --glass-border: #d8e2ec; /* solid hairline */
   --glass-border-strong: #c2d2e0;
 
   --bg: var(--glass);
   --bg-raised: var(--glass-strong);
-  --bg-row: #eef4fa; /* hover */
+  --bg-row: #e9f1f9; /* hover — a step bluer than the tinted card */
   --bg-row-sel: rgba(43, 127, 212, 0.14); /* selection — blue wash */
   --bg-sunken: #f2f6fb; /* wells */
   --border: var(--glass-border);
