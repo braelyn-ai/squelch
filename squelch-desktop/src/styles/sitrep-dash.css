@@ -860,7 +860,9 @@
   justify-content: center;
   overflow: hidden;
   border-radius: var(--radius-sm);
-  background: var(--bg-sunken);
+  /* bg-row, NOT bg-sunken: the sunken well is pure white in light mode, which
+     made the "no sample yet" state indistinguishable from a white sample. */
+  background: var(--bg-row);
   border: 1px solid var(--border);
 }
 .nl-hero {
