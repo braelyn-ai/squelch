@@ -834,15 +834,37 @@
   color: var(--fg-faint);
 }
 
-/* Newsletter hero thumbnail — a banner across the card top, mined from the
-   latest email. Cover-fit, capped height so text cards and image cards keep
-   comparable footprints. */
+/* Newsletter hero thumbnail — a SQUARE on the card's left, mined from the
+   latest email. The image CONTAIN-fits inside; the square's fill is the
+   image's sampled primary color (neutral well color when CORS blocks
+   sampling). The card becomes a flex row: thumb | content. */
+.nl-card {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+}
+.nl-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.nl-hero-box {
+  flex: 0 0 auto;
+  width: 72px;
+  height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+}
 .nl-hero {
-  display: block;
-  width: calc(100% + 24px);
-  margin: -11px -12px 9px;
-  height: 96px;
-  object-fit: cover;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  border-bottom: 1px solid var(--border);
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }

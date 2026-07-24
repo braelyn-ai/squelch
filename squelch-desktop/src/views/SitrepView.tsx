@@ -1068,6 +1068,7 @@ function NewsletterHero({ threadId }: { threadId: string }) {
   const imagesOn = usePref("loadRemoteImages");
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [fill, setFill] = useState<string | null>(null);
 
   useEffect(() => {
     if (!imagesOn || !threadId) return;
@@ -1086,18 +1087,69 @@ function NewsletterHero({ threadId }: { threadId: string }) {
     };
   }, [threadId, imagesOn]);
 
+  // PRIMARY-COLOR sampling: draw the image tiny on a canvas and average the
+  // opaque pixels. Needs a CORS-clean load (crossOrigin=anonymous) — most
+  // newsletter CDNs won't grant it, in which case getImageData throws on the
+  // tainted canvas and we quietly keep the neutral fill.
+  useEffect(() => {
+    if (!src) return;
+    let alive = true;
+    const probe = new Image();
+    probe.crossOrigin = "anonymous";
+    probe.referrerPolicy = "no-referrer";
+    probe.onload = () => {
+      if (!alive) return;
+      try {
+        const c = document.createElement("canvas");
+        c.width = 8;
+        c.height = 8;
+        const ctx = c.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(probe, 0, 0, 8, 8);
+        const d = ctx.getImageData(0, 0, 8, 8).data;
+        let r = 0,
+          g = 0,
+          b = 0,
+          n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i + 3] < 128) continue;
+          r += d[i];
+          g += d[i + 1];
+          b += d[i + 2];
+          n += 1;
+        }
+        if (n > 0) {
+          setFill(
+            `rgb(${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)})`,
+          );
+        }
+      } catch {
+        // Tainted canvas (no CORS) — neutral fill stays.
+      }
+    };
+    probe.src = src;
+    return () => {
+      alive = false;
+    };
+  }, [src]);
+
   if (!src || failed) return null;
   return (
-    <img
-      className="nl-hero"
-      src={src}
-      alt=""
+    <span
+      className="nl-hero-box"
+      style={fill ? { background: fill } : undefined}
       aria-hidden="true"
-      referrerPolicy="no-referrer"
-      decoding="async"
-      loading="lazy"
-      onError={() => setFailed(true)}
-    />
+    >
+      <img
+        className="nl-hero"
+        src={src}
+        alt=""
+        referrerPolicy="no-referrer"
+        decoding="async"
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    </span>
   );
 }
 
@@ -1129,6 +1181,7 @@ function NewsletterCard({
       }}
     >
       <NewsletterHero threadId={nl.latest_thread_id} />
+      <div className="nl-body">
       <div className="nl-top">
         <Avatar sender={nl.sender} size={24} />
         <span className="nl-sender">
@@ -1168,6 +1221,7 @@ function NewsletterCard({
           <Pencil size={12} className="nl-pencil" />
         </div>
       )}
+      </div>
     </div>
   );
 }
