@@ -329,6 +329,9 @@ pub struct Receipt {
     pub id: i64,
     pub account_id: AccountId,
     pub message_id: i64,
+    /// The message's thread — lets the client open the email directly in the
+    /// thread viewer (same click behavior as the attention rows).
+    pub thread_id: String,
     pub from_addr: String,
     pub from_name: Option<String>,
     pub amount: Option<f64>,
@@ -356,6 +359,9 @@ pub struct Receipt {
 pub struct Banking {
     pub id: i64,
     pub message_id: i64,
+    /// The message's thread — lets the client open the email directly in the
+    /// thread viewer (same click behavior as the attention rows).
+    pub thread_id: String,
     pub kind: String,
     pub institution: Option<String>,
     pub amount: Option<f64>,

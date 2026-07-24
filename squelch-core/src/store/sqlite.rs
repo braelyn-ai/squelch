@@ -1649,10 +1649,12 @@ impl Store for SqliteStore {
         // mail).
         let since = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, message_id, from_addr, from_name, amount, currency, received_at
-             FROM receipts
-             WHERE account_id=?1 AND received_at >= ?2
-             ORDER BY received_at DESC",
+            "SELECT rc.id, rc.account_id, rc.message_id, m.thread_id, rc.from_addr,
+                    rc.from_name, rc.amount, rc.currency, rc.received_at
+             FROM receipts rc
+             JOIN messages m ON m.id = rc.message_id
+             WHERE rc.account_id=?1 AND rc.received_at >= ?2
+             ORDER BY rc.received_at DESC",
         )?;
         let rows = stmt.query_map(params![account_id, since], |r| {
             Ok((
@@ -1660,19 +1662,22 @@ impl Store for SqliteStore {
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<f64>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<f64>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, acct, message_id, from_addr, from_name, amount, currency, received_at) = row?;
+            let (id, acct, message_id, thread_id, from_addr, from_name, amount, currency, received_at) =
+                row?;
             out.push(Receipt {
                 id,
                 account_id: acct,
                 message_id,
+                thread_id,
                 from_addr,
                 from_name,
                 amount,
@@ -1856,30 +1861,34 @@ impl Store for SqliteStore {
         // Newest-received first. No sealed filter needed: the table holds no
         // sealed rows by construction (extraction never runs on sealed mail).
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, kind, institution, amount, currency, account_hint, received_at
-             FROM banking
-             WHERE account_id=?1
-             ORDER BY received_at DESC",
+            "SELECT b.id, b.message_id, m.thread_id, b.kind, b.institution, b.amount,
+                    b.currency, b.account_hint, b.received_at
+             FROM banking b
+             JOIN messages m ON m.id = b.message_id
+             WHERE b.account_id=?1
+             ORDER BY b.received_at DESC",
         )?;
         let rows = stmt.query_map(params![account_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
                 r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, message_id, kind, institution, amount, currency, account_hint, received_at) =
+            let (id, message_id, thread_id, kind, institution, amount, currency, account_hint, received_at) =
                 row?;
             out.push(Banking {
                 id,
                 message_id,
+                thread_id,
                 kind,
                 institution,
                 amount,

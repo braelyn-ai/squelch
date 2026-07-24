@@ -699,7 +699,7 @@ function receiptAmount(r: ReceiptRecord): string {
  */
 function ReceiptsZone() {
   const [receipts, setReceipts] = useState<ReceiptRecord[] | null>(null);
-  const viewInEmails = useStore((s) => s.viewInEmails);
+  const openThread = useStore((s) => s.openThread);
 
   useEffect(() => {
     let alive = true;
@@ -742,8 +742,8 @@ function ReceiptsZone() {
               type="button"
               className="receipt-row"
               key={r.id}
-              onClick={() => viewInEmails(r.message_id)}
-              title="view this email"
+              onClick={() => openThread(r.thread_id)}
+              title="open this email"
             >
               <span className="receipt-sender" title={r.from_addr}>
                 {senderDisplayName(sender)}
@@ -801,7 +801,7 @@ const BANKING_SHOWN = 8;
  */
 function BankingZone() {
   const [records, setRecords] = useState<BankingRecord[] | null>(null);
-  const viewInEmails = useStore((s) => s.viewInEmails);
+  const openThread = useStore((s) => s.openThread);
 
   useEffect(() => {
     let alive = true;
@@ -837,8 +837,8 @@ function BankingZone() {
               type="button"
               className="receipt-row"
               key={r.id}
-              onClick={() => viewInEmails(r.message_id)}
-              title="view this email"
+              onClick={() => openThread(r.thread_id)}
+              title="open this email"
             >
               <span className="receipt-sender">
                 {r.institution ?? "bank"}

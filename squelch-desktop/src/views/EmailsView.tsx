@@ -177,6 +177,11 @@ export function EmailsView() {
         handler: () => moveByKey((i) => Math.max(0, i - 1)),
       },
       {
+        key: "Escape",
+        description: "back to sitrep",
+        handler: () => setView("sitrep"),
+      },
+      {
         key: "Enter",
         description: "drill in",
         handler: () => {
