@@ -1071,6 +1071,10 @@ function NewsletterHero({ threadId }: { threadId: string }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [fill, setFill] = useState<string | null>(null);
+  // Fit by shape: tall/square heroes crop to fill (cover — photos survive a
+  // crop); WIDE marks contain (cropping a wordmark chops its lettering, so
+  // they letterbox on the sampled fill instead).
+  const [fit, setFit] = useState<"cover" | "contain">("cover");
 
   useEffect(() => {
     if (!imagesOn || !threadId) return;
@@ -1117,6 +1121,11 @@ function NewsletterHero({ threadId }: { threadId: string }) {
         referrerPolicy="no-referrer"
         decoding="async"
         loading="lazy"
+        style={{ objectFit: fit }}
+        onLoad={(e) => {
+          const el = e.currentTarget;
+          if (el.naturalWidth > el.naturalHeight * 1.2) setFit("contain");
+        }}
         onError={() => setFailed(true)}
       />
     </span>
