@@ -1153,7 +1153,6 @@ function NewsletterCard({
       <NewsletterHero threadId={nl.latest_thread_id} />
       <div className="nl-body">
       <div className="nl-top">
-        <Avatar sender={nl.sender} size={24} />
         <span className="nl-sender">
           {senderDisplayName(nl.sender)}
         </span>
