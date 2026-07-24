@@ -81,6 +81,13 @@ async function dominantHex(blob: Blob): Promise<string | null> {
       return `#${hex(best.r, best.n)}${hex(best.g, best.n)}${hex(best.b, best.n)}`;
     }
     if (an > 0) {
+      // No dominant mid-tone region — a monochrome logo. A WHITE logo on a
+      // transparent background averages to near-white, which would vanish on
+      // the card: give it a dark slate stage instead (and mirror the inverse
+      // for an all-black mark so it never sits on near-black).
+      const lum = (0.299 * ar + 0.587 * ag + 0.114 * ab) / an;
+      if (lum > 225) return "#26313c";
+      if (lum < 30) return "#e9f1f9";
       return `#${hex(ar, an)}${hex(ag, an)}${hex(ab, an)}`;
     }
     return null;
