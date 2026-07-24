@@ -84,7 +84,11 @@ If no concrete date is present but a bill clearly exists, still set \
 has_deadline=true with deadline_iso=null.
 
 ONE_LINE: a single terse line (<=120 chars), no leading label, describing what \
-this email is and why it matters. reason: a short internal justification.
+this email is and why it matters. Never name the email's GENRE - do not write \
+\"promotional email\", \"promotion for\", \"newsletter\", \"marketing\", or \
+similar: the surface the line appears on already conveys that. State the actual \
+content or offer (\"Weekend club nights in SF; free tickets\" - not \"Event \
+promotion for weekend club nights\"). reason: a short internal justification.
 
 IMPORTANCE_REASON: one short clause (<=160 chars) stating WHY you chose that \
 importance score. DEADLINE_REASON: when has_deadline=true, one short clause \

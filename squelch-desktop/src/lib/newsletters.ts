@@ -243,3 +243,24 @@ export function extractHeroSrc(html: string): string | null {
   }
   return null;
 }
+
+/**
+ * Strip redundant genre labels from a newsletter summary — "Promotional email
+ * from X:", "Event promotion for ...", "Newsletter: ..." — the Newsletters
+ * section already says what these are. Conservative: only recognized leading
+ * label shapes are removed; anything else passes through unchanged. The first
+ * surviving letter is re-capitalized.
+ */
+export function cleanSummary(summary: string): string {
+  let out = summary.trim();
+  // "Promotional email (from X)(:|-|,) ", "Marketing email: ", "Newsletter: "
+  out = out.replace(
+    /^(promotional email|marketing email|newsletter|promo(?:tion)?)\s*(from\s+[^:,-]+)?[:,-]?\s+/i,
+    "",
+  );
+  // "(Event|Sale|Summer sale|Product) promotion (for|from|of) " -> drop lead-in
+  out = out.replace(/^\w[\w ]{0,24}?\bpromotion\s+(for|from|of)\s+/i, "");
+  out = out.trim();
+  if (!out) return summary.trim();
+  return out.charAt(0).toUpperCase() + out.slice(1);
+}

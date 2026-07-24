@@ -58,6 +58,7 @@ import { Avatar } from "../components/Avatar";
 import { RetriageButton } from "../components/RetriageButton";
 import { dispatchDone } from "../lib/dispatch";
 import {
+  cleanSummary,
   deriveNewsletters,
   extractHeroSrc,
   type Newsletter,
@@ -1192,7 +1193,7 @@ function NewsletterCard({
 
       {nl.summary && (
         <p className="nl-summary">
-          {truncate(nl.summary, 90)}
+          {truncate(cleanSummary(nl.summary), 90)}
         </p>
       )}
 

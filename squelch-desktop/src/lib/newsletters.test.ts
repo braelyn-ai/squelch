@@ -9,6 +9,7 @@ import {
   senderAddress,
   domainPattern,
   extractHeroSrc,
+  cleanSummary,
 } from "./newsletters";
 import type { AttentionUpdate, SenderRule } from "../api";
 
@@ -193,5 +194,24 @@ describe("extractHeroSrc", () => {
     expect(
       extractHeroSrc('<img src="https://x/i.gif" width="1" height="1">'),
     ).toBeNull();
+  });
+});
+
+describe("cleanSummary", () => {
+  test("strips genre labels, keeps content", () => {
+    expect(
+      cleanSummary("Event promotion for weekend club nights in SF; free tickets."),
+    ).toBe("Weekend club nights in SF; free tickets.");
+    expect(cleanSummary("Promotional email from Unplug: summer sale on accessories")).toBe(
+      "Summer sale on accessories",
+    );
+    expect(cleanSummary("Newsletter: speaker identification feature for video calls.")).toBe(
+      "Speaker identification feature for video calls.",
+    );
+  });
+  test("non-labeled summaries pass through", () => {
+    expect(cleanSummary("Gray Area event invite: Creative Intelligence talks")).toBe(
+      "Gray Area event invite: Creative Intelligence talks",
+    );
   });
 });
