@@ -169,6 +169,31 @@ pub struct ActionMessageRef {
 /// [`Store::message_unsub_fields`] for `POST /client/unsubscribe`. Sealed rows
 /// are excluded in SQL so this is returned `None` for a missing OR sealed
 /// message (indistinguishable), mirroring [`Store::thread_view`].
+/// The FULL triage state of one message, for the developer-mode inspector.
+/// Serialized verbatim to the client; carries verdicts/markers/reasons but
+/// never body content. Human door only; sealed rows are never returned.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TriageDebug {
+    pub message_id: i64,
+    pub subject: String,
+    pub importance: i64,
+    pub tier: String,
+    pub category: Option<String>,
+    pub one_line: String,
+    pub reason: String,
+    pub field_reasons: Option<crate::types::FieldReasons>,
+    pub deadline: Option<String>,
+    pub matched_rule_id: Option<i64>,
+    pub status: String,
+    pub surfaced_at: Option<String>,
+    pub resolved_at: Option<String>,
+    pub stage1_model_used: Option<String>,
+    pub model_used: Option<String>,
+    pub needs_stage2: bool,
+    pub extractor_model_used: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageUnsub {
     /// The sender address as stored (the caller lowercases it for the wire).
@@ -779,6 +804,15 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         message_id: i64,
     ) -> Result<Option<MessageUnsub>>;
+
+    /// DEV DEBUG: the full triage row for one NON-SEALED message — every model
+    /// marker, verdict, and reason, for the developer-mode triage inspector.
+    /// `None` for missing OR sealed (indistinguishable). Human door only.
+    fn triage_debug(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<TriageDebug>>;
 
     /// Upsert the unsubscribe row for `(account_id, sender)`. On conflict this
     /// RESETS the violation ledger: `requested_at`/`method`/`source_message_id`

@@ -335,6 +335,23 @@ pub async fn retriage(
     Ok(Json(json!({ "reset": reset })))
 }
 
+// --- GET /client/triage-debug/{message_id} (developer tool) ------------------
+
+/// DEV INSPECTOR: the full triage state of one non-sealed message — every
+/// verdict, model marker, and reason. Read-only, human door only; sealed and
+/// unknown are an indistinguishable 404. No body content is carried.
+pub async fn triage_debug(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let dbg = blocking(move || store.triage_debug(account_id, message_id))
+        .await?
+        .ok_or(ApiError::not_found())?;
+    Ok(Json(dbg))
+}
+
 // --- GET /client/thread/{thread_id} -----------------------------------------
 
 pub async fn get_thread(

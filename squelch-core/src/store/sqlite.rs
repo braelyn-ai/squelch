@@ -12,6 +12,7 @@ use zerocopy::AsBytes;
 
 use crate::error::{CoreError, Result};
 use crate::store::{
+    TriageDebug,
     AttachmentBytes, BankingApplied, ExtractQueued, MessageUnsub, MissingVector, NewAuditEntry,
     SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
@@ -2929,6 +2930,54 @@ impl Store for SqliteStore {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    fn triage_debug(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<TriageDebug>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT t.message_id, m.subject, t.importance, t.tier, t.category,
+                        t.one_line, t.reason, t.field_reasons, t.deadline,
+                        t.matched_rule_id, t.status, t.surfaced_at, t.resolved_at,
+                        t.stage1_model_used, t.model_used, t.needs_stage2,
+                        t.extractor_model_used, t.created_at
+                 FROM triage t
+                 JOIN messages m ON m.id = t.message_id
+                 WHERE t.account_id = ?1 AND t.message_id = ?2
+                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                params![account_id, message_id],
+                |r| {
+                    Ok(TriageDebug {
+                        message_id: r.get(0)?,
+                        subject: r.get(1)?,
+                        importance: r.get(2)?,
+                        tier: r.get(3)?,
+                        category: r.get(4)?,
+                        one_line: r.get(5)?,
+                        reason: r.get(6)?,
+                        field_reasons: r
+                            .get::<_, Option<String>>(7)?
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok()),
+                        deadline: r.get(8)?,
+                        matched_rule_id: r.get(9)?,
+                        status: r.get(10)?,
+                        surfaced_at: r.get(11)?,
+                        resolved_at: r.get(12)?,
+                        stage1_model_used: r.get(13)?,
+                        model_used: r.get(14)?,
+                        needs_stage2: r.get::<_, i64>(15)? != 0,
+                        extractor_model_used: r.get(16)?,
+                        created_at: r.get(17)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     fn message_unsub_fields(

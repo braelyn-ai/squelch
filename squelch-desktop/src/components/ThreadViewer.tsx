@@ -29,7 +29,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import type { ClientThreadView, UnsubscribeRecord } from "../api";
+import type { ClientThreadView, TriageDebug, UnsubscribeRecord } from "../api";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import { dateTime, relAge } from "../lib/format";
@@ -121,6 +121,18 @@ function ViewerBody({ threadId }: { threadId: string }) {
       pushToast(e instanceof ApiError ? e.message : "re-triage failed", "error");
     } finally {
       setRetriaging(false);
+    }
+  };
+  // DEV triage inspector: full triage row for the newest message, in an
+  // overlay. null = closed.
+  const [debugInfo, setDebugInfo] = useState<TriageDebug | null>(null);
+  const openDebug = async () => {
+    const newest = thread?.messages[thread.messages.length - 1];
+    if (!newest) return;
+    try {
+      setDebugInfo(await api.getTriageDebug(newest.id));
+    } catch (e) {
+      pushToast(e instanceof ApiError ? e.message : "debug fetch failed", "error");
     }
   };
   const containerRef = useRef<HTMLDivElement>(null);
@@ -390,6 +402,15 @@ function ViewerBody({ threadId }: { threadId: string }) {
               <button
                 type="button"
                 className="close tv-unsub"
+                onClick={() => void openDebug()}
+              >
+                triage debug
+              </button>
+            )}
+            {devMode && (
+              <button
+                type="button"
+                className="close tv-unsub"
                 onClick={() => void retriageThis()}
                 disabled={retriaging}
                 title="dev: reset this email's LLM verdicts and re-run triage"
@@ -446,6 +467,10 @@ function ViewerBody({ threadId }: { threadId: string }) {
             ))}
           </div>
         </>
+      )}
+
+      {debugInfo && (
+        <TriageDebugOverlay info={debugInfo} onClose={() => setDebugInfo(null)} />
       )}
 
       {/* Confirm-first unsubscribe card. Conditional-mount so its "modal"
@@ -520,6 +545,77 @@ function UnsubConfirm({
           <button type="button" disabled={busy} onClick={() => onCancel()}>
             Cancel
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * DEV overlay: the full triage row, key/value mono rows. Own "modal"
+ * KeyContext (conditional-mount) so Esc closes it without leaking to the
+ * thread keys underneath.
+ */
+function TriageDebugOverlay({
+  info,
+  onClose,
+}: {
+  info: TriageDebug;
+  onClose: () => void;
+}) {
+  useKeyContext("modal");
+  const bindings = useMemo(
+    () => [
+      {
+        key: "Escape",
+        description: "close",
+        allowInInput: true,
+        handler: () => onClose(),
+      },
+    ],
+    [onClose],
+  );
+  useKeys("modal", bindings, [bindings]);
+
+  const rows: [string, string][] = [
+    ["message_id", String(info.message_id)],
+    ["subject", info.subject],
+    ["importance", String(info.importance)],
+    ["tier", info.tier],
+    ["category", info.category ?? "null"],
+    ["one_line", info.one_line],
+    ["reason", info.reason],
+    ["reason.importance", info.field_reasons?.importance ?? "null"],
+    ["reason.deadline", info.field_reasons?.deadline ?? "null"],
+    ["reason.tier", info.field_reasons?.tier ?? "null"],
+    ["deadline", info.deadline ?? "null"],
+    ["matched_rule_id", info.matched_rule_id?.toString() ?? "null"],
+    ["status", info.status],
+    ["surfaced_at", info.surfaced_at ?? "null"],
+    ["resolved_at", info.resolved_at ?? "null"],
+    ["stage1_model_used", info.stage1_model_used ?? "null"],
+    ["model_used (stage2)", info.model_used ?? "null"],
+    ["needs_stage2", String(info.needs_stage2)],
+    ["extractor_model_used", info.extractor_model_used ?? "null"],
+    ["created_at", info.created_at],
+  ];
+
+  return (
+    <div className="dbg-overlay" onClick={onClose}>
+      <div className="dbg-card" onClick={(e) => e.stopPropagation()}>
+        <header className="dbg-head">
+          <span className="dbg-title">triage debug</span>
+          <span className="close">
+            <kbd>Esc</kbd> close
+          </span>
+        </header>
+        <div className="dbg-rows">
+          {rows.map(([k, v]) => (
+            <div className="dbg-row" key={k}>
+              <span className="dbg-k">{k}</span>
+              <span className="dbg-v">{v}</span>
+            </div>
+          ))}
         </div>
       </div>
     </div>

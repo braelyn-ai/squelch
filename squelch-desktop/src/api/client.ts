@@ -29,6 +29,7 @@ import type {
   StoreStats,
   TriageConfig,
   TriageConfigPatch,
+  TriageDebug,
   ClientThreadView,
   UnsubResolution,
   UnsubscribeRecord,
@@ -167,6 +168,11 @@ export function retriage(
     method: "POST",
     body,
   });
+}
+
+/** DEV INSPECTOR: full triage state for one message (404 unknown/sealed). */
+export function getTriageDebug(messageId: number): Promise<TriageDebug> {
+  return request<TriageDebug>(`/client/triage-debug/${messageId}`);
 }
 
 export function refreshMail(): Promise<{ triggered: boolean }> {

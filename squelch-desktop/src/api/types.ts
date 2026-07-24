@@ -520,3 +520,28 @@ export interface UpdatesParams {
   limit?: number;
   cursor?: string;
 }
+
+/**
+ * GET /client/triage-debug/{message_id} — the FULL triage state of one message
+ * (dev inspector). Read-only; 404 for unknown/sealed.
+ */
+export interface TriageDebug {
+  message_id: number;
+  subject: string;
+  importance: number;
+  tier: string;
+  category: string | null;
+  one_line: string;
+  reason: string;
+  field_reasons: FieldReasons | null;
+  deadline: string | null;
+  matched_rule_id: number | null;
+  status: string;
+  surfaced_at: string | null;
+  resolved_at: string | null;
+  stage1_model_used: string | null;
+  model_used: string | null;
+  needs_stage2: boolean;
+  extractor_model_used: string | null;
+  created_at: string;
+}

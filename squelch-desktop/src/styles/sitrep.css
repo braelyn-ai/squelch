@@ -1438,3 +1438,60 @@
   background: rgba(255, 255, 255, 0.24);
   border-color: rgba(255, 255, 255, 0.4);
 }
+
+/* ---- DEV triage-debug overlay ---- */
+.dbg-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: grid;
+  place-items: center;
+  z-index: 130;
+}
+.dbg-card {
+  width: 640px;
+  max-width: 92vw;
+  max-height: 80vh;
+  overflow: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-modal);
+  padding: 16px 18px;
+}
+.dbg-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.dbg-title {
+  font-size: var(--label-size);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  font-weight: 600;
+  color: var(--fg-faint);
+}
+.dbg-row {
+  display: flex;
+  gap: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--card-line);
+  font-size: 12px;
+}
+.dbg-row:last-child {
+  border-bottom: none;
+}
+.dbg-k {
+  flex: 0 0 170px;
+  font-family: var(--mono);
+  color: var(--fg-faint);
+}
+.dbg-v {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  color: var(--fg);
+  word-break: break-word;
+  user-select: text;
+}
