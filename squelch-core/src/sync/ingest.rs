@@ -57,15 +57,39 @@ pub struct RawFetched {
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
-    let chars = html.chars();
-    for c in chars {
+    let mut tag_buf = String::new();
+    // Inside a <style>/<script> block: their TEXT content is code, not prose —
+    // without this, HTML-only mail flattened to a wall of CSS (visible in the
+    // sealed reveal panel and fed to the triage models as "body").
+    let mut skip_block: Option<&'static str> = None;
+    for c in html.chars() {
         match c {
-            '<' => in_tag = true,
+            '<' => {
+                in_tag = true;
+                tag_buf.clear();
+            }
             '>' => {
                 in_tag = false;
+                let name = tag_buf.trim().to_ascii_lowercase();
+                let first = name.split_whitespace().next().unwrap_or("");
+                match skip_block {
+                    None => {
+                        if first == "style" {
+                            skip_block = Some("style");
+                        } else if first == "script" {
+                            skip_block = Some("script");
+                        }
+                    }
+                    Some(k) => {
+                        if first == format!("/{k}") {
+                            skip_block = None;
+                        }
+                    }
+                }
                 out.push(' ');
             }
-            _ if in_tag => {}
+            _ if in_tag => tag_buf.push(c),
+            _ if skip_block.is_some() => {}
             _ => out.push(c),
         }
     }

@@ -2696,7 +2696,7 @@ impl Store for SqliteStore {
         let row = conn
             .query_row(
                 "SELECT m.id, m.account_id, m.thread_id, m.from_addr, m.from_name,
-                        m.subject, m.received_at, t.sealed_kind, m.body
+                        m.subject, m.received_at, t.sealed_kind, m.body, m.body_html
                  FROM messages m
                  JOIN triage t ON t.message_id = m.id
                  WHERE m.account_id = ?1 AND m.id = ?2 AND t.sensitivity = 'sealed'",
@@ -2712,12 +2712,23 @@ impl Store for SqliteStore {
                         r.get::<_, String>(6)?,
                         r.get::<_, Option<String>>(7)?,
                         r.get::<_, String>(8)?,
+                        r.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
             .optional()?;
-        let (id, acct, thread_id, from_addr, from_name, subject, received_at, sealed_kind, body) =
-            row.ok_or(CoreError::NotFound)?;
+        let (
+            id,
+            acct,
+            thread_id,
+            from_addr,
+            from_name,
+            subject,
+            received_at,
+            sealed_kind,
+            body,
+            body_html,
+        ) = row.ok_or(CoreError::NotFound)?;
         Ok(SealedBody {
             id,
             account_id: acct,
@@ -2728,6 +2739,7 @@ impl Store for SqliteStore {
             received_at: parse_dt(&received_at)?,
             sealed_kind,
             body,
+            body_html,
         })
     }
 

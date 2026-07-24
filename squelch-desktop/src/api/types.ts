@@ -447,6 +447,10 @@ export interface RevealedSealed {
   kind: string | null;
   received_at: string;
   body: string;
+  /** Server-sanitized (ammonia) HTML when the mail had one — render in the
+   *  hard-sandboxed EmailFrame, exactly like normal mail. Sensitive like
+   *  `body`: React state only, never persist. */
+  html: string | null;
 }
 
 /** Generic paginated list envelope (handlers::Page<T>). */

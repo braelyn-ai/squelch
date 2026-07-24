@@ -127,6 +127,10 @@ pub struct SealedBody {
     pub received_at: DateTime<Utc>,
     pub sealed_kind: Option<String>,
     pub body: String,
+    /// The server-side-sanitized (ammonia) HTML body stored at ingest, when the
+    /// mail had one. Serving it here keeps the single audited reveal door — the
+    /// client renders it in the SAME hard-sandboxed EmailFrame as normal mail.
+    pub body_html: Option<String>,
 }
 
 /// The Gmail ids + header source fields an action endpoint needs to act on a

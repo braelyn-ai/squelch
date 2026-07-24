@@ -12,6 +12,7 @@ import type { RevealedSealed, SealedMeta } from "../api";
 import { useKeys, useKeyContext } from "../keys";
 import { dateTime } from "../lib/format";
 import { authKindLabel, authKindIcon } from "../lib/authCopy";
+import { EmailFrame } from "./EmailFrame";
 
 export interface RevealPanelProps {
   meta: SealedMeta;
@@ -81,7 +82,18 @@ export function RevealPanel({ meta, onClose }: RevealPanelProps) {
 
         {loading && <div className="side-loading">revealing…</div>}
         {error && <div className="side-error">{error}</div>}
-        {revealed && <div className="body">{revealed.body}</div>}
+        {/* HTML mail renders through the SAME hard-sandboxed EmailFrame as the
+            normal viewer (script-less, CSP-gated, trackers stripped). No
+            cacheKey: nothing about sealed mail is remembered, not even its
+            measured height. Text-only mail keeps the plain body well. */}
+        {revealed &&
+          (revealed.html ? (
+            <div className="reveal-body-html">
+              <EmailFrame html={revealed.html} />
+            </div>
+          ) : (
+            <div className="body">{revealed.body}</div>
+          ))}
 
         <div className="foot">
           <span>cleared from memory when you close this.</span>

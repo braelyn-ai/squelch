@@ -707,6 +707,10 @@ struct RevealedSealed {
     kind: Option<String>,
     received_at: DateTime<Utc>,
     body: String,
+    /// Server-sanitized (ammonia) HTML when the mail had one — rendered by the
+    /// client in the same hard-sandboxed EmailFrame as normal mail. Same single
+    /// audited reveal door; no-store like the text body.
+    html: Option<String>,
 }
 
 pub async fn reveal_sealed(
@@ -741,6 +745,7 @@ pub async fn reveal_sealed(
         kind: sealed.sealed_kind,
         received_at: sealed.received_at,
         body: sealed.body,
+        html: sealed.body_html,
     };
 
     // Never cache a sealed body anywhere along the path.

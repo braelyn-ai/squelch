@@ -399,7 +399,7 @@
   z-index: 120;
 }
 .reveal-card {
-  width: 520px;
+  width: 720px; /* email templates lay out ~600-700px — match the viewer */
   max-width: 90vw;
   background: var(--bg-raised);
   border: 1px solid var(--lock);
