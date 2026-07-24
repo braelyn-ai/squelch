@@ -9,7 +9,7 @@
 // and is dropped from the queue on dismiss. If multiple codes arrive they queue
 // newest-first; dismissing advances to the next.
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { KeyRound, Copy, Check } from "lucide-react";
 import { useStore } from "../state";
 import { useKeys, useKeyContext } from "../keys";
@@ -29,6 +29,28 @@ export function AuthCodeModal() {
   const codeId = entry?.meta.id;
   useEffect(() => setCopied(false), [codeId]);
 
+  // AUTO-DISMISS after 30s, with a visible countdown: a code you haven't
+  // grabbed in half a minute is a code you're not grabbing — and a secret
+  // shouldn't sit on screen indefinitely. The timer is PER CODE (advancing the
+  // queue restarts it) and copying PAUSES it: you clearly still want the code
+  // (some flows need it pasted more than once), so it stays until you dismiss.
+  const AUTO_DISMISS_S = 30;
+  const [secondsLeft, setSecondsLeft] = useState(AUTO_DISMISS_S);
+  const pausedRef = useRef(false);
+  useEffect(() => {
+    if (!codeId) return;
+    pausedRef.current = false;
+    setSecondsLeft(AUTO_DISMISS_S);
+    const iv = window.setInterval(() => {
+      if (pausedRef.current) return;
+      setSecondsLeft((s) => s - 1);
+    }, 1000);
+    return () => window.clearInterval(iv);
+  }, [codeId]);
+  useEffect(() => {
+    if (secondsLeft <= 0) dismissAuthCode();
+  }, [secondsLeft, dismissAuthCode]);
+
   const KindIcon = entry ? authKindIcon(entry.meta.kind) : KeyRound;
   const code = entry?.code ?? null;
 
@@ -36,6 +58,8 @@ export function AuthCodeModal() {
     if (!code) return;
     if (await copyText(code)) {
       setCopied(true);
+      // You grabbed it — stop the countdown; dismissal is yours now.
+      pausedRef.current = true;
       window.setTimeout(() => setCopied(false), 1400);
     }
   }
@@ -115,7 +139,22 @@ export function AuthCodeModal() {
 
         <div className="authcode-foot">
           not stored · revealing it was audited
+          {!pausedRef.current && secondsLeft > 0 && (
+            <span
+              className="authcode-timer num"
+              title="auto-dismisses; copying keeps it open"
+            >
+              · {secondsLeft}s
+            </span>
+          )}
         </div>
+        {/* Slim draining countdown bar along the card's bottom edge. Freezes
+            (via the paused class) once the code has been copied. */}
+        <div
+          className={`authcode-timerbar${pausedRef.current ? " paused" : ""}`}
+          style={{ width: `${(Math.max(0, secondsLeft) / AUTO_DISMISS_S) * 100}%` }}
+          aria-hidden="true"
+        />
       </div>
     </div>
   );

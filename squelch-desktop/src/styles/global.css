@@ -834,6 +834,8 @@ svg.lucide {
   z-index: 120;
 }
 .authcode-card {
+  position: relative; /* anchors the countdown bar */
+  overflow: hidden; /* the bar hugs the rounded bottom edge */
   width: 340px;
   background: var(--bg-raised);
   border: 1px solid var(--border-strong);
@@ -1116,4 +1118,25 @@ svg.lucide {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---- auth modal auto-dismiss countdown ---- */
+.authcode-foot .authcode-timer {
+  color: var(--lock);
+  font-variant-numeric: tabular-nums;
+}
+/* Slim draining bar along the card's bottom edge — lock-purple (the auth
+   accent), width driven inline by the remaining fraction, 1s linear steps. */
+.authcode-timerbar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--lock);
+  opacity: 0.55;
+  transition: width 1s linear;
+}
+.authcode-timerbar.paused {
+  opacity: 0.2;
+  transition: none;
 }
