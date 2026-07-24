@@ -12,14 +12,15 @@ use zerocopy::AsBytes;
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    BankingApplied, ExtractQueued, MessageUnsub, MissingVector, NewAuditEntry, SealedBody,
-    SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides,
-    Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
+    AttachmentBytes, BankingApplied, ExtractQueued, MessageUnsub, MissingVector, NewAuditEntry,
+    SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
+    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking, CalendarUpdate,
-    ClientMessage, ClientThreadView, Deadline, Disposition, NewMessage, Receipt, SanitizedMessage,
-    SearchHit, SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
+    AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
+    CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
+    NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity, StoreStats,
+    ThreadView, Tier, Update, UnsubscribeRecord,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -277,6 +278,28 @@ impl SqliteStore {
             params![message_id, account_id, json],
         )?;
         Ok(())
+    }
+
+    /// Test/local helper: insert a single attachment row directly, returning its
+    /// id. Real attachments are written by the ingest pipeline
+    /// ([`Store::ingest_message`]); this lets tests seed the byte-serving endpoint
+    /// (including an over-cap, `data == None` row) without a full RFC822 fixture.
+    pub fn insert_attachment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        filename: &str,
+        mime: &str,
+        size_bytes: i64,
+        data: Option<&[u8]>,
+    ) -> Result<i64> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO attachments(account_id, message_id, filename, mime, size_bytes, data)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![account_id, message_id, filename, mime, size_bytes, data],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     // =====================================================================
@@ -962,6 +985,74 @@ fn upsert_receipt_conn(
     Ok(id)
 }
 
+/// Replace this message's attachment rows with `attachments`, in the caller's
+/// transaction. DELETE-then-INSERT (mirrors the deadlines path) keeps re-ingest
+/// idempotent without leaning on the UNIQUE(account,message,filename,size)
+/// constraint. `data == None` writes a NULL blob (over-cap: metadata only);
+/// `size_bytes` is always the real decoded size.
+///
+/// Written for sealed mail too — the byte-serving path is what guards sealed
+/// parents, not the write.
+// INSERT OR IGNORE: a hostile (or merely clumsy) sender can attach the same
+// file twice — identical filename + size violates the UNIQUE key, and a plain
+// INSERT would roll back the ENTIRE message ingest (remote ingest DoS).
+// Identical duplicates collapsing to one stored row is the desired outcome.
+fn insert_attachments_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+    attachments: &[AttachmentInfo],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM attachments WHERE account_id=?1 AND message_id=?2",
+        params![account_id, message_id],
+    )?;
+    for a in attachments {
+        conn.execute(
+            "INSERT OR IGNORE INTO attachments(account_id, message_id, filename, mime, size_bytes, data)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                account_id,
+                message_id,
+                a.filename,
+                a.mime,
+                a.size_bytes,
+                a.data.as_deref(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Load one message's attachment metadata (NO bytes) as the human-door wire
+/// shape, ordered by row id. `downloadable` is `data IS NOT NULL`. Caller is
+/// responsible for the sealed guard (the only caller, `thread_view_with_html`,
+/// already 404s any sealed thread).
+fn load_client_attachments_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+) -> Result<Vec<ClientAttachment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, filename, mime, size_bytes, data IS NOT NULL
+         FROM attachments
+         WHERE account_id=?1 AND message_id=?2
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id, message_id], |r| {
+            Ok(ClientAttachment {
+                id: r.get(0)?,
+                filename: r.get(1)?,
+                mime: r.get(2)?,
+                size: r.get(3)?,
+                downloadable: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Upsert a banking row keyed by `(account_id, message_id)`. Idempotent: a
 /// re-run overwrites kind/institution/amount/currency/account_hint/received_at.
 /// Runs in the caller's connection/transaction.
@@ -1454,20 +1545,30 @@ impl Store for SqliteStore {
              WHERE account_id=?1 AND thread_id=?2
              ORDER BY received_at ASC",
         )?;
-        let rows = stmt.query_map(params![account_id, thread_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-            ))
-        })?;
+        // Collect the message rows first (releasing `stmt`'s borrow of `conn`) so
+        // the per-message attachment query below can run on the same connection.
+        let rows = stmt
+            .query_map(params![account_id, thread_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
 
         let mut messages = Vec::new();
-        for row in rows {
-            let (id, from_addr, from_name, received_at, body, body_html) = row?;
+        for (id, from_addr, from_name, received_at, body, body_html) in rows {
+            // Attachment metadata for this message. `downloadable` is
+            // `data IS NOT NULL` — false when only over-cap metadata was kept.
+            // ALWAYS present on the wire ([] when none). No sealed guard is
+            // needed here: this whole view already 404s any thread containing a
+            // sealed message (checked above).
+            let attachments = load_client_attachments_conn(&conn, account_id, id)?;
             messages.push(ClientMessage {
                 id,
                 from_addr,
@@ -1475,6 +1576,7 @@ impl Store for SqliteStore {
                 received_at: parse_dt(&received_at)?,
                 content: body,
                 html: body_html,
+                attachments,
             });
         }
         if messages.is_empty() {
@@ -1486,6 +1588,40 @@ impl Store for SqliteStore {
             subject,
             messages,
         })
+    }
+
+    fn attachment_bytes(
+        &self,
+        account_id: AccountId,
+        attachment_id: i64,
+    ) -> Result<Option<AttachmentBytes>> {
+        let conn = self.lock()?;
+        // SECURITY: the parent message must be non-sealed. A LEFT JOIN + COALESCE
+        // treats a message with no triage row as 'normal' (like
+        // `thread_id_for_message`), but requires sensitivity='normal' otherwise —
+        // so a sealed parent yields no row and the caller returns 404,
+        // indistinguishable from an unknown id. When the row exists but `data` is
+        // NULL (over the ingest cap), `Some((.., .., None))` flows out and the
+        // endpoint answers 410.
+        let row = conn
+            .query_row(
+                "SELECT a.filename, a.mime, a.data
+                 FROM attachments a
+                 JOIN messages m ON m.id = a.message_id AND m.account_id = a.account_id
+                 LEFT JOIN triage t ON t.message_id = a.message_id
+                 WHERE a.account_id = ?1 AND a.id = ?2
+                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                params![account_id, attachment_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     fn deadlines(
@@ -2337,6 +2473,12 @@ impl Store for SqliteStore {
                 triaged.message.received_at,
             )?;
         }
+
+        // 7. Attachments: written for BOTH sealed and non-sealed mail (storage is
+        //    fine; the byte-serving endpoint guards sealed parents). Replace any
+        //    prior rows for this message so re-ingest is idempotent, then insert
+        //    each part (over-cap parts carry `data == None` -> a NULL blob).
+        insert_attachments_conn(&tx, triaged.message.account_id, id, &triaged.attachments)?;
 
         tx.commit()?;
         Ok(id)
@@ -3557,6 +3699,154 @@ mod tests {
     use crate::types::{SealedKind, Sensitivity, Tier};
     use chrono::TimeZone;
 
+    #[test]
+    fn ingest_message_persists_attachments_and_thread_view_carries_them() {
+        use crate::config::Stage1Config;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let eml = "From: S <s@ex.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: files\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+                   \r\n\
+                   --B\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+                   --B\r\nContent-Type: application/pdf\r\n\
+                   Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n\
+                   --B--\r\n";
+        let fetched = crate::sync::ingest::RawFetched {
+            account_id: acct,
+            gmail_msg_id: "g1".into(),
+            gmail_thread_id: Some("t1".into()),
+            raw: eml.as_bytes().to_vec(),
+            internal_date: Some(Utc::now()),
+            is_sent: false,
+            account_addr: "me@example.com".into(),
+        };
+        let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.attachments.len(), 1, "one pdf attachment extracted");
+        let mid = store.ingest_message(&t).unwrap();
+
+        // Thread view carries the attachment metadata (downloadable = true).
+        let view = store.thread_view_with_html(acct, "t1").unwrap();
+        assert_eq!(view.messages.len(), 1);
+        let atts = &view.messages[0].attachments;
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].filename, "doc.pdf");
+        assert_eq!(atts[0].mime, "application/pdf");
+        assert_eq!(atts[0].size, 5);
+        assert!(atts[0].downloadable);
+
+        // Bytes come back through attachment_bytes.
+        let got = store.attachment_bytes(acct, atts[0].id).unwrap().expect("bytes");
+        assert_eq!(got.0, "doc.pdf");
+        assert_eq!(got.2.as_deref(), Some(&b"Hello"[..]));
+
+        // Re-ingest is idempotent: still exactly one attachment row.
+        let mid2 = store.ingest_message(&t).unwrap();
+        assert_eq!(mid, mid2);
+        let view2 = store.thread_view_with_html(acct, "t1").unwrap();
+        assert_eq!(view2.messages[0].attachments.len(), 1, "re-ingest must not duplicate");
+    }
+
+    #[test]
+    fn double_attached_identical_file_cannot_kill_ingest() {
+        // REMOTE INGEST DoS REGRESSION: two parts with the SAME filename and
+        // size (trivial for a hostile sender; plausible accidentally) violated
+        // the UNIQUE key and rolled back the whole message ingest. INSERT OR
+        // IGNORE collapses them to one row; the ingest must succeed.
+        use crate::config::Stage1Config;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let eml = "From: S <s@ex.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: dup\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+                   \r\n\
+                   --B\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+                   --B\r\nContent-Type: application/pdf\r\n\
+                   Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n\
+                   --B\r\nContent-Type: application/pdf\r\n\
+                   Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n\
+                   --B--\r\n";
+        let fetched = crate::sync::ingest::RawFetched {
+            account_id: acct,
+            gmail_msg_id: "g-dup".into(),
+            gmail_thread_id: Some("t-dup".into()),
+            raw: eml.as_bytes().to_vec(),
+            internal_date: Some(Utc::now()),
+            is_sent: false,
+            account_addr: "me@example.com".into(),
+        };
+        let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.attachments.len(), 2, "both parts extracted");
+        // The ingest MUST NOT error — identical duplicates collapse to one row.
+        store.ingest_message(&t).expect("duplicate attachments must not fail ingest");
+        let view = store.thread_view_with_html(acct, "t-dup").unwrap();
+        assert_eq!(view.messages[0].attachments.len(), 1);
+    }
+
+    #[test]
+    fn attachment_bytes_guards_sealed_overcap_and_unknown() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // Normal parent with a stored attachment and an over-cap (NULL data) one.
+        let mid = store.upsert_message(&sample_msg(acct, "g1", "t1")).unwrap();
+        store
+            .set_triage(mid, acct, 10, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        let a_ok = store
+            .insert_attachment(acct, mid, "doc.pdf", "application/pdf", 5, Some(b"Hello"))
+            .unwrap();
+        let a_over = store
+            .insert_attachment(acct, mid, "big.bin", "application/octet-stream", 11_000_000, None)
+            .unwrap();
+
+        // Normal parent, bytes present.
+        let ok = store.attachment_bytes(acct, a_ok).unwrap().expect("row");
+        assert_eq!(ok.2.as_deref(), Some(&b"Hello"[..]));
+
+        // Over-cap: row resolves but data is None (endpoint -> 410).
+        let over = store.attachment_bytes(acct, a_over).unwrap().expect("metadata row exists");
+        assert!(over.2.is_none(), "over-cap attachment carries no bytes");
+
+        // Unknown id -> None (endpoint -> 404).
+        assert!(store.attachment_bytes(acct, 999_999).unwrap().is_none());
+
+        // Sealed parent: attachment is stored, but attachment_bytes hides it
+        // (returns None, indistinguishable from unknown -> 404).
+        let sid = store.upsert_message(&sample_msg(acct, "g2", "t2")).unwrap();
+        store
+            .set_triage(
+                sid,
+                acct,
+                0,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        let sealed_att = store
+            .insert_attachment(acct, sid, "secret.pdf", "application/pdf", 6, Some(b"secret"))
+            .unwrap();
+        assert!(
+            store.attachment_bytes(acct, sealed_att).unwrap().is_none(),
+            "sealed parent must hide its attachment bytes"
+        );
+    }
+
     fn sample_msg(account_id: AccountId, gmail_id: &str, thread: &str) -> NewMessage {
         NewMessage {
             account_id,
@@ -3605,6 +3895,7 @@ mod tests {
                 currency: amount.map(|_| "USD".into()),
             }),
             calendar: None,
+            attachments: vec![],
             confident: true,
         }
     }
@@ -3639,6 +3930,7 @@ mod tests {
             shipment: None,
             receipt: None,
             calendar: None,
+            attachments: vec![],
             confident: true,
         }
     }
@@ -4393,6 +4685,7 @@ mod tests {
                 starts_at: Some(Utc.with_ymd_and_hms(2026, 7, 22, 10, 0, 0).unwrap()),
                 organizer: Some("Sam Doe".into()),
             }),
+            attachments: vec![],
             confident: true,
         }
     }
@@ -4534,6 +4827,7 @@ mod tests {
             shipment: None,
             receipt: None,
             calendar: None,
+            attachments: vec![],
             confident: true,
         }
     }
@@ -5480,6 +5774,7 @@ mod tests {
             shipment: None,
             receipt: None,
             calendar: None,
+            attachments: vec![],
             confident,
         }
     }

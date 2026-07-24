@@ -366,6 +366,36 @@ CREATE TABLE IF NOT EXISTS app_settings (
     UNIQUE(account_id, key)
 );
 
+-- EMAIL ATTACHMENTS. One row per attachment part extracted from a message's
+-- full RFC822 at ingest — real attachments (Content-Disposition: attachment) AND
+-- cid-inline parts (Content-Disposition: inline with a Content-ID, the way
+-- templates embed logos). `data` holds the decoded bytes, or NULL when the part
+-- exceeded the ingest cap (per-attachment 10 MB / per-message total 25 MB): the
+-- metadata still lands so the client can show the row, but the bytes were not
+-- stored (downloadable=false on the wire; the byte endpoint returns 410).
+-- `size_bytes` is always the part's real decoded size, whether or not the bytes
+-- were kept.
+--
+-- SECURITY: attachments are STORED for sealed mail exactly like the body
+-- (storage is fine; serving is guarded). The byte-serving path
+-- (`attachment_bytes`) JOINs `triage` and requires sensitivity='normal', so a
+-- sealed parent makes an attachment indistinguishable from a nonexistent one
+-- (both 404). The thread view that lists attachment metadata already 404s any
+-- thread containing a sealed message, so sealed attachment metadata never leaks
+-- there either.
+CREATE TABLE IF NOT EXISTS attachments (
+    id          INTEGER PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    filename    TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    data        BLOB,              -- NULL when over the ingest cap (metadata only)
+    UNIQUE(account_id, message_id, filename, size_bytes)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(account_id, message_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
 
 -- ON-BOX SEMANTIC RECALL (v1). A sqlite-vec `vec0` virtual table holding one

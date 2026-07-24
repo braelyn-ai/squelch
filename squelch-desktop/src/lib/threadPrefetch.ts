@@ -31,7 +31,10 @@ const WARM_PER_MESSAGE = 12;
 /** Bound the warmed-URL memo so it can't grow without limit. */
 const WARMED_MAX = 600;
 
-const cache = new Map<string, { view: ClientThreadView; ts: number }>();
+const cache = new Map<
+  string,
+  { view: ClientThreadView; ts: number; freshMs: number }
+>();
 const inflight = new Set<string>();
 const warmedUrls = new Set<string>();
 
@@ -66,9 +69,9 @@ function warmImages(view: ClientThreadView): void {
   }
 }
 
-function put(threadId: string, view: ClientThreadView): void {
+function put(threadId: string, view: ClientThreadView, freshMs: number): void {
   cache.delete(threadId); // re-insert => most-recent position
-  cache.set(threadId, { view, ts: Date.now() });
+  cache.set(threadId, { view, ts: Date.now(), freshMs });
   if (cache.size > CACHE_MAX) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
@@ -77,9 +80,17 @@ function put(threadId: string, view: ClientThreadView): void {
 
 /** Fire-and-forget: fetch + cache + warm. Deduped while in flight; a fresh
  *  cache hit just re-warms (Image() from HTTP cache is ~free). */
-export function prefetchThread(threadId: string): void {
+export function prefetchThread(
+  threadId: string,
+  opts?: { freshMs?: number },
+): void {
+  // Per-entry TTL: right-rail records (banking/receipts) stay valid as long as
+  // their column shows them, so their cached threads outlive the 60s default.
+  // A repeat prefetch may EXTEND an entry's ttl (never shorten it).
+  const freshMs = opts?.freshMs ?? FRESH_MS;
   const hit = cache.get(threadId);
-  if (hit && Date.now() - hit.ts < FRESH_MS) {
+  if (hit && Date.now() - hit.ts < Math.max(hit.freshMs, freshMs)) {
+    if (freshMs > hit.freshMs) hit.freshMs = freshMs;
     warmImages(hit.view);
     return;
   }
@@ -88,7 +99,7 @@ export function prefetchThread(threadId: string): void {
   api
     .getThread(threadId)
     .then((view) => {
-      put(threadId, view);
+      put(threadId, view, freshMs);
       warmImages(view);
     })
     .catch(() => {
@@ -100,13 +111,13 @@ export function prefetchThread(threadId: string): void {
 /** A fresh cached view for instant render, or null. */
 export function getPrefetchedThread(threadId: string): ClientThreadView | null {
   const hit = cache.get(threadId);
-  if (!hit || Date.now() - hit.ts >= FRESH_MS) return null;
+  if (!hit || Date.now() - hit.ts >= hit.freshMs) return null;
   return hit.view;
 }
 
 /** Let the viewer's own (authoritative) fetch feed the cache + warm images —
  *  the next reopen of the same thread is then instant too. */
 export function noteFetchedThread(threadId: string, view: ClientThreadView): void {
-  put(threadId, view);
+  put(threadId, view, FRESH_MS);
   warmImages(view);
 }

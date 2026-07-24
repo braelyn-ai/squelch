@@ -2002,3 +2002,264 @@ async fn triage_config_post_rejects_out_of_range_and_non_integer() {
     // Nothing was persisted by any rejected request.
     assert_eq!(store.stage2_cap_overrides(acct).unwrap(), Default::default());
 }
+
+// --- attachments ------------------------------------------------------------
+
+/// Collect a response body into raw bytes.
+async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+    resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+}
+
+fn header_str(resp: &axum::response::Response, name: header::HeaderName) -> String {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn thread_carries_attachment_metadata_and_empty_when_none() {
+    let (app, store, acct) = app_with(|store, acct| {
+        // Thread t1: one message with a stored pdf + an over-cap (NULL data) part.
+        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "s1", "b1")).unwrap();
+        store
+            .set_triage(m1, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        store
+            .insert_attachment(acct, m1, "doc.pdf", "application/pdf", 5, Some(b"Hello"))
+            .unwrap();
+        store
+            .insert_attachment(acct, m1, "big.bin", "application/octet-stream", 11_000_000, None)
+            .unwrap();
+        // Thread t2: a message with NO attachments -> [] on the wire.
+        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "s2", "b2")).unwrap();
+        store
+            .set_triage(m2, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+    });
+    let _ = (&store, acct);
+
+    let resp = app.clone().oneshot(authed("GET", "/client/thread/t1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let atts = &json["messages"][0]["attachments"];
+    assert_eq!(atts.as_array().unwrap().len(), 2);
+    // Ordered by id: pdf first (downloadable), big second (not downloadable).
+    assert_eq!(atts[0]["filename"], "doc.pdf");
+    assert_eq!(atts[0]["mime"], "application/pdf");
+    assert_eq!(atts[0]["size"], 5);
+    assert_eq!(atts[0]["downloadable"], true);
+    assert_eq!(atts[1]["filename"], "big.bin");
+    assert_eq!(atts[1]["downloadable"], false);
+
+    let resp = app.oneshot(authed("GET", "/client/thread/t2")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["messages"][0]["attachments"],
+        serde_json::json!([]),
+        "attachments key is always present, [] when none"
+    );
+}
+
+#[tokio::test]
+async fn attachment_bytes_headers_apply_render_safety_whitelist() {
+    // Seed one attachment of each interesting mime; ids come back in insert order.
+    let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i64, &'static str)>::new()));
+    let ids_seed = ids.clone();
+    let (app, _store, _acct) = app_with(move |store, acct| {
+        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        store
+            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        let mut v = ids_seed.lock().unwrap();
+        v.push((
+            store.insert_attachment(acct, m, "doc.pdf", "application/pdf", 3, Some(b"pdf")).unwrap(),
+            "pdf",
+        ));
+        v.push((
+            store.insert_attachment(acct, m, "pic.png", "image/png", 3, Some(b"png")).unwrap(),
+            "png",
+        ));
+        v.push((
+            store
+                .insert_attachment(acct, m, "vec.svg", "image/svg+xml", 3, Some(b"svg"))
+                .unwrap(),
+            "svg",
+        ));
+        v.push((
+            store
+                .insert_attachment(acct, m, "page.html", "text/html", 3, Some(b"htm"))
+                .unwrap(),
+            "html",
+        ));
+        // Case/parameter tricks + the xml family: all must force octet-stream.
+        v.push((
+            store
+                .insert_attachment(acct, m, "shout.svg", "IMAGE/SVG+XML; charset=x", 3, Some(b"svg"))
+                .unwrap(),
+            "svg-shout",
+        ));
+        v.push((
+            store
+                .insert_attachment(acct, m, "bare.svg", "image/svg", 3, Some(b"svg"))
+                .unwrap(),
+            "svg-bare",
+        ));
+        v.push((
+            store
+                .insert_attachment(acct, m, "x.xhtml", "application/xhtml+xml", 3, Some(b"xht"))
+                .unwrap(),
+            "xhtml",
+        ));
+        v.push((
+            store
+                .insert_attachment(acct, m, "x.xml", "text/xml", 3, Some(b"xml"))
+                .unwrap(),
+            "txml",
+        ));
+        v.push((
+            store
+                .insert_attachment(acct, m, "y.xml", "application/xml", 3, Some(b"xml"))
+                .unwrap(),
+            "axml",
+        ));
+    });
+
+    let ids = ids.lock().unwrap().clone();
+    for (id, kind) in ids {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/client/attachments/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{kind} should 200");
+        let ct = header_str(&resp, header::CONTENT_TYPE);
+        match kind {
+            "pdf" => assert_eq!(ct, "application/pdf"),
+            "png" => assert_eq!(ct, "image/png"),
+            // Scriptable types must NEVER be renderable from our origin.
+            "svg" => assert_eq!(ct, "application/octet-stream", "svg must be octet-stream"),
+            "html" => assert_eq!(ct, "application/octet-stream", "html must be octet-stream"),
+            "svg-shout" | "svg-bare" | "xhtml" | "txml" | "axml" => assert_eq!(
+                ct, "application/octet-stream",
+                "{kind}: scriptable/xml-family mime must be octet-stream"
+            ),
+            _ => unreachable!(),
+        }
+        // Common security headers on every served attachment.
+        assert_eq!(header_str(&resp, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        assert_eq!(header_str(&resp, header::CACHE_CONTROL), "private, max-age=3600");
+        assert!(
+            header_str(&resp, header::CONTENT_DISPOSITION).starts_with("attachment;"),
+            "must be an attachment disposition"
+        );
+        let bytes = body_bytes(resp).await;
+        assert_eq!(bytes.len(), 3, "{kind} bytes served");
+    }
+}
+
+#[tokio::test]
+async fn attachment_filename_is_sanitized_in_disposition() {
+    let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
+    let id_seed = id.clone();
+    let (app, _store, _acct) = app_with(move |store, acct| {
+        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        store
+            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        *id_seed.lock().unwrap() = store
+            .insert_attachment(
+                acct,
+                m,
+                "../../evil\"name.pdf",
+                "application/pdf",
+                3,
+                Some(b"pdf"),
+            )
+            .unwrap();
+    });
+    let id = *id.lock().unwrap();
+    let resp = app
+        .oneshot(authed("GET", &format!("/client/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let disp = header_str(&resp, header::CONTENT_DISPOSITION);
+    // Path separators and quotes stripped; the header stays well-formed.
+    assert!(!disp.contains('/'), "no path separators: {disp}");
+    assert!(!disp.contains('\\'), "no backslashes: {disp}");
+    assert_eq!(disp, "attachment; filename=\"....evilname.pdf\"");
+}
+
+#[tokio::test]
+async fn attachment_over_cap_is_410() {
+    let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
+    let id_seed = id.clone();
+    let (app, _store, _acct) = app_with(move |store, acct| {
+        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        store
+            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        // Metadata only (data == None): over the ingest cap.
+        *id_seed.lock().unwrap() = store
+            .insert_attachment(acct, m, "big.bin", "application/octet-stream", 11_000_000, None)
+            .unwrap();
+    });
+    let id = *id.lock().unwrap();
+    let resp = app
+        .oneshot(authed("GET", &format!("/client/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn attachment_on_sealed_parent_is_404() {
+    let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
+    let id_seed = id.clone();
+    let (app, _store, _acct) = app_with(move |store, acct| {
+        let m = store.upsert_message(&msg(acct, "g1", "t1", "code", "secret")).unwrap();
+        store
+            .set_triage(
+                m,
+                acct,
+                0,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        *id_seed.lock().unwrap() = store
+            .insert_attachment(acct, m, "secret.pdf", "application/pdf", 6, Some(b"secret"))
+            .unwrap();
+    });
+    let id = *id.lock().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "sealed parent -> 404");
+
+    // An unknown id is likewise 404 (indistinguishable from the sealed case).
+    let resp = app
+        .oneshot(authed("GET", "/client/attachments/999999"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn attachment_requires_bearer_auth() {
+    let (app, _store, _acct) = app_with(|_, _| {});
+    let req = Request::builder()
+        .uri("/client/attachments/1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "byte endpoint is behind auth");
+}

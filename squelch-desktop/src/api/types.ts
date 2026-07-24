@@ -77,10 +77,27 @@ export interface ThreadView {
 }
 
 /**
+ * core::types::Attachment — one attachment on a HUMAN-door ClientMessage. Never
+ * present on the /mcp (agent-door) SanitizedMessage. `size` is bytes.
+ * `downloadable` is false when the raw bytes were NOT stored (the attachment was
+ * over the ingest cap): the metadata still exists but GET /client/attachments/{id}
+ * would 410, so the UI shows the card dimmed with no actions. Inline images
+ * referenced by `cid:` in the body ARE stored as attachments (that's how mail
+ * templates embed logos), so this list can include the message's own inline art.
+ */
+export interface Attachment {
+  id: number;
+  filename: string;
+  mime: string;
+  size: number; // bytes
+  downloadable: boolean;
+}
+
+/**
  * core::types::ClientMessage — the HUMAN-door message shape. Adds `html`: a
  * server-side-sanitized (ammonia) HTML string, or null for plain-text-only
  * mail (client then falls back to `content`). Remote content is blocked by the
- * client CSP, never at ingest.
+ * client CSP, never at ingest. `attachments` is ALWAYS present ([] when none).
  */
 export interface ClientMessage {
   id: number;
@@ -89,6 +106,7 @@ export interface ClientMessage {
   received_at: string;
   content: string;
   html: string | null;
+  attachments: Attachment[];
 }
 
 /** core::types::ClientThreadView (GET /client/thread/{id}). */

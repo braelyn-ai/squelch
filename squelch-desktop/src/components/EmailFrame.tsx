@@ -56,13 +56,13 @@
 // the shell. We de-dupe + cap the list so a marketing mail with 40 tracking
 // links doesn't swamp the pane. If the html has no links, nothing renders.
 //
-// FOCUS/KEYS: a script-less iframe still steals keyboard focus if it is
-// tabbable, and keydowns landing inside it never reach the parent window's
-// listener (the keymap in ../keys). We keep the iframe OUT of the tab order and
-// non-focusable-by-pointer as much as the platform allows (tabIndex={-1}); the
-// message card around it stays the focus/selection target. See ThreadViewer for
-// the j/k/Esc guarantee — those keys are handled on window and never enter the
-// frame because the frame is never focused programmatically.
+// FOCUS/KEYS: a script-less iframe still steals keyboard focus when CLICKED,
+// and keydowns landing inside it never reach the parent window's listener (the
+// keymap in ../keys) — Esc/j/k went dead after a click into an email. The frame
+// is same-origin, so onFrameLoad attaches a contentDocument keydown listener
+// that RE-DISPATCHES each key on the parent window (synthetic events are fine —
+// the keymap is our own listener, not a browser default). tabIndex={-1} still
+// keeps the frame out of the tab order.
 //
 // HEIGHT: allow-same-origin (above) lets the parent read contentDocument, so
 // on the iframe's load event we measure documentElement.scrollHeight (body as
@@ -282,6 +282,27 @@ export function EmailFrame({
     }
 
     measure();
+    // KEY FORWARDING: clicking inside the frame moves keyboard focus into the
+    // frame's document, and keydowns inside an iframe NEVER reach the parent
+    // window's keymap listener — Esc/j/k went dead after a click into an email.
+    // The frame is same-origin (see header), so forward its keydowns by
+    // re-dispatching on the parent window. Synthetic events (isTrusted=false)
+    // are fine — the keymap is our own listener, not a browser default.
+    const onFrameKey = (e: KeyboardEvent) => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: e.key,
+          metaKey: e.metaKey,
+          ctrlKey: e.ctrlKey,
+          altKey: e.altKey,
+          shiftKey: e.shiftKey,
+        }),
+      );
+      // Keep the frame from scrolling on keys the app claims (space/arrows).
+      if (["Escape", "ArrowDown", "ArrowUp"].includes(e.key)) e.preventDefault();
+    };
+    doc.addEventListener("keydown", onFrameKey);
+
     // Images arriving are the ONLY post-load height change (no scripts can
     // run inside) — re-measure as they load, BATCHED to one measure per frame
     // (a burst of cached images landing together must cause at most one
@@ -308,6 +329,7 @@ export function EmailFrame({
     teardownRef.current = () => {
       cancelAnimationFrame(raf);
       if (imgRaf) cancelAnimationFrame(imgRaf);
+      doc.removeEventListener("keydown", onFrameKey);
       for (const img of imgs) {
         img.removeEventListener("load", onImg);
         img.removeEventListener("error", onImg);

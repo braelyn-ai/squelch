@@ -40,6 +40,7 @@ import { usePref } from "../lib/prefs";
 import { dispatchDone } from "../lib/dispatch";
 import { createBlockRule } from "../actions/blockSender";
 import { EmailFrame } from "./EmailFrame";
+import { AttachmentStrip } from "./AttachmentStrip";
 import {
   getPrefetchedThread,
   noteFetchedThread,
@@ -378,6 +379,17 @@ function ViewerBody({ threadId }: { threadId: string }) {
             {/* Discoverable unsubscribe affordance — same kbd+label language as
                 the Esc hint. Shows the prior-request age once a record exists;
                 clicking always (re-)fires the request. */}
+            {devMode && (
+              <button
+                type="button"
+                className="close tv-unsub"
+                onClick={() => void retriageThis()}
+                disabled={retriaging}
+                title="dev: reset this email's LLM verdicts and re-run triage"
+              >
+                {retriaging ? "re-triaging…" : "re-triage"}
+              </button>
+            )}
             <button
               type="button"
               className="close tv-unsub"
@@ -392,17 +404,6 @@ function ViewerBody({ threadId }: { threadId: string }) {
                 </>
               )}
             </button>
-            {devMode && (
-              <button
-                type="button"
-                className="close tv-unsub"
-                onClick={() => void retriageThis()}
-                disabled={retriaging}
-                title="dev: reset this email's LLM verdicts and re-run triage"
-              >
-                {retriaging ? "re-triaging…" : "re-triage"}
-              </button>
-            )}
             <span className="close">
               <kbd>Esc</kbd> back
             </span>
@@ -430,6 +431,10 @@ function ViewerBody({ threadId }: { threadId: string }) {
                 ) : (
                   <PlainBody content={m.content} />
                 )}
+                {/* Attachment strip under the body. `attachments` is always
+                    present on the human-door shape; the strip self-hides when
+                    empty. */}
+                <AttachmentStrip attachments={m.attachments ?? []} />
               </div>
             ))}
           </div>

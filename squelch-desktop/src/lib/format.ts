@@ -24,6 +24,16 @@ export function relAge(iso: string | null | undefined): string {
   return `${Math.round(mo)}mo`;
 }
 
+/** Human byte size for attachment cards, e.g. "812 B", "34 KB", "2.4 MB". */
+export function humanSize(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+}
+
 /** Louder relative age used in the STILL OPEN band, e.g. "2 WEEKS", "5 DAYS". */
 export function loudAge(iso: string | null | undefined): string {
   if (!iso) return "";

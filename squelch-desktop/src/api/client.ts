@@ -179,6 +179,79 @@ export function getThread(threadId: string): Promise<ClientThreadView> {
   );
 }
 
+/** The raw bytes of one attachment plus the mime/filename the server served. */
+export interface FetchedAttachment {
+  bytes: ArrayBuffer;
+  /** The Content-Type the server served — image/* or application/pdf when it
+   *  deemed the type safe to render, otherwise application/octet-stream. */
+  mime: string;
+  filename: string;
+}
+
+/**
+ * Parse a filename out of a Content-Disposition header. Handles the RFC 5987
+ * `filename*=UTF-8''…` form (percent-decoded) and the plain quoted `filename="…"`
+ * form. Returns null when neither is present so the caller can fall back to the
+ * message-level attachment metadata name.
+ */
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null;
+  // RFC 5987 extended form takes precedence when present.
+  const ext = /filename\*\s*=\s*(?:UTF-8|utf-8|[\w-]*)''([^;]+)/i.exec(header);
+  if (ext && ext[1]) {
+    try {
+      return decodeURIComponent(ext[1].trim());
+    } catch {
+      /* malformed %-encoding — fall through to the plain form */
+    }
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(header);
+  if (plain && plain[1]) return plain[1].trim();
+  return null;
+}
+
+/**
+ * Fetch one attachment's raw bytes over the authenticated human door. Bearer
+ * auth means an <img src>/<embed src> pointed straight at this route can't work
+ * (no header) — ALL attachment bytes must flow through here into a Blob +
+ * URL.createObjectURL (revoked by the caller on unmount).
+ *
+ * `fallbackName` is the message-level attachment filename, used when the server
+ * omits a Content-Disposition name. Non-2xx throws an ApiError: 404
+ * (unknown/sealed), 410 (metadata-only, bytes never stored — over the ingest
+ * cap), or a transport failure. The token is never echoed into the error.
+ */
+export async function fetchAttachment(
+  id: number,
+  fallbackName = "attachment",
+): Promise<FetchedAttachment> {
+  const { baseUrl, token } = requireConfig();
+  const url = `${baseUrl}/client/attachments/${id}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    throw new ApiError("network", 0, "cannot reach squelch server");
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      kindForStatus(res.status),
+      res.status,
+      `attachment fetch failed (${res.status})`,
+    );
+  }
+  const bytes = await res.arrayBuffer();
+  const mime =
+    res.headers.get("Content-Type") || "application/octet-stream";
+  const filename =
+    filenameFromDisposition(res.headers.get("Content-Disposition")) ||
+    fallbackName;
+  return { bytes, mime, filename };
+}
+
 export function search(
   q: string,
   opts: {

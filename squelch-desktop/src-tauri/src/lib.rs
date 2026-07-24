@@ -186,6 +186,9 @@ async fn llm_complete(body: serde_json::Value) -> Result<LlmResponse, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Attachment download: save dialog + fs write to the user-chosen path.
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,

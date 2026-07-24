@@ -733,7 +733,24 @@ function ReceiptsZone() {
     let alive = true;
     api
       .getReceipts()
-      .then((r) => alive && setReceipts(r))
+      .then((r) => {
+        if (!alive) return;
+        setReceipts(r);
+        // Preload today's receipts' emails; the column drops them at local
+        // midnight, so the cache TTL matches (staggered).
+        const midnight = new Date();
+        midnight.setHours(24, 0, 0, 0);
+        const ttl = Math.max(60_000, midnight.getTime() - Date.now());
+        r.filter((rec) => isToday(rec.received_at))
+          .forEach((rec, i) => {
+            if (rec.thread_id) {
+              window.setTimeout(
+                () => prefetchThread(rec.thread_id, { freshMs: ttl }),
+                120 * i,
+              );
+            }
+          });
+      })
       .catch(() => {
         // Non-fatal: leave the zone empty rather than surface token/url.
         if (alive) setReceipts([]);
@@ -841,7 +858,20 @@ function BankingZone() {
     let alive = true;
     api
       .getBanking()
-      .then((r) => alive && setRecords(r))
+      .then((r) => {
+        if (!alive) return;
+        setRecords(r);
+        // Preload the shown records' emails; they live in the column until
+        // newer records rotate them out, so cache for a day (staggered).
+        r.slice(0, BANKING_SHOWN).forEach((rec, i) => {
+          if (rec.thread_id) {
+            window.setTimeout(
+              () => prefetchThread(rec.thread_id, { freshMs: 86_400_000 }),
+              120 * i,
+            );
+          }
+        });
+      })
       .catch(() => {
         // Non-fatal: leave the zone empty rather than surface token/url.
         if (alive) setRecords([]);

@@ -19,9 +19,9 @@ use crate::triage::receipt;
 use crate::triage::seal::{self, SealInput};
 use crate::triage::shipment;
 use crate::triage::stage1_with_config;
-use crate::types::{AccountId, FieldReasons, NewMessage, Sensitivity, Tier};
+use crate::types::{AccountId, AttachmentInfo, FieldReasons, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
-use mail_parser::{Address, MessageParser};
+use mail_parser::{Address, MessageParser, MimeHeaders};
 
 /// The raw identity/metadata the transport supplies alongside the RFC822 body.
 /// The Gmail REST engine fills `gmail_msg_id` from the native `message.id` and
@@ -301,6 +301,73 @@ pub fn stable_hash(input: &str) -> String {
     format!("{h:016x}")
 }
 
+/// INGEST CAPS. Bytes are stored only up to these limits; a part over the
+/// per-attachment cap, or one that would push the message's stored total over the
+/// per-message cap, keeps its metadata but drops its bytes (`data: None`).
+const ATTACHMENT_CAP_BYTES: usize = 10 * 1024 * 1024;
+const MESSAGE_ATTACHMENT_TOTAL_CAP_BYTES: usize = 25 * 1024 * 1024;
+
+/// Extract every attachment part from a parsed message — REAL attachments
+/// (`Content-Disposition: attachment`) AND cid-inline parts
+/// (`Content-Disposition: inline` with a `Content-ID`, how templates embed
+/// logos). mail-parser's `attachments()` iterator already yields exactly this set
+/// (everything that is not a displayed text/html body part).
+///
+/// Caps are applied here (see the consts above): the metadata of an over-cap
+/// part is always kept (`size_bytes` is its real decoded size), but its bytes are
+/// dropped (`data: None`) so the store lands a NULL blob. Filename falls back to
+/// `attachment-<n>` (1-based part order) when the part declares none; the mime is
+/// the part's declared type, falling back to `application/octet-stream`.
+///
+/// This runs for BOTH sealed and non-sealed mail — storage is fine either way;
+/// the byte-serving endpoint is what guards sealed parents.
+pub fn extract_attachments(m: &mail_parser::Message) -> Vec<AttachmentInfo> {
+    let mut out = Vec::new();
+    let mut stored_total: usize = 0;
+    for (i, part) in m.attachments().enumerate() {
+        // Multipart containers carry no bytes of their own; mail-parser should
+        // not list them as attachments, but skip defensively.
+        if part.is_multipart() {
+            continue;
+        }
+        let bytes = part.contents();
+        let size = bytes.len();
+        let filename = part
+            .attachment_name()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("attachment-{}", i + 1));
+        let mime = part
+            .content_type()
+            .map(|ct| match ct.subtype() {
+                Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                None => ct.ctype().to_string(),
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        // Keep bytes only when this part is within the per-attachment cap AND
+        // keeping it would not push the message's stored total over its cap.
+        let within_per = size <= ATTACHMENT_CAP_BYTES;
+        let within_total =
+            stored_total.saturating_add(size) <= MESSAGE_ATTACHMENT_TOTAL_CAP_BYTES;
+        let data = if within_per && within_total {
+            stored_total += size;
+            Some(bytes.to_vec())
+        } else {
+            None
+        };
+        out.push(AttachmentInfo {
+            filename,
+            mime,
+            size_bytes: size as i64,
+            data,
+        });
+    }
+    out
+}
+
 /// Turn raw fetched bytes into a fully-triaged, store-ready message.
 ///
 /// `known_contact_lookup` is called ONLY for non-sealed mail, with the parsed
@@ -422,6 +489,14 @@ pub fn ingest(
 
     let thread_id = thread_id.unwrap_or_else(|| gmail_msg_id.clone());
 
+    // Attachments (real + cid-inline), capped. Extracted once here and moved into
+    // whichever TriagedMessage return path fires. Present for sealed mail too —
+    // storage is fine; the byte-serving endpoint guards sealed parents.
+    let attachments = parsed
+        .as_ref()
+        .map(extract_attachments)
+        .unwrap_or_default();
+
     // A compact snippet for list views; body text drives triage.
     let snippet: String = text.chars().take(200).collect();
 
@@ -486,6 +561,7 @@ pub fn ingest(
             shipment: None,
             receipt: None,
             calendar: None,
+            attachments,
             confident: true,
         };
     }
@@ -511,6 +587,7 @@ pub fn ingest(
             shipment: None,
             receipt: None,
             calendar: None,
+            attachments,
             confident: true,
         };
     }
@@ -566,6 +643,7 @@ pub fn ingest(
         shipment,
         receipt,
         calendar,
+        attachments,
         confident: result.confident,
     }
 }
@@ -1045,6 +1123,119 @@ mod tests {
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert!(t.message.list_unsubscribe.is_none());
         assert!(!t.message.list_unsub_one_click);
+    }
+
+    #[test]
+    fn attachments_extracted_with_caps_and_cid_inline() {
+        // A real multipart/mixed with: a text body (NOT an attachment), a pdf, a
+        // png, a cid-inline png (no filename), and an oversized octet-stream part
+        // that must exceed the 10 MB per-attachment cap.
+        let big = "A".repeat(11 * 1024 * 1024);
+        let eml = format!(
+            "From: Sender <s@example.com>\r\n\
+             To: me@example.com\r\n\
+             Subject: Files attached\r\n\
+             Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\
+             \r\n\
+             --BOUND\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             Here are the files.\r\n\
+             --BOUND\r\n\
+             Content-Type: application/pdf; name=\"doc.pdf\"\r\n\
+             Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             SGVsbG8=\r\n\
+             --BOUND\r\n\
+             Content-Type: image/png; name=\"pic.png\"\r\n\
+             Content-Disposition: attachment; filename=\"pic.png\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             d29ybGQ=\r\n\
+             --BOUND\r\n\
+             Content-Type: image/png\r\n\
+             Content-ID: <logo@squelch>\r\n\
+             Content-Disposition: inline\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             aW5saW5l\r\n\
+             --BOUND\r\n\
+             Content-Type: application/octet-stream; name=\"big.bin\"\r\n\
+             Content-Disposition: attachment; filename=\"big.bin\"\r\n\
+             \r\n\
+             {big}\r\n\
+             --BOUND--\r\n"
+        );
+        let f = raw(1, "g-att", &eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        let a = &t.attachments;
+        assert_eq!(
+            a.len(),
+            4,
+            "pdf + png + cid-inline + big (the text body is not an attachment)"
+        );
+
+        let pdf = a.iter().find(|x| x.filename == "doc.pdf").expect("pdf");
+        assert_eq!(pdf.mime, "application/pdf");
+        assert_eq!(pdf.size_bytes, 5);
+        assert_eq!(pdf.data.as_deref(), Some(&b"Hello"[..]));
+
+        let png = a.iter().find(|x| x.filename == "pic.png").expect("png");
+        assert_eq!(png.mime, "image/png");
+        assert_eq!(png.data.as_deref(), Some(&b"world"[..]));
+
+        // The cid-inline part declares no filename -> attachment-<n> fallback, and
+        // its bytes are kept (inline images are how templates embed logos).
+        let inline = a
+            .iter()
+            .find(|x| x.filename.starts_with("attachment-"))
+            .expect("cid inline part included");
+        assert_eq!(inline.mime, "image/png");
+        assert_eq!(inline.data.as_deref(), Some(&b"inline"[..]));
+
+        // The oversized part keeps its metadata (real size) but drops its bytes.
+        let big_att = a.iter().find(|x| x.filename == "big.bin").expect("big");
+        assert_eq!(big_att.size_bytes, (11 * 1024 * 1024) as i64);
+        assert!(big_att.data.is_none(), "over-cap attachment stores no bytes");
+    }
+
+    #[test]
+    fn plain_mail_has_no_attachments() {
+        let eml = "From: Alice <alice@friends.com>\r\n\
+                   Subject: dinner\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   friday?\r\n";
+        let f = raw(1, "g-plain-att", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(t.attachments.is_empty());
+    }
+
+    #[test]
+    fn sealed_mail_still_extracts_attachments_for_storage() {
+        // Attachments are STORED for sealed mail like the body; serving is guarded
+        // downstream. So extraction must still happen on the sealed path.
+        let eml = "From: Bank <noreply@bank.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your verification code\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+                   \r\n\
+                   --B\r\nContent-Type: text/plain\r\n\r\n\
+                   Your one-time passcode is 483920. Enter this code to continue.\r\n\
+                   --B\r\nContent-Type: application/pdf\r\n\
+                   Content-Disposition: attachment; filename=\"statement.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n\
+                   --B--\r\n";
+        let f = raw(1, "g-sealed-att", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.sensitivity, Sensitivity::Sealed);
+        assert_eq!(t.attachments.len(), 1, "sealed mail's attachment is still extracted for storage");
+        assert_eq!(t.attachments[0].filename, "statement.pdf");
     }
 
     #[test]

@@ -877,6 +877,9 @@
 .att-name {
   font-size: 11.5px;
   color: var(--fg);
+  /* Bidi isolation: a mail-derived filename with an RLO control can't reorder
+     the surrounding UI (extension spoofing) — the name renders isolated. */
+  unicode-bidi: isolate;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

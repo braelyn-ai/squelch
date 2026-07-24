@@ -116,10 +116,19 @@ fn redact_sender(from_addr: &str) -> String {
 /// padding. We accept both padded and unpadded input. Errors are surfaced (not
 /// logged with content) so a single bad message doesn't poison the batch.
 pub fn decode_raw_b64url(s: &str) -> Result<Vec<u8>> {
+    // MEMORY GUARD: bound peak ingest memory ourselves instead of inheriting
+    // Gmail's ~50MB message limit. b64 length upper-bounds the decoded size.
+    const MAX_RAW_BYTES: usize = 64 * 1024 * 1024;
+    let t = s.trim();
+    if t.len() / 4 * 3 > MAX_RAW_BYTES {
+        return Err(CoreError::InvalidInput(
+            "raw message exceeds the 64MB ingest bound".to_string(),
+        ));
+    }
     // Try no-pad first (Gmail's usual shape), then the padded variant.
     base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s.trim())
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s.trim()))
+        .decode(t)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(t))
         .map_err(|e| CoreError::InvalidInput(format!("base64url decode failed: {e}")))
 }
 

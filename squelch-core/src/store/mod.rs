@@ -13,9 +13,9 @@ pub use sqlite::SqliteStore;
 use crate::error::Result;
 use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
-    AccountId, AttentionStatus, AttentionUpdate, AuditEntry, Banking, CalendarUpdate, Deadline,
-    Disposition, FieldReasons, NewMessage, Receipt, SealedKind, SearchHit, SenderRule, Sensitivity,
-    StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
+    AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
+    CalendarUpdate, Deadline, Disposition, FieldReasons, NewMessage, Receipt, SealedKind, SearchHit,
+    SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
 
@@ -33,6 +33,11 @@ pub enum SitrepBand {
     New,
     Open,
 }
+
+/// The resolved bytes of one attachment: `(filename, mime, data)`, where `data`
+/// is `None` when the bytes were not stored (over the ingest cap). Returned by
+/// [`Store::attachment_bytes`]; factored out to keep that signature readable.
+pub type AttachmentBytes = (String, String, Option<Vec<u8>>);
 
 impl SitrepBand {
     pub fn parse(s: &str) -> Option<SitrepBand> {
@@ -106,6 +111,13 @@ pub struct TriagedMessage {
     /// calendar notification never surfaces as New/Attention/Aging clutter — it
     /// lives only in the Calendar category.
     pub calendar: Option<CalendarInfo>,
+    /// Attachments extracted from the message's RFC822 (real attachments AND
+    /// cid-inline parts), each already capped (over-cap parts carry `data: None`
+    /// / metadata only). Written to the `attachments` table in the SAME ingest
+    /// transaction as the message. Present for BOTH sealed and non-sealed mail —
+    /// storage is fine; the byte-serving endpoint is what guards sealed parents.
+    /// Empty when the message carried no attachment parts.
+    pub attachments: Vec<AttachmentInfo>,
     /// `false` when Stage-1 was not confident: the row is left with
     /// `model_used IS NULL` so the Stage-2 queue predicate
     /// (`model_used IS NULL AND sensitivity = 'normal'`) picks it up.
@@ -464,6 +476,21 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         thread_id: &str,
     ) -> Result<crate::types::ClientThreadView>;
+
+    /// HUMAN-DOOR-ONLY attachment byte fetch for `GET /client/attachments/{id}`.
+    /// Resolves one attachment by its `attachments.id`, returning
+    /// `(filename, mime, data)` where `data` is `None` when the bytes were not
+    /// stored (the part was over the ingest cap — the endpoint answers 410).
+    ///
+    /// SECURITY: the query JOINs `triage` and requires the PARENT message's
+    /// `sensitivity='normal'`, so an attachment on a sealed message is returned
+    /// as `Ok(None)` — indistinguishable from an unknown id (both 404). Sealed
+    /// attachment bytes therefore never leave the process through this door.
+    fn attachment_bytes(
+        &self,
+        account_id: AccountId,
+        attachment_id: i64,
+    ) -> Result<Option<AttachmentBytes>>;
 
     /// MCP-facing deadlines within `within_days` (None = all). Sealed excluded.
     fn deadlines(

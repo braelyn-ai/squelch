@@ -259,6 +259,33 @@ pub struct ClientMessage {
     /// Server-side-sanitized HTML body, or `None` when the email was
     /// plain-text-only. Served ONLY here (GET /client/thread/{id}).
     pub html: Option<String>,
+    /// Attachment metadata for this message (real attachments + cid-inline
+    /// parts). ALWAYS present — an empty list when the message has none. The
+    /// bytes themselves are pulled separately via GET /client/attachments/{id}.
+    /// HUMAN-DOOR ONLY: like `html`, this never crosses /mcp.
+    #[serde(default)]
+    pub attachments: Vec<ClientAttachment>,
+}
+
+/// One attachment's metadata as exposed on the HUMAN DOOR (the `attachments[]`
+/// entries of a `GET /client/thread/{id}` message). Carries NO bytes — the
+/// client fetches those from `GET /client/attachments/{id}` when `downloadable`.
+///
+/// WIRE CONTRACT (the desktop client is built against exactly this shape):
+/// `{ id, filename, mime, size, downloadable }`. `downloadable == false` means
+/// the bytes were not stored (the part exceeded the ingest cap); only its
+/// metadata exists, and the byte endpoint returns 410 for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientAttachment {
+    /// The `attachments.id` — the handle for GET /client/attachments/{id}.
+    pub id: i64,
+    pub filename: String,
+    pub mime: String,
+    /// Decoded size in bytes (the real part size, whether or not bytes were kept).
+    pub size: i64,
+    /// `true` when the bytes are stored and downloadable; `false` when only
+    /// metadata was kept (the part was over the ingest cap).
+    pub downloadable: bool,
 }
 
 /// A full thread for the HUMAN DOOR (squelch-api `GET /client/thread/{id}`),
@@ -488,6 +515,30 @@ pub struct NewMessage {
     pub list_unsub_one_click: bool,
 }
 
+/// A single attachment extracted from a message's RFC822 at ingest, ready to be
+/// committed alongside the message row. Produced by the ingest pipeline (see
+/// `sync::ingest`) for BOTH real attachments and cid-inline parts; stored in the
+/// `attachments` table in the same transaction as the message.
+///
+/// `data` is `None` when the part exceeded the ingest cap (per-attachment 10 MB
+/// or the per-message 25 MB total) — the metadata is still kept but the bytes
+/// were dropped (the row lands with a NULL `data` blob, downloadable=false on the
+/// wire). `size_bytes` is always the real decoded size regardless.
+#[derive(Debug, Clone)]
+pub struct AttachmentInfo {
+    /// Attachment filename; the ingest pipeline substitutes `attachment-<n>`
+    /// when the part declares none.
+    pub filename: String,
+    /// The MIME type the part declared (falling back to
+    /// `application/octet-stream`). Stored verbatim; the serving endpoint applies
+    /// its own render-safety whitelist independently.
+    pub mime: String,
+    /// The part's real decoded size in bytes (kept even when `data` is `None`).
+    pub size_bytes: i64,
+    /// The decoded bytes, or `None` when the part was over the ingest cap.
+    pub data: Option<Vec<u8>>,
+}
+
 /// One row of the human door's unsubscribe ledger (`GET /client/unsubscribes`).
 ///
 /// WIRE CONTRACT (the desktop client is built against exactly this shape):
@@ -536,6 +587,11 @@ mod tests {
         let v = serde_json::to_value(&tv).unwrap();
         let msg = &v["messages"][0];
         assert!(msg.get("html").is_none(), "MCP thread view must not carry html");
+        // The agent door gains NOTHING from the attachments feature: no key.
+        assert!(
+            msg.get("attachments").is_none(),
+            "MCP thread view must not carry attachments"
+        );
         assert!(msg.get("content").is_some());
     }
 
@@ -553,6 +609,13 @@ mod tests {
                     received_at: Utc::now(),
                     content: "text".into(),
                     html: Some("<p>hi</p>".into()),
+                    attachments: vec![ClientAttachment {
+                        id: 7,
+                        filename: "doc.pdf".into(),
+                        mime: "application/pdf".into(),
+                        size: 1234,
+                        downloadable: true,
+                    }],
                 },
                 ClientMessage {
                     id: 2,
@@ -561,6 +624,7 @@ mod tests {
                     received_at: Utc::now(),
                     content: "plain".into(),
                     html: None,
+                    attachments: vec![],
                 },
             ],
         };
@@ -568,6 +632,10 @@ mod tests {
         assert_eq!(v["messages"][0]["html"], serde_json::json!("<p>hi</p>"));
         // Absent html serializes as JSON null (the client falls back to text).
         assert_eq!(v["messages"][1]["html"], serde_json::Value::Null);
+        // Attachments always present; [] when none.
+        assert_eq!(v["messages"][0]["attachments"][0]["filename"], serde_json::json!("doc.pdf"));
+        assert_eq!(v["messages"][0]["attachments"][0]["downloadable"], serde_json::json!(true));
+        assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
     }
 
     fn base_update() -> Update {

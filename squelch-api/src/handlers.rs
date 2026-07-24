@@ -8,9 +8,10 @@
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -348,6 +349,103 @@ pub async fn get_thread(
     // sanitized `html` (null for plain-text-only mail) for the client to render.
     let view = blocking(move || store.thread_view_with_html(account_id, &thread_id)).await?;
     Ok(Json(view))
+}
+
+// --- GET /client/attachments/{id} -------------------------------------------
+
+/// Render-safety whitelist for the served `Content-Type`. The stored mime is
+/// echoed ONLY when it is `application/pdf` or an `image/*` OTHER THAN
+/// `image/svg+xml` (SVG is scriptable). Everything else — HTML, XML, SVG, JS,
+/// unknown — serves as `application/octet-stream`, so a hostile attachment can
+/// never be rendered inline from our origin. This header discipline IS the
+/// security story for the byte endpoint.
+fn safe_content_type(mime: &str) -> String {
+    // Compare on the bare type, lowercased, ignoring any `; charset=...` params.
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if base == "application/pdf" {
+        return base;
+    }
+    if let Some(sub) = base.strip_prefix("image/")
+        && !sub.is_empty()
+        // Reject ANY svg/xml-ish image subtype (image/svg+xml, image/svg,
+        // vendor xml types) — scriptable content must never echo renderable.
+        && !sub.contains("svg")
+        && !sub.contains("xml")
+    {
+        return base;
+    }
+    "application/octet-stream".to_string()
+}
+
+/// Sanitize a filename for a `Content-Disposition: attachment; filename="..."`
+/// header: strip path separators, control chars, quotes, and any non-ASCII byte
+/// (plain stripping — our clients don't need RFC 5987). Falls back to
+/// "attachment" when nothing usable survives.
+fn sanitize_attachment_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| {
+            c.is_ascii() && !c.is_ascii_control() && *c != '/' && *c != '\\' && *c != '"'
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Serve one attachment's raw bytes. The parent-message sealed guard lives in
+/// [`Store::attachment_bytes`] (sealed/unknown are indistinguishable -> 404);
+/// this handler adds the header discipline and the over-cap 410.
+pub async fn get_attachment(
+    State(state): State<ApiState>,
+    Path(attachment_id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    // `None` => unknown id OR sealed parent (indistinguishable): 404.
+    let found = blocking(move || store.attachment_bytes(account_id, attachment_id)).await?;
+    let (filename, mime, data) = found.ok_or_else(ApiError::not_found)?;
+    // Metadata exists but the bytes were never stored (over the ingest cap): 410.
+    let bytes =
+        data.ok_or_else(|| ApiError::new(StatusCode::GONE, "attachment bytes not stored"))?;
+
+    let ctype = safe_content_type(&mime);
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        sanitize_attachment_filename(&filename)
+    );
+
+    // Build the response directly (not via `Vec<u8>`'s IntoResponse) so we own the
+    // Content-Type exactly — no auto `application/octet-stream` sneaking in.
+    let mut resp = Response::new(Body::from(bytes));
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(&ctype)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream")),
+    );
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("attachment")),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, max-age=3600"),
+    );
+    Ok(resp)
 }
 
 // --- GET /client/search -----------------------------------------------------
