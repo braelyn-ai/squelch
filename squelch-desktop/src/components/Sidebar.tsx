@@ -45,7 +45,6 @@ const BOTTOM_ITEMS: RailItem[] = [
 export function Sidebar() {
   const activeView = useStore((s) => s.activeView);
   const setView = useStore((s) => s.setView);
-  const authCount = useStore((s) => s.sitrep.sealed.length);
 
   function railButton({ view, label, Icon }: RailItem, keyNum: number | null) {
     const active = activeView === view;
@@ -61,11 +60,6 @@ export function Sidebar() {
       >
         <Icon size={20} />
         {view === "auth" && <AuthRings />}
-        {view === "auth" && authCount > 0 && (
-          <span className="rail-badge" aria-hidden="true">
-            {authCount}
-          </span>
-        )}
         <span className="rail-tip" role="tooltip">
           {label} {keyNum && <kbd>{keyNum}</kbd>}
         </span>

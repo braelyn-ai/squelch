@@ -359,6 +359,10 @@
   border-radius: 999px;
   padding: 1px 8px;
   white-space: nowrap;
+  /* EQUAL WIDTH: the tags are a scannable column, not ragged pills. Sized to
+     the longest label ("Password reset"); content centers inside. */
+  width: 118px;
+  justify-content: center;
 }
 .auth-row .age {
   font-variant-numeric: tabular-nums;

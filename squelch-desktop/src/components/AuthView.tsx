@@ -37,6 +37,16 @@ export function AuthView() {
       },
       { key: "k", description: "prev", handler: () => setIdx((i) => Math.max(0, i - 1)) },
       {
+        key: "ArrowDown",
+        description: "next",
+        handler: () => setIdx((i) => Math.min(items.length - 1, i + 1)),
+      },
+      {
+        key: "ArrowUp",
+        description: "prev",
+        handler: () => setIdx((i) => Math.max(0, i - 1)),
+      },
+      {
         key: "r",
         description: "reveal",
         handler: () => {
@@ -93,7 +103,6 @@ export function AuthView() {
                 <KindIcon size={13} /> {authKindLabel(m.kind)}
               </span>
               <span className="age">{relAge(m.received_at)}</span>
-              {sel && <span className="verbs">[r] reveal</span>}
             </span>
           </div>
         );
