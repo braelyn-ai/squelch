@@ -84,7 +84,9 @@ If no concrete date is present but a bill clearly exists, still set \
 has_deadline=true with deadline_iso=null.
 
 ONE_LINE: a single terse line (<=120 chars), no leading label, describing what \
-this email is and why it matters. Never name the email's GENRE - do not write \
+this email is and why it matters. NEVER use an em dash or en dash in any \
+user-visible text (one_line, importance_reason, deadline_reason) - use a \
+comma, semicolon, or period instead. Never name the email's GENRE - do not write \
 \"promotional email\", \"promotion for\", \"newsletter\", \"marketing\", or \
 similar: the surface the line appears on already conveys that. State the actual \
 content or offer (\"Weekend club nights in SF; free tickets\" - not \"Event \
