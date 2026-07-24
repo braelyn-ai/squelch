@@ -396,6 +396,9 @@ pub struct Banking {
     /// The message's thread — lets the client open the email directly in the
     /// thread viewer (same click behavior as the attention rows).
     pub thread_id: String,
+    /// The sender address — the client's display fallback when the extractor
+    /// found no institution name (a bare "bank" label helps nobody).
+    pub from_addr: String,
     pub kind: String,
     pub institution: Option<String>,
     pub amount: Option<f64>,

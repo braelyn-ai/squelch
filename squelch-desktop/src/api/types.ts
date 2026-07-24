@@ -204,6 +204,8 @@ export interface BankingRecord {
   message_id: number;
   /** Opens the email directly in the thread viewer (same click as attention rows). */
   thread_id: string;
+  /** Sender address — display fallback when no institution was extracted. */
+  from_addr?: string;
   kind: BankingKind;
   institution: string | null;
   amount: number | null;

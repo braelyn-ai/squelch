@@ -64,6 +64,8 @@ export interface Newsletter {
   summary: string;
   /** Latest message date (ms) — cards sort newest-first. */
   latest: number;
+  /** The latest message's thread — clicking the card opens this email. */
+  latest_thread_id: string;
   /** The rule governing this sender, if any (drives the chip vs. CTA). */
   rule: SenderRule | null;
 }
@@ -136,6 +138,7 @@ export function deriveNewsletters(
     robot: boolean;
     latest: number;
     summary: string;
+    latest_thread_id: string;
   }
   const byAddr = new Map<string, Bucket>();
 
@@ -163,6 +166,7 @@ export function deriveNewsletters(
         robot: isRobotSender(u.sender) || isBrandSender(u.sender),
         latest: 0,
         summary: "",
+        latest_thread_id: "",
       };
       byAddr.set(address, b);
     }
@@ -173,6 +177,7 @@ export function deriveNewsletters(
     if (d >= b.latest) {
       b.latest = d;
       if (u.one_line) b.summary = u.one_line;
+      b.latest_thread_id = u.thread_id;
     }
   }
 
@@ -195,6 +200,7 @@ export function deriveNewsletters(
       count: b.total,
       summary: b.summary,
       latest: b.latest,
+      latest_thread_id: b.latest_thread_id,
       rule: ruleForAddress(rules, address),
     });
   }

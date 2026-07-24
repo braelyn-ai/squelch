@@ -1998,8 +1998,8 @@ impl Store for SqliteStore {
         // Newest-received first. No sealed filter needed: the table holds no
         // sealed rows by construction (extraction never runs on sealed mail).
         let mut stmt = conn.prepare(
-            "SELECT b.id, b.message_id, m.thread_id, b.kind, b.institution, b.amount,
-                    b.currency, b.account_hint, b.received_at
+            "SELECT b.id, b.message_id, m.thread_id, m.from_addr, b.kind, b.institution,
+                    b.amount, b.currency, b.account_hint, b.received_at
              FROM banking b
              JOIN messages m ON m.id = b.message_id
              WHERE b.account_id=?1
@@ -2011,21 +2011,33 @@ impl Store for SqliteStore {
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<f64>>(5)?,
-                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<f64>>(6)?,
                 r.get::<_, Option<String>>(7)?,
-                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, String>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, message_id, thread_id, kind, institution, amount, currency, account_hint, received_at) =
-                row?;
+            let (
+                id,
+                message_id,
+                thread_id,
+                from_addr,
+                kind,
+                institution,
+                amount,
+                currency,
+                account_hint,
+                received_at,
+            ) = row?;
             out.push(Banking {
                 id,
                 message_id,
                 thread_id,
+                from_addr,
                 kind,
                 institution,
                 amount,

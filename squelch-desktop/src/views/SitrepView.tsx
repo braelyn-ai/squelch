@@ -54,15 +54,10 @@ import { prefetchThread } from "../lib/threadPrefetch";
 import { usePref } from "../lib/prefs";
 import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { getUserName } from "../lib/identity";
-import { reasonFor } from "../lib/reasons";
 import { Avatar } from "../components/Avatar";
 import { RetriageButton } from "../components/RetriageButton";
 import { dispatchDone } from "../lib/dispatch";
-import {
-  deriveNewsletters,
-  domainPattern,
-  type Newsletter,
-} from "../lib/newsletters";
+import { deriveNewsletters, type Newsletter } from "../lib/newsletters";
 import { DISPOSITION_LABEL } from "../components/RuleEditor";
 import { openRuleEditorRequest } from "../components/ruleEditorBus";
 import "../styles/sitrep-dash.css";
@@ -308,7 +303,7 @@ function SitrepBody({
         <div className="hdr-status">
           <RetriageButton onSky />
           {needNow > 0 && (
-            <span className="need-pill" title="obligations that need you today">
+            <span className="need-pill">
               <span className="need-dot" />
               {needNow} need you now
             </span>
@@ -320,9 +315,11 @@ function SitrepBody({
 
       {/* Body: the LEFT column (hero + main zones) scrolls; the right bar is
           static. The vertical separator sits between them. */}
+      {/* Hero spans the full width ABOVE the two columns, so the right rail
+          starts at the same height as the For-your-eyes card. */}
+      <DashHero standing={standing} />
       <div className="dash-body">
       <div className="dash-left">
-      <DashHero standing={standing} />
       <div className="dash-main">
       {/* ---- (a) FOR YOUR EYES — ranked standing items, hidden when empty ---- */}
       {standing.length > 0 && (
@@ -436,17 +433,16 @@ function ObligationRow({
       }}
       role="button"
       tabIndex={-1}
-      title="open email"
     >
       <Avatar sender={u.sender} size={22} />
-      <span className="ob-sender" title={u.sender}>
+      <span className="ob-sender">
         {senderDisplayName(u.sender)}
       </span>
       {u.has_attachments && (
         <Paperclip size={12} className="att-clip" aria-label="has attachments" />
       )}
       {/* The abstracted one-liner carries the meaning; it truncates first. */}
-      <p className="ob-line" title={u.one_line}>
+      <p className="ob-line">
         {u.one_line}
       </p>
       {amount && (
@@ -455,10 +451,7 @@ function ObligationRow({
         </span>
       )}
       {chip ? (
-        <span
-          className={`chip ${overdue ? "overdue" : "upcoming"}`}
-          title={reasonFor(u, "deadline", chip.text)}
-        >
+        <span className={`chip ${overdue ? "overdue" : "upcoming"}`}>
           {chip.text}
         </span>
       ) : (
@@ -689,7 +682,6 @@ function CalendarZone() {
                 className={`cal-row${c.kind === "cancellation" ? " canceled" : ""}`}
                 key={c.id}
                 onClick={() => viewInEmails(c.message_id)}
-                title="view this email"
               >
                 <span className="cal-title">
                   {c.event_title ?? c.organizer ?? "calendar event"}
@@ -792,12 +784,13 @@ function ReceiptsZone() {
               className="receipt-row"
               key={r.id}
               onClick={() => open(r)}
-              title="open this email"
             >
               <span className="receipt-sender" title={r.from_addr}>
                 {senderDisplayName(sender)}
               </span>
-              <span className="receipt-amount">{receiptAmount(r)}</span>
+              {r.amount !== null && r.amount !== undefined && (
+                <span className="receipt-amount">{receiptAmount(r)}</span>
+              )}
             </button>
           );
         })}
@@ -906,14 +899,16 @@ function BankingZone() {
               className="receipt-row"
               key={r.id}
               onClick={() => open(r)}
-              title="open this email"
             >
               <span className="receipt-sender">
-                {r.institution ?? "bank"}
+                {r.institution ??
+                  (r.from_addr ? senderDisplayName(r.from_addr) : "bank")}
                 {r.account_hint ? ` ${r.account_hint}` : ""}
               </span>
               <span className="bank-tag">{BANK_KIND_TAG[r.kind]}</span>
-              <span className="receipt-amount">{bankingAmount(r)}</span>
+              {r.amount !== null && r.amount !== undefined && (
+                <span className="receipt-amount">{bankingAmount(r)}</span>
+              )}
             </button>
           ))}
         </div>
@@ -993,6 +988,7 @@ const NL_FETCH_LIMIT = 200;
 function NewslettersZone() {
   const [updates, setUpdates] = useState<AttentionUpdate[] | null>(null);
   const [rules, setRules] = useState<SenderRule[]>([]);
+  const openThread = useStore((s) => s.openThread);
 
   // Fetch noise updates + rules once; re-fetch after a rule save so chips/CTAs
   // reflect the new rule immediately.
@@ -1026,17 +1022,6 @@ function NewslettersZone() {
     if (!nl.rule) return;
     openRuleEditorRequest({ rule: nl.rule, onSaved: () => void load() });
   }
-  function createRule(nl: Newsletter) {
-    // Prefill *@domain (favicon-normalized so mail-subdomains collapse to the
-    // brand), disposition "filtered" (the onboarding default), and land focus on
-    // the want field so the human describes what they DO want to see.
-    openRuleEditorRequest({
-      sender: nl.address,
-      pattern: domainPattern(nl.address),
-      disposition: "filtered",
-      onSaved: () => void load(),
-    });
-  }
 
   // Hidden entirely when there are no newsletters (and while still loading).
   if (newsletters.length === 0) return null;
@@ -1057,7 +1042,7 @@ function NewslettersZone() {
             key={nl.address}
             nl={nl}
             onEdit={() => editRule(nl)}
-            onCreate={() => createRule(nl)}
+            onOpen={() => nl.latest_thread_id && openThread(nl.latest_thread_id)}
           />
         ))}
       </div>
@@ -1072,54 +1057,67 @@ function truncate(s: string, n: number): string {
 function NewsletterCard({
   nl,
   onEdit,
-  onCreate,
+  onOpen,
 }: {
   nl: Newsletter;
   onEdit: () => void;
-  onCreate: () => void;
+  onOpen: () => void;
 }) {
   const hasRule = nl.rule !== null;
-  // Enter (with the card focused) opens the right editor; click does the same.
-  const open = hasRule ? onEdit : onCreate;
 
+  // Clicking the card OPENS the latest newsletter email (owner call,
+  // 2026-07-23 — the rule-editor CTA is gone). A ruled card keeps its chip as
+  // the edit affordance (stopPropagation so chip clicks don't also open).
   return (
     <div
       className={`nl-card${hasRule ? " ruled" : ""}`}
       role="button"
       tabIndex={0}
-      onClick={open}
+      onClick={onOpen}
       onKeyDown={(e) => {
         if (e.key === "Enter") {
           e.preventDefault();
-          open();
+          onOpen();
         }
       }}
     >
       <div className="nl-top">
         <Avatar sender={nl.sender} size={24} />
-        <span className="nl-sender" title={nl.sender}>
+        <span className="nl-sender">
           {senderDisplayName(nl.sender)}
         </span>
         <span className="nl-count">{nl.count} this week</span>
       </div>
 
       {nl.summary && (
-        <p className="nl-summary" title={nl.summary}>
+        <p className="nl-summary">
           {truncate(nl.summary, 90)}
         </p>
       )}
 
-      {hasRule ? (
-        <div className="nl-rulechip" title="edit this rule">
+      {hasRule && (
+        <div
+          className="nl-rulechip"
+          title="edit this rule"
+          role="button"
+          tabIndex={0}
+          onClick={(e) => {
+            e.stopPropagation();
+            onEdit();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.stopPropagation();
+              onEdit();
+            }
+          }}
+        >
           <span className="nl-disp">{DISPOSITION_LABEL[nl.rule!.disposition]}</span>
           {nl.rule!.want_text && (
             <span className="nl-want">{truncate(nl.rule!.want_text, 48)}</span>
           )}
           <Pencil size={12} className="nl-pencil" />
-        </div>
-      ) : (
-        <div className="nl-cta">
-          Choose what you want to see <ArrowUpRight size={13} />
         </div>
       )}
     </div>

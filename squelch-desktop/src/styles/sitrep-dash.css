@@ -709,7 +709,7 @@
   margin: 0 -6px;
   border: none;
   border-bottom: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 0;
   background: transparent;
   font: inherit;
   font-size: 12.5px;
@@ -776,7 +776,7 @@
   margin: 0 -6px;
   border: none;
   border-bottom: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 0;
   background: transparent;
   font: inherit;
   font-size: 12.5px;

@@ -9,7 +9,6 @@ import type { AttentionUpdate } from "../api";
 import { useStore } from "../state";
 import { useKeys } from "../keys";
 import { relAge, tierColor, importanceColor } from "../lib/format";
-import { reasonFor } from "../lib/reasons";
 
 export function BrowseView() {
   const openThreadView = useStore((s) => s.openThread);
@@ -128,19 +127,17 @@ export function BrowseView() {
           <span
             className="tier-dot"
             style={{ background: tierColor(u.tier) }}
-            title={reasonFor(u, "tier", u.tier)}
           />
           <span
             className="imp"
             style={{ color: importanceColor(u.importance) }}
-            title={reasonFor(u, "importance", `importance ${u.importance}`)}
           >
             {u.importance}
           </span>
-          <span className="sender" title={u.sender}>
+          <span className="sender">
             {u.sender}
           </span>
-          <span className="one-line" title={u.one_line}>
+          <span className="one-line">
             {u.one_line}
           </span>
           <span className="meta">

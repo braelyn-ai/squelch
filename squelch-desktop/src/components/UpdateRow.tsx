@@ -16,7 +16,6 @@ import {
 } from "../lib/format";
 import { Avatar } from "./Avatar";
 import { senderDisplayName } from "../lib/avatar";
-import { reasonFor } from "../lib/reasons";
 
 export interface UpdateRowProps {
   update: AttentionUpdate;
@@ -41,12 +40,6 @@ export const UpdateRow = memo(function UpdateRow({
   onOpen,
 }: UpdateRowProps) {
   const chip = deadlineChip(u.deadline);
-  // Per-property triage reasons surface as hover tooltips. The importance title
-  // keeps its "importance N" context and appends the reason when one exists.
-  const impReason = reasonFor(u, "importance", "");
-  const impTitle = impReason
-    ? `importance ${u.importance} — ${impReason}`
-    : `importance ${u.importance}`;
   // The aging BADGE ("← 2 WEEKS") only earns its place once an item is genuinely
   // aging (age > 48h). Under that, the STILL OPEN row is still "open" but shows
   // the plain relative time like any other band — no shouty badge on fresh items.
@@ -74,13 +67,12 @@ export const UpdateRow = memo(function UpdateRow({
       <span
         className="imp meter"
         style={{ color: importanceColor(u.importance) }}
-        title={impTitle}
         aria-label={`importance ${u.importance}`}
       >
         {importanceMeter(u.importance)}
       </span>
       <Avatar sender={u.sender} />
-      <span className="sender" title={u.sender}>
+      <span className="sender">
         {senderDisplayName(u.sender)}
       </span>
       {u.has_attachments && (
@@ -90,22 +82,19 @@ export const UpdateRow = memo(function UpdateRow({
           aria-label="has attachments"
         />
       )}
-      <span className="one-line" style={{ color: oneLineColor }} title={u.one_line}>
+      <span className="one-line" style={{ color: oneLineColor }}>
         {u.one_line}
       </span>
 
       <span className="meta">
         {u.matched_rule !== null && (
-          <span className="rule-hint" title={`matched rule #${u.matched_rule}`}>
+          <span className="rule-hint">
             ·rule
           </span>
         )}
 
         {chip && (
-          <span
-            className={`chip ${chip.overdue ? "overdue" : "upcoming"}`}
-            title={reasonFor(u, "deadline", chip.text)}
-          >
+          <span className={`chip ${chip.overdue ? "overdue" : "upcoming"}`}>
             {chip.text}
           </span>
         )}
