@@ -215,3 +215,31 @@ export function domainPattern(address: string): string {
   const domain = faviconDomain(address) ?? address.split("@").pop() ?? address;
   return `*@${domain}`;
 }
+
+/**
+ * Pick the HERO image src from a newsletter's sanitized html: the first http(s)
+ * <img> that plausibly isn't chrome — declared width (when present) must be
+ * >= 80px (skips social icons / spacer gifs; tracking pixels are already
+ * stripped upstream). Protocol-relative srcs resolve to https. Returns null
+ * when nothing qualifies — the card simply renders without a thumb.
+ */
+export function extractHeroSrc(html: string): string | null {
+  if (typeof DOMParser === "undefined") return null;
+  let doc: Document;
+  try {
+    doc = new DOMParser().parseFromString(html, "text/html");
+  } catch {
+    return null;
+  }
+  for (const img of Array.from(doc.querySelectorAll("img[src]"))) {
+    let src = (img.getAttribute("src") ?? "").trim();
+    if (src.startsWith("//")) src = "https:" + src;
+    if (!/^https?:\/\//i.test(src)) continue;
+    const w = parseInt(img.getAttribute("width") ?? "", 10);
+    if (!Number.isNaN(w) && w < 80) continue;
+    const h = parseInt(img.getAttribute("height") ?? "", 10);
+    if (!Number.isNaN(h) && h < 40) continue;
+    return src;
+  }
+  return null;
+}

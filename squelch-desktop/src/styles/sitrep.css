@@ -603,10 +603,7 @@
    column scrolls; frames auto-size to content (EmailFrame) so nothing nests. */
 /* Reading column: NARROW by design — email templates lay out for ~600-700px
    (the mail-client norm); a 1100px column stretched them into billboards. */
-.tv-body { flex: 1; min-height: 0; overflow-y: auto; padding: 28px 20px 16px; max-width: 760px; width: 100%; margin: 0 auto;
-  /* Top fade: message cards melt out under the blue band on scroll. */
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 24px);
-  mask-image: linear-gradient(to bottom, transparent 0, black 24px); }
+.tv-body { flex: 1; min-height: 0; overflow-y: auto; padding: 28px 20px 16px; max-width: 760px; width: 100%; margin: 0 auto; }
 
 /* ---- unsubscribe confirm card (flat modal over the thread viewer) ---- */
 /* Same language as the authcode-card / block-prompt: a dim backdrop + a small

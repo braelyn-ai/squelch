@@ -8,6 +8,7 @@ import {
   ruleForAddress,
   senderAddress,
   domainPattern,
+  extractHeroSrc,
 } from "./newsletters";
 import type { AttentionUpdate, SenderRule } from "../api";
 
@@ -174,5 +175,23 @@ describe("helpers", () => {
   test("domainPattern builds *@domain, collapsing mail subdomains", () => {
     expect(domainPattern("news@acme.com")).toBe("*@acme.com");
     expect(domainPattern("x@mail.acme.com")).toBe("*@acme.com");
+  });
+});
+
+describe("extractHeroSrc", () => {
+  test("first big image wins; icons and relative srcs skipped", () => {
+    const html =
+      '<img src="https://x/social.png" width="24" height="24">' +
+      '<img src="cid:inline1">' +
+      '<img src="//cdn.x.com/hero.jpg" width="600">' +
+      '<img src="https://x/second.jpg">';
+    expect(extractHeroSrc(html)).toBe("https://cdn.x.com/hero.jpg");
+  });
+  test("undeclared size qualifies; nothing qualifies -> null", () => {
+    expect(extractHeroSrc('<img src="https://x/a.png">')).toBe("https://x/a.png");
+    expect(extractHeroSrc('<p>no images</p>')).toBeNull();
+    expect(
+      extractHeroSrc('<img src="https://x/i.gif" width="1" height="1">'),
+    ).toBeNull();
   });
 });

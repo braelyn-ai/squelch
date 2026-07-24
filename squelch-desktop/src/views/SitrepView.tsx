@@ -50,14 +50,18 @@ import { useStore, triggerMailRefresh } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import { deadlineChip, lastChecked, relAge } from "../lib/format";
 import { rankItems } from "../lib/ranking";
-import { prefetchThread } from "../lib/threadPrefetch";
+import { fetchThreadCached, prefetchThread } from "../lib/threadPrefetch";
 import { usePref } from "../lib/prefs";
 import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { getUserName } from "../lib/identity";
 import { Avatar } from "../components/Avatar";
 import { RetriageButton } from "../components/RetriageButton";
 import { dispatchDone } from "../lib/dispatch";
-import { deriveNewsletters, type Newsletter } from "../lib/newsletters";
+import {
+  deriveNewsletters,
+  extractHeroSrc,
+  type Newsletter,
+} from "../lib/newsletters";
 import { DISPOSITION_LABEL } from "../components/RuleEditor";
 import { openRuleEditorRequest } from "../components/ruleEditorBus";
 import "../styles/sitrep-dash.css";
@@ -1054,6 +1058,49 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s;
 }
 
+/**
+ * Hero thumbnail for a newsletter card: mined from the LATEST email's sanitized
+ * html (first plausibly-big image) via the shared thread cache. Renders nothing
+ * until (and unless) a hero resolves; gated on the remote-images pref — when
+ * images are "on demand", no network fetch happens for unopened mail.
+ */
+function NewsletterHero({ threadId }: { threadId: string }) {
+  const imagesOn = usePref("loadRemoteImages");
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!imagesOn || !threadId) return;
+    let alive = true;
+    fetchThreadCached(threadId, { freshMs: 600_000 })
+      .then((view) => {
+        if (!alive) return;
+        const newest = view.messages[view.messages.length - 1];
+        if (newest?.html) setSrc(extractHeroSrc(newest.html));
+      })
+      .catch(() => {
+        // No thumb — the card just renders without one.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [threadId, imagesOn]);
+
+  if (!src || failed) return null;
+  return (
+    <img
+      className="nl-hero"
+      src={src}
+      alt=""
+      aria-hidden="true"
+      referrerPolicy="no-referrer"
+      decoding="async"
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
 function NewsletterCard({
   nl,
   onEdit,
@@ -1081,6 +1128,7 @@ function NewsletterCard({
         }
       }}
     >
+      <NewsletterHero threadId={nl.latest_thread_id} />
       <div className="nl-top">
         <Avatar sender={nl.sender} size={24} />
         <span className="nl-sender">

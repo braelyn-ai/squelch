@@ -121,9 +121,6 @@
   min-width: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  /* Top fade: scrolled content melts out instead of hard-clipping. */
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 22px);
-  mask-image: linear-gradient(to bottom, transparent 0, black 22px);
   display: flex;
   flex-direction: column;
   padding: 0 22px 40px 0;
@@ -148,9 +145,6 @@
   border-left: 1px solid var(--border);
   padding-left: 22px;
   overflow-y: auto;
-  /* Same top fade as the left column. */
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 22px);
-  mask-image: linear-gradient(to bottom, transparent 0, black 22px);
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -838,4 +832,17 @@
 .att-clip {
   flex: 0 0 auto;
   color: var(--fg-faint);
+}
+
+/* Newsletter hero thumbnail — a banner across the card top, mined from the
+   latest email. Cover-fit, capped height so text cards and image cards keep
+   comparable footprints. */
+.nl-hero {
+  display: block;
+  width: calc(100% + 24px);
+  margin: -11px -12px 9px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  border-bottom: 1px solid var(--border);
 }

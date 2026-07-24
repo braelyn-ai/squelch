@@ -36,6 +36,9 @@ const cache = new Map<
   { view: ClientThreadView; ts: number; freshMs: number }
 >();
 const inflight = new Set<string>();
+/** Promise-shaped in-flight dedupe for callers that need the VIEW back
+ *  (newsletter hero thumbnails) rather than fire-and-forget warming. */
+const inflightPromises = new Map<string, Promise<ClientThreadView>>();
 const warmedUrls = new Set<string>();
 
 /** Extract http(s) img srcs (protocol-relative resolved to https). */
@@ -113,6 +116,35 @@ export function getPrefetchedThread(threadId: string): ClientThreadView | null {
   const hit = cache.get(threadId);
   if (!hit || Date.now() - hit.ts >= hit.freshMs) return null;
   return hit.view;
+}
+
+/**
+ * Fetch a thread THROUGH the cache, returning the view: a fresh cache hit
+ * resolves immediately; concurrent callers share one request. Used by the
+ * newsletter hero thumbnails (they need the html, not just warming).
+ */
+export function fetchThreadCached(
+  threadId: string,
+  opts?: { freshMs?: number },
+): Promise<ClientThreadView> {
+  const freshMs = opts?.freshMs ?? FRESH_MS;
+  const hit = cache.get(threadId);
+  if (hit && Date.now() - hit.ts < Math.max(hit.freshMs, freshMs)) {
+    if (freshMs > hit.freshMs) hit.freshMs = freshMs;
+    return Promise.resolve(hit.view);
+  }
+  const pending = inflightPromises.get(threadId);
+  if (pending) return pending;
+  const p = api
+    .getThread(threadId)
+    .then((view) => {
+      put(threadId, view, freshMs);
+      warmImages(view);
+      return view;
+    })
+    .finally(() => inflightPromises.delete(threadId));
+  inflightPromises.set(threadId, p);
+  return p;
 }
 
 /** Let the viewer's own (authoritative) fetch feed the cache + warm images —
