@@ -49,6 +49,7 @@ import { useStore, triggerMailRefresh } from "../state";
 import { useKeys, useKeyContext } from "../keys";
 import { deadlineChip, lastChecked, relAge } from "../lib/format";
 import { rankItems } from "../lib/ranking";
+import { prefetchThread } from "../lib/threadPrefetch";
 import { usePref } from "../lib/prefs";
 import { senderDisplayName, faviconUrl } from "../lib/avatar";
 import { getUserName } from "../lib/identity";
@@ -178,6 +179,19 @@ function SitrepBody({
   const [eyesExpanded, setEyesExpanded] = useState(false);
   const visibleEyes = eyesExpanded ? ranked : ranked.slice(0, EYES_VISIBLE);
   const eyesOverflow = ranked.length - EYES_VISIBLE;
+
+  // PRELOAD every For-your-eyes email (thread + images) so opening one is
+  // instant. The visible top-10 warm immediately; the collapsed remainder
+  // trickles at 150ms spacing so a long list never stampedes the daemon.
+  // prefetchThread dedupes in-flight + fresh entries, so re-runs on re-rank
+  // or the 10s poll are near-free.
+  useEffect(() => {
+    for (const u of ranked.slice(0, EYES_VISIBLE)) prefetchThread(u.thread_id);
+    const timers = ranked.slice(EYES_VISIBLE).map((u, i) =>
+      window.setTimeout(() => prefetchThread(u.thread_id), 150 * (i + 1)),
+    );
+    return () => timers.forEach((t) => window.clearTimeout(t));
+  }, [ranked]);
 
   // --- rules count (cheap, lazily fetched once) -----------------------------
   const [rulesCount, setRulesCount] = useState<number | null>(null);

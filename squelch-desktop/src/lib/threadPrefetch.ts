@@ -20,7 +20,10 @@ import type { ClientThreadView } from "../api";
 import { getPrefs } from "./prefs";
 import { stripTrackers } from "./trackers";
 
-const CACHE_MAX = 20;
+/* Sized to hold the whole For-your-eyes list (sitrep preloads every standing
+   item) plus inbox hover-warms without LRU churn. Views are small (text/html
+   strings); 60 is a few MB worst-case. */
+const CACHE_MAX = 60;
 /** A cached view older than this refetches on real open (mail can change). */
 const FRESH_MS = 60_000;
 /** Max images warmed per message — a 60-image megamail shouldn't stampede. */
