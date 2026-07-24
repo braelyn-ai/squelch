@@ -724,6 +724,10 @@ function receiptAmount(r: ReceiptRecord): string {
 function ReceiptsZone() {
   const [receipts, setReceipts] = useState<ReceiptRecord[] | null>(null);
   const openThread = useStore((s) => s.openThread);
+  const viewInEmails = useStore((s) => s.viewInEmails);
+  // Same stale-daemon fallback as BankingZone.
+  const open = (r: ReceiptRecord) =>
+    r.thread_id ? openThread(r.thread_id) : viewInEmails(r.message_id);
 
   useEffect(() => {
     let alive = true;
@@ -766,7 +770,7 @@ function ReceiptsZone() {
               type="button"
               className="receipt-row"
               key={r.id}
-              onClick={() => openThread(r.thread_id)}
+              onClick={() => open(r)}
               title="open this email"
             >
               <span className="receipt-sender" title={r.from_addr}>
@@ -826,6 +830,12 @@ const BANKING_SHOWN = 8;
 function BankingZone() {
   const [records, setRecords] = useState<BankingRecord[] | null>(null);
   const openThread = useStore((s) => s.openThread);
+  const viewInEmails = useStore((s) => s.viewInEmails);
+  // thread_id shipped after the banking wire type — a daemon that predates it
+  // sends rows without one. Fall back to the emails-page jump so the click
+  // always does SOMETHING.
+  const open = (r: BankingRecord) =>
+    r.thread_id ? openThread(r.thread_id) : viewInEmails(r.message_id);
 
   useEffect(() => {
     let alive = true;
@@ -861,7 +871,7 @@ function BankingZone() {
               type="button"
               className="receipt-row"
               key={r.id}
-              onClick={() => openThread(r.thread_id)}
+              onClick={() => open(r)}
               title="open this email"
             >
               <span className="receipt-sender">
