@@ -66,7 +66,9 @@ SCORING (importance is an integer 0-100, aligned with these anchors):
 
 TIER: pick one of \"past_due\", \"deadline\", \"signal\", \"noise\" that best fits. \
 Use past_due/deadline only for a concrete bill, payment, or dated obligation; \
-signal for mail worth surfacing; noise otherwise. The is_known_contact flag in \
+signal for mail worth surfacing; noise otherwise. A row categorized \
+banking_statement, transaction_alert, or autopay_bill is a RECORD: its tier \
+must be noise, never past_due or deadline. The is_known_contact flag in \
 the TRUSTED CONTEXT is a strong signal for a higher tier.
 
 DEADLINES: set has_deadline=true only for a concrete bill, payment, or dated \
@@ -225,6 +227,36 @@ pub const CATEGORIES: &[&str] = &[
 /// Normalize a model-emitted category to one of [`CATEGORIES`], defaulting an
 /// unknown/empty value to `general`. Keeps a rogue value from ever polluting the
 /// extractor queue (which routes strictly on this string).
+/// The record-shaped categories: rows that live in the Banking rail, never the
+/// attention bands. See [`clamp_record_tier`].
+pub const RECORD_CATEGORIES: &[&str] = &["banking_statement", "transaction_alert", "autopay_bill"];
+
+/// STRUCTURAL CONSISTENCY: category wins over tier. The model decides category
+/// and tier independently, and a contradictory verdict (category
+/// banking_statement + tier deadline) would sit in For-your-eyes until the
+/// extractor happened to resolve it — the PayPal "June statement" bug. For a
+/// record category, force the tier to Noise, drop any deadline, and say why.
+/// Returns the (possibly) clamped (tier, deadline, tier_reason).
+pub(crate) fn clamp_record_tier(
+    category: &str,
+    tier: crate::types::Tier,
+    deadline: Option<crate::triage::DeadlineHit>,
+    tier_reason: String,
+    stage_label: &str,
+) -> (crate::types::Tier, Option<crate::triage::DeadlineHit>, String) {
+    if RECORD_CATEGORIES.contains(&category)
+        && matches!(tier, crate::types::Tier::PastDue | crate::types::Tier::Deadline)
+    {
+        (
+            crate::types::Tier::Noise,
+            None,
+            format!("{stage_label}: {category} is a record; lives in Banking, never the attention bands"),
+        )
+    } else {
+        (tier, deadline, tier_reason)
+    }
+}
+
 pub fn normalize_category(raw: &str) -> String {
     let c = raw.trim();
     if CATEGORIES.contains(&c) {
@@ -360,6 +392,10 @@ pub fn apply_result(
         }
     };
 
+    let category = normalize_category(&out.category);
+    let (tier, deadline, tier_reason) =
+        clamp_record_tier(&category, tier, deadline, tier_reason, "stage-1");
+
     Stage1Applied {
         message_id: queued.message_id,
         account_id: queued.account_id,
@@ -377,7 +413,7 @@ pub fn apply_result(
         needs_stage2: !out.confident,
         deadline,
         // Normalized routing category (an unknown value -> "general").
-        category: Some(normalize_category(&out.category)),
+        category: Some(category),
     }
 }
 
@@ -491,6 +527,26 @@ mod tests {
         let tier = a.field_reasons.tier.as_deref().unwrap();
         assert!(tier.starts_with("stage-1:"), "stage-1 label: {tier}");
         assert!(tier.contains("capped at deadline"));
+    }
+
+    #[test]
+    fn record_category_never_lands_in_the_attention_bands() {
+        // THE PAYPAL-STATEMENT BUG: the model can emit a contradictory verdict
+        // (category banking_statement + tier deadline + a claimed due date).
+        // Category must win structurally: tier clamps to Noise, the deadline is
+        // dropped, and the tier reason says why.
+        let q = queued(false);
+        let mut o = out(60, true);
+        o.tier = "deadline".into();
+        o.category = "banking_statement".into();
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-07-20T00:00:00Z".into());
+        let a = apply_result(&q, &o, "m", now());
+        assert_eq!(a.tier, Tier::Noise, "record categories never reach FYE");
+        assert!(a.deadline.is_none(), "no deadline row for a record");
+        let tr = a.field_reasons.tier.as_deref().unwrap_or("");
+        assert!(tr.contains("record"), "reason states the clamp: {tr}");
+        assert_eq!(a.category.as_deref(), Some("banking_statement"));
     }
 
     #[test]

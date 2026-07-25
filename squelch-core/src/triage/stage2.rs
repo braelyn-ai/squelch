@@ -470,6 +470,15 @@ pub fn apply_result(
         }
     };
 
+    let category = crate::triage::stage1_llm::normalize_category(&out.category);
+    let (tier, deadline, tier_reason) = crate::triage::stage1_llm::clamp_record_tier(
+        &category,
+        tier,
+        deadline,
+        tier_reason,
+        "stage-2",
+    );
+
     Stage2Applied {
         message_id: queued.message_id,
         account_id: queued.account_id,
@@ -485,7 +494,7 @@ pub fn apply_result(
         model_used: model.to_string(),
         deadline,
         // Normalized routing category (parity with Stage-1; unknown -> "general").
-        category: Some(crate::triage::stage1_llm::normalize_category(&out.category)),
+        category: Some(category),
     }
 }
 

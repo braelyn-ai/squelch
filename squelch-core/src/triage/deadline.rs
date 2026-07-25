@@ -147,6 +147,13 @@ fn detector() -> &'static BillDetector {
             rx(r"\bmoney back\b"),
         ],
         past_transaction: vec![
+            // STATEMENT-AVAILABILITY: "your June statement is available" is a
+            // record notice, not an obligation (the PayPal-statement-in-FYE
+            // bug). Same precedence as the rest of this list: explicit
+            // payment-obligation phrasing still wins.
+            rx(r"\bstatement is (now )?(available|ready)\b"),
+            rx(r"\b(view|access) your (account |monthly )?statement\b"),
+            rx(r"\b(account|monthly|billing) statement\b"),
             rx(r"\bpayment (was )?received\b"),
             rx(r"\bthank you for your payment\b"),
             rx(r"\bpayment (processed|successful|complete|confirmation)\b"),
@@ -502,6 +509,31 @@ mod tests {
 
     fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn statement_availability_is_a_record_not_a_bill() {
+        // "Your June account statement is available" (PayPal shape) must not
+        // seed as a bill; an explicit obligation still wins.
+        let now = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+        assert!(
+            detect_bill(
+                "Braelyn, your June account statement is available.",
+                "Access your account statements quickly and easily.",
+                now
+            )
+            .is_none(),
+            "statement availability must not be a bill"
+        );
+        assert!(
+            detect_bill(
+                "Your statement is available",
+                "Minimum payment due: amount due $45 by August 1, 2026",
+                now
+            )
+            .is_some(),
+            "explicit obligation phrasing still wins"
+        );
     }
 
     #[test]
