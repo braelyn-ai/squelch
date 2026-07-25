@@ -17,7 +17,7 @@
 // ranked rows, d marks the focused item done, Enter/v opens it fullscreen. The
 // global 1..5 nav (App) works here too.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   KeyRound,
   SlidersHorizontal,
@@ -433,6 +433,7 @@ function ObligationRow({
   return (
     <div
       className={`ob-row${focused ? " focused" : ""}${overdue ? " overdue" : ""}`}
+      onMouseEnter={onFocus}
       onClick={() => {
         onFocus();
         onView();
@@ -995,6 +996,51 @@ function NewslettersZone() {
   const [updates, setUpdates] = useState<AttentionUpdate[] | null>(null);
   const [rules, setRules] = useState<SenderRule[]>([]);
   const openThread = useStore((s) => s.openThread);
+  const pushToast = useStore((s) => s.pushToast);
+  // Hovered card (address) — `e` while hovering marks that sender's window
+  // done. Registered in the SAME "sitrep" context as the FYE keymap; the FYE
+  // handler defers to this when a card is hovered (see SitrepBody).
+  const hoveredRef = useRef<string | null>(null);
+  const [, forceHover] = useState(0);
+
+  const markDone = useMemo(
+    () => async (nl: Newsletter) => {
+      // Bulk-resolve every aggregated update; one toast, optimistic card drop.
+      setUpdates((xs) =>
+        xs ? xs.filter((u) => !nl.items.some((it) => it.id === u.id)) : xs,
+      );
+      try {
+        await Promise.all(nl.items.map((it) => api.setStatus(it.id, "done")));
+        pushToast(
+          `done: ${senderDisplayName(nl.sender)} (${nl.items.length})`,
+          "info",
+        );
+      } catch {
+        pushToast("some marks failed; refresh to re-sync", "error");
+      }
+    },
+    [pushToast],
+  );
+
+  const newslettersRef = useRef<Newsletter[]>([]);
+  const bindings = useMemo(
+    () => [
+      {
+        key: "e",
+        description: "mark hovered newsletter done",
+        handler: () => {
+          const addr = hoveredRef.current;
+          if (!addr) return false; // not hovering → let the FYE handler run
+          const nl = newslettersRef.current.find(
+            (n: Newsletter) => n.address === addr,
+          );
+          if (nl) void markDone(nl);
+        },
+      },
+    ],
+    [markDone],
+  );
+  useKeys("sitrep", bindings, [bindings]);
 
   // Fetch noise updates + rules once; re-fetch after a rule save so chips/CTAs
   // reflect the new rule immediately.
@@ -1023,6 +1069,7 @@ function NewslettersZone() {
     () => (updates ? deriveNewsletters(updates, rules) : []),
     [updates, rules],
   );
+  newslettersRef.current = newsletters;
 
   function editRule(nl: Newsletter) {
     if (!nl.rule) return;
@@ -1048,7 +1095,13 @@ function NewslettersZone() {
             key={nl.address}
             nl={nl}
             onEdit={() => editRule(nl)}
-            onOpen={() => nl.latest_thread_id && openThread(nl.latest_thread_id)}
+            onOpen={() =>
+              nl.latest_thread_id && openThread(nl.latest_thread_id, nl.items)
+            }
+            onHover={(over) => {
+              hoveredRef.current = over ? nl.address : null;
+              forceHover((n) => n + 1);
+            }}
           />
         ))}
       </div>
@@ -1136,10 +1189,12 @@ function NewsletterCard({
   nl,
   onEdit,
   onOpen,
+  onHover,
 }: {
   nl: Newsletter;
   onEdit: () => void;
   onOpen: () => void;
+  onHover: (over: boolean) => void;
 }) {
   const hasRule = nl.rule !== null;
 
@@ -1152,6 +1207,8 @@ function NewsletterCard({
       role="button"
       tabIndex={0}
       onClick={onOpen}
+      onMouseEnter={() => onHover(true)}
+      onMouseLeave={() => onHover(false)}
       onKeyDown={(e) => {
         if (e.key === "Enter") {
           e.preventDefault();

@@ -66,6 +66,9 @@ export interface Newsletter {
   latest: number;
   /** The latest message's thread — clicking the card opens this email. */
   latest_thread_id: string;
+  /** The window's aggregated updates, NEWEST FIRST — the viewer's horizontal
+   *  queue (h/l between this sender's emails) and the bulk-done target. */
+  items: AttentionUpdate[];
   /** The rule governing this sender, if any (drives the chip vs. CTA). */
   rule: SenderRule | null;
 }
@@ -139,6 +142,7 @@ export function deriveNewsletters(
     latest: number;
     summary: string;
     latest_thread_id: string;
+    items: AttentionUpdate[];
   }
   const byAddr = new Map<string, Bucket>();
 
@@ -167,10 +171,12 @@ export function deriveNewsletters(
         latest: 0,
         summary: "",
         latest_thread_id: "",
+        items: [],
       };
       byAddr.set(address, b);
     }
     b.total += 1;
+    b.items.push(u);
     if (isNewsletterReason(u.reason)) b.newsletterHits += 1;
     if (isReceiptReason(u.reason)) b.receiptHits += 1;
     const d = dateOf(u);
@@ -201,6 +207,7 @@ export function deriveNewsletters(
       summary: b.summary,
       latest: b.latest,
       latest_thread_id: b.latest_thread_id,
+      items: [...b.items].sort((a2, b2) => dateOf(b2) - dateOf(a2)),
       rule: ruleForAddress(rules, address),
     });
   }

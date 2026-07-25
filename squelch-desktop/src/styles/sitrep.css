@@ -134,7 +134,8 @@
   border-bottom: none;
 }
 .row:hover {
-  background: var(--bg-row);
+  background: var(--bg-row-sel);
+  border-left-color: var(--accent);
 }
 .row.sel {
   background: var(--bg-row-sel);

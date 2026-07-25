@@ -303,7 +303,24 @@ function ViewerBody({ threadId }: { threadId: string }) {
 
   const doneAndNext = useCallback(() => {
     const cidx = threadQueue.findIndex((u) => u.thread_id === threadId);
-    if (cidx < 0) return; // not opened from a queue — nothing to advance through
+    if (cidx < 0) {
+      // Not opened from a queue (search, a right-rail record, an old link):
+      // e still means done — resolve the newest message directly and close.
+      const newest = thread?.messages[thread.messages.length - 1];
+      if (newest) {
+        void api
+          .setStatus(newest.id, "done")
+          .then(() => pushToast("done", "info"))
+          .catch((err) =>
+            pushToast(
+              err instanceof ApiError ? err.message : "done failed",
+              "error",
+            ),
+          );
+      }
+      closeThread();
+      return;
+    }
     void dispatchDone(threadQueue[cidx]);
     const next = threadQueue[cidx + 1] ?? null;
     if (next) {
@@ -311,7 +328,20 @@ function ViewerBody({ threadId }: { threadId: string }) {
     } else {
       closeThread();
     }
-  }, [threadQueue, threadId, openThread, closeThread]);
+  }, [threadQueue, threadId, thread, openThread, closeThread, pushToast]);
+
+  // HORIZONTAL queue nav (h/l + Left/Right): move between the queued emails
+  // WITHOUT resolving anything — the newsletter "2 this week" browse.
+  const stepQueue = useCallback(
+    (delta: number) => {
+      if (threadQueue.length < 2) return;
+      const cidx = threadQueue.findIndex((u) => u.thread_id === threadId);
+      if (cidx < 0) return;
+      const next = threadQueue[cidx + delta];
+      if (next) openThread(next.thread_id, threadQueue);
+    },
+    [threadQueue, threadId, openThread],
+  );
 
   // Keep the selected card visible: fires on j/k moves AND once right after
   // load (setIdx→newest triggers it; a single-message thread is already at the
@@ -345,6 +375,10 @@ function ViewerBody({ threadId }: { threadId: string }) {
         description: "back",
         handler: () => closeThread(),
       },
+      { key: "h", description: "prev email", handler: () => stepQueue(-1) },
+      { key: "l", description: "next email", handler: () => stepQueue(1) },
+      { key: "ArrowLeft", description: "prev email", handler: () => stepQueue(-1) },
+      { key: "ArrowRight", description: "next email", handler: () => stepQueue(1) },
       {
         key: "j",
         description: "older message",
@@ -372,7 +406,7 @@ function ViewerBody({ threadId }: { threadId: string }) {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [count, closeThread, openConfirm, doneAndNext],
+    [count, closeThread, openConfirm, doneAndNext, stepQueue],
   );
   useKeys("thread", bindings, [bindings]);
 

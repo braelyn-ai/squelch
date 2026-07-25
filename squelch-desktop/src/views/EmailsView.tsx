@@ -53,9 +53,19 @@ export function EmailsView() {
   // viewport edge would otherwise scroll-jump under the cursor. The follow
   // effect reads this ref and skips mouse-driven changes.
   const moveSrc = useRef<"keyboard" | "mouse">("keyboard");
+  // NO persistent selection (owner call, 2026-07-24): the row highlight is
+  // hover-driven (CSS :hover). The .sel highlight renders ONLY while the
+  // keyboard is driving; any mouse hover hides it (and re-anchors idx so
+  // arrows continue from the hovered row).
+  const [kbActive, setKbActive] = useState(false);
+  // True only while the cursor is actually over a row — cleared on list leave.
+  // e/d/r/Enter require kbActive OR a live hover: with nothing highlighted,
+  // action keys must be inert (no invisible row-0 casualties).
+  const hoveringRef = useRef(false);
   // Keyboard move: tag the source, then step the selection.
   const moveByKey = (next: (i: number) => number) => {
     moveSrc.current = "keyboard";
+    setKbActive(true);
     setIdx(next);
   };
   // STABLE per-row callbacks (UpdateRow is memoized): rebuilding closures for
@@ -73,6 +83,8 @@ export function EmailsView() {
       const i = idIndex.get(id);
       if (i !== undefined) {
         moveSrc.current = "mouse";
+        hoveringRef.current = true;
+        setKbActive(false);
         setIdx(i);
       }
     },
@@ -181,6 +193,7 @@ export function EmailsView() {
         key: "Enter",
         description: "drill in",
         handler: () => {
+          if (!kbActive && !hoveringRef.current) return;
           // Hand the current ordered inbox rows to the viewer as its queue so
           // "done + next" (e/d) can advance in place.
           if (selected) openThread(selected.thread_id, rows);
@@ -190,6 +203,7 @@ export function EmailsView() {
         key: "r",
         description: "reply",
         handler: () => {
+          if (!kbActive && !hoveringRef.current) return;
           if (selected) dispatchReply(selected);
         },
       },
@@ -197,6 +211,7 @@ export function EmailsView() {
         key: "e",
         description: "done",
         handler: () => {
+          if (!kbActive && !hoveringRef.current) return;
           // e = done everywhere (sitrep parity — owner call, 2026-07-23).
           if (selected) {
             void dispatchDone(selected);
@@ -208,6 +223,7 @@ export function EmailsView() {
         key: "d",
         description: "done",
         handler: () => {
+          if (!kbActive && !hoveringRef.current) return;
           if (selected) {
             void dispatchDone(selected);
             removeRow(selected.id);
@@ -255,7 +271,7 @@ export function EmailsView() {
     ],
     // Recompute when the list or selection changes so closures stay fresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [rows, idx],
+    [rows, idx, kbActive],
   );
   useKeys("list", bindings, [bindings]);
 
@@ -273,7 +289,12 @@ export function EmailsView() {
         onOpenAudit={() => setView("audit")}
       />
 
-      <section className="band">
+      <section
+        className="band"
+        onMouseLeave={() => {
+          hoveringRef.current = false;
+        }}
+      >
         <div className="band-head">
           <span className="glyph">
             <Inbox size={13} />
@@ -293,7 +314,7 @@ export function EmailsView() {
             <UpdateRow
               key={u.id}
               update={u}
-              selected={i === idx}
+              selected={kbActive && i === idx}
               onSelect={hoverSelectById}
               onOpen={openUpdate}
             />
