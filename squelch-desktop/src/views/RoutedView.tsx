@@ -22,8 +22,7 @@ import "../styles/sitrep.css";
 
 type RoutedKind = "auth" | "rules" | "audit";
 
-const TITLE: Record<RoutedKind, string> = {
-  auth: "Auth — login codes & alerts",
+const TITLE: Record<Exclude<RoutedKind, "auth">, string> = {
   rules: "Rules — sender rules",
   audit: "Audit — agent & app actions",
 };
@@ -49,13 +48,17 @@ export function RoutedView({ view }: { view: RoutedKind }) {
   );
   useKeys("modal", bindings, [bindings]);
 
+  // Auth owns its entire surface — its own header band and a two-column body —
+  // so it opts out of the shared routed-head/body chrome. The "modal" context
+  // and the Esc binding above are already registered, so its keys still work.
+  if (view === "auth") return <AuthView />;
+
   return (
     <div className="routed-view">
       <header className="routed-head">
         <h2>{TITLE[view]}</h2>
       </header>
       <div className="routed-body">
-        {view === "auth" && <AuthView />}
         {view === "rules" && <RulesView />}
         {view === "audit" && <AuditView />}
       </div>

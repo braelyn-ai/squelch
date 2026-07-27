@@ -545,3 +545,38 @@ export interface TriageDebug {
   extractor_model_used: string | null;
   created_at: string;
 }
+
+// --- auth-mail shredder (retention) -----------------------------------------
+
+/**
+ * types::ShredStats (GET/POST /client/shredder). The retention policy for auth
+ * mail plus the real counts from the server's `shred_log` ledger.
+ *
+ * `enabled` and `write_ready` are SEPARATE on purpose: the pass can only run
+ * when both hold, and the UI has to be able to say "off" and "on, but no write
+ * credential" differently rather than showing a switch that quietly does
+ * nothing. Shredding means Gmail's Trash (recoverable for 30 days), never a
+ * permanent delete.
+ */
+export interface ShredStats {
+  /** Whether automatic shredding is turned on. Server default is false. */
+  enabled: boolean;
+  /** Retention window in days; auth mail older than this is eligible. */
+  after_days: number;
+  /** Messages trashed in the trailing 30 days — the headline figure. */
+  shredded_recent: number;
+  /** Messages trashed since the ledger began. */
+  shredded_total: number;
+  /** ISO time of the most recent shred, or null if nothing ever has been. */
+  last_shredded_at: string | null;
+  /** How many messages are eligible right now under the current policy. */
+  pending: number;
+  /** False when no write credential is configured (the pass cannot run). */
+  write_ready: boolean;
+}
+
+/** POST /client/shredder body — any subset of the policy. */
+export interface ShredderPatch {
+  enabled?: boolean;
+  after_days?: number;
+}

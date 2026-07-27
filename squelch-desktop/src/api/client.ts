@@ -34,6 +34,8 @@ import type {
   UnsubResolution,
   UnsubscribeRecord,
   UnsubscribeResult,
+  ShredStats,
+  ShredderPatch,
   UpdatesParams,
   UsageResponse,
 } from "./types";
@@ -483,4 +485,25 @@ export function actionSend(input: {
     override_guard: input.overrideGuard ?? false,
   };
   return request("/client/actions/send", { method: "POST", body });
+}
+
+// --- auth-mail shredder (retention) -----------------------------------------
+
+/** Current retention policy + real ledger counts for the Auth page. */
+export function getShredder(): Promise<ShredStats> {
+  return request<ShredStats>("/client/shredder");
+}
+
+/** Update the retention policy; returns the refreshed stats. */
+export function setShredder(patch: ShredderPatch): Promise<ShredStats> {
+  return request<ShredStats>("/client/shredder", { method: "POST", body: patch });
+}
+
+/**
+ * Run a retention pass NOW rather than waiting for the daemon's hourly timer.
+ * A no-op server-side when the shredder is off or no write credential exists,
+ * so it is safe to fire whenever the Auth page opens.
+ */
+export function runShredder(): Promise<{ shredded: number; stats: ShredStats }> {
+  return request("/client/shredder/run", { method: "POST", body: {} });
 }
