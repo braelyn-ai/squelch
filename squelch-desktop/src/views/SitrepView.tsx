@@ -9,8 +9,8 @@
 //      (d/e), open email (Enter/v — opens the thread fullscreen in ThreadViewer).
 //   b. ATTENTION — aggregate only: "N new since <relative last check>" +
 //      deduped sender chips (from band=new). Click → Emails.
-//   c. STATUS STRIP — auth chip (→ Auth), last sync/check, today's triage cost,
-//      rules count.
+//   c. STATUS STRIP — last sync/check, today's triage cost, rules count. (Auth
+//      is reached from the rail; the strip no longer carries a chip for it.)
 // The long tail (aging/open items) lives on the Emails page now, not here.
 //
 // Minimal keymap in its own "sitrep" KeyContext: j/k move between the VISIBLE
@@ -19,7 +19,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  KeyRound,
   SlidersHorizontal,
   ArrowUpRight,
   Eye,
@@ -168,7 +167,7 @@ function SitrepBody({
 }) {
   const sitrep = useStore((s) => s.sitrep);
   const lastRefresh = useStore((s) => s.lastRefresh);
-  const { standing, new: fresh, stats, sealed } = sitrep;
+  const { standing, new: fresh, stats } = sitrep;
 
   // --- "For your eyes" ranking: top-10 by a configurable urgency/severity blend.
   // Re-ranks live when the rankWeight pref changes (Settings slider). The full
@@ -388,12 +387,10 @@ function SitrepBody({
 
       {/* ---- (d) STATUS STRIP ---- */}
       <StatusStrip
-        authCount={sealed.length}
         lastCheckIso={stats?.last_surfaced_at}
         lastRefresh={lastRefresh}
         costUsd={stats?.stage2?.est_cost_usd_today}
         rulesCount={rulesCount}
-        onAuth={() => onGoto("auth")}
         onRules={() => onGoto("rules")}
       />
       </div>
@@ -1264,20 +1261,16 @@ function NewsletterCard({
 // ---- zone (d): status strip ------------------------------------------------
 
 function StatusStrip({
-  authCount,
   lastCheckIso,
   lastRefresh,
   costUsd,
   rulesCount,
-  onAuth,
   onRules,
 }: {
-  authCount: number;
   lastCheckIso: string | null | undefined;
   lastRefresh: number | null;
   costUsd: number | null | undefined;
   rulesCount: number | null;
-  onAuth: () => void;
   onRules: () => void;
 }) {
   const syncedIso = lastRefresh ? new Date(lastRefresh).toISOString() : null;
@@ -1293,11 +1286,6 @@ function StatusStrip({
   };
   return (
     <div className="status-strip">
-      {authCount > 0 && (
-        <button type="button" className="status-chip auth" onClick={onAuth} title="auth messages">
-          <KeyRound size={13} /> {authCount} auth
-        </button>
-      )}
       <button
         type="button"
         className="status-chip refresh"

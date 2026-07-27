@@ -663,14 +663,6 @@
   border-color: var(--fg-faint);
   color: var(--fg);
 }
-.status-strip .status-chip.auth {
-  color: var(--lock);
-  background: var(--lock-soft);
-  border-color: color-mix(in srgb, var(--lock) 40%, var(--border));
-}
-.status-strip .status-chip.auth:hover {
-  border-color: var(--lock);
-}
 /* Manual "check for new mail now" chip. Wraps the synced-ago text so the whole
    pill is the hit target; the icon spins while a poke+pull is in flight. */
 .status-strip .status-chip.refresh {
