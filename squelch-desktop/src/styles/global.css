@@ -74,38 +74,51 @@
      not a glass panel — it stays solid so body copy is never on a busy photo */
   --reader-bg: #f4f8fd;
 
-  /* MATERIALS — translucent tints, ordered by density. --mat-thick is the
-     primary content pane (zone cards, modals); --mat-regular is a surface
-     nested INSIDE one; --mat-thin is a chip/row hover; --mat-ultrathin is the
-     faintest wash. The legacy surface names below alias onto these, so views
-     this pass has not touched still inherit the material system. */
-  --mat-thick: rgba(255, 255, 255, 0.66);
-  --mat-regular: rgba(255, 255, 255, 0.46);
-  --mat-thin: rgba(255, 255, 255, 0.3);
-  --mat-ultrathin: rgba(255, 255, 255, 0.16);
+  /* MATERIALS — ordered by density.
+     --mat-thick is the primary CONTENT pane (zone cards, modals) and it is
+     deliberately NEAR-OPAQUE. Reading surfaces do not get to be translucent:
+     a well-built mac app keeps its sidebar see-through and its content solid
+     (Mail's message list, Notes' body, Finder's file list) because effective
+     contrast on a translucent pane depends on the user's wallpaper, which is
+     not a thing text legibility is allowed to depend on. Glass lives in the
+     CHROME — rail, masthead pills, sheet backdrops, the hero field.
+     --mat-regular is a surface nested inside a pane and therefore steps DOWN
+     in lightness; on a near-white pane a lighter wash would simply vanish.
+     --mat-thin / --mat-ultrathin are ink-side hover washes, for the same
+     reason. */
+  --mat-thick: rgba(251, 253, 255, 0.95);
+  --mat-regular: rgba(233, 240, 249, 0.88);
+  --mat-thin: rgba(20, 45, 80, 0.055);
+  --mat-ultrathin: rgba(20, 45, 80, 0.03);
 
-  /* SPECULAR EDGE — the gradient hairline that makes a pane read as glass.
-     Bright along the lit top edge, near-nothing at the waist, a soft bounce
-     along the bottom. */
-  --spec-top: rgba(255, 255, 255, 0.95);
-  --spec-waist: rgba(255, 255, 255, 0.28);
-  --spec-bottom: rgba(255, 255, 255, 0.62);
+  /* SPECULAR EDGE — the gradient hairline around a pane. Lit along the top
+     edge, INK along the waist and bottom. An all-white rim was right when the
+     panes were translucent and dark things showed through them; on a
+     near-opaque white pane it is invisible, and the card loses its outline
+     entirely. Light from above, contact shadow below — which is also just how
+     a real edge behaves. */
+  --spec-top: rgba(255, 255, 255, 0.9);
+  --spec-waist: rgba(20, 45, 80, 0.1);
+  --spec-bottom: rgba(20, 45, 80, 0.14);
   /* the inner sheen sitting just under the top edge */
   --spec-sheen: rgba(255, 255, 255, 0.85);
 
   --glass: var(--mat-thick); /* card */
-  --glass-strong: rgba(255, 255, 255, 0.76); /* modal / raised */
+  --glass-strong: rgba(253, 254, 255, 0.97); /* modal / raised */
   --zone-wash: var(--mat-thick); /* zone card */
-  /* inputs / code wells: near-opaque on purpose — typed text must stay crisp */
-  --glass-legible: rgba(255, 255, 255, 0.82);
-  --glass-border: rgba(255, 255, 255, 0.5);
-  --glass-border-strong: rgba(255, 255, 255, 0.72);
+  /* inputs / code wells: opaque — typed text must stay crisp */
+  --glass-legible: rgba(255, 255, 255, 0.97);
+  /* BORDERS ARE INK-SIDE. They are drawn on top of near-opaque panes, where a
+     white hairline is invisible. (The specular EDGE is a separate thing — see
+     --edge — and stays light-side, because it lives on the pane's rim.) */
+  --glass-border: rgba(20, 45, 80, 0.14);
+  --glass-border-strong: rgba(20, 45, 80, 0.22);
 
   --bg: var(--glass);
   --bg-raised: var(--glass-strong);
   --bg-row: var(--mat-thin); /* hover */
-  --bg-row-sel: rgba(10, 114, 232, 0.16); /* selection — accent wash */
-  --bg-sunken: rgba(232, 239, 248, 0.55); /* wells */
+  --bg-row-sel: rgba(10, 114, 232, 0.14); /* selection — accent wash */
+  --bg-sunken: rgba(234, 240, 248, 0.9); /* wells */
   --border: var(--glass-border);
   --border-strong: var(--glass-border-strong);
   /* hairline divider INSIDE a pane — ink-side, not light-side, so it reads on
@@ -165,8 +178,8 @@
      as the scrim so rail and content read as one window. */
   --canvas-top: linear-gradient(
     180deg,
-    rgba(247, 250, 254, 0.44) 0%,
-    rgba(236, 243, 251, 0.4) 100%
+    rgba(247, 250, 254, 0.58) 0%,
+    rgba(236, 243, 251, 0.54) 100%
   );
 
   /* the squelch line — the noise divider */
@@ -184,15 +197,17 @@
   );
   --reader-bg: #10161f;
 
-  --mat-thick: rgba(30, 38, 52, 0.62);
-  --mat-regular: rgba(38, 47, 63, 0.5);
-  --mat-thin: rgba(255, 255, 255, 0.08);
-  --mat-ultrathin: rgba(255, 255, 255, 0.045);
+  /* Same rule as light: content panes are near-opaque, glass lives in chrome.
+     Nested surfaces step UP in lightness here (the pane is already dark). */
+  --mat-thick: rgba(25, 32, 44, 0.95);
+  --mat-regular: rgba(38, 47, 63, 0.9);
+  --mat-thin: rgba(255, 255, 255, 0.07);
+  --mat-ultrathin: rgba(255, 255, 255, 0.035);
 
-  --spec-top: rgba(255, 255, 255, 0.34);
-  --spec-waist: rgba(255, 255, 255, 0.07);
-  --spec-bottom: rgba(255, 255, 255, 0.14);
-  --spec-sheen: rgba(255, 255, 255, 0.16);
+  --spec-top: rgba(255, 255, 255, 0.22);
+  --spec-waist: rgba(255, 255, 255, 0.06);
+  --spec-bottom: rgba(0, 0, 0, 0.28);
+  --spec-sheen: rgba(255, 255, 255, 0.14);
 
   --canvas-top: linear-gradient(
     180deg,
@@ -201,17 +216,18 @@
   );
 
   --glass: var(--mat-thick);
-  --glass-strong: rgba(34, 43, 58, 0.76);
+  --glass-strong: rgba(32, 41, 55, 0.97);
   --zone-wash: var(--mat-thick);
-  --glass-legible: rgba(16, 22, 32, 0.72);
-  --glass-border: rgba(255, 255, 255, 0.14);
-  --glass-border-strong: rgba(255, 255, 255, 0.24);
+  --glass-legible: rgba(13, 18, 27, 0.95);
+  /* Light-side here: on a dark pane it is the pale hairline that reads. */
+  --glass-border: rgba(255, 255, 255, 0.13);
+  --glass-border-strong: rgba(255, 255, 255, 0.22);
 
   --bg: var(--glass);
   --bg-raised: var(--glass-strong);
   --bg-row: var(--mat-thin);
-  --bg-row-sel: rgba(74, 163, 255, 0.24);
-  --bg-sunken: rgba(10, 15, 24, 0.5);
+  --bg-row-sel: rgba(74, 163, 255, 0.22);
+  --bg-sunken: rgba(10, 15, 24, 0.85);
   --border: var(--glass-border);
   --border-strong: var(--glass-border-strong);
   --card-line: rgba(255, 255, 255, 0.09);
@@ -395,8 +411,10 @@ body {
 body {
   color: var(--fg);
   font-family: var(--sans);
-  /* 13px is the AppKit control/body size; the whole scale hangs off it */
-  font-size: 13px;
+  /* 13px is the AppKit *control* size, but this drives body copy too and SF at
+     13 read smaller than the Hanken Grotesk it replaced — dropping from 13.5
+     to 13 cost legibility for no gain. Back to 13.5. */
+  font-size: 13.5px;
   line-height: 1.55;
   /* AppKit renders UI text greyscale-antialiased, not subpixel */
   -webkit-font-smoothing: antialiased;
