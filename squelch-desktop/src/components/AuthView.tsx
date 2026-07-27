@@ -240,12 +240,12 @@ export function AuthView() {
 
   return (
     <div className="authp">
+      {/* Same bar as every other page (see .authp-head) — the title follows the
+          "Page — what it holds" convention of Rules and Audit. */}
       <header className="authp-head">
-        <h2>
-          Auth <span className="authp-tag">codes, alerts &amp; resets — nothing else</span>
-        </h2>
+        <h2>Auth — codes, alerts &amp; resets</h2>
         <div className="authp-headright">
-          <span className="authp-pill">
+          <span className="authp-live">
             <i className="dot" /> {live.length} live · {open.length} awaiting you
           </span>
           <span className="authp-keys">

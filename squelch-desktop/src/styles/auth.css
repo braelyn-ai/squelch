@@ -20,34 +20,27 @@
   flex-direction: column;
 }
 
-/* Header band — the canvas blue, continuous with the icon rail to its left,
-   exactly like .routed-head and .tv-head. Keeps the top --chrome-top strip free
-   of controls so the traffic lights and the drag strip stay usable. */
+/* Header band — IDENTICAL to .routed-head and .tv-head: same traffic-light
+   clearance, same padding, same canvas blue, same 14px on-sky title. Every page
+   in the app wears this bar, and the icon rail continues it to the left, so
+   they read as one unbroken blue L. Auth's extras (live counter, key hints) sit
+   on the right in the same quiet on-sky-faint language the thread viewer uses
+   for its Esc hint — additions to the bar, not a different bar. */
 .authp-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: calc(var(--chrome-top) - 8px) 22px 14px;
+  padding: calc(var(--chrome-top) - 8px) 20px 12px;
   background: var(--canvas-top);
   flex: none;
 }
 .authp-head h2 {
-  margin: 0;
-  font-size: 19px;
+  font-size: 14px;
   font-weight: 650;
-  color: #fff;
-  letter-spacing: -0.01em;
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}
-.authp-tag {
-  font-size: 12.5px;
-  font-weight: 450;
-  color: rgba(255, 255, 255, 0.72);
-  letter-spacing: 0;
+  margin: 0;
+  color: var(--on-sky);
+  letter-spacing: -0.1px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -57,27 +50,22 @@
   align-items: center;
   gap: 14px;
   flex: none;
+  font-size: 11px;
+  color: var(--on-sky-faint);
 }
-/* Live/awaiting counter. A glass pill on the blue, with a soft pulsing dot —
-   the only animated thing on the page, because "live" is the one word here
-   that means something is still happening. */
-.authp-pill {
+.authp-live {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 12px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.16);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  color: #fff;
-  font-size: 12px;
+  gap: 6px;
   white-space: nowrap;
 }
-.authp-pill .dot {
+/* The only animated thing on the page, because "live" is the one word up here
+   that means something is still happening. */
+.authp-live .dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #7ee0b0;
+  background: var(--accent);
   animation: authp-pulse 2.4s ease-in-out infinite;
 }
 @keyframes authp-pulse {
@@ -90,26 +78,23 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .authp-pill .dot {
+  .authp-live .dot {
     animation: none;
   }
 }
 .authp-keys {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.66);
+  gap: 5px;
   white-space: nowrap;
 }
+/* kbd on the blue band: the global chrome is tuned for light cards, so tint it
+   the way .rail-btn .rail-tip kbd does rather than punching a bright hole. */
 .authp-keys kbd {
-  background: rgba(255, 255, 255, 0.16);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  color: #fff;
-  border-radius: 4px;
-  padding: 1px 5px;
-  font-size: 10.5px;
-  font-family: inherit;
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.22);
+  border-bottom-width: 1px;
+  color: var(--on-sky);
 }
 
 /* ---- body: main column + rail ------------------------------------------- */
@@ -120,8 +105,9 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
   gap: 16px;
-  /* A little breathing room under the blue band before the card starts. */
-  padding: 12px 20px 20px;
+  /* Breathing room under the blue band, matching .routed-body's 14/20/20 inset
+     so Auth sits on the canvas exactly like Rules and Audit do. */
+  padding: 14px 20px 20px;
   /* INDEPENDENT SCROLL. The two columns are doing different jobs — the left is
      a list you scan, the right is a short set of things to answer — so they get
      their own scroll boxes rather than one shared page scroll. Scrolling the
