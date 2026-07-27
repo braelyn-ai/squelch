@@ -104,6 +104,14 @@ standing instruction is given, set matches_sender_rule to null.
 
 CATEGORY: assign exactly one coarse category, used to route the email to a \
 specialist. Choose the single best fit:
+- marketing = a promotional or bulk send: a sale, an offer, a newsletter, a \
+product announcement, an event promo, a digest. The test is INTENT, not tone: \
+the sender is broadcasting to a list to get you to buy, read, or attend, rather \
+than telling you something about YOUR OWN account. A shipping notice, receipt, \
+security alert, or anything about an order or account you already have is NOT \
+marketing, even when the sender also markets to you. When a promotional email \
+also carries a genuine transactional fact about your account, the transactional \
+category wins.
 - invoice = a bill or invoice that NEEDS PAYING (an action). It stays in the \
 attention bands so the user does not miss it.
 - autopay_bill = a bill the email EXPLICITLY says will be paid automatically: \
@@ -270,7 +278,7 @@ pub fn output_schema() -> serde_json::Value {
             "deadline_reason": { "type": ["string", "null"] },
             "category": {
                 "type": "string",
-                "enum": ["general", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
+                "enum": ["general", "marketing", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
             }
         }
     })

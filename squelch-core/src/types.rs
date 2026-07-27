@@ -578,8 +578,8 @@ pub struct UnsubscribeRecord {
 pub enum TriageAxis {
     /// `triage.tier` — past_due | deadline | signal | noise.
     Tier,
-    /// `triage.category` — general | invoice | autopay_bill | banking_statement
-    /// | transaction_alert.
+    /// `triage.category` — general | marketing | invoice | autopay_bill |
+    /// banking_statement | transaction_alert.
     Category,
 }
 
@@ -607,6 +607,7 @@ impl TriageAxis {
             TriageAxis::Tier => &["past_due", "deadline", "signal", "noise"],
             TriageAxis::Category => &[
                 "general",
+                "marketing",
                 "invoice",
                 "autopay_bill",
                 "banking_statement",

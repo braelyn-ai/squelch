@@ -52,12 +52,18 @@ describe("matchTargets", () => {
     expect(matchTargets("zzzzq")).toEqual([]);
   });
 
-  test("marketing words resolve to Noise", () => {
-    // There is no marketing CATEGORY in the pipeline; noise-tier is how this
-    // system expresses "this is marketing, stop surfacing it".
+  test("marketing words resolve to the Marketing category, not Noise", () => {
+    // Marketing is a real category now. "This is marketing" (what the mail IS)
+    // and "this is noise" (whether it should have surfaced) are different
+    // claims, and the dataset must not conflate them — otherwise it learns
+    // that every promo is unwanted, which is the assumption the category
+    // exists to stop making.
     for (const q of ["marketing", "newsletter", "promo", "ad"]) {
-      expect(matchTargets(q)[0].value).toBe("noise");
+      const top = matchTargets(q)[0];
+      expect(top.value).toBe("marketing");
+      expect(top.axis).toBe("category");
     }
+    expect(matchTargets("junk")[0].value).toBe("noise");
   });
 
   test("tiers are reachable by their own words", () => {

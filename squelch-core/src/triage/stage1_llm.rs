@@ -108,6 +108,14 @@ set deadline_reason to null.
 
 CATEGORY: assign exactly one coarse category, used to route the email to a \
 specialist. Choose the single best fit:
+- marketing = a promotional or bulk send: a sale, an offer, a newsletter, a \
+product announcement, an event promo, a digest. The test is INTENT, not tone: \
+the sender is broadcasting to a list to get you to buy, read, or attend, rather \
+than telling you something about YOUR OWN account. A shipping notice, receipt, \
+security alert, or anything about an order or account you already have is NOT \
+marketing, even when the sender also markets to you. When a promotional email \
+also carries a genuine transactional fact about your account, the transactional \
+category wins.
 - invoice = a bill or invoice that NEEDS PAYING (an action). It stays in the \
 attention bands so the user does not miss it.
 - autopay_bill = a bill the email EXPLICITLY says will be paid automatically: \
@@ -176,7 +184,7 @@ pub fn output_schema() -> serde_json::Value {
             "confident": { "type": "boolean" },
             "category": {
                 "type": "string",
-                "enum": ["general", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
+                "enum": ["general", "marketing", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
             }
         }
     })
@@ -201,7 +209,7 @@ pub struct Stage1Output {
     pub deadline_reason: Option<String>,
     /// `false` => escalate to the more capable Stage-2 model.
     pub confident: bool,
-    /// Coarse routing category: `general` | `invoice` | `autopay_bill` | `banking_statement` |
+    /// Coarse routing category: `general` | `marketing` | `invoice` | `autopay_bill` | `banking_statement` |
     /// `transaction_alert`. Constrained by the schema enum; normalized on apply
     /// (an unknown value falls back to `general`) before it is stored on the row.
     /// `#[serde(default)]` so a pre-category model response still parses.
@@ -218,6 +226,7 @@ pub fn default_category() -> String {
 /// so the routing enum has a single source of truth.
 pub const CATEGORIES: &[&str] = &[
     "general",
+    "marketing",
     "invoice",
     "autopay_bill",
     "banking_statement",
@@ -465,10 +474,10 @@ mod tests {
         for k in ["tier", "confident", "importance", "one_line", "category"] {
             assert!(req.iter().any(|v| v == k), "missing required {k}");
         }
-        // The category property is a closed enum of exactly the five routes.
+        // The category property is a closed enum of exactly the six routes.
         let en = s["properties"]["category"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), 5);
-        for c in ["general", "invoice", "autopay_bill", "banking_statement", "transaction_alert"] {
+        assert_eq!(en.len(), CATEGORIES.len());
+        for c in ["general", "marketing", "invoice", "autopay_bill", "banking_statement", "transaction_alert"] {
             assert!(en.iter().any(|v| v == c), "missing category enum {c}");
         }
     }

@@ -64,6 +64,23 @@ export const TRIAGE_TARGETS: TriageTarget[] = [
   },
   {
     axis: "category",
+    value: "marketing",
+    label: "Marketing",
+    hint: "a sale, offer, newsletter or promo blast",
+    aliases: [
+      "marketing",
+      "newsletter",
+      "promo",
+      "promotional",
+      "ad",
+      "advertising",
+      "sale",
+      "offer",
+      "deal",
+    ],
+  },
+  {
+    axis: "category",
     value: "general",
     label: "General",
     hint: "none of the money categories",
@@ -96,28 +113,14 @@ export const TRIAGE_TARGETS: TriageTarget[] = [
     axis: "tier",
     value: "noise",
     label: "Noise",
-    hint: "marketing, newsletters, anything that should not have surfaced",
-    // "marketing" / "newsletter" / "promo" land HERE rather than on a category
-    // of their own, because the pipeline has no marketing category — `category`
-    // exists to route mail to a specialist extractor (invoice, statement,
-    // transaction) and marketing has no specialist. Noise-tier IS how this
-    // system says "this is marketing, stop surfacing it", and that is also the
-    // useful training signal: the correction records "should not have
-    // surfaced", which is the thing that was actually wrong. The genre label
-    // would add little — the triage prompts explicitly forbid naming the genre.
-    aliases: [
-      "noise",
-      "marketing",
-      "newsletter",
-      "promo",
-      "promotional",
-      "ad",
-      "advertising",
-      "junk",
-      "ignore",
-      "spam",
-      "quiet",
-    ],
+    hint: "should not have surfaced at all",
+    // The marketing words deliberately do NOT live here any more: marketing is
+    // a real category now, and the two say different things. "This is
+    // marketing" is a statement about what the mail IS; "this is noise" is a
+    // statement about whether it should have surfaced. Conflating them would
+    // teach the dataset that every promo is unwanted, which is exactly the
+    // assumption the marketing category exists to stop making.
+    aliases: ["noise", "junk", "ignore", "spam", "quiet"],
   },
 ];
 
