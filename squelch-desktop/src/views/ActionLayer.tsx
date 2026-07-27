@@ -150,19 +150,11 @@ export function ActionLayer() {
 
   return (
     <>
-      {/* Toast stack (undo + notices), bottom-left, terminal-adjacent. */}
-      <div
-        style={{
-          position: "fixed",
-          left: 12,
-          bottom: 12,
-          display: "flex",
-          flexDirection: "column",
-          gap: 6,
-          zIndex: 50,
-          maxWidth: 340,
-        }}
-      >
+      {/* Toast stack (undo + notices), bottom-left, terminal-adjacent. Position
+          and layer live in global.css (.toast-stack) — it sits above every
+          fullscreen surface, including the thread viewer, so an undo is never
+          buried by the email it was fired from. */}
+      <div className="toast-stack">
         {/* Unsubscribe-violation prompt — a flat action card above the toasts.
             sender strings are email-derived → rendered as text only, never HTML. */}
         {blockPrompt && (

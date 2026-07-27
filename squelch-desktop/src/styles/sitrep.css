@@ -551,8 +551,8 @@
 
 /* ---- fullscreen thread viewer ---- */
 /* Layered above the side panels (z 40) and below ActionLayer overlays
-   (z 120+): opening a thread from search/browse covers the panel; compose,
-   undo toasts and the palette still win. */
+   (z 120+) and the toast stack (z 200): opening a thread from search/browse
+   covers the panel; compose, undo toasts and the palette still win. */
 .thread-view {
   position: fixed;
   /* Leave the 52px icon rail (z 20) visible + clickable to its left; the viewer

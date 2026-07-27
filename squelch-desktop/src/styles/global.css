@@ -945,6 +945,31 @@ svg.lucide {
   text-align: center;
 }
 
+/* ---- toast stack (undo + notices, bottom-left) --------------------------- */
+/* TOP OF THE STACK, deliberately. A toast is the app reporting what it just
+   did — and for a destructive action it carries the only undo affordance, on a
+   5s clock. Nothing may bury it, because a buried undo is a lost one.
+
+   This lived as an inline z-index of 50 on the container, which put it UNDER
+   the fullscreen thread viewer (z 60): fire e/d from inside an open email and
+   the undo toast was invisible for its whole lifetime. Keeping the value here
+   instead means the layer shows up when you read the z-index scale, which is
+   how the drift happened in the first place.
+
+   200 clears every overlay (2FA 120, ask bar 130) and stays below the drag
+   strip (240), which has to keep the top band draggable — and the stack is
+   bottom-left, so the two never overlap anyway. */
+.toast-stack {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 340px;
+}
+
 /* ---- unsubscribe block prompt (bottom-left action card) ------------------ */
 /* Flat white/navy card in the toast stack. Red left-edge marks the "they're
    ignoring you" state without shouting. Matches the toast/undo card language. */
@@ -987,7 +1012,7 @@ svg.lucide {
   justify-content: center;
   align-items: flex-start;
   padding-top: 14vh;
-  z-index: 130; /* above side panels + 2FA rail, below nothing */
+  z-index: 130; /* above side panels + 2FA rail, below the toast stack (200) */
 }
 .askbar {
   width: 560px;
