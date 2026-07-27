@@ -413,18 +413,16 @@
   background: var(--glass-legible);
   margin-bottom: 6px;
   cursor: pointer;
-  /* The left edge is the selection tell — it fills in rather than the whole row
-     changing color, so a long list stays calm while scanning. */
-  border-left: 3px solid var(--border-strong);
   transition: border-color 0.12s ease, background 0.12s ease;
 }
 .authp-row:hover {
   background: var(--bg-row);
 }
+/* Selection is carried by the wash and the border tint alone — no accent bar on
+   the leading edge. One tell is enough, and the rows keep a flat left edge. */
 .authp-row.sel {
   background: var(--bg-row-sel);
   border-color: color-mix(in srgb, var(--lock) 34%, var(--border));
-  border-left-color: var(--lock);
 }
 .authp-row .sender {
   font-weight: 600;
