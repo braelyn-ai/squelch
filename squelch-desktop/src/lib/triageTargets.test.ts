@@ -52,6 +52,14 @@ describe("matchTargets", () => {
     expect(matchTargets("zzzzq")).toEqual([]);
   });
 
+  test("marketing words resolve to Noise", () => {
+    // There is no marketing CATEGORY in the pipeline; noise-tier is how this
+    // system expresses "this is marketing, stop surfacing it".
+    for (const q of ["marketing", "newsletter", "promo", "ad"]) {
+      expect(matchTargets(q)[0].value).toBe("noise");
+    }
+  });
+
   test("tiers are reachable by their own words", () => {
     expect(matchTargets("junk")[0].value).toBe("noise");
     expect(matchTargets("overdue")[0].value).toBe("past_due");

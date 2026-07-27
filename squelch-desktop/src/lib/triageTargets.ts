@@ -96,8 +96,28 @@ export const TRIAGE_TARGETS: TriageTarget[] = [
     axis: "tier",
     value: "noise",
     label: "Noise",
-    hint: "should not have surfaced at all",
-    aliases: ["noise", "junk", "ignore", "spam", "quiet"],
+    hint: "marketing, newsletters, anything that should not have surfaced",
+    // "marketing" / "newsletter" / "promo" land HERE rather than on a category
+    // of their own, because the pipeline has no marketing category — `category`
+    // exists to route mail to a specialist extractor (invoice, statement,
+    // transaction) and marketing has no specialist. Noise-tier IS how this
+    // system says "this is marketing, stop surfacing it", and that is also the
+    // useful training signal: the correction records "should not have
+    // surfaced", which is the thing that was actually wrong. The genre label
+    // would add little — the triage prompts explicitly forbid naming the genre.
+    aliases: [
+      "noise",
+      "marketing",
+      "newsletter",
+      "promo",
+      "promotional",
+      "ad",
+      "advertising",
+      "junk",
+      "ignore",
+      "spam",
+      "quiet",
+    ],
   },
 ];
 

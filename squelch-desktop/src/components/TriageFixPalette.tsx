@@ -78,7 +78,18 @@ export function TriageFixPalette({
   useKeyContext("modal");
   const bindings = useMemo(
     () => [
-      { key: "Escape", description: "cancel", handler: () => onClose() },
+      {
+        // allowInInput is REQUIRED here, not optional polish: the palette
+        // autofocuses its input, so dispatchCore's `editing && !allowInInput`
+        // guard drops any binding without it. Escape was not merely inert —
+        // it fell through to whatever else binds Escape underneath (the routed
+        // view's back-to-sitrep, the thread viewer's close), so cancelling the
+        // palette navigated the app instead.
+        key: "Escape",
+        description: "cancel",
+        allowInInput: true,
+        handler: () => onClose(),
+      },
       {
         key: "ArrowDown",
         description: "next",
