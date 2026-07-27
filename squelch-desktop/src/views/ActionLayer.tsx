@@ -24,6 +24,7 @@ import { ComposeReview } from "../components/ComposeReview";
 import { RuleEditor } from "../components/RuleEditor";
 import { ProcessMode } from "../components/ProcessMode";
 import { AuthCodeModal } from "../components/AuthCodeModal";
+import { TriageFixPalette } from "../components/TriageFixPalette";
 import { AskBar } from "../components/AskBar";
 import {
   onOpenRuleEditor,
@@ -36,6 +37,8 @@ import { onOpenAskBar } from "../components/askBarBus";
 export function ActionLayer() {
   const undos = useStore((s) => s.undos);
   const toasts = useStore((s) => s.toasts);
+  const triageFix = useStore((s) => s.triageFix);
+  const closeTriageFix = useStore((s) => s.closeTriageFix);
   const fireUndo = useStore((s) => s.fireUndo);
   const dismissToast = useStore((s) => s.dismissToast);
   const selectedUpdate = useStore((s) => s.selectedUpdate);
@@ -259,6 +262,11 @@ export function ActionLayer() {
       {/* 2FA present-don't-read: the big code modal (auto-revealed on arrival).
           Conditional-mount on the queue so the code lives only while shown. */}
       {hasAuthCode && <AuthCodeModal />}
+      {/* `v` from any list/viewer raises this; the store holds the target so
+          all three surfaces share one mount. */}
+      {triageFix && (
+        <TriageFixPalette target={triageFix} onClose={closeTriageFix} />
+      )}
 
       {/* ⌘K ask-your-inbox assistant. Conditional-mount so its "modal" context is
           only on the stack while open (same contract as the other overlays). */}

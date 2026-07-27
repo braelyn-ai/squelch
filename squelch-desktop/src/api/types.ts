@@ -580,3 +580,29 @@ export interface ShredderPatch {
   enabled?: boolean;
   after_days?: number;
 }
+
+// --- triage feedback (human corrections) ------------------------------------
+
+/**
+ * types::TriageFeedback (GET/POST /client/triage-feedback). One recorded
+ * "the pipeline said X, the human said Y" pair.
+ *
+ * `original` is the JSON snapshot of the whole triage verdict at correction
+ * time, including which model produced it — that is what makes the row usable
+ * for refining the triage agent rather than just an audit line.
+ */
+export interface TriageFeedback {
+  id: number;
+  message_id: number;
+  corrected_at: string;
+  /** Which axis was overruled: "tier" | "category". */
+  dimension: string;
+  /** What triage had; null when that axis was never set. */
+  from_value: string | null;
+  /** What the human said it should be. */
+  to_value: string;
+  original: Record<string, unknown> | null;
+  sender: string;
+  subject: string;
+  note: string | null;
+}

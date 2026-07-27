@@ -36,6 +36,7 @@ import type {
   UnsubscribeResult,
   ShredStats,
   ShredderPatch,
+  TriageFeedback,
   UpdatesParams,
   UsageResponse,
 } from "./types";
@@ -506,4 +507,35 @@ export function setShredder(patch: ShredderPatch): Promise<ShredStats> {
  */
 export function runShredder(): Promise<{ shredded: number; stats: ShredStats }> {
   return request("/client/shredder/run", { method: "POST", body: {} });
+}
+
+// --- triage feedback (human corrections) ------------------------------------
+
+/**
+ * Record that triage got one wrong, and apply the fix. Server-side this is a
+ * single transaction: the triage row moves AND the correction is stored as a
+ * training row. `to_value` is validated against the pipeline's own value set,
+ * so a bad value is a 400 rather than a junk label in the dataset.
+ */
+export function correctTriage(input: {
+  messageId: number;
+  dimension: "tier" | "category";
+  toValue: string;
+  note?: string;
+}): Promise<TriageFeedback> {
+  return request<TriageFeedback>("/client/triage-feedback", {
+    method: "POST",
+    body: {
+      message_id: input.messageId,
+      dimension: input.dimension,
+      to_value: input.toValue,
+      note: input.note,
+    },
+  });
+}
+
+/** The accumulated correction dataset, newest first. */
+export function getTriageFeedback(limit?: number): Promise<TriageFeedback[]> {
+  const qs = limit ? `?limit=${limit}` : "";
+  return request<TriageFeedback[]>(`/client/triage-feedback${qs}`);
 }

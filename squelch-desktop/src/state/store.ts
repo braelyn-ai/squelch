@@ -18,6 +18,7 @@ import type {
   StoreStats,
 } from "../api";
 import { configureClient } from "../api/client";
+import type { TriageFixTarget } from "../components/TriageFixPalette";
 import {
   getSettings,
   setSettings,
@@ -261,6 +262,15 @@ export interface AppState {
   pushAuthCode: (entry: AuthCodeEntry) => void;
   /** Pop the front (currently-shown) code-modal entry on dismiss. */
   dismissAuthCode: () => void;
+
+  // triage-fix slice — the `v` correction palette. Lives here rather than in
+  // each view because three surfaces can raise it (sitrep, emails, thread
+  // viewer) and ActionLayer is already the app's host for global overlays;
+  // duplicating the mount in every list would be three chances to diverge.
+  /** The email currently being reclassified, or null. */
+  triageFix: TriageFixTarget | null;
+  openTriageFix: (target: TriageFixTarget) => void;
+  closeTriageFix: () => void;
 
   // side view slice
   sideView: SideView;
@@ -602,6 +612,10 @@ export const useStore = create<AppState>((set, get) => ({
         ? s
         : { authQueue: [entry, ...s.authQueue] },
     ),
+  triageFix: null,
+  openTriageFix: (target) => set({ triageFix: target }),
+  closeTriageFix: () => set({ triageFix: null }),
+
   dismissAuthCode: () =>
     set((s) => ({ authQueue: s.authQueue.slice(1) })),
 

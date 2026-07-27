@@ -86,6 +86,7 @@ function ViewerBody({ threadId }: { threadId: string }) {
   const openThread = useStore((s) => s.openThread);
   const threadQueue = useStore((s) => s.threadQueue);
   const pushToast = useStore((s) => s.pushToast);
+  const openTriageFix = useStore((s) => s.openTriageFix);
   // Seed from the prefetch cache (inbox hover/selection warms it): a cached
   // thread renders on the FIRST paint — no loading flash, no refetch.
   const [thread, setThread] = useState<ClientThreadView | null>(() =>
@@ -388,6 +389,22 @@ function ViewerBody({ threadId }: { threadId: string }) {
         key: "k",
         description: "newer message",
         handler: () => setIdx((i) => Math.max(0, i - 1)),
+      },
+      {
+        // Same verb as the lists: the reading surface is where a miscategorized
+        // email is most obvious, so correcting it should not require going back.
+        key: "v",
+        description: "fix triage",
+        handler: () => {
+          const m = thread?.messages[idx];
+          if (m && thread) {
+            openTriageFix({
+              messageId: m.id,
+              sender: m.from_addr,
+              subject: thread.subject,
+            });
+          }
+        },
       },
       {
         key: "e",

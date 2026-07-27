@@ -52,6 +52,7 @@ export function EmailsView() {
   const openThread = useStore((s) => s.openThread);
   const setView = useStore((s) => s.setView);
   const fireUndo = useStore((s) => s.fireUndo);
+  const openTriageFix = useStore((s) => s.openTriageFix);
 
   const [items, setItems] = useState<AttentionUpdate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -218,6 +219,21 @@ export function EmailsView() {
           // Hand the current ordered inbox rows to the viewer as its queue so
           // "done + next" (e/d) can advance in place.
           if (selected) openThread(selected.thread_id, rows);
+        },
+      },
+      {
+        key: "v",
+        description: "fix triage",
+        handler: () => {
+          if (!kbActive && !hoveringRef.current) return;
+          if (selected) {
+            openTriageFix({
+              messageId: selected.id,
+              sender: selected.sender,
+              subject: selected.one_line,
+              tier: selected.tier,
+            });
+          }
         },
       },
       {

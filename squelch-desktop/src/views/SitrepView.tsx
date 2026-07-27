@@ -6,7 +6,8 @@
 //      of urgency (time) + severity (importance) (lib/ranking.ts, rankWeight
 //      pref). Rows: avatar + sender, one-line + amount + due date. A quiet
 //      "{n} more" button expands the full ranked list in place. Actions: done
-//      (d/e), open email (Enter/v — opens the thread fullscreen in ThreadViewer).
+//      (d/e), open email (Enter — opens the thread fullscreen in ThreadViewer),
+//      fix a wrong triage verdict (v).
 //   b. ATTENTION — aggregate only: "N new since <relative last check>" +
 //      deduped sender chips (from band=new). Click → Emails.
 //   c. STATUS STRIP — last sync/check, today's triage cost, rules count. (Auth
@@ -14,7 +15,8 @@
 // The long tail (aging/open items) lives on the Emails page now, not here.
 //
 // Minimal keymap in its own "sitrep" KeyContext: j/k move between the VISIBLE
-// ranked rows, d marks the focused item done, Enter/v opens it fullscreen. The
+// ranked rows, d marks the focused item done, Enter opens it fullscreen, v
+// corrects a wrong triage verdict. The
 // global 1..5 nav (App) works here too.
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -172,6 +174,7 @@ function SitrepBody({
   // --- "For your eyes" ranking: top-10 by a configurable urgency/severity blend.
   // Re-ranks live when the rankWeight pref changes (Settings slider). The full
   // ranked list expands in place behind the quiet "{n} more" button.
+  const openTriageFix = useStore((s) => s.openTriageFix);
   const rankWeight = usePref("rankWeight");
   const ranked = useMemo(
     () => rankItems(standing, rankWeight),
@@ -211,7 +214,7 @@ function SitrepBody({
   }, []);
 
   // --- "For your eyes" keymap: j/k across the VISIBLE ranked list only, d done,
-  // Enter/v view. The keyboard never reaches collapsed-away rows.
+  // Enter view, v fix triage. The keyboard never reaches collapsed-away rows.
   const [obIdx, setObIdx] = useState(0);
   useEffect(() => {
     setObIdx((i) =>
@@ -267,16 +270,27 @@ function SitrepBody({
         },
       },
       {
+        // `v` used to be a second way to open the email, which Enter already
+        // does. Repurposed for the triage-fix palette: this is the surface
+        // where a wrong verdict is most visible, so it is where correcting it
+        // should be cheapest.
         key: "v",
-        description: "open email",
+        description: "fix triage",
         handler: () => {
           const u = visibleEyes[obIdx];
-          if (u) onView(u);
+          if (u) {
+            openTriageFix({
+              messageId: u.id,
+              sender: u.sender,
+              subject: u.one_line,
+              tier: u.tier,
+            });
+          }
         },
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [visibleEyes, obIdx],
+    [visibleEyes, obIdx, openTriageFix],
   );
   useKeys("sitrep", bindings, [bindings]);
 
