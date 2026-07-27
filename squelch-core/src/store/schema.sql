@@ -336,6 +336,51 @@ CREATE TABLE IF NOT EXISTS shred_log (
 
 CREATE INDEX IF NOT EXISTS idx_shred_at ON shred_log(account_id, shredded_at);
 
+-- TRIAGE FEEDBACK. Every time a human overrules the triage pipeline, the
+-- correction lands here. This table is a TRAINING SET, not a UI log: the point
+-- is to accumulate real-world "the model said X, the human said Y" pairs so the
+-- triage prompts and heuristics can be refined against what actually went wrong
+-- rather than against what we imagine goes wrong.
+--
+-- Two decisions worth stating, because both are what make the data usable later:
+--
+-- 1. `original` carries a JSON SNAPSHOT of the whole triage row at the moment of
+--    correction — tier, category, importance, one_line, reason, and crucially
+--    which model produced it. A label without the features that produced it is
+--    almost worthless for refinement: "should have been invoice" tells you
+--    nothing unless you know what the model saw and which model saw it.
+-- 2. `sender`/`subject` are DENORMALIZED rather than joined from `messages`.
+--    The shredder trashes old auth mail, users delete things, and rows go away —
+--    a training set that silently loses its inputs is worse than no training set,
+--    because you cannot tell the difference between "no corrections" and
+--    "corrections whose emails are gone".
+--
+-- NOT unique per message: correcting the same email twice (tier, then category)
+-- is two facts, and a human changing their mind is itself signal. Rows are
+-- append-only and ordered by `corrected_at`.
+CREATE TABLE IF NOT EXISTS triage_feedback (
+    id           INTEGER PRIMARY KEY,
+    account_id   INTEGER NOT NULL,
+    message_id   INTEGER NOT NULL,
+    corrected_at TEXT NOT NULL,
+    -- Which axis the human overrode: 'tier' | 'category'.
+    dimension    TEXT NOT NULL,
+    -- What triage had (NULL when the row never had a value for that axis).
+    from_value   TEXT,
+    -- What the human says it should have been.
+    to_value     TEXT NOT NULL,
+    -- JSON snapshot of the triage row as it was. See note 1 above.
+    original     TEXT NOT NULL,
+    -- See note 2 above.
+    sender       TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    -- Optional free-text from the human ("this is a receipt, not a bill").
+    note         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_triage_feedback_at
+    ON triage_feedback(account_id, corrected_at);
+
 -- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
 -- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
 -- last_uid holds the account's historyId (a u64 that fits in SQLite's i64

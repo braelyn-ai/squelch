@@ -21,7 +21,7 @@ use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
     NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity, ShredCandidate,
-    StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
+    StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, Update, UnsubscribeRecord,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -1912,8 +1912,12 @@ impl Store for SqliteStore {
         let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         // Scope: one message, or the trailing-days inbound window. Guards mirror
         // the stage-1 queue: normal sensitivity only, and never rule-decided
-        // ('rule') or sealed/sent ('n/a') markers — rules are authoritative and
-        // sealed mail re-enters no queue.
+        // ('rule'), human-corrected ('human') or sealed/sent ('n/a') markers —
+        // rules are authoritative, a human who corrected a verdict is MORE
+        // authoritative still, and sealed mail re-enters no queue. Re-running the
+        // model over a row someone explicitly fixed would both undo their work
+        // and corrupt the feedback dataset, which would then record corrections
+        // that never actually stuck.
         let scope_sql = match message_id {
             Some(_) => "m.id = ?2",
             None => "m.received_at >= ?2",
@@ -1927,7 +1931,7 @@ impl Store for SqliteStore {
                     needs_stage2 = 0, extractor_model_used = NULL
              WHERE account_id = ?1
                AND COALESCE(sensitivity, 'normal') = 'normal'
-               AND COALESCE(stage1_model_used, '') NOT IN ('rule', 'n/a')
+               AND COALESCE(stage1_model_used, '') NOT IN ('rule', 'n/a', 'human')
                AND message_id IN (
                    SELECT m.id FROM messages m
                    WHERE m.account_id = ?1 AND m.is_sent = 0 AND {scope_sql}
@@ -3092,6 +3096,197 @@ impl Store for SqliteStore {
             params![account_id, sender, resolution],
         )?;
         Ok(n > 0)
+    }
+
+    // ---- triage feedback (human corrections) -----------------------------
+
+    fn correct_triage(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        axis: TriageAxis,
+        to_value: &str,
+        note: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<TriageFeedback>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // Snapshot the row BEFORE touching it. Sealed rows are included on
+        // purpose: this is the local store and a human correcting a
+        // misclassified auth message is exactly the signal we want. No body is
+        // read — only the triage verdict and the envelope.
+        let row = tx
+            .query_row(
+                "SELECT m.from_addr, m.subject, t.tier, t.category, t.importance,
+                        t.one_line, t.reason, t.sensitivity, t.sealed_kind,
+                        t.stage1_model_used, t.model_used, t.matched_rule_id
+                 FROM messages m
+                 JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1 AND m.id = ?2",
+                params![account_id, message_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<i64>>(11)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            sender,
+            subject,
+            tier,
+            category,
+            importance,
+            one_line,
+            reason,
+            sensitivity,
+            sealed_kind,
+            stage1_model,
+            model,
+            matched_rule_id,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let from_value = match axis {
+            TriageAxis::Tier => Some(tier.clone()),
+            TriageAxis::Category => category.clone(),
+        };
+
+        // The features that produced the verdict, alongside the verdict itself.
+        // Refinement needs both; see the schema note.
+        let original = serde_json::json!({
+            "tier": tier,
+            "category": category,
+            "importance": importance,
+            "one_line": one_line,
+            "reason": reason,
+            "sensitivity": sensitivity,
+            "sealed_kind": sealed_kind,
+            "stage1_model_used": stage1_model,
+            "model_used": model,
+            "matched_rule_id": matched_rule_id,
+        });
+
+        // Apply the correction, and stamp the row HUMAN-DECIDED. 'human' in the
+        // model columns takes the row out of both LLM queue predicates
+        // (stage1: stage1_model_used IS NULL; stage2: model_used IS NULL AND
+        // needs_stage2=1), so a later pass cannot quietly overwrite the person
+        // who corrected it. That would be maddening, and it would also corrupt
+        // the dataset by making corrections look like they never stuck.
+        let column = match axis {
+            TriageAxis::Tier => "tier",
+            TriageAxis::Category => "category",
+        };
+        tx.execute(
+            &format!(
+                "UPDATE triage
+                 SET {column} = ?3,
+                     stage1_model_used = 'human',
+                     model_used = 'human',
+                     needs_stage2 = 0
+                 WHERE account_id = ?1 AND message_id = ?2"
+            ),
+            params![account_id, message_id, to_value],
+        )?;
+
+        let original_s = original.to_string();
+        tx.execute(
+            "INSERT INTO triage_feedback(account_id, message_id, corrected_at, dimension,
+                                         from_value, to_value, original, sender, subject, note)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                account_id,
+                message_id,
+                now.to_rfc3339(),
+                axis.as_str(),
+                from_value,
+                to_value,
+                original_s,
+                sender,
+                subject,
+                note,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+
+        Ok(Some(TriageFeedback {
+            id,
+            message_id,
+            corrected_at: now,
+            dimension: axis.as_str().to_string(),
+            from_value,
+            to_value: to_value.to_string(),
+            original,
+            sender,
+            subject,
+            note: note.map(|s| s.to_string()),
+        }))
+    }
+
+    fn list_triage_feedback(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+    ) -> Result<Vec<TriageFeedback>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, corrected_at, dimension, from_value, to_value,
+                    original, sender, subject, note
+             FROM triage_feedback
+             WHERE account_id = ?1
+             ORDER BY corrected_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, message_id, at, dimension, from_value, to_value, original, sender, subject, note) =
+                row?;
+            out.push(TriageFeedback {
+                id,
+                message_id,
+                corrected_at: parse_dt(&at)?,
+                dimension,
+                from_value,
+                to_value,
+                // A row written by an older build (or hand-edited) must not take
+                // the whole list down; fall back to a null snapshot.
+                original: serde_json::from_str(&original).unwrap_or(serde_json::Value::Null),
+                sender,
+                subject,
+                note,
+            });
+        }
+        Ok(out)
     }
 
     // ---- auth-mail shredder (retention) ----------------------------------
@@ -4648,6 +4843,56 @@ mod tests {
             .unwrap();
         let u = ups.iter().find(|u| u.update.id == mid).unwrap();
         assert!(u.update.field_reasons.is_none());
+    }
+
+    #[test]
+    fn correcting_triage_applies_records_and_survives_retriage() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let id = store
+            .ingest_message(&inbound_triaged(acct, "g1", "t1", "acme@x.com", t0, false))
+            .unwrap();
+
+        // The pipeline called it noise; the human says it is a deadline.
+        let fb = store
+            .correct_triage(acct, id, TriageAxis::Tier, "deadline", Some("this is a bill"), t0)
+            .unwrap()
+            .expect("message exists");
+        assert_eq!(fb.dimension, "tier");
+        assert_eq!(fb.from_value.as_deref(), Some("noise"));
+        assert_eq!(fb.to_value, "deadline");
+        assert_eq!(fb.sender, "acme@x.com");
+        assert_eq!(fb.note.as_deref(), Some("this is a bill"));
+        // The snapshot carries the FEATURES, not just the label — without them
+        // the row is near-useless for refining anything.
+        assert_eq!(fb.original["tier"], "noise");
+        assert!(fb.original.get("importance").is_some());
+        assert!(fb.original.get("reason").is_some());
+
+        // The correction actually moved the row.
+        let listed = store.list_triage_feedback(acct, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].to_value, "deadline");
+
+        // THE INVARIANT THAT MATTERS: a later re-triage must not silently
+        // overwrite the human. retriage_reset requeues rows for the LLM passes;
+        // a human-stamped row must not come back into the queue.
+        let reset = store.retriage_reset(acct, Some(id), 90).unwrap();
+        assert_eq!(reset, 0, "a human-corrected row must not be requeued");
+    }
+
+    #[test]
+    fn correcting_an_unknown_message_is_none_not_an_error() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = Utc::now();
+        assert!(store
+            .correct_triage(acct, 9999, TriageAxis::Category, "invoice", None, t0)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -15,8 +15,8 @@ use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, FieldReasons, NewMessage, Receipt, SealedKind, SearchHit,
-    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, Update,
-    UnsubscribeRecord,
+    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis,
+    TriageFeedback, Update, UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
 
@@ -841,6 +841,36 @@ pub trait Store: Send + Sync {
         sender: &str,
         resolution: &str,
     ) -> Result<bool>;
+
+    /// Apply a human's triage correction and record it as feedback, in ONE
+    /// transaction — the training row and the state it describes must never
+    /// disagree.
+    ///
+    /// Two effects. The triage row's `axis` column is set to `to_value`, and the
+    /// row is stamped as human-decided (`stage1_model_used`/`model_used` =
+    /// 'human', `needs_stage2` = 0) so the LLM queue predicates skip it and a
+    /// later pass cannot silently overwrite the human. And a `triage_feedback`
+    /// row is appended carrying the full prior snapshot.
+    ///
+    /// Returns `None` when the message does not exist for this account. The
+    /// caller validates `to_value` against [`TriageAxis::allowed`] first.
+    fn correct_triage(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        axis: TriageAxis,
+        to_value: &str,
+        note: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<TriageFeedback>>;
+
+    /// Recorded corrections, newest first, capped at `limit`. This is the
+    /// refinement dataset — read it to see where triage actually goes wrong.
+    fn list_triage_feedback(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+    ) -> Result<Vec<TriageFeedback>>;
 
     // ---------------------------------------------------------------------
     // AUTH-MAIL SHREDDER (retention). See the `shred_log` block in schema.sql

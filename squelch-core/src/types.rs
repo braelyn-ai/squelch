@@ -572,6 +572,68 @@ pub struct UnsubscribeRecord {
     pub resolution: Option<String>,
 }
 
+/// Which axis of a triage verdict a human overruled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriageAxis {
+    /// `triage.tier` — past_due | deadline | signal | noise.
+    Tier,
+    /// `triage.category` — general | invoice | autopay_bill | banking_statement
+    /// | transaction_alert.
+    Category,
+}
+
+impl TriageAxis {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TriageAxis::Tier => "tier",
+            TriageAxis::Category => "category",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<TriageAxis> {
+        match s {
+            "tier" => Some(TriageAxis::Tier),
+            "category" => Some(TriageAxis::Category),
+            _ => None,
+        }
+    }
+
+    /// The values this axis accepts. Corrections are validated against this, so
+    /// a typo can never write a value the pipeline would not itself produce —
+    /// which would poison the training set with labels that mean nothing.
+    pub fn allowed(&self) -> &'static [&'static str] {
+        match self {
+            TriageAxis::Tier => &["past_due", "deadline", "signal", "noise"],
+            TriageAxis::Category => &[
+                "general",
+                "invoice",
+                "autopay_bill",
+                "banking_statement",
+                "transaction_alert",
+            ],
+        }
+    }
+}
+
+/// One recorded human correction of a triage verdict. See the `triage_feedback`
+/// block in schema.sql for why `original` and the denormalized sender/subject
+/// are what make this useful for refinement later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageFeedback {
+    pub id: i64,
+    pub message_id: i64,
+    pub corrected_at: DateTime<Utc>,
+    pub dimension: String,
+    pub from_value: Option<String>,
+    pub to_value: String,
+    /// JSON snapshot of the triage row as it stood before the correction.
+    pub original: serde_json::Value,
+    pub sender: String,
+    pub subject: String,
+    pub note: Option<String>,
+}
+
 /// One auth message eligible for shredding: old enough under the retention
 /// policy and not already in `shred_log`. Carries the Gmail id the trash call
 /// needs plus the fields the ledger row records. Human-door-only.

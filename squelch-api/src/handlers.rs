@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squelch_core::store::{ActionMessageRef, NewAuditEntry, SitrepBand, Store};
-use squelch_core::types::{AttentionStatus, Disposition, ShredStats, Tier};
+use squelch_core::types::{AttentionStatus, Disposition, ShredStats, Tier, TriageAxis};
 
 use crate::error::ApiError;
 use crate::gmail_write::{
@@ -1669,6 +1669,106 @@ pub async fn unsubscribe(
             Ok(Json(json!({ "method": "browser", "sender": sender, "url": url })))
         }
     }
+}
+
+// --- TRIAGE FEEDBACK (human corrections) ------------------------------------
+//
+// The capture point for "the pipeline got this one wrong". Applying the fix and
+// recording it are the same call on purpose: a correction the human sees take
+// effect but which never reaches the dataset is worse than useless, because it
+// looks like triage is doing better than it is.
+//
+// `to_value` is validated against TriageAxis::allowed, so a typo can never write
+// a label the pipeline would not itself produce — a training set full of
+// invented categories is not a training set.
+
+/// How many corrections GET returns by default / at most.
+const FEEDBACK_DEFAULT_LIMIT: u32 = 200;
+const FEEDBACK_MAX_LIMIT: u32 = 2000;
+/// Ceiling on the optional free-text note.
+const FEEDBACK_NOTE_MAX: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct TriageFeedbackBody {
+    message_id: i64,
+    /// Which axis was wrong: "tier" | "category".
+    dimension: String,
+    /// The value it should have had.
+    to_value: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+pub async fn post_triage_feedback(
+    State(state): State<ApiState>,
+    Json(body): Json<TriageFeedbackBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(axis) = TriageAxis::parse(body.dimension.trim()) else {
+        return Err(ApiError::bad_request("dimension must be one of: tier, category"));
+    };
+    let to_value = body.to_value.trim().to_ascii_lowercase();
+    if !axis.allowed().contains(&to_value.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "{} must be one of: {}",
+            axis.as_str(),
+            axis.allowed().join(", ")
+        )));
+    }
+    let note = body
+        .note
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    if let Some(n) = &note {
+        if n.chars().count() > FEEDBACK_NOTE_MAX {
+            return Err(ApiError::bad_request("note is too long"));
+        }
+    }
+
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let message_id = body.message_id;
+    let to = to_value.clone();
+    let n = note.clone();
+    let recorded = blocking(move || {
+        store.correct_triage(account_id, message_id, axis, &to, n.as_deref(), Utc::now())
+    })
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    audit_action(
+        &state,
+        "triage_correction",
+        Some(message_id.to_string()),
+        &format!(
+            "{}:{}->{}",
+            axis.as_str(),
+            recorded.from_value.as_deref().unwrap_or("none"),
+            to_value
+        ),
+    )
+    .await;
+    Ok(Json(recorded))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeedbackQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The refinement dataset. Read this to see where triage actually goes wrong.
+pub async fn get_triage_feedback(
+    State(state): State<ApiState>,
+    Query(q): Query<FeedbackQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let limit = q
+        .limit
+        .unwrap_or(FEEDBACK_DEFAULT_LIMIT)
+        .clamp(1, FEEDBACK_MAX_LIMIT);
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let items = blocking(move || store.list_triage_feedback(account_id, limit)).await?;
+    Ok(Json(items))
 }
 
 // --- AUTH-MAIL SHREDDER (retention) -----------------------------------------
