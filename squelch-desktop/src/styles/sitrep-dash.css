@@ -39,69 +39,113 @@
   flex-direction: column;
   gap: 2px;
 }
+/* Everything in the masthead sits DIRECTLY on the backdrop with an unknown
+   wallpaper behind it, so all of it is white + shadowed. */
 .dash-header .brand {
   font-family: var(--serif);
   font-style: italic;
   color: var(--on-sky);
-  font-size: 18px;
+  font-size: 19px;
   font-weight: 500;
   letter-spacing: 0;
+  text-shadow: var(--on-sky-shadow-sm);
 }
 .dash-header .dash-sub {
   color: var(--on-sky-faint);
   font-size: 10px;
+  font-weight: 590;
   text-transform: uppercase;
-  letter-spacing: 0.2em; /* design uses wide .2em tracking on the sub-label */
+  letter-spacing: 0.2em;
+  text-shadow: var(--on-sky-shadow-sm);
 }
 /* Top-right status: "● N need you now" pill + date + last-sync. */
 .hdr-status {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   padding-top: 2px;
 }
+/* A glass capsule floating on the backdrop — the one piece of material in the
+   masthead, because it is the one piece that is a live alarm. */
 .need-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 620;
   color: var(--on-sky);
-  background: rgba(255, 255, 255, 0.16);
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.12))
+      padding-box,
+    linear-gradient(
+        180deg,
+        rgba(255, 255, 255, 0.7) 0%,
+        rgba(255, 255, 255, 0.16) 50%,
+        rgba(255, 255, 255, 0.34) 100%
+      )
+      border-box;
+  border: 1px solid transparent;
+  -webkit-backdrop-filter: var(--blur-thin);
+  backdrop-filter: var(--blur-thin);
   border-radius: var(--radius-pill);
-  padding: 3px 10px 3px 8px;
+  padding: 3px 11px 3px 9px;
+  text-shadow: var(--on-sky-shadow-sm);
+  box-shadow: var(--shadow-contact);
 }
+/* The dot PULSES — it is the only animated thing in the masthead, and it marks
+   the one state that wants you to act now. */
 .need-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--red);
-  box-shadow: 0 0 0 3px rgba(217, 92, 80, 0.28);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 34%, transparent);
+  animation: need-pulse 2.4s var(--ease-glass) infinite;
+}
+@keyframes need-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 34%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--red) 12%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .need-dot {
+    animation: none;
+  }
 }
 .hdr-date {
   font-size: 11px;
   color: var(--on-sky-dim);
   font-variant-numeric: tabular-nums;
+  text-shadow: var(--on-sky-shadow-sm);
 }
 .hdr-sync {
   font-size: 11px;
   color: var(--on-sky-faint);
+  text-shadow: var(--on-sky-shadow-sm);
 }
 
-/* ---- DASH HERO — the editorial centerpiece (on the sky, white) ---- */
+/* ---- DASH HERO — the editorial centerpiece, straight on the glass ----
+   THE ONE PLACE the Newsreader serif survives the move to SF. It earns that by
+   being the only display-size type in the app, and by sitting on the backdrop
+   rather than on a material — the wallpaper reading through the counters of a
+   50px serif is the single strongest "this is glass" moment on the page. */
 .dash-hero {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 14px 4px 24px;
+  padding: 14px 4px 26px;
 }
 .hero-greeting {
   font-size: 10.5px;
-  font-weight: 600;
+  font-weight: 620;
   text-transform: uppercase;
-  letter-spacing: 0.18em; /* design: wide-tracked greeting label */
+  letter-spacing: 0.18em;
   color: var(--on-sky-dim);
+  text-shadow: var(--on-sky-shadow-sm);
 }
 .hero-title {
   margin: 0;
@@ -112,6 +156,10 @@
   letter-spacing: -0.6px;
   color: var(--on-sky);
   max-width: 20ch;
+  /* Two shadows, doing different jobs: a tight one for edge definition against
+     a busy wallpaper, and a wide soft one that reads as the headline casting
+     light onto the glass behind it. */
+  text-shadow: var(--on-sky-shadow);
 }
 
 /* LEFT column — the ONLY scrolling region: hero + main zones. Everything left
@@ -142,23 +190,32 @@
 .dash-right {
   flex: 0 0 320px;
   min-width: 0;
-  border-left: 1px solid var(--border);
+  /* a lit hairline on the backdrop, not a grey rule */
+  border-left: 1px solid var(--spec-waist);
   padding-left: 22px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 18px;
 }
-/* Shipment cards inside the white panel: drop their own fill/border so they
-   don't double up (white-on-white); a hairline divider separates stacked ones. */
+/* Shipment cards in the right rail live inside a zone pane that is ALREADY
+   glass, so they drop their own material entirely — stacking a second one just
+   muddies both. They become plain rows split by a hairline. The box-shadow
+   reset matters: without it the inherited specular sheen draws a highlight
+   across a card that no longer has an edge to catch it. */
 .dash-right .transit-card {
-  background: transparent;
+  background: none;
   border: none;
   border-radius: 0;
+  box-shadow: none;
   padding: 10px 0;
 }
+.dash-right .transit-card:hover {
+  background: var(--mat-thin);
+  border-radius: var(--radius-sm);
+}
 .dash-right .transit-card + .transit-card {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--card-line);
 }
 .dash-right .zone-transit {
   display: flex;
@@ -192,19 +249,36 @@
   }
 }
 
-/* ---- shared zone card ---- */
+/* ---- shared zone card ----
+   The MATERIAL comes from the `.glass-pane, .zone` recipe in global.css (tint +
+   specular edge + blur + shadow). This file only sets what is specific to the
+   dashboard: padding, and how a zone behaves when the whole card is a target.
+   Deliberately does NOT restate background/border/box-shadow — this stylesheet
+   loads after global.css, so any of those here would silently win and flatten
+   the glass back out. */
 .zone {
-  background: var(--zone-wash); /* solid card */
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
   padding: 18px;
+  position: relative;
+  transition:
+    background 0.22s var(--ease-glass),
+    box-shadow 0.22s var(--ease-glass),
+    transform 0.22s var(--ease-glass);
 }
 .zone.clickable {
   cursor: pointer;
 }
+/* A clickable pane LIFTS: the material brightens and the ambient shadow grows,
+   as though it rose a few points off the backdrop. */
 .zone.clickable:hover {
-  border-color: var(--border-strong);
+  background:
+    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
+    var(--edge) border-box;
+  box-shadow: var(--sheen), var(--shadow-modal);
+  transform: translateY(-1px);
+}
+.zone.clickable:active {
+  transform: translateY(0) scale(0.998);
+  box-shadow: var(--sheen), var(--shadow-card-sm);
 }
 .zone-head {
   display: flex;
@@ -228,11 +302,15 @@
   color: var(--fg-faint);
 }
 .zone-head .zone-count {
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 11.5px;
+  font-weight: 650;
   color: var(--fg);
-  background: var(--bg-row);
-  border-radius: 999px;
+  background:
+    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
+    var(--edge) border-box;
+  border: 1px solid transparent;
+  box-shadow: var(--sheen);
+  border-radius: var(--radius-pill);
   padding: 0 8px;
   font-variant-numeric: tabular-nums;
 }
@@ -271,20 +349,30 @@
   border-bottom: 1px solid var(--card-line);
   border-radius: var(--radius-sm);
   cursor: pointer;
+  transition:
+    background 0.16s var(--ease-glass),
+    box-shadow 0.16s var(--ease-glass);
 }
 .ob-row:last-child {
   border-bottom: none;
 }
+/* Hover is a thin wash of material INSIDE the pane — light enough that the row
+   reads as illuminated rather than as a second card stacked on the first. */
 .ob-row:hover {
-  background: var(--bg-row);
+  background: var(--mat-thin);
   border-bottom-color: transparent;
 }
 /* Overdue rows stay visually calm — urgency lives in the deadline chip, not a
    red row wash (too aggressive as a background, even for past-due). */
+/* FOCUSED is the keyboard cursor (j/k). It gets the accent wash plus a soft
+   accent glow rather than a hard 1px inset frame: on glass, a crisp inner
+   border reads as a seam in the material. */
 .ob-row.focused {
   background: var(--bg-row-sel);
   border-bottom-color: transparent;
-  box-shadow: inset 0 0 0 1px var(--brass);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--brass) 45%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--brass) 14%, transparent);
 }
 .ob-row .ob-sender {
   flex: 0 0 auto;
@@ -334,20 +422,15 @@
    text link). Full-row hit target, solid fill, hairline border. */
 .ob-more {
   display: block;
-  margin: 10px auto 2px;
-  padding: 6px 18px;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font: inherit;
+  margin: 12px auto 2px;
+  padding: 5px 18px;
+  border-radius: var(--radius-pill); /* a capsule, the macOS pill button */
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 590;
   color: var(--fg-dim);
   cursor: pointer;
 }
 .ob-more:hover {
-  background: var(--bg-row);
-  border-color: var(--fg-faint);
   color: var(--fg);
 }
 
@@ -366,6 +449,8 @@
   flex-wrap: wrap;
   gap: 7px;
 }
+/* Sender chips are the densest glass on the page — thin material, specular
+   rim, capsule. */
 .sender-chip {
   display: inline-flex;
   align-items: center;
@@ -373,9 +458,12 @@
   padding: 3px 10px 3px 4px;
   font-size: 12px;
   color: var(--fg);
-  background: var(--bg-row);
-  border: 1px solid var(--border);
-  border-radius: 999px;
+  background:
+    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
+    var(--edge) border-box;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  box-shadow: var(--sheen);
   max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -395,19 +483,28 @@
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 12px;
 }
+/* Nested material: a card INSIDE a zone pane, so it uses the thinner tint (see
+   the .glass-sub rationale in global.css — two thick panes stacked read muddy).
+   Radius steps down from the parent's to stay concentric. */
 .transit-card {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
+    var(--edge) border-box;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sub);
+  box-shadow: var(--sheen);
   padding: 11px 12px;
   display: flex;
   flex-direction: column;
   gap: 9px;
   min-width: 0; /* let the name ellipsis instead of forcing horizontal overflow */
   overflow: hidden;
+  transition: background 0.18s var(--ease-glass);
 }
 .transit-card:hover {
-  background: var(--bg-row);
+  background:
+    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
+    var(--edge) border-box;
 }
 /* Delivered-today: quieter than active shipments — dimmed name, no left signal. */
 .transit-card.delivered {
@@ -527,25 +624,39 @@
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 12px;
 }
+/* Same nested-material treatment as the shipment cards, plus a lift on hover —
+   these are the most clickable things in the left column. */
 .nl-card {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
+    var(--edge) border-box;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sub);
+  box-shadow: var(--sheen);
   padding: 11px 12px;
   display: flex;
   flex-direction: column;
   gap: 9px;
   cursor: pointer;
   text-align: left;
+  transition:
+    background 0.2s var(--ease-glass),
+    box-shadow 0.2s var(--ease-glass),
+    transform 0.2s var(--ease-glass);
 }
 .nl-card:hover {
-  background: var(--bg-row);
-  border-color: var(--border-strong);
+  background:
+    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
+    var(--edge) border-box;
+  box-shadow: var(--sheen), var(--shadow-card-sm);
+  transform: translateY(-1px);
+}
+.nl-card:active {
+  transform: translateY(0) scale(0.995);
 }
 .nl-card:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+  outline: 3.5px solid color-mix(in srgb, var(--brass) 55%, transparent);
+  outline-offset: 1px;
 }
 .nl-top {
   display: flex;
@@ -634,11 +745,15 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 10px 16px;
-  padding: 10px 14px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
+  padding: 9px 14px;
+  background:
+    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
+    var(--edge) border-box;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill); /* the strip IS a capsule */
+  -webkit-backdrop-filter: var(--blur-thick);
+  backdrop-filter: var(--blur-thick);
+  box-shadow: var(--sheen), var(--shadow-card-sm);
   color: var(--fg-dim);
   font-size: 12.5px;
 }
@@ -654,14 +769,19 @@
   gap: 5px;
   padding: 3px 10px;
   font-size: 12px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--fg-dim);
-  background: var(--bg-row);
-  border: 1px solid var(--border);
+  background:
+    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
+    var(--edge) border-box;
+  border: 1px solid transparent;
+  box-shadow: var(--sheen);
 }
 .status-strip .status-chip:hover {
-  border-color: var(--fg-faint);
   color: var(--fg);
+  background:
+    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
+    var(--edge) border-box;
 }
 /* Manual "check for new mail now" chip. Wraps the synced-ago text so the whole
    pill is the hit target; the icon spins while a poke+pull is in flight. */
@@ -693,6 +813,10 @@
   display: flex;
   flex-direction: column;
 }
+/* These rows are <button>s, so they inherit the glass-capsule chrome from the
+   base `button` rule in global.css. A dense record row must opt ALL of it back
+   out — the material, the specular sheen, the contact shadow, the blur and the
+   press-squish — or every line in the rail grows its own little card. */
 .cal-row {
   display: flex;
   align-items: baseline;
@@ -700,9 +824,12 @@
   padding: 7px 6px;
   margin: 0 -6px;
   border: none;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
+  border-bottom: 1px solid var(--card-line);
+  border-radius: var(--radius-sm);
+  background: none;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
   font: inherit;
   font-size: 12.5px;
   text-align: left;
@@ -710,8 +837,14 @@
   cursor: pointer;
 }
 .cal-row:hover {
-  background: var(--bg-row);
+  background: var(--mat-thin);
+  box-shadow: none;
   border-bottom-color: transparent;
+}
+/* A full-width row scaling on press reads as the list flinching. */
+.cal-row:active {
+  transform: none;
+  box-shadow: none;
 }
 .cal-row:last-child {
   border-bottom: none;
@@ -760,6 +893,7 @@
   display: flex;
   flex-direction: column;
 }
+/* Same opt-out as .cal-row — see the note there. */
 .receipt-row {
   display: flex;
   align-items: baseline;
@@ -767,9 +901,12 @@
   padding: 7px 6px;
   margin: 0 -6px;
   border: none;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
+  border-bottom: 1px solid var(--card-line);
+  border-radius: var(--radius-sm);
+  background: none;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
   font: inherit;
   font-size: 12.5px;
   text-align: left;
@@ -777,8 +914,13 @@
   cursor: pointer;
 }
 .receipt-row:hover {
-  background: var(--bg-row);
+  background: var(--mat-thin);
+  box-shadow: none;
   border-bottom-color: transparent;
+}
+.receipt-row:active {
+  transform: none;
+  box-shadow: none;
 }
 .receipt-row:last-child {
   border-bottom: none;

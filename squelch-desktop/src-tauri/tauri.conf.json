@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "squelch",
@@ -19,7 +20,7 @@
         "minHeight": 640,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "backgroundColor": "#6ba6e0"
+        "transparent": true
       }
     ],
     "security": {

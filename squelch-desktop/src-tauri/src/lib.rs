@@ -309,6 +309,58 @@ fn b64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Install the native macOS backdrop behind the (transparent) webview.
+///
+/// This is the layer the CSS glass language sits ON: AppKit renders the blurred,
+/// refracted desktop; the page paints translucent cards over it. Without it a
+/// transparent window is just a hole — every "frosted" surface in the CSS would
+/// have nothing to frost.
+///
+/// Two tiers, best-first:
+///   1. `NSGlassEffectView` (macOS 26 Tahoe+) — the real Liquid Glass material,
+///      with its specular edge treatment and live refraction.
+///   2. `NSVisualEffectView` / `UnderWindowBackground` — the pre-Tahoe frosted
+///      material. Visually flatter, still a legible translucent backdrop.
+///
+/// Both are decoration. If AppKit refuses (unsupported version, or the private
+/// transparency path is off), we log and carry on: `--canvas-fallback` in
+/// global.css paints an opaque surface so the app is never an unreadable
+/// see-through window.
+#[cfg(target_os = "macos")]
+fn apply_native_backdrop(window: &tauri::WebviewWindow) {
+    use window_vibrancy::{
+        apply_liquid_glass, apply_vibrancy, LiquidGlassOptions, NSGlassEffectViewStyle,
+        NSVisualEffectMaterial, NSVisualEffectState,
+    };
+
+    // radius 0 / content_view None => the glass view is inserted BELOW the
+    // webview as a full-bleed background subview. It never reparents our
+    // content, so a failure here cannot break the app's view hierarchy.
+    match apply_liquid_glass(
+        window,
+        LiquidGlassOptions::new(NSGlassEffectViewStyle::Regular),
+    ) {
+        Ok(()) => return,
+        Err(e) => eprintln!("liquid glass unavailable ({e}); falling back to vibrancy"),
+    }
+
+    if let Err(e) = apply_vibrancy(
+        window,
+        NSVisualEffectMaterial::UnderWindowBackground,
+        // Stay frosted when the window loses focus — the sitrep is a glanceable
+        // surface, so it has to stay legible while it sits in the background.
+        Some(NSVisualEffectState::Active),
+        None,
+    ) {
+        // Nothing is rendering behind the transparent webview, so the window
+        // would be a literal hole punched through to the desktop. Repaint it
+        // opaque: no glass, but a usable app. The CSS needs no fallback branch
+        // because it only ever paints translucent tints ON TOP of this.
+        eprintln!("window vibrancy unavailable ({e}); falling back to an opaque window");
+        let _ = window.set_background_color(Some(tauri::window::Color(238, 244, 251, 255)));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -316,6 +368,16 @@ pub fn run() {
         // Attachment download: save dialog + fs write to the user-chosen path.
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .setup(|_app| {
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::Manager;
+                if let Some(window) = _app.get_webview_window("main") {
+                    apply_native_backdrop(&window);
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,

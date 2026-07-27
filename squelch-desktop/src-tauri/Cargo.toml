@@ -16,7 +16,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `macos-private-api` is what allows a TRANSPARENT window on macOS, which is the
+# prerequisite for the native backdrop (see `apply_native_backdrop` in lib.rs) —
+# without it AppKit paints an opaque window background over the vibrancy layer.
+# NOTE: apps using this feature are not eligible for the Mac App Store.
+tauri = { version = "2", features = ["macos-private-api"] }
 # Opens external https URLs in the system browser (Sitrep "Track" buttons +
 # email link list). Version-matched to the JS @tauri-apps/plugin-opener.
 tauri-plugin-opener = "2"
@@ -36,6 +40,10 @@ keyring = "4"
 # key never enters JS and webview CORS is bypassed. rustls (no OpenSSL) to match
 # the workspace pin; `json` for (de)serializing the message body.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Native macOS window backdrop: NSGlassEffectView (the real Liquid Glass
+# material, macOS 26+) with an NSVisualEffectView fallback. 0.8 is the first
+# release carrying the Tahoe glass API. See `apply_native_backdrop` in lib.rs.
+window-vibrancy = "0.8.0"
 
 [features]
 # Kept for parity with the tauri template; no custom protocol features used.
