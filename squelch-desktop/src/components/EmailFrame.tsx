@@ -40,6 +40,19 @@
 //     images: a missed tracker is a bounded, referrer-less GET; a wrongly-nuked
 //     image visibly breaks the mail. When blocked > 0 we show a passive chip.
 //
+// IMAGES / FLICKER (2026-07): every image the mail references is fetched
+// through the Rust shell AHEAD of the open (inbox warming, see
+// lib/threadPrefetch) and inlined here as a `data:` URI by lib/imageCache
+// before the srcdoc string is built. A fully-inlined frame issues NO network
+// requests, so nothing can arrive late and re-measure it — which is what the
+// flicker always was (see HEIGHT below: images are the only post-load height
+// change). When a frame IS fully inlined its CSP tightens to `img-src data:`,
+// which is strictly stronger than the remote grant it replaces. Uncached
+// references are left pointing at the network and simply behave as before, so
+// a cold or partially-warmed open degrades to the old behavior rather than
+// breaking. Inlining is gated on the SAME allowRemote flag as everything else:
+// with "load on demand" on, we must not fetch bytes the user declined.
+//
 // LINKS: because the sandbox omits allow-popups AND allow-top-navigation (and
 // has no allow-scripts), a link click INSIDE the frame is INERT — it cannot
 // navigate the top page or open a window. We still set <base target="_blank">
@@ -82,6 +95,12 @@ import { usePref } from "../lib/prefs";
 import { stripTrackers } from "../lib/trackers";
 import { findQuoteNodes } from "../lib/quotes";
 import { getFrameHeight, setFrameHeight } from "../lib/frameHeights";
+import {
+  hasNetworkImages,
+  imagesSettled,
+  inlineImages,
+  warmImageCache,
+} from "../lib/imageCache";
 
 /** An extracted, de-duped outbound link: the http(s) href + its visible text. */
 interface EmailLink {
@@ -139,19 +158,16 @@ function hostOf(url: string): string {
   }
 }
 
-/** True when the sanitized html references at least one network image. */
-function hasRemoteImages(html: string): boolean {
-  return /<img\b[^>]*\bsrc\s*=\s*["'](?:https?:)?\/\//i.test(html);
-}
-
-function buildSrcdoc(html: string, allowRemote: boolean): string {
+function buildSrcdoc(html: string, needsNetwork: boolean): string {
   // The frame's meta CSP is the per-message image gate. NOTE the parent app
   // CSP is inherited by srcdoc frames, so the effective policy is the
   // intersection — the app CSP (tauri.conf.json) permits http:/https: images
-  // precisely so this per-frame line is the deciding one. When remote is off
-  // (Settings → load on demand, before the per-email opt-in) only embedded
-  // data: images render. Trackers are stripped upstream, not here.
-  const csp = allowRemote
+  // precisely so this per-frame line is the deciding one. The remote grant is
+  // issued ONLY when a reference still points at the network: with images off
+  // (Settings → load on demand, before the per-email opt-in), and equally when
+  // every image was inlined as a data: URI, this collapses to `img-src data:`.
+  // Trackers are stripped upstream, not here.
+  const csp = needsNetwork
     ? "default-src 'none'; style-src 'unsafe-inline'; img-src http: https: data:"
     : "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
   // The CSP meta MUST be the first thing in <head> so it governs every
@@ -179,6 +195,75 @@ function buildSrcdoc(html: string, allowRemote: boolean): string {
 /** Frame height (px) shown before the first successful measurement. */
 const PLACEHOLDER_HEIGHT = 120;
 
+/** How long a COLD frame holds paint waiting for its images before giving up
+ *  and rendering with whatever landed. Pre-open warming means a warmed inbox
+ *  never reaches this; it bounds only the unwarmed case, where the alternative
+ *  is exactly the visible reflow we are removing. */
+const WARM_HOLD_MS = 450;
+
+interface InlineState {
+  /** The html to render — cached images swapped for data: URIs. */
+  html: string;
+  /** How many references still point at the network (they need the CSP grant). */
+  remote: number;
+  /** True while waiting on a warm; the frame is not mounted yet. */
+  holding: boolean;
+}
+
+/**
+ * The html the frame should actually render, with cached images inlined.
+ *
+ * Resolved ONCE per (html, enabled) pair and then frozen: mutating srcdoc after
+ * the fact RELOADS the iframe, which is a bigger flicker than the one being
+ * fixed. A message whose images are already warmed resolves synchronously on
+ * the very first render — no async gap. A cold one holds paint until its
+ * fetches settle or WARM_HOLD_MS elapses, then renders with whatever is cached
+ * and leaves the rest remote.
+ */
+function useInlinedHtml(html: string, enabled: boolean): InlineState {
+  const initial = useMemo<InlineState>(() => {
+    // Images off: fetching bytes here would smuggle a network request past the
+    // very CSP the user turned on. Render as-is and let that CSP block them.
+    if (!enabled) return { html, remote: 0, holding: false };
+    if (imagesSettled(html)) {
+      const r = inlineImages(html);
+      return { html: r.html, remote: r.remote, holding: false };
+    }
+    return { html, remote: 0, holding: true };
+  }, [html, enabled]);
+
+  const [state, setState] = useState(initial);
+  // Inputs changed => snap to the fresh initial DURING render (React's
+  // sanctioned "adjust state when props change" pattern) rather than showing
+  // the previous message's frame for a tick.
+  const [seen, setSeen] = useState({ html, enabled });
+  if (seen.html !== html || seen.enabled !== enabled) {
+    setSeen({ html, enabled });
+    setState(initial);
+  }
+
+  useEffect(() => {
+    if (!initial.holding) return;
+    let alive = true;
+    const settle = () => {
+      if (!alive) return;
+      alive = false;
+      window.clearTimeout(timer);
+      const r = inlineImages(html);
+      setState({ html: r.html, remote: r.remote, holding: false });
+    };
+    // Whichever lands first: the warm completing, or the patience running out.
+    const timer = window.setTimeout(settle, WARM_HOLD_MS);
+    void warmImageCache(html, { urgent: true }).then(settle);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [html, initial.holding]);
+
+  return state;
+}
+
 export function EmailFrame({
   html,
   cacheKey,
@@ -196,11 +281,18 @@ export function EmailFrame({
   const autoImages = usePref("loadRemoteImages");
   const [optedIn, setOptedIn] = useState(false);
   const allowRemote = autoImages || optedIn;
-  const remoteCandidates = useMemo(() => hasRemoteImages(cleaned), [cleaned]);
+  // Counts CSS url() references too, not just <img src> — a mail whose art is
+  // all inline-style backgrounds still gets the per-email opt-in bar.
+  const remoteCandidates = useMemo(() => hasNetworkImages(cleaned), [cleaned]);
 
+  // Fetch-and-inline pass (see IMAGES / FLICKER in the header).
+  const inlined = useInlinedHtml(cleaned, allowRemote);
+  // The remote grant is issued only while something still points at the
+  // network; a fully-inlined frame gets the stricter `img-src data:`.
+  const needsNetwork = allowRemote && inlined.remote > 0;
   const srcdoc = useMemo(
-    () => buildSrcdoc(cleaned, allowRemote),
-    [cleaned, allowRemote],
+    () => buildSrcdoc(inlined.html, needsNetwork),
+    [inlined.html, needsNetwork],
   );
   // Links can't navigate out of the sandbox (see header) — surface them below
   // the frame as openExternal buttons instead. Extract from the cleaned html so
@@ -337,8 +429,16 @@ export function EmailFrame({
     };
   }, [measure]);
 
-  // Unmount: release whatever the last load wired up.
-  useEffect(() => () => teardownRef.current?.(), []);
+  // Release whatever the last load wired up: on unmount, and also if a warm
+  // hold ever un-mounts the frame — the contentDocument those listeners were
+  // bound to goes with it.
+  useEffect(() => {
+    if (inlined.holding) {
+      teardownRef.current?.();
+      teardownRef.current = null;
+    }
+    return () => teardownRef.current?.();
+  }, [inlined.holding]);
 
   // DOM writes + re-measure live OUTSIDE the state updater: updaters can be
   // double-invoked (StrictMode), and a double display-flip would desync the
@@ -372,38 +472,52 @@ export function EmailFrame({
           {blocked} tracker{blocked === 1 ? "" : "s"} blocked
         </div>
       ) : null}
-      <iframe
-        ref={frameRef}
-        // allow-same-origin ONLY — allow-scripts stays absent, so nothing can
-        // ever execute inside; same-origin is what lets us measure. See header.
-        sandbox="allow-same-origin"
-        // Kept out of the tab order so it never steals keyboard focus from the
-        // parent window keymap (j/k/Esc). See file header.
-        tabIndex={-1}
-        title="email content"
-        className="email-iframe"
-        srcDoc={srcdoc}
-        onLoad={onFrameLoad}
-        // The frame never scrolls itself: it is sized to its exact content.
-        // (In the measure-failed fallback we re-enable scrolling so a long
-        // mail is still fully readable inside the fixed 65vh box.)
-        scrolling={measureFailed ? "yes" : "no"}
-        // PAINT-HOLD: an unmeasured frame keeps its placeholder space but stays
-        // invisible until the first measurement lands (same tick as load), so
-        // the reader never sees a half-laid-out document snap to size. A frame
-        // with a remembered height paints immediately at its final size.
-        style={
-          measureFailed
-            ? { height: "65vh", overflowY: "auto" }
-            : {
-                height: `${height ?? PLACEHOLDER_HEIGHT}px`,
-                visibility: height === null ? "hidden" : "visible",
-              }
-        }
-        // referrerPolicy suppresses the Referer on every remote image fetch, so
-        // hosts learn nothing about which mail (or reader) requested the image.
-        referrerPolicy="no-referrer"
-      />
+      {inlined.holding ? (
+        // WARM HOLD: the iframe is not mounted yet, so it loads EXACTLY ONCE —
+        // with the finished, inlined srcdoc. (Mounting it now and swapping
+        // srcdoc later would reload the frame and flash an empty white box.)
+        // The reserved box matches what the frame will occupy: a remembered
+        // height when we have one, the placeholder otherwise.
+        <div
+          className="email-iframe"
+          aria-hidden="true"
+          style={{ height: `${height ?? PLACEHOLDER_HEIGHT}px`, visibility: "hidden" }}
+        />
+      ) : (
+        <iframe
+          ref={frameRef}
+          // allow-same-origin ONLY — allow-scripts stays absent, so nothing can
+          // ever execute inside; same-origin is what lets us measure. See header.
+          sandbox="allow-same-origin"
+          // Kept out of the tab order so it never steals keyboard focus from the
+          // parent window keymap (j/k/Esc). See file header.
+          tabIndex={-1}
+          title="email content"
+          className="email-iframe"
+          srcDoc={srcdoc}
+          onLoad={onFrameLoad}
+          // The frame never scrolls itself: it is sized to its exact content.
+          // (In the measure-failed fallback we re-enable scrolling so a long
+          // mail is still fully readable inside the fixed 65vh box.)
+          scrolling={measureFailed ? "yes" : "no"}
+          // PAINT-HOLD: an unmeasured frame keeps its placeholder space but
+          // stays invisible until the first measurement lands (same tick as
+          // load), so the reader never sees a half-laid-out document snap to
+          // size. A frame with a remembered height paints at its final size.
+          style={
+            measureFailed
+              ? { height: "65vh", overflowY: "auto" }
+              : {
+                  height: `${height ?? PLACEHOLDER_HEIGHT}px`,
+                  visibility: height === null ? "hidden" : "visible",
+                }
+          }
+          // referrerPolicy suppresses the Referer on any image left pointing at
+          // the network (inlined data: URIs make no request at all), so hosts
+          // learn nothing about which mail — or reader — asked for them.
+          referrerPolicy="no-referrer"
+        />
+      )}
       {hasQuoted && (
         <button
           type="button"

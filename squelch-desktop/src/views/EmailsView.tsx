@@ -25,6 +25,15 @@ import "../styles/sitrep.css";
 // One generous page — the read model is local, this is cheap.
 const FETCH_LIMIT = 500;
 
+/** How many inbox rows get their thread AND images warmed ahead of any click.
+ *  Deliberately a bounded prefix, not the whole list: this view holds up to
+ *  FETCH_LIMIT rows, and warming all of them would stampede the daemon and pull
+ *  megabytes of images for mail nobody scrolls to. This covers several
+ *  screenfuls; hover/selection warming (below) picks up anything past it. */
+const WARM_ROWS = 40;
+/** Rows warmed immediately; the rest of the prefix trickles behind them. */
+const WARM_IMMEDIATE = 5;
+
 /** Epoch ms for "order received". surfaced_at approximates arrival; items the
  *  triage loop hasn't surfaced yet (surfaced_at null) are the newest mail, so
  *  they sort to the top. Ties (and the null bucket) break on id, which is
@@ -144,9 +153,21 @@ export function EmailsView() {
     const t = window.setTimeout(() => prefetchThread(u.thread_id), 120);
     return () => window.clearTimeout(t);
   }, [idx, rows]);
-  // Also warm the top few rows when a fresh list lands — the likeliest opens.
+  // PRE-OPEN WARM: pull the thread AND every image it references for the first
+  // WARM_ROWS rows before any click, so an open renders from cache with nothing
+  // left to fetch — a late-arriving image is exactly what reflows a frame and
+  // reads as flicker. Staggered so a fresh list never stampedes the daemon;
+  // prefetchThread dedupes in-flight + fresh entries, so the re-runs this
+  // effect does on every list refresh are near-free.
   useEffect(() => {
-    for (const u of (items ?? []).slice(0, 3)) prefetchThread(u.thread_id);
+    const head = (items ?? []).slice(0, WARM_ROWS);
+    for (const u of head.slice(0, WARM_IMMEDIATE)) prefetchThread(u.thread_id);
+    const timers = head
+      .slice(WARM_IMMEDIATE)
+      .map((u, i) =>
+        window.setTimeout(() => prefetchThread(u.thread_id), 120 * (i + 1)),
+      );
+    return () => timers.forEach((t) => window.clearTimeout(t));
   }, [items]);
 
   // Keep the keyboard selection on screen (j/k/arrows in a long list). Skip

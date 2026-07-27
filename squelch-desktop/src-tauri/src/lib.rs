@@ -182,43 +182,81 @@ async fn llm_complete(body: serde_json::Value) -> Result<LlmResponse, String> {
     Ok(LlmResponse { status, json })
 }
 
-/// Fetch one remote image's raw bytes in RUST (no webview, no CORS taint) so
-/// React can read its pixels for the newsletter-thumb fill color. Guards:
-/// http/https only, 10s timeout, 8MB cap, image/* content-type, no
-/// credentials/cookies (a bare client has none). Exposure is equivalent to the
-/// <img> fetches the webview already makes for the same mail-derived URLs —
-/// this just returns the bytes to same-origin JS instead of painting them.
-/// Returned base64 so the IPC payload is one string, not a JSON byte array.
-#[tauri::command]
-async fn fetch_image(url: String) -> Result<String, String> {
+/// Per-image ceiling shared by both image commands.
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The ONE HTTP client every image fetch goes through.
+///
+/// This used to be a `Client::builder()` per call, which threw away the
+/// connection pool on every image: warming a 40-image newsletter paid 40 TLS
+/// handshakes to the same CDN host. Now that the frontend warms whole-inbox
+/// image sets (hundreds of fetches, mostly to a handful of hosts), keep-alive
+/// reuse is the difference between "instant" and "why is this so slow".
+/// Built once, lazily; a build failure is cached as `None` and re-reported.
+fn image_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| "client build failed".to_string())
+}
+
+/// A validated `image/<subtype>` content type, lowercased with any parameters
+/// (`; charset=…`) dropped. Rejects anything that isn't a well-formed image
+/// MIME so a hostile `Content-Type` can never shape the `data:` URL we build
+/// from it.
+fn image_mime(resp: &reqwest::Response) -> Result<String, String> {
+    let raw = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime = raw.split(';').next().unwrap_or("").trim().to_string();
+    let Some(subtype) = mime.strip_prefix("image/") else {
+        return Err("not an image".into());
+    };
+    let ok = !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'));
+    if !ok {
+        return Err("not an image".into());
+    }
+    Ok(mime)
+}
+
+/// Shared core of both image commands: fetch one remote image in RUST (no
+/// webview, no CORS taint) and return its validated MIME plus raw bytes.
+/// Guards: http/https only, 10s timeout, 8MB cap, `image/*` content-type, no
+/// credentials/cookies (a bare client has none) and no Referer (reqwest sends
+/// none, matching the frame's `referrerPolicy="no-referrer"`). Exposure is
+/// equivalent to the <img> fetches the webview already makes for the same
+/// mail-derived URLs — this just hands the bytes to same-origin JS instead of
+/// painting them. Errors are REDACTED: never echo the mail-derived URL back
+/// into JS logs.
+async fn fetch_image_parts(url: &str) -> Result<(String, Vec<u8>), String> {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return Err("only http(s) urls".into());
     }
-    const MAX_BYTES: usize = 8 * 1024 * 1024;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|_| "client build failed".to_string())?;
-    // Redacted errors: never echo the (mail-derived) URL back into JS logs.
-    let resp = client
-        .get(&url)
+    let resp = image_client()?
+        .get(url)
         .send()
         .await
         .map_err(|_| "image fetch failed".to_string())?;
     if !resp.status().is_success() {
         return Err("image fetch failed".into());
     }
-    let ct = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !ct.starts_with("image/") {
-        return Err("not an image".into());
-    }
+    let mime = image_mime(&resp)?;
+    // Cheap pre-check on the declared length, then the real check on the body
+    // (a lying/absent Content-Length must not get us past the cap).
     if let Some(len) = resp.content_length() {
-        if len as usize > MAX_BYTES {
+        if len as usize > MAX_IMAGE_BYTES {
             return Err("image too large".into());
         }
     }
@@ -226,10 +264,32 @@ async fn fetch_image(url: String) -> Result<String, String> {
         .bytes()
         .await
         .map_err(|_| "image fetch failed".to_string())?;
-    if bytes.len() > MAX_BYTES {
+    if bytes.len() > MAX_IMAGE_BYTES {
         return Err("image too large".into());
     }
+    Ok((mime, bytes.to_vec()))
+}
+
+/// Raw base64 bytes of one remote image, for pixel reading (the newsletter-thumb
+/// fill color decodes these through a blob). Returned base64 so the IPC payload
+/// is one string, not a JSON byte array.
+#[tauri::command]
+async fn fetch_image(url: String) -> Result<String, String> {
+    let (_mime, bytes) = fetch_image_parts(&url).await?;
     Ok(b64_encode(&bytes))
+}
+
+/// One remote image as a ready-to-render `data:<mime>;base64,<…>` URL.
+///
+/// This is what lets the email frame render with ZERO network fetches: the
+/// frontend rewrites every `<img src>` / CSS `url()` in a message to the data
+/// URL returned here BEFORE the srcdoc is built, so nothing can arrive late and
+/// reflow the frame. Same guards as [`fetch_image`] — the MIME is validated
+/// (see [`image_mime`]) precisely because it is interpolated into that URL.
+#[tauri::command]
+async fn fetch_image_data_url(url: String) -> Result<String, String> {
+    let (mime, bytes) = fetch_image_parts(&url).await?;
+    Ok(format!("data:{mime};base64,{}", b64_encode(&bytes)))
 }
 
 /// Minimal dependency-free base64 (standard alphabet, padded).
@@ -263,7 +323,8 @@ pub fn run() {
             set_assistant_key,
             clear_assistant_key,
             llm_complete,
-            fetch_image
+            fetch_image,
+            fetch_image_data_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running squelch-desktop");
