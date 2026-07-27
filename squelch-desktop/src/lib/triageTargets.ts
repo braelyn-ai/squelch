@@ -18,7 +18,7 @@
 // list stays on screen so an ambiguous prefix is a visible choice, not a
 // coin-flip.
 
-export type TriageAxis = "tier" | "category";
+export type TriageAxis = "tier" | "category" | "sensitivity";
 
 export interface TriageTarget {
   axis: TriageAxis;
@@ -85,6 +85,43 @@ export const TRIAGE_TARGETS: TriageTarget[] = [
     label: "General",
     hint: "none of the money categories",
     aliases: ["general", "none", "other", "plain"],
+  },
+
+  // --- auth: the sealed axis -----------------------------------------------
+  // Auth is NOT a category — it is `triage.sensitivity`, and it is the axis with
+  // real consequences. Sealed mail is what the Auth page lists and is
+  // structurally absent from the agent door (/mcp), so moving a message here
+  // RESTRICTS what any agent can ever see of it, and moving it out EXPOSES it.
+  // Both directions are offered because both are genuine triage mistakes worth
+  // recording: a missed login code landed in the normal inbox, or ordinary mail
+  // got locked away (seal.rs carries explicit guards against over-sealing, so
+  // its false positives are exactly the signal worth collecting).
+  {
+    axis: "sensitivity",
+    value: "sealed",
+    label: "Auth",
+    hint: "a code, reset or sign-in alert; hides it from agents",
+    aliases: [
+      "auth",
+      "sealed",
+      "seal",
+      "code",
+      "otp",
+      "2fa",
+      "mfa",
+      "login",
+      "signin",
+      "verification",
+      "password",
+      "reset",
+    ],
+  },
+  {
+    axis: "sensitivity",
+    value: "normal",
+    label: "Not auth",
+    hint: "wrongly sealed; unhides it from agents",
+    aliases: ["notauth", "unseal", "unsealed", "normal", "notsealed"],
   },
 
   // --- tiers: how much it should DEMAND of you -----------------------------

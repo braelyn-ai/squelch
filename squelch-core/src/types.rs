@@ -581,6 +581,13 @@ pub enum TriageAxis {
     /// `triage.category` — general | marketing | invoice | autopay_bill |
     /// banking_statement | transaction_alert.
     Category,
+    /// `triage.sensitivity` — normal | sealed. This is the AUTH axis: sealed
+    /// mail is what the Auth page lists, and it is structurally absent from the
+    /// agent door. Correcting it in either direction is meaningful:
+    /// under-sealing means a code went to the normal inbox, and over-sealing
+    /// means ordinary mail got locked away (seal.rs has explicit guards against
+    /// exactly that, so its false positives are worth capturing).
+    Sensitivity,
 }
 
 impl TriageAxis {
@@ -588,6 +595,7 @@ impl TriageAxis {
         match self {
             TriageAxis::Tier => "tier",
             TriageAxis::Category => "category",
+            TriageAxis::Sensitivity => "sensitivity",
         }
     }
 
@@ -595,6 +603,7 @@ impl TriageAxis {
         match s {
             "tier" => Some(TriageAxis::Tier),
             "category" => Some(TriageAxis::Category),
+            "sensitivity" => Some(TriageAxis::Sensitivity),
             _ => None,
         }
     }
@@ -613,6 +622,7 @@ impl TriageAxis {
                 "banking_statement",
                 "transaction_alert",
             ],
+            TriageAxis::Sensitivity => &["normal", "sealed"],
         }
     }
 }

@@ -134,6 +134,13 @@
   background: var(--lock-soft);
   color: var(--lock);
 }
+/* The auth axis wears the app's sealed colour and reads as the consequential
+   one, because it is: it changes what agents can see. */
+.tfix-axis.sensitivity {
+  background: var(--amber-soft);
+  color: var(--amber);
+  letter-spacing: 0.06em;
+}
 .tfix-label {
   font-weight: 600;
   flex: none;

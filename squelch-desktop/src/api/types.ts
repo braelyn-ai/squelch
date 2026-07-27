@@ -595,7 +595,7 @@ export interface TriageFeedback {
   id: number;
   message_id: number;
   corrected_at: string;
-  /** Which axis was overruled: "tier" | "category". */
+  /** Which axis was overruled: "tier" | "category" | "sensitivity". */
   dimension: string;
   /** What triage had; null when that axis was never set. */
   from_value: string | null;

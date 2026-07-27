@@ -3256,6 +3256,7 @@ impl Store for SqliteStore {
         let from_value = match axis {
             TriageAxis::Tier => Some(tier.clone()),
             TriageAxis::Category => category.clone(),
+            TriageAxis::Sensitivity => Some(sensitivity.clone()),
         };
 
         // The features that produced the verdict, alongside the verdict itself.
@@ -3282,6 +3283,7 @@ impl Store for SqliteStore {
         let column = match axis {
             TriageAxis::Tier => "tier",
             TriageAxis::Category => "category",
+            TriageAxis::Sensitivity => "sensitivity",
         };
         tx.execute(
             &format!(
@@ -3294,6 +3296,33 @@ impl Store for SqliteStore {
             ),
             params![account_id, message_id, to_value],
         )?;
+
+        // SEALING has consequences beyond the one column. The schema documents
+        // that sealed rows carry a NULL category and that the specialist tables
+        // hold no sealed rows BY CONSTRUCTION — true because sealed mail never
+        // reaches the LLM stages. A human sealing a row AFTER it was categorized
+        // and extracted would quietly falsify both, and would leave the message
+        // sitting in the Marketing/Banking zones while the Auth page also claims
+        // it. So: drop the category and any extracted rows.
+        //
+        // (Neither specialist table crosses the agent door, so this is about
+        // keeping a stated invariant true and the surfaces coherent, not about
+        // patching a /mcp leak.)
+        if matches!(axis, TriageAxis::Sensitivity) && to_value == "sealed" {
+            tx.execute(
+                "UPDATE triage SET category = NULL, extractor_model_used = NULL
+                 WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            tx.execute(
+                "DELETE FROM marketing WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            tx.execute(
+                "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+            )?;
+        }
 
         let original_s = original.to_string();
         tx.execute(
@@ -4974,6 +5003,80 @@ mod tests {
         // a human-stamped row must not come back into the queue.
         let reset = store.retriage_reset(acct, Some(id), 90).unwrap();
         assert_eq!(reset, 0, "a human-corrected row must not be requeued");
+    }
+
+    #[test]
+    fn sealing_by_hand_clears_the_category_and_specialist_rows() {
+        // A human can seal a message the pipeline already categorized and
+        // extracted. Two documented invariants would otherwise become false:
+        // "sealed rows carry a NULL category", and "the specialist tables hold
+        // no sealed rows BY CONSTRUCTION". The message would also sit in the
+        // Marketing zone while the Auth page claimed it.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = Utc::now();
+        let id = store
+            .ingest_message(&inbound_triaged(acct, "g1", "t1", "deals@shop.com", t0, false))
+            .unwrap();
+
+        // Pretend the pipeline categorized + extracted it as marketing.
+        store
+            .correct_triage(acct, id, TriageAxis::Category, "marketing", None, t0)
+            .unwrap()
+            .unwrap();
+        store
+            .marketing_apply(&crate::store::MarketingApplied {
+                message_id: id,
+                account_id: acct,
+                brand: Some("Shop".into()),
+                offer: Some("30% off".into()),
+                discount: Some("30% off".into()),
+                code: Some("SAVE30".into()),
+                expires_at: None,
+                received_at: t0,
+                extractor_model_used: "m".into(),
+            })
+            .unwrap();
+        assert_eq!(store.marketing_offers(acct, 30, 10).unwrap().len(), 1);
+
+        // Now the human says: actually this is auth.
+        store
+            .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+            .unwrap()
+            .unwrap();
+
+        // The extracted row is gone, so it cannot show in the Marketing zone.
+        assert_eq!(store.marketing_offers(acct, 30, 10).unwrap().len(), 0);
+        // And it now reads as sealed auth mail.
+        let sealed = store.sealed_messages(acct).unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].id, id);
+    }
+
+    #[test]
+    fn unsealing_records_the_correction_and_frees_the_message() {
+        // The other direction: over-sealing is a real failure mode (seal.rs
+        // carries explicit guards against it), so it must be correctable.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = Utc::now();
+        let id = store
+            .ingest_message(&inbound_triaged(acct, "g1", "t1", "news@x.com", t0, false))
+            .unwrap();
+        store
+            .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.sealed_messages(acct).unwrap().len(), 1);
+
+        let fb = store
+            .correct_triage(acct, id, TriageAxis::Sensitivity, "normal", None, t0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fb.dimension, "sensitivity");
+        assert_eq!(fb.from_value.as_deref(), Some("sealed"));
+        assert_eq!(fb.to_value, "normal");
+        assert_eq!(store.sealed_messages(acct).unwrap().len(), 0);
     }
 
     #[test]

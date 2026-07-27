@@ -1732,7 +1732,9 @@ pub async fn post_triage_feedback(
     Json(body): Json<TriageFeedbackBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(axis) = TriageAxis::parse(body.dimension.trim()) else {
-        return Err(ApiError::bad_request("dimension must be one of: tier, category"));
+        return Err(ApiError::bad_request(
+            "dimension must be one of: tier, category, sensitivity",
+        ));
     };
     let to_value = body.to_value.trim().to_ascii_lowercase();
     if !axis.allowed().contains(&to_value.as_str()) {

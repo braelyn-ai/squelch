@@ -520,7 +520,7 @@ export function runShredder(): Promise<{ shredded: number; stats: ShredStats }> 
  */
 export function correctTriage(input: {
   messageId: number;
-  dimension: "tier" | "category";
+  dimension: "tier" | "category" | "sensitivity";
   toValue: string;
   note?: string;
 }): Promise<TriageFeedback> {

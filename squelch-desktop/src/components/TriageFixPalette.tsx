@@ -176,7 +176,11 @@ export function TriageFixPalette({
                 onClick={() => void apply(t)}
                 disabled={busy}
               >
-                <span className={`tfix-axis ${t.axis}`}>{t.axis}</span>
+                {/* "sensitivity" is the column name, not a word anyone
+                    thinks in — the chip says what the axis MEANS. */}
+                <span className={`tfix-axis ${t.axis}`}>
+                  {t.axis === "sensitivity" ? "auth" : t.axis}
+                </span>
                 <span className="tfix-label">{t.label}</span>
                 <span className="tfix-hint">{t.hint}</span>
               </button>
