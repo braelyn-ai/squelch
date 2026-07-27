@@ -204,8 +204,9 @@
 .dash-right {
   flex: 0 0 320px;
   min-width: 0;
-  /* a lit hairline on the backdrop, not a grey rule */
-  border-left: 1px solid var(--spec-waist);
+  /* A lit hairline: this rule sits on the blue field, not inside a pane, so it
+     takes white rather than the ink-side --spec-waist the panes use. */
+  border-left: 1px solid rgba(255, 255, 255, 0.24);
   padding-left: 22px;
   overflow-y: auto;
   display: flex;

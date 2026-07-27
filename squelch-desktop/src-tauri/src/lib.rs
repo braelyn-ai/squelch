@@ -326,6 +326,13 @@ fn b64_encode(input: &[u8]) -> String {
 /// transparency path is off), we log and carry on: `--canvas-fallback` in
 /// global.css paints an opaque surface so the app is never an unreadable
 /// see-through window.
+/// The squelch blue (#2b7fd4), as the tint on the native glass. Alpha is the
+/// dial: raise it for a more saturated window, drop it toward 0 for neutral
+/// frost. Keep it in step with `--scrim` in global.css, which carries the same
+/// blue on the CSS side.
+#[cfg(target_os = "macos")]
+const SQUELCH_BLUE_TINT: window_vibrancy::Color = (43, 127, 212, 74);
+
 #[cfg(target_os = "macos")]
 fn apply_native_backdrop(window: &tauri::WebviewWindow) {
     use window_vibrancy::{
@@ -336,9 +343,17 @@ fn apply_native_backdrop(window: &tauri::WebviewWindow) {
     // radius 0 / content_view None => the glass view is inserted BELOW the
     // webview as a full-bleed background subview. It never reparents our
     // content, so a failure here cannot break the app's view hierarchy.
+    //
+    // TINTED squelch blue. This is what keeps the app from reading as generic
+    // frosted grey: AppKit refracts the desktop through BLUE glass, so the
+    // brand colour lives in the material itself rather than being painted on
+    // top of it. Kept moderate (alpha 74) because the CSS scrim carries most of
+    // the blue — the two multiply, and a strong tint here turns the window
+    // murky rather than saturated.
     match apply_liquid_glass(
         window,
-        LiquidGlassOptions::new(NSGlassEffectViewStyle::Regular),
+        LiquidGlassOptions::new(NSGlassEffectViewStyle::Regular)
+            .tint_color(SQUELCH_BLUE_TINT),
     ) {
         Ok(()) => return,
         Err(e) => eprintln!("liquid glass unavailable ({e}); falling back to vibrancy"),

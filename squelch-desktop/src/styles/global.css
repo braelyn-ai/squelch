@@ -59,16 +59,20 @@
 /* ---- LIGHT PALETTE (default) ---------------------------------------------- */
 :root,
 :root[data-theme="light"] {
-  /* THE APP TINT over the native backdrop — the content area's own material.
-     Tuned against a DARK window behind the app, which is the hard case: much
-     below ~0.55 and whatever sits behind bleeds through hard enough that the
-     light theme reads as a muddy dark one with white cards floating on it.
-     This is still a material, not a fill — blurred wallpaper shape and colour
-     read through it clearly at this alpha. */
+  /* THE APP TINT over the native backdrop — the content area's own material,
+     and THE BRAND. This is squelch blue (#2b7fd4): the identity that the first
+     glass pass sanded off by making it a neutral grey wash.
+
+     It multiplies with the blue tint on the native glass layer
+     (SQUELCH_BLUE_TINT in src-tauri/src/lib.rs) — change one and look at the
+     other. Alpha is the dial between identity and translucency: at ~0.7 the
+     window reads unmistakably blue while blurred wallpaper still moves through
+     the gutters. Push it to 1.0 and you are back to the flat 2026-07-22 design;
+     drop it under ~0.5 and the brand washes out again. */
   --scrim: linear-gradient(
     180deg,
-    rgba(247, 250, 254, 0.62) 0%,
-    rgba(233, 241, 251, 0.56) 100%
+    rgba(43, 127, 212, 0.72) 0%,
+    rgba(32, 108, 190, 0.78) 100%
   );
   /* opaque reading surface (thread viewer): long-form mail is a reading page,
      not a glass panel — it stays solid so body copy is never on a busy photo */
@@ -176,10 +180,14 @@
      to establish its own value regardless of what the user's wallpaper is
      doing, or its icons only stay legible over dark desktops. Same hue family
      as the scrim so rail and content read as one window. */
+  /* THE CHROME BLUE. A step LIGHTER than the canvas, so the rail reads as its
+     own layer of window chrome rather than as more canvas. Opaque enough that
+     its white glyphs are legible over any wallpaper — the rail is the one
+     surface whose contrast cannot be allowed to float. */
   --canvas-top: linear-gradient(
     180deg,
-    rgba(247, 250, 254, 0.58) 0%,
-    rgba(236, 243, 251, 0.54) 100%
+    rgba(74, 148, 222, 0.82) 0%,
+    rgba(62, 134, 208, 0.86) 100%
   );
 
   /* the squelch line — the noise divider */
@@ -190,10 +198,12 @@
 /* Materials become dark tints; the specular edge dims hard (a bright rim on a
    dark pane reads as plastic, not glass) but never disappears. */
 :root[data-theme="dark"] {
+  /* The same blue after dark — deep navy rather than neutral black, so the
+     brand survives the theme switch. */
   --scrim: linear-gradient(
     180deg,
-    rgba(14, 20, 30, 0.6) 0%,
-    rgba(9, 14, 23, 0.68) 100%
+    rgba(16, 36, 62, 0.74) 0%,
+    rgba(10, 25, 45, 0.82) 100%
   );
   --reader-bg: #10161f;
 
@@ -209,10 +219,11 @@
   --spec-bottom: rgba(0, 0, 0, 0.28);
   --spec-sheen: rgba(255, 255, 255, 0.14);
 
+  /* Chrome blue after dark — lighter than the navy canvas, same as in light. */
   --canvas-top: linear-gradient(
     180deg,
-    rgba(18, 25, 36, 0.46) 0%,
-    rgba(12, 18, 28, 0.52) 100%
+    rgba(34, 62, 98, 0.86) 0%,
+    rgba(26, 50, 82, 0.9) 100%
   );
 
   --glass: var(--mat-thick);
@@ -662,10 +673,9 @@ kbd {
   gap: 4px;
   padding: var(--chrome-top) 0 10px;
   background: var(--canvas-top);
-  /* Separator from the content area. Ink-side, not light-side: the content
-     scrim beside it is LIGHTER than the rail, so a white hairline here would
-     dissolve straight into it. */
-  box-shadow: inset -1px 0 0 var(--card-line);
+  /* Separator from the content area — a lit hairline, since both sides of it
+     are saturated blue now rather than the rail being darker than the field. */
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.2);
   /* stack above .app-main so hover tooltips (which overflow to the right into
      the content area) paint over the content, not under it. */
   position: relative;
@@ -681,7 +691,7 @@ kbd {
   width: 24px;
   height: 1px;
   margin: 2px 0 6px;
-  background: var(--card-line);
+  background: rgba(255, 255, 255, 0.26);
 }
 /* Rail buttons are bare until touched — the rail should read as glass with
    icons floating in it, not as a strip of buttons. They opt OUT of the global
@@ -698,18 +708,19 @@ kbd {
   background: none;
   border: 1px solid transparent;
   box-shadow: none;
-  /* Label ink, not white — a Finder/Mail sidebar tints its glyphs with the
-     label colour so they survive any wallpaper. White icons only work while
-     the desktop behind happens to be dark. */
-  color: var(--fg-dim);
+  /* White again. Earlier this had to be label ink, because the rail was a thin
+     neutral wash whose value tracked the wallpaper. Now the rail is saturated
+     chrome blue at ~0.85 — a known dark-enough surface in BOTH themes — so
+     white glyphs are the legible choice rather than the fragile one. */
+  color: var(--on-sky-dim);
   transition:
     background 0.2s var(--ease-glass),
     color 0.16s ease,
     transform 0.14s var(--ease-glass);
 }
 .rail-btn:hover {
-  background: var(--mat-thin);
-  color: var(--fg);
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--on-sky);
   box-shadow: none;
 }
 .rail-btn:active {
