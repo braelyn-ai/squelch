@@ -52,13 +52,16 @@
 /* ---- LIGHT PALETTE (default) ---------------------------------------------- */
 :root,
 :root[data-theme="light"] {
-  /* THE APP TINT over the native backdrop. Deliberately thin: push it past
-     ~0.45 and the wallpaper stops reading through, which throws away the whole
-     effect. Legibility is bought by the MATERIALS below, not by this. */
+  /* THE APP TINT over the native backdrop — the content area's own material.
+     Tuned against a DARK window behind the app, which is the hard case: much
+     below ~0.55 and whatever sits behind bleeds through hard enough that the
+     light theme reads as a muddy dark one with white cards floating on it.
+     This is still a material, not a fill — blurred wallpaper shape and colour
+     read through it clearly at this alpha. */
   --scrim: linear-gradient(
     180deg,
-    rgba(247, 250, 254, 0.34) 0%,
-    rgba(232, 241, 251, 0.28) 100%
+    rgba(247, 250, 254, 0.62) 0%,
+    rgba(233, 241, 251, 0.56) 100%
   );
   /* opaque reading surface (thread viewer): long-form mail is a reading page,
      not a glass panel — it stays solid so body copy is never on a busy photo */
@@ -147,6 +150,17 @@
   /* modal/side backdrop — a dimming wash, blurred via .*-overlay rules */
   --overlay: rgba(120, 145, 180, 0.2);
 
+  /* THE RAIL MATERIAL. Thinner than --scrim so the sidebar stays the most
+     translucent surface in the window, but NOT arbitrarily thin: the rail has
+     to establish its own value regardless of what the user's wallpaper is
+     doing, or its icons only stay legible over dark desktops. Same hue family
+     as the scrim so rail and content read as one window. */
+  --canvas-top: linear-gradient(
+    180deg,
+    rgba(247, 250, 254, 0.44) 0%,
+    rgba(236, 243, 251, 0.4) 100%
+  );
+
   /* the squelch line — the noise divider */
   --squelch-line: var(--brass-line);
 }
@@ -157,8 +171,8 @@
 :root[data-theme="dark"] {
   --scrim: linear-gradient(
     180deg,
-    rgba(14, 20, 30, 0.44) 0%,
-    rgba(10, 15, 24, 0.52) 100%
+    rgba(14, 20, 30, 0.6) 0%,
+    rgba(9, 14, 23, 0.68) 100%
   );
   --reader-bg: #10161f;
 
@@ -171,6 +185,12 @@
   --spec-waist: rgba(255, 255, 255, 0.07);
   --spec-bottom: rgba(255, 255, 255, 0.14);
   --spec-sheen: rgba(255, 255, 255, 0.16);
+
+  --canvas-top: linear-gradient(
+    180deg,
+    rgba(18, 25, 36, 0.46) 0%,
+    rgba(12, 18, 28, 0.52) 100%
+  );
 
   --glass: var(--mat-thick);
   --glass-strong: rgba(34, 43, 58, 0.76);
@@ -256,9 +276,6 @@
   --on-sky-shadow-sm: 0 1px 2px rgba(10, 20, 40, 0.42),
     0 1px 10px rgba(10, 20, 40, 0.3);
 
-  /* Window chrome (icon rail, header bands) — its own faint material so the
-     rail reads as a layer without becoming an opaque bar. */
-  --canvas-top: var(--mat-ultrathin);
 
   --row-h: 30px;
   --gap: 10px;
@@ -385,12 +402,9 @@ body {
   user-select: none;
 }
 
-/* THE APP TINT. One layer over the native backdrop, carrying the whole window.
-   It is a paint-only surface: it must never trap pointer events or clip the
-   layers above it. */
 #root {
   height: 100%;
-  background: var(--scrim);
+  background: transparent;
 }
 
 /* Editorial serif — the display accent. Applied to the HERO + body/content
@@ -601,13 +615,20 @@ kbd {
   z-index: 240;
   background: transparent; /* the blue canvas shows through */
 }
-/* The routed view fills the space to the right of the icon rail. */
+/* The routed view fills the space to the right of the icon rail.
+   IT CARRIES THE SCRIM, not #root — that split is the whole native sidebar
+   convention. AppKit apps make the sidebar the most transparent surface in the
+   window (it is where the wallpaper genuinely reads) and frost the CONTENT area
+   behind it, because that is where the text lives. Putting the scrim on the
+   root instead would tint the rail too, and the rail could then never be more
+   transparent than the content it sits beside. */
 .app-main {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  background: var(--scrim);
 }
 
 /* ---- sidebar icon rail --------------------------------------------------- */
@@ -627,8 +648,10 @@ kbd {
   background: var(--canvas-top);
   -webkit-backdrop-filter: var(--blur-regular);
   backdrop-filter: var(--blur-regular);
-  /* the lit trailing edge — a highlight, not a divider */
-  box-shadow: inset -1px 0 0 var(--spec-waist);
+  /* Separator from the content area. Ink-side, not light-side: the content
+     scrim beside it is LIGHTER than the rail, so a white hairline here would
+     dissolve straight into it. */
+  box-shadow: inset -1px 0 0 var(--card-line);
   /* stack above .app-main so hover tooltips (which overflow to the right into
      the content area) paint over the content, not under it. */
   position: relative;
@@ -644,7 +667,7 @@ kbd {
   width: 24px;
   height: 1px;
   margin: 2px 0 6px;
-  background: var(--border);
+  background: var(--card-line);
 }
 /* Rail buttons are bare until touched — the rail should read as glass with
    icons floating in it, not as a strip of buttons. They opt OUT of the global
@@ -663,15 +686,18 @@ kbd {
   box-shadow: none;
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
-  color: var(--on-sky-dim);
+  /* Label ink, not white — a Finder/Mail sidebar tints its glyphs with the
+     label colour so they survive any wallpaper. White icons only work while
+     the desktop behind happens to be dark. */
+  color: var(--fg-dim);
   transition:
     background 0.2s var(--ease-glass),
     color 0.16s ease,
     transform 0.14s var(--ease-glass);
 }
 .rail-btn:hover {
-  background: rgba(255, 255, 255, 0.16);
-  color: var(--on-sky);
+  background: var(--mat-thin);
+  color: var(--fg);
   box-shadow: none;
 }
 .rail-btn:active {
@@ -824,12 +850,17 @@ svg.lucide {
 }
 
 /* ---- Connect screen ------------------------------------------------------ */
+/* The Connect screen mounts OUTSIDE .app-shell (App renders it in place of the
+   whole shell), so it carries the scrim itself — otherwise the very first
+   screen of the app is a card sitting on bare wallpaper. The daemon-down pane
+   does NOT need this: it renders INSIDE .app-main and is already scrimmed. */
 .connect {
   height: 100%;
   display: grid;
   place-items: center;
   position: relative;
   z-index: 1;
+  background: var(--scrim);
 }
 .connect-card {
   width: 400px;
