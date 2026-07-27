@@ -120,26 +120,51 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
   gap: 16px;
-  padding: 0 20px 20px;
-  overflow-y: auto;
+  /* A little breathing room under the blue band before the card starts. */
+  padding: 12px 20px 20px;
+  /* INDEPENDENT SCROLL. The two columns are doing different jobs — the left is
+     a list you scan, the right is a short set of things to answer — so they get
+     their own scroll boxes rather than one shared page scroll. Scrolling the
+     message list no longer drags the decision cards off screen, and a long rail
+     no longer pushes the list around. */
+  overflow: hidden;
 }
 /* Below ~1100px the rail would squeeze the digits; stack it under instead. */
 @media (max-width: 1100px) {
   .authp-body {
     grid-template-columns: minmax(0, 1fr);
+    /* Stacked, two short scroll boxes read worse than one page scroll. */
+    overflow-y: auto;
+  }
+  .authp-main,
+  .authp-rail {
+    overflow: visible;
+    min-height: auto;
+  }
+  .authp-list {
+    overflow-y: visible;
   }
 }
 
 .authp-main {
-  /* The card hugs its content; only the rail stretches, which is what lets the
-     shredder panel pin to the bottom of the column (see .authp-card.shredder). */
-  align-self: start;
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: var(--shadow-card-sm);
-  overflow: hidden;
   min-width: 0;
+  /* Column so the focused code and the filters stay PUT while only the list
+     below them scrolls. Scrolling the code out of view would undo the point of
+     the page: j/k walks the list and the digits must still be on screen when
+     you land on the one you came for. `overflow: hidden` keeps children
+     clipped to the rounded corners. */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.authp-focus,
+.authp-filters {
+  flex: none;
 }
 
 /* ---- in focus ------------------------------------------------------------ */
@@ -379,6 +404,9 @@
 /* ---- the list ------------------------------------------------------------ */
 
 .authp-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   padding: 8px 14px 16px;
 }
 .authp-sec {
@@ -484,6 +512,8 @@
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
 }
 .authp-railhead {
   display: flex;

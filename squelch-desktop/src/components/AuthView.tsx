@@ -117,6 +117,13 @@ export function AuthView() {
   }, [shown.length]);
   useEffect(() => setCopied(false), [focus?.id]);
 
+  // The list scrolls in its own box now, so j/k can walk the selection right
+  // out of view. Follow it. `block: "nearest"` scrolls the minimum needed, so
+  // a selection that is already visible never jumps the list under the cursor.
+  useEffect(() => {
+    document.querySelector(".authp-row.sel")?.scrollIntoView({ block: "nearest" });
+  }, [idx]);
+
   // Seed from the arrival flow: a code auto-revealed as it landed is already in
   // memory and already audited, so showing it here costs nothing extra.
   useEffect(() => {
