@@ -1462,8 +1462,6 @@
       )
       border-box;
   border: 1px solid transparent;
-  -webkit-backdrop-filter: var(--blur-thin);
-  backdrop-filter: var(--blur-thin);
   box-shadow: var(--shadow-contact);
 }
 .retriage-btn.on-sky:hover {

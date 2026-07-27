@@ -14,10 +14,17 @@
         bottom. That edge is what makes glass read as glass; without it a
         translucent card just looks washed out.
 
-   Because layer 0 is native, CSS backdrop-filter cannot blur it further (it is
-   not part of the page's backdrop). The blur values below still matter for
-   surfaces that overlap PAGE content — modals, panels, the thread viewer — and
-   are harmless elsewhere.
+   BACKDROP-FILTER IS ALMOST ALWAYS THE WRONG TOOL HERE, and it is expensive.
+   Layer 0 is native, so it is not part of the page's backdrop and CSS cannot
+   blur it. What IS behind a card is layer 1 — a smooth gradient — and blurring
+   a smooth gradient returns the same smooth gradient. So every backdrop-filter
+   on a card, button, chip or the rail cost a compositing layer in WKWebView and
+   bought exactly zero pixels of difference; on a scrolling list of them that is
+   a measurable amount of jank. They were all removed 2026-07-27.
+
+   Blur survives in exactly three places, where the thing behind really is page
+   content: the two sheet backdrops (.authcode-overlay, .askbar-overlay) and
+   .pdf-overlay. Before adding a fourth, check what is actually behind it.
 
    THE ONE ACCENT is blue (--brass, now the system-blue-adjacent #0a72e8):
    focus rings, selection, the active rail item, primary buttons, the auth ring.
@@ -132,11 +139,12 @@
   --lock-soft: rgba(109, 92, 224, 0.14);
 
   /* SHADOWS — glass sits ON something, so it needs a tight contact shadow AND
-     a wide ambient one. The tight one is what sells the lift. */
+     a wide ambient one. The tight one is what sells the lift.
+     TWO layers, not three: --shadow-card lands on every pane on the page, and
+     each extra large-radius layer is another full-size blur to rasterize. */
   --shadow-contact: 0 1px 2px rgba(20, 40, 70, 0.1);
   --shadow-card:
-    0 1px 2px rgba(20, 40, 70, 0.1), 0 8px 24px -8px rgba(20, 40, 70, 0.16),
-    0 28px 56px -28px rgba(20, 40, 70, 0.22);
+    0 1px 2px rgba(20, 40, 70, 0.1), 0 10px 30px -10px rgba(20, 40, 70, 0.22);
   --shadow-card-sm:
     0 1px 2px rgba(20, 40, 70, 0.08), 0 6px 18px -8px rgba(20, 40, 70, 0.14);
   --shadow-receipt: 0 1px 2px rgba(20, 40, 70, 0.08),
@@ -235,9 +243,7 @@
   --lock-soft: rgba(155, 139, 240, 0.18);
 
   --shadow-contact: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-card:
-    0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -8px rgba(0, 0, 0, 0.45),
-    0 28px 56px -28px rgba(0, 0, 0, 0.6);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px -10px rgba(0, 0, 0, 0.55);
   --shadow-card-sm:
     0 1px 2px rgba(0, 0, 0, 0.35), 0 6px 18px -8px rgba(0, 0, 0, 0.4);
   --shadow-receipt: 0 1px 2px rgba(0, 0, 0, 0.35),
@@ -341,8 +347,6 @@
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-card);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   box-shadow: var(--sheen), var(--shadow-card);
 }
 
@@ -354,8 +358,6 @@
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-sub);
-  -webkit-backdrop-filter: var(--blur-regular);
-  backdrop-filter: var(--blur-regular);
   box-shadow: var(--sheen);
 }
 
@@ -450,8 +452,6 @@ button {
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  -webkit-backdrop-filter: var(--blur-thin);
-  backdrop-filter: var(--blur-thin);
   box-shadow: var(--sheen), var(--shadow-contact);
   padding: 5px 12px;
   cursor: pointer;
@@ -544,8 +544,6 @@ textarea {
   background: var(--glass-legible);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  -webkit-backdrop-filter: var(--blur-thin);
-  backdrop-filter: var(--blur-thin);
   box-shadow:
     inset 0 1px 2px rgba(20, 40, 70, 0.09),
     inset 0 0 0 0.5px rgba(20, 40, 70, 0.04);
@@ -646,8 +644,6 @@ kbd {
   gap: 4px;
   padding: var(--chrome-top) 0 10px;
   background: var(--canvas-top);
-  -webkit-backdrop-filter: var(--blur-regular);
-  backdrop-filter: var(--blur-regular);
   /* Separator from the content area. Ink-side, not light-side: the content
      scrim beside it is LIGHTER than the rail, so a white hairline here would
      dissolve straight into it. */
@@ -684,8 +680,6 @@ kbd {
   background: none;
   border: 1px solid transparent;
   box-shadow: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
   /* Label ink, not white — a Finder/Mail sidebar tints its glyphs with the
      label colour so they survive any wallpaper. White icons only work while
      the desktop behind happens to be dark. */
@@ -712,8 +706,6 @@ kbd {
       padding-box,
     var(--edge) border-box;
   border: 1px solid transparent;
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   box-shadow: var(--sheen), var(--shadow-float);
   color: var(--brass-ink);
 }
@@ -782,8 +774,6 @@ kbd {
     linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
     var(--edge) border-box;
   border: 1px solid transparent;
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   color: var(--fg);
   font-size: 11.5px;
   font-weight: 550;
@@ -870,8 +860,6 @@ svg.lucide {
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-card-lg);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   padding: 28px;
   box-shadow: var(--sheen), var(--shadow-modal);
 }
@@ -933,8 +921,6 @@ svg.lucide {
   border: 1px solid transparent;
   border-left: 3px solid var(--red);
   border-radius: var(--radius);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   box-shadow: var(--sheen), var(--shadow-card-sm);
   font-size: 12.5px;
 }
@@ -998,8 +984,6 @@ svg.lucide {
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-card-lg);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   padding: 28px;
   box-shadow: var(--sheen), var(--shadow-modal);
   text-align: center;
@@ -1136,8 +1120,6 @@ svg.lucide {
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-card);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   box-shadow: var(--sheen), var(--shadow-modal);
   padding: 20px;
   display: flex;
@@ -1278,8 +1260,6 @@ svg.lucide {
   border: 1px solid transparent;
   border-left: 2px solid var(--red);
   border-radius: var(--radius);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   padding: 9px 11px;
   display: flex;
   flex-direction: column;
@@ -1326,8 +1306,6 @@ svg.lucide {
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-card);
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   box-shadow: var(--sheen), var(--shadow-modal);
   padding: 14px 16px 16px;
   display: flex;

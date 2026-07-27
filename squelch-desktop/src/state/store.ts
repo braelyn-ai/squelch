@@ -516,8 +516,37 @@ export const useStore = create<AppState>((set, get) => ({
   sitrep: emptySitrep,
   lastRefresh: null,
   refreshError: null,
+  // IDENTITY-STABLE WRITE. The poller calls this every 10s with a full read
+  // model (three bands, up to 200 items each) whether or not anything actually
+  // changed — and the overwhelming majority of polls change nothing. Writing
+  // unconditionally handed React brand-new array and object identities on every
+  // tick, which re-reconciled the entire dashboard, re-ran the For-your-eyes
+  // re-rank, and tore down + recreated the whole prefetch timer fan. That is
+  // what the 10s hitch was.
+  //
+  // So: keep each FIELD's previous reference when its content is unchanged, and
+  // skip the state write entirely when nothing moved. Comparison is by
+  // serialization, which is sound here because every value in this object came
+  // straight from JSON.parse of the daemon's response — so key order is the
+  // server's and stable between polls. It costs ~1ms against a full re-render.
   setSitrep: (partial) =>
-    set((s) => ({ sitrep: { ...s.sitrep, ...partial } })),
+    set((s) => {
+      const next: SitrepData = { ...s.sitrep };
+      let changed = false;
+      for (const k of Object.keys(partial) as (keyof SitrepData)[]) {
+        const incoming = partial[k];
+        if (incoming === undefined) continue;
+        if (JSON.stringify(incoming) === JSON.stringify(s.sitrep[k])) continue;
+        // Only a genuinely different field takes the new reference. (Object
+        // .assign rather than `next[k] = incoming`: across a `keyof` loop TS
+        // cannot prove the key and the value belong to the same member.)
+        Object.assign(next, { [k]: incoming });
+        changed = true;
+      }
+      // Returning an empty patch leaves every subscriber's slice identical, so
+      // zustand notifies but no selector sees a change and nothing re-renders.
+      return changed ? { sitrep: next } : {};
+    }),
   setRefreshError: (err) => set({ refreshError: err }),
   markRefreshed: () => set({ lastRefresh: Date.now() }),
 

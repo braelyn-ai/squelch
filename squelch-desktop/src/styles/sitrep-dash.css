@@ -85,34 +85,48 @@
       )
       border-box;
   border: 1px solid transparent;
-  -webkit-backdrop-filter: var(--blur-thin);
-  backdrop-filter: var(--blur-thin);
   border-radius: var(--radius-pill);
   padding: 3px 11px 3px 9px;
   text-shadow: var(--on-sky-shadow-sm);
   box-shadow: var(--shadow-contact);
 }
 /* The dot PULSES — it is the only animated thing in the masthead, and it marks
-   the one state that wants you to act now. */
+   the one state that wants you to act now.
+
+   The halo is a separate ::after animating TRANSFORM and OPACITY only. The
+   obvious version animates box-shadow spread on .need-dot itself, which is a
+   paint-driven property: it repaints that region every frame, forever, while
+   the app is idle. transform/opacity stay on the compositor. */
 .need-dot {
+  position: relative;
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--red);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 34%, transparent);
+}
+.need-dot::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: var(--red);
+  opacity: 0.34;
   animation: need-pulse 2.4s var(--ease-glass) infinite;
+  pointer-events: none;
 }
 @keyframes need-pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 34%, transparent);
+    transform: scale(1);
+    opacity: 0.34;
   }
   50% {
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--red) 12%, transparent);
+    transform: scale(1.5);
+    opacity: 0.06;
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .need-dot {
+  .need-dot::after {
     animation: none;
   }
 }
@@ -751,8 +765,6 @@
     var(--edge) border-box;
   border: 1px solid transparent;
   border-radius: var(--radius-pill); /* the strip IS a capsule */
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
   box-shadow: var(--sheen), var(--shadow-card-sm);
   color: var(--fg-dim);
   font-size: 12.5px;
@@ -828,8 +840,6 @@
   border-radius: var(--radius-sm);
   background: none;
   box-shadow: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
   font: inherit;
   font-size: 12.5px;
   text-align: left;
@@ -905,8 +915,6 @@
   border-radius: var(--radius-sm);
   background: none;
   box-shadow: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
   font: inherit;
   font-size: 12.5px;
   text-align: left;
