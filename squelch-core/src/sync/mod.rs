@@ -38,7 +38,7 @@ use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules};
-use crate::triage::extract::{self, banking};
+use crate::triage::extract::{self, banking, marketing};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
@@ -1103,6 +1103,58 @@ impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
                     .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
             {
                 eprintln!("squelch: extract budget increment failed ({e}); skipping row");
+                continue;
+            }
+
+            // ROUTE BY CATEGORY. Each specialist owns its own prompt, schema
+            // and ledger line, so the row's category decides which one runs.
+            // Marketing is handled in its own arm below.
+            if marketing::CATEGORIES.contains(&row.category.as_str()) {
+                match marketing::classify(&self.http, api_key, cfg, provider, row).await {
+                    Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
+                        if let Some(u) = usage {
+                            in_tok += u.input_tokens;
+                            out_tok += u.output_tokens;
+                            if let Err(e) = self.store.extract_bump_usage(
+                                self.account_id,
+                                &day,
+                                marketing::LEDGER_CATEGORY,
+                                u.input_tokens,
+                                u.output_tokens,
+                            ) {
+                                eprintln!("squelch: extract usage ledger bump failed ({e})");
+                            }
+                        }
+                        let applied = marketing::apply_result(row, &out, &cfg.model);
+                        if let Err(e) = self.store.marketing_apply(&applied) {
+                            // Same reasoning as the banking arm: the call is
+                            // already paid for, so mark processed rather than
+                            // re-buying it every cycle.
+                            eprintln!(
+                                "squelch: marketing apply failed ({e}); row marked apply-failed"
+                            );
+                            let _ = self.store.extract_mark_processed(
+                                self.account_id,
+                                row.message_id,
+                                "apply-failed",
+                            );
+                        } else {
+                            extracted += 1;
+                        }
+                    }
+                    Ok(marketing::ExtractOutcome::Refused)
+                    | Ok(marketing::ExtractOutcome::Failed(_)) => {
+                        let _ = self.store.extract_mark_processed(
+                            self.account_id,
+                            row.message_id,
+                            "extract-failed",
+                        );
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("squelch: extract {e}; row stays queued");
+                    }
+                }
                 continue;
             }
 

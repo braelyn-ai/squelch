@@ -1006,6 +1006,10 @@ const NL_FETCH_LIMIT = 200;
 function NewslettersZone() {
   const [updates, setUpdates] = useState<AttentionUpdate[] | null>(null);
   const [rules, setRules] = useState<SenderRule[]>([]);
+  /** Message ids the PIPELINE categorized `marketing`. When this is populated
+   *  it is what qualifies a sender for the zone; the old reason-string
+   *  heuristic only runs while it is empty (see lib/newsletters). */
+  const [marketingIds, setMarketingIds] = useState<Set<number>>(new Set());
   const openThread = useStore((s) => s.openThread);
   const pushToast = useStore((s) => s.pushToast);
   // Hovered card (address) — `e` while hovering marks that sender's window
@@ -1058,12 +1062,17 @@ function NewslettersZone() {
   const load = useMemo(
     () => async () => {
       try {
-        const [page, rl] = await Promise.all([
+        const [page, rl, mk] = await Promise.all([
           api.getUpdates({ tier: "noise", limit: NL_FETCH_LIMIT }),
           api.listRules(),
+          // Best-effort: an older daemon has no /client/marketing, in which
+          // case the zone falls back to the legacy heuristic rather than
+          // rendering empty.
+          api.getMarketing().catch(() => []),
         ]);
         setUpdates(page.items);
         setRules(rl);
+        setMarketingIds(new Set(mk.map((m) => m.message_id)));
       } catch (e) {
         // Non-fatal: leave the zone empty rather than surfacing token/url.
         if (!(e instanceof ApiError)) setUpdates([]);
@@ -1077,8 +1086,8 @@ function NewslettersZone() {
   }, [load]);
 
   const newsletters = useMemo(
-    () => (updates ? deriveNewsletters(updates, rules) : []),
-    [updates, rules],
+    () => (updates ? deriveNewsletters(updates, rules, { marketingIds }) : []),
+    [updates, rules, marketingIds],
   );
   newslettersRef.current = newsletters;
 

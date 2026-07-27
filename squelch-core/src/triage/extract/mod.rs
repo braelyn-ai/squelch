@@ -38,6 +38,7 @@
 //! cross into an extractor call.
 
 pub mod banking;
+pub mod marketing;
 
 use crate::error::{CoreError, Result};
 use crate::store::ExtractQueued;
@@ -48,7 +49,9 @@ use crate::types::Sensitivity;
 /// as the routing set, and dispatches each returned row by its category. Growing
 /// the framework = adding a specialist module and extending this slice.
 pub fn extractable_categories() -> Vec<&'static str> {
-    banking::CATEGORIES.to_vec()
+    let mut out = banking::CATEGORIES.to_vec();
+    out.extend_from_slice(marketing::CATEGORIES);
+    out
 }
 
 /// The SEALED GUARD for the extractor pass (defense in depth), mirroring
@@ -195,10 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn extractable_categories_are_the_banking_pair() {
+    fn extractable_categories_cover_banking_and_marketing() {
         let cats = extractable_categories();
         assert!(cats.contains(&"banking_statement"));
         assert!(cats.contains(&"transaction_alert"));
+        assert!(cats.contains(&"marketing"));
         assert!(!cats.contains(&"invoice"), "invoice has no extractor -> stays standing");
         assert!(!cats.contains(&"general"));
     }

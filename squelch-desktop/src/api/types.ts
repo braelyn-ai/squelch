@@ -606,3 +606,33 @@ export interface TriageFeedback {
   subject: string;
   note: string | null;
 }
+
+// --- marketing (extracted promotions) ---------------------------------------
+
+/**
+ * store::MarketingOffer (GET /client/marketing). One promotion pulled out of a
+ * marketing-categorized email by the specialist extractor.
+ *
+ * There is deliberately NO url/link field. Asking a model to emit a URL derived
+ * from untrusted email content, which the client then renders as clickable, is a
+ * prompt-injection lever — a hostile email could steer it and squelch would be
+ * the one presenting the result. Open the email; its real links are extracted
+ * from the sanitized html and re-guarded to http(s) (see EmailFrame).
+ */
+export interface MarketingOffer {
+  message_id: number;
+  thread_id: string;
+  sender: string;
+  subject: string;
+  /** Clean brand/publication display name, or null. */
+  brand: string | null;
+  /** One line on what is actually being offered, or null. */
+  offer: string | null;
+  /** Headline saving as stated ("30% off"), or null. Never computed. */
+  discount: string | null;
+  /** Promo code, shape-validated server-side. Never a sentence or a URL. */
+  code: string | null;
+  /** YYYY-MM-DD, only when plausible relative to arrival. */
+  expires_at: string | null;
+  received_at: string;
+}

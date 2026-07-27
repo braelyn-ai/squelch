@@ -19,6 +19,7 @@ use crate::types::{
     TriageFeedback, Update, UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// A server-side convenience bucket for the sitrep chassis, selectable via the
 /// `band` param on `/client/updates`. See [`Store::attention_updates`].
@@ -368,6 +369,38 @@ pub struct ExtractQueued {
 /// is what the store persists: a `banking` row upsert PLUS the extractor marker
 /// and (for records) an auto-resolve of the triage row.
 #[derive(Debug, Clone)]
+pub struct MarketingApplied {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    pub brand: Option<String>,
+    pub offer: Option<String>,
+    pub discount: Option<String>,
+    /// Shape-validated promo code, or `None`. Never a sentence or a URL.
+    pub code: Option<String>,
+    /// `YYYY-MM-DD`, or `None` when absent/implausible.
+    pub expires_at: Option<String>,
+    pub received_at: DateTime<Utc>,
+    /// Stamped onto `triage.extractor_model_used` so the queue stops selecting
+    /// the row. NOTE: unlike banking, this write does NOT resolve the triage
+    /// row — see the extractor's module header.
+    pub extractor_model_used: String,
+}
+
+/// One extracted promotion, for the client's marketing surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketingOffer {
+    pub message_id: i64,
+    pub thread_id: String,
+    pub sender: String,
+    pub subject: String,
+    pub brand: Option<String>,
+    pub offer: Option<String>,
+    pub discount: Option<String>,
+    pub code: Option<String>,
+    pub expires_at: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
 pub struct BankingApplied {
     pub message_id: i64,
     pub account_id: AccountId,
@@ -841,6 +874,21 @@ pub trait Store: Send + Sync {
         sender: &str,
         resolution: &str,
     ) -> Result<bool>;
+
+    /// Upsert one extracted promotion + stamp `triage.extractor_model_used`.
+    /// Unlike [`Store::banking_apply`] this does NOT resolve the triage row; see
+    /// the marketing extractor's module header for why.
+    fn marketing_apply(&self, applied: &MarketingApplied) -> Result<()>;
+
+    /// Extracted promotions, newest first, received within the last `days`,
+    /// capped at `limit`. Structurally sealed-free (see the `marketing` block
+    /// in schema.sql).
+    fn marketing_offers(
+        &self,
+        account_id: AccountId,
+        days: u32,
+        limit: u32,
+    ) -> Result<Vec<MarketingOffer>>;
 
     /// Apply a human's triage correction and record it as feedback, in ONE
     /// transaction — the training row and the state it describes must never

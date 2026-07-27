@@ -37,6 +37,7 @@ import type {
   ShredStats,
   ShredderPatch,
   TriageFeedback,
+  MarketingOffer,
   UpdatesParams,
   UsageResponse,
 } from "./types";
@@ -538,4 +539,12 @@ export function correctTriage(input: {
 export function getTriageFeedback(limit?: number): Promise<TriageFeedback[]> {
   const qs = limit ? `?limit=${limit}` : "";
   return request<TriageFeedback[]>(`/client/triage-feedback${qs}`);
+}
+
+// --- marketing (extracted promotions) ---------------------------------------
+
+/** Extracted promotions, newest first. `days` clamps to 1..90 server-side. */
+export function getMarketing(days?: number): Promise<MarketingOffer[]> {
+  const qs = days ? `?days=${days}` : "";
+  return request<MarketingOffer[]>(`/client/marketing${qs}`);
 }

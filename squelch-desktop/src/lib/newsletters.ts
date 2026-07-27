@@ -10,8 +10,10 @@
 //   • "cold-outbound / sales language …"           → cold sales (not a newsletter)
 //   • "matched squelch/filtered rule …"            → user-muted (still shows so the
 //                                                     rule chip can render)
-// We treat the newsletter reason as the strong signal, and additionally admit
-// robot/brand senders that show up ≥2× in the window (recurring machine mail).
+// SUPERSEDED (mostly): `marketing` is a real triage category now, and the
+// pipeline's own classification is the qualifier whenever any is available
+// (see DeriveOpts.marketingIds). The reason-string heuristic below survives
+// only as a migration bridge for stores whose mail predates the category.
 // Senders whose window is entirely receipts are excluded.
 
 import type { AttentionUpdate, SenderRule } from "../api";
@@ -116,6 +118,16 @@ export interface DeriveOpts {
   since?: number;
   /** Max cards to return (default: 24). */
   limit?: number;
+  /**
+   * Message ids the PIPELINE classified `marketing` (GET /client/marketing).
+   *
+   * When this is non-empty it is the ONLY qualifier: a sender makes the zone
+   * because the LLM said its mail is marketing, not because we pattern-matched
+   * prose. When it is empty — nothing has been categorized yet, e.g. before a
+   * re-triage — we fall back to the legacy heuristic so the zone is not simply
+   * blank during the migration. See the qualification block below.
+   */
+  marketingIds?: Set<number>;
 }
 
 const WEEK_MS = 7 * 86_400_000;
@@ -131,6 +143,7 @@ export function deriveNewsletters(
 ): Newsletter[] {
   const since = opts.since ?? Date.now() - WEEK_MS;
   const limit = opts.limit ?? 24;
+  const marketingIds = opts.marketingIds ?? new Set<number>();
 
   // Bucket by address, tracking newsletter/receipt evidence + robot/brand shape.
   interface Bucket {
@@ -138,6 +151,8 @@ export function deriveNewsletters(
     total: number;
     newsletterHits: number;
     receiptHits: number;
+    /** Messages of this sender the pipeline categorized `marketing`. */
+    marketingHits: number;
     robot: boolean;
     latest: number;
     summary: string;
@@ -167,6 +182,7 @@ export function deriveNewsletters(
         total: 0,
         newsletterHits: 0,
         receiptHits: 0,
+        marketingHits: 0,
         robot: isRobotSender(u.sender) || isBrandSender(u.sender),
         latest: 0,
         summary: "",
@@ -177,6 +193,7 @@ export function deriveNewsletters(
     }
     b.total += 1;
     b.items.push(u);
+    if (marketingIds.has(u.id)) b.marketingHits += 1;
     if (isNewsletterReason(u.reason)) b.newsletterHits += 1;
     if (isReceiptReason(u.reason)) b.receiptHits += 1;
     const d = dateOf(u);
@@ -191,13 +208,25 @@ export function deriveNewsletters(
   for (const [address, b] of byAddr) {
     // Exclude senders whose window is entirely receipts (order updates, not a
     // newsletter) with no newsletter signal at all.
-    const allReceipts = b.receiptHits > 0 && b.newsletterHits === 0;
+    const allReceipts =
+      b.receiptHits > 0 && b.newsletterHits === 0 && b.marketingHits === 0;
     if (allReceipts) continue;
 
-    // Qualify: a newsletter-shaped reason present, OR a recurring robot/brand
-    // sender (≥2 noise messages in the window).
+    // QUALIFICATION.
+    //
+    // Preferred: the pipeline classified at least one of this sender's messages
+    // as `marketing`. That is a real classification, not an inference.
+    //
+    // Legacy fallback (only while NOTHING has been categorized yet): the old
+    // heuristic — a newsletter-shaped `reason` string, or a recurring
+    // robot/brand sender. The second half of that was the leak: robot/brand
+    // tests only ask whether the local part looks automated, which is true of
+    // CI, alerts and system mail, none of which is marketing. It stays ONLY as
+    // a migration bridge and disappears the moment real data exists.
     const qualifies =
-      b.newsletterHits > 0 || (b.robot && b.total >= 2);
+      marketingIds.size > 0
+        ? b.marketingHits > 0
+        : b.newsletterHits > 0 || (b.robot && b.total >= 2);
     if (!qualifies) continue;
 
     out.push({

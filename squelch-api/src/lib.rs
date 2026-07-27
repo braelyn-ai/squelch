@@ -79,6 +79,7 @@ pub fn router(state: ApiState) -> Router {
             get(handlers::get_shredder).post(handlers::set_shredder),
         )
         .route("/client/shredder/run", post(handlers::run_shredder))
+        .route("/client/marketing", get(handlers::get_marketing))
         .route("/client/audit", get(handlers::get_audit))
         .route("/client/stats", get(handlers::get_stats))
         .route("/client/usage", get(handlers::get_usage))

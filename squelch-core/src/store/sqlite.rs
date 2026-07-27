@@ -13,7 +13,8 @@ use zerocopy::AsBytes;
 use crate::error::{CoreError, Result};
 use crate::store::{
     TriageDebug,
-    AttachmentBytes, BankingApplied, ExtractQueued, MessageUnsub, MissingVector, NewAuditEntry,
+    AttachmentBytes, BankingApplied, ExtractQueued, MarketingApplied, MarketingOffer,
+    MessageUnsub, MissingVector, NewAuditEntry,
     SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
@@ -1996,6 +1997,97 @@ impl Store for SqliteStore {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    fn marketing_apply(&self, applied: &MarketingApplied) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO marketing(account_id, message_id, brand, offer, discount, code,
+                                   expires_at, received_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id, message_id) DO UPDATE SET
+                 brand=excluded.brand,
+                 offer=excluded.offer,
+                 discount=excluded.discount,
+                 code=excluded.code,
+                 expires_at=excluded.expires_at",
+            params![
+                applied.account_id,
+                applied.message_id,
+                applied.brand,
+                applied.offer,
+                applied.discount,
+                applied.code,
+                applied.expires_at,
+                applied.received_at.to_rfc3339(),
+            ],
+        )?;
+        // Stamp the extractor marker so the row leaves the queue. NO status
+        // change: marketing does not auto-resolve (see the extractor header).
+        // sensitivity='normal' guard mirrors banking_apply — a sealed row can
+        // never be mutated here even though one can never reach this path.
+        tx.execute(
+            "UPDATE triage SET extractor_model_used = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.extractor_model_used
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn marketing_offers(
+        &self,
+        account_id: AccountId,
+        days: u32,
+        limit: u32,
+    ) -> Result<Vec<MarketingOffer>> {
+        let conn = self.lock()?;
+        let since = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT k.message_id, m.thread_id, m.from_addr, m.subject, k.brand, k.offer,
+                    k.discount, k.code, k.expires_at, k.received_at
+             FROM marketing k
+             JOIN messages m ON m.id = k.message_id AND m.account_id = k.account_id
+             WHERE k.account_id = ?1 AND k.received_at >= ?2
+             ORDER BY k.received_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, since, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, String>(9)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (message_id, thread_id, sender, subject, brand, offer, discount, code, expires_at, received_at) = row?;
+            out.push(MarketingOffer {
+                message_id,
+                thread_id,
+                sender,
+                subject,
+                brand,
+                offer,
+                discount,
+                code,
+                expires_at,
+                received_at: parse_dt(&received_at)?,
+            });
+        }
+        Ok(out)
     }
 
     fn list_banking(&self, account_id: AccountId) -> Result<Vec<Banking>> {

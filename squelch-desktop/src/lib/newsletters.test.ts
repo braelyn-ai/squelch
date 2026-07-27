@@ -179,6 +179,45 @@ describe("helpers", () => {
   });
 });
 
+describe("marketing classification supersedes the heuristic", () => {
+  test("a pipeline-classified sender qualifies; an unclassified one does not", () => {
+    // Two senders, NEITHER of which the old reason heuristic would admit.
+    const promo = upd({ id: 1, sender: "hello@brand.com", reason: "bulk send" });
+    const other = upd({ id: 2, sender: "noreply@ci.example", reason: "bulk send" });
+    const nls = deriveNewsletters([promo, other], [], {
+      marketingIds: new Set([1]),
+    });
+    expect(nls.map((n) => n.address)).toEqual(["hello@brand.com"]);
+  });
+
+  test("the robot/brand leak is closed once real data exists", () => {
+    // THE BUG THIS FIXES: isRobotSender only asks whether the local part looks
+    // automated, so recurring CI/alert mail used to land in the zone. With any
+    // marketing classification present, that fallback no longer runs.
+    const ci1 = upd({ id: 10, sender: "noreply@ci.example", reason: "automated" });
+    const ci2 = upd({ id: 11, sender: "noreply@ci.example", reason: "automated" });
+    const promo = upd({ id: 12, sender: "deals@shop.com", reason: "automated" });
+
+    // Legacy path (nothing classified yet): the robot sender still slips in.
+    const legacy = deriveNewsletters([ci1, ci2, promo], []);
+    expect(legacy.some((n) => n.address === "noreply@ci.example")).toBe(true);
+
+    // Real data present: only the classified sender survives.
+    const real = deriveNewsletters([ci1, ci2, promo], [], {
+      marketingIds: new Set([12]),
+    });
+    expect(real.map((n) => n.address)).toEqual(["deals@shop.com"]);
+  });
+
+  test("a marketing classification beats the all-receipts exclusion", () => {
+    const u = upd({ id: 20, sender: "shop@store.com", reason: "order confirmation / receipt" });
+    expect(deriveNewsletters([u], []).length).toBe(0);
+    expect(
+      deriveNewsletters([u], [], { marketingIds: new Set([20]) }).length,
+    ).toBe(1);
+  });
+});
+
 describe("extractHeroSrc", () => {
   test("first big image wins; icons and relative srcs skipped", () => {
     const html =

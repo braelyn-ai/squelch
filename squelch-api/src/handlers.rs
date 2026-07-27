@@ -650,6 +650,34 @@ pub async fn get_banking(
     Ok(Json(items))
 }
 
+// --- GET /client/marketing ---------------------------------------------------
+
+/// Look-back window for the marketing surface, and its clamp bounds. Promos age
+/// out fast; a fortnight is already generous for "what is on offer".
+const DEFAULT_MARKETING_DAYS: u32 = 14;
+const MAX_MARKETING_DAYS: u32 = 90;
+const MARKETING_LIMIT: u32 = 200;
+
+#[derive(Debug, Deserialize)]
+pub struct MarketingQuery {
+    #[serde(default)]
+    days: Option<u32>,
+}
+
+/// Extracted promotions, newest first. Structurally sealed-free: the `marketing`
+/// table can only ever hold rows an extractor wrote, and sealed mail never
+/// reaches an extractor (it carries a NULL category by construction).
+pub async fn get_marketing(
+    State(state): State<ApiState>,
+    Query(q): Query<MarketingQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let days = q.days.unwrap_or(DEFAULT_MARKETING_DAYS).clamp(1, MAX_MARKETING_DAYS);
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let items = blocking(move || store.marketing_offers(account_id, days, MARKETING_LIMIT)).await?;
+    Ok(Json(items))
+}
+
 // --- GET /client/calendar ----------------------------------------------------
 
 /// Default look-back window (hours of MAIL ARRIVAL, not event start) for the

@@ -269,6 +269,43 @@ CREATE TABLE IF NOT EXISTS banking (
 
 CREATE INDEX IF NOT EXISTS idx_banking_received ON banking(account_id, received_at);
 
+-- MARKETING. One row per message the LLM categorized `marketing`, holding the
+-- fields that make a promo worth keeping: brand, the offer in one line, the
+-- discount, a promo code, and when it expires. Written by the marketing
+-- specialist extractor (triage/extract/marketing.rs).
+--
+-- WHY A TABLE AND NOT A HEURISTIC: the client used to derive "this is a
+-- newsletter" by pattern-matching Stage-1's `reason` prose — text documented as
+-- an internal justification, written for another purpose, that nothing promised
+-- to keep stable. It over-matched (every recurring robot sender qualified) and
+-- could silently stop matching. This is the record that replaces that guess.
+--
+-- Like `banking`, this table has NO sealed rows BY CONSTRUCTION: sealed mail
+-- never runs the LLM stages, so it carries a NULL category and is structurally
+-- absent from every extractor queue. No sealed join is needed on read.
+--
+-- NOTE this extractor does NOT auto-resolve its triage row (banking does).
+-- Marketing is noise-tier already so it is not crowding the attention bands,
+-- and resolving it would drop it out of the flat Emails inbox, whose whole
+-- promise is that it hides nothing.
+CREATE TABLE IF NOT EXISTS marketing (
+    id          INTEGER PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    brand       TEXT,
+    offer       TEXT,
+    discount    TEXT,
+    -- Shape-validated in the extractor: short, alphanumeric, never a sentence
+    -- or a URL. See sanitize_code.
+    code        TEXT,
+    -- YYYY-MM-DD, and only when plausible relative to received_at.
+    expires_at  TEXT,
+    received_at TEXT NOT NULL,
+    UNIQUE(account_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_marketing_received ON marketing(account_id, received_at);
+
 -- UNSUBSCRIBES. One row per (account, sender_addr): the human-door record that
 -- the user asked to stop hearing from a sender, plus the "did they honor it?"
 -- violation ledger. Created/updated by POST /client/unsubscribe (upsert: a fresh
