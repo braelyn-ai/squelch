@@ -20,8 +20,8 @@ use crate::store::{
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity, StoreStats,
-    ThreadView, Tier, Update, UnsubscribeRecord,
+    NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity, ShredCandidate,
+    StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -3092,6 +3092,126 @@ impl Store for SqliteStore {
             params![account_id, sender, resolution],
         )?;
         Ok(n > 0)
+    }
+
+    // ---- auth-mail shredder (retention) ----------------------------------
+
+    fn shred_candidates(
+        &self,
+        account_id: AccountId,
+        cutoff: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ShredCandidate>> {
+        let conn = self.lock()?;
+        // Same predicate as sealed_messages (sensitivity='sealed'), narrowed to
+        // rows older than the cutoff and not already shredded. OLDEST FIRST so a
+        // capped pass always chews through the deepest backlog first and makes
+        // monotonic progress across runs. `gmail_msg_id <> ''` because a row we
+        // cannot address is a row we cannot trash.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.gmail_msg_id, m.from_addr, t.sealed_kind, m.received_at
+             FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             LEFT JOIN shred_log s
+               ON s.message_id = m.id AND s.account_id = m.account_id
+             WHERE m.account_id = ?1
+               AND t.sensitivity = 'sealed'
+               AND m.received_at <= ?2
+               AND m.gmail_msg_id IS NOT NULL AND m.gmail_msg_id <> ''
+               AND s.id IS NULL
+             ORDER BY m.received_at ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, cutoff.to_rfc3339(), limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (message_id, gmail_msg_id, sender, kind, received_at) = row?;
+            out.push(ShredCandidate {
+                message_id,
+                gmail_msg_id,
+                sender,
+                kind,
+                received_at: parse_dt(&received_at)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn shred_pending_count(&self, account_id: AccountId, cutoff: DateTime<Utc>) -> Result<i64> {
+        let conn = self.lock()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             LEFT JOIN shred_log s
+               ON s.message_id = m.id AND s.account_id = m.account_id
+             WHERE m.account_id = ?1
+               AND t.sensitivity = 'sealed'
+               AND m.received_at <= ?2
+               AND m.gmail_msg_id IS NOT NULL AND m.gmail_msg_id <> ''
+               AND s.id IS NULL",
+            params![account_id, cutoff.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    fn record_shred(
+        &self,
+        account_id: AccountId,
+        candidate: &ShredCandidate,
+        shredded_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        // DO NOTHING on conflict: a message already in the ledger has already
+        // been trashed, and re-running the pass must never inflate the count.
+        conn.execute(
+            "INSERT INTO shred_log(account_id, message_id, gmail_msg_id, sender, kind,
+                                   received_at, shredded_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(account_id, message_id) DO NOTHING",
+            params![
+                account_id,
+                candidate.message_id,
+                candidate.gmail_msg_id,
+                candidate.sender,
+                candidate.kind,
+                candidate.received_at.to_rfc3339(),
+                shredded_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn shred_counts(
+        &self,
+        account_id: AccountId,
+        recent_since: DateTime<Utc>,
+    ) -> Result<(i64, i64, Option<DateTime<Utc>>)> {
+        let conn = self.lock()?;
+        let (recent, total, last): (i64, i64, Option<String>) = conn.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN shredded_at >= ?2 THEN 1 ELSE 0 END), 0),
+               COUNT(*),
+               MAX(shredded_at)
+             FROM shred_log WHERE account_id = ?1",
+            params![account_id, recent_since.to_rfc3339()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let last_at = match last {
+            Some(s) => Some(parse_dt(&s)?),
+            None => None,
+        };
+        Ok((recent, total, last_at))
     }
 
     fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>> {

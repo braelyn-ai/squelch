@@ -15,7 +15,8 @@ use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, FieldReasons, NewMessage, Receipt, SealedKind, SearchHit,
-    SenderRule, Sensitivity, StoreStats, ThreadView, Tier, Update, UnsubscribeRecord,
+    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, Update,
+    UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
 
@@ -840,6 +841,44 @@ pub trait Store: Send + Sync {
         sender: &str,
         resolution: &str,
     ) -> Result<bool>;
+
+    // ---------------------------------------------------------------------
+    // AUTH-MAIL SHREDDER (retention). See the `shred_log` block in schema.sql
+    // for the policy and why this is human-door-only.
+    // ---------------------------------------------------------------------
+
+    /// Auth mail (`triage.sensitivity = 'sealed'` — the same set the Auth page
+    /// lists) received at or before `cutoff` and not already in `shred_log`,
+    /// oldest first, capped at `limit`. Rows without a `gmail_msg_id` are
+    /// skipped: there is nothing for the trash call to address.
+    fn shred_candidates(
+        &self,
+        account_id: AccountId,
+        cutoff: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ShredCandidate>>;
+
+    /// How many candidates [`Store::shred_candidates`] would return, unbounded.
+    /// Drives the "N waiting" figure without materializing the rows.
+    fn shred_pending_count(&self, account_id: AccountId, cutoff: DateTime<Utc>) -> Result<i64>;
+
+    /// Record one shredded message. Called ONLY after Gmail has confirmed the
+    /// trash, so the ledger never claims a deletion that did not happen. The
+    /// UNIQUE(account_id, message_id) constraint makes a re-run a no-op.
+    fn record_shred(
+        &self,
+        account_id: AccountId,
+        candidate: &ShredCandidate,
+        shredded_at: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Ledger totals for the Auth page: shreds since `recent_since`, the
+    /// all-time count, and the most recent shred time.
+    fn shred_counts(
+        &self,
+        account_id: AccountId,
+        recent_since: DateTime<Utc>,
+    ) -> Result<(i64, i64, Option<DateTime<Utc>>)>;
 
     /// Read the most recent audit rows (newest first), capped at `limit`. Each row
     /// is enriched with `target_sender`/`target_subject` when its `target` parses

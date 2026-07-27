@@ -291,6 +291,20 @@ impl GmailWriteClient {
         self.modify(gmail_msg_id, &[], &[LABEL_INBOX.to_string()]).await
     }
 
+    /// Move a message to Gmail's Trash — the strongest deletion this app can
+    /// perform, and deliberately so.
+    ///
+    /// This is `/trash`, NOT `messages.delete`. Trashed mail is recoverable by
+    /// the user for 30 days, and `messages.delete` (permanent, unrecoverable)
+    /// requires the full `https://mail.google.com/` scope, which squelch never
+    /// requests. The blast radius here is therefore capped by the OAuth scope
+    /// itself, not merely by our own restraint. Used by the auth-mail retention
+    /// pass; see the `shred_log` block in schema.sql.
+    pub async fn trash(&self, gmail_msg_id: &str) -> Result<(), WriteError> {
+        let url = format!("{}/messages/{gmail_msg_id}/trash", self.base);
+        self.post_json(&url, &serde_json::json!({})).await.map(|_| ())
+    }
+
     /// Read the parent message's threading headers (Message-ID, References) using
     /// the WRITE token (gmail.modify grants read too). Used only to thread a
     /// reply correctly; never exposes a body.

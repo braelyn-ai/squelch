@@ -27,6 +27,10 @@ pub mod unsubscribe;
 
 pub use auth::require_bearer;
 pub use error::ApiError;
+/// The auth-mail retention pass. Exported so the daemon can run it on a timer
+/// in-process — it is human-door machinery (it uses the write credential), and
+/// the daemon's own sync loop is readonly-bound and must never touch it.
+pub use handlers::run_shred_pass;
 pub use state::{ApiState, StateError};
 
 use axum::{
@@ -70,6 +74,11 @@ pub fn router(state: ApiState) -> Router {
             "/client/sealed/{message_id}/reveal",
             post(handlers::reveal_sealed),
         )
+        .route(
+            "/client/shredder",
+            get(handlers::get_shredder).post(handlers::set_shredder),
+        )
+        .route("/client/shredder/run", post(handlers::run_shredder))
         .route("/client/audit", get(handlers::get_audit))
         .route("/client/stats", get(handlers::get_stats))
         .route("/client/usage", get(handlers::get_usage))

@@ -301,6 +301,41 @@ CREATE TABLE IF NOT EXISTS unsubscribes (
 
 CREATE INDEX IF NOT EXISTS idx_unsubscribes_requested ON unsubscribes(account_id, requested_at);
 
+-- AUTH-MAIL SHREDDER (retention). One row per message the retention pass moved
+-- to Gmail Trash, so the "N shredded" figure on the Auth page is a real ledger
+-- rather than an estimate, and a message can never be shredded twice.
+--
+-- WHO WRITES IT: the human door only. The sync daemon holds a `gmail.readonly`
+-- credential by hard invariant and physically cannot trash anything; the pass
+-- runs in the API process against the opt-in write credential, exactly like
+-- every other Gmail mutation in this app.
+--
+-- POLICY (both keys live in `app_settings`, per account):
+--   shred_enabled    '1' | '0'  — DEFAULT OFF. Deleting someone's mail on a
+--                                 timer is destructive and irreversible-ish; it
+--                                 only ever happens after a deliberate opt-in.
+--   shred_after_days  integer   — default 30. Auth mail (the same
+--                                 `triage.sensitivity = 'sealed'` set the Auth
+--                                 page lists) older than this is trashed.
+--
+-- TRASH, NEVER DELETE: the pass calls Gmail's /trash, so anything it touches
+-- stays recoverable from Trash for 30 days. The write credential is
+-- `gmail.modify`, which CANNOT permanently delete — the blast radius is capped
+-- by the scope itself, not just by our code.
+CREATE TABLE IF NOT EXISTS shred_log (
+    id           INTEGER PRIMARY KEY,
+    account_id   INTEGER NOT NULL,
+    message_id   INTEGER NOT NULL,
+    gmail_msg_id TEXT NOT NULL,
+    sender       TEXT NOT NULL,
+    kind         TEXT,
+    received_at  TEXT NOT NULL,
+    shredded_at  TEXT NOT NULL,
+    UNIQUE(account_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shred_at ON shred_log(account_id, shredded_at);
+
 -- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
 -- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
 -- last_uid holds the account's historyId (a u64 that fits in SQLite's i64

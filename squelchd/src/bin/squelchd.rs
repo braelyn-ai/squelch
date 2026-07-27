@@ -475,6 +475,34 @@ fn cmd_serve(
             })
         };
 
+        // AUTH-MAIL RETENTION. Periodic pass that trashes auth mail older than
+        // the account's policy. It runs HERE, in the process that owns the human
+        // door's write credential — the sync loop is bound to a `gmail.readonly`
+        // credential by hard invariant and could not perform a write even by
+        // accident. The pass is a no-op unless the user has explicitly enabled
+        // the shredder AND a write credential exists, so this task costs one
+        // cheap settings read per tick on every other install.
+        {
+            let shred_state = api_state.clone();
+            tokio::spawn(async move {
+                // Stagger the first run so startup isn't competing with the
+                // initial sync burst, then settle into a slow cadence: retention
+                // is measured in days, so hourly is already far more often than
+                // it needs to be.
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                loop {
+                    match squelch_api::run_shred_pass(&shred_state).await {
+                        Ok(0) => {}
+                        Ok(n) => eprintln!("squelchd: shredder trashed {n} old auth message(s)"),
+                        // Never fatal: retention failing must not take the daemon
+                        // down, and the error is redacted by construction.
+                        Err(_) => eprintln!("squelchd: shredder pass failed"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            });
+        }
+
         // Build the combined app and bind BEFORE building the embedder. Binding is
         // the priority: both doors must be reachable immediately (issue #16).
         let app = build_serve_router(store.clone(), &email, api_state, mcp_cancel.clone())

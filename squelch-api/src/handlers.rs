@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squelch_core::store::{ActionMessageRef, NewAuditEntry, SitrepBand, Store};
-use squelch_core::types::{AttentionStatus, Disposition, Tier};
+use squelch_core::types::{AttentionStatus, Disposition, ShredStats, Tier};
 
 use crate::error::ApiError;
 use crate::gmail_write::{
@@ -1671,6 +1671,216 @@ pub async fn unsubscribe(
     }
 }
 
+// --- AUTH-MAIL SHREDDER (retention) -----------------------------------------
+//
+// Auth mail is the one class of message with a natural expiry: a login code
+// from three weeks ago is pure liability — it can only ever be a thing someone
+// else reads. This pass moves auth mail older than the policy window to Gmail's
+// TRASH (never permanent delete; see GmailWriteClient::trash) and records each
+// one in `shred_log`, which is what makes the Auth page's counter a fact rather
+// than an estimate.
+//
+// SAFETY POSTURE, because this deletes a human's mail on a timer:
+//   * OFF by default. Nothing is ever trashed until the user turns it on.
+//   * Trash only — recoverable for 30 days, and `gmail.modify` cannot
+//     permanently delete even if we asked it to.
+//   * Requires the opt-in write credential; without one the pass is a no-op and
+//     the UI says so rather than pretending it ran.
+//   * Bounded per pass, oldest first, so a first run over a large backlog makes
+//     steady progress instead of one enormous burst of API calls.
+//   * Ledger row is written only AFTER Gmail confirms, and every shred writes an
+//     audit row — a deletion this app performed is always accounted for.
+
+const SHRED_ENABLED_KEY: &str = "shred_enabled";
+const SHRED_AFTER_DAYS_KEY: &str = "shred_after_days";
+/// Default retention window. Matches the Auth page's copy.
+const SHRED_DEFAULT_DAYS: i64 = 30;
+/// Floor on the window. A shorter one would start trashing codes while they are
+/// plausibly still in use, which is a footgun we simply do not offer.
+const SHRED_MIN_DAYS: i64 = 7;
+const SHRED_MAX_DAYS: i64 = 365;
+/// Messages trashed per pass. Bounds the API burst on a first run; the next
+/// pass picks up where this one left off (candidates come back oldest-first).
+const SHRED_BATCH: u32 = 50;
+/// Window for the headline "shredded recently" figure.
+const SHRED_RECENT_DAYS: i64 = 30;
+
+/// Interpret the two raw `app_settings` values into a policy. Unset or
+/// malformed falls back to the SAFE default (off / 30d) rather than erroring: a
+/// corrupted knob must never be able to start deleting mail, and must never
+/// take the Auth page down either. Pure, so it is directly unit-testable.
+fn parse_shred_policy(enabled: Option<String>, days: Option<String>) -> (bool, i64) {
+    let enabled = enabled
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let after_days = days
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|d| (SHRED_MIN_DAYS..=SHRED_MAX_DAYS).contains(d))
+        .unwrap_or(SHRED_DEFAULT_DAYS);
+    (enabled, after_days)
+}
+
+/// Read the account's retention policy off the store.
+async fn shred_policy(state: &ApiState) -> Result<(bool, i64), ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    blocking(move || {
+        let enabled = store.get_app_setting(account_id, SHRED_ENABLED_KEY)?;
+        let days = store.get_app_setting(account_id, SHRED_AFTER_DAYS_KEY)?;
+        Ok(parse_shred_policy(enabled, days))
+    })
+    .await
+}
+
+/// Assemble the Auth page's shredder panel state.
+async fn shred_stats(state: &ApiState) -> Result<ShredStats, ApiError> {
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let now = Utc::now();
+    let recent_since = now - chrono::Duration::days(SHRED_RECENT_DAYS);
+
+    let (enabled, after_days, pending, shredded_recent, shredded_total, last_shredded_at) =
+        blocking(move || {
+            let enabled = store.get_app_setting(account_id, SHRED_ENABLED_KEY)?;
+            let days = store.get_app_setting(account_id, SHRED_AFTER_DAYS_KEY)?;
+            let (enabled, after_days) = parse_shred_policy(enabled, days);
+            let cutoff = now - chrono::Duration::days(after_days);
+            let pending = store.shred_pending_count(account_id, cutoff)?;
+            let (recent, total, last) = store.shred_counts(account_id, recent_since)?;
+            Ok((enabled, after_days, pending, recent, total, last))
+        })
+        .await?;
+
+    Ok(ShredStats {
+        enabled,
+        after_days,
+        shredded_recent,
+        shredded_total,
+        last_shredded_at,
+        pending,
+        // Reported separately from `enabled` so the UI can distinguish "off" from
+        // "on but structurally unable to run".
+        write_ready: state.write_creds().is_some(),
+    })
+}
+
+/// Run one bounded retention pass. Returns how many messages were trashed.
+///
+/// A no-op (Ok(0)) when disabled or when no write credential is configured —
+/// both are ordinary states, not errors, so the caller can fire this on a timer
+/// without special-casing. A per-message Gmail failure is logged to the audit
+/// trail and skipped; it does NOT abort the pass or write a ledger row.
+pub async fn run_shred_pass(state: &ApiState) -> Result<u32, ApiError> {
+    let (enabled, after_days) = shred_policy(state).await?;
+    if !enabled {
+        return Ok(0);
+    }
+    let Ok(client) = write_client(state) else {
+        // No write credential: nothing to do, and nothing to complain about.
+        return Ok(0);
+    };
+
+    let cutoff = Utc::now() - chrono::Duration::days(after_days);
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    let candidates = blocking(move || store.shred_candidates(account_id, cutoff, SHRED_BATCH))
+        .await?;
+
+    let mut shredded = 0u32;
+    for candidate in candidates {
+        if client.trash(&candidate.gmail_msg_id).await.is_err() {
+            // Gmail refused this one (already gone, transient, permissions).
+            // Skip it: no ledger row, so a later pass retries it naturally.
+            audit_action(
+                state,
+                "shred_failed",
+                Some(candidate.message_id.to_string()),
+                &candidate.sender,
+            )
+            .await;
+            continue;
+        }
+        // Ledger AFTER Gmail confirms, so the count can never overstate.
+        let store = state.store.clone();
+        let c = candidate.clone();
+        let recorded =
+            blocking(move || store.record_shred(account_id, &c, Utc::now())).await;
+        if recorded.is_err() {
+            // The mail IS trashed; only our bookkeeping failed. Say so loudly in
+            // the audit trail rather than silently under-counting.
+            audit_action(
+                state,
+                "shred_unrecorded",
+                Some(candidate.message_id.to_string()),
+                &candidate.sender,
+            )
+            .await;
+            continue;
+        }
+        audit_action(
+            state,
+            "shred",
+            Some(candidate.message_id.to_string()),
+            &format!("trash:{}", candidate.sender),
+        )
+        .await;
+        shredded += 1;
+    }
+    Ok(shredded)
+}
+
+pub async fn get_shredder(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(shred_stats(&state).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShredderBody {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    after_days: Option<i64>,
+}
+
+pub async fn set_shredder(
+    State(state): State<ApiState>,
+    Json(body): Json<ShredderBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    if let Some(days) = body.after_days {
+        if !(SHRED_MIN_DAYS..=SHRED_MAX_DAYS).contains(&days) {
+            return Err(ApiError::bad_request(format!(
+                "after_days must be between {SHRED_MIN_DAYS} and {SHRED_MAX_DAYS}"
+            )));
+        }
+        let store = state.store.clone();
+        let account_id = state.account_id;
+        let v = days.to_string();
+        blocking(move || store.set_app_setting(account_id, SHRED_AFTER_DAYS_KEY, &v)).await?;
+    }
+    if let Some(enabled) = body.enabled {
+        let store = state.store.clone();
+        let account_id = state.account_id;
+        let v = if enabled { "1" } else { "0" }.to_string();
+        blocking(move || store.set_app_setting(account_id, SHRED_ENABLED_KEY, &v)).await?;
+        // Turning automatic deletion on or off is a policy change worth a row.
+        audit_action(
+            &state,
+            "shred_policy",
+            None,
+            if enabled { "enabled" } else { "disabled" },
+        )
+        .await;
+    }
+    Ok(Json(shred_stats(&state).await?))
+}
+
+/// POST /client/shredder/run — run a pass now. The Auth page fires this on open
+/// so the policy applies without waiting for the daemon's timer.
+pub async fn run_shredder(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+    let shredded = run_shred_pass(&state).await?;
+    let stats = shred_stats(&state).await?;
+    Ok(Json(json!({ "shredded": shredded, "stats": stats })))
+}
+
 // --- GET /client/unsubscribes -----------------------------------------------
 
 pub async fn list_unsubscribes(
@@ -1726,4 +1936,61 @@ pub async fn unsubscribe_resolution(
     )
     .await;
     Ok(Json(json!({ "sender": sender, "resolution": resolution })))
+}
+
+#[cfg(test)]
+mod shred_policy_tests {
+    use super::*;
+
+    #[test]
+    fn unset_policy_is_off_at_the_default_window() {
+        // The whole point: an account that never opted in never deletes mail.
+        assert_eq!(parse_shred_policy(None, None), (false, SHRED_DEFAULT_DAYS));
+    }
+
+    #[test]
+    fn enabled_accepts_the_stored_form_and_a_friendly_one() {
+        assert!(parse_shred_policy(Some("1".into()), None).0);
+        assert!(parse_shred_policy(Some("true".into()), None).0);
+        assert!(parse_shred_policy(Some("TRUE".into()), None).0);
+        assert!(!parse_shred_policy(Some("0".into()), None).0);
+        // Anything unrecognized reads as OFF, never as on.
+        assert!(!parse_shred_policy(Some("yes".into()), None).0);
+        assert!(!parse_shred_policy(Some(String::new()), None).0);
+    }
+
+    #[test]
+    fn window_is_clamped_to_the_supported_range() {
+        assert_eq!(parse_shred_policy(None, Some("90".into())).1, 90);
+        assert_eq!(parse_shred_policy(None, Some(" 45 ".into())).1, 45);
+        // Below the floor, above the ceiling, and outright garbage all fall back
+        // to the default rather than deleting on an aggressive window.
+        assert_eq!(
+            parse_shred_policy(None, Some("1".into())).1,
+            SHRED_DEFAULT_DAYS
+        );
+        assert_eq!(
+            parse_shred_policy(None, Some("100000".into())).1,
+            SHRED_DEFAULT_DAYS
+        );
+        assert_eq!(
+            parse_shred_policy(None, Some("-30".into())).1,
+            SHRED_DEFAULT_DAYS
+        );
+        assert_eq!(
+            parse_shred_policy(None, Some("soon".into())).1,
+            SHRED_DEFAULT_DAYS
+        );
+    }
+
+    #[test]
+    fn a_corrupt_knob_never_enables_deletion() {
+        // Belt and braces on the property that actually matters.
+        for raw in ["", "  ", "off", "null", "2", "-1", "on"] {
+            assert!(
+                !parse_shred_policy(Some(raw.into()), Some("30".into())).0,
+                "{raw:?} must not read as enabled"
+            );
+        }
+    }
 }

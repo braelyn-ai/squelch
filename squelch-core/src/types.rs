@@ -572,6 +572,41 @@ pub struct UnsubscribeRecord {
     pub resolution: Option<String>,
 }
 
+/// One auth message eligible for shredding: old enough under the retention
+/// policy and not already in `shred_log`. Carries the Gmail id the trash call
+/// needs plus the fields the ledger row records. Human-door-only.
+#[derive(Debug, Clone)]
+pub struct ShredCandidate {
+    /// Local `messages.id`.
+    pub message_id: i64,
+    /// Gmail's own message id — what the trash API is keyed by.
+    pub gmail_msg_id: String,
+    pub sender: String,
+    /// `triage.sealed_kind` (otp / password_reset / …), when classified.
+    pub kind: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
+/// Shredder state for the Auth page: the policy plus the real counts from
+/// `shred_log`. `write_ready` is false when no write credential is configured,
+/// in which case the pass can never run no matter what `enabled` says — the UI
+/// uses it to explain why rather than silently doing nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShredStats {
+    pub enabled: bool,
+    pub after_days: i64,
+    /// Messages trashed in the trailing 30 days (the headline figure).
+    pub shredded_recent: i64,
+    /// Messages trashed since the ledger began.
+    pub shredded_total: i64,
+    /// When the most recent shred happened, or `None` if nothing ever has.
+    pub last_shredded_at: Option<DateTime<Utc>>,
+    /// How many messages are eligible RIGHT NOW under the current policy.
+    pub pending: i64,
+    /// Whether a write credential exists for the trash call.
+    pub write_ready: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
