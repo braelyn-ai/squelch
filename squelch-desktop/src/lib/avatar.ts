@@ -24,22 +24,37 @@ function parseSender(sender: string): { name: string; addr: string } {
   return { name: s, addr: s };
 }
 
-/** Up to two initials from a display name; fallback to the address local-part. */
+/**
+ * Up to two initials for a sender.
+ *
+ * THE SOURCE IS NEVER THE FULL ADDRESS. It used to be, and the domain leaked
+ * into the result: "bboynton97@gmail.com" split to ["bboynton97@gmail","com"]
+ * and rendered "BC" — that second letter is the C of ".com". Almost every bare
+ * address produced a "?C" monogram, which is why a column of avatars read RC,
+ * IC, BC, MC, SC.
+ *
+ * Order: a real display name, then the resolved brand/robot label (so a row
+ * labelled "Corpnet" shows CO rather than the IC of "info@corpnet.com"), then
+ * the local-part alone.
+ */
 export function initialsFor(sender: string): string {
   const { name, addr } = parseSender(sender);
-  const source = name || addr;
-  // Prefer word-based initials from a human name.
-  const words = source
-    .split(/[\s._-]+/)
-    .filter((w) => /[a-z0-9]/i.test(w));
+  const local = (addr.split("@")[0] ?? "").split("+")[0];
+
+  let source = name;
+  if (!source) {
+    const shown = senderDisplayName(sender);
+    source = shown && shown.toLowerCase() !== addr.toLowerCase() ? shown : local;
+  }
+
+  const words = source.split(/[\s._-]+/).filter((w) => /[a-z0-9]/i.test(w));
   if (words.length >= 2) {
     return (words[0][0] + words[1][0]).toUpperCase();
   }
   if (words.length === 1 && words[0].length >= 2) {
     return words[0].slice(0, 2).toUpperCase();
   }
-  const local = addr.split("@")[0] ?? source;
-  return (local[0] ?? "?").toUpperCase();
+  return (local[0] ?? source[0] ?? "?").toUpperCase();
 }
 
 /** Deterministic small hash of the address (stable across sessions). */
@@ -63,7 +78,20 @@ export function avatarSlot(sender: string): number {
 // service mailboxes, not people — safe to resolve a favicon for. Humans never
 // match, so humans never trigger a fetch.
 const ROBOT_LOCAL =
-  /^(no-?reply|do-?not-?reply|notifications?|alerts?|updates?|news(letter)?|marketing|mailer|billing|receipts?|orders?|team|hello|info|support|accounts?|security|admin|service|contact|help|feedback|noreply-\S*)$/i;
+  /^(no-?reply|do-?not-?reply|notifications?|alerts?|updates?|news(letter)?|marketing|mailer|billing|receipts?|orders?|team|hello|info|support|accounts?|security|admin|service|contact|help|feedback|noreply-\S*|e?mail|invoices?|statements?|confirmations?|tracking|delivery|digest|bulletin)$/i;
+
+// The above must match the WHOLE local-part, which real senders very often
+// fail: "no.reply.alerts@chase.com", "no_reply@discord.com",
+// "billing-noreply@stripe.com" and "no-reply-aws@amazon.com" are all obviously
+// machines, and all fell through to initials. So separators are squashed and
+// the result is scanned for an UNAMBIGUOUS automation marker.
+//
+// Deliberately narrow: only markers that no human is ever behind. The
+// human-capable words in ROBOT_LOCAL (hello, info, support, team, contact) stay
+// whole-local-part matches ONLY — segment-matching those would classify
+// "jane.support@acme.com" as a robot and fetch a favicon for a domain a HUMAN
+// corresponds with, which is exactly the leak the privacy model forbids.
+const ROBOT_MARKER = /(noreply|donotreply|mailerdaemon|automailer|automated|autoconfirm)/;
 
 // Mail-ish subdomain prefixes to peel so notifications.github.com resolves the
 // github.com favicon. First label only; naive but sufficient.
@@ -75,7 +103,9 @@ export function isRobotSender(sender: string): boolean {
   const { addr } = parseSender(sender);
   const local = addr.split("@")[0] ?? "";
   const base = local.split("+")[0]; // segment before any +tag
-  return ROBOT_LOCAL.test(base);
+  if (ROBOT_LOCAL.test(base)) return true;
+  // "no.reply.alerts" / "no_reply" / "billing-noreply" -> "...noreply..."
+  return ROBOT_MARKER.test(base.toLowerCase().replace(/[^a-z0-9]/g, ""));
 }
 
 /**
@@ -150,13 +180,36 @@ export function faviconUrl(domain: string): string {
   return `https://icons.duckduckgo.com/ip3/${domain}.ico`;
 }
 
-// Per-domain verdict cache: each domain resolves at most once. "ok" = the img
-// loaded; "failed" = error / blank / tiny — fall back to initials forever.
+// ---- Per-domain verdict cache ---------------------------------------------
+//
+// "ok" is PERMANENT — an icon that loaded once will load again.
+//
+// A FAILURE IS NOT. This cache used to store "failed" forever, with no expiry
+// and no retry, which quietly broke the feature over time: `<img>` reports one
+// undifferentiated `onerror`, so being offline for a moment, a DDG rate-limit,
+// a DNS blip or a slow cold start all looked identical to "this domain has no
+// icon" — and every one of them was written down as permanent. A real cache
+// inspected on 2026-07-27 had 50 domains marked failed, including github.com,
+// paypal.com, google.com, ebay.com, venmo.com and schwab.com, every one of
+// which served a valid icon when re-tested. The user saw initials everywhere
+// and reasonably concluded favicons were broken.
+//
+// So failures now carry the time they happened and are retried after
+// FAILED_RETRY_MS. A domain that genuinely has no icon costs one request a
+// week; a domain that failed transiently heals itself.
 type Verdict = "ok" | "failed";
-const LS_KEY = "squelch.favicons";
-const mem = new Map<string, Verdict>();
 
-function loadStore(): Record<string, Verdict> {
+/** How long a failure is trusted before the domain is worth another attempt. */
+const FAILED_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/** On-disk shape. Legacy entries are bare strings (see the migration below). */
+type StoredVerdict = Verdict | { v: "failed"; t: number };
+type Entry = { v: "ok" } | { v: "failed"; t: number };
+
+const LS_KEY = "squelch.favicons";
+const mem = new Map<string, Entry>();
+
+function loadStore(): Record<string, StoredVerdict> {
   try {
     return JSON.parse(localStorage.getItem(LS_KEY) || "{}");
   } catch {
@@ -166,25 +219,48 @@ function loadStore(): Record<string, Verdict> {
 
 // Warm the in-memory map from localStorage once at module load.
 try {
-  for (const [d, v] of Object.entries(loadStore())) {
-    if (v === "ok" || v === "failed") mem.set(d, v);
+  for (const [d, raw] of Object.entries(loadStore())) {
+    if (raw === "ok") {
+      mem.set(d, { v: "ok" });
+    } else if (raw && typeof raw === "object" && raw.v === "failed") {
+      if (typeof raw.t === "number") mem.set(d, { v: "failed", t: raw.t });
+    }
+    // A LEGACY bare "failed" (written before failures expired) is deliberately
+    // NOT loaded: it carries no timestamp, so there is no honest way to age it,
+    // and the odds are high it was a transient failure recorded as permanent.
+    // Dropping it retries the domain once and then re-records it properly. This
+    // is what un-poisons an existing install.
   }
 } catch {
   /* no localStorage (e.g. SSR/tests) — in-memory only */
 }
 
-/** Cached verdict for a domain, or null if not yet resolved. */
-export function faviconVerdict(domain: string): Verdict | null {
-  return mem.get(domain) ?? null;
+/**
+ * Cached verdict for a domain. Returns null when the domain is unresolved OR
+ * when its recorded failure has aged out — both mean "try again".
+ */
+export function faviconVerdict(domain: string, now = Date.now()): Verdict | null {
+  const e = mem.get(domain);
+  if (!e) return null;
+  if (e.v === "ok") return "ok";
+  return now - e.t < FAILED_RETRY_MS ? "failed" : null;
 }
 
 /** Record a domain verdict in both the in-memory map and localStorage. */
-export function setFaviconVerdict(domain: string, verdict: Verdict): void {
-  if (mem.get(domain) === verdict) return;
-  mem.set(domain, verdict);
+export function setFaviconVerdict(
+  domain: string,
+  verdict: Verdict,
+  now = Date.now(),
+): void {
+  const prev = mem.get(domain);
+  if (prev?.v === "ok" && verdict === "ok") return;
+  const entry: Entry = verdict === "ok" ? { v: "ok" } : { v: "failed", t: now };
+  mem.set(domain, entry);
   try {
     const store = loadStore();
-    store[domain] = verdict;
+    // "ok" persists as the bare legacy string (an older build reads it fine);
+    // only failures need the timestamp that makes them expirable.
+    store[domain] = entry.v === "ok" ? "ok" : entry;
     localStorage.setItem(LS_KEY, JSON.stringify(store));
   } catch {
     /* ignore persistence failures — the in-memory verdict still holds */
