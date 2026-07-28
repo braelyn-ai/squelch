@@ -104,9 +104,8 @@ pub fn router(state: ApiState) -> Router {
             "/client/unsubscribes/resolution",
             post(handlers::unsubscribe_resolution),
         )
-        // Action STUBS. Another agent implements these THIS SESSION on top of
-        // this router; they slot in by replacing the stub handlers. Each returns
-        // 501 with {"error":"actions not yet wired"} for now.
+        // Actions: the only write capability. Require the opt-in write
+        // credential; 403 without one.
         .route("/client/actions/archive", post(handlers::action_archive))
         .route("/client/actions/label", post(handlers::action_label))
         .route("/client/actions/send", post(handlers::action_send))
