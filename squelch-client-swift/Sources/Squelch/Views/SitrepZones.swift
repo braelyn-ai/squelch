@@ -512,20 +512,22 @@ private struct NewsletterCard: View {
 /// unless) a hero resolves, and is gated on the remote-images pref — with
 /// images "on demand" NO network fetch happens for unopened mail.
 private struct NewsletterHero: View {
-    @Environment(Prefs.self) private var prefs
     let threadId: String
-    @State private var image: NSImage?
-    /// The hero's own dominant colour, painted behind it so a letterboxed mark
-    /// sits on a stage drawn FROM the art instead of on a grey well. nil until
-    /// sampled (and for art we could not sample).
-    @State private var fill: Color?
+    @State private var resolved: HeroCache.Hero?
 
     /// Side of the square thumb.
     private static let side: CGFloat = 54
 
+    /// Falling back to the cache INSIDE the read is what keeps a recycled card
+    /// from flashing empty: `@State` is gone the moment LazyVGrid drops the
+    /// card, but the resolved hero is not, so it repaints from the cache on the
+    /// very first frame instead of waiting for `.task` to hand back what we
+    /// already had.
+    private var hero: HeroCache.Hero? { resolved ?? HeroCache.shared.cached(threadId) }
+
     var body: some View {
         content
-            .task(id: threadId) { await load() }
+            .task(id: threadId) { resolved = await HeroCache.shared.resolve(threadId) }
     }
 
     /// The no-hero branch is a REAL zero-size leaf, not an implicit EmptyView.
@@ -536,15 +538,15 @@ private struct NewsletterHero: View {
     /// note on NewslettersZone.
     @ViewBuilder
     private var content: some View {
-        if let image {
-            Image(nsImage: image)
+        if let hero {
+            Image(nsImage: hero.image)
                 .resizable()
-                .aspectRatio(contentMode: fit(image))
+                .aspectRatio(contentMode: fit(hero.image))
                 .frame(width: Self.side, height: Self.side)
                 // The REST OF THE SQUARE, in the art's own dominant colour —
                 // see ImageFill. Falls back to the neutral well when sampling
                 // failed, which must stay distinguishable from a white sample.
-                .background(fill ?? Palette.canvas.opacity(0.7))
+                .background(hero.fill ?? Palette.canvas.opacity(0.7))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
             // No art: the text takes the full width rather than sitting beside
@@ -560,55 +562,6 @@ private struct NewsletterHero: View {
     /// leave a meaningless slice of two letters.
     private func fit(_ image: NSImage) -> ContentMode {
         image.size.width > image.size.height * 1.2 ? .fit : .fill
-    }
-
-    private func load() async {
-        guard prefs.loadRemoteImages, !threadId.isEmpty else { return }
-        guard let view = try? await ThreadPrefetch.shared.fetch(threadId, fresh: 600) else {
-            return
-        }
-        guard let newest = view.messages.last, let html = newest.html,
-            let src = Trackers.extractHeroSrc(html), let url = URL(string: src)
-        else { return }
-        guard let art = await RemoteImageLoader.shared.load(url) else { return }
-        // Sample BEFORE publishing the image, so the square never flashes the
-        // neutral well and then repaints itself a beat later.
-        fill = ImageFill.dominant(art)
-        image = art
-    }
-}
-
-/// Fetches newsletter hero art. Referrer-suppressed and cookie-free, matching
-/// the posture of every other remote-image fetch in the app.
-@MainActor
-final class RemoteImageLoader {
-    static let shared = RemoteImageLoader()
-    private var cache: [URL: NSImage] = [:]
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 10
-        cfg.httpShouldSetCookies = false
-        return URLSession(configuration: cfg)
-    }()
-    /// 8MB per image, matching the Rust shell's cap.
-    private static let maxBytes = 8 * 1024 * 1024
-
-    private init() {}
-
-    func load(_ url: URL) async -> NSImage? {
-        if let hit = cache[url] { return hit }
-        guard url.scheme == "http" || url.scheme == "https" else { return nil }
-        var req = URLRequest(url: url)
-        req.setValue("", forHTTPHeaderField: "Referer")
-        guard let (data, response) = try? await session.data(for: req),
-            let http = response as? HTTPURLResponse, http.statusCode == 200,
-            data.count <= Self.maxBytes,
-            let mime = http.value(forHTTPHeaderField: "Content-Type"),
-            mime.lowercased().hasPrefix("image/"),
-            let image = NSImage(data: data)
-        else { return nil }
-        cache[url] = image
-        return image
     }
 }
 

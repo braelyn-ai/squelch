@@ -112,7 +112,13 @@ struct SitrepView: View {
         .keyContext(.sitrep)
         .keyBindings(.sitrep, bindings)
         .task { await loadRulesCount() }
-        .task { newsletters = await NewsletterFeed.load() }
+        .task {
+            newsletters = await NewsletterFeed.load()
+            // Warm every hero BEFORE the zone is scrolled to. Resolving them
+            // lazily meant the decode landed while the scroll was in flight,
+            // which is precisely when the main actor has no time to spare.
+            HeroCache.shared.preload(newsletters.map(\.latestThreadId))
+        }
         // PRELOAD every For-your-eyes email so opening one is instant. The
         // visible top-10 warm immediately; the collapsed remainder trickles so a
         // long list never stampedes the daemon. Prefetch dedupes in-flight and
