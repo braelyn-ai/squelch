@@ -1,13 +1,18 @@
 // Attachment strip for the thread viewer — one flat card per attachment, shown
 // under a message body. Card variants:
-//   * image/* (not svg): a real thumbnail, fetched LAZILY on mount over the
-//     authenticated door (bearer auth can't ride an <img src>, so bytes flow
-//     through the API client into an NSImage).
-//   * application/pdf: a document card; clicking opens the PDF preview overlay.
+//   * image/* (not svg): a real thumbnail of the image.
+//   * application/pdf: page 1, rasterized at tile size — a receipt should look
+//     like a receipt in the strip. Clicking opens the PDF preview.
 //   * everything else, AND image/svg+xml (scriptable — never rendered inline):
 //     a file card with filename + human size.
 // downloadable=false (bytes over the ingest cap, metadata only) => dimmed card,
 // "too large — not stored", no thumbnail/preview/download.
+//
+// Tiles resolve through AttachmentThumbs, NOT inside the card: these cards live
+// in a LazyVStack, and re-downloading the bytes on every recycle is the exact
+// bug that cache exists to prevent. Bytes ride the AUTHENTICATED door either
+// way — bearer auth can't ride an <img src>, so everything flows through
+// APIClient rather than a plain URL.
 //
 // SECURITY: nothing here trusts the attachment mime for rendering beyond the
 // image/pdf/other bucket choice; the SERVER decides what Content-Type it will
@@ -28,11 +33,27 @@ struct AttachmentStrip: View {
     /// Images above this skip the auto-fetched thumbnail (a 10MB photo for a
     /// 120px thumb is silly bandwidth) and show the glyph card instead.
     private static let thumbMaxBytes = 2 * 1024 * 1024
+    /// PDFs get more headroom than photos: page 1 of a 3MB invoice rasterizes
+    /// as cheaply as page 1 of a 30KB one, and receipts/tickets/boarding passes
+    /// — the attachments actually worth recognizing at a glance — routinely sit
+    /// above the photo cap. Still capped, because pulling a 10MB scanned
+    /// brochure down for a 38pt tile is the same silly bandwidth.
+    private static let pdfThumbMaxBytes = 4 * 1024 * 1024
 
     static func isThumbnailable(_ mime: String, _ size: Int) -> Bool {
         mime.hasPrefix("image/") && mime != "image/svg+xml" && size <= thumbMaxBytes
     }
     static func isPDF(_ mime: String) -> Bool { mime == "application/pdf" }
+
+    /// Which rasterizer a card's tile uses, or nil for the glyph. This is the
+    /// ONE place the mime buckets are decided — svg lands in the glyph bucket
+    /// here and nowhere reconsiders it.
+    static func tileSource(_ att: Attachment) -> AttachmentThumbs.Source? {
+        guard att.downloadable else { return nil }
+        if isThumbnailable(att.mime, att.size) { return .image }
+        if isPDF(att.mime), att.size <= pdfThumbMaxBytes { return .pdf }
+        return nil
+    }
 
     var body: some View {
         if !attachments.isEmpty {
@@ -47,12 +68,18 @@ struct AttachmentStrip: View {
             }
             .padding(.top, 4)
             .accessibilityLabel("attachments")
-            .overlay {
-                if let preview {
-                    PDFPreview(
-                        attachment: preview, onDownload: { Task { await download(preview) } },
-                        onClose: { self.preview = nil })
-                }
+            // A SHEET, not an overlay. An overlay here is laid out against the
+            // strip's own 38pt-tall frame, deep inside the thread's ScrollView:
+            // the 820pt card was centred on the attachment card, hung off the
+            // left edge of the window, painted UNDER the messages below it, and
+            // scrolled away with the content. A sheet is presented by the
+            // window, so it lands where a modal belongs no matter how deep the
+            // view that opened it is.
+            .sheet(item: $preview) { att in
+                PDFPreview(
+                    attachment: att,
+                    onDownload: { Task { await download(att) } },
+                    onClose: { preview = nil })
             }
         }
     }
@@ -78,18 +105,16 @@ private struct AttachmentCard: View {
     @State private var hovering = false
 
     private var stored: Bool { attachment.downloadable }
-    private var thumb: Bool {
-        stored && AttachmentStrip.isThumbnailable(attachment.mime, attachment.size)
-    }
     private var pdf: Bool { stored && AttachmentStrip.isPDF(attachment.mime) }
+    private var glyph: String { pdf ? "doc.richtext" : "doc" }
 
     var body: some View {
         HStack(spacing: 9) {
             ZStack {
-                if thumb {
-                    ThumbImage(attachment: attachment)
+                if let source = AttachmentStrip.tileSource(attachment) {
+                    ThumbTile(attachment: attachment, source: source, glyph: glyph)
                 } else {
-                    Image(systemName: pdf ? "doc.richtext" : "doc")
+                    Image(systemName: glyph)
                         .font(.system(size: 18, weight: .light))
                         .foregroundStyle(Palette.inkFaintest)
                 }
@@ -132,45 +157,50 @@ private struct AttachmentCard: View {
         .contentShape(Rectangle())
         .onTapGesture { onPreview?() }
         .onHover { hovering = $0 }
-        .help(attachment.filename)
+        // A previewable card looks exactly like one that only downloads, so the
+        // tooltip is the only place "this opens" is ever said.
+        .help(onPreview == nil ? attachment.filename : "\(attachment.filename) — click to preview")
     }
 }
 
-/// A lazily-fetched image thumbnail. Fetches bytes on mount over the
-/// authenticated door; a failure falls back to the generic file glyph.
-private struct ThumbImage: View {
+/// One attachment's tile. Owns no fetching of its own: AttachmentThumbs resolves
+/// (and memoizes) the art, so a card that scrolls out and back paints from cache
+/// instead of re-downloading. A failure falls back to the card's file glyph.
+private struct ThumbTile: View {
     let attachment: Attachment
-    @State private var image: NSImage?
-    @State private var failed = false
+    let source: AttachmentThumbs.Source
+    let glyph: String
+
+    @State private var resolved: AttachmentThumbs.Tile?
 
     var body: some View {
+        // Read the cache on the way INTO body, not just from `.task`: a
+        // recycled card must paint art we already hold on its first frame
+        // rather than flash a spinner while the task re-confirms it.
+        let tile = resolved ?? AttachmentThumbs.shared.cached(attachment.id)
         Group {
-            if let image {
-                Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
-            } else if failed {
-                Image(systemName: "doc")
+            switch tile {
+            case .art(let image)?:
+                // A page keeps its aspect (that shape is what reads as "a
+                // document"); a photo fills the square.
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: source == .pdf ? .fit : .fill)
+            case .blank?:
+                Image(systemName: glyph)
                     .font(.system(size: 18, weight: .light))
                     .foregroundStyle(Palette.inkFaintest)
-            } else {
+            case nil:
                 ProgressView().controlSize(.mini)
             }
         }
-        .task {
-            do {
-                let fetched = try await APIClient.shared.fetchAttachment(
-                    attachment.id, fallbackName: attachment.filename)
-                image = NSImage(data: fetched.bytes)
-                if image == nil { failed = true }
-            } catch {
-                failed = true
-            }
-        }
+        .task { resolved = await AttachmentThumbs.shared.resolve(attachment, as: source) }
     }
 }
 
-/// PDF preview overlay. Own "modal" KeyContext so Esc closes it without leaking
-/// to the thread keys underneath. Renders natively via PDFKit — no webview and
-/// no blob URL, which is strictly stronger than the <embed> the web build used.
+/// PDF preview. Own "modal" KeyContext so Esc closes it without leaking to the
+/// thread keys underneath. Renders natively via PDFKit — no webview and no blob
+/// URL, which is strictly stronger than the <embed> the web build used.
 private struct PDFPreview: View {
     let attachment: Attachment
     let onDownload: () -> Void
@@ -180,46 +210,51 @@ private struct PDFPreview: View {
     @State private var error: String?
 
     var body: some View {
-        OverlayScrim(onDismiss: onClose) {
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    Text(attachment.filename)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Palette.ink)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    Button(action: onDownload) {
-                        Label("download", systemImage: "arrow.down.circle")
-                            .font(Typo.micro)
-                            .padding(.horizontal, 8).padding(.vertical, 3)
-                    }
-                    .buttonStyle(.glass)
-                    .foregroundStyle(Palette.accent)
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text(attachment.filename)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button(action: onDownload) {
+                    Label("download", systemImage: "arrow.down.circle")
+                        .font(Typo.micro)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                }
+                .buttonStyle(.glass)
+                .foregroundStyle(Palette.accent)
+                // A sheet has no scrim to click away, so the Esc hint has to be
+                // the button too — otherwise the keyboard is the only exit.
+                Button(action: onClose) {
                     HStack(spacing: 4) {
                         Kbd("esc")
                         Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-
-                Divider().overlay(Palette.hairline)
-
-                Group {
-                    if let error {
-                        Text(error).font(Typo.rowSub).foregroundStyle(Palette.danger)
-                    } else if let document {
-                        PDFKitView(document: document)
-                    } else {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .buttonStyle(.plain)
             }
-            .frame(width: 820, height: 620)
-            .squelchGlass(.pane, cornerRadius: 20, tint: Palette.glassTint)
-            .shadow(color: .black.opacity(0.3), radius: 44, y: 20)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+
+            Divider().overlay(Palette.hairline)
+
+            Group {
+                if let error {
+                    Text(error).font(Typo.rowSub).foregroundStyle(Palette.danger)
+                } else if let document {
+                    PDFKitView(document: document)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(width: 820, height: 620)
+        .squelchGlass(.pane, cornerRadius: 20, tint: Palette.glassTint)
+        // The sheet's own backing would otherwise paint an opaque slab behind
+        // the glass and flatten it into a plain grey panel.
+        .presentationBackground(.clear)
         .keyContext(.modal)
         .keyBindings(.modal, [
             KeyBinding("Escape", "close preview", allowInInput: true) { onClose() }
