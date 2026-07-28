@@ -57,17 +57,18 @@
 .sitrep-header .refresh-err {
   color: #ffd9d3;
 }
-/* Header controls (theme toggle / help / audit hint) — white icons on blue. */
+/* Header controls (theme toggle / help / audit hint). Ink on the pale field —
+   these were white-on-blue while the canvas was flooded. */
 .sitrep-header .theme-toggle {
   color: var(--on-sky-dim);
 }
 .sitrep-header .theme-toggle:hover {
-  background: rgba(255, 255, 255, 0.15);
-  border-color: rgba(255, 255, 255, 0.28);
+  background: var(--mat-thin);
+  border-color: var(--border);
   color: var(--on-sky);
 }
 .sitrep-header .help-hint {
-  border-color: rgba(255, 255, 255, 0.35);
+  border-color: var(--border);
   color: var(--on-sky-dim);
 }
 
@@ -196,28 +197,32 @@
   color: var(--accent);
 }
 
-/* deadline chip — a small flat capsule sitting on a pane */
+/* deadline chip — a small soft capsule sitting on a pane. SANS, not mono: it is
+   a status label, and setting it in the data face made every row look like it
+   carried a serial number. Borderless, tinted by tier. */
 .chip {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  padding: 2px 9px;
   border-radius: var(--radius-pill);
   background: var(--mat-thin);
-  border: 1px solid var(--border);
+  border: none;
   font-variant-numeric: tabular-nums;
-  font-family: var(--mono);
+  font-family: var(--sans);
 }
 /* Overdue reads in red INK only — no red fill; a red-washed pill on every
    past-due row was too aggressive (owner call, 2026-07-22). A flat tinted
    hairline is how it gets its urgency back without shouting. */
+/* Past due shouts quietly: uppercase, coral ink on a coral wash. */
 .chip.overdue {
   color: var(--red-ink);
-  border-color: color-mix(in srgb, var(--red) 42%, transparent);
+  background: var(--red-soft);
+  text-transform: uppercase;
 }
 .chip.upcoming {
   color: var(--amber);
   background: var(--amber-soft);
-  border-color: color-mix(in srgb, var(--amber) 38%, transparent);
 }
 
 /* STILL OPEN escalation: a left rail whose weight tracks age. */
@@ -255,7 +260,7 @@
   right: 0;
   top: 0;
   height: 1px;
-  background: rgba(255, 255, 255, 0.4);
+  background: var(--card-line);
 }
 .noise-line .knob {
   margin-left: auto;
@@ -599,7 +604,7 @@
 }
 .thread-view .tv-unsub:hover {
   color: var(--on-sky);
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--mat-thin);
 }
 /* THE single scroll surface: message cards stack in plain block flow and the
    column scrolls; frames auto-size to content (EmailFrame) so nothing nests. */
@@ -1430,18 +1435,18 @@
 .retriage-btn .spin {
   animation: conn-spin 0.9s linear infinite;
 }
-/* In a masthead the pill sits on the blue field, not on a pane — so it matches
-   .need-pill: white ink, a flat translucent capsule, flat white hairline. */
+/* In a masthead the pill sits on the pale field, not on a pane — so it matches
+   the status-strip chips: a small white capsule lifted by a shadow. */
 .retriage-btn.on-sky {
-  color: var(--on-sky);
-  text-shadow: var(--on-sky-shadow-sm);
-  background: rgba(255, 255, 255, 0.18);
-  border: 1px solid rgba(255, 255, 255, 0.32);
-  box-shadow: none;
+  color: var(--fg-dim);
+  background: rgba(255, 255, 255, 0.72);
+  border: none;
+  box-shadow: var(--shadow-card-sm);
 }
 .retriage-btn.on-sky:hover {
-  background: rgba(255, 255, 255, 0.28);
-  border-color: rgba(255, 255, 255, 0.46);
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: var(--shadow-float);
 }
 
 /* ---- DEV triage-debug overlay ---- */
