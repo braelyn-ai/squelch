@@ -1,0 +1,39 @@
+[package]
+name = "squelch-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squelch-relay"
+path = "src/bin/squelch-relay.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Full-feature axum on the same 0.8 line the rest of the workspace pins.
+axum = { version = "0.8" }
+tower = "0.5"
+# APNs speaks HTTP/2 only, so `http2` must be on — the workspace default-features
+# = false reqwest does NOT include it. rustls, never native-tls.
+reqwest = { workspace = true, features = ["http2"] }
+# Bounded-concurrency fan-out over the token list.
+futures = { workspace = true }
+# APNs provider tokens: ES256 over the .p8 PKCS#8 key. `rust_crypto` (not
+# `aws_lc_rs`) keeps the tree pure-Rust, matching why the workspace forces
+# rustls everywhere: no openssl/C toolchain on the headless Linux box.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
+# Constant-time bearer comparison, exactly as squelch-api/src/auth.rs does it.
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

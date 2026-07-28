@@ -88,7 +88,7 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 | [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
 | [`squelch-desktop`](squelch-desktop/README.md) | the Tauri desktop client over the human door |
 | `squelch-client-swift` | the native macOS client over the human door |
-| [`squelch-relay`](squelch-relay/README.md) | (design only) blind APNs ping relay for the future iOS app |
+| [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
 
 Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
 
