@@ -17,13 +17,16 @@ Delivery is a per-platform adapter reading that one log:
 triage verdict
      v
 events table (SQLite, monotonic id)    <- one source of truth, in squelchd
-     ├── SSE  GET /client/events        -> desktop (Tauri), macOS Swift client
+     ├── SSE  GET /client/events        -> macOS Swift client (resident app)
      └── APNs pusher (this relay)       -> iOS
 ```
 
-Desktop and the Swift client stay resident (tray / Dock) and hold an SSE
-connection to the human door — no relay involved. iOS has no resident-process
-option: a native app that isn't foregrounded can only be woken by APNs.
+The client story is all-Swift: `squelch-client-swift` on macOS today, an iOS
+app later, sharing models and API-client code. On the Mac the app stays
+resident (window hides on close, the process lingers), holds one SSE connection
+to the human door, and posts through `UNUserNotificationCenter` — no relay
+involved. iOS has no resident-process option: a native app that isn't
+foregrounded can only be woken by APNs.
 
 APNs requires holding the `.p8` signing key bound to the app identifier and the
 developer account. That key cannot ship inside every user's daemon — anyone who
@@ -46,6 +49,12 @@ fetches the real event from the user's own daemon over their tailnet
 (`GET /client/events/{id}` on the human door, bearer-authed), and rewrites the
 notification with actual content. If the daemon is unreachable, the generic
 alert shows as-is.
+
+Because both clients are Swift, the "turn event N into notification title/body"
+code is written once in a shared package: the macOS app runs it on events
+arriving over SSE, the iOS NSE runs the identical code on events fetched after
+a ping. Same for the API client and event models. The relay never needs to know
+any of it exists.
 
 What each party sees:
 
@@ -72,14 +81,14 @@ Stateless. One endpoint that matters. No database in v1.
   `content-available` background push — those get throttled; a visible
   mutable notification runs the NSE reliably).
 
-Config: APNs auth key (`.p8`), key id, team id, bundle id, sandbox/production
+Config: APNs auth key (`.p8`), key id, team id, bundle id(s), sandbox/production
 toggle. That's the whole surface.
 
 Logging: request timing and status codes only. Never log tokens or payloads.
 
-## Daemon-side integration (lives in the main repo, not here)
+## Daemon and client integration (lives in the main repo, not here)
 
-Planned, in dependency order with the desktop notification waves:
+Planned, in dependency order:
 
 1. `events` table + triage emission rules + in-process broadcast
    (`squelch-core`). Emission rules decided up front: never on initial
@@ -87,14 +96,20 @@ Planned, in dependency order with the desktop notification waves:
    v1 — an OTP on a lock screen would undo the seal design); deterministically
    squelched senders are silent.
 2. `GET /client/events` SSE with replay cursor, and `GET /client/events/{id}`
-   (id-addressable from day one — the NSE fetches by id; trivial now, a
+   (id-addressable from day one — the iOS NSE fetches by id; trivial now, a
    retrofit later).
-3. Desktop consumes SSE from the Tauri Rust core (the webview dies with the
-   window; the shell process doesn't), posts native notifications, tray +
-   hide-on-close.
+3. macOS Swift client consumes SSE (`URLSession.bytes` on the existing
+   `APIClient` plumbing, reconnect with the persisted last-seen id), renders
+   through `UNUserNotificationCenter`, notification click focuses the app and
+   deep-links to the thread. Residency: last-window-closed does not terminate,
+   optional menu bar extra, `SMAppService` login item. The app is already a
+   real bundle (`dev.squelch.client`) so notification authorization just works;
+   note that re-signing ad-hoc can reset the user's notification permission
+   grant.
 4. iOS era: `POST /client/devices` registration on the human door (device
    token, human door, bearer-authed), a pusher task in squelchd reading the
-   events table and POSTing to this relay, dropping tokens on 410.
+   events table and POSTing to this relay, dropping tokens on 410. NSE +
+   shared-package rendering as described above.
 
 **Per-channel cursors, not a global "delivered" flag** — the Mac's SSE consumer
 and each phone track their own `after=<id>` independently. A single-consumer
@@ -119,6 +134,10 @@ only secret.
 - **Batching.** Should `POST /v1/push` take many tokens per event? (Yes,
   probably — multi-device fan-out belongs in one request.)
 - **Sandbox vs production APNs** routing — per-request flag or per-deployment?
+- **Mac over APNs too?** Native macOS apps can register for remote
+  notifications, so the relay could someday serve the Mac client through the
+  same door (e.g. a Mac App Store build without residency assumptions). SSE
+  stays the local-first default; this is a distribution-era option, not a plan.
 
 ## Rejected alternatives
 
@@ -126,8 +145,8 @@ only secret.
   at distribution scale. Kept as a dev-mode possibility only.
 - **Web Push / PWA** — iOS 16.4+ supports Web Push for home-screen PWAs with
   end-to-end encrypted payloads and self-generated keys: no Apple account, no
-  relay, ideologically pure. Requires the iOS app to be a PWA, and we want
-  native. Noted with respect, discarded.
+  relay, ideologically pure. Requires the iOS app to be a PWA, and the client
+  line is native Swift. Noted with respect, discarded.
 - **Background fetch / silent polling on iOS** — throttled by the OS into
   uselessness for timely mail.
 - **ntfy / UnifiedPush** — still routes through someone's APNs upstream on
