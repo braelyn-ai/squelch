@@ -433,7 +433,11 @@ private struct NewsletterCard: View {
 
     var body: some View {
         Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 0) {
+            // Hero LEFT as a square thumb, text right — the card reads as a row
+            // at a glance instead of a banner you have to scan vertically, and
+            // a fixed square keeps every card in the grid the same height
+            // whether or not its sender ships art.
+            HStack(alignment: .top, spacing: 9) {
                 NewsletterHero(threadId: newsletter.latestThreadId)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
@@ -479,8 +483,9 @@ private struct NewsletterCard: View {
                         .help("edit this rule")
                     }
                 }
-                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .padding(9)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -510,27 +515,49 @@ private struct NewsletterHero: View {
     @Environment(Prefs.self) private var prefs
     let threadId: String
     @State private var image: NSImage?
+    /// The hero's own dominant colour, painted behind it so a letterboxed mark
+    /// sits on a stage drawn FROM the art instead of on a grey well. nil until
+    /// sampled (and for art we could not sample).
+    @State private var fill: Color?
+
+    /// Side of the square thumb.
+    private static let side: CGFloat = 54
 
     var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: fit(image))
-                    .frame(height: 84)
-                    .frame(maxWidth: .infinity)
-                    .background(Palette.canvas.opacity(0.7))
-                    .clipShape(
-                        UnevenRoundedRectangle(
-                            topLeadingRadius: 12, bottomLeadingRadius: 0,
-                            bottomTrailingRadius: 0, topTrailingRadius: 12, style: .continuous))
-            }
-        }
-        .task(id: threadId) { await load() }
+        content
+            .task(id: threadId) { await load() }
     }
 
-    /// Fit by shape: tall/square heroes crop to fill (photos survive a crop);
-    /// WIDE art letterboxes (cropping a wordmark chops its lettering).
+    /// The no-hero branch is a REAL zero-size leaf, not an implicit EmptyView.
+    /// SwiftUI gives EmptyView no lifetime, so `.task` on a view that resolves
+    /// to nothing never fires — and this view starts with no image, which meant
+    /// the fetch that would produce one never ran and no card ever showed art.
+    /// Identical to the trap that kept the zones themselves invisible; see the
+    /// note on NewslettersZone.
+    @ViewBuilder
+    private var content: some View {
+        if let image {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: fit(image))
+                .frame(width: Self.side, height: Self.side)
+                // The REST OF THE SQUARE, in the art's own dominant colour —
+                // see ImageFill. Falls back to the neutral well when sampling
+                // failed, which must stay distinguishable from a white sample.
+                .background(fill ?? Palette.canvas.opacity(0.7))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        } else {
+            // No art: the text takes the full width rather than sitting beside
+            // an empty box. Zero in BOTH axes — a zero-height-only placeholder
+            // would still collect the HStack's spacing and indent the text.
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    /// Fit by shape, and it matters MORE in a square than it did in the old
+    /// full-width banner: tall/square heroes crop to fill (photos survive a
+    /// crop), WIDE art letterboxes. Filling the square with a wordmark would
+    /// leave a meaningless slice of two letters.
     private func fit(_ image: NSImage) -> ContentMode {
         image.size.width > image.size.height * 1.2 ? .fit : .fill
     }
@@ -543,7 +570,11 @@ private struct NewsletterHero: View {
         guard let newest = view.messages.last, let html = newest.html,
             let src = Trackers.extractHeroSrc(html), let url = URL(string: src)
         else { return }
-        image = await RemoteImageLoader.shared.load(url)
+        guard let art = await RemoteImageLoader.shared.load(url) else { return }
+        // Sample BEFORE publishing the image, so the square never flashes the
+        // neutral well and then repaints itself a beat later.
+        fill = ImageFill.dominant(art)
+        image = art
     }
 }
 

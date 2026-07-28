@@ -20,15 +20,23 @@ struct SidebarRail: View {
     let namespace: Namespace.ID
     @Namespace private var railGlass
 
-    private static let railWidth: CGFloat = 60
+    static let railWidth: CGFloat = 60
+
+    /// Height of the strip the traffic lights live in, left unpainted by the
+    /// rail's material below. Sits in the ~21pt of clear space between the
+    /// bottom of the dots and the top of the first rail icon.
+    static let titleBarHeight: CGFloat = 24
 
     var body: some View {
         GlassEffectContainer(spacing: 14) {
             VStack(spacing: 6) {
-                // Leave room for the traffic lights — the title bar is hidden
-                // but the buttons still live in that corner.
-                Color.clear.frame(height: 30)
-
+                // NO TOP SPACER. The first icon sits on the SAME LINE as the
+                // "squelch" wordmark beside it, which is what makes the rail
+                // read as part of the page header rather than as a strip that
+                // starts late. A 30pt spacer used to hold it 36pt below that
+                // line (30 plus the stack's own 6) to clear the traffic lights
+                // — but they end ~19pt above where the icon now starts, so the
+                // clearance was paying for itself twice.
                 ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in
                     RailButton(
                         view: view, keyNumber: index + 1, active: store.activeView == view,
@@ -52,18 +60,45 @@ struct SidebarRail: View {
             .frame(width: Self.railWidth)
             .frame(maxHeight: .infinity)
         }
+        // WHAT MAKES IT SLIDE. The shared glassEffectID above is only half the
+        // trick: the material morphs between icons only if the change lands in
+        // an animated transaction, and `setView` mutates `activeView` plainly —
+        // so without this the selector popped from one icon to the next.
+        //
+        // It hangs off the VALUE rather than the click, which is the point:
+        // every route in gets the same motion — the 1..5 keys, ⌘[ / ], the
+        // View menu, a health banner deep-linking into Settings.
+        //
+        // NOT in `setView` itself. A `withAnimation` there would also animate
+        // the main content swap hanging off the same property, which is a much
+        // bigger (and unrequested) behaviour change.
+        .animation(.smooth(duration: 0.32), value: store.activeView)
         .background {
             // The rail is the most translucent surface in the window, but not
             // arbitrarily thin: it has to hold its own value regardless of what
             // the wallpaper is doing, or its icons stop being legible over a
             // dark desktop.
+            //
+            // IT STARTS BELOW THE TITLE BAR. The window is .hiddenTitleBar with
+            // a full-size content view, so this material used to run up behind
+            // the traffic lights: the three dots sat on the rail's own colour
+            // while everything to their right sat on the window backdrop, and
+            // that mismatch read as the dots CLIPPING the sidebar.
+            //
+            // Leaving the strip UNPAINTED is what makes the top bar exactly the
+            // background — it IS the background, the same WindowBackdrop the
+            // rest of the window sits on, so it cannot drift out of match with
+            // the theme or the palette. Painting a second copy into a 24pt box
+            // does not work: the backdrop's gradient is relative to its own
+            // frame, so a short box compresses it and the seam shows.
             Rectangle()
                 .fill(.thinMaterial)
                 .overlay(Palette.glassTint.opacity(0.5))
                 .overlay(alignment: .trailing) {
                     Rectangle().fill(Palette.hairline).frame(width: 0.5)
                 }
-                .ignoresSafeArea()
+                .padding(.top, Self.titleBarHeight)
+                .ignoresSafeArea(edges: .bottom)
         }
     }
 }

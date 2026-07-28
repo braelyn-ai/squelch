@@ -120,7 +120,7 @@ struct EmailsView: View {
         return HStack(spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
                 Text("squelch")
-                    .font(Typo.serif(17, weight: .medium))
+                    .font(Typo.serif(19, weight: .medium))
                     .foregroundStyle(Palette.ink)
                 Text("all mail")
                     .font(Typo.micro)
@@ -169,8 +169,12 @@ struct EmailsView: View {
             .help("keyboard shortcuts (?)")
             ThemeToggle()
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 13)
+        // Same metrics as the sitrep masthead, not just the same fonts: the rail
+        // icon beside it is aligned to that wordmark's line, so a header that
+        // sat 3pt higher here would break the alignment on every page but one.
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
         .overlay(alignment: .bottom) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
     }
 
