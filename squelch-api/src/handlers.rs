@@ -1748,10 +1748,10 @@ pub async fn post_triage_feedback(
         .note
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty());
-    if let Some(n) = &note {
-        if n.chars().count() > FEEDBACK_NOTE_MAX {
-            return Err(ApiError::bad_request("note is too long"));
-        }
+    if let Some(n) = &note
+        && n.chars().count() > FEEDBACK_NOTE_MAX
+    {
+        return Err(ApiError::bad_request("note is too long"));
     }
 
     let store = state.store.clone();
