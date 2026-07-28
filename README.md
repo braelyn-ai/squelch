@@ -79,7 +79,7 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 
 ## Workspace layout
 
-| Crate | What it is |
+| Component | What it is |
 |---|---|
 | `squelch-core` | types, SQLite store, seal detection, two-stage triage (rules + LLM), Gmail sync, OAuth |
 | [`squelch-mcp`](squelch-mcp/README.md) | the agent door (rmcp server, stdio or HTTP) |
@@ -87,8 +87,42 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 | [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
 | [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
 | [`squelch-desktop`](squelch-desktop/README.md) | the Tauri desktop client over the human door |
+| `squelch-client-swift` | the native macOS client over the human door |
 
 Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
+
+## Building the macOS client
+
+`squelch-client-swift` builds with `swiftc` directly — no Xcode needed for a local build.
+
+```sh
+cd squelch-client-swift
+./build.sh          # debug
+./build.sh run      # build and launch
+./build.sh release  # optimized
+```
+
+Local builds sign with whatever `Developer ID Application` certificate is in the keychain, falling back to ad-hoc when there is none. That is deliberate and worth knowing about: keychain ACLs match on a bundle's *designated requirement*, and an ad-hoc signature's requirement is a hash of the build itself, so every recompile looks like a new app and re-prompts for access to the stored credentials. A Developer ID requirement is keyed to the team and stays constant across rebuilds. Local builds also get `get-task-allow` so a debugger can attach; it is injected into a throwaway copy of the entitlements and never reaches a release, which the notary service would reject for carrying it.
+
+`VERSION` holds the user-facing version; the build number is the git commit count, so it only ever increases. Override either with `MARKETING_VERSION=` / `BUILD_NUMBER=`.
+
+### Releases
+
+`./build-release.sh` produces a bundle that opens by double-click on any Mac: Developer ID signature, hardened runtime, Apple notarization, stapled ticket. Ad-hoc builds from `build.sh` do not — Gatekeeper blocks them everywhere but the machine that built them.
+
+```sh
+./build-release.sh              # sign, notarize, staple, package
+./build-release.sh --no-notary  # sign only; fast, still Gatekeeper-warned
+```
+
+It picks up whatever `Developer ID Application` certificate is in the keychain; set `SIGN_ID` to choose explicitly. Notarization needs an **app-specific password** (generated at [appleid.apple.com](https://appleid.apple.com) under Sign-In and Security — *not* your Apple ID password), stored once:
+
+```sh
+xcrun notarytool store-credentials squelch-notary \
+  --apple-id <your apple id> --team-id <your team id>
+```
+
+Override the profile name with `NOTARY_PROFILE=`. Apple's turnaround is typically 2–15 minutes; on rejection the script fetches and prints the reason.
 
 ## Security posture
 
