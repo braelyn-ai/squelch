@@ -532,6 +532,26 @@ final class AppStore {
         {
             return
         }
+        // JOIN an in-flight refresh rather than starting a second one. The TTL
+        // above cannot do this job: `loadedAt` is only stamped when a refresh
+        // COMPLETES, and all five zones plus the dashboard call this from their
+        // own `.task` the moment the sitrep mounts — so on a cold load every one
+        // of them would sail past the TTL check and fire its own copy of all
+        // five requests.
+        if let running = zoneRefresh {
+            await running.value
+            return
+        }
+        let refresh = Task { await performZoneRefresh() }
+        zoneRefresh = refresh
+        await refresh.value
+        zoneRefresh = nil
+    }
+
+    /// In-flight zone refresh, so concurrent callers share one pass.
+    private var zoneRefresh: Task<Void, Never>?
+
+    private func performZoneRefresh() async {
         // Kicked off together: these are five independent endpoints and running
         // them in series made the FIRST paint wait for the sum of them.
         async let calendar = APIClient.shared.getCalendar()
