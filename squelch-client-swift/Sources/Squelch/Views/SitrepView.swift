@@ -53,13 +53,14 @@ struct SitrepView: View {
     /// True only while the cursor is actually over a row.
     @State private var eyesHovering = false
     @State private var eyesExpanded = false
-    @State private var rulesCount: Int?
     /// Hovered newsletter address — `e` while hovering marks that sender's
     /// window done, deferring to the For-your-eyes handler when nothing hovers.
     @State private var hoveredNewsletter: String?
-    /// Fed from HERE rather than by the zone itself — see the note on
-    /// NewslettersZone. This view is always mounted, so its `.task` always runs.
-    @State private var newsletters: [Newsletter] = []
+
+    /// Zone data lives in the STORE, not here — see SitrepZoneCache. Held in
+    /// `@State` it was thrown away every time you navigated off the dashboard,
+    /// so coming back showed empty cards until five round-trips landed.
+    private var rulesCount: Int? { store.zones.rulesCount }
 
     private var ranked: [AttentionUpdate] {
         Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
@@ -70,7 +71,9 @@ struct SitrepView: View {
     private var eyesOverflow: Int { ranked.count - eyesVisible }
 
     var body: some View {
-        VStack(spacing: 0) {
+        @Bindable var store = store
+
+        return VStack(spacing: 0) {
             masthead
             // ONE scroll surface for the dashboard. The GlassEffectContainers
             // live INSIDE, one per column: a container sizes itself to what it
@@ -88,9 +91,9 @@ struct SitrepView: View {
                             if !store.sitrep.standing.isEmpty { forYourEyes }
                             if !store.sitrep.new.isEmpty { attentionZone }
                             NewslettersZone(
-                                newsletters: $newsletters,
+                                newsletters: $store.zones.newsletters,
                                 hovered: $hoveredNewsletter,
-                                reload: { newsletters = await NewsletterFeed.load() })
+                                reload: { await store.refreshZones(force: true) })
                             StatusStrip(rulesCount: rulesCount)
                         }
                         .frame(maxWidth: .infinity, alignment: .top)
@@ -111,14 +114,11 @@ struct SitrepView: View {
         }
         .keyContext(.sitrep)
         .keyBindings(.sitrep, bindings)
-        .task { await loadRulesCount() }
-        .task {
-            newsletters = await NewsletterFeed.load()
-            // Warm every hero BEFORE the zone is scrolled to. Resolving them
-            // lazily meant the decode landed while the scroll was in flight,
-            // which is precisely when the main actor has no time to spare.
-            HeroCache.shared.preload(newsletters.map(\.latestThreadId))
-        }
+        // Renders from whatever the store already holds, then refreshes
+        // underneath — the rows on screen are never cleared first, so a revisit
+        // paints instantly and updates in place. Hero art is warmed by the same
+        // pass (see AppStore.refreshZones).
+        .task { await store.refreshZones() }
         // PRELOAD every For-your-eyes email so opening one is instant. The
         // visible top-10 warm immediately; the collapsed remainder trickles so a
         // long list never stampedes the daemon. Prefetch dedupes in-flight and
@@ -284,7 +284,7 @@ struct SitrepView: View {
             // for-your-eyes done handler below runs instead.
             KeyBinding(declining: "e", "mark done") {
                 if let addr = hoveredNewsletter,
-                    let nl = newsletters.first(where: { $0.address == addr })
+                    let nl = store.zones.newsletters.first(where: { $0.address == addr })
                 {
                     Task { await markNewsletterDone(nl) }
                     return true
@@ -320,7 +320,7 @@ struct SitrepView: View {
 
     private func markNewsletterDone(_ nl: Newsletter) async {
         // Bulk-resolve every aggregated update; one toast, optimistic drop.
-        newsletters.removeAll { $0.address == nl.address }
+        store.zones.newsletters.removeAll { $0.address == nl.address }
         do {
             for item in nl.items { try await APIClient.shared.setStatus(item.id, .done) }
             store.pushToast(
@@ -330,10 +330,6 @@ struct SitrepView: View {
         }
     }
 
-    private func loadRulesCount() async {
-        // Non-fatal: just omit the chip. Never surface the token/url.
-        rulesCount = try? await APIClient.shared.listRules().count
-    }
 }
 
 /// The masthead's freshness stamp, isolated in its own view ON PURPOSE.

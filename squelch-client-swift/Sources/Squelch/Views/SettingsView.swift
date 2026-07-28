@@ -1,8 +1,9 @@
 // SETTINGS — a routed main view (bottom rail group), with a left sub-nav whose
 // last-active section is persisted so reopening restores it.
 //
-//   GENERAL   — connection (server URL + token, "Test & Save" re-validates
-//               against /client/stats and persists), appearance, developer
+//   GENERAL   — connection (server URL + token — clicking away from either
+//               validates the pair against /client/stats and persists it only
+//               if it works; "Test" re-checks on demand), appearance, developer
 //               mode, your display name.
 //   MAIL      — remote images.
 //   TRIAGE    — the pipeline explainer, the daily caps + spend estimator, and
@@ -56,6 +57,15 @@ struct SettingsView: View {
                 }
             }
         }
+        // Esc leaves, like every other routed page. Settings is full of text
+        // fields, and Escape is exempt from the dispatcher's input guard for
+        // exactly this reason — a surface you type on must not become one you
+        // cannot leave. Auth/Rules/Audit get this from RoutedHost; Settings
+        // owns its whole surface, so it registers directly.
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
+        ])
     }
 
     private var nav: some View {
@@ -139,6 +149,161 @@ struct GlassSegmented<T: Hashable>: View {
     }
 }
 
+/// A STORED SECRET: masked at rest, with an eye to reveal it and a pencil to
+/// change it, both parked to the right of the well. Editing prefills the
+/// current value, so fixing one wrong character does not mean re-pasting the
+/// whole key.
+///
+/// The plaintext is pulled through `load` only when the eye or the pencil is
+/// pressed — a secret nobody asked to see never enters view state. With nothing
+/// stored yet (`hasStored == false`) there is nothing to mask, so it is a plain
+/// input and the icons that would unlock it are omitted.
+///
+/// NO SAVE BUTTON, AND NO CANCEL. Clicking away commits through `onCommit`, and
+/// only when the value actually changed. A cancel affordance is impossible to
+/// build honestly against that: pressing it blurs the field, so the save it was
+/// supposed to prevent has already fired.
+///
+/// That is also why an edit in progress is shown in the clear — masking a value
+/// you deliberately opened for editing is theatre when it arrived prefilled,
+/// and it hides where the caret is. FIRST entry still uses a SecureField, where
+/// there is a real shoulder-surfing story and nothing to prefill.
+struct SecretField: View {
+    let label: String
+    let placeholder: String
+    /// Whether a secret is already stored — drives the masked resting state.
+    let hasStored: Bool
+    /// Fetches the plaintext on demand. May prompt (keychain), so it's async.
+    let load: @MainActor () async -> String?
+    /// Persist a CHANGED value. Never called with one that matches storage.
+    let onCommit: @MainActor (String) async -> Void
+    /// The edit buffer. Meaningful to the caller while `editing` is true.
+    @Binding var text: String
+    @Binding var editing: Bool
+
+    @State private var revealed = false
+    @State private var loading = false
+    /// The value as last read from storage — what `text` is diffed against, so
+    /// opening a field and clicking straight back out writes nothing.
+    @State private var baseline = ""
+    @FocusState private var focused: Bool
+
+    /// Nothing stored means nothing to unlock — skip straight to the input.
+    private var inputMode: Bool { editing || !hasStored }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            FieldLabel(label)
+            HStack(spacing: 6) {
+                well
+                controls
+            }
+        }
+    }
+
+    @ViewBuilder private var well: some View {
+        if inputMode {
+            input
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .onSubmit { focused = false }
+                .onChange(of: focused) { _, nowFocused in
+                    if !nowFocused { Task { await commit() } }
+                }
+                .fieldWell()
+        } else {
+            Text(resting)
+                .font(revealed ? Typo.mono(12) : Font.system(size: 13))
+                .foregroundStyle(Palette.inkDim)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fieldWell()
+        }
+    }
+
+    /// Two branches rather than one field with a toggled mask: swapping
+    /// TextField for SecureField in place destroys and rebuilds it, which drops
+    /// focus — and a dropped focus here means a save. The swap therefore only
+    /// happens across a commit, when focus is going away anyway.
+    @ViewBuilder private var input: some View {
+        if hasStored {
+            TextField(placeholder, text: $text).focused($focused)
+        } else {
+            SecureField(placeholder, text: $text).focused($focused)
+        }
+    }
+
+    private var resting: String {
+        if loading { return "reading keychain…" }
+        if revealed { return text.isEmpty ? "—" : text }
+        return String(repeating: "•", count: 22)
+    }
+
+    @ViewBuilder private var controls: some View {
+        if inputMode {
+            // Nothing to unmask (the text is already legible) — this is just an
+            // explicit "done" that drops focus, which is what saves.
+            icon("checkmark", help: "Done") { focused = false }
+        } else {
+            icon(revealed ? "eye.slash" : "eye", help: revealed ? "Hide" : "Show") {
+                if revealed {
+                    revealed = false
+                } else {
+                    Task {
+                        await pull()
+                        revealed = true
+                    }
+                }
+            }
+            icon("pencil", help: "Edit") {
+                Task {
+                    await pull()
+                    editing = true
+                    // Focus only lands once the field actually exists, which is
+                    // the render pass after `editing` flips.
+                    DispatchQueue.main.async { focused = true }
+                }
+            }
+        }
+    }
+
+    private func icon(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Palette.inkFaint)
+        .help(help)
+        .disabled(loading)
+    }
+
+    /// Populate the buffer — and the diff baseline — from storage.
+    @MainActor private func pull() async {
+        if text.isEmpty, hasStored {
+            loading = true
+            text = await load() ?? ""
+            loading = false
+        }
+        baseline = text
+    }
+
+    /// Blur is the save. Re-masks either way, but only writes on a real change.
+    @MainActor private func commit() async {
+        guard inputMode else { return }
+        let value = text
+        editing = false
+        revealed = false
+        guard value != baseline else { return }
+        baseline = value
+        await onCommit(value)
+    }
+}
+
 /// The small hint line under a control.
 struct SettingsHint: View {
     let text: String
@@ -155,10 +320,13 @@ struct SettingsHint: View {
 /// A key/control row: label on the left, control on the right.
 struct InlineRow<Content: View>: View {
     let key: String
+    /// `.top` for controls taller than one line (a radio group), so the key
+    /// doesn't float against the middle of the stack.
+    var alignment: VerticalAlignment = .center
     @ViewBuilder var content: Content
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(alignment: alignment, spacing: 14) {
             Text(key)
                 .font(Typo.rowSub)
                 .foregroundStyle(Palette.inkDim)
@@ -175,8 +343,10 @@ private struct ConnectionSection: View {
     @Environment(AppStore.self) private var store
     @State private var url = ""
     @State private var token = ""
+    @State private var editingToken = false
     @State private var busy = false
     @State private var result: Result<Void, String>?
+    @FocusState private var urlFocused: Bool
 
     private enum Result<T, E> { case ok, err(E) }
 
@@ -186,15 +356,25 @@ private struct ConnectionSection: View {
                 TextField("http://127.0.0.1:8848", text: $url)
                     .textFieldStyle(.plain)
                     .autocorrectionDisabled()
+                    .focused($urlFocused)
+                    .onSubmit { urlFocused = false }
                     .onChange(of: url) { _, _ in result = nil }
             }
-            Field(label: "api token") {
-                SecureField("SQUELCH_API_TOKEN", text: $token)
-                    .textFieldStyle(.plain)
-                    .onChange(of: token) { _, _ in result = nil }
+            .onChange(of: urlFocused) { _, nowFocused in
+                if !nowFocused { Task { await commitIfChanged() } }
             }
+            SecretField(
+                label: "api token", placeholder: "SQUELCH_API_TOKEN",
+                hasStored: !(store.settings?.apiToken ?? "").isEmpty,
+                load: { store.settings?.apiToken },
+                onCommit: { _ in await commitIfChanged() },
+                text: $token, editing: $editingToken
+            )
+            .onChange(of: token) { _, _ in result = nil }
             HStack(spacing: 10) {
-                Button(busy ? "testing…" : "Test & Save") { Task { await testSave() } }
+                // Not "Save" — clicking away already did that. This is here for
+                // re-checking a connection that worked yesterday.
+                Button(busy ? "testing…" : "Test") { Task { await testSave() } }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.accent)
                     .disabled(busy || url.trimmed.isEmpty || token.trimmed.isEmpty)
@@ -212,13 +392,25 @@ private struct ConnectionSection: View {
                 }
             }
             SettingsHint(
-                "The token lives in your macOS keychain and is sent only as a bearer header — never logged."
+                "Saved when you click away. The token lives in your macOS keychain and is sent only as a bearer header — never logged."
             )
         }
         .onAppear {
             url = store.settings?.serverURL ?? ""
             token = store.settings?.apiToken ?? ""
         }
+    }
+
+    /// Clicking away from either field saves the pair — but only on a real
+    /// change, and only through `revalidate`, which proves the credentials
+    /// against /client/stats BEFORE it writes them. A fat-fingered paste is
+    /// reported and discarded rather than persisted, so blur-to-save can never
+    /// strand you at the connect gate with a token that doesn't work.
+    private func commitIfChanged() async {
+        let (u, t) = (url.trimmed, token.trimmed)
+        guard !u.isEmpty, !t.isEmpty else { return }
+        guard u != store.settings?.serverURL || t != store.settings?.apiToken else { return }
+        await testSave()
     }
 
     private func testSave() async {
@@ -237,10 +429,18 @@ private struct AppearanceSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SettingsSectionCard(label: "Appearance") {
-            InlineRow(key: "theme") {
-                GlassSegmented(
-                    options: ThemeChoice.allCases.map { ($0, $0.label) },
-                    selection: $prefs.theme)
+            InlineRow(key: "theme", alignment: .top) {
+                // Three-state, so a Toggle can't hold it. A .segmented Picker
+                // is native too, but macOS 26 draws segmented controls in glass
+                // — which made it indistinguishable from the hand-rolled
+                // GlassSegmented it replaced. Radios read as stock AppKit.
+                Picker("theme", selection: $prefs.theme) {
+                    ForEach(ThemeChoice.allCases, id: \.self) { choice in
+                        Text(choice.label).tag(choice)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
             }
             SettingsHint("Auto follows the system appearance. \\ flips light/dark from anywhere.")
         }
@@ -258,8 +458,10 @@ private struct DeveloperSection: View {
         @Bindable var prefs = prefs
         SettingsSectionCard(label: "Developer") {
             InlineRow(key: "dev mode") {
-                GlassSegmented(
-                    options: [(false, "Off"), (true, "On")], selection: $prefs.developerMode)
+                Toggle("dev mode", isOn: $prefs.developerMode)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .tint(Palette.accent)
             }
             SettingsHint(
                 "Adds re-triage buttons (sitrep masthead + open email) that re-run the triage pipeline. Re-triaging spends model budget."
@@ -663,13 +865,18 @@ private struct RankingSection: View {
 
 /// The BYOK "ask your inbox" (⌘K) settings: paste your OWN Anthropic key
 /// (stored in the OS keychain, never sent to the squelch server) and pick the
-/// model. The key is WRITE-ONLY from this view's perspective: it can see
-/// whether one is set and which provider it routes to, never the value.
+/// model.
+///
+/// The key rests MASKED and is read back out of the keychain only when Show or
+/// Edit is pressed — see `AssistantKeyStore.revealAsync`, the one sanctioned
+/// way for a view to hold this secret. The request path still never surfaces
+/// it: `LLMProxy` reads the keychain itself.
 private struct AssistantSection: View {
     @Environment(Prefs.self) private var prefs
 
     @State private var status = AssistantKeyStatus.absent
     @State private var keyInput = ""
+    @State private var editingKey = false
     @State private var busy = false
     @State private var note: Note?
 
@@ -681,18 +888,18 @@ private struct AssistantSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SettingsSectionCard(label: "Assistant") {
-            Field(label: "api key (yours)") {
-                SecureField(
-                    status.present ? "•••••• set — paste to replace" : "sk-ant-…", text: $keyInput
-                )
-                .textFieldStyle(.plain)
-                .onChange(of: keyInput) { _, _ in note = nil }
-            }
+            SecretField(
+                label: "api key (yours)", placeholder: "sk-ant-…",
+                hasStored: status.present,
+                load: { await AssistantKeyStore.revealAsync() },
+                onCommit: { await saveKey($0) },
+                text: $keyInput, editing: $editingKey
+            )
+            .onChange(of: keyInput) { _, _ in note = nil }
             HStack(spacing: 10) {
-                Button(busy ? "saving…" : "Save key") { Task { await saveKey() } }
-                    .buttonStyle(.glassProminent)
-                    .tint(Palette.accent)
-                    .disabled(busy || keyInput.trimmed.isEmpty)
+                if busy {
+                    Text("saving…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                }
                 if status.present {
                     HStack(spacing: 5) {
                         Circle().fill(Palette.positive).frame(width: 6, height: 6)
@@ -717,7 +924,7 @@ private struct AssistantSection: View {
                 }
             }
             SettingsHint(
-                "Your key stays on this machine (macOS keychain) and is used only for the ⌘K assistant — never sent to the squelch server."
+                "Saved when you click away. Your key stays on this machine (macOS keychain) and is used only for the ⌘K assistant — never sent to the squelch server."
             )
 
             InlineRow(key: "model") {
@@ -730,12 +937,18 @@ private struct AssistantSection: View {
         .task { status = await AssistantKeyStore.statusAsync() }
     }
 
-    private func saveKey() async {
+    /// Called by the field on blur, with the value it holds. Clearing `keyInput`
+    /// afterwards keeps the plaintext out of view state once it is safely in the
+    /// keychain — the next Show or Edit reads it back.
+    private func saveKey(_ value: String) async {
+        let key = value.trimmed
+        guard !key.isEmpty else { return }
         busy = true
         note = nil
         do {
-            try AssistantKeyStore.set(keyInput.trimmed)
+            try AssistantKeyStore.set(key)
             keyInput = ""
+            editingKey = false
             status = await AssistantKeyStore.statusAsync()
             note = .ok("key saved")
         } catch {
@@ -748,6 +961,8 @@ private struct AssistantSection: View {
         busy = true
         note = nil
         try? AssistantKeyStore.clear()
+        keyInput = ""
+        editingKey = false
         status = await AssistantKeyStore.statusAsync()
         note = .ok("key forgotten")
         busy = false

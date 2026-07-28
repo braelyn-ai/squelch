@@ -18,6 +18,7 @@
 import SwiftUI
 
 struct UsageView: View {
+    @Environment(AppStore.self) private var store
     @State private var usage: UsageResponse?
     @State private var error: String?
     @State private var loading = true
@@ -99,6 +100,12 @@ struct UsageView: View {
             }
         }
         .task { await load() }
+        // Esc leaves, same as Settings and the RoutedHost pages. Usage had the
+        // identical gap: a full routed page with no way out but the rail.
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
+        ])
     }
 
     private func load() async {

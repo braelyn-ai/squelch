@@ -83,6 +83,13 @@ final class SitrepPoller {
             if store.selectedId == nil, let first = store.orderedIds.first {
                 store.selectedId = first
             }
+
+            // Keep the dashboard's ZONES warm from here too, not just from the
+            // view. The bands above are only half the sitrep; if the zones only
+            // loaded when SitrepView mounted, the FIRST visit of a session still
+            // paid for five round-trips. Its own TTL makes this a no-op most
+            // polls (see AppStore.refreshZones), so the cost is one date compare.
+            await store.refreshZones()
         } catch {
             // Keep the kind so the UI can say "daemon unreachable" vs "token
             // rejected" instead of one undifferentiated failure.

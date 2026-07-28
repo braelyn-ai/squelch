@@ -91,6 +91,30 @@ enum SideView: Equatable, Sendable {
 /// and two numbers drifting apart would leave a seam or a covered strip.
 let sidePanelWidth: CGFloat = 460
 
+/// EVERYTHING THE SITREP'S ZONES RENDER, held in the store rather than in the
+/// zones themselves.
+///
+/// A zone that owns its rows in `@State` throws them away the moment you
+/// navigate off the dashboard and re-fetches on the way back — so every visit
+/// showed empty cards until four or five round-trips landed. Held here, the
+/// last good answer is already on screen when the view mounts and the refresh
+/// happens UNDERNEATH it: rows are only ever replaced by newer rows, never
+/// cleared first, so there is no flash and no empty state on a revisit.
+///
+/// `loadedAt` is what keeps that honest in the other direction — see
+/// `AppStore.refreshZones`, which skips a refetch that just happened so
+/// bouncing between views cannot turn into a request storm.
+struct SitrepZoneCache: Sendable {
+    var calendar: [CalendarUpdate] = []
+    var shipments: [Shipment] = []
+    var banking: [BankingRecord] = []
+    var receipts: [Receipt] = []
+    var newsletters: [Newsletter] = []
+    var rulesCount: Int?
+    /// When the last full refresh COMPLETED. nil = never loaded.
+    var loadedAt: Date?
+}
+
 /// The search panel's state, held OUT of the panel. SwiftUI throws away a view's
 /// `@State` the instant it unmounts, so parking the query and results here is
 /// what makes `/` a RESUMABLE surface: close it, read a thread, reopen — same
@@ -262,6 +286,9 @@ final class AppStore {
 
     // MARK: selection slice — stable by message id
     var selectedId: Int?
+
+    // MARK: sitrep zones — see SitrepZoneCache
+    var zones = SitrepZoneCache()
 
     // MARK: surfaces
     var sideView: SideView = .none
@@ -488,6 +515,67 @@ final class AppStore {
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen || compose != nil
             || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
+    }
+
+    // MARK: - sitrep zones
+
+    /// Refresh every zone CONCURRENTLY, replacing rows only once new ones
+    /// arrive. Skips entirely if the last refresh is still fresh, so navigating
+    /// back to the dashboard costs nothing — that is what makes the sitrep load
+    /// instantly on a revisit instead of re-fetching five endpoints.
+    ///
+    /// Pass `force` for the deliberate cases (an explicit sync, a rule save)
+    /// where the caller knows the cache is stale regardless of its age.
+    func refreshZones(force: Bool = false) async {
+        if !force, let loadedAt = zones.loadedAt,
+            Date().timeIntervalSince(loadedAt) < Self.zoneTTL
+        {
+            return
+        }
+        // Kicked off together: these are five independent endpoints and running
+        // them in series made the FIRST paint wait for the sum of them.
+        async let calendar = APIClient.shared.getCalendar()
+        async let shipments = APIClient.shared.getShipments(includeDelivered: true)
+        async let banking = APIClient.shared.getBanking()
+        async let receipts = APIClient.shared.getReceipts()
+        async let rules = APIClient.shared.listRules()
+        let newsletters = await NewsletterFeed.load()
+
+        // Each lands on its own: one failing endpoint leaves the OTHER four
+        // zones showing their last good rows rather than blanking the column.
+        if let rows = try? await calendar { zones.calendar = rows }
+        if let rows = try? await shipments { zones.shipments = rows }
+        if let rows = try? await banking { zones.banking = rows }
+        if let rows = try? await receipts { zones.receipts = rows }
+        if let rows = try? await rules { zones.rulesCount = rows.count }
+        if !newsletters.isEmpty || zones.newsletters.isEmpty {
+            zones.newsletters = newsletters
+        }
+        zones.loadedAt = Date()
+
+        HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))
+        warmZoneThreads()
+    }
+
+    /// How long a zone refresh stays good. Long enough that flipping between
+    /// views is free, short enough that a dashboard left open still tracks the
+    /// mail — the 10s sitrep poll drives the bands, which is what actually
+    /// changes minute to minute.
+    private static let zoneTTL: TimeInterval = 45
+
+    /// Preload the emails behind the records the columns show, so clicking one
+    /// opens instantly. Same intent as the sitrep's own row prefetch.
+    private func warmZoneThreads() {
+        ThreadPrefetch.shared.warm(zones.banking.prefix(6).compactMap(\.thread_id), immediate: 2)
+        // Receipts rotate at local midnight, so match the cache TTL to that.
+        let midnight =
+            Calendar.current.nextDate(
+                after: Date(), matching: DateComponents(hour: 0, minute: 0),
+                matchingPolicy: .nextTime) ?? Date().addingTimeInterval(3600)
+        let ttl = max(60, midnight.timeIntervalSinceNow)
+        for id in zones.receipts.compactMap(\.thread_id) {
+            ThreadPrefetch.shared.prefetch(id, fresh: ttl)
+        }
     }
 
     func openSide(_ view: SideView) { sideView = view }

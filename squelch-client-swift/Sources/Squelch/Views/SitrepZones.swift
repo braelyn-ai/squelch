@@ -19,7 +19,7 @@ import SwiftUI
 /// not an agenda; cancellations strike through.
 struct CalendarZone: View {
     @Environment(AppStore.self) private var store
-    @State private var rows: [CalendarUpdate] = []
+    private var rows: [CalendarUpdate] { store.zones.calendar }
 
     var body: some View {
         ZoneCard(
@@ -56,7 +56,7 @@ struct CalendarZone: View {
                 }
             }
         }
-        .task { rows = (try? await APIClient.shared.getCalendar()) ?? [] }
+        .task { await store.refreshZones() }
     }
 
     private func tagTone(_ kind: CalendarKind) -> Color {
@@ -76,7 +76,8 @@ struct CalendarZone: View {
 /// active OR it was delivered TODAY. Yesterday's-and-older deliveries drop out.
 /// View-only by design: no j/k, but each card's Track button is real.
 struct ShipmentsZone: View {
-    @State private var shipments: [Shipment] = []
+    @Environment(AppStore.self) private var store
+    private var shipments: [Shipment] { store.zones.shipments }
 
     private var rows: [Shipment] {
         shipments.filter { $0.status != .delivered || Fmt.isToday($0.last_update) }
@@ -94,7 +95,7 @@ struct ShipmentsZone: View {
                 }
             }
         }
-        .task { shipments = (try? await APIClient.shared.getShipments(includeDelivered: true)) ?? [] }
+        .task { await store.refreshZones() }
     }
 }
 
@@ -199,7 +200,7 @@ private struct CarrierBadge: View {
 /// statement's amount is the TOTAL balance the extractor pulled).
 struct BankingZone: View {
     @Environment(AppStore.self) private var store
-    @State private var records: [BankingRecord] = []
+    private var records: [BankingRecord] { store.zones.banking }
 
     /// How many the rail shows. Statements are ~monthly, so a short recency
     /// list beats a today-only filter that would sit empty.
@@ -240,7 +241,7 @@ struct BankingZone: View {
                 }
             }
         }
-        .task { await load() }
+        .task { await store.refreshZones() }
     }
 
     private func institutionLabel(_ r: BankingRecord) -> String {
@@ -258,14 +259,6 @@ struct BankingZone: View {
             store.viewInEmails(r.message_id)
         }
     }
-
-    private func load() async {
-        records = (try? await APIClient.shared.getBanking()) ?? []
-        // Preload the shown records' emails; they live in the column until
-        // newer records rotate them out, so cache for a day.
-        ThreadPrefetch.shared.warm(
-            records.prefix(Self.shown).compactMap(\.thread_id), immediate: 2)
-    }
 }
 
 // MARK: - receipts
@@ -275,7 +268,7 @@ struct BankingZone: View {
 /// receipt you'd glance at and file.
 struct ReceiptsZone: View {
     @Environment(AppStore.self) private var store
-    @State private var receipts: [Receipt] = []
+    private var receipts: [Receipt] { store.zones.receipts }
 
     private var rows: [Receipt] { receipts.filter { Fmt.isToday($0.received_at) } }
 
@@ -313,7 +306,7 @@ struct ReceiptsZone: View {
                 }
             }
         }
-        .task { await load() }
+        .task { await store.refreshZones() }
     }
 
     private func open(_ r: Receipt) {
@@ -324,18 +317,6 @@ struct ReceiptsZone: View {
         }
     }
 
-    private func load() async {
-        receipts = (try? await APIClient.shared.getReceipts()) ?? []
-        // The column drops these at local midnight, so match the cache TTL.
-        let midnight =
-            Calendar.current.nextDate(
-                after: Date(), matching: DateComponents(hour: 0, minute: 0),
-                matchingPolicy: .nextTime) ?? Date().addingTimeInterval(3600)
-        let ttl = max(60, midnight.timeIntervalSinceNow)
-        for id in rows.compactMap(\.thread_id) {
-            ThreadPrefetch.shared.prefetch(id, fresh: ttl)
-        }
-    }
 }
 
 // MARK: - newsletters
