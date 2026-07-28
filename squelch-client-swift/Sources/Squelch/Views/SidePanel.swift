@@ -10,13 +10,15 @@
 // permanently gating out the entire "list" keymap and leaving Escape as the
 // only working key — the exact bug the desktop client's header warns about.
 //
-// The thread drill-in is NOT a side view: it's the fullscreen viewer, layered
-// ABOVE this panel, so opening a thread from search keeps the results mounted
-// underneath and Esc returns to them.
+// The thread drill-in is NOT a side view: it's the viewer, layered ABOVE this
+// panel and INSET by `sidePanelWidth` while a panel is open, so opening a hit
+// from search leaves the results sitting right there beside the email instead of
+// swallowing them. Esc closes the reader; a second Esc closes the panel.
 //
 // Ported from squelch-desktop/src/views/SideViews.tsx and
 // src/components/{SearchView,BrowseView}.tsx.
 
+import AppKit
 import SwiftUI
 
 struct SidePanel: View {
@@ -44,14 +46,14 @@ struct SidePanel: View {
 
                 Group {
                     switch store.sideView {
-                    case .search(let query): SearchView(initialQuery: query)
+                    case .search: SearchView()
                     case .browse: BrowseView()
                     case .none: EmptyView()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            .frame(width: 460)
+            .frame(width: sidePanelWidth)
             .frame(maxHeight: .infinity)
             .squelchGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.24), radius: 40, x: -14)
@@ -66,28 +68,22 @@ struct SidePanel: View {
 // MARK: - search
 
 /// Search side view. Debounced to GET /client/search; results with j/k
-/// selection; Enter opens the selected hit fullscreen (the viewer layers above
-/// this panel, which stays mounted underneath).
+/// selection; click or Enter opens a hit in the reader beside these results.
+///
+/// EVERY piece of durable state lives in `store.search`, not here — see
+/// SearchSession. This view owns only `loading`, which is transient by
+/// definition: an in-flight request dies with the panel anyway.
 struct SearchView: View {
-    let initialQuery: String
-
     @Environment(AppStore.self) private var store
-    @State private var query: String
-    @State private var hits: [SearchHit] = []
-    @State private var error: String?
     @State private var loading = false
-    @State private var index = 0
     @FocusState private var focused: Bool
 
-    init(initialQuery: String) {
-        self.initialQuery = initialQuery
-        _query = State(initialValue: initialQuery)
-    }
-
     var body: some View {
+        @Bindable var store = store
+
         VStack(alignment: .leading, spacing: 0) {
             Field(label: "") {
-                TextField("search mail…", text: $query)
+                TextField("search mail…", text: $store.search.query)
                     .textFieldStyle(.plain)
                     .focused($focused)
             }
@@ -96,16 +92,22 @@ struct SearchView: View {
             .padding(.bottom, 8)
 
             if loading { BandNote("searching…") }
-            if let error { BandNote(error) }
-            if !loading && error == nil && !query.trimmed.isEmpty && hits.isEmpty {
+            if let error = store.search.error { BandNote(error) }
+            if !loading && store.search.error == nil && !store.search.query.trimmed.isEmpty
+                && store.search.hits.isEmpty
+            {
                 BandNote("no matches.")
             }
 
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 6) {
-                        ForEach(Array(hits.enumerated()), id: \.element.id) { i, hit in
-                            HitRow(hit: hit, selected: i == index, onSelect: { index = i }) {
+                        ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
+                            // ONE click opens. The reader sits beside this list,
+                            // so opening a hit costs nothing and the double-click
+                            // this used to require was pure undiscoverable tax.
+                            HitRow(hit: hit, selected: i == store.search.index) {
+                                store.search.index = i
                                 store.openThread(hit.thread_id)
                             }
                             .id(hit.id)
@@ -114,55 +116,82 @@ struct SearchView: View {
                     .padding(.horizontal, 14)
                     .padding(.bottom, 14)
                 }
-                .onChange(of: index) { _, i in
-                    guard let hit = hits[safe: i] else { return }
+                .onChange(of: store.search.index) { _, i in
+                    guard let hit = store.search.hits[safe: i] else { return }
                     withAnimation(.easeOut(duration: 0.12)) {
                         proxy.scrollTo(hit.id, anchor: .center)
                     }
+                }
+                // Reopening restores the selection, so restore the scroll to
+                // match — a preserved index you have to hunt for isn't preserved.
+                .onAppear {
+                    guard let hit = store.search.hits[safe: store.search.index] else { return }
+                    Task { @MainActor in proxy.scrollTo(hit.id, anchor: .center) }
                 }
             }
         }
         .keyBindings(.modal, bindings)
         .onAppear { focused = true }
-        .task(id: query) { await runSearch() }
+        // The remembered query lands SELECTED, so `/` serves both callers:
+        // arrow straight down into the old results, or just type to replace it.
+        .onChange(of: focused) { _, on in
+            guard on, !store.search.query.isEmpty else { return }
+            Task { @MainActor in
+                NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+            }
+        }
+        .task(id: store.search.query) { await runSearch() }
     }
 
     private var bindings: [KeyBinding] {
         [
-            KeyBinding("ArrowDown", "next hit", allowInInput: true) {
-                index = min(hits.count - 1, index + 1)
-            },
-            KeyBinding("ArrowUp", "prev hit", allowInInput: true) {
-                index = max(0, index - 1)
-            },
-            KeyBinding("Enter", "open thread", allowInInput: true) {
-                if let hit = hits[safe: index] { store.openThread(hit.thread_id) }
-            },
+            KeyBinding("ArrowDown", "next hit", allowInInput: true) { move(1) },
+            KeyBinding("ArrowUp", "prev hit", allowInInput: true) { move(-1) },
+            KeyBinding("Enter", "open thread", allowInInput: true) { open() },
             // j/k also work when focus is not in the input.
-            KeyBinding("j", "next hit") { index = min(hits.count - 1, index + 1) },
-            KeyBinding("k", "prev hit") { index = max(0, index - 1) },
+            KeyBinding("j", "next hit") { move(1) },
+            KeyBinding("k", "prev hit") { move(-1) },
         ]
     }
 
+    private func move(_ delta: Int) {
+        store.search.index = max(
+            0, min(store.search.hits.count - 1, store.search.index + delta))
+    }
+
+    private func open() {
+        if let hit = store.search.hits[safe: store.search.index] {
+            store.openThread(hit.thread_id)
+        }
+    }
+
     private func runSearch() async {
-        let term = query.trimmed
+        let term = store.search.query.trimmed
         guard !term.isEmpty else {
-            hits = []
-            error = nil
+            store.search.hits = []
+            store.search.error = nil
+            store.search.fetchedQuery = nil
             loading = false
             return
         }
+        // Already holding this term's results: show them. This is the whole
+        // point of the hoisted session — reopening must not re-fetch and flash.
+        guard term != store.search.fetchedQuery else { return }
         loading = true
         // Debounce: a fresh keystroke cancels this task before the request.
         try? await Task.sleep(for: .milliseconds(220))
         guard !Task.isCancelled else { return }
         do {
             let page = try await APIClient.shared.search(term, limit: 50)
-            hits = page.items
-            index = 0
-            error = nil
+            store.search.hits = page.items
+            store.search.index = 0
+            store.search.error = nil
+            store.search.fetchedQuery = term
         } catch {
-            self.error = errText(error, "search failed")
+            store.search.error = errText(error, "search failed")
+            // Leave `fetchedQuery` nil so reopening RETRIES rather than
+            // resurrecting a stale error over stale hits.
+            store.search.fetchedQuery = nil
         }
         loading = false
     }
@@ -171,11 +200,10 @@ struct SearchView: View {
 private struct HitRow: View {
     let hit: SearchHit
     let selected: Bool
-    let onSelect: () -> Void
     let onOpen: () -> Void
 
     var body: some View {
-        Button(action: onSelect) {
+        Button(action: onOpen) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(hit.from_name ?? hit.from_addr)
@@ -206,7 +234,6 @@ private struct HitRow: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(selected ? Palette.accentSoft : Palette.hairline.opacity(0.35))
         )
-        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen() })
     }
 }
 
@@ -257,7 +284,6 @@ struct BrowseView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        GlassEffectContainer(spacing: 2) {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
                                 BrowseRow(
@@ -267,7 +293,6 @@ struct BrowseView: View {
                                 }
                                 .id(u.id)
                             }
-                        }
                         }
                         .padding(.horizontal, 12)
                         .padding(.bottom, 14)
@@ -332,7 +357,7 @@ private struct BrowseRow: View {
                     .font(Typo.num(11, weight: .semibold))
                     .foregroundStyle(Palette.importanceColor(update.importance))
                     .frame(width: 24, alignment: .trailing)
-                Text(SenderID.displayName(update.sender))
+                Text(SenderCache.resolved(update.sender).displayName)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)

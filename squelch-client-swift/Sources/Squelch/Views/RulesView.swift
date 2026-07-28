@@ -53,7 +53,6 @@ struct RulesView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        GlassEffectContainer(spacing: 2) {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(rules.enumerated()), id: \.element.id) { i, rule in
                                 RuleRow(
@@ -64,7 +63,6 @@ struct RulesView: View {
                                     onEdit: { edit(rule) })
                                 .id(rule.id)
                             }
-                        }
                         }
                         .padding(.horizontal, 18)
                         .padding(.vertical, 10)

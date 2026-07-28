@@ -69,9 +69,14 @@ final class SitrepPoller {
             async let sealed = APIClient.shared.listSealed()
 
             let (s, f, o, st, sl) = try await (standing, fresh, open, stats, sealed)
-            store.sitrep = SitrepData(
+            let next = SitrepData(
                 standing: s.items, new: f.items, open: o.items, stats: st, sealed: sl)
-            store.refreshError = nil
+            // ASSIGN ONLY ON CHANGE. @Observable notifies on assignment, not on
+            // value difference, so writing an identical read model every 10s
+            // invalidated every view reading it and re-laid out the whole
+            // dashboard — for nothing. Most polls return identical data.
+            if next != store.sitrep { store.sitrep = next }
+            if store.refreshError != nil { store.refreshError = nil }
             store.lastRefresh = Date()
 
             // Keep a valid selection: if nothing selected, land on the first row.

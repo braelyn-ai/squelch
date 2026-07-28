@@ -23,8 +23,36 @@ enum Fmt {
         return f
     }()
 
+    /// Parsed timestamps, memoized. Every visible row asks for a relative age
+    /// and a deadline chip on every render, and RFC3339 parsing is not cheap —
+    /// uncached it was a measurable share of each frame in a long list.
+    nonisolated(unsafe) private static var dateCache: [String: Date?] = [:]
+    private static let dateCacheLock = NSLock()
+    private static let dateCacheCap = 4000
+
     static func date(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
+        dateCacheLock.lock()
+        if let hit = dateCache[iso] {
+            dateCacheLock.unlock()
+            return hit
+        }
+        dateCacheLock.unlock()
+
+        let parsed = parseISO(iso)
+
+        dateCacheLock.lock()
+        if dateCache.count >= dateCacheCap { dateCache.removeAll(keepingCapacity: true) }
+        dateCache[iso] = parsed
+        dateCacheLock.unlock()
+        return parsed
+    }
+
+    private static func parseISO(_ iso: String) -> Date? {
+        dateCacheLock.lock()
+        defer { dateCacheLock.unlock() }
+        // The formatters are not thread-safe for concurrent use; the lock that
+        // guards the cache guards them too.
         if let d = isoFractional.date(from: iso) { return d }
         if let d = isoPlain.date(from: iso) { return d }
         // Bare "YYYY-MM-DD" (marketing expires_at).
@@ -185,5 +213,47 @@ enum Fmt {
     /// Today's date, "Mon, Jul 27" — the sitrep masthead stamp.
     static func todayStamp(now: Date = Date()) -> String {
         now.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+    }
+}
+
+/// Pulls the first "$1,234.56"-shaped run out of a one-liner.
+///
+/// Hand-rolled and memoized on purpose: the sitrep evaluates this for every
+/// visible row on every render, and a `Regex` there was costing frames.
+@MainActor
+enum MoneyScan {
+    private static var cache: [String: String?] = [:]
+    private static let cap = 2000
+
+    static func amount(in text: String) -> String? {
+        if let hit = cache[text] { return hit }
+        let value = scan(text)
+        if cache.count >= cap { cache.removeAll(keepingCapacity: true) }
+        cache[text] = value
+        return value
+    }
+
+    private static func scan(_ text: String) -> String? {
+        let chars = Array(text)
+        var i = 0
+        while i < chars.count {
+            guard chars[i] == "$" else {
+                i += 1
+                continue
+            }
+            var j = i + 1
+            // Tolerate one space after the sigil ("$ 142.00").
+            if j < chars.count, chars[j] == " " { j += 1 }
+            var digits = ""
+            while j < chars.count, chars[j].isNumber || chars[j] == "," || chars[j] == "." {
+                digits.append(chars[j])
+                j += 1
+            }
+            // Trim a trailing separator so "$5." reads as "$5".
+            while digits.hasSuffix(".") || digits.hasSuffix(",") { digits.removeLast() }
+            if digits.contains(where: \.isNumber) { return "$" + digits }
+            i = j + 1
+        }
+        return nil
     }
 }

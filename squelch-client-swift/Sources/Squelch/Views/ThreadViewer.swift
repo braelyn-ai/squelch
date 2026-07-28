@@ -50,7 +50,7 @@ struct ThreadViewer: View {
     private var newestSender: String? {
         newest.map { $0.from_addr.trimmingCharacters(in: .whitespaces).lowercased() }
     }
-    private var senderName: String { newest.map { SenderID.displayName($0.senderString) } ?? "" }
+    private var senderName: String { newest.map { SenderCache.resolved($0.senderString).displayName } ?? "" }
 
     var body: some View {
         ZStack {
@@ -356,7 +356,7 @@ private struct MessageCard: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
                 Avatar(sender: message.senderString, size: 24)
-                Text(SenderID.displayName(message.senderString))
+                Text(SenderCache.resolved(message.senderString).displayName)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Palette.ink)
                 Spacer(minLength: 8)

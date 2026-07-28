@@ -44,7 +44,7 @@ struct UpdateRow: View {
 
                 Avatar(sender: update.sender, size: 20)
 
-                Text(SenderID.displayName(update.sender))
+                Text(SenderCache.resolved(update.sender).displayName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)

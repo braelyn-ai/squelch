@@ -41,19 +41,15 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         }
     }
 
-    /// Rail glyph. These are the FILLED SF Symbol variants on purpose — filled
-    /// is the iOS tab-bar convention, and it reads better than hairline outlines
-    /// at rail size over a translucent, wallpaper-dependent backdrop (a 1pt
-    /// stroke competes with whatever is showing through; a solid shape doesn't).
     var symbol: String {
         switch self {
-        case .sitrep: "square.grid.2x2.fill"
-        case .emails: "envelope.fill"
-        case .auth: "key.fill"
-        case .rules: "line.3.horizontal.decrease.circle.fill"
-        case .audit: "list.bullet.rectangle.fill"
-        case .usage: "chart.bar.fill"
-        case .settings: "gearshape.fill"
+        case .sitrep: "gauge.with.dots.needle.33percent"
+        case .emails: "envelope"
+        case .auth: "key"
+        case .rules: "slider.horizontal.3"
+        case .audit: "scroll"
+        case .usage: "waveform.path.ecg"
+        case .settings: "gearshape"
         }
     }
 }
@@ -77,7 +73,7 @@ let historyCap = 50
 enum SideView: Equatable, Sendable {
     case none
     case browse
-    case search(query: String)
+    case search
 
     var isOpen: Bool { self != .none }
 
@@ -88,6 +84,27 @@ enum SideView: Equatable, Sendable {
         case .none: ""
         }
     }
+}
+
+/// How wide the right-hand panel is. ONE definition: the thread viewer insets
+/// itself by exactly this much so an open panel stays visible beside the reader,
+/// and two numbers drifting apart would leave a seam or a covered strip.
+let sidePanelWidth: CGFloat = 460
+
+/// The search panel's state, held OUT of the panel. SwiftUI throws away a view's
+/// `@State` the instant it unmounts, so parking the query and results here is
+/// what makes `/` a RESUMABLE surface: close it, read a thread, reopen — same
+/// query, same hits, same selection, no refetch and no empty flash.
+struct SearchSession: Sendable, Equatable {
+    var query = ""
+    var hits: [SearchHit] = []
+    var index = 0
+    var error: String?
+    /// The term `hits` actually came from. Reopening on an unchanged query skips
+    /// the round-trip entirely rather than flashing "searching…" over results
+    /// that are already correct. nil = whatever is on screen is not authoritative
+    /// (never fetched, or the last fetch failed), so reopening retries.
+    var fetchedQuery: String?
 }
 
 // MARK: - connection
@@ -248,6 +265,8 @@ final class AppStore {
 
     // MARK: surfaces
     var sideView: SideView = .none
+    /// Survives the search panel closing — see SearchSession.
+    var search = SearchSession()
     /// The fullscreen email viewer. Orthogonal to sideView (it layers above),
     /// so closing the viewer restores whatever was underneath.
     var threadId: String?
@@ -459,8 +478,30 @@ final class AppStore {
         threadQueue = []
     }
 
+    /// True while a modal owns the screen. The surfaces UNDER it get blurred so
+    /// the modal reads as FOCUS rather than as a new page — the board stays
+    /// visible, just out of focus.
+    ///
+    /// Toasts are deliberately absent: a toast is not a modal and must never
+    /// defocus the app you are working in. So are the side panels and the thread
+    /// viewer, which are surfaces you interact with, not overlays on one.
+    var modalOverlayOpen: Bool {
+        askBarOpen || shortcutsOpen || processModeOpen || compose != nil
+            || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
+    }
+
     func openSide(_ view: SideView) { sideView = view }
     func closeSide() { sideView = .none }
+
+    /// Open search. By default it RESUMES the last one; pass `seed` to force a
+    /// fresh term (nothing does yet, but a "search this sender" affordance would).
+    func openSearch(seed: String? = nil) {
+        if let seed {
+            search.query = seed
+            search.fetchedQuery = nil
+        }
+        sideView = .search
+    }
 
     func openCompose(_ state: ComposeState) { compose = state }
     func closeCompose() { compose = nil }

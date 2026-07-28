@@ -355,7 +355,7 @@ private struct FocusPanel: View {
             HStack(spacing: 12) {
                 Avatar(sender: meta.sender, size: 42)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(SenderID.displayName(meta.sender))
+                    Text(SenderCache.resolved(meta.sender).displayName)
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(Palette.ink)
                         .help(meta.sender)
@@ -505,7 +505,7 @@ private struct AuthRow: View {
         Button(action: onSelect) {
             HStack(spacing: 9) {
                 Avatar(sender: meta.sender, size: 20)
-                Text(SenderID.displayName(meta.sender))
+                Text(SenderCache.resolved(meta.sender).displayName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)
@@ -557,7 +557,7 @@ private struct DecisionCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
                 Avatar(sender: meta.sender, size: 18)
-                Text(SenderID.displayName(meta.sender))
+                Text(SenderCache.resolved(meta.sender).displayName)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)

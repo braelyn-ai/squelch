@@ -94,8 +94,44 @@ extension View {
     /// demonstration of the real material in a dense list — and it is precisely
     /// what a CSS `background-color` swap cannot do.
     ///
+    /// The active-item material for a small selector (the rail).
+    ///
+    /// Applied to the CONTENT, never as a sibling background: a
+    /// `GlassEffectContainer` deliberately raises its descendants above its
+    /// content view, so glass added behind an icon renders on top of it.
+    @ViewBuilder
+    func glassSelector(
+        _ active: Bool,
+        tint: Color = Palette.accent,
+        cornerRadius: CGFloat = 11,
+        id: String,
+        in namespace: Namespace.ID
+    ) -> some View {
+        if active {
+            self.glassEffect(
+                .regular.tint(tint.opacity(0.26)).interactive(),
+                in: .rect(cornerRadius: cornerRadius, style: .continuous)
+            )
+            .glassEffectID(id, in: namespace)
+        } else {
+            self
+        }
+    }
+
     /// Unselected rows get a cheap hover wash instead: putting glass on 500
     /// simultaneous rows would be both illegible and slow.
+    ///
+    /// COST OF THE BRANCH, and why both lists gate the glass on `kbActive`:
+    /// this is a conditional modifier, so the two branches are separate view
+    /// identities and flipping `selected` re-creates the row's ENTIRE subtree —
+    /// `@State` reset, `.task` re-run, layout rebuilt. Fine a few times per
+    /// keypress; ruinous if it happens twice for every row a mouse crosses,
+    /// which is what made sitrep hover trail the cursor (fixed 2026-07-27).
+    ///
+    /// Moving the glass into a `.background` layer would keep row identity
+    /// stable, and does render correctly on its own — but NOT inside a
+    /// `GlassEffectContainer`, which hoists glass above the container's content
+    /// and so draws the material over the row's own text. Measured, not assumed.
     @ViewBuilder
     func selectionGlass(
         _ selected: Bool,
@@ -158,11 +194,6 @@ struct ZoneCard<Content: View>: View {
             HStack(spacing: 8) {
                 Image(systemName: symbol)
                     .font(.system(size: 12, weight: .semibold))
-                    // Filled, matching the rail — the app should read as one
-                    // icon system. `.fill` degrades to the base symbol for the
-                    // few glyphs that have no filled variant (e.g. calendar),
-                    // so this is safe to apply blanket.
-                    .symbolVariant(.fill)
                     .foregroundStyle(tint ?? Palette.accent)
                 Text(title)
                     .font(Typo.zoneTitle)
@@ -243,9 +274,14 @@ struct OverlayScrim<Content: View>: View {
 
     var body: some View {
         ZStack(alignment: alignment) {
+            // DIM ONLY — the defocus is done by BLURRING THE CONTENT ITSELF
+            // (see MainShell.modalBlur), not by stacking a material here.
+            // A material is not a blur: `.thinMaterial` over the dark board
+            // flattened it into an opaque slab and `.ultraThinMaterial` read as
+            // nothing at all. Neither one keeps the app visible, which is the
+            // whole point — you should still see the board you're asking about.
             Rectangle()
-                .fill(.black.opacity(0.18))
-                .background(.ultraThinMaterial)
+                .fill(.black.opacity(0.14))
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onDismiss)
@@ -292,15 +328,19 @@ struct WindowBackdrop: View {
     var body: some View {
         ZStack {
             VisualEffectBackdrop()
+            // The canvas is BLUE, not neutral — this is the squelch window, and
+            // a grey one reads as any other app. Light mode is a pale sky that
+            // deepens toward the bottom; dark mode is a blue-black rather than
+            // a true black, so the accent still has somewhere to sit.
             LinearGradient(
                 colors: [
-                    Color(light: 0xF7FAFD, dark: 0x0E141E).opacity(0.62),
-                    Color(light: 0xE9F1FB, dark: 0x090E17).opacity(0.68),
+                    Color(light: 0xE6EFFC, dark: 0x0C1420).opacity(0.66),
+                    Color(light: 0xD5E5F8, dark: 0x080E19).opacity(0.72),
                 ],
                 startPoint: .top, endPoint: .bottom)
-            // A whisper of the brand blue across the whole canvas, so even the
-            // empty parts of the window belong to squelch rather than to macOS.
-            Palette.glassTint.opacity(0.35)
+            // The brand wash on top of it, so even the empty parts of the
+            // window belong to squelch rather than to macOS.
+            Palette.glassTint.opacity(0.55)
         }
     }
 }

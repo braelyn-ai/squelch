@@ -85,7 +85,7 @@ struct SquelchCommands: Commands {
         CommandMenu("Inbox") {
             Button("Ask Your Inbox…") { store.askBarOpen = true }
                 .keyboardShortcut("k", modifiers: [.command])
-            Button("Search…") { store.openSide(.search(query: "")) }
+            Button("Search…") { store.openSearch() }
                 .keyboardShortcut("f", modifiers: [.command])
             Divider()
             Button("Check for New Mail") {

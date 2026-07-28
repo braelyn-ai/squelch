@@ -24,11 +24,21 @@ struct Avatar: View {
     @State private var favicon: NSImage?
     @State private var failed = false
 
-    private var domain: String? { SenderID.eligibleFaviconDomain(sender) }
+    private var resolved: SenderID.Resolved { SenderCache.resolved(sender) }
+    private var domain: String? { resolved.faviconDomain }
+
+    /// Prefer this frame's loaded image, but fall back to a SYNCHRONOUS read of
+    /// the in-memory cache. A list row that gets rebuilt — SwiftUI re-creates the
+    /// subtree whenever a selection flip switches which branch of a conditional
+    /// modifier it lives in — loses `@State` and would otherwise flash initials
+    /// for the frame it takes `.task` to hand the same cached image back.
+    private var image: NSImage? {
+        favicon ?? domain.flatMap { FaviconLoader.shared.cached($0) }
+    }
 
     var body: some View {
         Group {
-            if let favicon, !failed {
+            if let favicon = image, !failed {
                 Image(nsImage: favicon)
                     .resizable()
                     .interpolation(.high)
@@ -49,8 +59,9 @@ struct Avatar: View {
     }
 
     private var initialsAvatar: some View {
-        let colors = Palette.avatarColors(for: sender)
-        return Text(SenderID.initials(sender))
+        let r = resolved
+        let colors = Palette.avatarPalette[r.slot % Palette.avatarPalette.count]
+        return Text(r.initials)
             .font(.system(size: size * 0.42, weight: .semibold))
             .foregroundStyle(colors.fg)
             .frame(width: size, height: size)
@@ -91,6 +102,10 @@ final class FaviconLoader {
     }()
 
     private init() {}
+
+    /// Already-loaded image for a domain, with no async hop. Lets a rebuilt
+    /// `Avatar` draw the right thing on its first frame.
+    func cached(_ domain: String) -> NSImage? { images[domain] }
 
     func load(url: URL, domain: String) async -> NSImage? {
         if let cached = images[domain] { return cached }

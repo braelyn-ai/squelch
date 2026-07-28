@@ -47,10 +47,7 @@ struct EmailsView: View {
             header
             ScrollViewReader { proxy in
                 ScrollView {
-                    // One container so the selected row's glass travels within
-                    // the list instead of cross-fading between positions.
-                    GlassEffectContainer(spacing: 2) {
-                        LazyVStack(spacing: 1) {
+                    LazyVStack(spacing: 1) {
                         if let error {
                             BandNote(error)
                         } else if items == nil {
@@ -75,7 +72,6 @@ struct EmailsView: View {
                                 )
                                 .id(u.id)
                             }
-                        }
                         }
                     }
                     .padding(.horizontal, 18)
@@ -211,7 +207,6 @@ struct EmailsView: View {
             KeyBinding("T", "rules") { store.setView(.rules) },
             KeyBinding("A", "audit log") { store.setView(.audit) },
             KeyBinding("g", "auth messages") { store.setView(.auth) },
-            KeyBinding("/", "search") { store.openSide(.search(query: "")) },
             KeyBinding("u", "undo") { Task { await store.fireUndo() } },
             // `\` (theme) and `?` (help) live in the GLOBAL context — see
             // MainShell.globalBindings — so they work from every surface.
@@ -246,7 +241,7 @@ struct EmailsView: View {
             // Done/archived mail leaves the inbox (gmail semantics). This also
             // keeps auto-resolved receipts out — they're records on the sitrep
             // rail, not inbox rows.
-            items =
+            let next =
                 page.items
                 .filter { $0.status != .done }
                 .sorted { a, b in
@@ -254,6 +249,9 @@ struct EmailsView: View {
                     let tb = Self.receivedTS(b)
                     return ta != tb ? ta > tb : a.id > b.id
                 }
+            // Only touch state when the list actually changed — the 10s poll
+            // re-runs this and an identical assignment would re-render 500 rows.
+            if next != items { items = next }
             error = nil
             // PRE-OPEN WARM: pull the head rows' threads before any click, so an
             // open renders from cache.

@@ -15,6 +15,18 @@
 // ranked rows, d/e mark done, Enter opens fullscreen, v corrects a wrong
 // verdict. The global 1..5 nav works here too.
 //
+// SELECTION MODEL — the same one the inbox uses (owner call, 2026-07-24). There
+// is NO persistent selection: the tinted focus glass renders only while the
+// KEYBOARD is driving, and any mouse hover hides it, paints a cheap wash on the
+// hovered row, and re-anchors the cursor so j/k continue from there. Action keys
+// need kbActive OR a live hover, or nothing is highlighted and `e` quietly
+// resolves row 0.
+//
+// This is also why hover does NOT drag the glass: `selectionGlass` is a
+// conditional modifier, so flipping a row between its two branches re-creates
+// that row's whole subtree (state lost, `.task` re-run). Doing that twice per
+// row you cross made a mouse sweep visibly lag the cursor.
+//
 // GLASS: the whole dashboard is one GlassEffectContainer. That is what makes
 // adjacent zones read as a single sheet of material that parts around them
 // rather than four separate panes — and it is precisely the behavior CSS
@@ -35,11 +47,18 @@ struct SitrepView: View {
     // For-your-eyes cursor (j/k), over the VISIBLE rows only — the keyboard
     // never reaches collapsed-away rows.
     @State private var eyesIndex = 0
+    /// True only while the KEYBOARD is driving the cursor — see the selection
+    /// model note in the header.
+    @State private var eyesKbActive = false
+    /// True only while the cursor is actually over a row.
+    @State private var eyesHovering = false
     @State private var eyesExpanded = false
     @State private var rulesCount: Int?
     /// Hovered newsletter address — `e` while hovering marks that sender's
     /// window done, deferring to the For-your-eyes handler when nothing hovers.
     @State private var hoveredNewsletter: String?
+    /// Fed from HERE rather than by the zone itself — see the note on
+    /// NewslettersZone. This view is always mounted, so its `.task` always runs.
     @State private var newsletters: [Newsletter] = []
 
     private var ranked: [AttentionUpdate] {
@@ -65,26 +84,22 @@ struct SitrepView: View {
                         .padding(.horizontal, 4)
 
                     HStack(alignment: .top, spacing: 18) {
-                        GlassEffectContainer(spacing: 16) {
-                            VStack(spacing: 16) {
-                                if !store.sitrep.standing.isEmpty { forYourEyes }
-                                if !store.sitrep.new.isEmpty { attentionZone }
-                                MarketingZone()
-                                NewslettersZone(
-                                    newsletters: $newsletters,
-                                    hovered: $hoveredNewsletter)
-                                StatusStrip(rulesCount: rulesCount)
-                            }
+                        VStack(spacing: 16) {
+                            if !store.sitrep.standing.isEmpty { forYourEyes }
+                            if !store.sitrep.new.isEmpty { attentionZone }
+                            NewslettersZone(
+                                newsletters: $newsletters,
+                                hovered: $hoveredNewsletter,
+                                reload: { newsletters = await NewsletterFeed.load() })
+                            StatusStrip(rulesCount: rulesCount)
                         }
                         .frame(maxWidth: .infinity, alignment: .top)
 
-                        GlassEffectContainer(spacing: 14) {
-                            VStack(spacing: 14) {
-                                CalendarZone()
-                                ShipmentsZone()
-                                BankingZone()
-                                ReceiptsZone()
-                            }
+                        VStack(spacing: 14) {
+                            CalendarZone()
+                            ShipmentsZone()
+                            BankingZone()
+                            ReceiptsZone()
                         }
                         .frame(width: 306)
                     }
@@ -97,6 +112,7 @@ struct SitrepView: View {
         .keyContext(.sitrep)
         .keyBindings(.sitrep, bindings)
         .task { await loadRulesCount() }
+        .task { newsletters = await NewsletterFeed.load() }
         // PRELOAD every For-your-eyes email so opening one is instant. The
         // visible top-10 warm immediately; the collapsed remainder trickles so a
         // long list never stampedes the daemon. Prefetch dedupes in-flight and
@@ -142,9 +158,7 @@ struct SitrepView: View {
             Text(Fmt.todayStamp())
                 .font(Typo.num(11, weight: .medium))
                 .foregroundStyle(Palette.inkFaint)
-            Text(syncLabel)
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaintest)
+            SyncLabel()
         }
         .padding(.horizontal, 24)
         .padding(.top, 16)
@@ -154,11 +168,6 @@ struct SitrepView: View {
     /// Obligations that are overdue or due by end of today — the "need you" set.
     private var needNow: Int { Self.needTodayCount(store.sitrep.standing) }
 
-    private var syncLabel: String {
-        guard let last = store.lastRefresh else { return "syncing…" }
-        let rel = Fmt.relAge(ISO8601DateFormatter().string(from: last))
-        return (rel == "now" || rel.isEmpty) ? "synced just now" : "synced \(rel) ago"
-    }
 
     static func needTodayCount(_ items: [AttentionUpdate], now: Date = Date()) -> Int {
         let endOfDay = Calendar.current.date(
@@ -180,9 +189,13 @@ struct SitrepView: View {
                 ForEach(Array(visibleEyes.enumerated()), id: \.element.id) { i, u in
                     ObligationRow(
                         update: u,
-                        focused: i == eyesIndex,
+                        focused: eyesKbActive && i == eyesIndex,
                         glassNamespace: zoneGlass,
-                        onHover: { eyesIndex = i },
+                        onHover: {
+                            eyesHovering = true
+                            eyesKbActive = false
+                            eyesIndex = i
+                        },
                         onOpen: {
                             eyesIndex = i
                             store.openThread(u.thread_id)
@@ -202,6 +215,12 @@ struct SitrepView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 6)
                 }
+            }
+            // Leaving the zone entirely ends the hover; moving BETWEEN rows keeps
+            // it (the phase stays .active), so a sweep never flickers actionable
+            // off and on.
+            .onContinuousHover { phase in
+                if case .ended = phase { eyesHovering = false }
             }
             }
         }
@@ -240,18 +259,19 @@ struct SitrepView: View {
 
     // MARK: - keymap
 
+    /// Action keys are inert unless something is actually highlighted — either
+    /// the keyboard cursor or a live hover.
+    private var eyesActionable: Bool { eyesKbActive || eyesHovering }
+
     private var bindings: [KeyBinding] {
         [
-            KeyBinding("j", "next item") {
-                eyesIndex = min(visibleEyes.count - 1, eyesIndex + 1)
-            },
-            KeyBinding("k", "prev item") { eyesIndex = max(0, eyesIndex - 1) },
-            KeyBinding("ArrowDown", "next item") {
-                eyesIndex = min(visibleEyes.count - 1, eyesIndex + 1)
-            },
-            KeyBinding("ArrowUp", "prev item") { eyesIndex = max(0, eyesIndex - 1) },
+            KeyBinding("j", "next item") { moveEyes(+1) },
+            KeyBinding("k", "prev item") { moveEyes(-1) },
+            KeyBinding("ArrowDown", "next item") { moveEyes(+1) },
+            KeyBinding("ArrowUp", "prev item") { moveEyes(-1) },
             KeyBinding("d", "mark done") {
-                if let u = visibleEyes[safe: eyesIndex] { Task { await Actions.done(u) } }
+                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
+                Task { await Actions.done(u) }
             },
             // `e` first tries the hovered newsletter card (bulk-resolve that
             // sender's window); with nothing hovered it DECLINES and the
@@ -263,26 +283,33 @@ struct SitrepView: View {
                     Task { await markNewsletterDone(nl) }
                     return true
                 }
-                guard let u = visibleEyes[safe: eyesIndex] else { return false }
+                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return false }
                 Task { await Actions.done(u) }
                 return true
             },
             KeyBinding("Enter", "open email") {
-                if let u = visibleEyes[safe: eyesIndex] { store.openThread(u.thread_id) }
+                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
+                store.openThread(u.thread_id)
             },
             // `v` used to be a second way to open the email, which Enter already
             // does. Repurposed for the triage-fix palette: this is the surface
             // where a wrong verdict is most visible, so it is where correcting
             // it should be cheapest.
             KeyBinding("v", "fix triage") {
-                if let u = visibleEyes[safe: eyesIndex] {
-                    store.openTriageFix(
-                        TriageFixTarget(
-                            messageId: u.id, sender: u.sender, subject: u.one_line,
-                            tier: .some(u.tier.rawValue)))
-                }
+                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
+                store.openTriageFix(
+                    TriageFixTarget(
+                        messageId: u.id, sender: u.sender, subject: u.one_line,
+                        tier: .some(u.tier.rawValue)))
             },
         ]
+    }
+
+    /// j/k hand the cursor back to the keyboard, which is what makes the focus
+    /// glass reappear.
+    private func moveEyes(_ delta: Int) {
+        eyesKbActive = true
+        eyesIndex = max(0, min(visibleEyes.count - 1, eyesIndex + delta))
     }
 
     private func markNewsletterDone(_ nl: Newsletter) async {
@@ -291,7 +318,7 @@ struct SitrepView: View {
         do {
             for item in nl.items { try await APIClient.shared.setStatus(item.id, .done) }
             store.pushToast(
-                "done: \(SenderID.displayName(nl.sender)) (\(nl.items.count))", .info)
+                "done: \(SenderCache.resolved(nl.sender).displayName) (\(nl.items.count))", .info)
         } catch {
             store.pushToast("some marks failed; refresh to re-sync", .error)
         }
@@ -300,6 +327,27 @@ struct SitrepView: View {
     private func loadRulesCount() async {
         // Non-fatal: just omit the chip. Never surface the token/url.
         rulesCount = try? await APIClient.shared.listRules().count
+    }
+}
+
+/// The masthead's freshness stamp, isolated in its own view ON PURPOSE.
+///
+/// `lastRefresh` changes on every 10s poll. Read inline in the dashboard's body
+/// it would invalidate the ENTIRE sitrep — hero, zones, rows, rails — six times
+/// a minute. Scoped here, a poll re-renders one line of text.
+private struct SyncLabel: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Text(label)
+            .font(Typo.micro)
+            .foregroundStyle(Palette.inkFaintest)
+    }
+
+    private var label: String {
+        guard let last = store.lastRefresh else { return "syncing…" }
+        let rel = Fmt.relAge(ISO8601DateFormatter().string(from: last))
+        return (rel == "now" || rel.isEmpty) ? "synced just now" : "synced \(rel) ago"
     }
 }
 
@@ -372,11 +420,15 @@ private struct ObligationRow: View {
     let onHover: () -> Void
     let onOpen: () -> Void
 
+    /// Drives the cheap hover wash. Kept LOCAL on purpose: it is the row's own
+    /// feedback, so it never depends on the dashboard re-rendering.
+    @State private var hovering = false
+
     /// Best-effort money amount pulled from an update's one_line ("$142.00").
-    private var amount: String? {
-        guard let m = update.one_line.firstMatch(of: /\$\s?[\d,]+(?:\.\d{2})?/) else { return nil }
-        return String(m.0).replacingOccurrences(of: " ", with: "")
-    }
+    /// Scanned by hand rather than by regex, and memoized: this is evaluated for
+    /// every visible row on every render, and Swift `Regex` is far too slow to
+    /// sit in that path.
+    private var amount: String? { MoneyScan.amount(in: update.one_line) }
 
     var body: some View {
         let chip = Fmt.deadlineChip(update.deadline)
@@ -387,7 +439,7 @@ private struct ObligationRow: View {
         Button(action: onOpen) {
             HStack(spacing: 9) {
                 Avatar(sender: update.sender, size: 22)
-                Text(SenderID.displayName(update.sender))
+                Text(SenderCache.resolved(update.sender).displayName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)
@@ -430,10 +482,12 @@ private struct ObligationRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // The focused row is glass, tinted by urgency — overdue items carry the
-        // danger tint IN the material rather than as a flat wash on top of it.
+        // The KEYBOARD-focused row is glass, tinted by urgency — overdue items
+        // carry the danger tint IN the material rather than as a flat wash on top
+        // of it. A hovered row gets the wash instead: same branch as a plain row,
+        // so sweeping the mouse only recolors a fill.
         .selectionGlass(
-            focused, tint: overdue ? Palette.danger : Palette.accent,
+            focused, hovering: hovering, tint: overdue ? Palette.danger : Palette.accent,
             id: "eyes-selection", in: glassNamespace)
         .overlay(alignment: .leading) {
             if overdue {
@@ -443,7 +497,10 @@ private struct ObligationRow: View {
                     .padding(.vertical, 5)
             }
         }
-        .onHover { if $0 { onHover() } }
+        .onHover { over in
+            hovering = over
+            if over { onHover() }
+        }
     }
 }
 
@@ -472,14 +529,17 @@ private struct SenderChips: View {
             ForEach(shown) { u in
                 HStack(spacing: 5) {
                     Avatar(sender: u.sender, size: 16)
-                    Text(SenderID.displayName(u.sender))
+                    Text(SenderCache.resolved(u.sender).displayName)
                         .font(Typo.micro)
                         .foregroundStyle(Palette.inkDim)
                         .lineLimit(1)
                 }
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
-                .glassCapsule(interactive: false)
+                // A plain capsule, NOT glass: this row can hold a dozen chips,
+                // and a dozen live glass passes costs real frames while reading
+                // no better than a tinted pill at this size.
+                .background(Capsule().fill(Palette.hairline.opacity(0.7)))
                 .help(u.sender)
             }
             if extra > 0 {

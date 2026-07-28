@@ -58,6 +58,11 @@ struct MainShell: View {
         @Bindable var store = store
 
         ZStack(alignment: .topLeading) {
+            // EVERYTHING A MODAL SITS ON TOP OF, blurred as one layer while a
+            // modal is up. Blurring the content is what keeps the app VISIBLE
+            // behind ⌘K — layout and colour survive a defocus, where a material
+            // scrim just paints over them.
+            ZStack(alignment: .topLeading) {
             HStack(spacing: 0) {
                 SidebarRail(namespace: shellGlass)
                 VStack(spacing: 0) {
@@ -81,19 +86,35 @@ struct MainShell: View {
                     .zIndex(10)
             }
 
-            // Fullscreen email viewer — above the side panels, below the action
-            // layer so compose/undo/palette stay on top.
+            // Email viewer — above the side panels, below the action layer so
+            // compose/undo/palette stay on top. It fills the window EXCEPT for
+            // an open side panel's strip: opening a hit from search must leave
+            // the results you're working through visible beside the email, not
+            // swallow them. Esc closes the reader, a second Esc the panel.
             if let threadId = store.threadId {
-                ThreadViewer(threadId: threadId)
-                    .id(threadId)
-                    .transition(.opacity)
-                    .zIndex(20)
+                HStack(spacing: 0) {
+                    ThreadViewer(threadId: threadId)
+                        .id(threadId)
+                    if store.sideView.isOpen {
+                        // Reserves the strip without taking clicks off the panel
+                        // sitting under it.
+                        Color.clear
+                            .frame(width: sidePanelWidth)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .transition(.opacity)
+                .zIndex(20)
             }
+            }
+            .blur(radius: store.modalOverlayOpen ? 9 : 0)
 
-            // Global overlays: undo toasts, compose ceremony, palettes.
+            // Global overlays: undo toasts, compose ceremony, palettes. OUTSIDE
+            // the blurred stack — the modal itself must stay sharp.
             ActionLayer()
                 .zIndex(30)
         }
+        .animation(.easeOut(duration: 0.18), value: store.modalOverlayOpen)
         .animation(.smooth(duration: 0.22), value: store.sideView)
         .animation(.smooth(duration: 0.2), value: store.threadId)
         .keyBindings(.global, globalBindings)
@@ -136,6 +157,12 @@ struct MainShell: View {
         // the sitrep should open help, not nothing. Neither collides with any
         // other binding, and both stay input-guarded (no allowInInput), so
         // typing "?" into search still types a question mark.
+        // `/` was registered ONLY in the Emails list, so it did nothing on the
+        // surface the app actually LANDS on. Search is a global affordance —
+        // ⌘F already opens it from anywhere — and it stays input-guarded, so
+        // typing "/" into a field still types a slash.
+        bindings.append(
+            KeyBinding("/", "search") { store.openSearch() })
         bindings.append(
             KeyBinding("\\", "toggle light/dark theme") { Prefs.shared.flipTheme() })
         bindings.append(

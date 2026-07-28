@@ -100,6 +100,9 @@ struct EmailWebView: View {
 
     /// Frame height shown before the first successful measurement.
     private static let placeholderHeight: CGFloat = 120
+    /// Height used when measurement never arrives at all — generous on purpose:
+    /// too tall leaves whitespace, too short silently hides mail.
+    private static let unmeasuredFallbackHeight: CGFloat = 900
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -150,6 +153,16 @@ struct EmailWebView: View {
         // Prepare once per content change, never per render.
         .task(id: html) {
             if prepared.sourceHash != html.hashValue { prepared = Prepared.make(from: html) }
+        }
+        // SAFETY NET: the view is sized purely from what the measuring script
+        // reports, so if that never arrives (a pathological document, a load
+        // failure) the message would sit clipped at the placeholder height with
+        // no way to read the rest. After a beat, fall back to a tall box.
+        .task(id: prepared.sourceHash) {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, !measured, height == 0 else { return }
+            height = Self.unmeasuredFallbackHeight
+            measured = true
         }
     }
 

@@ -51,7 +51,6 @@ struct AuditView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        GlassEffectContainer(spacing: 2) {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(rows.enumerated()), id: \.element.id) { i, entry in
                                 AuditRow(
@@ -62,7 +61,6 @@ struct AuditView: View {
                                     onUndo: { Task { await performUndo(entry) } })
                                 .id(entry.id)
                             }
-                        }
                         }
                         .padding(.horizontal, 18)
                         .padding(.vertical, 10)

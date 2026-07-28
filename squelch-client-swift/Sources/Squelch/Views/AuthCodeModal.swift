@@ -106,7 +106,7 @@ struct AuthCodeModal: View {
         HStack(spacing: 10) {
             Avatar(sender: entry.meta.sender, size: 28)
             VStack(alignment: .leading, spacing: 1) {
-                Text(SenderID.displayName(entry.meta.sender))
+                Text(SenderCache.resolved(entry.meta.sender).displayName)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Palette.ink)
                     .help(entry.meta.sender)

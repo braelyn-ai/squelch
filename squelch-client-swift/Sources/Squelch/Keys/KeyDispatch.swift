@@ -190,7 +190,15 @@ final class KeyRegistry {
                     for b in set.box.bindings {
                         guard b.meta == metaHeld else { continue }
                         guard matcher(b.key, eventStr) else { continue }
-                        if editing && !b.allowInInput { continue }
+                        // Escape is NEVER input-suppressed. "Esc closes this" is
+                        // the app's universal contract — panels even render an
+                        // `Esc close` hint — so a surface that happens to focus a
+                        // text field must not become a trap. It was left to each
+                        // binding to opt in, which 10 of 15 Escapes did and 5
+                        // (search panel, help, auth code, process mode, the two
+                        // back-to-sitreps) did not: with the search field focused
+                        // there was NO way out of the panel.
+                        if editing && !b.allowInInput && b.key != "Escape" { continue }
                         if b.handler() {
                             return DispatchOutcome(
                                 handled: true, firedKey: b.key, firedContext: context)

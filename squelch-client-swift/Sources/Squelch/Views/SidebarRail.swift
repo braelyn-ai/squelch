@@ -4,11 +4,14 @@
 // MainView.mainViews), Usage + Settings pinned below a divider and deliberately
 // OUT of the digit sequence so adding them never renumbers 1..5.
 //
-// GLASS: the rail is one GlassEffectContainer, and the ACTIVE item is its own
-// tinted glass capsule carrying a shared glassEffectID. Moving between views
-// makes that capsule FLOW from one icon to the next through the rail's material
-// rather than cross-fading — the single most legible demonstration of the real
-// material in the app, and something the CSS build could not do at all.
+// GLASS: the rail is one GlassEffectContainer, and the ACTIVE item carries a
+// shared glassEffectID. Moving between views makes that material FLOW from one
+// icon to the next rather than cross-fading — the clearest demonstration of the
+// real material in the app, and something the CSS build could not do at all.
+//
+// No count badges: the auth arrival flow already announces a fresh code loudly
+// (a countdown ring, and a modal that presents the code), so a permanent number
+// on the tab was redundant nagging about mail that is mostly history.
 
 import SwiftUI
 
@@ -29,8 +32,7 @@ struct SidebarRail: View {
                 ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in
                     RailButton(
                         view: view, keyNumber: index + 1, active: store.activeView == view,
-                        namespace: railGlass, showRings: view == .auth,
-                        badge: badge(for: view))
+                        namespace: railGlass, showRings: view == .auth)
                 }
 
                 Spacer(minLength: 8)
@@ -43,7 +45,7 @@ struct SidebarRail: View {
                 ForEach(MainView.bottomViews, id: \.self) { view in
                     RailButton(
                         view: view, keyNumber: nil, active: store.activeView == view,
-                        namespace: railGlass, showRings: false, badge: nil)
+                        namespace: railGlass, showRings: false)
                 }
             }
             .padding(.vertical, 10)
@@ -64,14 +66,6 @@ struct SidebarRail: View {
                 .ignoresSafeArea()
         }
     }
-
-    /// Unread-ish counts the rail is allowed to shout about. Auth is the only
-    /// one that earns a badge: a login code arriving is time-critical.
-    private func badge(for view: MainView) -> Int? {
-        guard view == .auth else { return nil }
-        let count = store.sitrep.sealed.count
-        return count > 0 ? count : nil
-    }
 }
 
 private struct RailButton: View {
@@ -81,7 +75,6 @@ private struct RailButton: View {
     let active: Bool
     let namespace: Namespace.ID
     let showRings: Bool
-    let badge: Int?
 
     @State private var hovering = false
 
@@ -91,40 +84,23 @@ private struct RailButton: View {
         } label: {
             ZStack {
                 Image(systemName: view.symbol)
-                    // iOS tab-bar sizing: a solid glyph at a single weight, with
-                    // the ACTIVE state carried by color + the glass capsule
-                    // behind it rather than by a heavier stroke.
-                    .font(.system(size: 17))
-                    .symbolVariant(.fill)
+                    .font(.system(size: 17, weight: active ? .semibold : .regular))
                     .foregroundStyle(active ? Palette.accent : Palette.inkDim)
-                    .frame(width: 40, height: 34)
+                    .frame(width: 44, height: 36)
+                    // The material goes on the ICON ITSELF, not in a background
+                    // layer. A GlassEffectContainer deliberately raises its
+                    // descendants above its content view, so a glass pane added
+                    // as a sibling background rendered ON TOP of the glyph and
+                    // washed it out. Applying the effect here makes the icon the
+                    // glass's content, which is where it belongs anyway.
+                    .glassSelector(active, id: "rail-active", in: namespace)
 
                 if showRings { AuthRingsOverlay() }
-
-                if let badge {
-                    Text("\(badge)")
-                        .font(Typo.num(9, weight: .bold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Palette.lock))
-                        .offset(x: 13, y: -11)
-                }
             }
         }
         .buttonStyle(.plain)
         .background {
-            if active {
-                // The morphing capsule: one glassEffectID shared across every
-                // rail item means the material FLOWS to the newly-active one.
-                Color.clear
-                    .frame(width: 44, height: 36)
-                    .glassEffect(
-                        .regular.tint(Palette.accent.opacity(0.26)).interactive(),
-                        in: .rect(cornerRadius: 11, style: .continuous)
-                    )
-                    .glassEffectID("rail-active", in: namespace)
-            } else if hovering {
+            if hovering && !active {
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(Palette.hairline.opacity(0.7))
                     .frame(width: 44, height: 36)

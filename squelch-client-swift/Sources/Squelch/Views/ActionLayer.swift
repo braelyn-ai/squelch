@@ -161,7 +161,7 @@ struct ActionLayer: View {
     private func violationPrompt(_ record: UnsubscribeRecord) -> some View {
         VStack(alignment: .leading, spacing: 9) {
             Text(
-                "\(SenderID.displayName(record.sender)) is ignoring your unsubscribe — "
+                "\(SenderCache.resolved(record.sender).displayName) is ignoring your unsubscribe — "
                     + "\(record.violation_count) email\(record.violation_count == 1 ? "" : "s") "
                     + "since you asked \(Fmt.relAge(record.requested_at)) ago."
             )
