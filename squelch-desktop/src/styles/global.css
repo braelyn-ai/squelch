@@ -66,49 +66,47 @@
 /* ---- LIGHT PALETTE (default) ---------------------------------------------- */
 :root,
 :root[data-theme="light"] {
-  /* THE FIELD — the content area's own material over the native backdrop.
-     PALE, not saturated: the app is blue by TINT, not by flooding the canvas.
-     A saturated field forces white type on it, which then forces near-white
-     cards, which is the high-contrast stripe pattern the earlier pass produced.
-     Going pale lets the hero, the masthead and the cards all sit in dark ink on
-     light blue — the Swift build's proportions, which is the direction the
-     owner picked on 2026-07-27.
+  /* THE APP TINT over the native backdrop — the content area's own material,
+     and THE BRAND. This is squelch blue (#2b7fd4): the identity that the first
+     glass pass sanded off by making it a neutral grey wash.
 
-     Diagonal, near-white at the top-left, settling into periwinkle. Still
-     translucent, so the blue-tinted NSGlassEffectView (SQUELCH_BLUE_TINT in
-     src-tauri/src/lib.rs) keeps showing through underneath. */
+     It multiplies with the blue tint on the native glass layer
+     (SQUELCH_BLUE_TINT in src-tauri/src/lib.rs) — change one and look at the
+     other. Alpha is the dial between identity and translucency: at ~0.7 the
+     window reads unmistakably blue while blurred wallpaper still moves through
+     the gutters. Push it to 1.0 and you are back to the flat 2026-07-22 design;
+     drop it under ~0.5 and the brand washes out again. */
   --scrim: linear-gradient(
-    150deg,
-    rgba(250, 252, 255, 0.88) 0%,
-    rgba(230, 240, 252, 0.87) 52%,
-    rgba(214, 229, 248, 0.89) 100%
+    180deg,
+    rgba(43, 127, 212, 0.72) 0%,
+    rgba(32, 108, 190, 0.78) 100%
   );
   /* opaque reading surface (thread viewer): long-form mail is a reading page,
      not a glass panel — it stays solid so body copy is never on a busy photo */
   --reader-bg: #f4f8fd;
 
   /* MATERIALS — ordered by density.
-     --mat-thick is the primary CONTENT pane (zone cards, modals): a light BLUE
-     wash, a clear step bluer than the field so a card reads as a card without
-     needing a border to say so. Translucency is safe at this value in a way it
-     was not on the saturated field — both the pane and everything behind it are
-     pale, so dark ink keeps its contrast no matter what wallpaper shows
-     through. Legibility is no longer hostage to the desktop.
-     --mat-regular is a surface nested inside a pane and steps UP toward white
-     (the pane is tinted now, so a whiter nested card separates cleanly).
-     --mat-thin / --mat-ultrathin stay ink-side hover washes. */
-  --mat-thick: rgba(219, 233, 250, 0.78);
-  --mat-regular: rgba(255, 255, 255, 0.58);
+     --mat-thick is the primary CONTENT pane (zone cards, modals) and it is
+     deliberately NEAR-OPAQUE. Reading surfaces do not get to be translucent:
+     a well-built mac app keeps its sidebar see-through and its content solid
+     (Mail's message list, Notes' body, Finder's file list) because effective
+     contrast on a translucent pane depends on the user's wallpaper, which is
+     not a thing text legibility is allowed to depend on. Glass lives in the
+     CHROME — rail, masthead pills, sheet backdrops, the hero field.
+     --mat-regular is a surface nested inside a pane and therefore steps DOWN
+     in lightness; on a near-white pane a lighter wash would simply vanish.
+     --mat-thin / --mat-ultrathin are ink-side hover washes, for the same
+     reason. */
+  --mat-thick: rgba(251, 253, 255, 0.95);
+  --mat-regular: rgba(233, 240, 249, 0.88);
   --mat-thin: rgba(20, 45, 80, 0.055);
   --mat-ultrathin: rgba(20, 45, 80, 0.03);
 
   --glass: var(--mat-thick); /* card */
-  /* modal / raised — near-white, because a sheet should read as lifted OFF the
-     blue cards behind it rather than as one more of them */
-  --glass-strong: rgba(252, 253, 255, 0.96);
+  --glass-strong: rgba(253, 254, 255, 0.97); /* modal / raised */
   --zone-wash: var(--mat-thick); /* zone card */
   /* inputs / code wells: opaque — typed text must stay crisp */
-  --glass-legible: rgba(255, 255, 255, 0.92);
+  --glass-legible: rgba(255, 255, 255, 0.97);
   /* BORDERS ARE INK-SIDE. They are drawn on top of near-opaque panes, where a
      white hairline is invisible. Surfaces that sit on the BLUE FIELD instead
      (masthead pills, the right-rail divider) hard-code a white hairline
@@ -153,21 +151,19 @@
   --lock: #6d5ce0; /* sealed/auth — periwinkle */
   --lock-soft: rgba(109, 92, 224, 0.14);
 
-  /* SHADOWS — a tight contact shadow plus a wide soft ambient one. On a pale
-     field the shadow is now the PRIMARY way a card separates from its ground
-     (there is no border doing that job), so it is more generous than before —
-     the drop shadows are the thing the owner singled out as wanting more of.
-     Still TWO layers: --shadow-card lands on every pane on the page, and each
-     extra large-radius layer is another full-size blur to rasterize. */
-  --shadow-contact: 0 1px 2px rgba(22, 48, 88, 0.08);
+  /* SHADOWS — glass sits ON something, so it needs a tight contact shadow AND
+     a wide ambient one. The tight one is what sells the lift.
+     TWO layers, not three: --shadow-card lands on every pane on the page, and
+     each extra large-radius layer is another full-size blur to rasterize. */
+  --shadow-contact: 0 1px 2px rgba(20, 40, 70, 0.1);
   --shadow-card:
-    0 2px 5px rgba(22, 48, 88, 0.07), 0 16px 38px -12px rgba(22, 48, 88, 0.26);
+    0 1px 2px rgba(20, 40, 70, 0.1), 0 10px 30px -10px rgba(20, 40, 70, 0.22);
   --shadow-card-sm:
-    0 1px 3px rgba(22, 48, 88, 0.07), 0 8px 22px -8px rgba(22, 48, 88, 0.18);
-  --shadow-receipt: 0 1px 3px rgba(22, 48, 88, 0.07),
-    0 10px 26px -10px rgba(22, 48, 88, 0.2);
+    0 1px 2px rgba(20, 40, 70, 0.08), 0 6px 18px -8px rgba(20, 40, 70, 0.14);
+  --shadow-receipt: 0 1px 2px rgba(20, 40, 70, 0.08),
+    0 8px 22px -10px rgba(20, 40, 70, 0.16);
   --shadow-float:
-    0 1px 3px rgba(22, 48, 88, 0.1), 0 10px 26px -8px rgba(22, 48, 88, 0.24);
+    0 1px 2px rgba(20, 40, 70, 0.12), 0 8px 22px -8px rgba(20, 40, 70, 0.22);
   --shadow-panel: -1px 0 0 rgba(255, 255, 255, 0.4),
     -20px 0 60px rgba(20, 40, 70, 0.2);
   --shadow-modal:
@@ -175,15 +171,19 @@
   /* modal/side backdrop — a dimming wash, blurred via .*-overlay rules */
   --overlay: rgba(120, 145, 180, 0.2);
 
-  /* THE RAIL MATERIAL — a touch lighter than the field, so the rail reads as
-     its own strip of chrome without becoming a slab of colour. Its glyphs are
-     label INK now: on a pale field that is both the legible choice and the
-     stable one, since the rail no longer has to out-contrast an arbitrary
-     wallpaper the way a saturated blue rail did. */
+  /* THE RAIL MATERIAL. Thinner than --scrim so the sidebar stays the most
+     translucent surface in the window, but NOT arbitrarily thin: the rail has
+     to establish its own value regardless of what the user's wallpaper is
+     doing, or its icons only stay legible over dark desktops. Same hue family
+     as the scrim so rail and content read as one window. */
+  /* THE CHROME BLUE. A step LIGHTER than the canvas, so the rail reads as its
+     own layer of window chrome rather than as more canvas. Opaque enough that
+     its white glyphs are legible over any wallpaper — the rail is the one
+     surface whose contrast cannot be allowed to float. */
   --canvas-top: linear-gradient(
     180deg,
-    rgba(252, 253, 255, 0.72) 0%,
-    rgba(242, 247, 253, 0.7) 100%
+    rgba(74, 148, 222, 0.82) 0%,
+    rgba(62, 134, 208, 0.86) 100%
   );
 
   /* the squelch line — the noise divider */
@@ -194,27 +194,27 @@
 /* Materials become dark tints; the specular edge dims hard (a bright rim on a
    dark pane reads as plastic, not glass) but never disappears. */
 :root[data-theme="dark"] {
-  /* The dark field: the same diagonal, blue-leaning rather than neutral black,
-     so the brand survives the theme switch without flooding the canvas. */
+  /* The same blue after dark — deep navy rather than neutral black, so the
+     brand survives the theme switch. */
   --scrim: linear-gradient(
-    150deg,
-    rgba(19, 27, 39, 0.9) 0%,
-    rgba(14, 21, 32, 0.9) 52%,
-    rgba(11, 18, 29, 0.92) 100%
+    180deg,
+    rgba(16, 36, 62, 0.74) 0%,
+    rgba(10, 25, 45, 0.82) 100%
   );
   --reader-bg: #10161f;
 
-  /* Panes are a step LIGHTER than the dark field — same relationship as light
-     mode, where they are a step lighter than the pale one. */
-  --mat-thick: rgba(35, 45, 61, 0.82);
-  --mat-regular: rgba(48, 60, 79, 0.8);
+  /* Same rule as light: content panes are near-opaque, glass lives in chrome.
+     Nested surfaces step UP in lightness here (the pane is already dark). */
+  --mat-thick: rgba(25, 32, 44, 0.95);
+  --mat-regular: rgba(38, 47, 63, 0.9);
   --mat-thin: rgba(255, 255, 255, 0.07);
   --mat-ultrathin: rgba(255, 255, 255, 0.035);
 
+  /* Chrome blue after dark — lighter than the navy canvas, same as in light. */
   --canvas-top: linear-gradient(
     180deg,
-    rgba(30, 39, 53, 0.6) 0%,
-    rgba(24, 32, 45, 0.58) 100%
+    rgba(34, 62, 98, 0.86) 0%,
+    rgba(26, 50, 82, 0.9) 100%
   );
 
   --glass: var(--mat-thick);
@@ -239,6 +239,9 @@
   --fg-faint: #8698a9;
   --fg-faintest: #6c7d8e;
 
+  /* on-backdrop text shadows go darker over a dark wallpaper */
+  --on-sky-shadow: 0 1px 16px rgba(0, 0, 0, 0.55);
+  --on-sky-shadow-sm: 0 1px 10px rgba(0, 0, 0, 0.5);
 
   --brass: #4aa3ff; /* system blue, lifted for contrast on dark */
   --brass-ink: #7dbdff;
@@ -287,19 +290,15 @@
      system serif and stands in cleanly if the bundled woff2 ever fails. */
   --serif: "Newsreader", "New York", ui-serif, Georgia, serif;
 
-  /* Text sitting DIRECTLY on the field (hero, masthead) rather than inside a
-     pane. THESE ARE INK, not white. The name is historical: it meant "on the
-     saturated blue sky" back when the canvas was flooded with colour and the
-     only legible answer was white type with a shadow to hold it off a busy
-     wallpaper. The field is pale now, so the polarity flips and the shadows go
-     away — a drop shadow under dark text on a light ground just looks grubby.
-     Kept as their own tokens (rather than folded into --fg) because on-field
-     and in-pane text are still different jobs and may diverge again. */
-  --on-sky: var(--fg);
-  --on-sky-dim: var(--fg-dim);
-  --on-sky-faint: var(--fg-faint);
-  --on-sky-shadow: none;
-  --on-sky-shadow-sm: none;
+  /* Text sitting DIRECTLY on the backdrop (hero, masthead) rather than inside a
+     material. It has an unknown wallpaper behind it, so it is white + shadowed;
+     anything longer than a headline belongs on a material instead. */
+  --on-sky: #ffffff;
+  --on-sky-dim: rgba(255, 255, 255, 0.88);
+  --on-sky-faint: rgba(255, 255, 255, 0.72);
+  --on-sky-shadow: 0 1px 3px rgba(10, 20, 40, 0.4), 0 2px 18px rgba(10, 20, 40, 0.3);
+  --on-sky-shadow-sm: 0 1px 2px rgba(10, 20, 40, 0.42),
+    0 1px 10px rgba(10, 20, 40, 0.3);
 
 
   --row-h: 30px;
@@ -347,14 +346,10 @@
 /* One place defines what a raised surface looks like. `.zone` (the shared card
    primitive across sitrep/emails/rules) and `.glass-pane` (opt-in, for anything
    else) both get it, so converting a surface is a class away. */
-/* NO BORDER. On a pale field a tinted pane already separates by value, and the
-   shadow does the lifting — adding a hairline on top of both reads as a boxed
-   web card rather than a mac one. Controls and inputs still take --border;
-   panes do not. */
 .glass-pane,
 .zone {
   background: var(--mat-thick);
-  border: none;
+  border: 1px solid var(--border);
   border-radius: var(--radius-card);
   box-shadow: var(--shadow-card);
 }
@@ -624,10 +619,9 @@ kbd {
   gap: 4px;
   padding: var(--chrome-top) 0 10px;
   background: var(--canvas-top);
-  /* Barely-there separator. Both sides are pale now, so this is a whisper —
-     the rail is distinguished by being slightly lighter than the field, not by
-     being fenced off from it. */
-  box-shadow: inset -1px 0 0 var(--card-line);
+  /* Separator from the content area — a lit hairline, since both sides of it
+     are saturated blue now rather than the rail being darker than the field. */
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.2);
   /* stack above .app-main so hover tooltips (which overflow to the right into
      the content area) paint over the content, not under it. */
   position: relative;
@@ -643,7 +637,7 @@ kbd {
   width: 24px;
   height: 1px;
   margin: 2px 0 6px;
-  background: var(--card-line);
+  background: rgba(255, 255, 255, 0.26);
 }
 /* Rail buttons are bare until touched — the rail should read as glass with
    icons floating in it, not as a strip of buttons. They opt OUT of the global
@@ -660,33 +654,34 @@ kbd {
   background: none;
   border: 1px solid transparent;
   box-shadow: none;
-  /* Label ink. The rail is a pale wash again, so ink is both the legible and
-     the stable choice — and unlike the earlier pale-rail attempt, the FIELD is
-     pale too now, so this no longer has to survive an arbitrary wallpaper. */
-  color: var(--fg-dim);
+  /* White again. Earlier this had to be label ink, because the rail was a thin
+     neutral wash whose value tracked the wallpaper. Now the rail is saturated
+     chrome blue at ~0.85 — a known dark-enough surface in BOTH themes — so
+     white glyphs are the legible choice rather than the fragile one. */
+  color: var(--on-sky-dim);
   transition:
     background 0.2s var(--ease-glass),
     color 0.16s ease,
     transform 0.14s var(--ease-glass);
 }
 .rail-btn:hover {
-  background: var(--mat-thin);
-  color: var(--fg);
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--on-sky);
   box-shadow: none;
 }
 .rail-btn:active {
   transform: scale(0.92);
 }
-/* ACTIVE — the "you are here" tile: a soft accent wash holding a blue glyph,
-   the way a mac sidebar marks its selection. */
+/* ACTIVE — the "you are here" lozenge: a flat white tile on the chrome blue,
+   holding an accent-tinted glyph. */
 .rail-btn.active {
-  background: var(--brass-soft);
+  background: rgba(255, 255, 255, 0.94);
   border: 1px solid transparent;
-  box-shadow: none;
-  color: var(--brass);
+  box-shadow: var(--shadow-contact);
+  color: var(--brass-ink);
 }
 :root[data-theme="dark"] .rail-btn.active {
-  background: var(--brass-soft);
+  background: rgba(255, 255, 255, 0.16);
   color: var(--brass);
 }
 .rail-btn .rail-badge {
