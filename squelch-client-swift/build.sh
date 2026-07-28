@@ -30,6 +30,7 @@ SWIFT_FLAGS=(
   -framework WebKit
   -framework Security
   -framework UniformTypeIdentifiers
+  -framework PDFKit
 )
 
 case "$MODE" in

@@ -1,0 +1,131 @@
+// One dense update row: importance meter · avatar · sender · one_line ·
+// relative time · matched-rule hint · deadline chip. Mouse click selects AND
+// opens the thread (gmail semantics). Action affordances stay keyboard-first —
+// the [r][e][d] verb hint shows only on the selected row.
+//
+// Ported from squelch-desktop/src/components/UpdateRow.tsx.
+
+import SwiftUI
+
+struct UpdateRow: View {
+    let update: AttentionUpdate
+    let selected: Bool
+    /// STILL OPEN band: escalating left-rail weight + age note.
+    var aging = false
+    /// 0..1 escalation weight for the STILL OPEN visual ramp.
+    var weight: Double = 0
+    let onHover: () -> Void
+    let onOpen: () -> Void
+
+    @State private var hovering = false
+
+    /// The aging BADGE only earns its place once an item is genuinely aging
+    /// (> 48h). Under that a STILL OPEN row shows the plain relative time like
+    /// any other band — no shouty badge on fresh items.
+    private var showAgeBadge: Bool {
+        aging && Fmt.isAging(update.surfaced_at ?? update.resolved_at)
+    }
+
+    var body: some View {
+        let chip = Fmt.deadlineChip(update.deadline)
+
+        Button {
+            onHover()
+            onOpen()
+        } label: {
+            HStack(spacing: 9) {
+                Text(Fmt.importanceMeter(update.importance))
+                    .font(Typo.mono(10))
+                    .foregroundStyle(Palette.importanceColor(update.importance))
+                    .accessibilityLabel("importance \(update.importance)")
+                    .layoutPriority(2)
+
+                Avatar(sender: update.sender, size: 20)
+
+                Text(SenderID.displayName(update.sender))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(1)
+                    .frame(minWidth: 96, idealWidth: 150, maxWidth: 190, alignment: .leading)
+                    .layoutPriority(2)
+
+                if update.hasAttachments {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Palette.inkFaintest)
+                        .accessibilityLabel("has attachments")
+                }
+
+                Text(update.one_line)
+                    .font(Typo.rowSub)
+                    // Escalation: text leans toward amber as weight climbs.
+                    .foregroundStyle(
+                        showAgeBadge
+                            ? Palette.warn.opacity(0.45 + weight * 0.55) : Palette.inkDim
+                    )
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 7) {
+                    if update.matched_rule != nil {
+                        Text("·rule")
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.accent.opacity(0.8))
+                            .help("matched a sender rule")
+                    }
+                    if let chip {
+                        Chip(
+                            text: chip.text, tone: chip.overdue ? Palette.danger : Palette.warn,
+                            filled: chip.overdue)
+                    }
+                    if showAgeBadge {
+                        Text("← \(Fmt.loudAge(update.surfaced_at ?? update.resolved_at))")
+                            .font(Typo.num(10, weight: .semibold))
+                            .foregroundStyle(Palette.warn)
+                    } else {
+                        Text(Fmt.relAge(update.surfaced_at))
+                            .font(Typo.num(10))
+                            .foregroundStyle(Palette.inkFaintest)
+                            .frame(width: 30, alignment: .trailing)
+                    }
+                    if selected {
+                        Text("[r][e][d]")
+                            .font(Typo.mono(9))
+                            .foregroundStyle(Palette.inkFaintest)
+                    }
+                }
+                .layoutPriority(3)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(
+                    selected
+                        ? Palette.accentSoft
+                        : (hovering ? Palette.hairline.opacity(0.55) : .clear))
+        }
+        .overlay(alignment: .leading) {
+            if showAgeBadge {
+                // Heavier rail as the item rots.
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Palette.warn)
+                    .frame(width: 3 + weight * 3)
+                    .padding(.vertical, 4)
+            } else if selected {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Palette.accent)
+                    .frame(width: 2)
+                    .padding(.vertical, 4)
+            }
+        }
+        .onHover { over in
+            hovering = over
+            if over { onHover() }
+        }
+    }
+}

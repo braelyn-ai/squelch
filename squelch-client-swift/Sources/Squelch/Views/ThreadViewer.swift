@@ -1,0 +1,553 @@
+// FULLSCREEN THREAD VIEWER — the email reading surface.
+//
+// Fetches GET /client/thread/{id} and renders ALL messages stacked NEWEST-FIRST
+// — the mail you came for is at the top, the history reads downward. j/k move
+// the selected message (j = older); click a card to select it. HTML renders in
+// the hard-sandboxed EmailWebView; plain text falls back to a selectable card
+// with its quoted history collapsed by the same heuristic.
+//
+// ONE SCROLL SURFACE: the outer column is the single scroll. Each web view
+// measures its own content and sizes to it exactly, so message frames NEVER
+// scroll internally and the stacked cards flow like one long document.
+//
+// LAYERED / ESC RETURNS YOU: this is a fullscreen overlay ABOVE everything,
+// including the browse/search side panels. The surface underneath stays
+// mounted, so opening a thread from search keeps the results under it and Esc
+// drops you right back where you were.
+//
+// Ported from squelch-desktop/src/components/ThreadViewer.tsx.
+
+import SwiftUI
+
+struct ThreadViewer: View {
+    let threadId: String
+
+    @Environment(AppStore.self) private var store
+    @Environment(Prefs.self) private var prefs
+
+    @State private var thread: ClientThreadView?
+    @State private var error: String?
+    @State private var loading = true
+    /// Selected message: j/k move it, click selects, the rail highlights it.
+    @State private var index = 0
+    /// Existing unsubscribe record for THIS thread's sender; drives the header
+    /// hint copy. nil = none.
+    @State private var unsub: UnsubscribeRecord?
+    /// nil = closed; .ask = "Unsubscribe from X?"; .noLink = the 422 fallback.
+    @State private var confirmMode: ConfirmMode?
+    @State private var confirmBusy = false
+    @State private var retriaging = false
+    @State private var debugInfo: TriageDebug?
+
+    enum ConfirmMode: Equatable { case ask, noLink }
+
+    /// Server order is chronological; display order is newest-first.
+    private var messages: [ClientMessage] { (thread?.messages ?? []).reversed() }
+    /// The NEWEST message is what `u` acts on (the server derives the sender
+    /// from it) and whose from_addr keys the record lookup.
+    private var newest: ClientMessage? { messages.first }
+    /// trim().lowercased() mirrors the server's canonical `sender`.
+    private var newestSender: String? {
+        newest.map { $0.from_addr.trimmingCharacters(in: .whitespaces).lowercased() }
+    }
+    private var senderName: String { newest.map { SenderID.displayName($0.senderString) } ?? "" }
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(Palette.readerBackground.opacity(0.97))
+                .background(.regularMaterial)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                header
+                content
+            }
+
+            if let debugInfo {
+                TriageDebugOverlay(info: debugInfo) { self.debugInfo = nil }
+            }
+            if let confirmMode {
+                UnsubConfirm(
+                    mode: confirmMode, senderName: senderName, busy: confirmBusy,
+                    onConfirm: {
+                        Task {
+                            if confirmMode == .ask { await runUnsubscribe() } else { await runBlock() }
+                        }
+                    },
+                    onCancel: { if !confirmBusy { self.confirmMode = nil } })
+            }
+        }
+        .keyContext(.thread)
+        .keyBindings(.thread, bindings)
+        .task(id: threadId) { await load() }
+        .task(id: newestSender) { await refreshUnsub() }
+        // Warm the NEXT queued thread while this one is being read, so e/d's
+        // done+advance opens it instantly.
+        .onAppear {
+            if let cur = store.threadQueue.firstIndex(where: { $0.thread_id == threadId }),
+                let next = store.threadQueue[safe: cur + 1]
+            {
+                ThreadPrefetch.shared.prefetch(next.thread_id)
+            }
+        }
+    }
+
+    // MARK: - chrome
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Text(thread?.subject ?? "…")
+                .font(Typo.serif(19, weight: .medium))
+                .foregroundStyle(Palette.ink)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if prefs.developerMode {
+                Button("triage debug") { Task { await openDebug() } }
+                    .buttonStyle(.glass).font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                Button(retriaging ? "re-triaging…" : "re-triage") {
+                    Task { await retriageThis() }
+                }
+                .buttonStyle(.glass).font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                .disabled(retriaging)
+                .help("dev: reset this email's LLM verdicts and re-run triage")
+            }
+
+            Button {
+                confirmMode = .ask
+            } label: {
+                if let unsub {
+                    Text("unsubscribe requested \(Fmt.relAge(unsub.requested_at)) ago")
+                        .font(Typo.micro)
+                } else {
+                    HStack(spacing: 4) {
+                        Kbd("u")
+                        Text("unsubscribe").font(Typo.micro)
+                    }
+                }
+            }
+            .buttonStyle(.glass)
+            .foregroundStyle(Palette.inkFaint)
+            .help("unsubscribe from this sender")
+
+            Button { store.closeThread() } label: {
+                HStack(spacing: 4) {
+                    Kbd("esc")
+                    Text("back").font(Typo.micro)
+                }
+            }
+            .buttonStyle(.glass)
+            .foregroundStyle(Palette.inkFaint)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 13)
+        .overlay(alignment: .bottom) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if loading {
+            centeredNote("loading thread…")
+        } else if let error {
+            centeredNote(error, tone: Palette.danger)
+        } else if thread == nil {
+            centeredNote("no thread.")
+        } else if messages.isEmpty {
+            centeredNote("no messages in this thread.")
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
+                            MessageCard(message: m, selected: i == index) { index = i }
+                                .id(i)
+                        }
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 18)
+                    .frame(maxWidth: 900)
+                    .frame(maxWidth: .infinity)
+                }
+                .onChange(of: index) { _, i in
+                    withAnimation(.easeOut(duration: 0.14)) { proxy.scrollTo(i, anchor: .top) }
+                }
+            }
+        }
+    }
+
+    private func centeredNote(_ text: String, tone: Color = Palette.inkFaintest) -> some View {
+        Text(text)
+            .font(Typo.rowSub)
+            .foregroundStyle(tone)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - keymap
+
+    private var bindings: [KeyBinding] {
+        [
+            // allowInInput matters: a search input underneath may still hold
+            // focus (if our focus-steal loses the race).
+            KeyBinding("Escape", "back", allowInInput: true) { store.closeThread() },
+            // ⌘[ = back, same as Esc — the viewer is a page you navigated into.
+            KeyBinding("[", "back", meta: true) { store.closeThread() },
+            KeyBinding("h", "prev email") { stepQueue(-1) },
+            KeyBinding("l", "next email") { stepQueue(1) },
+            KeyBinding("ArrowLeft", "prev email") { stepQueue(-1) },
+            KeyBinding("ArrowRight", "next email") { stepQueue(1) },
+            KeyBinding("j", "older message") { index = min(messages.count - 1, index + 1) },
+            KeyBinding("k", "newer message") { index = max(0, index - 1) },
+            // The reading surface is where a miscategorized email is most
+            // obvious, so correcting it should not require going back.
+            KeyBinding("v", "fix triage") {
+                guard let thread, let m = messages[safe: index] else { return }
+                store.openTriageFix(
+                    TriageFixTarget(
+                        messageId: m.id, sender: m.from_addr, subject: thread.subject))
+            },
+            KeyBinding("e", "done + next") { Task { await doneAndNext() } },
+            KeyBinding("d", "done + next") { Task { await doneAndNext() } },
+            KeyBinding("u", "unsubscribe") { confirmMode = .ask },
+        ]
+    }
+
+    // MARK: - queue navigation
+
+    /// HORIZONTAL queue nav: move between the queued emails WITHOUT resolving
+    /// anything — the newsletter "2 this week" browse.
+    private func stepQueue(_ delta: Int) {
+        let queue = store.threadQueue
+        guard queue.count > 1,
+            let cur = queue.firstIndex(where: { $0.thread_id == threadId }),
+            let next = queue[safe: cur + delta]
+        else { return }
+        store.openThread(next.thread_id, queue: queue)
+    }
+
+    /// e/d — "done + next": mark the current thread's update done (keeping its
+    /// 5s undo), then advance to the NEXT queued update in place; if none
+    /// remain, close the viewer.
+    private func doneAndNext() async {
+        let queue = store.threadQueue
+        guard let cur = queue.firstIndex(where: { $0.thread_id == threadId }) else {
+            // Not opened from a queue (search, a right-rail record): `e` still
+            // means done — resolve the newest message directly and close.
+            if let newestChrono = thread?.messages.last {
+                do {
+                    try await APIClient.shared.setStatus(newestChrono.id, .done)
+                    store.pushToast("done", .info)
+                } catch {
+                    store.pushToast(errText(error, "done failed"), .error)
+                }
+            }
+            store.closeThread()
+            return
+        }
+        await Actions.done(queue[cur])
+        if let next = queue[safe: cur + 1] {
+            store.openThread(next.thread_id, queue: queue)
+        } else {
+            store.closeThread()
+        }
+    }
+
+    // MARK: - data
+
+    private func load() async {
+        // Fresh prefetch hit → render it and skip the round-trip entirely (the
+        // cache is at most 60s old; e/d/refresh paths repopulate it).
+        if let cached = ThreadPrefetch.shared.cached(threadId) {
+            thread = cached
+            error = nil
+            loading = false
+            index = 0
+            return
+        }
+        loading = true
+        error = nil
+        do {
+            let view = try await APIClient.shared.getThread(threadId)
+            ThreadPrefetch.shared.note(threadId, view)  // instant reopen
+            thread = view
+            index = 0  // newest renders first — land on it
+        } catch {
+            self.error = errText(error, "thread load failed")
+        }
+        loading = false
+    }
+
+    /// Best-effort: a failed lookup just leaves the hint in its default state.
+    private func refreshUnsub() async {
+        guard let newestSender else {
+            unsub = nil
+            return
+        }
+        guard let rows = try? await APIClient.shared.getUnsubscribes() else { return }
+        unsub = rows.first { $0.sender == newestSender }
+    }
+
+    /// Confirmed unsubscribe. 200 -> open the url + toast + refresh the hint.
+    /// 422 -> swap the card to the "no link — block instead?" fallback.
+    private func runUnsubscribe() async {
+        guard let newest, !confirmBusy else { return }
+        confirmBusy = true
+        defer { confirmBusy = false }
+        do {
+            let result = try await APIClient.shared.unsubscribe(messageId: newest.id)
+            Opener.open(result.url)
+            store.pushToast("opened unsubscribe page — \(result.sender)", .success)
+            await refreshUnsub()
+            confirmMode = nil
+        } catch let apiError as APIError where apiError.status == 422 {
+            // No http(s) unsubscribe link — offer to block the sender instead.
+            confirmMode = .noLink
+        } catch {
+            store.pushToast(errText(error, "unsubscribe failed"), .error)
+            confirmMode = nil
+        }
+    }
+
+    /// No-link fallback: block the EXACT sender.
+    private func runBlock() async {
+        guard let newestSender, !confirmBusy else { return }
+        confirmBusy = true
+        defer { confirmBusy = false }
+        do {
+            try await Actions.createBlockRule(sender: newestSender)
+            store.pushToast("blocked \(newestSender)", .success)
+        } catch {
+            store.pushToast(errText(error, "block failed"), .error)
+        }
+        confirmMode = nil
+    }
+
+    private func retriageThis() async {
+        guard let newestChrono = thread?.messages.last, !retriaging else { return }
+        retriaging = true
+        defer { retriaging = false }
+        do {
+            let result = try await APIClient.shared.retriage(.message(newestChrono.id))
+            store.pushToast(
+                result.reset > 0 ? "re-triaging this email…" : "nothing to re-triage here", .info)
+        } catch {
+            store.pushToast(errText(error, "re-triage failed"), .error)
+        }
+    }
+
+    private func openDebug() async {
+        guard let newestChrono = thread?.messages.last else { return }
+        do {
+            debugInfo = try await APIClient.shared.getTriageDebug(newestChrono.id)
+        } catch {
+            store.pushToast(errText(error, "debug fetch failed"), .error)
+        }
+    }
+}
+
+// MARK: - message card
+
+private struct MessageCard: View {
+    let message: ClientMessage
+    let selected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                Avatar(sender: message.senderString, size: 24)
+                Text(SenderID.displayName(message.senderString))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                Spacer(minLength: 8)
+                Text(Fmt.dateTime(message.received_at))
+                    .font(Typo.num(11))
+                    .foregroundStyle(Palette.inkFaintest)
+            }
+
+            if let html = message.html, !html.isEmpty {
+                EmailWebView(html: html, cacheKey: String(message.id))
+            } else {
+                PlainBody(content: message.content)
+            }
+
+            AttachmentStrip(attachments: message.attachmentList)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Palette.readerBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(
+                    selected ? Palette.accent.opacity(0.5) : Palette.hairline,
+                    lineWidth: selected ? 1.5 : 0.75)
+        )
+        .shadow(color: .black.opacity(0.07), radius: 12, y: 4)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+    }
+}
+
+/// A plain-text body with its trailing quoted history collapsed behind a chip.
+/// Mirrors the html-side collapse; the split heuristic is shared (Quotes) and
+/// conservative — when in doubt the full text renders.
+private struct PlainBody: View {
+    let content: String
+    @State private var open = false
+
+    var body: some View {
+        let split = Quotes.splitText(content)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(split.quoted == nil ? content : split.visible)
+                .font(.system(size: 13.5))
+                .foregroundStyle(Palette.ink)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            if let quoted = split.quoted {
+                Button {
+                    open.toggle()
+                } label: {
+                    Text(open ? "hide quoted history" : "··· show quoted history")
+                        .font(Typo.micro)
+                        .padding(.horizontal, 9).padding(.vertical, 3)
+                }
+                .buttonStyle(.glass)
+                .foregroundStyle(Palette.inkFaint)
+                .help("the quoted reply chain below this message")
+                if open {
+                    Text(quoted)
+                        .font(.system(size: 13))
+                        .foregroundStyle(Palette.inkFaint)
+                        .textSelection(.enabled)
+                        .padding(.leading, 10)
+                        .overlay(alignment: .leading) {
+                            Rectangle().fill(Palette.hairline).frame(width: 2)
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - unsubscribe confirm
+
+/// Confirm-first unsubscribe. Pushes the "modal" KeyContext (Enter confirms,
+/// Esc cancels) so the thread's j/k/e/d/u never fire while it's open. `mode`
+/// swaps the copy between the initial confirm and the 422 fallback.
+private struct UnsubConfirm: View {
+    let mode: ThreadViewer.ConfirmMode
+    let senderName: String
+    let busy: Bool
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        OverlayScrim(onDismiss: onCancel) {
+            ModalCard(width: 400) {
+                if mode == .ask {
+                    Text("Unsubscribe from **\(senderName)**?")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Palette.ink)
+                } else {
+                    Text("No unsubscribe link on this email. Block **\(senderName)** instead?")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Palette.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 8) {
+                    Spacer()
+                    Button("Cancel", action: onCancel)
+                        .buttonStyle(.glass).disabled(busy)
+                    Button(mode == .ask ? "Unsubscribe" : "Block sender", action: onConfirm)
+                        .buttonStyle(.glassProminent)
+                        .tint(mode == .ask ? Palette.accent : Palette.danger)
+                        .disabled(busy)
+                }
+            }
+        }
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "cancel", allowInInput: true) { onCancel() },
+            KeyBinding("Enter", "confirm", allowInInput: true) { onConfirm() },
+        ])
+    }
+}
+
+// MARK: - dev triage inspector
+
+/// DEV overlay: the full triage row as key/value mono rows. Own "modal"
+/// KeyContext so Esc closes it without leaking to the thread keys underneath.
+private struct TriageDebugOverlay: View {
+    let info: TriageDebug
+    let onClose: () -> Void
+
+    private var rows: [(String, String)] {
+        [
+            ("message_id", String(info.message_id)),
+            ("subject", info.subject),
+            ("importance", String(info.importance)),
+            ("tier", info.tier),
+            ("category", info.category ?? "null"),
+            ("one_line", info.one_line),
+            ("reason", info.reason),
+            ("reason.importance", info.field_reasons?.importance ?? "null"),
+            ("reason.deadline", info.field_reasons?.deadline ?? "null"),
+            ("reason.tier", info.field_reasons?.tier ?? "null"),
+            ("deadline", info.deadline ?? "null"),
+            ("matched_rule_id", info.matched_rule_id.map(String.init) ?? "null"),
+            ("status", info.status),
+            ("surfaced_at", info.surfaced_at ?? "null"),
+            ("resolved_at", info.resolved_at ?? "null"),
+            ("stage1_model_used", info.stage1_model_used ?? "null"),
+            ("model_used (stage2)", info.model_used ?? "null"),
+            ("needs_stage2", String(info.needs_stage2)),
+            ("extractor_model_used", info.extractor_model_used ?? "null"),
+            ("created_at", info.created_at),
+        ]
+    }
+
+    var body: some View {
+        OverlayScrim(onDismiss: onClose) {
+            ModalCard(width: 560) {
+                HStack {
+                    Text("triage debug")
+                        .font(Typo.sectionLabel)
+                        .foregroundStyle(Palette.inkFaint)
+                        .textCase(.uppercase)
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Kbd("esc")
+                        Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    }
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(rows, id: \.0) { key, value in
+                            HStack(alignment: .top, spacing: 10) {
+                                Text(key)
+                                    .font(Typo.mono(10))
+                                    .foregroundStyle(Palette.inkFaintest)
+                                    .frame(width: 150, alignment: .leading)
+                                Text(value)
+                                    .font(Typo.mono(10))
+                                    .foregroundStyle(Palette.inkDim)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 420)
+            }
+        }
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "close", allowInInput: true) { onClose() }
+        ])
+    }
+}
