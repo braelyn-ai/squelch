@@ -244,6 +244,7 @@ enum CalendarKind: String, LenientRawEnum {
 struct CalendarUpdate: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var message_id: Int
+    var thread_id: String?
     var kind: CalendarKind
     var event_title: String?
     var starts_at: String?

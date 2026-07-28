@@ -416,7 +416,7 @@ pub struct Banking {
 /// structurally incapable of representing sealed content.
 ///
 /// SERIALIZED SHAPE IS A WIRE CONTRACT: the desktop sidebar is built against
-/// exactly `{id, message_id, kind, event_title, starts_at, organizer,
+/// exactly `{id, message_id, thread_id, kind, event_title, starts_at, organizer,
 /// received_at}` — no `account_id` on purpose (the endpoint is already
 /// account-scoped). `kind` is one of "invite" | "update" | "cancellation" |
 /// "response" (see [`crate::triage::CalendarKind`]); every extracted field is
@@ -425,6 +425,9 @@ pub struct Banking {
 pub struct CalendarUpdate {
     pub id: i64,
     pub message_id: i64,
+    /// The message's thread — lets the client open the email directly in the
+    /// thread viewer (same click behavior as the attention rows).
+    pub thread_id: String,
     pub kind: String,
     pub event_title: Option<String>,
     pub starts_at: Option<DateTime<Utc>>,

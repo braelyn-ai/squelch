@@ -695,11 +695,14 @@ pub struct CalendarQuery {
 
 /// WIRE CONTRACT (the desktop sidebar is built against exactly this): a JSON
 /// array, newest-received first, of
-/// `{id, message_id, kind, event_title, starts_at, organizer, received_at}`
-/// where `kind` is "invite" | "update" | "cancellation" | "response" and every
-/// extracted field is nullable. The serialized shape is
+/// `{id, message_id, thread_id, kind, event_title, starts_at, organizer,
+/// received_at}` where `kind` is "invite" | "update" | "cancellation" |
+/// "response" and every extracted field is nullable. The serialized shape is
 /// [`squelch_core::types::CalendarUpdate`] — change that type and you change
-/// the contract.
+/// the contract. `thread_id` is the joined message's thread, so the client can
+/// open the mail instead of jumping to the mail page. Sealed mail can never
+/// produce a calendar row (structural, like receipts/banking), so no sealed
+/// filtering is applied here.
 pub async fn get_calendar(
     State(state): State<ApiState>,
     Query(q): Query<CalendarQuery>,

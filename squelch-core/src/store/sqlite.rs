@@ -2169,28 +2169,33 @@ impl Store for SqliteStore {
         // never runs on sealed mail).
         let since = (Utc::now() - chrono::Duration::hours(hours as i64)).to_rfc3339();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, kind, event_title, starts_at, organizer, received_at
-             FROM calendar_updates
-             WHERE account_id=?1 AND received_at >= ?2
-             ORDER BY received_at DESC",
+            "SELECT c.id, c.message_id, m.thread_id, c.kind, c.event_title, c.starts_at,
+                    c.organizer, c.received_at
+             FROM calendar_updates c
+             JOIN messages m ON m.id = c.message_id
+             WHERE c.account_id=?1 AND c.received_at >= ?2
+             ORDER BY c.received_at DESC",
         )?;
         let rows = stmt.query_map(params![account_id, since], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
-                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, message_id, kind, event_title, starts_at, organizer, received_at) = row?;
+            let (id, message_id, thread_id, kind, event_title, starts_at, organizer, received_at) =
+                row?;
             out.push(CalendarUpdate {
                 id,
                 message_id,
+                thread_id,
                 kind,
                 event_title,
                 starts_at: starts_at.as_deref().map(parse_dt).transpose()?,
@@ -5344,6 +5349,9 @@ mod tests {
         let items = store.list_calendar_updates(acct, 24).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].message_id, id);
+        // The joined thread is what the rail clicks through to; without it the
+        // row can only jump to the mail page.
+        assert_eq!(items[0].thread_id, "t-g-cal1");
         assert_eq!(items[0].kind, "invite");
         assert_eq!(items[0].event_title.as_deref(), Some("Design review"));
         assert_eq!(

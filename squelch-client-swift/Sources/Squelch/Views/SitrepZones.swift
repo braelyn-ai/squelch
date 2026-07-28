@@ -31,7 +31,7 @@ struct CalendarZone: View {
                 VStack(spacing: 1) {
                     ForEach(rows) { c in
                         Button {
-                            store.viewInEmails(c.message_id)
+                            open(c)
                         } label: {
                             HStack(spacing: 7) {
                                 Text(c.event_title ?? c.organizer ?? "calendar event")
@@ -61,6 +61,17 @@ struct CalendarZone: View {
 
     private func tagTone(_ kind: CalendarKind) -> Color {
         kind == .cancellation ? Palette.danger : Palette.inkFaint
+    }
+
+    /// thread_id shipped after the calendar wire type — a daemon that predates it
+    /// sends rows without one. Fall back to the emails-page jump so the click
+    /// always does SOMETHING.
+    private func open(_ c: CalendarUpdate) {
+        if let tid = c.thread_id, !tid.isEmpty {
+            store.openThread(tid)
+        } else {
+            store.viewInEmails(c.message_id)
+        }
     }
 
     /// Compact when-column: time if the event is today, short date otherwise.

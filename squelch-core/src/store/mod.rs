@@ -624,9 +624,10 @@ pub trait Store: Send + Sync {
     ) -> Result<i64>;
 
     /// List calendar updates for the account RECEIVED within the last `hours`
-    /// (mail arrival window, NOT event start time), newest-received first.
-    /// Sealed rows are structurally absent (never inserted), so no sealed
-    /// filter is required.
+    /// (mail arrival window, NOT event start time), newest-received first,
+    /// each carrying its message's `thread_id` (joined) so the client can open
+    /// the mail. Sealed rows are structurally absent (never inserted), so no
+    /// sealed filter is required.
     fn list_calendar_updates(
         &self,
         account_id: AccountId,
