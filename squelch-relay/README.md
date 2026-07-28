@@ -135,9 +135,11 @@ only secret.
   probably — multi-device fan-out belongs in one request.)
 - **Sandbox vs production APNs** routing — per-request flag or per-deployment?
 - **Mac over APNs too?** Native macOS apps can register for remote
-  notifications, so the relay could someday serve the Mac client through the
-  same door (e.g. a Mac App Store build without residency assumptions). SSE
-  stays the local-first default; this is a distribution-era option, not a plan.
+  notifications — no App Store required, but it does require Developer ID
+  signing with a push-entitled provisioning profile (ad-hoc bundles can't get
+  an APNs token), and Developer ID profiles only get the *production* APNs
+  environment. SSE stays the local-first default; this is a distribution-era
+  option, not a plan.
 
 ## Rejected alternatives
 
