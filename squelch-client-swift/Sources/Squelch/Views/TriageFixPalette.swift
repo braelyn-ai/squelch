@@ -138,6 +138,7 @@ struct TriageFixPalette: View {
                         ForEach(Array(hits.enumerated()), id: \.element.id) { i, hit in
                             TargetRow(
                                 target: hit, selected: i == selection,
+                                glassNamespace: paletteGlass,
                                 onHover: { selection = i },
                                 onPick: { Task { await apply(hit) } })
                             .id(hit.id)
@@ -214,6 +215,7 @@ struct TriageFixPalette: View {
 private struct TargetRow: View {
     let target: TriageTarget
     let selected: Bool
+    let glassNamespace: Namespace.ID
     let onHover: () -> Void
     let onPick: () -> Void
 
@@ -245,10 +247,9 @@ private struct TargetRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(selected ? Palette.accentSoft : .clear)
-        )
+        .selectionGlass(
+            selected, tint: axisTone, cornerRadius: 9,
+            id: "palette-selection", in: glassNamespace)
         .onHover { if $0 { onHover() } }
     }
 }

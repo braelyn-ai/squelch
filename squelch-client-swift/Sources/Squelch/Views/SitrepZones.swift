@@ -598,3 +598,152 @@ struct RecordRowStyle: ButtonStyle {
             .onHover { hovering = $0 }
     }
 }
+
+// MARK: - marketing
+
+/// MARKETING — promotions the specialist extractor pulled out of marketing mail:
+/// brand, what the offer actually is, the headline discount, a promo code, and
+/// an expiry. Clicking a row opens the email.
+///
+/// THERE IS DELIBERATELY NO LINK HERE, and that is a security property, not an
+/// omission. `MarketingOffer` carries no url by design: asking a model to emit a
+/// URL derived from untrusted email content, which the client then renders as
+/// clickable, is a prompt-injection lever — a hostile email could steer it and
+/// squelch would be the one presenting the result. The email's REAL links are
+/// reachable by opening it, where they are extracted from the sanitized html and
+/// re-guarded to http(s). Every string below renders as TEXT only.
+struct MarketingZone: View {
+    @Environment(AppStore.self) private var store
+    @State private var offers: [MarketingOffer] = []
+    @State private var expanded = false
+
+    /// Rows shown before the quiet expander — same pattern as For-your-eyes.
+    private static let visible = 6
+
+    private var rows: [MarketingOffer] {
+        expanded ? offers : Array(offers.prefix(Self.visible))
+    }
+
+    var body: some View {
+        // Hidden entirely when there is nothing to show — a left-column zone,
+        // so it follows the left column's hide-when-empty rule (unlike the
+        // right rail, which always keeps its cards).
+        Group {
+            if !offers.isEmpty {
+                ZoneCard(
+                    symbol: "tag", title: "Offers", count: offers.count,
+                    subtitle: "extracted from marketing mail", tint: Palette.warn
+                ) {
+                    VStack(spacing: 1) {
+                        ForEach(rows, id: \.message_id) { offer in
+                            OfferRow(offer: offer) { store.openThread(offer.thread_id) }
+                        }
+                        if offers.count > Self.visible {
+                            Button {
+                                withAnimation(.smooth(duration: 0.28)) { expanded.toggle() }
+                            } label: {
+                                Text(
+                                    expanded
+                                        ? "show less" : "\(offers.count - Self.visible) more"
+                                )
+                                .font(Typo.micro)
+                                .foregroundStyle(Palette.inkFaint)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 4)
+                            }
+                            .buttonStyle(.glass)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 6)
+                        }
+                    }
+                }
+            }
+        }
+        // Best-effort: an older daemon has no /client/marketing, in which case
+        // the zone simply never appears.
+        .task { offers = (try? await APIClient.shared.getMarketing()) ?? [] }
+    }
+}
+
+private struct OfferRow: View {
+    let offer: MarketingOffer
+    let onOpen: () -> Void
+
+    @State private var hovering = false
+
+    /// Brand, falling back to a clean sender display name.
+    private var brand: String {
+        if let brand = offer.brand, !brand.isEmpty { return brand }
+        return SenderID.displayName(offer.sender)
+    }
+
+    /// Expiry chip; "expires today"/"expired" read louder than a bare date.
+    private var expiryChip: (text: String, urgent: Bool)? {
+        guard let expires = offer.expires_at, let date = Fmt.date(expires) else { return nil }
+        if date < Date() { return ("expired", true) }
+        if Fmt.isToday(expires) { return ("ends today", true) }
+        return ("through \(Fmt.shortDate(expires))", false)
+    }
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 9) {
+                Avatar(sender: offer.sender, size: 22)
+                Text(brand)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(1)
+                    .frame(minWidth: 78, idealWidth: 120, maxWidth: 150, alignment: .leading)
+                    .layoutPriority(2)
+
+                // The offer line, else the subject — both are email-derived and
+                // rendered as plain text.
+                Text(offer.offer ?? offer.subject)
+                    .font(Typo.rowSub)
+                    .foregroundStyle(Palette.inkDim)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if let discount = offer.discount, !discount.isEmpty {
+                    Text(discount)
+                        .font(Typo.num(11, weight: .semibold))
+                        .foregroundStyle(Palette.warn)
+                        .layoutPriority(3)
+                }
+                if let code = offer.code, !code.isEmpty {
+                    // Shape-validated server-side; never a sentence or a URL.
+                    Text(code)
+                        .font(Typo.mono(10, weight: .medium))
+                        .foregroundStyle(Palette.accent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .strokeBorder(
+                                    Palette.accent.opacity(0.4), style: StrokeStyle(
+                                        lineWidth: 0.75, dash: [3, 2]))
+                        )
+                        .layoutPriority(3)
+                        .help("promo code")
+                }
+                if let expiryChip {
+                    Chip(
+                        text: expiryChip.text,
+                        tone: expiryChip.urgent ? Palette.danger : Palette.inkFaintest,
+                        filled: expiryChip.urgent)
+                    .layoutPriority(3)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(hovering ? Palette.warnSoft.opacity(0.5) : .clear)
+        )
+        .onHover { hovering = $0 }
+    }
+}

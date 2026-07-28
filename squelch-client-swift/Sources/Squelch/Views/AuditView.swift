@@ -20,6 +20,7 @@ import SwiftUI
 
 struct AuditView: View {
     @Environment(AppStore.self) private var store
+    @Namespace private var auditGlass
 
     @State private var entries: [AuditEntry] = []
     @State private var error: String?
@@ -50,15 +51,18 @@ struct AuditView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
+                        GlassEffectContainer(spacing: 2) {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(rows.enumerated()), id: \.element.id) { i, entry in
                                 AuditRow(
+                                    glassNamespace: auditGlass,
                                     entry: entry, selected: i == index,
                                     undo: Self.undoFor(entry),
                                     onSelect: { index = i },
                                     onUndo: { Task { await performUndo(entry) } })
                                 .id(entry.id)
                             }
+                        }
                         }
                         .padding(.horizontal, 18)
                         .padding(.vertical, 10)
@@ -218,6 +222,7 @@ struct AuditView: View {
 }
 
 private struct AuditRow: View {
+    let glassNamespace: Namespace.ID
     let entry: AuditEntry
     let selected: Bool
     let undo: AuditView.UndoSpec?
@@ -288,12 +293,9 @@ private struct AuditRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(
-                    selected
-                        ? Palette.accentSoft : (hovering ? Palette.hairline.opacity(0.5) : .clear))
-        )
+        .selectionGlass(
+            selected, hovering: hovering, cornerRadius: 8,
+            id: "audit-selection", in: glassNamespace)
         .onHover { hovering = $0 }
     }
 }

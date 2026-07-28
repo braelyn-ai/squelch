@@ -33,9 +33,22 @@ struct ActionLayer: View {
         ZStack(alignment: .bottomLeading) {
             // Toast stack — bottom-left, above every fullscreen surface, so an
             // undo is never buried by the email it was fired from.
-            toastStack
-                .padding(.leading, 74)
-                .padding(.bottom, 18)
+            //
+            // Spacers + fixedSize are load-bearing, not tidiness: a
+            // GlassEffectContainer expands to the size it is offered, so an
+            // unconstrained one here became an invisible full-window pane that
+            // swallowed every scroll and click in the app. Sizing it to its
+            // content means only the toasts themselves are hit-testable, and
+            // Spacers never take hits.
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                HStack(spacing: 0) {
+                    toastStack.fixedSize()
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(.leading, 74)
+            .padding(.bottom, 18)
 
             if store.compose != nil { ComposeReview() }
             if let request = store.ruleEditor {
@@ -50,7 +63,6 @@ struct ActionLayer: View {
             if store.shortcutsOpen { ShortcutsOverlay { store.shortcutsOpen = false } }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-        .allowsHitTesting(hasInteractiveOverlay)
         .keyBindings(.list, [
             KeyBinding("t", "tune sender") {
                 if let u = store.selectedUpdate { Actions.tune(sender: u.sender) }
@@ -59,15 +71,6 @@ struct ActionLayer: View {
         ])
         // Re-scan for unsubscribe violations whenever the read model ticks.
         .task(id: store.lastRefresh) { await scanViolations() }
-    }
-
-    /// The layer is click-through except where something is actually shown —
-    /// otherwise an invisible full-window ZStack would eat every click.
-    private var hasInteractiveOverlay: Bool {
-        store.compose != nil || store.ruleEditor != nil || store.processModeOpen
-            || !store.authQueue.isEmpty || store.triageFix != nil || store.askBarOpen
-            || store.shortcutsOpen || !store.toasts.isEmpty || !store.undos.isEmpty
-            || blockPrompt != nil
     }
 
     // MARK: - toasts

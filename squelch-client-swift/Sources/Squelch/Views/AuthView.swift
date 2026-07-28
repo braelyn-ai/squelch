@@ -24,6 +24,7 @@ import SwiftUI
 
 struct AuthView: View {
     @Environment(AppStore.self) private var store
+    @Namespace private var authGlass
 
     /// Anything newer than this counts as LIVE and heads the list.
     private static let liveWindow: TimeInterval = 60 * 60
@@ -174,9 +175,11 @@ struct AuthView: View {
                 }
 
                 ScrollViewReader { proxy in
-                    VStack(spacing: 1) {
-                        section("Live · last hour", rows: live)
-                        section("Archive", rows: archive)
+                    GlassEffectContainer(spacing: 2) {
+                        VStack(spacing: 1) {
+                            section("Live · last hour", rows: live)
+                            section("Archive", rows: archive)
+                        }
                     }
                     .onChange(of: index) { _, i in
                         guard let m = shown[safe: i] else { return }
@@ -204,6 +207,7 @@ struct AuthView: View {
             ForEach(rows) { m in
                 let i = shown.firstIndex(of: m) ?? 0
                 AuthRow(
+                    glassNamespace: authGlass,
                     meta: m, selected: i == index, code: codes[m.id] ?? nil,
                     onSelect: { index = i },
                     onOpen: { Task { await reveal(m) } })
@@ -488,6 +492,7 @@ private struct FocusPanel: View {
 // MARK: - rows
 
 private struct AuthRow: View {
+    let glassNamespace: Namespace.ID
     let meta: SealedMeta
     let selected: Bool
     let code: String?
@@ -532,12 +537,9 @@ private struct AuthRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(
-                    selected
-                        ? Palette.lockSoft : (hovering ? Palette.hairline.opacity(0.5) : .clear))
-        )
+        .selectionGlass(
+            selected, hovering: hovering, tint: Palette.lock, cornerRadius: 8,
+            id: "auth-selection", in: glassNamespace)
         .onHover { hovering = $0 }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen() })
     }

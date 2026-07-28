@@ -53,35 +53,45 @@ struct SitrepView: View {
     var body: some View {
         VStack(spacing: 0) {
             masthead
-            ScrollView {
-                GlassEffectContainer(spacing: 22) {
-                    VStack(alignment: .leading, spacing: 18) {
-                        DashHero(standing: store.sitrep.standing)
-                            .padding(.horizontal, 4)
+            // ONE scroll surface for the dashboard. The GlassEffectContainers
+            // live INSIDE, one per column: a container sizes itself to what it
+            // is offered, so wrapping the entire scrollable body in one gave
+            // the ScrollView a content height it could not scroll. Per-column
+            // containers are also where merging actually reads — glass merging
+            // across a whole scrolling page is not a thing anyone can perceive.
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 18) {
+                    DashHero(standing: store.sitrep.standing)
+                        .padding(.horizontal, 4)
 
-                        HStack(alignment: .top, spacing: 18) {
+                    HStack(alignment: .top, spacing: 18) {
+                        GlassEffectContainer(spacing: 16) {
                             VStack(spacing: 16) {
                                 if !store.sitrep.standing.isEmpty { forYourEyes }
                                 if !store.sitrep.new.isEmpty { attentionZone }
+                                MarketingZone()
                                 NewslettersZone(
                                     newsletters: $newsletters,
                                     hovered: $hoveredNewsletter)
                                 StatusStrip(rulesCount: rulesCount)
                             }
-                            .frame(maxWidth: .infinity, alignment: .top)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .top)
 
+                        GlassEffectContainer(spacing: 14) {
                             VStack(spacing: 14) {
                                 CalendarZone()
                                 ShipmentsZone()
                                 BankingZone()
                                 ReceiptsZone()
                             }
-                            .frame(width: 306)
                         }
+                        .frame(width: 306)
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 28)
                 }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 28)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .keyContext(.sitrep)
@@ -165,11 +175,13 @@ struct SitrepView: View {
         ZoneCard(
             symbol: "eye", title: "For your eyes", count: store.sitrep.standing.count
         ) {
+            GlassEffectContainer(spacing: 2) {
             VStack(spacing: 1) {
                 ForEach(Array(visibleEyes.enumerated()), id: \.element.id) { i, u in
                     ObligationRow(
                         update: u,
                         focused: i == eyesIndex,
+                        glassNamespace: zoneGlass,
                         onHover: { eyesIndex = i },
                         onOpen: {
                             eyesIndex = i
@@ -190,6 +202,7 @@ struct SitrepView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 6)
                 }
+            }
             }
         }
     }
@@ -355,6 +368,7 @@ private struct DashHero: View {
 private struct ObligationRow: View {
     let update: AttentionUpdate
     let focused: Bool
+    let glassNamespace: Namespace.ID
     let onHover: () -> Void
     let onOpen: () -> Void
 
@@ -416,12 +430,11 @@ private struct ObligationRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background {
-            if focused {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(overdue ? Palette.dangerSoft : Palette.accentSoft)
-            }
-        }
+        // The focused row is glass, tinted by urgency — overdue items carry the
+        // danger tint IN the material rather than as a flat wash on top of it.
+        .selectionGlass(
+            focused, tint: overdue ? Palette.danger : Palette.accent,
+            id: "eyes-selection", in: glassNamespace)
         .overlay(alignment: .leading) {
             if overdue {
                 RoundedRectangle(cornerRadius: 1)

@@ -48,7 +48,7 @@ material is AppKit's own.
 | `.tint(_:)` | brand + tier tints on glass | Carries squelch blue **into** the material instead of painting a blue box on a grey one; semantic surfaces tint with their tier color |
 | `.interactive()` | rail item, buttons, toasts | Material responds to press/hover |
 | `GlassEffectContainer` | sidebar rail, sitrep body, toast stack, ⌘K bar, triage palette | Adjacent glass **merges and separates fluidly** — the signature behavior with no web equivalent |
-| `.glassEffectID(_:in:)` + `@Namespace` | rail active indicator, ask bar, triage palette | Matched-geometry glass: the active capsule **flows** between rail icons; the palette **stretches** as its list narrows |
+| `.glassEffectID(_:in:)` + `@Namespace` | rail active indicator, **every list selection**, ask bar, triage palette | Matched-geometry glass: the active capsule **flows** between rail icons; the selection material **travels** row-to-row in the inbox / sitrep / auth / rules / audit / browse / palette instead of cross-fading; the palette **stretches** as its list narrows |
 | `.buttonStyle(.glass)` / `.glassProminent` | every control in the app | No hand-rolled button backgrounds anywhere |
 | `NSVisualEffectView` (`.underWindowBackground`) | `WindowBackdrop` | The layer the whole language sits on; window is non-opaque so glass has real content to refract |
 
@@ -70,7 +70,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 
 | View | Status | Notes |
 | --- | --- | --- |
-| Sitrep dashboard | **done** | Editorial hero (serif, spelled counts, greeting + name), For-your-eyes ranked list w/ in-place expander, Attention aggregate + deduped sender chips, Newsletters, status strip |
+| Sitrep dashboard | **done** | Editorial hero (serif, spelled counts, greeting + name), For-your-eyes ranked list w/ in-place expander, Attention aggregate + deduped sender chips, Offers, Newsletters, status strip |
 | Sitrep right rail | **done** | Calendar · Shipments · Banking · Receipts, each with its empty state (the rail never disappears) |
 | Emails band list | **done** | Flat inbox, newest-first, importance meter, hover/keyboard selection model |
 | Auth | **done** | In-focus panel w/ digit boxes, filter chips, Live/Archive sections, decision rail, shredder card |
@@ -256,6 +256,14 @@ These are improvements or native-platform equivalents, not gaps:
    actually succeeded.
 10. **Theme sync needs no pub/sub.** The web build hand-rolled a listener set so
     every mount tracked the theme; `@Observable` gives that for free.
+11. **An "Offers" zone** on the sitrep, surfacing `/client/marketing` extractions
+    (brand · offer · discount · promo code · expiry). The web build fetched that
+    route only to qualify newsletters and never showed the offers themselves.
+    It renders NO link, deliberately: `MarketingOffer` carries no url because a
+    model-emitted, email-derived URL rendered as clickable is a prompt-injection
+    lever. Clicking a row opens the email, where real links are extracted from
+    sanitized html and re-guarded. Hidden while the extractor has produced
+    nothing (currently 0 offers on this daemon).
 
 ---
 
@@ -286,3 +294,30 @@ These are improvements or native-platform equivalents, not gaps:
 4. **`xcodebuild` is unreliable on this machine** (see Build). `build.sh` is the
    supported path; the `.xcodeproj` is kept in sync for when the toolchain is
    repaired.
+
+---
+
+## Fixed after first review
+
+- **Scrolling was dead.** Two independent causes, both now fixed: (a) the
+  action layer's `GlassEffectContainer` was unconstrained, so it expanded to an
+  invisible full-window pane that swallowed every scroll and click — it is now
+  sized to its content with Spacers, and hit-testing is structural rather than a
+  boolean; (b) `WKWebView` swallowed the wheel over every email body, so the
+  thread viewer would not scroll whenever the pointer was over mail — a
+  `PassthroughWebView` now forwards the wheel to the SwiftUI ScrollView that
+  owns the column.
+- **The Newsletters zone looked missing.** It derives correctly (33 cards
+  against the live daemon); it sits below the fold and was unreachable while
+  scrolling was broken.
+- **Caching genuinely did not work.** Every email view got its OWN
+  `WKWebsiteDataStore.nonPersistent()` — which mints a new store per call — so
+  no image was ever cached and reopening mail was as slow as the first open.
+  All email views now share one ephemeral store: caching works, nothing touches
+  disk, no cookie jar survives the app.
+- **Pre-warming had a hole.** The inbox warmed only a bounded head prefix, so
+  anything past row 40 was always a cold open. A debounced per-row warmer now
+  covers the row the cursor or keyboard actually rests on.
+- **Scroll jank.** `EmailWebView` re-ran tracker stripping and link extraction
+  on every body evaluation — a full regex scan of every message on every frame.
+  Now computed once per content change.

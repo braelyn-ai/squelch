@@ -84,6 +84,40 @@ extension View {
     func zonePadding() -> some View {
         padding(.horizontal, 16).padding(.vertical, 14)
     }
+
+    /// THE SELECTION MATERIAL for a list row.
+    ///
+    /// Only the selected row carries glass, and every row in a list shares ONE
+    /// `glassEffectID`, so moving the cursor makes the material physically FLOW
+    /// from row to row inside the list's `GlassEffectContainer` rather than
+    /// fading out here and in there. That travel is the single clearest
+    /// demonstration of the real material in a dense list — and it is precisely
+    /// what a CSS `background-color` swap cannot do.
+    ///
+    /// Unselected rows get a cheap hover wash instead: putting glass on 500
+    /// simultaneous rows would be both illegible and slow.
+    @ViewBuilder
+    func selectionGlass(
+        _ selected: Bool,
+        hovering: Bool = false,
+        tint: Color = Palette.accent,
+        cornerRadius: CGFloat = 9,
+        id: String,
+        in namespace: Namespace.ID
+    ) -> some View {
+        if selected {
+            self.glassEffect(
+                .regular.tint(tint.opacity(0.28)).interactive(),
+                in: .rect(cornerRadius: cornerRadius, style: .continuous)
+            )
+            .glassEffectID(id, in: namespace)
+        } else {
+            self.background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(hovering ? Palette.hairline.opacity(0.55) : .clear)
+            )
+        }
+    }
 }
 
 // MARK: - zone card

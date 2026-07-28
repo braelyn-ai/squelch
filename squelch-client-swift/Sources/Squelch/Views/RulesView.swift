@@ -13,6 +13,7 @@ import SwiftUI
 
 struct RulesView: View {
     @Environment(AppStore.self) private var store
+    @Namespace private var rulesGlass
 
     @State private var rules: [SenderRule] = []
     @State private var error: String?
@@ -52,15 +53,18 @@ struct RulesView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
+                        GlassEffectContainer(spacing: 2) {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(rules.enumerated()), id: \.element.id) { i, rule in
                                 RuleRow(
+                                    glassNamespace: rulesGlass,
                                     rule: rule, selected: i == index,
                                     matchCount: matchCounts[rule.id] ?? 0,
                                     onSelect: { index = i },
                                     onEdit: { edit(rule) })
                                 .id(rule.id)
                             }
+                        }
                         }
                         .padding(.horizontal, 18)
                         .padding(.vertical, 10)
@@ -176,6 +180,7 @@ final class RulesReload {
 }
 
 private struct RuleRow: View {
+    let glassNamespace: Namespace.ID
     let rule: SenderRule
     let selected: Bool
     let matchCount: Int
@@ -227,12 +232,9 @@ private struct RuleRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(
-                    selected
-                        ? Palette.accentSoft : (hovering ? Palette.hairline.opacity(0.5) : .clear))
-        )
+        .selectionGlass(
+            selected, hovering: hovering, cornerRadius: 8,
+            id: "rules-selection", in: glassNamespace)
         .onHover { hovering = $0 }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onEdit() })
     }

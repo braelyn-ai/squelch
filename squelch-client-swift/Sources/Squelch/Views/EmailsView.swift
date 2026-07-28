@@ -20,6 +20,7 @@ import SwiftUI
 
 struct EmailsView: View {
     @Environment(AppStore.self) private var store
+    @Namespace private var listGlass
 
     /// One generous page — the read model is local, this is cheap.
     private static let fetchLimit = 500
@@ -46,7 +47,10 @@ struct EmailsView: View {
             header
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 1) {
+                    // One container so the selected row's glass travels within
+                    // the list instead of cross-fading between positions.
+                    GlassEffectContainer(spacing: 2) {
+                        LazyVStack(spacing: 1) {
                         if let error {
                             BandNote(error)
                         } else if items == nil {
@@ -58,6 +62,7 @@ struct EmailsView: View {
                                 UpdateRow(
                                     update: u,
                                     selected: kbActive && i == index,
+                                    glassNamespace: listGlass,
                                     onHover: {
                                         // A hover must NOT follow-scroll: hovering a
                                         // row near the viewport edge would jump the
@@ -70,6 +75,7 @@ struct EmailsView: View {
                                 )
                                 .id(u.id)
                             }
+                        }
                         }
                     }
                     .padding(.horizontal, 18)
@@ -87,6 +93,17 @@ struct EmailsView: View {
         }
         .keyBindings(.list, bindings)
         .task(id: store.lastRefresh) { await load() }
+        // INSTANT-OPEN warmer: pull the thread for the row the cursor (or the
+        // keyboard selection) actually rests on. Debounced, so sweeping the
+        // mouse down a 500-row list fires one request for the row you stop on
+        // rather than one per row you pass over. The bounded head-warm above
+        // covers the first screenfuls; this covers everything past them.
+        .task(id: selected?.id) {
+            guard let u = selected else { return }
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            ThreadPrefetch.shared.prefetch(u.thread_id)
+        }
         .onChange(of: rows.count) { _, count in
             index = max(0, min(index, count - 1))
         }

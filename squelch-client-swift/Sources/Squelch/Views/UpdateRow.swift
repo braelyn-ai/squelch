@@ -10,6 +10,8 @@ import SwiftUI
 struct UpdateRow: View {
     let update: AttentionUpdate
     let selected: Bool
+    /// Shared with every row in the list so the selection material FLOWS.
+    let glassNamespace: Namespace.ID
     /// STILL OPEN band: escalating left-rail weight + age note.
     var aging = false
     /// 0..1 escalation weight for the STILL OPEN visual ramp.
@@ -102,13 +104,9 @@ struct UpdateRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(
-                    selected
-                        ? Palette.accentSoft
-                        : (hovering ? Palette.hairline.opacity(0.55) : .clear))
-        }
+        .selectionGlass(
+            selected, hovering: hovering, cornerRadius: 8,
+            id: "inbox-selection", in: glassNamespace)
         .overlay(alignment: .leading) {
             if showAgeBadge {
                 // Heavier rail as the item rots.

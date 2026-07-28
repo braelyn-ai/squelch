@@ -66,14 +66,36 @@ struct EmailWebView: View {
     @State private var quotedHidden = true
     @State private var measured = false
 
-    /// Strip tracking pixels before render; keep the count for the passive chip.
-    private var stripped: StripResult { Trackers.strip(html) }
-    private var allowRemote: Bool { prefs.loadRemoteImages || optedIn }
-    /// Counts CSS url() too, not just <img src> — mail whose art is all
-    /// inline-style backgrounds still gets the per-email opt-in bar.
-    private var hasRemoteCandidates: Bool { Trackers.hasNetworkImages(stripped.html) }
+    /// The tracker-strip + link-extraction pass, computed ONCE per html string.
+    ///
+    /// These were computed as `var`s off `html` on every body evaluation, which
+    /// meant a full regex scan of every message body in the thread on every
+    /// single scroll frame — enough to make the whole viewer feel locked up.
+    /// `Prepared` is cached by content so scrolling costs nothing.
+    @State private var prepared: Prepared = .empty
 
-    private var links: [EmailLink] { Trackers.extractLinks(stripped.html) }
+    struct Prepared: Equatable {
+        var sourceHash: Int
+        var html: String
+        var blocked: Int
+        var hasRemoteCandidates: Bool
+        var links: [EmailLink]
+
+        static let empty = Prepared(
+            sourceHash: 0, html: "", blocked: 0, hasRemoteCandidates: false, links: [])
+
+        static func make(from html: String) -> Prepared {
+            let stripped = Trackers.strip(html)
+            return Prepared(
+                sourceHash: html.hashValue,
+                html: stripped.html,
+                blocked: stripped.blocked,
+                hasRemoteCandidates: Trackers.hasNetworkImages(stripped.html),
+                links: Trackers.extractLinks(stripped.html))
+        }
+    }
+
+    private var allowRemote: Bool { prefs.loadRemoteImages || optedIn }
     private static let maxLinks = 8
 
     /// Frame height shown before the first successful measurement.
@@ -84,7 +106,7 @@ struct EmailWebView: View {
             imageBar
 
             EmailWebViewRepresentable(
-                html: stripped.html,
+                html: prepared.html,
                 allowRemote: allowRemote,
                 collapseQuotes: quotedHidden,
                 onHeight: { h in
@@ -125,6 +147,10 @@ struct EmailWebView: View {
                 height = remembered
             }
         }
+        // Prepare once per content change, never per render.
+        .task(id: html) {
+            if prepared.sourceHash != html.hashValue { prepared = Prepared.make(from: html) }
+        }
     }
 
     private var rememberedHeight: CGFloat? { cacheKey.flatMap { FrameHeights.shared.get($0) } }
@@ -134,7 +160,7 @@ struct EmailWebView: View {
 
     @ViewBuilder
     private var imageBar: some View {
-        if !allowRemote && hasRemoteCandidates {
+        if !allowRemote && prepared.hasRemoteCandidates {
             Button {
                 optedIn = true
             } label: {
@@ -147,9 +173,9 @@ struct EmailWebView: View {
             .foregroundStyle(Palette.inkFaint)
             .help(
                 "remote images are off by default (Settings → Mail); load them for this email only")
-        } else if stripped.blocked > 0 {
+        } else if prepared.blocked > 0 {
             Label(
-                "\(stripped.blocked) tracker\(stripped.blocked == 1 ? "" : "s") blocked",
+                "\(prepared.blocked) tracker\(prepared.blocked == 1 ? "" : "s") blocked",
                 systemImage: "eye.slash"
             )
             .font(Typo.micro)
@@ -165,7 +191,7 @@ struct EmailWebView: View {
 
     @ViewBuilder
     private var linkRow: some View {
-        let shown = Array(links.prefix(Self.maxLinks))
+        let shown = Array(prepared.links.prefix(Self.maxLinks))
         if !shown.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
                 Text("links open externally")
@@ -186,8 +212,8 @@ struct EmailWebView: View {
                         .foregroundStyle(Palette.accent)
                         .help(link.href)
                     }
-                    if links.count > shown.count {
-                        Text("+\(links.count - shown.count) more")
+                    if prepared.links.count > shown.count {
+                        Text("+\(prepared.links.count - shown.count) more")
                             .font(Typo.micro)
                             .foregroundStyle(Palette.inkFaintest)
                             .padding(.vertical, 4)
@@ -201,6 +227,21 @@ struct EmailWebView: View {
 
 // MARK: - the webview itself
 
+/// A WKWebView that does NOT eat the scroll wheel.
+///
+/// Each message is sized to its exact content and its document is
+/// `overflow: hidden`, so the web view has nothing of its own to scroll — but it
+/// still swallowed every wheel event that landed on it, which meant the thread
+/// viewer simply would not scroll while the pointer was over an email body
+/// (i.e. almost always). Forwarding to the next responder hands the gesture to
+/// the SwiftUI ScrollView that owns the column, which is the single intended
+/// scroll surface.
+private final class PassthroughWebView: WKWebView {
+    override func scrollWheel(with event: NSEvent) {
+        nextResponder?.scrollWheel(with: event)
+    }
+}
+
 private struct EmailWebViewRepresentable: NSViewRepresentable {
     let html: String
     let allowRemote: Bool
@@ -213,6 +254,18 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         Coordinator(onHeight: onHeight, onQuotedFound: onQuotedFound, onLink: onLink)
     }
 
+    /// ONE ephemeral data store shared by every email view.
+    ///
+    /// `WKWebsiteDataStore.nonPersistent()` mints a BRAND NEW store per call, so
+    /// giving each message its own meant nothing was ever cached: every image in
+    /// every message re-fetched from the network on every open, and re-opening
+    /// the same mail was as slow as the first time. Sharing one store restores
+    /// the URL cache (and lets messages from the same CDN warm each other) while
+    /// keeping the property that actually matters — non-persistent, so nothing
+    /// touches disk and no cookie jar survives the app.
+    @MainActor
+    private static let sharedDataStore: WKWebsiteDataStore = .nonPersistent()
+
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
 
@@ -220,7 +273,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         // Our injected user script is governed separately and still runs.
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         // LAYER 5: no cookie jar, no persistent storage, nothing survives close.
-        config.websiteDataStore = .nonPersistent()
+        config.websiteDataStore = Self.sharedDataStore
         config.suppressesIncrementalRendering = true
 
         let controller = WKUserContentController()
@@ -231,13 +284,10 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
                 forMainFrameOnly: true))
         config.userContentController = controller
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = PassthroughWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
-        // The frame never scrolls itself: it is sized to its exact content and
-        // the thread column is the single scroll surface.
-        webView.enclosingScrollView?.hasVerticalScroller = false
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
 

@@ -218,6 +218,7 @@ private struct HitRow: View {
 /// re-fetching. j/k selects, Enter opens the thread.
 struct BrowseView: View {
     @Environment(AppStore.self) private var store
+    @Namespace private var browseGlass
 
     @State private var all: [AttentionUpdate] = []
     @State private var error: String?
@@ -256,13 +257,17 @@ struct BrowseView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
+                        GlassEffectContainer(spacing: 2) {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
-                                BrowseRow(update: u, selected: i == index) { index = i } open: {
+                                BrowseRow(
+                                    update: u, selected: i == index, glassNamespace: browseGlass
+                                ) { index = i } open: {
                                     store.openThread(u.thread_id)
                                 }
                                 .id(u.id)
                             }
+                        }
                         }
                         .padding(.horizontal, 12)
                         .padding(.bottom, 14)
@@ -313,6 +318,7 @@ struct BrowseView: View {
 private struct BrowseRow: View {
     let update: AttentionUpdate
     let selected: Bool
+    let glassNamespace: Namespace.ID
     let onSelect: () -> Void
     let open: () -> Void
 
@@ -346,10 +352,9 @@ private struct BrowseRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(selected ? Palette.accentSoft : .clear)
-        )
+        .selectionGlass(
+            selected, tint: Palette.tierColor(update.tier), cornerRadius: 7,
+            id: "browse-selection", in: glassNamespace)
         .overlay(alignment: .leading) {
             if selected {
                 RoundedRectangle(cornerRadius: 1)
