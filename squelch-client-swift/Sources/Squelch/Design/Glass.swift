@@ -128,6 +128,12 @@ struct ZoneCard<Content: View>: View {
                 Text(title)
                     .font(Typo.zoneTitle)
                     .foregroundStyle(Palette.ink)
+                    // Pin the casing: SwiftUI's textCase is an ENVIRONMENT
+                    // value, so an ancestor (or a future container) could
+                    // silently uppercase every zone heading. Zone titles are
+                    // sentence case by design — the engraved uppercase voice
+                    // belongs to Settings/Usage section labels, not here.
+                    .textCase(nil)
                 if let count, count > 0 {
                     Text("\(count)")
                         .font(Typo.num(11, weight: .semibold))
@@ -228,14 +234,39 @@ struct ModalCard<Content: View>: View {
 
 // MARK: - native window backdrop
 
-/// The AppKit backdrop the whole glass language sits ON.
+/// The AppKit backdrop the whole glass language sits ON, plus the app's own
+/// tint over it.
 ///
 /// A non-opaque window over a `.underWindowBackground` visual-effect view is
 /// what lets `.glassEffect` sample real desktop content: without it the window
 /// is either an opaque slab (glass with nothing to refract) or a literal hole.
 /// This is the direct analogue of `apply_native_backdrop` in the Tauri shell,
 /// except here the glass ABOVE it is native too.
-struct WindowBackdrop: NSViewRepresentable {
+///
+/// THE SCRIM is not decoration and it is not optional. It is tuned against the
+/// HARD case — a dark, busy wallpaper behind a light-theme window — because
+/// below roughly this alpha whatever sits behind bleeds through hard enough
+/// that light mode reads as a muddy dark one with white cards floating on it.
+/// It is still a material, not a fill: blurred wallpaper shape and colour read
+/// through clearly at this alpha, and the glass above it still refracts.
+struct WindowBackdrop: View {
+    var body: some View {
+        ZStack {
+            VisualEffectBackdrop()
+            LinearGradient(
+                colors: [
+                    Color(light: 0xF7FAFD, dark: 0x0E141E).opacity(0.62),
+                    Color(light: 0xE9F1FB, dark: 0x090E17).opacity(0.68),
+                ],
+                startPoint: .top, endPoint: .bottom)
+            // A whisper of the brand blue across the whole canvas, so even the
+            // empty parts of the window belong to squelch rather than to macOS.
+            Palette.glassTint.opacity(0.35)
+        }
+    }
+}
+
+private struct VisualEffectBackdrop: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
         view.material = .underWindowBackground

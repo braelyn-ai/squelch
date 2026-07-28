@@ -501,7 +501,7 @@ private struct StatusStrip: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 10, weight: .semibold))
                         .symbolEffect(.rotate, isActive: refreshing)
-                    Text("synced \(syncedAge) ago")
+                    Text(syncedLabel)
                 }
                 .font(Typo.micro)
                 .padding(.horizontal, 9)
@@ -540,10 +540,14 @@ private struct StatusStrip: View {
         .padding(.top, 2)
     }
 
-    private var syncedAge: String {
+    /// "synced 4m ago" / "synced just now". The desktop build concatenated
+    /// unconditionally and produced the nonsense "synced now ago" whenever the
+    /// age token was "now"; the masthead already phrased it correctly, so this
+    /// matches the masthead rather than reproducing the typo.
+    private var syncedLabel: String {
         let iso = store.lastRefresh.map { ISO8601DateFormatter().string(from: $0) }
         let age = Fmt.relAge(iso ?? store.sitrep.stats?.last_surfaced_at)
-        return age.isEmpty ? "just now" : age
+        return (age.isEmpty || age == "now") ? "synced just now" : "synced \(age) ago"
     }
 }
 
