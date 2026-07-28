@@ -129,12 +129,12 @@ parts that are easy to get subtly wrong:
   reordering the stack (re-registering would let a stale surface steal keys from
   an overlay above it).
 
-Full keymap: digits 1–5 view nav · ⌘[ / ⌘] history · ⌘K ask bar · j/k/arrows ·
+Full keymap: digits 1–5 view nav · ⌘[ / ⌘] history · ⌘K ask bar · ⌘, settings · j/k/arrows ·
 Enter open · r reply · e/d done · v fix triage · t tune · p process · a browse ·
 / search · u undo · T rules · A audit · g auth · `\` theme · `?` help · Esc
 close · thread viewer h/l queue nav, u unsubscribe · rules n/e/x · browse ± noise.
 
-Menu-bar equivalents (⌘1–5, ⌘[, ⌘], ⌘K, ⌘F, ⌘R, ⌘Z) exist for discoverability;
+Menu-bar equivalents (⌘1–5, ⌘[, ⌘], ⌘K, ⌘F, ⌘R, ⌘Z, ⌘,) exist for discoverability;
 the registry remains the authority on dispatch semantics.
 
 ---

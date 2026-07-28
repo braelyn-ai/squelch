@@ -41,15 +41,19 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         }
     }
 
+    /// Rail glyph. These are the FILLED SF Symbol variants on purpose — filled
+    /// is the iOS tab-bar convention, and it reads better than hairline outlines
+    /// at rail size over a translucent, wallpaper-dependent backdrop (a 1pt
+    /// stroke competes with whatever is showing through; a solid shape doesn't).
     var symbol: String {
         switch self {
-        case .sitrep: "gauge.with.dots.needle.33percent"
-        case .emails: "envelope"
-        case .auth: "key"
-        case .rules: "slider.horizontal.3"
-        case .audit: "scroll"
-        case .usage: "waveform.path.ecg"
-        case .settings: "gearshape"
+        case .sitrep: "square.grid.2x2.fill"
+        case .emails: "envelope.fill"
+        case .auth: "key.fill"
+        case .rules: "line.3.horizontal.decrease.circle.fill"
+        case .audit: "list.bullet.rectangle.fill"
+        case .usage: "chart.bar.fill"
+        case .settings: "gearshape.fill"
         }
     }
 }

@@ -124,6 +124,11 @@ struct ZoneCard<Content: View>: View {
             HStack(spacing: 8) {
                 Image(systemName: symbol)
                     .font(.system(size: 12, weight: .semibold))
+                    // Filled, matching the rail — the app should read as one
+                    // icon system. `.fill` degrades to the base symbol for the
+                    // few glyphs that have no filled variant (e.g. calendar),
+                    // so this is safe to apply blanket.
+                    .symbolVariant(.fill)
                     .foregroundStyle(tint ?? Palette.accent)
                 Text(title)
                     .font(Typo.zoneTitle)

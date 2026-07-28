@@ -266,6 +266,7 @@ struct ShortcutsOverlay: View {
                 (["a"], "browse all mail"),
                 (["/"], "search"),
                 (["⌘K"], "ask your inbox"),
+                (["⌘,"], "settings"),
                 (["g"], "auth messages"),
                 (["T"], "rules"),
                 (["A"], "audit log"),

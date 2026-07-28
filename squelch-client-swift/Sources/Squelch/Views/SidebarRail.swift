@@ -91,7 +91,11 @@ private struct RailButton: View {
         } label: {
             ZStack {
                 Image(systemName: view.symbol)
-                    .font(.system(size: 17, weight: active ? .semibold : .regular))
+                    // iOS tab-bar sizing: a solid glyph at a single weight, with
+                    // the ACTIVE state carried by color + the glass capsule
+                    // behind it rather than by a heavier stroke.
+                    .font(.system(size: 17))
+                    .symbolVariant(.fill)
                     .foregroundStyle(active ? Palette.accent : Palette.inkDim)
                     .frame(width: 40, height: 34)
 

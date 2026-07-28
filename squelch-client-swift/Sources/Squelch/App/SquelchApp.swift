@@ -56,6 +56,14 @@ struct SquelchCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {}
 
+        // ⌘, is THE macOS settings shortcut and belongs in the app menu where
+        // every mac user already looks for it. Settings is a routed view here
+        // rather than a separate window, so this routes instead of opening one.
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") { store.setView(.settings) }
+                .keyboardShortcut(",", modifiers: .command)
+        }
+
         CommandMenu("Go") {
             ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in
                 Button(view.label) { store.setView(view) }
