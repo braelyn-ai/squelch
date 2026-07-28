@@ -30,7 +30,12 @@ struct RootView: View {
                 ConnectView()
             }
         }
-        .task { await store.loadSettings() }
+        .task {
+            // Pay WebKit's process-launch cost at boot rather than on the first
+            // email the reader opens. See EmailWebView.warmProcess.
+            EmailWebView.warmProcess()
+            await store.loadSettings()
+        }
         .onChange(of: store.connStatus) { _, status in
             if status == .connected { SitrepPoller.shared.start() } else { SitrepPoller.shared.stop() }
         }

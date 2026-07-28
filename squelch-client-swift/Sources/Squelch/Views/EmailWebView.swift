@@ -98,6 +98,30 @@ struct EmailWebView: View {
     private var allowRemote: Bool { prefs.loadRemoteImages || optedIn }
     private static let maxLinks = 8
 
+    /// Spin WebKit up BEFORE the first email is opened.
+    ///
+    /// The thread itself is already prefetched (ThreadPrefetch), so opening one
+    /// costs no network — but the FIRST WKWebView in a process still pays for
+    /// launching the content process, and that landed squarely on the first
+    /// message the reader opened. This burns that cost at boot, on a throwaway
+    /// frame that shares the real one's data store (and therefore its process
+    /// pool and URL cache), then keeps it alive so the process is not reaped.
+    ///
+    /// Idempotent, and deliberately loads NOTHING but an empty document: it is
+    /// a process warmer, not a cache.
+    @MainActor
+    static func warmProcess() {
+        guard warmFrame == nil else { return }
+        let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.allowsContentJavaScript = false
+        config.websiteDataStore = EmailWebViewRepresentable.sharedDataStore
+        let frame = WKWebView(frame: .zero, configuration: config)
+        frame.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        warmFrame = frame
+    }
+
+    @MainActor private static var warmFrame: WKWebView?
+
     /// Frame height shown before the first successful measurement.
     private static let placeholderHeight: CGFloat = 120
     /// Height used when measurement never arrives at all — generous on purpose:
@@ -277,7 +301,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
     /// keeping the property that actually matters — non-persistent, so nothing
     /// touches disk and no cookie jar survives the app.
     @MainActor
-    private static let sharedDataStore: WKWebsiteDataStore = .nonPersistent()
+    fileprivate static let sharedDataStore: WKWebsiteDataStore = .nonPersistent()
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -453,7 +477,14 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         /// content/policy change (a reload flashes an empty frame).
         private var loadedSignature: String?
         /// Set for exactly the initial load; every other navigation is refused.
-        private var allowingInitialLoad = false
+        /// Navigations WE started that have not yet been through the policy
+        /// gate. A COUNTER, not a flag: `loadHTMLString` is asynchronous, so two
+        /// loads in quick succession produce two policy callbacks racing for one
+        /// permission. With a bool, whichever arrived first consumed it and the
+        /// OTHER navigation was cancelled — and when the loser was the real
+        /// document, the frame stayed blank forever while still reporting a
+        /// height. Counting means every load we start is allowed exactly once.
+        private var pendingOwnLoads = 0
 
         init(
             onHeight: @escaping (CGFloat) -> Void, onQuotedFound: @escaping (Bool) -> Void,
@@ -465,10 +496,15 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         }
 
         func load(_ webView: WKWebView, html: String, allowRemote: Bool) {
+            // NEVER LOAD THE PLACEHOLDER. `prepared` starts empty and is filled
+            // by a `.task`, so the first body pass used to load a blank document
+            // and the real one landed as a SECOND navigation a beat later. That
+            // is what made the race below reachable at all.
+            guard !html.isEmpty else { return }
             let signature = "\(allowRemote)|\(html.hashValue)"
             guard signature != loadedSignature else { return }
             loadedSignature = signature
-            allowingInitialLoad = true
+            pendingOwnLoads += 1
             webView.loadHTMLString(
                 Self.document(html: html, allowRemote: allowRemote),
                 // A nil base URL gives the document a unique opaque origin, so
@@ -481,7 +517,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
                 "window.__squelchSetQuotes && window.__squelchSetQuotes(\(collapsed))")
         }
 
-        /// LAYER 4: allow exactly the initial in-memory load; refuse everything
+        /// LAYER 4: allow exactly the in-memory loads WE started; refuse everything
         /// else. A link click cannot navigate this view anywhere.
         ///
         /// NOTE the exact signature — the closure must be `@MainActor @Sendable`
@@ -492,8 +528,8 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
             _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
-            if allowingInitialLoad {
-                allowingInitialLoad = false
+            if pendingOwnLoads > 0 {
+                pendingOwnLoads -= 1
                 decisionHandler(.allow)
                 return
             }
