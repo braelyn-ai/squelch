@@ -129,3 +129,34 @@ struct UpdateRow: View {
         }
     }
 }
+
+/// The header sun/moon theme toggle. Mirrors the `\` keybinding; both route
+/// through the same Prefs so every mount stays in sync automatically (the
+/// desktop client needed a hand-rolled pub/sub for this — @Observable is the
+/// native equivalent).
+struct ThemeToggle: View {
+    @Environment(Prefs.self) private var prefs
+
+    private var isDark: Bool {
+        switch prefs.theme {
+        case .dark: true
+        case .light: false
+        case .system:
+            NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        }
+    }
+
+    var body: some View {
+        Button {
+            prefs.flipTheme()
+        } label: {
+            Image(systemName: isDark ? "sun.max" : "moon")
+                .font(.system(size: 12))
+                .padding(.horizontal, 6).padding(.vertical, 3)
+        }
+        .buttonStyle(.glass)
+        .foregroundStyle(Palette.inkFaint)
+        .help("\(isDark ? "light" : "dark") mode (\\)")
+        .accessibilityLabel("switch to \(isDark ? "light" : "dark") mode")
+    }
+}

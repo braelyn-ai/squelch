@@ -271,16 +271,20 @@ final class AppStore {
     // MARK: - settings
 
     func loadSettings() async {
-        do {
-            if let s = try SettingsStore.load() {
-                await APIClient.shared.configure(baseURL: s.serverURL, token: s.apiToken)
-                settings = s
+        // Off the main actor: a keychain read can put up the system's "allow
+        // access?" panel and block until answered.
+        switch await SettingsStore.loadAsync() {
+        case .success(let stored):
+            if let stored {
+                await APIClient.shared.configure(
+                    baseURL: stored.serverURL, token: stored.apiToken)
+                settings = stored
                 connStatus = .connected
                 connError = nil
             } else {
                 connStatus = .disconnected
             }
-        } catch {
+        case .failure:
             connStatus = .disconnected
             connError = "settings load failed"
         }
@@ -295,8 +299,8 @@ final class AppStore {
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
             _ = try await APIClient.shared.getStats()  // 401 => bad token; network => bad url
-            try SettingsStore.save(
-                ConnectionSettings(serverURL: serverURL, apiToken: apiToken))
+            try await SettingsStore.saveAsync(
+                ConnectionSettings(serverURL: serverURL, apiToken: apiToken)).get()
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             connStatus = .connected
             connError = nil
@@ -321,8 +325,8 @@ final class AppStore {
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
             _ = try await APIClient.shared.getStats()
-            try SettingsStore.save(
-                ConnectionSettings(serverURL: serverURL, apiToken: apiToken))
+            try await SettingsStore.saveAsync(
+                ConnectionSettings(serverURL: serverURL, apiToken: apiToken)).get()
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             return (true, nil)
         } catch {

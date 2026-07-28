@@ -689,7 +689,7 @@ private struct AssistantSection: View {
                 .onChange(of: keyInput) { _, _ in note = nil }
             }
             HStack(spacing: 10) {
-                Button(busy ? "saving…" : "Save key") { saveKey() }
+                Button(busy ? "saving…" : "Save key") { Task { await saveKey() } }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.accent)
                     .disabled(busy || keyInput.trimmed.isEmpty)
@@ -702,7 +702,7 @@ private struct AssistantSection: View {
                         )
                         .font(Typo.micro).foregroundStyle(Palette.positive)
                     }
-                    Button("forget") { forgetKey() }
+                    Button("forget") { Task { await forgetKey() } }
                         .buttonStyle(.plain)
                         .font(Typo.micro)
                         .foregroundStyle(Palette.danger)
@@ -727,16 +727,16 @@ private struct AssistantSection: View {
             }
             SettingsHint(prefs.assistantModel.label)
         }
-        .onAppear { status = AssistantKeyStore.status() }
+        .task { status = await AssistantKeyStore.statusAsync() }
     }
 
-    private func saveKey() {
+    private func saveKey() async {
         busy = true
         note = nil
         do {
             try AssistantKeyStore.set(keyInput.trimmed)
             keyInput = ""
-            status = AssistantKeyStore.status()
+            status = await AssistantKeyStore.statusAsync()
             note = .ok("key saved")
         } catch {
             note = .err(errText(error, "could not save key"))
@@ -744,11 +744,11 @@ private struct AssistantSection: View {
         busy = false
     }
 
-    private func forgetKey() {
+    private func forgetKey() async {
         busy = true
         note = nil
         try? AssistantKeyStore.clear()
-        status = AssistantKeyStore.status()
+        status = await AssistantKeyStore.statusAsync()
         note = .ok("key forgotten")
         busy = false
     }

@@ -256,7 +256,7 @@ enum Assistant {
     /// Ask a question and return a cited answer. Throws on a missing key, the
     /// wrong provider, a provider error, a refusal, or hitting the step limit.
     static func ask(_ question: String) async throws -> AssistantAnswer {
-        let status = AssistantKeyStore.status()
+        let status = await AssistantKeyStore.statusAsync()
         guard status.present else {
             throw AssistantError(message: "No assistant key set — add one in Settings.")
         }

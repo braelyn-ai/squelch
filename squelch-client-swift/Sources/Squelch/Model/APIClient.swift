@@ -419,11 +419,18 @@ actor APIClient {
         var note: String?
     }
 
-    @discardableResult
+    /// Record that triage got one wrong, and apply the fix. Server-side this is
+    /// a single transaction: the triage row moves AND the correction is stored
+    /// as a training row.
+    ///
+    /// The response body is deliberately NOT decoded. The only caller needs
+    /// success/failure, and coupling "the correction landed" to "the feedback
+    /// row decoded exactly as expected" would surface a scary error toast for a
+    /// write that actually succeeded.
     func correctTriage(messageId: Int, dimension: TriageAxis, toValue: String, note: String? = nil)
-        async throws -> TriageFeedback
+        async throws
     {
-        try await post(
+        try await postNoContent(
             "/client/triage-feedback",
             body: CorrectTriageBody(
                 message_id: messageId, dimension: dimension.rawValue, to_value: toValue, note: note)

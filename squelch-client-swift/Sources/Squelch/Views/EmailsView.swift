@@ -20,7 +20,6 @@ import SwiftUI
 
 struct EmailsView: View {
     @Environment(AppStore.self) private var store
-    @Environment(Prefs.self) private var prefs
 
     /// One generous page — the read model is local, this is cheap.
     private static let fetchLimit = 500
@@ -155,6 +154,7 @@ struct EmailsView: View {
             .buttonStyle(.glass)
             .foregroundStyle(Palette.inkFaint)
             .help("keyboard shortcuts (?)")
+            ThemeToggle()
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 13)
@@ -196,8 +196,8 @@ struct EmailsView: View {
             KeyBinding("g", "auth messages") { store.setView(.auth) },
             KeyBinding("/", "search") { store.openSide(.search(query: "")) },
             KeyBinding("u", "undo") { Task { await store.fireUndo() } },
-            KeyBinding("\\", "toggle light/dark theme") { prefs.flipTheme() },
-            KeyBinding("?", "keyboard shortcuts") { store.shortcutsOpen.toggle() },
+            // `\` (theme) and `?` (help) live in the GLOBAL context — see
+            // MainShell.globalBindings — so they work from every surface.
         ]
     }
 

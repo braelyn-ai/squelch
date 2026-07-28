@@ -91,10 +91,14 @@ struct SquelchCommands: Commands {
         }
 
         CommandGroup(after: .toolbar) {
+            // Deliberately NO keyboardShortcut: `\` is bound in the key registry
+            // instead. A menu shortcut with no modifier fires even while a text
+            // field has focus, which would make it impossible to type a
+            // backslash anywhere in the app. The registry's input guard is the
+            // whole reason that dispatch layer exists.
             Button(prefs.theme == .dark ? "Light Appearance" : "Dark Appearance") {
                 prefs.flipTheme()
             }
-            .keyboardShortcut("\\", modifiers: [])
         }
 
         CommandGroup(replacing: .help) {

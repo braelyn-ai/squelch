@@ -131,6 +131,15 @@ struct MainShell: View {
             KeyBinding("k", "ask your inbox", meta: true, allowInInput: true) {
                 store.askBarOpen = true
             })
+        // The help overlay files these under "App", so they belong in the
+        // GLOBAL context rather than only in the inbox list — pressing `?` on
+        // the sitrep should open help, not nothing. Neither collides with any
+        // other binding, and both stay input-guarded (no allowInInput), so
+        // typing "?" into search still types a question mark.
+        bindings.append(
+            KeyBinding("\\", "toggle light/dark theme") { Prefs.shared.flipTheme() })
+        bindings.append(
+            KeyBinding("?", "keyboard shortcuts") { store.shortcutsOpen.toggle() })
         return bindings
     }
 }

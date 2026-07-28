@@ -181,7 +181,10 @@ struct AuditView: View {
     /// CAST maps to 0, so an undo could fire against a DIFFERENT id than the row
     /// displayed. Digits-only, positive, in-range.
     static func parseAuditId(_ raw: String?) -> Int? {
-        guard let raw, !raw.isEmpty, raw.allSatisfy(\.isNumber), let id = Int(raw), id > 0 else {
+        guard let raw, !raw.isEmpty,
+            raw.allSatisfy({ $0.isASCII && $0.isNumber }),
+            let id = Int(raw), id > 0
+        else {
             return nil
         }
         return id

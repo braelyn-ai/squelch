@@ -107,6 +107,11 @@ struct ConnectionSettings: Sendable, Equatable {
 enum SettingsStore {
     /// Load stored settings. Returns nil until BOTH fields have been saved
     /// (the first-run Connect gate relies on this).
+    ///
+    /// ALWAYS call this off the main actor (see `loadAsync`). A keychain read
+    /// can put up the system's "allow access?" panel and block until the human
+    /// answers — on the main thread that is a frozen, unpaintable app, which is
+    /// exactly the impression you do not want to make on first launch.
     static func load() throws -> ConnectionSettings? {
         let url = try Keychain.read(account: accountURL)
         let token = try Keychain.read(account: accountToken)
@@ -114,10 +119,29 @@ enum SettingsStore {
         return ConnectionSettings(serverURL: url, apiToken: token)
     }
 
+    /// The safe entry point: performs the (possibly prompting) read on a
+    /// background executor so the UI keeps painting and stays responsive.
+    static func loadAsync() async -> Result<ConnectionSettings?, Error> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: Result { try load() })
+            }
+        }
+    }
+
     /// Persist settings into the OS keychain. The token never touches disk or logs.
     static func save(_ settings: ConnectionSettings) throws {
         try Keychain.write(account: accountURL, value: settings.serverURL)
         try Keychain.write(account: accountToken, value: settings.apiToken)
+    }
+
+    /// Off-main-actor write, for the same reason as `loadAsync`.
+    static func saveAsync(_ settings: ConnectionSettings) async -> Result<Void, Error> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: Result { try save(settings) })
+            }
+        }
     }
 
     /// Clear stored settings (Disconnect) so the next boot lands on the
@@ -170,6 +194,16 @@ enum AssistantKeyStore {
     static func status() -> AssistantKeyStatus {
         guard let k = read() else { return .absent }
         return AssistantKeyStatus(present: true, provider: provider(forKey: k))
+    }
+
+    /// Off-main-actor status read — same prompt-blocking reasoning as
+    /// `SettingsStore.loadAsync`. Still never yields the key itself.
+    static func statusAsync() async -> AssistantKeyStatus {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: status())
+            }
+        }
     }
 
     /// Store the user's assistant key. Never logged, never echoed.

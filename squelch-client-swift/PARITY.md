@@ -29,7 +29,8 @@ xcodegen generate
 xcodebuild -project Squelch.xcodeproj -scheme Squelch -destination 'platform=macOS' build
 ```
 
-Current state: **50 Swift source files, builds clean with zero warnings.**
+Current state: **50 Swift source files, debug and release both build clean with
+zero warnings.**
 
 ---
 
@@ -238,22 +239,41 @@ These are improvements or native-platform equivalents, not gaps:
    unconditionally and produced that phrase whenever the age token was "now";
    its own masthead already phrased it correctly.
 5. **Menu-bar commands** for the ⌘-chords, so they appear in Help search and
-   read as native.
+   read as native. Deliberately *no* menu shortcut for `\` — a menu item with no
+   modifier fires even while a text field has focus, which would make typing a
+   backslash impossible. The registry's input guard handles it correctly.
 6. No drag-strip hack: `isMovableByWindowBackground` plus a hidden title bar is
    the native equivalent of `data-tauri-drag-region`.
+7. **`\` (theme) and `?` (help) are GLOBAL**, not inbox-only. The help overlay
+   files them under "App", so pressing `?` on the sitrep should open help rather
+   than do nothing.
+8. **Toasts auto-dismiss after 6s.** The web build only removed them on click,
+   so a long session accumulated them indefinitely. Undos keep their own 5s
+   window and click target unchanged.
+9. **`correctTriage` does not decode its response.** The only caller needs
+   success/failure; coupling "the correction landed" to "the feedback row
+   decoded exactly as expected" would show an error toast for a write that
+   actually succeeded.
+10. **Theme sync needs no pub/sub.** The web build hand-rolled a listener set so
+    every mount tracked the theme; `@Observable` gives that for free.
 
 ---
 
 ## Open questions
 
-1. **Keychain access prompt on first launch.** The app is ad-hoc signed
-   (`codesign -s -`), so its code identity differs from the Tauri app that
-   created the keychain items and macOS prompts once per slot. Clicking "Always
-   Allow" resolves it permanently. A real signing identity would remove the
-   prompt entirely; that is a distribution decision, not a code one, so the
-   build script ad-hoc signs (which at least keeps the identity stable across
-   rebuilds — an unsigned binary gets a fresh identity every build and re-prompts
-   every time).
+1. **Keychain access prompt.** The app is ad-hoc signed (`codesign -s -`), so
+   its code identity differs from the Tauri app that created the keychain items
+   and macOS prompts before handing them over. Clicking "Always Allow" resolves
+   it for that build. **During development it re-prompts after every rebuild**,
+   because an ad-hoc signature's identity is derived from the binary itself and
+   the binary changes each time. A real signing identity removes this entirely;
+   that is a distribution decision, not a code one.
+
+   This surfaced a genuine bug, now fixed: the keychain read ran on the main
+   actor, so the prompt froze the whole UI until it was answered. All keychain
+   I/O (`SettingsStore.loadAsync` / `saveAsync`,
+   `AssistantKeyStore.statusAsync`) now runs on a background executor and the
+   app keeps painting while the panel is up.
 2. **OpenAI assistant keys** are accepted and stored, and `LLMProxy` routes them
    to the chat-completions endpoint, but the agent loop speaks the Anthropic
    message/tool-use shape and refuses non-Anthropic keys with a clear message —

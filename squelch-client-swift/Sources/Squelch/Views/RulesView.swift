@@ -77,7 +77,11 @@ struct RulesView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .keyBindings(.modal, bindings)
-        .task { await load() }
+        .task {
+            RulesReload.shared.handler = { await load() }
+            await load()
+        }
+        .onDisappear { RulesReload.shared.handler = nil }
         .onChange(of: rules.count) { _, count in
             index = max(0, min(index, max(0, count - 1)))
         }
@@ -138,7 +142,7 @@ struct RulesView: View {
                     CreateRuleBody(
                         match_pattern: rule.match_pattern, want: rule.want_text,
                         disposition: rule.disposition))
-                await RulesReload.shared.fire()
+                await RulesReload.shared.reload()
             }
         } catch {
             store.pushToast(errText(error, "delete failed"), .error)
@@ -154,18 +158,21 @@ struct RulesView: View {
         } catch {
             self.error = errText(error, "rules failed")
         }
-        RulesReload.shared.handler = { Task { await load() } }
+
     }
 }
 
-/// A tiny hook so an undo fired from the global toast stack (which outlives this
-/// view's closures) can still ask the rules list to re-pull.
+/// A tiny hook so an undo fired from the global toast stack — which outlives
+/// this view's closures, and may fire after the view has gone away — can still
+/// ask the rules list to re-pull if it is still on screen.
 @MainActor
 final class RulesReload {
     static let shared = RulesReload()
-    var handler: (() -> Void)?
+    /// Set while a RulesView is mounted; nil otherwise (the undo then simply
+    /// has nothing to refresh, which is correct).
+    var handler: (@MainActor () async -> Void)?
     private init() {}
-    func fire() { handler?() }
+    func reload() async { await handler?() }
 }
 
 private struct RuleRow: View {

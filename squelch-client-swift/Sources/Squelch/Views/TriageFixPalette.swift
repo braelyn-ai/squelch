@@ -200,7 +200,7 @@ struct TriageFixPalette: View {
         guard !busy else { return }
         busy = true
         do {
-            _ = try await APIClient.shared.correctTriage(
+            try await APIClient.shared.correctTriage(
                 messageId: target.messageId, dimension: hit.axis, toValue: hit.value)
             store.pushToast("moved to \(hit.label) · recorded", .success)
             onClose()
