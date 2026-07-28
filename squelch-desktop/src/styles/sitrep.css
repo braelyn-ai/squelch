@@ -196,44 +196,28 @@
   color: var(--accent);
 }
 
-/* deadline chip — a small glass capsule sitting on a pane */
+/* deadline chip — a small flat capsule sitting on a pane */
 .chip {
   font-size: 11px;
   font-weight: 600;
   padding: 1px 8px;
   border-radius: var(--radius-pill);
-  border: 1px solid transparent;
-  background:
-    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
-    var(--edge) border-box;
-  box-shadow: var(--sheen);
+  background: var(--mat-thin);
+  border: 1px solid var(--border);
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
 }
 /* Overdue reads in red INK only — no red fill; a red-washed pill on every
-   past-due row was too aggressive (owner call, 2026-07-22). The tinted edge is
-   how it gets its urgency back without shouting. */
+   past-due row was too aggressive (owner call, 2026-07-22). A flat tinted
+   hairline is how it gets its urgency back without shouting. */
 .chip.overdue {
   color: var(--red-ink);
-  background:
-    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
-    linear-gradient(
-        180deg,
-        color-mix(in srgb, var(--red) 55%, transparent) 0%,
-        color-mix(in srgb, var(--red) 22%, transparent) 100%
-      )
-      border-box;
+  border-color: color-mix(in srgb, var(--red) 42%, transparent);
 }
 .chip.upcoming {
   color: var(--amber);
-  background:
-    linear-gradient(var(--amber-soft), var(--amber-soft)) padding-box,
-    linear-gradient(
-        180deg,
-        color-mix(in srgb, var(--amber) 50%, transparent) 0%,
-        color-mix(in srgb, var(--amber) 20%, transparent) 100%
-      )
-      border-box;
+  background: var(--amber-soft);
+  border-color: color-mix(in srgb, var(--amber) 38%, transparent);
 }
 
 /* STILL OPEN escalation: a left rail whose weight tracks age. */
@@ -1446,35 +1430,18 @@
 .retriage-btn .spin {
   animation: conn-spin 0.9s linear infinite;
 }
-/* In a masthead the pill sits on the backdrop, not on a pane — so it matches
-   .need-pill: white ink, a thin glass capsule, specular rim. */
+/* In a masthead the pill sits on the blue field, not on a pane — so it matches
+   .need-pill: white ink, a flat translucent capsule, flat white hairline. */
 .retriage-btn.on-sky {
   color: var(--on-sky);
   text-shadow: var(--on-sky-shadow-sm);
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.12))
-      padding-box,
-    linear-gradient(
-        180deg,
-        rgba(255, 255, 255, 0.7) 0%,
-        rgba(255, 255, 255, 0.16) 50%,
-        rgba(255, 255, 255, 0.34) 100%
-      )
-      border-box;
-  border: 1px solid transparent;
-  box-shadow: var(--shadow-contact);
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  box-shadow: none;
 }
 .retriage-btn.on-sky:hover {
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.3), rgba(255, 255, 255, 0.18))
-      padding-box,
-    linear-gradient(
-        180deg,
-        rgba(255, 255, 255, 0.85) 0%,
-        rgba(255, 255, 255, 0.22) 50%,
-        rgba(255, 255, 255, 0.44) 100%
-      )
-      border-box;
+  background: rgba(255, 255, 255, 0.28);
+  border-color: rgba(255, 255, 255, 0.46);
 }
 
 /* ---- DEV triage-debug overlay ---- */

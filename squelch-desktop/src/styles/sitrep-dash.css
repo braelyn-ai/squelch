@@ -65,8 +65,10 @@
   gap: 12px;
   padding-top: 2px;
 }
-/* A glass capsule floating on the backdrop — the one piece of material in the
-   masthead, because it is the one piece that is a live alarm. */
+/* A flat translucent capsule on the blue field — the one piece of chrome in
+   the masthead, because it is the one piece that is a live alarm. FLAT: a
+   gradient fill plus a gradient rim made it read as a glossy blob rather than
+   a control (owner call, 2026-07-27). */
 .need-pill {
   display: inline-flex;
   align-items: center;
@@ -74,21 +76,11 @@
   font-size: 11px;
   font-weight: 620;
   color: var(--on-sky);
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.12))
-      padding-box,
-    linear-gradient(
-        180deg,
-        rgba(255, 255, 255, 0.7) 0%,
-        rgba(255, 255, 255, 0.16) 50%,
-        rgba(255, 255, 255, 0.34) 100%
-      )
-      border-box;
-  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.32);
   border-radius: var(--radius-pill);
   padding: 3px 11px 3px 9px;
   text-shadow: var(--on-sky-shadow-sm);
-  box-shadow: var(--shadow-contact);
 }
 /* The dot PULSES — it is the only animated thing in the masthead, and it marks
    the one state that wants you to act now.
@@ -205,7 +197,7 @@
   flex: 0 0 320px;
   min-width: 0;
   /* A lit hairline: this rule sits on the blue field, not inside a pane, so it
-     takes white rather than the ink-side --spec-waist the panes use. */
+     takes white rather than the ink-side --border the panes use. */
   border-left: 1px solid rgba(255, 255, 255, 0.24);
   padding-left: 22px;
   overflow-y: auto;
@@ -285,15 +277,13 @@
 /* A clickable pane LIFTS: the material brightens and the ambient shadow grows,
    as though it rose a few points off the backdrop. */
 .zone.clickable:hover {
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  box-shadow: var(--sheen), var(--shadow-modal);
+  background: var(--glass-strong);
+  box-shadow: var(--shadow-modal);
   transform: translateY(-1px);
 }
 .zone.clickable:active {
   transform: translateY(0) scale(0.998);
-  box-shadow: var(--sheen), var(--shadow-card-sm);
+  box-shadow: var(--shadow-card-sm);
 }
 .zone-head {
   display: flex;
@@ -320,11 +310,8 @@
   font-size: 11.5px;
   font-weight: 650;
   color: var(--fg);
-  background:
-    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
-  box-shadow: var(--sheen);
+  background: var(--mat-thin);
+  border: 1px solid var(--border);
   border-radius: var(--radius-pill);
   padding: 0 8px;
   font-variant-numeric: tabular-nums;
@@ -473,12 +460,9 @@
   padding: 3px 10px 3px 4px;
   font-size: 12px;
   color: var(--fg);
-  background:
-    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-thin);
+  border: 1px solid var(--border);
   border-radius: var(--radius-pill);
-  box-shadow: var(--sheen);
   max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -502,12 +486,9 @@
    the .glass-sub rationale in global.css — two thick panes stacked read muddy).
    Radius steps down from the parent's to stay concentric. */
 .transit-card {
-  background:
-    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-regular);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sub);
-  box-shadow: var(--sheen);
   padding: 11px 12px;
   display: flex;
   flex-direction: column;
@@ -517,9 +498,7 @@
   transition: background 0.18s var(--ease-glass);
 }
 .transit-card:hover {
-  background:
-    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
-    var(--edge) border-box;
+  background: var(--mat-thick);
 }
 /* Delivered-today: quieter than active shipments — dimmed name, no left signal. */
 .transit-card.delivered {
@@ -642,12 +621,9 @@
 /* Same nested-material treatment as the shipment cards, plus a lift on hover —
    these are the most clickable things in the left column. */
 .nl-card {
-  background:
-    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-regular);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sub);
-  box-shadow: var(--sheen);
   padding: 11px 12px;
   display: flex;
   flex-direction: column;
@@ -660,10 +636,8 @@
     transform 0.2s var(--ease-glass);
 }
 .nl-card:hover {
-  background:
-    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
-    var(--edge) border-box;
-  box-shadow: var(--sheen), var(--shadow-card-sm);
+  background: var(--mat-thick);
+  box-shadow: var(--shadow-card-sm);
   transform: translateY(-1px);
 }
 .nl-card:active {
@@ -761,12 +735,10 @@
   align-items: center;
   gap: 10px 16px;
   padding: 9px 14px;
-  background:
-    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-thick);
+  border: 1px solid var(--border);
   border-radius: var(--radius-pill); /* the strip IS a capsule */
-  box-shadow: var(--sheen), var(--shadow-card-sm);
+  box-shadow: var(--shadow-card-sm);
   color: var(--fg-dim);
   font-size: 12.5px;
 }
@@ -784,17 +756,12 @@
   font-size: 12px;
   border-radius: var(--radius-pill);
   color: var(--fg-dim);
-  background:
-    linear-gradient(var(--mat-thin), var(--mat-thin)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
-  box-shadow: var(--sheen);
+  background: var(--mat-thin);
+  border: 1px solid var(--border);
 }
 .status-strip .status-chip:hover {
   color: var(--fg);
-  background:
-    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
-    var(--edge) border-box;
+  background: var(--mat-regular);
 }
 /* Manual "check for new mail now" chip. Wraps the synced-ago text so the whole
    pill is the hit target; the icon spins while a poke+pull is in flight. */

@@ -5,14 +5,21 @@
      0. AppKit paints the backdrop BEHIND the webview — NSGlassEffectView on
         macOS 26, NSVisualEffectView below it (see apply_native_backdrop in
         src-tauri/src/lib.rs). The desktop wallpaper blurs and refracts there.
-     1. The page is TRANSPARENT. `#root` lays one --scrim over the backdrop:
-        the app's own tint, thin enough that the wallpaper still reads.
-     2. Surfaces are MATERIALS, not fills. Four densities (--mat-thick →
-        --mat-ultrathin) tint what is behind them rather than hiding it.
-     3. Every raised surface carries a SPECULAR EDGE — a gradient hairline that
-        is bright along the top, dim at the waist, and picks up a bounce at the
-        bottom. That edge is what makes glass read as glass; without it a
-        translucent card just looks washed out.
+     1. The page is TRANSPARENT. `.app-main` lays one --scrim over the backdrop:
+        squelch blue, thin enough that the wallpaper still moves through it.
+     2. CONTENT surfaces are near-opaque and FLAT — a plain tint, a plain
+        hairline, a shadow. Reading surfaces do not get to be translucent, and
+        they do not get gradients either.
+     3. Glass lives in the CHROME only: the rail, the masthead pills, the sheet
+        backdrops, and the hero field.
+
+   WHAT THIS DELIBERATELY IS NOT: an attempt to imitate Liquid Glass in CSS.
+   The earlier version of this file gave every surface a gradient fill and a
+   gradient "specular" rim; at control size that reads as a glossy blob, and
+   the owner correctly called the result "just transparency and buttons with
+   gradients" (2026-07-27). The genuine material is the AppKit layer BEHIND the
+   page — CSS cannot sample it, so CSS should not pretend. Flat surfaces on real
+   blue glass beat fake glass everywhere.
 
    BACKDROP-FILTER IS ALMOST ALWAYS THE WRONG TOOL HERE, and it is expensive.
    Layer 0 is native, so it is not part of the page's backdrop and CSS cannot
@@ -95,26 +102,15 @@
   --mat-thin: rgba(20, 45, 80, 0.055);
   --mat-ultrathin: rgba(20, 45, 80, 0.03);
 
-  /* SPECULAR EDGE — the gradient hairline around a pane. Lit along the top
-     edge, INK along the waist and bottom. An all-white rim was right when the
-     panes were translucent and dark things showed through them; on a
-     near-opaque white pane it is invisible, and the card loses its outline
-     entirely. Light from above, contact shadow below — which is also just how
-     a real edge behaves. */
-  --spec-top: rgba(255, 255, 255, 0.9);
-  --spec-waist: rgba(20, 45, 80, 0.1);
-  --spec-bottom: rgba(20, 45, 80, 0.14);
-  /* the inner sheen sitting just under the top edge */
-  --spec-sheen: rgba(255, 255, 255, 0.85);
-
   --glass: var(--mat-thick); /* card */
   --glass-strong: rgba(253, 254, 255, 0.97); /* modal / raised */
   --zone-wash: var(--mat-thick); /* zone card */
   /* inputs / code wells: opaque — typed text must stay crisp */
   --glass-legible: rgba(255, 255, 255, 0.97);
   /* BORDERS ARE INK-SIDE. They are drawn on top of near-opaque panes, where a
-     white hairline is invisible. (The specular EDGE is a separate thing — see
-     --edge — and stays light-side, because it lives on the pane's rim.) */
+     white hairline is invisible. Surfaces that sit on the BLUE FIELD instead
+     (masthead pills, the right-rail divider) hard-code a white hairline
+     locally, because there the polarity is the other way round. */
   --glass-border: rgba(20, 45, 80, 0.14);
   --glass-border-strong: rgba(20, 45, 80, 0.22);
 
@@ -213,11 +209,6 @@
   --mat-regular: rgba(38, 47, 63, 0.9);
   --mat-thin: rgba(255, 255, 255, 0.07);
   --mat-ultrathin: rgba(255, 255, 255, 0.035);
-
-  --spec-top: rgba(255, 255, 255, 0.22);
-  --spec-waist: rgba(255, 255, 255, 0.06);
-  --spec-bottom: rgba(0, 0, 0, 0.28);
-  --spec-sheen: rgba(255, 255, 255, 0.14);
 
   /* Chrome blue after dark — lighter than the navy canvas, same as in light. */
   --canvas-top: linear-gradient(
@@ -330,23 +321,15 @@
   --blur-regular: saturate(180%) blur(20px);
   --blur-thin: saturate(170%) blur(12px);
 
-  /* THE SPECULAR EDGE, as a paintable background pair. Used as:
-       background: linear-gradient(<tint>,<tint>) padding-box, var(--edge) border-box;
-       border: 1px solid transparent;
-     A gradient BORDER (not a flat one) is the whole trick — it catches light on
-     the top edge and bounces along the bottom, which is what separates glass
-     from a translucent rectangle. */
-  --edge: linear-gradient(
-    180deg,
-    var(--spec-top) 0%,
-    var(--spec-waist) 42%,
-    var(--spec-waist) 62%,
-    var(--spec-bottom) 100%
-  );
-  /* The inner sheen that rides just under the lit edge. */
-  --sheen: inset 0 1px 0 -0.5px var(--spec-sheen);
+  /* NO GRADIENT FILLS, NO GRADIENT RIMS. Surfaces get a flat tint and a flat
+     hairline; separation comes from the shadow. Retired 2026-07-27 (owner
+     call): every raised surface used to carry a --edge gradient border plus a
+     --sheen inset highlight, and on a control-sized element that reads as a
+     glossy blob rather than as glass. The real material is the AppKit layer
+     behind the page — CSS imitating it in gradients only ever looked like
+     imitation. */
 
-  /* Springy easing for the lift/press of glass controls. */
+  /* Springy easing for the lift/press of controls. */
   --ease-glass: cubic-bezier(0.32, 0.72, 0, 1);
 
   /* micro-label recipe: 600 weight, uppercase, WIDE tracking, small. Used for
@@ -359,33 +342,24 @@
   --chrome-top: 46px;
 }
 
-/* ---- THE GLASS PANE RECIPE ------------------------------------------------ */
-/* One place defines what a raised material surface looks like. `.zone` (the
-   shared card primitive across sitrep/emails/rules) and `.glass-pane` (opt-in,
-   for anything else) both get it, so converting a surface is a class away.
-
-   Order matters in `background`: the tint is painted to padding-box and the
-   specular gradient to border-box, so the gradient shows ONLY in the 1px border
-   band. */
+/* ---- THE PANE RECIPE ------------------------------------------------------ */
+/* One place defines what a raised surface looks like. `.zone` (the shared card
+   primitive across sitrep/emails/rules) and `.glass-pane` (opt-in, for anything
+   else) both get it, so converting a surface is a class away. */
 .glass-pane,
 .zone {
-  background:
-    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-thick);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  box-shadow: var(--sheen), var(--shadow-card);
+  box-shadow: var(--shadow-card);
 }
 
 /* Nested material — a surface INSIDE a pane. Thinner tint and a quieter edge,
    because stacking two full-strength panes reads as muddy rather than layered. */
 .glass-sub {
-  background:
-    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-regular);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sub);
-  box-shadow: var(--sheen);
 }
 
 * {
@@ -476,12 +450,10 @@ button {
   font-weight: 510;
   letter-spacing: -0.005em;
   color: var(--fg);
-  background:
-    linear-gradient(var(--mat-regular), var(--mat-regular)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--mat-regular);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  box-shadow: var(--sheen), var(--shadow-contact);
+  box-shadow: var(--shadow-contact);
   padding: 5px 12px;
   cursor: pointer;
   transition:
@@ -491,20 +463,18 @@ button {
     color 0.12s ease;
 }
 button:hover {
-  background:
-    linear-gradient(var(--mat-thick), var(--mat-thick)) padding-box,
-    var(--edge) border-box;
-  box-shadow: var(--sheen), var(--shadow-card-sm);
+  background: var(--mat-thick);
+  box-shadow: var(--shadow-card-sm);
 }
 button:active {
   transform: scale(0.97);
-  box-shadow: var(--sheen), var(--shadow-contact);
+  box-shadow: var(--shadow-contact);
 }
 button:disabled {
   opacity: 0.45;
   cursor: default;
   transform: none;
-  box-shadow: var(--sheen), var(--shadow-contact);
+  box-shadow: var(--shadow-contact);
 }
 
 /* THE macOS FOCUS RING: a soft accent halo outside the control's own edge, not
@@ -522,41 +492,17 @@ textarea:focus-visible,
   background: color-mix(in srgb, var(--brass) 34%, transparent);
 }
 
-/* Primary action — the one loud control per surface. Accent-filled, and it
-   keeps a specular top edge so it still reads as glass rather than a flat
-   rectangle of blue. */
+/* Primary action — the one loud control per surface. A flat fill of the accent,
+   full stop. */
 button.primary {
-  background:
-    linear-gradient(
-        color-mix(in srgb, var(--brass) 92%, transparent),
-        color-mix(in srgb, var(--brass) 92%, transparent)
-      )
-      padding-box,
-    linear-gradient(
-        180deg,
-        rgba(255, 255, 255, 0.62) 0%,
-        rgba(255, 255, 255, 0.1) 45%,
-        rgba(255, 255, 255, 0.24) 100%
-      )
-      border-box;
+  background: var(--brass);
+  border-color: color-mix(in srgb, var(--brass) 78%, #000);
   color: #ffffff;
-  box-shadow:
-    inset 0 1px 0 -0.5px rgba(255, 255, 255, 0.55),
-    var(--shadow-card-sm);
+  box-shadow: var(--shadow-contact);
 }
 button.primary:hover {
-  background:
-    linear-gradient(var(--brass), var(--brass)) padding-box,
-    linear-gradient(
-        180deg,
-        rgba(255, 255, 255, 0.72) 0%,
-        rgba(255, 255, 255, 0.14) 45%,
-        rgba(255, 255, 255, 0.3) 100%
-      )
-      border-box;
-  box-shadow:
-    inset 0 1px 0 -0.5px rgba(255, 255, 255, 0.65),
-    var(--shadow-card);
+  background: color-mix(in srgb, var(--brass) 88%, #fff);
+  box-shadow: var(--shadow-card-sm);
 }
 :root[data-theme="dark"] button.primary {
   /* dark-mode --brass is a lighter blue; dark ink reads better than white on it */
@@ -726,23 +672,16 @@ kbd {
 .rail-btn:active {
   transform: scale(0.92);
 }
-/* ACTIVE — the "you are here" lozenge. This is the one place the app shows
-   full-strength Liquid Glass on a control: a bright pane of material with a
-   specular rim, holding an accent-tinted icon. */
+/* ACTIVE — the "you are here" lozenge: a flat white tile on the chrome blue,
+   holding an accent-tinted glyph. */
 .rail-btn.active {
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.66))
-      padding-box,
-    var(--edge) border-box;
+  background: rgba(255, 255, 255, 0.94);
   border: 1px solid transparent;
-  box-shadow: var(--sheen), var(--shadow-float);
+  box-shadow: var(--shadow-contact);
   color: var(--brass-ink);
 }
 :root[data-theme="dark"] .rail-btn.active {
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.1))
-      padding-box,
-    var(--edge) border-box;
+  background: rgba(255, 255, 255, 0.16);
   color: var(--brass);
 }
 .rail-btn .rail-badge {
@@ -799,16 +738,14 @@ kbd {
   left: calc(100% + 10px);
   top: 50%;
   white-space: nowrap;
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   color: var(--fg);
   font-size: 11.5px;
   font-weight: 550;
   padding: 4px 9px;
   border-radius: var(--radius-sm);
-  box-shadow: var(--sheen), var(--shadow-float);
+  box-shadow: var(--shadow-float);
   opacity: 0;
   transform: translateY(-50%) translateX(-4px);
   pointer-events: none;
@@ -884,13 +821,11 @@ svg.lucide {
 .connect-card {
   width: 400px;
   max-width: 90vw;
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card-lg);
   padding: 28px;
-  box-shadow: var(--sheen), var(--shadow-modal);
+  box-shadow: var(--shadow-modal);
 }
 .connect-card h1 {
   font-family: var(--serif);
@@ -944,13 +879,11 @@ svg.lucide {
   margin: calc(var(--chrome-top) - 8px) 16px 0;
   padding: 7px 12px;
   color: var(--fg);
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   border-left: 3px solid var(--red);
   border-radius: var(--radius);
-  box-shadow: var(--sheen), var(--shadow-card-sm);
+  box-shadow: var(--shadow-card-sm);
   font-size: 12.5px;
 }
 .conn-banner > svg {
@@ -1008,13 +941,11 @@ svg.lucide {
 .daemon-down-card {
   width: 400px;
   max-width: 90vw;
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card-lg);
   padding: 28px;
-  box-shadow: var(--sheen), var(--shadow-modal);
+  box-shadow: var(--shadow-modal);
   text-align: center;
 }
 .daemon-down-card .down-glyph {
@@ -1144,12 +1075,10 @@ svg.lucide {
   position: relative; /* anchors the countdown bar */
   overflow: hidden; /* the bar hugs the rounded bottom edge */
   width: 340px;
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  box-shadow: var(--sheen), var(--shadow-modal);
+  box-shadow: var(--shadow-modal);
   padding: 20px;
   display: flex;
   flex-direction: column;
@@ -1283,17 +1212,15 @@ svg.lucide {
 /* Flat white/navy card in the toast stack. Red left-edge marks the "they're
    ignoring you" state without shouting. Matches the toast/undo card language. */
 .block-prompt {
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   border-left: 2px solid var(--red);
   border-radius: var(--radius);
   padding: 9px 11px;
   display: flex;
   flex-direction: column;
   gap: 9px;
-  box-shadow: var(--sheen), var(--shadow-float);
+  box-shadow: var(--shadow-float);
 }
 .block-prompt-text {
   font-size: 12px;
@@ -1330,12 +1257,10 @@ svg.lucide {
 .askbar {
   width: 560px;
   max-width: calc(100vw - 48px);
-  background:
-    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
-    var(--edge) border-box;
-  border: 1px solid transparent;
+  background: var(--glass-strong);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  box-shadow: var(--sheen), var(--shadow-modal);
+  box-shadow: var(--shadow-modal);
   padding: 14px 16px 16px;
   display: flex;
   flex-direction: column;
