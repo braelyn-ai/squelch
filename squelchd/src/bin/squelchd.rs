@@ -1,36 +1,28 @@
 //! `squelchd` — the squelch daemon / CLI.
 //!
-//! Subcommands:
-//! - `auth`: run the OAuth consent flow and store tokens in the configured
-//!   backend (keyring or file). Requires your own Google Cloud "Desktop app"
-//!   OAuth client (see [`squelch_core::config`] docs).
-//! - `run`: sync-only loop (back-compat). Drives the Gmail sync engine and
-//!   nothing else.
-//! - `serve`: the UNIFIED process. One tokio runtime hosts the sync loop AND a
-//!   single axum server that mounts BOTH doors — the agent door (MCP Streamable
-//!   HTTP at `/mcp`, via [`squelch_mcp`]) and the human door (the authenticated
-//!   `/client/*` API, via [`squelch_api`]). Bind from `--bind`/`SQUELCH_BIND`
-//!   (default loopback `127.0.0.1:8848`); a reverse proxy such as
-//!   `tailscale serve` is expected to front it.
+//! - `auth`: run the OAuth consent flow and store tokens (keyring or file).
+//! - `run`: sync-only loop (back-compat), no HTTP.
+//! - `serve`: the unified process — sync loop plus one axum server hosting the
+//!   agent door (`/mcp`) and the human door (`/client/*`).
 
 use clap::{Args, Parser, Subcommand};
 use squelch_core::auth::{AuthFlowOptions, AuthScopes, DEFAULT_HEADLESS_PORT, run_auth_flow};
-use squelch_core::config::{Config, CredentialBackend, Stage2CapSources};
+use squelch_core::config::{Config, CredentialBackend, OAuthClientConfig, Stage2CapSources};
 use squelch_core::credentials::{
-    FileCredentialStore, KeyringCredentialStore, load_token_backend, store_token_backend,
+    CredentialStore, FileCredentialStore, KeyringCredentialStore, load_token_backend,
+    store_token_backend,
 };
 use squelch_core::embed::{Embedder, FastEmbedder};
 use squelch_core::store::SqliteStore;
 use squelch_core::sync::SyncEngine;
+use squelch_core::types::AccountId;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Default bind address for `serve`. Loopback ONLY: a reverse proxy
-/// (`tailscale serve`) fronts this listener. We never default to a
-/// non-loopback interface, and never silently widen it.
+/// Loopback only, by design: a reverse proxy (`tailscale serve`) fronts this.
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8848";
 
 #[derive(Parser)]
@@ -94,10 +86,19 @@ struct AuthArgs {
     port: u16,
 }
 
-/// Load config AND the config/env-layer Stage-2 cap sources (whether each daily
-/// cap came from the default or config/env), so the human door's
-/// `/client/triage-config` can report "default" vs "config". Only `serve` uses
-/// the sources; the other subcommands ignore them.
+fn other_err(msg: String) -> squelch_core::CoreError {
+    squelch_core::CoreError::Other(anyhow::anyhow!(msg))
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime, squelch_core::CoreError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| other_err(format!("tokio runtime: {e}")))
+}
+
+/// Load config plus the Stage-2 cap sources (`serve` reports "default" vs
+/// "config" on `/client/triage-config`; the other subcommands ignore them).
 fn load_config(cli: &Cli) -> (Config, Stage2CapSources) {
     match &cli.config {
         Some(path) => Config::load_from_with_cap_sources(path),
@@ -105,12 +106,26 @@ fn load_config(cli: &Cli) -> (Config, Stage2CapSources) {
     }
 }
 
-/// Build the on-box semantic-recall embedder from config. Returns `None` (with a
-/// single redacted stderr notice) if the model fails to construct — semantic
-/// recall then degrades gracefully: sync, triage, and keyword search all keep
-/// working, only vector recall is unavailable. First construction downloads the
-/// ONNX weights to the configured cache dir (fastembed logs its own progress; the
-/// core embedder logs a one-line first-download notice).
+/// The READ-bound credential store for the sync engine, per configured backend.
+fn make_credential_store(
+    backend: CredentialBackend,
+    account_id: AccountId,
+    email: String,
+    creds_path: PathBuf,
+    client: OAuthClientConfig,
+) -> Arc<dyn CredentialStore> {
+    match backend {
+        CredentialBackend::Keyring => {
+            Arc::new(KeyringCredentialStore::new(account_id, email, client))
+        }
+        CredentialBackend::File => {
+            Arc::new(FileCredentialStore::new(account_id, email, creds_path, client))
+        }
+    }
+}
+
+/// Build the semantic-recall embedder. `None` (with one redacted stderr notice)
+/// if construction fails — search then degrades to keyword-only.
 fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
     match FastEmbedder::new(&config.embed.settings()) {
         Ok(e) => Some(Arc::new(e) as Arc<dyn Embedder>),
@@ -124,13 +139,9 @@ fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
     }
 }
 
-/// Mirror the `.env` we just loaded into `~/.config/squelch/config.toml` so the
-/// other binaries (`squelch-tui`, `squelch-mcp`, standalone `squelch-api`) and
-/// non-repo CWDs resolve the same account/paths without needing the `.env`.
-/// Only [`Config`]-representable keys are written (client id/secret, account
-/// email, db/credentials paths, backend) — env-only secrets like
-/// `SQUELCH_API_TOKEN` stay env-only. Best-effort: failure is a warning, never
-/// fatal, since the env vars themselves are already set for THIS process.
+/// Mirror the loaded `.env` into config.toml so the other binaries and non-repo
+/// CWDs resolve the same account/paths. Env-only secrets (`SQUELCH_API_TOKEN`)
+/// are never written. Best-effort: failure warns, never fatal.
 fn mirror_env_to_config(env_path: &std::path::Path) {
     let Some(config_path) = Config::default_path() else {
         return;
@@ -153,9 +164,8 @@ fn mirror_env_to_config(env_path: &std::path::Path) {
 }
 
 fn main() -> ExitCode {
-    // Dev convenience: pick up a `.env` from the CWD (or an ancestor) before
-    // config reads the environment. Never overrides vars already exported, and
-    // a missing file is fine — prod boxes get their env from systemd instead.
+    // Dev convenience: pick up a `.env` before config reads the environment.
+    // Never overrides already-exported vars; prod boxes use systemd env instead.
     if let Ok(path) = dotenvy::dotenv() {
         eprintln!("squelchd: loaded env from {}", path.display());
         mirror_env_to_config(&path);
@@ -173,8 +183,6 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // Errors may reference missing credentials etc. — safe to print, we
-            // never put tokens or secrets into error strings.
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
@@ -182,8 +190,6 @@ fn main() -> ExitCode {
 }
 
 /// Run the OAuth consent flow and persist tokens for the configured account.
-/// The scope set (read vs write) and the storage slot are chosen from the flags;
-/// the storage backend (keyring vs file) comes from config.
 fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreError> {
     let client = config.oauth_client()?;
     let email = config.require_account_email()?;
@@ -213,19 +219,18 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
 
     // Confirm persistence without ever printing the token material.
     let _ = load_token_backend(backend, &creds_path, &email, kind)?;
-    let has_refresh = token.refresh_token.is_some();
     match backend {
-        squelch_core::config::CredentialBackend::Keyring => {
+        CredentialBackend::Keyring => {
             println!("\nStored {kind:?} credentials for {email} in the OS keyring (service \"squelch\").");
         }
-        squelch_core::config::CredentialBackend::File => {
+        CredentialBackend::File => {
             println!(
                 "\nStored {kind:?} credentials for {email} in {} (mode 0600).",
                 creds_path.display()
             );
         }
     }
-    if has_refresh {
+    if token.refresh_token.is_some() {
         println!("A refresh token was captured; squelch can renew access automatically.");
     } else {
         println!(
@@ -236,45 +241,34 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
     Ok(())
 }
 
-/// Run the daemon: load config, open the store, build the keyring-backed
-/// credential store, and drive the Gmail IMAP sync loop under a tokio runtime
-/// with graceful Ctrl-C shutdown.
-///
-/// v0 resolves exactly one account (`config.account_email`), but `account_id`
-/// flows through the whole engine so multi-tenant is a data change, not a
-/// rewrite.
+/// Sync-only loop with graceful Ctrl-C shutdown. v0 resolves exactly one
+/// account, but `account_id` threads through the engine so multi-tenant is a
+/// data change, not a rewrite.
 fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
-    // Resolve the single v0 account and its OAuth client up front so we fail fast
-    // with a helpful message before spinning up the async runtime.
+    // Fail fast on config problems before spinning up the runtime.
     let email = config.require_account_email()?;
     let client = config.oauth_client()?;
 
-    // Open the store and ensure the account row exists; its id threads through
-    // the engine (multi-tenant-shaped).
     let mut store = SqliteStore::open(&config.db_path)?;
     let account_id = store.ensure_account(&email)?;
 
-    // On-box semantic recall (v1): build the embedder once, attach it to BOTH the
-    // store (query-side: semantic_search/hybrid_search embed the query) and the
-    // sync engine (write-side: embed at ingest + startup backfill). `None` keeps
-    // everything working without vector recall.
+    // Attach the embedder to both the store (query-side) and the engine
+    // (write-side). `None` keeps everything working without vector recall.
     let embedder = build_embedder(&config);
     if let Some(e) = &embedder {
         store = store.with_embedder(e.clone())?;
     }
-
     let store = Arc::new(store);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| squelch_core::CoreError::Other(anyhow::anyhow!("tokio runtime: {e}")))?;
+    let creds = make_credential_store(
+        config.credential_backend,
+        account_id,
+        email.clone(),
+        config.resolve_credentials_path(),
+        client,
+    );
 
-    // Sync ALWAYS uses the READ credential. Pick the concrete backend store per
-    // config; both are Read-bound. SyncEngine is monomorphic over the store
-    // type, so we branch here rather than through a trait object.
-    let backend = config.credential_backend;
-    let creds_path = config.resolve_credentials_path();
+    let runtime = build_runtime()?;
     runtime.block_on(async move {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
@@ -284,88 +278,47 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
             }
         });
 
-        match backend {
-            CredentialBackend::Keyring => {
-                let creds = Arc::new(KeyringCredentialStore::new(
-                    account_id,
-                    email.clone(),
-                    client,
-                ));
-                let mut engine = SyncEngine::new(store, creds, account_id, email, config);
-                if let Some(e) = embedder {
-                    engine = engine.with_embedder(e);
-                }
-                engine.run(shutdown_rx).await
-            }
-            CredentialBackend::File => {
-                let creds = Arc::new(FileCredentialStore::new(
-                    account_id,
-                    email.clone(),
-                    creds_path,
-                    client,
-                ));
-                let mut engine = SyncEngine::new(store, creds, account_id, email, config);
-                if let Some(e) = embedder {
-                    engine = engine.with_embedder(e);
-                }
-                engine.run(shutdown_rx).await
-            }
+        let mut engine = SyncEngine::new(store, creds, account_id, email, config);
+        if let Some(e) = embedder {
+            engine = engine.with_embedder(e);
         }
+        engine.run(shutdown_rx).await
     })?;
 
     eprintln!("squelch: sync stopped.");
     Ok(())
 }
 
-/// Resolve the `serve` bind address: `--bind` wins, then `SQUELCH_BIND`, then
-/// the loopback default. Parsed to a concrete [`SocketAddr`] so a bad value
-/// fails fast before we open the store or bind anything.
+/// Resolve the `serve` bind address: `--bind` > `SQUELCH_BIND` > loopback
+/// default. Parsed eagerly so a bad value fails before we open anything.
 fn resolve_bind(args: &ServeArgs) -> Result<SocketAddr, squelch_core::CoreError> {
     let raw = args
         .bind
         .clone()
         .or_else(|| std::env::var("SQUELCH_BIND").ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
-    raw.parse().map_err(|e| {
-        squelch_core::CoreError::Other(anyhow::anyhow!("invalid bind address `{raw}`: {e}"))
-    })
+    raw.parse()
+        .map_err(|e| other_err(format!("invalid bind address `{raw}`: {e}")))
 }
 
-/// Build the unified axum router that hosts BOTH doors.
-///
-/// - `/mcp` — the agent door, an MCP Streamable HTTP service built through
-///   [`squelch_mcp::streamable_http_service`]. Narrow, sealed-absent, zero write
-///   capability. Its `mcp_cancel` token, when cancelled, tears down active MCP
-///   sessions.
-/// - `/client/*` — the human door, [`squelch_api::router`], which already layers
-///   bearer auth onto every route. Hosts the only write/action capability.
-///
-/// Both doors share the same `Arc<SqliteStore>`; the agent door NEVER sees the
-/// write credential (it only reads the store), preserving the two-door split.
+/// The unified axum router hosting both doors: `/mcp` (agent door, read-only,
+/// sealed-absent) and `/client/*` (human door, bearer-authed, the only write
+/// capability). Both share the store; the agent door never sees the write
+/// credential.
 fn build_serve_router(
     store: Arc<SqliteStore>,
     account_email: &str,
     api_state: squelch_api::ApiState,
     mcp_cancel: CancellationToken,
 ) -> anyhow::Result<axum::Router> {
-    let mcp_service =
-        squelch_mcp::streamable_http_service(store, account_email, mcp_cancel)?;
-    // Human-door router carries its own bearer auth + state; merge the agent
-    // door's nested service alongside it under a single app.
-    let app = squelch_api::router(api_state)
-        .nest_service(squelch_mcp::MCP_PATH, mcp_service);
+    let mcp_service = squelch_mcp::streamable_http_service(store, account_email, mcp_cancel)?;
+    let app = squelch_api::router(api_state).nest_service(squelch_mcp::MCP_PATH, mcp_service);
     Ok(app)
 }
 
-/// The UNIFIED daemon: one runtime, one process, both doors + the sync loop.
-///
-/// Concurrency model:
-/// - The Gmail [`SyncEngine`] runs on its own spawned task, driven by a `watch`
-///   channel. It ALWAYS uses the READ credential (never the write token).
-/// - One axum server hosts `/mcp` (agent door) and `/client/*` (human door).
-/// - On Ctrl-C we: cancel the MCP token (drops active MCP sessions), tell axum
-///   to stop accepting connections, then signal the sync loop to finish
-///   in-flight work and flush. We await the sync task before returning.
+/// The unified daemon: one runtime hosting the sync loop (READ credential
+/// only), both HTTP doors, the auth-mail shredder, and background embedder
+/// init. Ctrl-C cancels MCP sessions, stops axum, then flushes sync.
 fn cmd_serve(
     config: Config,
     cap_sources: Stage2CapSources,
@@ -378,38 +331,22 @@ fn cmd_serve(
 
     let store = SqliteStore::open(&config.db_path)?;
     let account_id = store.ensure_account(&email)?;
-
-    // On-box semantic recall (v1): the embedder is NOT built here. Building it may
-    // download ~30MB of ONNX weights on first run, and we refuse to block the HTTP
-    // bind on that (issue #16: both doors were unreachable during the download).
-    // Instead we bind immediately and attach the embedder to the store in the
-    // BACKGROUND (spawned below). Until it is ready, search degrades to keyword-
-    // only (the store's hybrid_search returns keyword hits when no embedder is
-    // attached) and the sync engine skips the vector write at ingest, letting the
-    // per-tick backfill fill vectors in once the embedder appears — no restart.
     let store = Arc::new(store);
 
     let backend = config.credential_backend;
     let creds_path = config.resolve_credentials_path();
 
-    // Human door refuses to build without SQUELCH_API_TOKEN — surface that now
-    // (StateError carries either the missing-token message or a core error).
-    // The action endpoints (the ONLY write capability) are enabled by attaching
-    // a WRITE-bound credential store here. It is bound to CredentialKind::Write
-    // inside `with_write_credentials`; the SyncEngine below is handed a SEPARATE
-    // Read-bound store and never sees this one.
-    // Manual-refresh signal shared between the human door and the sync loop:
-    // `POST /client/refresh` fires it, the poll loop wakes and polls Gmail now
-    // instead of waiting out `poll_secs`. One handle, two clones (API + engine).
+    // Manual-refresh signal: `POST /client/refresh` fires it, the poll loop
+    // wakes early. One handle, two clones (API + engine).
     let refresh = Arc::new(tokio::sync::Notify::new());
 
+    // The human door refuses to build without SQUELCH_API_TOKEN. Attaching the
+    // WRITE-bound credential store here enables the action endpoints — the sync
+    // engine below gets a separate Read-bound store and never sees this one.
     let api_state = squelch_api::ApiState::from_env(store.clone(), &email)
-        .map_err(|e| squelch_core::CoreError::Other(anyhow::anyhow!("{e}")))?
+        .map_err(|e| other_err(format!("{e}")))?
         .with_write_credentials(backend, email.clone(), creds_path.clone(), client.clone())
         .with_refresh(refresh.clone())
-        // Surface the Stage-2 pricing/model/caps on the human door so
-        // /client/stats, /client/usage, and /client/triage-config report the
-        // operator's configured values (and cap "sources") rather than defaults.
         .with_stage2_prices(config.stage2.price_in_per_mtok, config.stage2.price_out_per_mtok)
         .with_stage2_model(
             config.stage2.model.clone(),
@@ -428,74 +365,42 @@ fn cmd_serve(
             config.stage1.global_daily_cap,
         );
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| squelch_core::CoreError::Other(anyhow::anyhow!("tokio runtime: {e}")))?;
-
+    let runtime = build_runtime()?;
     runtime.block_on(async move {
-        // Sync shutdown signal (watch) + MCP session cancellation token.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mcp_cancel = CancellationToken::new();
 
-        // Spawn the sync loop. It is monomorphic over the credential store, so
-        // we pick the concrete Read-bound backend here. Sync NEVER touches the
-        // write credential. It does NOT receive an embedder override — it resolves
-        // the embedder from the SHARED store each tick, so it picks up the
-        // background-attached embedder automatically once it is ready.
+        // The sync loop. No embedder override: it resolves the embedder from the
+        // shared store each tick, so it picks up the background-attached one.
         let sync_handle = {
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
             let refresh = refresh.clone();
+            let creds =
+                make_credential_store(backend, account_id, email.clone(), creds_path, client);
             tokio::spawn(async move {
-                match backend {
-                    CredentialBackend::Keyring => {
-                        let creds = Arc::new(KeyringCredentialStore::new(
-                            account_id,
-                            email.clone(),
-                            client,
-                        ));
-                        let engine = SyncEngine::new(store, creds, account_id, email, config)
-                            .with_refresh(refresh);
-                        engine.run(shutdown_rx).await
-                    }
-                    CredentialBackend::File => {
-                        let creds = Arc::new(FileCredentialStore::new(
-                            account_id,
-                            email.clone(),
-                            creds_path,
-                            client,
-                        ));
-                        let engine = SyncEngine::new(store, creds, account_id, email, config)
-                            .with_refresh(refresh);
-                        engine.run(shutdown_rx).await
-                    }
-                }
+                SyncEngine::new(store, creds, account_id, email, config)
+                    .with_refresh(refresh)
+                    .run(shutdown_rx)
+                    .await
             })
         };
 
-        // AUTH-MAIL RETENTION. Periodic pass that trashes auth mail older than
-        // the account's policy. It runs HERE, in the process that owns the human
-        // door's write credential — the sync loop is bound to a `gmail.readonly`
-        // credential by hard invariant and could not perform a write even by
-        // accident. The pass is a no-op unless the user has explicitly enabled
-        // the shredder AND a write credential exists, so this task costs one
-        // cheap settings read per tick on every other install.
+        // Auth-mail retention. Runs here because this process owns the write
+        // credential (sync is bound to gmail.readonly by hard invariant). No-op
+        // unless the shredder is enabled AND a write credential exists.
         {
             let shred_state = api_state.clone();
             tokio::spawn(async move {
-                // Stagger the first run so startup isn't competing with the
-                // initial sync burst, then settle into a slow cadence: retention
-                // is measured in days, so hourly is already far more often than
-                // it needs to be.
+                // Stagger past the startup sync burst; retention is measured in
+                // days, so hourly is plenty.
                 tokio::time::sleep(std::time::Duration::from_secs(120)).await;
                 loop {
                     match squelch_api::run_shred_pass(&shred_state).await {
                         Ok(0) => {}
                         Ok(n) => eprintln!("squelchd: shredder trashed {n} old auth message(s)"),
-                        // Never fatal: retention failing must not take the daemon
-                        // down, and the error is redacted by construction.
+                        // Never fatal; the error is redacted by construction.
                         Err(_) => eprintln!("squelchd: shredder pass failed"),
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -503,25 +408,21 @@ fn cmd_serve(
             });
         }
 
-        // Build the combined app and bind BEFORE building the embedder. Binding is
-        // the priority: both doors must be reachable immediately (issue #16).
+        // Bind BEFORE building the embedder: its first-run model download must
+        // not leave the doors unreachable (issue #16).
         let app = build_serve_router(store.clone(), &email, api_state, mcp_cancel.clone())
             .map_err(squelch_core::CoreError::Other)?;
         let listener = tokio::net::TcpListener::bind(bind)
             .await
-            .map_err(|e| squelch_core::CoreError::Other(anyhow::anyhow!("bind {bind}: {e}")))?;
+            .map_err(|e| other_err(format!("bind {bind}: {e}")))?;
         let bound = listener.local_addr().unwrap_or(bind);
         // Single startup line. No tokens or message content are ever logged.
         eprintln!(
             "squelchd: serving agent door http://{bound}/mcp and human door http://{bound}/client/*"
         );
 
-        // BACKGROUND EMBEDDER INIT (issue #16). The server is ALREADY serving; we
-        // build the embedder off the runtime (first run downloads ~30MB of ONNX
-        // weights) and attach it to the shared store when ready. Until then, search
-        // is keyword-only. `spawn_blocking` keeps the CPU/IO-bound construction off
-        // the async workers. Attach failures are logged and leave search in the
-        // (fully functional) keyword-only mode.
+        // Background embedder init: build off the async workers, attach to the
+        // shared store when ready. Search is keyword-only until then.
         {
             let store = store.clone();
             let config = config.clone();
@@ -549,8 +450,7 @@ fn cmd_serve(
             });
         }
 
-        // Graceful shutdown: stop accepting, cancel MCP sessions, then signal
-        // sync to flush.
+        // Graceful shutdown: stop accepting, cancel MCP sessions, signal sync.
         let shutdown_signal = {
             let mcp_cancel = mcp_cancel.clone();
             let shutdown_tx = shutdown_tx.clone();
@@ -566,8 +466,8 @@ fn cmd_serve(
             .with_graceful_shutdown(shutdown_signal)
             .await;
 
-        // The server has stopped accepting. Make sure sync is told to stop even
-        // if the server exited for another reason, then wait for it to flush.
+        // Ensure sync is told to stop even if the server exited for another
+        // reason, then wait for it to flush.
         let _ = shutdown_tx.send(true);
         match sync_handle.await {
             Ok(Ok(())) => {}
@@ -575,8 +475,7 @@ fn cmd_serve(
             Err(e) => eprintln!("squelchd: sync task join error: {e}"),
         }
 
-        serve_result
-            .map_err(|e| squelch_core::CoreError::Other(anyhow::anyhow!("http serve: {e}")))
+        serve_result.map_err(|e| other_err(format!("http serve: {e}")))
     })?;
 
     eprintln!("squelchd: stopped.");
@@ -606,7 +505,6 @@ mod tests {
     /// Bind resolution: flag > env > loopback default, and a bad value errors.
     #[test]
     fn resolve_bind_precedence_and_default() {
-        // Explicit flag wins.
         let args = ServeArgs {
             bind: Some("127.0.0.1:9999".to_string()),
         };
@@ -615,7 +513,6 @@ mod tests {
             "127.0.0.1:9999".parse::<SocketAddr>().unwrap()
         );
 
-        // No flag, no env => loopback default.
         let args = ServeArgs { bind: None };
         // Guard against a stray env var in the test process.
         unsafe {
@@ -626,17 +523,14 @@ mod tests {
             DEFAULT_BIND_ADDR.parse::<SocketAddr>().unwrap()
         );
 
-        // Garbage value errors rather than silently falling back.
         let args = ServeArgs {
             bind: Some("not-an-addr".to_string()),
         };
         assert!(resolve_bind(&args).is_err());
     }
 
-    /// The unified router mounts BOTH doors: an unauthenticated `/client/stats`
-    /// is rejected by the human door's bearer layer (401/… not 404), and `/mcp`
-    /// exists (a bare GET is not 404). This proves composition without needing a
-    /// live sync loop.
+    /// The unified router mounts both doors: `/client/stats` is bearer-gated
+    /// (401, not 404; 200 with the token) and `/mcp` exists (not 404).
     #[tokio::test]
     async fn router_mounts_both_doors() {
         use axum::body::Body;
@@ -651,7 +545,6 @@ mod tests {
         let app = build_serve_router(store, "me@localhost", api_state, cancel)
             .expect("router builds");
 
-        // Human door present + auth-gated: no bearer => NOT 404.
         let resp = app
             .clone()
             .oneshot(
@@ -668,7 +561,6 @@ mod tests {
             "/client/stats must be mounted (auth-gated, not missing)"
         );
 
-        // With the correct bearer, the human door answers (not 404, not 401).
         let resp = app
             .clone()
             .oneshot(
@@ -686,8 +578,6 @@ mod tests {
             "/client/stats must answer 200 with a valid bearer"
         );
 
-        // Agent door present: a bare GET to /mcp is handled by the MCP service,
-        // which is NOT 404 (the path is mounted).
         let resp = app
             .oneshot(
                 Request::builder()

@@ -263,7 +263,7 @@ struct WarnDays {
 }
 
 /// Everything the sync loop needs, resolved once at startup.
-pub struct SyncEngine<S: Store, C: CredentialStore> {
+pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     store: Arc<S>,
     creds: Arc<C>,
     account_id: AccountId,
@@ -297,7 +297,7 @@ pub struct SyncEngine<S: Store, C: CredentialStore> {
     warn_days: std::sync::Mutex<WarnDays>,
 }
 
-impl<S: Store + 'static, C: CredentialStore + 'static> SyncEngine<S, C> {
+impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C> {
     pub fn new(
         store: Arc<S>,
         creds: Arc<C>,
