@@ -52,6 +52,30 @@ struct ThreadViewer: View {
     }
     private var senderName: String { newest.map { SenderCache.resolved($0.senderString).displayName } ?? "" }
 
+    /// EVERY participant, in first-appearance order, deduped by canonical
+    /// address. Reads `thread.messages` (chronological) rather than the
+    /// newest-first display order, so the list starts with whoever started the
+    /// thread. Naming only the newest sender hides half of what a thread is.
+    private var participants: [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        for m in thread?.messages ?? [] {
+            let key = m.from_addr.trimmingCharacters(in: .whitespaces).lowercased()
+            guard seen.insert(key).inserted else { continue }
+            names.append(SenderCache.resolved(m.senderString).displayName)
+        }
+        return names
+    }
+
+    /// "Alice, Bob, Carol +3". The header is a fixed strip above a scroll —
+    /// a long thread must collapse into a count rather than wrap and shove the
+    /// mail down the screen.
+    private var participantLine: String {
+        let names = participants
+        guard names.count > 3 else { return names.joined(separator: ", ") }
+        return names.prefix(3).joined(separator: ", ") + " +\(names.count - 3)"
+    }
+
     var body: some View {
         ZStack {
             Rectangle()
@@ -96,20 +120,29 @@ struct ThreadViewer: View {
     // MARK: - chrome
 
     private var header: some View {
-        HStack(spacing: 10) {
-            Text(thread?.subject ?? "…")
-                .font(Typo.serif(19, weight: .medium))
-                .foregroundStyle(Palette.ink)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(alignment: .firstTextBaseline, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(thread?.subject ?? "…")
+                    .font(Typo.serif(19, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(2)
+                if !participantLine.isEmpty {
+                    Text(participantLine)
+                        .font(Typo.rowSub)
+                        .foregroundStyle(Palette.inkFaint)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if prefs.developerMode {
                 Button("triage debug") { Task { await openDebug() } }
-                    .buttonStyle(.glass).font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                    .buttonStyle(.textAction).font(Typo.micro)
                 Button(retriaging ? "re-triaging…" : "re-triage") {
                     Task { await retriageThis() }
                 }
-                .buttonStyle(.glass).font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                .buttonStyle(.textAction).font(Typo.micro)
                 .disabled(retriaging)
                 .help("dev: reset this email's LLM verdicts and re-run triage")
             }
@@ -127,8 +160,7 @@ struct ThreadViewer: View {
                     }
                 }
             }
-            .buttonStyle(.glass)
-            .foregroundStyle(Palette.inkFaint)
+            .buttonStyle(.textAction)
             .help("unsubscribe from this sender")
 
             Button { store.closeThread() } label: {
@@ -137,8 +169,7 @@ struct ThreadViewer: View {
                     Text("back").font(Typo.micro)
                 }
             }
-            .buttonStyle(.glass)
-            .foregroundStyle(Palette.inkFaint)
+            .buttonStyle(.textAction)
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 13)
@@ -158,14 +189,19 @@ struct ThreadViewer: View {
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
+                    // spacing 0: each message owns its own vertical rhythm so
+                    // the hairline between two of them lands in the middle of
+                    // the gap instead of hugging one side of it.
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
-                            MessageCard(message: m, selected: i == index) { index = i }
-                                .id(i)
+                            MessageCard(message: m, selected: i == index, ruled: i > 0) {
+                                index = i
+                            }
+                            .id(i)
                         }
                     }
                     .padding(.horizontal, 22)
-                    .padding(.vertical, 18)
+                    .padding(.vertical, 4)
                     .frame(maxWidth: 900)
                     .frame(maxWidth: .infinity)
                 }
@@ -347,9 +383,20 @@ struct ThreadViewer: View {
 
 // MARK: - message card
 
+/// ONE container per message, and it is the web frame's own rounded clip.
+///
+/// What used to be here: a `readerBackground` fill the exact color of the page
+/// beneath it, plus a bordered rounded rect, plus a drop shadow, wrapped around
+/// a frame that already clips itself round — three nested shapes carrying zero
+/// information, on every message, in a surface whose whole job is reading. Now
+/// messages are divided by a hairline and marked by a rule, and the mail is the
+/// only thing with edges.
 private struct MessageCard: View {
     let message: ClientMessage
     let selected: Bool
+    /// The first message needs no divider above it: that is the top of the
+    /// document, not a seam between two messages.
+    let ruled: Bool
     let onSelect: () -> Void
 
     var body: some View {
@@ -373,19 +420,28 @@ private struct MessageCard: View {
 
             AttachmentStrip(attachments: message.attachmentList)
         }
-        .padding(14)
+        // The gutter is reserved whether or not this message is selected, so
+        // j/k moves a rule rather than shifting every body left and right.
+        .padding(.leading, 13)
+        .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Palette.readerBackground)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(
-                    selected ? Palette.accent.opacity(0.5) : Palette.hairline,
-                    lineWidth: selected ? 1.5 : 0.75)
-        )
-        .shadow(color: .black.opacity(0.07), radius: 12, y: 4)
+        // BOTH rules stay mounted and only change opacity. A conditional
+        // modifier here would give selected and unselected separate view
+        // identities, so every j/k would tear down the message's subtree and
+        // make its web frame re-measure from scratch.
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(Palette.accent)
+                .frame(width: 3)
+                .padding(.vertical, 11)
+                .opacity(selected ? 1 : 0)
+        }
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Palette.hairline)
+                .frame(height: 0.5)
+                .opacity(ruled ? 1 : 0)
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
     }
@@ -415,8 +471,10 @@ private struct PlainBody: View {
                         .font(Typo.micro)
                         .padding(.horizontal, 9).padding(.vertical, 3)
                 }
-                .buttonStyle(.glass)
-                .foregroundStyle(Palette.inkFaint)
+                // Same text-on-hover treatment as the header actions: this is
+                // the only control INSIDE the reading surface, so a glass pill
+                // here read as a second piece of chrome stapled to the mail.
+                .buttonStyle(.textAction)
                 .help("the quoted reply chain below this message")
                 if open {
                     Text(quoted)

@@ -98,6 +98,13 @@ struct MainShell: View {
             // swallow them. Esc closes the reader, a second Esc the panel.
             if let threadId = store.threadId {
                 HStack(spacing: 0) {
+                    // THE RAIL STAYS. Reading an email is not leaving the app,
+                    // so the nav you navigate BY should not disappear underneath
+                    // it — the reader insets past the rail instead of covering
+                    // it, and 1..5 stay clickable while you read.
+                    Color.clear
+                        .frame(width: SidebarRail.railWidth)
+                        .allowsHitTesting(false)
                     ThreadViewer(threadId: threadId)
                         .id(threadId)
                     if store.sideView.isOpen {
@@ -108,7 +115,10 @@ struct MainShell: View {
                             .allowsHitTesting(false)
                     }
                 }
-                .transition(.opacity)
+                // NO TRANSITION. Opening an email is a jump, not a dissolve —
+                // a crossfade means every open and close spends a fifth of a
+                // second showing you two surfaces at once, which reads as lag
+                // rather than polish on a surface you enter and leave constantly.
                 .zIndex(20)
             }
             }
@@ -121,7 +131,7 @@ struct MainShell: View {
         }
         .animation(.easeOut(duration: 0.18), value: store.modalOverlayOpen)
         .animation(.smooth(duration: 0.22), value: store.sideView)
-        .animation(.smooth(duration: 0.2), value: store.threadId)
+        // threadId is deliberately NOT animated — see the reader's zIndex block.
         .keyBindings(.global, globalBindings)
         .onChange(of: store.sitrep.sealed) { _, sealed in
             AuthArrival.shared.observe(sealed: sealed)

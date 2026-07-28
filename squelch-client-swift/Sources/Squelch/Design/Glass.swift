@@ -345,6 +345,36 @@ struct WindowBackdrop: View {
     }
 }
 
+// MARK: - text actions
+
+/// An action that is nothing but its own label — no pill, no border, no fill.
+/// Hover IS the affordance.
+///
+/// For chrome that sits directly above content the user is reading: a row of
+/// outlined glass pills up there reads as a toolbar demanding attention, and
+/// competes with the mail it is framing. The rest color is deliberately faint
+/// enough to recede and the hover color is the accent, because with no shape
+/// of its own the color change is the only thing left to say "this is a
+/// button". Wrap key hints (`Kbd`) in the label as usual; they keep their own
+/// chip, which is the point — the hint is the affordance at rest.
+struct TextActionStyle: ButtonStyle {
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(hovering ? Palette.accent : Palette.inkFaint)
+            .opacity(configuration.isPressed ? 0.55 : 1)
+            // Without a background the label's glyphs would be the only hit
+            // target, so hover would flicker between letters.
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+    }
+}
+
+extension ButtonStyle where Self == TextActionStyle {
+    static var textAction: TextActionStyle { TextActionStyle() }
+}
+
 private struct VisualEffectBackdrop: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()

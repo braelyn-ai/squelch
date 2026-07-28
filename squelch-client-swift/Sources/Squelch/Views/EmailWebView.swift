@@ -162,8 +162,10 @@ struct EmailWebView: View {
                         .padding(.horizontal, 9)
                         .padding(.vertical, 3)
                 }
-                .buttonStyle(.glass)
-                .foregroundStyle(Palette.inkFaint)
+                // Same text-on-hover treatment as the header actions: this is
+                // the only control INSIDE the reading surface, so a glass pill
+                // here read as a second piece of chrome stapled to the mail.
+                .buttonStyle(.textAction)
                 .help("the quoted reply chain below this message")
             }
 
