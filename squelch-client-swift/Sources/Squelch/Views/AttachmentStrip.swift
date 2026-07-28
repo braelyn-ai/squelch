@@ -21,6 +21,7 @@
 //
 // Ported from squelch-desktop/src/components/AttachmentStrip.tsx.
 
+import AppKit
 import PDFKit
 import SwiftUI
 
@@ -209,7 +210,48 @@ private struct PDFPreview: View {
     @State private var document: PDFDocument?
     @State private var error: String?
 
+    /// The scrim, and the card inside it. The gap between them IS the click-off
+    /// target, so it has to stay wide enough to hit without aiming.
+    ///
+    /// Both are FIXED rather than sized to the window, because macOS clamps a
+    /// sheet: asking for a 1320x880 sheet on a 1320x880 window gets you 980x640
+    /// regardless, so a "cover the window" scrim is not a thing a sheet can be.
+    /// These are sized to sit inside that clamp.
+    private static let scrimSize = CGSize(width: 940, height: 620)
+    private static let cardSize = CGSize(width: 820, height: 520)
+
     var body: some View {
+        ZStack {
+            // A sheet brings no scrim of its own, so "click off to close" needs
+            // a real view to click. Dimmed the same 14% as every other modal
+            // here, with the card centred on it.
+            Rectangle()
+                .fill(.black.opacity(0.14))
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onClose)
+            card
+        }
+        .frame(width: Self.scrimSize.width, height: Self.scrimSize.height)
+        // Without this the sheet's own backing paints an opaque slab, which
+        // both flattens the glass and hides the window the scrim is dimming.
+        .presentationBackground(.clear)
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "close preview", allowInInput: true) { onClose() }
+        ])
+        .task {
+            do {
+                let fetched = try await APIClient.shared.fetchAttachment(
+                    attachment.id, fallbackName: attachment.filename)
+                document = PDFDocument(data: fetched.bytes)
+                if document == nil { error = "could not read that PDF" }
+            } catch {
+                self.error = errText(error, "preview failed")
+            }
+        }
+    }
+
+    private var card: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Text(attachment.filename)
@@ -250,25 +292,13 @@ private struct PDFPreview: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 820, height: 620)
-        .squelchGlass(.pane, cornerRadius: 20, tint: Palette.glassTint)
-        // The sheet's own backing would otherwise paint an opaque slab behind
-        // the glass and flatten it into a plain grey panel.
-        .presentationBackground(.clear)
-        .keyContext(.modal)
-        .keyBindings(.modal, [
-            KeyBinding("Escape", "close preview", allowInInput: true) { onClose() }
-        ])
-        .task {
-            do {
-                let fetched = try await APIClient.shared.fetchAttachment(
-                    attachment.id, fallbackName: attachment.filename)
-                document = PDFDocument(data: fetched.bytes)
-                if document == nil { error = "could not read that PDF" }
-            } catch {
-                self.error = errText(error, "preview failed")
-            }
-        }
+        .frame(width: Self.cardSize.width, height: Self.cardSize.height)
+        .squelchGlass(.pane, cornerRadius: 13, tint: Palette.glassTint)
+        .shadow(color: .black.opacity(0.3), radius: 40, y: 16)
+        // The card swallows clicks so they never reach the dismiss scrim under
+        // it — otherwise selecting text in the PDF would close the preview.
+        .contentShape(Rectangle())
+        .onTapGesture {}
     }
 }
 
