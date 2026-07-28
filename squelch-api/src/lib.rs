@@ -87,6 +87,10 @@ pub fn router(state: ApiState) -> Router {
             "/client/triage-config",
             get(handlers::get_triage_config).post(handlers::set_triage_config),
         )
+        .route(
+            "/client/triage-feedback",
+            get(handlers::get_triage_feedback).post(handlers::post_triage_feedback),
+        )
         // Dev re-triage + inspector: human-door only.
         .route("/client/retriage", post(handlers::retriage))
         .route(

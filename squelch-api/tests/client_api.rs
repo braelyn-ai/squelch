@@ -2263,3 +2263,75 @@ async fn attachment_requires_bearer_auth() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "byte endpoint is behind auth");
 }
+
+#[tokio::test]
+async fn triage_feedback_round_trip_records_and_audits() {
+    let mut mid = 0;
+    let (app, store, acct) = app_with(|store, acct| {
+        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        store
+            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+        mid = m;
+    });
+
+    // Correct the tier; the response carries the recorded row.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-feedback",
+            serde_json::json!({
+                "message_id": mid,
+                "dimension": "tier",
+                "to_value": "noise",
+                "note": "newsletter, not signal"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "route must be mounted and accept the correction");
+    let json = body_json(resp).await;
+    assert_eq!(json["dimension"], "tier");
+    assert_eq!(json["from_value"], "signal");
+    assert_eq!(json["to_value"], "noise");
+
+    // The correction is the dataset: GET returns it.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/triage-feedback"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().map(Vec::len), Some(1));
+    assert_eq!(json[0]["message_id"], mid);
+
+    // Audited.
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit.iter().any(|e| e.action == "triage_correction"),
+        "correction must land an audit row"
+    );
+
+    // Invalid axis / invalid value are 400, not recorded.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-feedback",
+            serde_json::json!({ "message_id": mid, "dimension": "vibes", "to_value": "noise" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/triage-feedback",
+            serde_json::json!({ "message_id": mid, "dimension": "tier", "to_value": "spam" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
