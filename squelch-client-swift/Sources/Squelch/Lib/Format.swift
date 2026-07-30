@@ -149,22 +149,49 @@ enum Fmt {
         return DeadlineChip(text: "due \(shortDate(iso))", overdue: false)
     }
 
+    /// Rendered stamps, memoized like the parsed dates above and for the same
+    /// reason: `Date.formatted` builds a format style and runs ICU on every call,
+    /// and these run for every visible row on every render — a deadline chip
+    /// alone pays it once per for-your-eyes row. Only ABSOLUTE formats belong
+    /// here; anything relative to `now` (see `relAge`) must never be cached.
+    nonisolated(unsafe) private static var textCache = LRUMap<String, String>(limit: dateCacheCap)
+
+    /// `kind` namespaces the key, so the same stamp can hold a short date and a
+    /// date-time without one answering for the other.
+    private static func rendered(_ iso: String?, _ kind: String, _ make: (Date) -> String) -> String
+    {
+        // Parse FIRST: `date` takes the same lock, so holding it here would
+        // deadlock on the very first miss.
+        guard let iso, let d = date(iso) else { return "" }
+        let key = kind + iso
+        dateCacheLock.lock()
+        if let hit = textCache.get(key) {
+            dateCacheLock.unlock()
+            return hit
+        }
+        dateCacheLock.unlock()
+
+        let value = make(d)
+
+        dateCacheLock.lock()
+        textCache.set(key, value)
+        dateCacheLock.unlock()
+        return value
+    }
+
     /// Compact date like "Jul 11" (local).
     static func shortDate(_ iso: String?) -> String {
-        guard let d = date(iso) else { return "" }
-        return d.formatted(.dateTime.month(.abbreviated).day())
+        rendered(iso, "d|") { $0.formatted(.dateTime.month(.abbreviated).day()) }
     }
 
     /// Date + time like "Jul 11, 2:32 PM" for thread messages / audit.
     static func dateTime(_ iso: String?) -> String {
-        guard let d = date(iso) else { return "" }
-        return d.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+        rendered(iso, "dt|") { $0.formatted(.dateTime.month(.abbreviated).day().hour().minute()) }
     }
 
     /// Time-of-day like "3:00 PM" (calendar rail).
     static func timeOfDay(_ iso: String?) -> String {
-        guard let d = date(iso) else { return "" }
-        return d.formatted(.dateTime.hour().minute())
+        rendered(iso, "t|") { $0.formatted(.dateTime.hour().minute()) }
     }
 
     /// True if the stamp falls on the current LOCAL calendar day; nil → false.
