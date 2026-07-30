@@ -1,12 +1,8 @@
-//! APNs provider authentication tokens.
-//!
-//! Apple wants an ES256 JWT signed with the `.p8` key, header `{alg, kid}` and
-//! claims `{iss = team id, iat}`. There is no `exp`: APNs rejects a token whose
-//! `iat` is older than one hour and rate-limits providers that re-sign on every
-//! request, so the token is CACHED and re-signed only past [`MAX_TOKEN_AGE`].
-//!
-//! SECURITY: the signed token is a bearer credential for the whole app
-//! identifier. It is never logged and never returned to a caller.
+//! APNs provider tokens: an ES256 JWT signed with the `.p8`, header
+//! `{alg, kid}`, claims `{iss = team id, iat}`. No `exp` — APNs rejects an `iat`
+//! older than an hour and throttles providers that re-sign per request, so the
+//! token is CACHED and re-signed only past [`MAX_TOKEN_AGE_SECS`]. It is a
+//! bearer credential for the whole app id: never logged, never returned.
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,9 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 
-/// Re-sign once the cached token is older than this. Apple's documented window
-/// is 20-60 minutes: under 20 the provider gets throttled, over 60 the token is
-/// rejected. 50 minutes sits inside both bounds with room for clock skew.
+/// Re-sign once the cached token is older than this. Apple's window is 20-60
+/// minutes (under 20 throttles, over 60 rejects); 50 leaves room for skew.
 pub const MAX_TOKEN_AGE_SECS: i64 = 50 * 60;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,15 +42,14 @@ pub struct JwtSigner {
     key: EncodingKey,
     header: Header,
     team_id: String,
-    /// Guarded so concurrent pushes cannot stampede a re-sign: the first waiter
-    /// re-signs, the rest observe the fresh token. Signing is a sub-millisecond
-    /// CPU operation with no `.await` inside, so a `std::sync::Mutex` is the
-    /// right lock here — an async mutex would buy nothing.
+    /// Guarded so concurrent pushes cannot stampede a re-sign. Signing is
+    /// sub-millisecond CPU with no `.await` inside, so a `std::sync::Mutex` is
+    /// the right lock.
     cached: Mutex<Option<Cached>>,
 }
 
-/// Hand-written so neither the key nor a signed token can reach a log through
-/// a stray `{:?}`.
+/// Hand-written so neither the key nor a signed token can reach a log through a
+/// stray `{:?}`.
 impl std::fmt::Debug for JwtSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JwtSigner")
@@ -85,13 +79,12 @@ impl JwtSigner {
         self.token_at(now_unix())
     }
 
-    /// [`JwtSigner::token`] with an injected clock. Exposed so the age-based
-    /// re-sign can be tested without waiting fifty minutes.
+    /// [`JwtSigner::token`] with an injected clock, so the age-based re-sign is
+    /// testable without waiting fifty minutes.
     pub fn token_at(&self, now: i64) -> Result<Arc<str>, JwtError> {
         // Poisoning is RECOVERED, not propagated: the guarded value is a cached
         // token with no invariant a panic could corrupt, and propagating would
-        // let one panic under this lock fail every future push forever while the
-        // liveness probe still reported a healthy process.
+        // fail every future push forever while `/healthz` stayed green.
         let mut slot = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = slot.as_ref()
             && now.saturating_sub(c.iat) <= MAX_TOKEN_AGE_SECS
@@ -155,8 +148,7 @@ mod tests {
         let claims = decode_claims(&tok);
         assert_eq!(claims["iss"], "TEAMID6789");
         assert_eq!(claims["iat"], 1_700_000_000i64);
-        // No exp: APNs ages tokens by iat, and an exp we got wrong would be a
-        // hard rejection.
+        // No exp: APNs ages tokens by iat, and a wrong exp is a hard rejection.
         assert!(claims.get("exp").is_none());
         assert_eq!(claims.as_object().unwrap().len(), 2);
     }
@@ -182,8 +174,8 @@ mod tests {
         let s = signer();
         let t0 = 1_700_000_000;
         let a = s.token_at(t0).unwrap();
-        // A token dated in the future is rejected by APNs, so a backwards clock
-        // step must invalidate the cache rather than serve it.
+        // APNs rejects a future-dated token, so a backwards clock step must
+        // invalidate the cache rather than serve it.
         let b = s.token_at(t0 - 60).unwrap();
         assert_ne!(a.as_ref(), b.as_ref());
         assert_eq!(decode_claims(&b)["iat"], t0 - 60);
@@ -204,8 +196,8 @@ mod tests {
         assert_eq!(data.claims["iss"], "TEAMID6789");
     }
 
-    /// Decode the payload segment without verifying — the signature is checked
-    /// in its own test.
+    /// Decode the payload segment without verifying; the signature has its own
+    /// test.
     fn decode_claims(token: &str) -> serde_json::Value {
         let payload = token.split('.').nth(1).expect("jwt has three segments");
         serde_json::from_slice(&b64url_decode(payload)).unwrap()

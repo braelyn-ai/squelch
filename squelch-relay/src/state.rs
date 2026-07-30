@@ -11,20 +11,16 @@ use crate::jwt::JwtSigner;
 use crate::ratelimit::{REQUESTS_PER_MINUTE, RateLimiter};
 
 /// State threaded through the router, the auth layer, and the rate limiter.
-///
-/// Cheap to clone (one `Arc`), matching how squelch-api clones `ApiState`. The
-/// config, the HTTP client, the token cache, and the limiter are all
-/// process-wide singletons: cloning must never fork the JWT cache or the
+/// Cheap to clone (one `Arc`): the config, HTTP client, token cache, and limiter
+/// are process-wide singletons, and cloning must never fork the cache or the
 /// buckets.
 #[derive(Clone)]
 pub struct RelayState {
     inner: Arc<Inner>,
 }
 
-/// Process-wide ceiling on concurrent APNs requests. `FANOUT` in [`crate`]'s
-/// handler bounds concurrency inside one batch only; without this, C concurrent
-/// pushes open C*FANOUT sockets. 64 keeps a healthy pipe to Apple full while
-/// staying a fixed, known number of file descriptors.
+/// Process-wide ceiling on concurrent APNs requests. `FANOUT` bounds one batch
+/// only; without this, C concurrent pushes open C*FANOUT sockets.
 const MAX_INFLIGHT_APNS: usize = 64;
 
 struct Inner {
@@ -36,18 +32,18 @@ struct Inner {
 }
 
 impl RelayState {
-    /// Build state from validated config, constructing the APNs HTTP client and
-    /// the JWT signer. Fails if the `.p8` is not a usable ES256 key — the relay
-    /// refuses to start rather than discovering it on the first push.
+    /// Build state from validated config. Fails if the `.p8` is not a usable
+    /// ES256 key, so the relay refuses to start rather than discovering it on
+    /// the first push.
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let signer = JwtSigner::new(
             &config.apns_key_pem,
             &config.apns_key_id,
             &config.apns_team_id,
         )?;
-        // Connection reuse matters: APNs expects providers to hold a long-lived
-        // HTTP/2 connection rather than reconnecting per push. `http2` is
-        // negotiated by ALPN, so a plain-HTTP test override still works over 1.1.
+        // APNs expects providers to hold a long-lived HTTP/2 connection rather
+        // than reconnecting per push; ALPN negotiates it, so a plain-HTTP test
+        // override still works over 1.1.
         let http = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(600))
             .timeout(Duration::from_secs(10))
@@ -81,11 +77,9 @@ impl RelayState {
     }
 
     /// Charge one push against `ip`'s bucket. False means "over the limit".
-    ///
     /// Poisoning is RECOVERED, not propagated: the guarded value is a token
-    /// bucket with no invariant a panic could corrupt, and `.expect()` here
-    /// would let one unrelated panic brick every future push while `/healthz`
-    /// kept answering 200, so nothing would ever restart the process.
+    /// bucket with no invariant a panic could corrupt, and `.expect()` would
+    /// brick every future push while `/healthz` kept answering 200.
     pub(crate) fn check_rate(&self, ip: IpAddr) -> bool {
         self.inner
             .limiter
@@ -94,11 +88,11 @@ impl RelayState {
             .check(ip, Instant::now())
     }
 
-    /// Wait for a slot in the process-wide APNs concurrency budget. The permit
-    /// releases the slot when dropped.
+    /// Wait for a slot in the process-wide APNs concurrency budget; the permit
+    /// releases it when dropped.
     pub(crate) async fn apns_slot(&self) -> Option<SemaphorePermit<'_>> {
-        // The semaphore is never closed, so this only fails if that changes;
-        // proceeding without a permit is strictly better than dropping a push.
+        // The semaphore is never closed; proceeding without a permit beats
+        // dropping a push if that ever changes.
         self.inner.apns_inflight.acquire().await.ok()
     }
 }

@@ -1,8 +1,7 @@
-//! squelch-core: domain types, storage, and triage for the squelch local-first
-//! email intelligence tool.
+//! squelch-core: domain types, storage, and triage for squelch.
 //!
-//! SECURITY INVARIANT: sealed (auth-related) messages are INVISIBLE to any
-//! MCP-facing query — absent, not redacted. See [`store`] and [`triage::seal`].
+//! Sealed (auth-related) messages are ABSENT from every agent-door query, never
+//! redacted — see docs/SECURITY.md §4, [`store`], and [`triage::seal`].
 
 pub mod auth;
 pub mod config;

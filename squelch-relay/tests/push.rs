@@ -1,10 +1,7 @@
-//! End-to-end tests for `POST /v1/push` against a mock APNs server.
-//!
-//! The mock is a second axum app on an ephemeral port, wired in through
-//! `Config::apns_url_override` — the same knob `SQUELCH_RELAY_APNS_URL_OVERRIDE`
-//! sets, but passed directly so tests never mutate process-global environment
-//! and can run in parallel. The env path itself is covered in
-//! `tests/config_env.rs`, which needs a process to itself.
+//! End-to-end `POST /v1/push` against a mock APNs on an ephemeral port, wired in
+//! through `Config::apns_url_override` directly so these tests never mutate
+//! process-global environment and can run in parallel. The env path itself is
+//! covered by `tests/config_env.rs`, which needs a process to itself.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -43,8 +40,8 @@ struct Mock {
     seen: Arc<Mutex<Vec<Captured>>>,
 }
 
-/// Mock APNs: 410/400 for the two known-bad tokens, 200 otherwise. Every
-/// request is recorded so the outgoing headers and payload can be asserted.
+/// Mock APNs: 410/400 for the two known-bad tokens, 200 otherwise. Requests are
+/// recorded so the outgoing headers and payload can be asserted.
 async fn apns_device(
     State(mock): State<Mock>,
     Path(token): Path<String>,
@@ -163,8 +160,7 @@ async fn forwards_apns_headers_and_a_content_free_payload() {
     assert_eq!(c.headers["apns-priority"], "10");
     assert_eq!(c.headers["apns-collapse-id"], "thread-99");
 
-    // A real ES256 provider token under the `bearer` scheme; its contents are
-    // asserted in the jwt unit tests.
+    // A real ES256 provider token under the `bearer` scheme.
     let auth = c.headers["authorization"].to_str().unwrap();
     let jwt = auth.strip_prefix("bearer ").expect("bearer scheme");
     assert_eq!(jwt.split('.').count(), 3);
@@ -213,8 +209,7 @@ async fn per_token_apns_status_passes_through_verbatim() {
     )
     .await;
 
-    // One dead token never fails the batch: the relay owns no cleanup policy,
-    // the daemon does.
+    // One dead token never fails the batch: the daemon owns cleanup, not us.
     assert_eq!(status, StatusCode::OK);
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 3);
@@ -304,8 +299,7 @@ async fn malformed_requests_are_rejected_with_400() {
         ),
         ("not an object", json!([1, 2, 3])),
         (
-            // Unbounded, this is a 100x bandwidth amplifier: the payload is
-            // cloned once per token.
+            // Unbounded, a 100x amplifier: the payload is cloned per token.
             "oversized event_id",
             json!({ "device_tokens": [LIVE], "event_id": "e".repeat(500_000) }),
         ),
@@ -354,9 +348,8 @@ async fn bearer_auth_gates_the_push_route() {
     assert_eq!(mock.seen.lock().unwrap().len(), 1);
 }
 
-/// The limiter lives INSIDE the auth layer. Behind the expected TLS proxy the
-/// whole deployment shares one bucket, so if unauthenticated requests spent it,
-/// any internet client could lock the real daemon out with a minute of junk.
+/// The limiter lives INSIDE the auth layer: the deployment shares one bucket
+/// behind the proxy, so junk that spent it would lock the real daemon out.
 #[tokio::test]
 async fn unauthenticated_floods_do_not_spend_the_authenticated_budget() {
     let (apns, mock) = spawn_mock().await;
@@ -390,8 +383,8 @@ async fn rate_limit_returns_429_past_the_per_minute_budget() {
     let body = json!({ "device_tokens": [LIVE], "event_id": 1 });
     let budget = squelch_relay::ratelimit::REQUESTS_PER_MINUTE as usize;
     // The bucket refills at budget/60 per second, so on a slow runner a token
-    // can come back mid-loop and push the first 429 past request budget+1.
-    // Assert a 429 turns up within twice the budget, not at an exact index.
+    // can come back mid-loop: assert a 429 within twice the budget, not at an
+    // exact index.
     let mut saw_429 = false;
     for i in 0..budget * 2 {
         let (status, _) = push(&relay, body.clone()).await;

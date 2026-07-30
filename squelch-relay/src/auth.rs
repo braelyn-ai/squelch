@@ -1,18 +1,10 @@
-//! Optional bearer auth for `POST /v1/push`.
+//! Optional bearer auth for `POST /v1/push`. The token is OPTIONAL — a
+//! deployment may serve open-but-rate-limited — and that choice is made once at
+//! router construction: this layer is mounted only when a token is configured.
 //!
-//! Mechanically identical to `squelch-api/src/auth.rs` — same parser, same
-//! constant-time comparison — with one difference: the relay's token is
-//! OPTIONAL. Device tokens are unguessable capabilities, so the design doc
-//! allows a v1 deployment to run unauthenticated-but-rate-limited. That choice
-//! is made once, at router construction: this middleware is only mounted when a
-//! token is configured, so it never has to decide whether to serve open.
-//!
-//! SECURITY:
-//! - `Authorization: Bearer <token>` is compared in CONSTANT TIME via
-//!   `subtle::ConstantTimeEq`, so a timing side channel cannot leak the secret
-//!   prefix-by-prefix.
-//! - A missing, malformed, or mismatched token returns a bare 401 with no
-//!   detail. The token is never logged or echoed.
+//! `Authorization: Bearer <token>` is compared in CONSTANT TIME, so a timing
+//! side channel cannot leak it prefix-by-prefix. Any failure is a bare 401; the
+//! token is never logged or echoed.
 
 use axum::{
     body::Body,
@@ -25,9 +17,8 @@ use subtle::ConstantTimeEq;
 
 use crate::state::RelayState;
 
-/// Constant-time equality over two byte slices. `ConstantTimeEq` is only defined
-/// for equal-length slices, so we branch on length first (length is not secret)
-/// and then compare in constant time.
+/// Constant-time equality. `ConstantTimeEq` is defined only for equal-length
+/// slices, so length is branched on first — length is not the secret.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -37,9 +28,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Extract a `Bearer` token from an `Authorization` header value.
 fn parse_bearer(value: &str) -> Option<&str> {
-    // Case-insensitive scheme, single space, then the token.
     let rest = value.strip_prefix("Bearer ").or_else(|| {
-        // Tolerate lowercase / mixed-case scheme.
         let (scheme, rest) = value.split_once(' ')?;
         scheme.eq_ignore_ascii_case("bearer").then_some(rest)
     })?;

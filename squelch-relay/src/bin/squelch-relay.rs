@@ -1,18 +1,8 @@
-//! The relay binary.
+//! The relay binary: validate config from the environment, refuse to start on
+//! any bad value, serve the router. The bind default is loopback — a TLS proxy
+//! is expected in front, and we never widen to a public interface silently.
 //!
-//! Loads and validates config from the environment, refuses to start on any bad
-//! value, and serves the router. The bind default is loopback: a TLS proxy is
-//! expected in front, and we never widen to a public interface silently.
-//!
-//! Env (see `README.md` for the full table):
-//! - `SQUELCH_RELAY_BIND` (default `127.0.0.1:8850`)
-//! - `SQUELCH_RELAY_APNS_KEY_PATH` | `SQUELCH_RELAY_APNS_KEY` (exactly one)
-//! - `SQUELCH_RELAY_APNS_KEY_ID`, `SQUELCH_RELAY_APNS_TEAM_ID` (required)
-//! - `SQUELCH_RELAY_APNS_TOPICS` (required; first entry is the default)
-//! - `SQUELCH_RELAY_APNS_ENV` (`production` | `sandbox`, default `production`)
-//! - `SQUELCH_RELAY_AUTH_TOKEN` (required bearer for `POST /v1/push`, unless
-//!   `SQUELCH_RELAY_ALLOW_ANONYMOUS=1`)
-//! - `SQUELCH_RELAY_APNS_URL_OVERRIDE` (TEST ONLY)
+//! Env table: `README.md`.
 
 use std::net::SocketAddr;
 

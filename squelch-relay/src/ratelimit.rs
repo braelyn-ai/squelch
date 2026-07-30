@@ -1,14 +1,9 @@
-//! Per-client-IP token bucket over `POST /v1/push`.
+//! Per-client-IP token bucket over `POST /v1/push`: in-memory, per-process
+//! abuse dampening, not a quota system — a restart forgives everyone.
 //!
-//! In-memory and per-process — this is abuse dampening, not a quota system. A
-//! restart forgives everyone, and a horizontally scaled deployment limits per
-//! instance. Both are acceptable: the relay is stateless by design and the
-//! design doc puts real abuse controls at distribution time.
-//!
-//! CONSTRAINT: the client IP is the TCP peer address. Behind the expected TLS
-//! proxy every request peers from the proxy, so the whole deployment shares one
-//! bucket. `X-Forwarded-For` is deliberately NOT trusted — it is caller-supplied
-//! and would hand any client an unlimited supply of fresh identities.
+//! The client IP is the TCP peer address, so behind the expected TLS proxy the
+//! whole deployment shares one bucket. `X-Forwarded-For` is deliberately NOT
+//! trusted: caller-supplied, it would mint unlimited fresh identities.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -25,8 +20,8 @@ use axum::{
 /// Sustained rate, in requests per minute, per client IP.
 pub const REQUESTS_PER_MINUTE: f64 = 120.0;
 
-/// Buckets idle longer than this are dropped on the next prune. Two windows of
-/// slack so a burst-then-pause client is not credited a full bucket early.
+/// Buckets idle longer than this are dropped on the next prune — two windows of
+/// slack, so a burst-then-pause client is not credited a full bucket early.
 const IDLE_TTL: Duration = Duration::from_secs(120);
 
 /// Prune only once the map is big enough to matter, so the common path stays a
@@ -34,17 +29,16 @@ const IDLE_TTL: Duration = Duration::from_secs(120);
 const PRUNE_AT: usize = 1024;
 
 /// A prune is a full-map scan, so it runs on a clock, not per request: a client
-/// walking an IPv6 /64 must not be able to make every request pay for one.
+/// walking an IPv6 /64 must not make every request pay for one.
 const PRUNE_EVERY: Duration = Duration::from_secs(10);
 
-/// Hard ceiling on tracked buckets. A client rotating source addresses faster
-/// than [`IDLE_TTL`] has nothing to reclaim, so the TTL alone does not bound the
-/// map — this does. ~64k buckets is a few MB and a sub-millisecond scan.
+/// Hard ceiling on tracked buckets. A client rotating addresses faster than
+/// [`IDLE_TTL`] leaves nothing to reclaim, so the TTL alone does not bound the
+/// map — this does.
 const MAX_BUCKETS: usize = 65_536;
 
-/// When the ceiling is hit, evict down to this fraction of it rather than
-/// evicting one bucket per insert: the O(n) scan then amortizes to O(1) per
-/// request instead of running on every single one.
+/// Evict in a batch down to this size rather than one bucket per insert, so the
+/// O(n) scan amortizes to O(1) per request.
 const EVICT_TO: usize = MAX_BUCKETS / 2;
 
 struct Bucket {
@@ -57,14 +51,12 @@ pub struct RateLimiter {
     buckets: HashMap<IpAddr, Bucket>,
     capacity: f64,
     refill_per_sec: f64,
-    /// When the last full-map maintenance ran. `None` until the map first grows
-    /// past [`PRUNE_AT`].
+    /// `None` until the map first grows past [`PRUNE_AT`].
     last_prune: Option<Instant>,
 }
 
 impl RateLimiter {
-    /// A limiter allowing `per_minute` sustained requests, with a burst
-    /// allowance of the same size.
+    /// `per_minute` sustained requests, with a burst allowance of the same size.
     pub fn per_minute(per_minute: f64) -> Self {
         Self {
             buckets: HashMap::new(),
@@ -83,8 +75,8 @@ impl RateLimiter {
             tokens: capacity,
             last: now,
         });
-        // `saturating_duration_since` keeps a non-monotonic surprise from
-        // panicking; the worst case is simply no refill for this request.
+        // `saturating_duration_since` cannot panic on a non-monotonic clock; the
+        // worst case is no refill for this request.
         let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
         b.tokens = (b.tokens + elapsed * refill).min(capacity);
         b.last = now;
@@ -96,8 +88,8 @@ impl RateLimiter {
         }
     }
 
-    /// Keep the map bounded in both size and scan cost. Everything expensive
-    /// lives here so `check`'s common path stays one hash lookup.
+    /// Bound the map in size and scan cost. Everything expensive lives here so
+    /// `check`'s common path stays one hash lookup.
     fn maintain(&mut self, ip: IpAddr, now: Instant) {
         if self.buckets.len() < PRUNE_AT {
             return;
@@ -115,7 +107,7 @@ impl RateLimiter {
         }
     }
 
-    /// Drop buckets untouched for [`IDLE_TTL`]. An idle bucket has refilled to
+    /// Drop buckets untouched for [`IDLE_TTL`]; an idle bucket has refilled to
     /// capacity anyway, so forgetting it costs the limiter nothing.
     fn prune(&mut self, now: Instant) {
         self.buckets
@@ -123,17 +115,15 @@ impl RateLimiter {
     }
 
     /// Evict least-recently-seen buckets until at most `target` remain.
-    ///
-    /// Forgetting a bucket only ever FORGIVES a client, so over-eviction (ties
-    /// on `last`) is safe; being unable to bound the map would not be.
+    /// Forgetting a bucket only ever FORGIVES a client, so over-eviction on
+    /// `last` ties is safe; failing to bound the map would not be.
     fn evict_oldest_to(&mut self, target: usize) {
         if self.buckets.len() <= target {
             return;
         }
         let excess = self.buckets.len() - target;
         let mut times: Vec<Instant> = self.buckets.values().map(|b| b.last).collect();
-        // `select_nth_unstable` is O(n): the cutoff is the `excess`-th oldest
-        // timestamp, without sorting the whole vector.
+        // O(n): the `excess`-th oldest timestamp without sorting the vector.
         let (_, cutoff, _) = times.select_nth_unstable(excess - 1);
         let cutoff = *cutoff;
         self.buckets.retain(|_, b| b.last > cutoff);
@@ -152,8 +142,8 @@ pub async fn limit(
     next: Next,
 ) -> Result<Response, StatusCode> {
     // `ConnectInfo` is absent when the router is driven directly as a `Service`
-    // (tower `oneshot`) rather than served over TCP. Those callers all share the
-    // unspecified address; production always serves with connect info attached.
+    // (tower `oneshot`); those callers share the unspecified address. Production
+    // always serves with connect info attached.
     let ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -206,14 +196,14 @@ mod tests {
         assert!(l.check(ip(1), t + Duration::from_secs(1)));
     }
 
-    /// The map must be bounded even against a client that never reuses an
-    /// address, which is exactly the case the idle TTL cannot reclaim.
+    /// The map stays bounded against a client that never reuses an address —
+    /// exactly the case the idle TTL cannot reclaim.
     #[test]
     fn caps_the_bucket_count_against_address_rotation() {
         let mut l = RateLimiter::per_minute(10.0);
         let t = Instant::now();
-        // Every address distinct and every bucket touched "now", so nothing is
-        // ever idle enough to prune.
+        // Every address distinct, every bucket touched "now": nothing is ever
+        // idle enough to prune.
         for n in 0..(MAX_BUCKETS as u32 + 5_000) {
             l.check(IpAddr::V4(Ipv4Addr::from(n)), t);
             assert!(l.len() <= MAX_BUCKETS, "map exceeded the ceiling");
@@ -229,16 +219,16 @@ mod tests {
         for n in 0..PRUNE_AT as u32 {
             l.check(IpAddr::V4(Ipv4Addr::from(n)), t);
         }
-        // Everything is now older than the TTL, but only the first check past
-        // the interval may prune; the next one within the interval must not.
+        // Everything is older than the TTL, but only the first check past the
+        // interval may prune.
         let later = t + IDLE_TTL + Duration::from_secs(1);
         l.check(ip(1), later);
         assert_eq!(l.len(), 1);
         for n in 0..PRUNE_AT as u32 {
             l.check(IpAddr::V4(Ipv4Addr::from(n)), later);
         }
-        // Still inside PRUNE_EVERY, so the idle sweep has not run again even
-        // though the map is back over PRUNE_AT.
+        // Still inside PRUNE_EVERY, so no second sweep despite being over
+        // PRUNE_AT again.
         assert_eq!(l.len(), PRUNE_AT + 1);
         assert!(l.check(ip(2), later + PRUNE_EVERY));
     }

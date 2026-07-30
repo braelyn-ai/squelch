@@ -1,19 +1,9 @@
 //! `GET /healthz` and `POST /v1/push`.
 //!
-//! The push handler validates, fans out to APNs with bounded concurrency, and
-//! reports each token's APNs status VERBATIM. That pass-through is the contract:
-//! `410 Unregistered` in particular must reach the daemon unchanged, because the
-//! daemon — not this relay — owns dead-token cleanup. The relay remembers
-//! nothing.
-//!
-//! Failure split:
-//! - A malformed REQUEST is the caller's bug and gets a 4xx for the whole batch.
-//! - A failed TOKEN is data, not a bug: an unreachable APNs yields `status: 0`
-//!   with reason `unreachable` for that token while the rest of the batch still
-//!   reports. One dead token never fails the batch.
-//!
-//! PRIVACY: nothing here logs a device token value, the payload, the bearer
-//! token, or the signed APNs JWT.
+//! Each token's APNs status passes through VERBATIM — `410 Unregistered`
+//! especially, since the daemon owns dead-token cleanup. A malformed request
+//! 4xxs the whole batch; a failed token is data (`status: 0`), never a batch
+//! failure. PRIVACY: no token value, payload, bearer, or APNs JWT is logged.
 
 use std::time::{Duration, Instant};
 
@@ -31,34 +21,29 @@ use serde_json::json;
 use crate::config::Environment;
 use crate::state::RelayState;
 
-/// Multi-device fan-out belongs in one request, but an unbounded list would let
-/// one call hold a connection open indefinitely.
+/// An unbounded token list would let one call hold a connection open forever.
 const MAX_TOKENS: usize = 100;
-/// APNs device tokens are 32 bytes (64 hex) today; the bounds are deliberately
-/// loose around that so a token-format change does not require a relay release.
+/// APNs tokens are 32 bytes (64 hex) today; the bounds are deliberately loose so
+/// a token-format change does not require a relay release.
 const TOKEN_MIN_LEN: usize = 16;
 const TOKEN_MAX_LEN: usize = 200;
 /// APNs caps `apns-collapse-id` at 64 bytes and 400s anything longer.
 const MAX_COLLAPSE_ID: usize = 64;
-/// A string `event_id` is opaque, but it is not a payload channel: it is an id.
-/// Unbounded, it would turn one request into a 100x fan-out of megabyte bodies.
+/// Unbounded, an opaque id would turn one request into a 100x fan-out of
+/// megabyte bodies.
 const MAX_EVENT_ID: usize = 256;
-/// APNs' own payload ceiling for an alert push. A body over this is rejected by
-/// Apple anyway, so sending it is pure waste — refuse it here instead. This is
-/// the backstop that cannot drift as fields are added to the payload.
+/// APNs' own payload ceiling for an alert push; the backstop that cannot drift
+/// as fields are added to the payload.
 const MAX_PAYLOAD: usize = 4096;
 /// Concurrent APNs requests per batch.
 const FANOUT: usize = 8;
-/// Wall-clock budget for the whole fan-out. 13 sequential waves at the 10s
-/// per-request client timeout would otherwise pin a connection for ~130s
-/// against an APNs host that blackholes rather than resets. Tokens that have
-/// not finished by then report `status: 0` / `timeout`, which the per-token
-/// failure model already accommodates.
+/// Wall-clock budget for the whole fan-out, so an APNs host that blackholes
+/// rather than resets cannot pin a connection for ~130s. Unfinished tokens
+/// report `status: 0` / `timeout`.
 const BATCH_BUDGET: Duration = Duration::from_secs(30);
 
-/// The generic fallback alert. The Notification Service Extension replaces it
-/// with real content fetched from the user's own daemon; if the daemon is
-/// unreachable this is what the user sees. It must therefore say nothing.
+/// The generic fallback alert, shown when the Notification Service Extension
+/// cannot reach the user's daemon to fetch real content. It must say nothing.
 const ALERT_TITLE: &str = "squelch";
 const ALERT_BODY: &str = "New mail surfaced";
 
@@ -88,10 +73,8 @@ impl IntoResponse for RelayError {
     }
 }
 
-/// An opaque event id. Forwarded into the APNs payload VERBATIM — the relay
-/// never interprets it, so both the daemon's monotonic ints and any future
-/// random string id work without a relay change. Anything else is a 400: a
-/// bool, float, array, or object here means the caller is confused.
+/// An opaque event id, forwarded into the APNs payload VERBATIM — the relay
+/// never interprets it. Anything non-scalar is a 400.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum EventId {
@@ -112,7 +95,7 @@ pub struct PushRequest {
 }
 
 /// One token's outcome. `status` is the APNs HTTP status verbatim, or 0 when
-/// the request never got an HTTP response at all.
+/// there was no HTTP response at all.
 #[derive(Debug, Serialize)]
 pub struct PushResult {
     pub token: String,
@@ -148,12 +131,10 @@ pub async fn push(
 ) -> Result<Json<PushResponse>, RelayError> {
     let started = Instant::now();
 
-    // Parsed by hand rather than through the `Json` extractor so every
-    // malformed body gets the same 400 + `{"error": ...}` shape as a failed
-    // bound check, instead of axum's 415/422 split. serde's Display can embed
-    // the offending value verbatim (`invalid type: string "abc…"`), which
-    // would reflect device tokens into a body an upstream proxy might log —
-    // only the error class and position go back.
+    // Parsed by hand so every malformed body gets the same 400 + `{"error": …}`
+    // shape as a failed bound check. serde's Display embeds the offending value
+    // verbatim, which would reflect device tokens into a body an upstream proxy
+    // might log — only the error class and position go back.
     let req: PushRequest = serde_json::from_slice(&body).map_err(|e| {
         RelayError::bad_request(format!(
             "invalid request body: {:?} error at line {} column {}",
@@ -165,16 +146,15 @@ pub async fn push(
     let v = validate(&state, req)?;
 
     let jwt = state.signer().token().map_err(|_| {
-        // The error detail could name the key file; keep it out of both the log
-        // and the response.
+        // The error detail could name the key file; keep it out of the log and
+        // the response.
         tracing::error!("failed to sign APNs provider token");
         RelayError::new(StatusCode::INTERNAL_SERVER_ERROR, "apns token unavailable")
     })?;
 
     let total = v.tokens.len();
-    // `buffered`, not `buffer_unordered`: same bounded concurrency, but results
-    // come back in request order so the response array lines up with
-    // `device_tokens` and the log line is reproducible.
+    // `buffered`, not `buffer_unordered`: results come back in request order, so
+    // the response array lines up with `device_tokens` index for index.
     let mut results: Vec<PushResult> = Vec::with_capacity(total);
     let fanout = async {
         let mut stream = stream::iter(v.tokens.iter().cloned())
@@ -189,8 +169,8 @@ pub async fn push(
             results.push(r);
         }
     };
-    // Results arrive in request order, so anything past `results.len()` when the
-    // budget expires is exactly the set that never finished.
+    // Results arrive in request order, so everything past `results.len()` at
+    // expiry is exactly the set that never finished.
     let timed_out = tokio::time::timeout(BATCH_BUDGET, fanout).await.is_err();
     if timed_out {
         for token in v.tokens.iter().skip(results.len()) {
@@ -231,8 +211,8 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
         )));
     }
     for t in &req.device_tokens {
-        // Hex-only is also what keeps a token from reshaping the APNs URL: no
-        // slashes, no dots, no query, no percent-escapes can survive this.
+        // Hex-only is what keeps a token from reshaping the APNs URL: no
+        // slashes, dots, query, or percent-escapes survive it.
         if t.len() < TOKEN_MIN_LEN || t.len() > TOKEN_MAX_LEN {
             return Err(RelayError::bad_request(format!(
                 "device token length must be {TOKEN_MIN_LEN}..={TOKEN_MAX_LEN} hex characters"
@@ -254,9 +234,8 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
                     "collapse_id exceeds {MAX_COLLAPSE_ID} bytes"
                 )));
             }
-            // It becomes a header value; anything outside printable ASCII would
-            // fail header construction later, which would be a 500 for what is
-            // really a bad request.
+            // It becomes a header value; non-graphic bytes would fail header
+            // construction later — a 500 for what is really a bad request.
             if !c.bytes().all(|b| b.is_ascii_graphic()) {
                 return Err(RelayError::bad_request(
                     "collapse_id must be printable ASCII with no spaces",
@@ -266,8 +245,8 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
         }
     };
 
-    // Every other field is bounded; an unbounded id would be the one way to buy
-    // a 100x amplifier with a single rate-limited request.
+    // An unbounded id is the one way to buy a 100x amplifier with a single
+    // rate-limited request.
     if let EventId::Str(s) = &req.event_id
         && s.len() > MAX_EVENT_ID
     {
@@ -281,8 +260,6 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
         .ok_or_else(|| RelayError::bad_request("topic is not in this relay's allowlist"))?
         .to_string();
 
-    // A per-request environment override still has to route to a real APNs
-    // host, unless the test-only base URL override is pinning both.
     let environment = match req.environment.as_deref() {
         None => cfg.apns_env,
         Some(e) => Environment::parse(e).ok_or_else(|| {
@@ -294,7 +271,7 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
         None => environment.base_url().to_string(),
     };
 
-    // Content-free by design: an opaque id plus a generic alert. See README.
+    // Content-free by design: an opaque id plus a generic alert.
     let payload = serde_json::to_vec(&json!({
         "aps": {
             "alert": { "title": ALERT_TITLE, "body": ALERT_BODY },
@@ -305,8 +282,8 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
     }))
     .map_err(|_| RelayError::new(StatusCode::INTERNAL_SERVER_ERROR, "payload encode failed"))?;
 
-    // Belt to the event-id braces: whatever the fields grow into, a body Apple
-    // would reject never gets multiplied by the token count.
+    // Backstop: whatever the fields grow into, a body Apple would reject never
+    // gets multiplied by the token count.
     if payload.len() > MAX_PAYLOAD {
         return Err(RelayError::bad_request(format!(
             "APNs payload exceeds {MAX_PAYLOAD} bytes"
@@ -326,10 +303,9 @@ fn validate(state: &RelayState, req: PushRequest) -> Result<Validated, RelayErro
 /// Push one token. Never returns an error: a transport failure is reported as
 /// `status: 0` so the rest of the batch still gets through.
 async fn send_one(state: &RelayState, v: &Validated, jwt: &str, token: String) -> PushResult {
-    // `FANOUT` bounds concurrency WITHIN one batch; this bounds it across all
-    // in-flight batches, so N concurrent requests cannot open N*FANOUT sockets.
-    // Waiting here counts against the batch budget, which is the point: the
-    // request sheds load as `timeout` rather than queueing without limit.
+    // `FANOUT` bounds concurrency within one batch; this bounds it across all
+    // in-flight batches. Waiting counts against the batch budget, so load sheds
+    // as `timeout` rather than queueing without limit.
     let _permit = state.apns_slot().await;
 
     let url = format!("{}/3/device/{}", v.base_url, token);
@@ -350,8 +326,7 @@ async fn send_one(state: &RelayState, v: &Validated, jwt: &str, token: String) -
     let resp = match req.body(v.payload.clone()).send().await {
         Ok(r) => r,
         Err(_) => {
-            // The error carries the URL, which carries the device token. Do not
-            // log it.
+            // The error carries the URL, which carries the device token.
             return PushResult {
                 token,
                 status: 0,
@@ -475,9 +450,7 @@ mod tests {
         }
     }
 
-    /// An unbounded id is a 100x amplifier: the payload is cloned once per
-    /// token, so the bound here is what keeps one request from becoming
-    /// hundreds of megabytes aimed at Apple.
+    /// An unbounded id is a 100x amplifier: the payload is cloned per token.
     #[test]
     fn bounds_the_string_event_id() {
         let ok = "a".repeat(MAX_EVENT_ID);
@@ -490,8 +463,8 @@ mod tests {
         }
     }
 
-    /// The backstop: whatever the payload grows to hold, a body APNs would
-    /// reject anyway never reaches the fan-out.
+    /// Whatever the payload grows to hold, a body APNs would reject never
+    /// reaches the fan-out.
     #[test]
     fn the_encoded_payload_stays_under_the_apns_limit() {
         let v = parse(base(json!([hex(64)]))).unwrap();

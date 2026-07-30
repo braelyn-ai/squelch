@@ -1,8 +1,6 @@
-//! Integration tests for the human-door router.
-//!
-//! Covers: bearer auth (401 without / with bad token, 200 with good token),
-//! search excludes sealed rows, reveal writes an audit row and returns the body
-//! with `Cache-Control: no-store`, and pagination cursor round-trip.
+//! Integration tests for the human-door router: bearer auth, sealed exclusion
+//! from search, the audited `no-store` reveal, actions against a mock Gmail, and
+//! the wire shapes the desktop client decodes.
 
 use std::sync::Arc;
 
@@ -102,14 +100,14 @@ async fn state_refuses_empty_token() {
 #[tokio::test]
 async fn search_excludes_sealed() {
     let (app, _s, _a) = app_with(|store, acct| {
-        // Normal message mentioning "verification".
+        // Normal message mentioning "verification"...
         let n = store
             .upsert_message(&msg(acct, "g1", "t1", "Your account verification steps", "hello"))
             .unwrap();
         store
             .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
             .unwrap();
-        // Sealed OTP also mentioning "verification".
+        // ...and a sealed OTP mentioning it too.
         let s = store
             .upsert_message(&msg(acct, "g2", "t2", "verification code inside", "123456"))
             .unwrap();
@@ -258,8 +256,7 @@ async fn retriage_route_exists_resets_and_audits() {
         store
             .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
             .unwrap();
-        // Simulate an LLM-classified row (via the public apply path) so there is
-        // something to reset.
+        // An LLM-classified row, so there is something to reset.
         store
             .stage1_apply(&squelch_core::store::Stage1Applied {
                 message_id: m,
@@ -277,7 +274,7 @@ async fn retriage_route_exists_resets_and_audits() {
             .unwrap();
     });
 
-    // Route exists (the 404 class of regression) + resets the window.
+    // The route is mounted (the 404 class of regression) and resets the window.
     let resp = app
         .clone()
         .oneshot(authed_json(
@@ -459,9 +456,8 @@ async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     let json = body_json(resp).await;
     assert_eq!(json.as_array().unwrap().len(), 3);
 
-    // Out-of-range hours are CLAMPED, not rejected: hours=0 -> 1 (only the
-    // 1h-old row misses even that? no — 1h-old is exactly at the boundary; use
-    // presence of a 200 + subset semantics instead of exact count).
+    // Out-of-range hours are CLAMPED, not rejected. The 1h-old row sits exactly
+    // on the hours=1 boundary, so assert a subset rather than an exact count.
     let resp = app
         .clone()
         .oneshot(authed("GET", "/client/calendar?hours=0"))
@@ -527,8 +523,7 @@ async fn search_semantic_without_vectors_falls_back_to_keyword() {
 async fn search_modes_with_embedder_and_sealed_excluded() {
     use squelch_core::embed::StubEmbedder;
 
-    // Attach a deterministic stub embedder (384-dim to match the vec0 table)
-    // before wrapping the store in an Arc.
+    // 384-dim to match the vec0 table.
     let store = SqliteStore::open_in_memory()
         .unwrap()
         .with_embedder(Arc::new(StubEmbedder::new(384)))
@@ -603,7 +598,6 @@ async fn reveal_writes_audit_and_returns_body() {
             .unwrap();
     });
 
-    // Find the sealed message id.
     let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
 
     let resp = app
@@ -618,7 +612,6 @@ async fn reveal_writes_audit_and_returns_body() {
     let json = body_json(resp).await;
     assert_eq!(json["body"], "your code is 987654");
 
-    // Audit row was written.
     let audit = store.list_audit(acct, 10).unwrap();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].action, "reveal_sealed");
@@ -671,7 +664,6 @@ async fn pagination_cursor_round_trip() {
         }
     });
 
-    // First page.
     let resp = app
         .clone()
         .oneshot(authed("GET", "/client/updates?limit=2"))
@@ -714,7 +706,7 @@ fn authed_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body
 
 #[tokio::test]
 async fn action_requires_confirm() {
-    // confirm gate fires before anything else: missing confirm => 400.
+    // The confirm gate fires before anything else.
     let (app, _s, _a) = app_with(|_, _| {});
     let resp = app
         .oneshot(authed_json(
@@ -734,7 +726,7 @@ async fn action_requires_confirm() {
 
 #[tokio::test]
 async fn action_without_write_credential_is_403() {
-    // confirm present, but no write credential configured => 403 with a hint.
+    // Confirmed, but no write credential configured => 403 with a hint.
     let (app, _s, _a) = app_with(|store, acct| {
         let m = store
             .upsert_message(&msg(acct, "g1", "t1", "hi", "body"))
@@ -787,9 +779,8 @@ async fn send_outbound_guard_blocks_and_audits() {
 
 #[tokio::test]
 async fn send_guard_override_passes_guard_then_403_no_creds() {
-    // With override_guard the guard is bypassed; without a write credential the
-    // action then hits the 403 gate. Two audit rows: the override note + the
-    // no-credential rejection.
+    // override_guard bypasses the guard, then the 403 gate stops it. Two audit
+    // rows: the override note and the no-credential rejection.
     let (app, store, acct) = app_with(|_, _| {});
     let resp = app
         .oneshot(authed_json(
@@ -804,11 +795,9 @@ async fn send_guard_override_passes_guard_then_403_no_creds() {
         ))
         .await
         .unwrap();
-    // Guard passed; no write creds => 403.
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let audit = store.list_audit(acct, 10).unwrap();
-    // newest first: rejection then override note.
     assert!(audit.iter().any(|a| a.detail.as_deref() == Some("rejected:no_write_credential")));
     assert!(
         audit
@@ -819,8 +808,8 @@ async fn send_guard_override_passes_guard_then_403_no_creds() {
 
 #[tokio::test]
 async fn clean_send_passes_guard() {
-    // A clean body must clear the guard (then hit 403 for no creds, proving the
-    // guard did not block).
+    // A clean body clears the guard; the 403 for missing creds proves it did
+    // not block.
     let (app, _s, _a) = app_with(|_, _| {});
     let resp = app
         .oneshot(authed_json(
@@ -860,8 +849,8 @@ impl CredentialStore for StubCreds {
     }
 }
 
-/// Serve `n` sequential HTTP requests, each answered `200 {}`. Returns the
-/// captured raw request bytes. Runs on a background task.
+/// Serve `n` sequential requests, each answered `200 {}`, returning the raw
+/// request bytes.
 async fn mock_gmail(n: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -910,7 +899,6 @@ async fn archive_success_audits_ok_and_hits_gmail() {
             .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
             .unwrap();
     });
-    // Grab the local message id via search (non-sealed).
     let message_id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
 
     let resp = app
@@ -936,8 +924,8 @@ async fn archive_success_audits_ok_and_hits_gmail() {
 
 #[tokio::test]
 async fn action_on_sealed_message_is_404() {
-    // A sealed message must be invisible to actions: archive => 404 (and no
-    // Gmail call is made). Proves the write path can never touch sealed mail.
+    // A sealed message is invisible to actions: 404, and no Gmail call at all —
+    // the write path can never touch sealed mail.
     let (base, handle) = mock_gmail(0).await;
     let (app, store, acct) = app_with_writes(base, |store, acct| {
         let s = store
@@ -967,9 +955,8 @@ async fn action_on_sealed_message_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    // No Gmail request should have been issued.
     handle.abort();
-    // The attempted action is still audited as a target failure.
+    // The attempted action is still audited.
     let audit = store.list_audit(acct, 10).unwrap();
     assert_eq!(audit[0].detail.as_deref(), Some("failed:target"));
 }
@@ -1051,7 +1038,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
     );
     assert_eq!(items[0]["status"], "new", "pre-stamp status is new");
 
-    // The ledger was stamped as a side effect.
+    // Stamped as a side effect of the fetch.
     let after = store
         .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, None, None)
         .unwrap();
@@ -1104,8 +1091,8 @@ async fn updates_carry_field_reasons_object() {
 
 #[tokio::test]
 async fn updates_without_reasons_omit_the_field_reasons_key() {
-    // A row with no recorded reasons (predates the feature / Stage-1 wrote none)
-    // omits the key entirely — the desktop treats absent the same as null.
+    // A row with no recorded reasons omits the key entirely — the desktop
+    // treats absent the same as null.
     let (app, _s, _a) = app_with(|store, acct| {
         seed_one_signal(store, acct, "g1", "t1", "hi");
     });
@@ -1121,7 +1108,7 @@ async fn updates_without_reasons_omit_the_field_reasons_key() {
 #[tokio::test]
 async fn band_query_filters_server_side() {
     let (app, _s, _a) = app_with(|store, acct| {
-        // A past_due bill (standing) + a plain signal.
+        // A past_due bill (standing) plus a plain signal.
         let bill = store
             .upsert_message(&msg(acct, "g1", "t1", "PG&E past due", "pay"))
             .unwrap();
@@ -1268,10 +1255,8 @@ async fn archive_success_resolves_target_to_done() {
 
 #[tokio::test]
 async fn update_rule_edits_in_place_and_404s_bogus() {
-    // TASK 6: create -> PUT -> GET shows updated -> 404 on a bogus id.
     let (app, _s, _a) = app_with(|_, _| {});
 
-    // Create a rule.
     let resp = app
         .clone()
         .oneshot(authed_json(
@@ -1337,8 +1322,6 @@ async fn update_rule_edits_in_place_and_404s_bogus() {
 
 #[tokio::test]
 async fn rule_mutations_write_audit_rows() {
-    // Each of POST/PUT/DELETE /client/rules writes a best-effort audit row
-    // (actor="client-api"), so the human review UI can see rule changes.
     let (app, store, acct) = app_with(|_, _| {});
 
     // POST => rule.create, target = match_pattern.
@@ -1383,7 +1366,6 @@ async fn rule_mutations_write_audit_rows() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let audit = store.list_audit(acct, 20).unwrap();
-    // Newest-first. All three rows are actor="client-api".
     assert!(audit.iter().all(|a| a.actor == "client-api"));
     let create = audit.iter().find(|a| a.action == "rule.create").unwrap();
     assert_eq!(create.target.as_deref(), Some("*@old.com"));
@@ -1425,12 +1407,10 @@ async fn failed_rule_mutations_write_no_audit_row() {
 
 #[tokio::test]
 async fn stats_expose_stage2_usage_and_cost() {
-    // GET /client/stats surfaces a stage2 object with today's usage + an
-    // estimated cost from the default Stage-2 (claude-sonnet-5) per-MTok prices
-    // (3.0 in / 15.0 out).
+    // Cost comes from the default Stage-2 per-MTok prices (3.0 in / 15.0 out).
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let (app, _s, _a) = app_with(move |store, acct| {
-        // 2 calls: 1_000_000 input tokens, 200_000 output tokens today.
+        // 2 calls: 1_000_000 in, 200_000 out.
         store.stage2_bump_usage(acct, &day, 600_000, 100_000).unwrap();
         store.stage2_bump_usage(acct, &day, 400_000, 100_000).unwrap();
     });
@@ -1449,9 +1429,7 @@ async fn stats_expose_stage2_usage_and_cost() {
 
 #[tokio::test]
 async fn usage_returns_rows_totals_and_is_bearer_gated() {
-    // GET /client/usage: newest-first daily rows, aggregate totals with est cost
-    // from the default Stage-2 (claude-sonnet-5) per-MTok prices (3.0 in / 15.0
-    // out), and the model label.
+    // Newest-first daily rows, totals costed at the default 3.0 in / 15.0 out.
     let (app, _s, _a) = app_with(|store, acct| {
         store.stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000).unwrap();
         store.stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000).unwrap();
@@ -1480,9 +1458,8 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     let cost = totals["est_cost_usd"].as_f64().unwrap();
     assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
 
-    // Default Stage-2 model label present.
-    assert_eq!(json["model"], "claude-sonnet-5");
     // Stage-1 and Stage-2 appear as separate usage categories.
+    assert_eq!(json["model"], "claude-sonnet-5");
     assert_eq!(json["categories"]["stage2"]["model"], "claude-sonnet-5");
     assert_eq!(json["categories"]["stage1"]["model"], "claude-haiku-4-5");
 

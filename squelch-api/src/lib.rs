@@ -1,27 +1,9 @@
-//! squelch-api: the HUMAN DOOR.
-//!
-//! A rich, authenticated HTTP API for the user's own desktop client, served
-//! under `/client/*`. Unlike the MCP surface (the AGENT DOOR at `/mcp`, which is
-//! narrow, read-only, and structurally sealed-absent), the human door may carry
-//! sealed METADATA and — on an explicit per-message pull only — a single sealed
-//! body. It is also the ONLY place write/action capability will live.
-//!
-//! SECURITY:
-//! - Every `/client/*` route sits behind bearer-token auth (see [`auth`]). The
-//!   token is a static shared secret from `SQUELCH_API_TOKEN`; comparison is
-//!   constant-time. If the token is unset the router REFUSES TO SERVE rather than
-//!   serving open.
-//! - `/client/search` excludes sealed rows in SQL, exactly like the MCP surface.
-//! - `/client/sealed` returns sealed METADATA only (never bodies).
-//! - `/client/sealed/{id}/reveal` returns exactly one sealed body and writes an
-//!   audit row BEFORE returning; the response is marked `Cache-Control: no-store`.
-//! - `/client/events` streams the notification log and `/client/events/{id}`
-//!   serves one row of it. Sealed mail can never be represented there (enforced
-//!   at emission in squelch-core), and the agent door has no access to either.
-//! - `/client/devices` registers an APNs device token for the daemon's pusher
-//!   task. Tokens are user-owned capability material: never logged, never echoed
-//!   back in a response, never visible on the agent door.
-//! - No secrets, tokens, or message bodies are ever logged.
+//! squelch-api: the HUMAN DOOR — the authenticated `/client/*` API for the
+//! user's own client. Bearer auth on every route; the router refuses to serve
+//! without a token. Carries sealed METADATA and exactly one sealed body (audited
+//! before it is served, `no-store`), and is the only surface with write
+//! capability. No token, secret, or message body is ever logged. See
+//! docs/SECURITY.md §4.
 
 mod auth;
 mod devices;
@@ -35,9 +17,8 @@ pub mod unsubscribe;
 
 pub use auth::require_bearer;
 pub use error::ApiError;
-/// The auth-mail retention pass. Exported so the daemon can run it on a timer
-/// in-process — it is human-door machinery (it uses the write credential), and
-/// the daemon's own sync loop is readonly-bound and must never touch it.
+/// The auth-mail retention pass. Exported for the daemon's timer: it uses the
+/// WRITE credential, which the readonly-bound sync loop must never touch.
 pub use handlers::run_shred_pass;
 pub use state::{ApiState, StateError};
 
@@ -47,14 +28,8 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
-/// Build the `/client/*` router for the human door.
-///
-/// The returned router already has bearer auth applied to every route via a
-/// middleware layer; callers just `.merge`/`.nest` it into their top-level axum
-/// app (or serve it directly, as the dev bin does). The `state` carries the
-/// store, the active account, and the (already-validated, non-empty) bearer
-/// token — construct it with [`ApiState::from_env`] / [`ApiState::new`], which
-/// refuse to build without a token.
+/// Build the `/client/*` router. Bearer auth is already layered over every
+/// route; [`ApiState::from_env`] / [`ApiState::new`] refuse an empty token.
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/client/updates", get(handlers::get_updates))
@@ -112,18 +87,16 @@ pub fn router(state: ApiState) -> Router {
             "/client/unsubscribes/resolution",
             post(handlers::unsubscribe_resolution),
         )
-        // Notification delivery: the SSE feed the resident client holds open,
-        // plus the by-id fetch the iOS NSE makes after an opaque push. Human
-        // door only — the agent door gains no access to the event log.
+        // Notification delivery: the SSE feed plus the iOS NSE's by-id fetch.
+        // Human door only — the agent door gains no access to the event log.
         .route("/client/events", get(events::events_stream))
         .route("/client/events/{id}", get(events::get_event))
-        // Push-device registration: the phone hands ITS OWN daemon an APNs
-        // token, which the pusher task fans event ids out to via the blind
-        // relay. Human door only — the agent door never learns a device exists.
+        // Push-device registration. Human door only — the agent door never
+        // learns a device exists.
         .route("/client/devices", post(devices::register_device))
-        // Unregister is a POST carrying the token in the BODY, deliberately not
-        // `DELETE /client/devices/{token}`: a device token is capability
-        // material, and a URL path is the most-logged part of a request.
+        // Unregister carries the token in the BODY, not a path segment: a device
+        // token is capability material, and a URL path is the most-logged part
+        // of a request.
         .route(
             "/client/devices/unregister",
             post(devices::unregister_device),
@@ -138,12 +111,9 @@ pub fn router(state: ApiState) -> Router {
             state.clone(),
             auth::require_bearer,
         ))
-        // CORS wraps auth (outermost) so OPTIONS preflights — which browsers
-        // send WITHOUT the Authorization header — are answered instead of
-        // 401ing. Permissive by design: the webview clients live on
-        // tauri://localhost / http://localhost:1420 / proxied tailnet hosts,
-        // bearer auth is the actual security boundary, and non-browser
-        // clients ignore CORS entirely. No cookies are involved.
+        // CORS wraps auth (outermost) so credential-less OPTIONS preflights are
+        // answered instead of 401ing. Permissive by design: bearer auth is the
+        // security boundary and no cookies are involved.
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)

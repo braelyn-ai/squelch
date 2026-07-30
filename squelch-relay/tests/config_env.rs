@@ -1,9 +1,6 @@
-//! Startup-config tests.
-//!
-//! In its OWN test binary because it mutates process-global environment:
-//! `set_var` is unsound while another thread reads the environment, and reqwest
-//! (used by `tests/push.rs`) reads proxy vars on client construction. A separate
-//! integration-test file is a separate process, which makes that impossible.
+//! Startup-config tests, in their OWN test binary because they mutate
+//! process-global environment: `set_var` is unsound while another thread reads
+//! the environment, and a separate integration-test file is a separate process.
 
 use squelch_relay::{Config, Environment, RelayState};
 
@@ -11,8 +8,8 @@ const KEY: &str = include_str!("fixture_test_key.p8");
 const TOPIC: &str = "dev.squelch.ios";
 const BETA_TOPIC: &str = "dev.squelch.ios.beta";
 
-/// The ONLY test that touches process-global environment. It sets, reads, and
-/// clears in one body so no other test can observe a half-built config.
+/// The ONLY test that touches process-global environment: it sets, reads, and
+/// clears in one body so nothing else can observe a half-built config.
 #[test]
 fn config_reads_the_environment() {
     const VARS: &[&str] = &[
@@ -51,8 +48,7 @@ fn config_reads_the_environment() {
         " dev.squelch.ios , dev.squelch.ios.beta ",
     );
 
-    // Serving /v1/push open is allowed, but only when asked for: a forgotten
-    // bearer must be a refusal to boot, not a silently open relay.
+    // A forgotten bearer must be a refusal to boot, not a silently open relay.
     assert!(
         Config::from_env().is_err(),
         "auth token still missing and anonymous not opted into"
@@ -84,8 +80,8 @@ fn config_reads_the_environment() {
     let cfg = Config::from_env().unwrap();
     assert!(cfg.apns_key_pem.contains("BEGIN PRIVATE KEY"));
 
-    // A PEM flattened onto one line with literal `\n` sequences — what a
-    // secret-manager paste box produces — is unmangled, and still signs.
+    // A PEM flattened onto one line with literal `\n` sequences is unmangled,
+    // and still signs.
     unsafe { std::env::remove_var("SQUELCH_RELAY_APNS_KEY_PATH") };
     set("SQUELCH_RELAY_APNS_KEY", &KEY.trim_end().replace('\n', "\\n"));
     let cfg = Config::from_env().unwrap();

@@ -1,17 +1,8 @@
-//! Bearer-token auth for the human door.
-//!
-//! Every `/client/*` route is wrapped by [`require_bearer`]. The expected token
-//! is the static shared secret held in [`ApiState`] (sourced from
-//! `SQUELCH_API_TOKEN`), which is guaranteed non-empty by construction — so the
-//! "serve open" case cannot happen here; it is refused earlier, when the state
-//! is built.
-//!
-//! SECURITY:
-//! - The `Authorization: Bearer <token>` value is compared to the expected
-//!   token in CONSTANT TIME via `subtle::ConstantTimeEq`, so a timing side
-//!   channel cannot leak the secret prefix-by-prefix.
-//! - A missing/malformed header, or a mismatched token, both return a bare 401
-//!   with no detail. The token is never logged or echoed.
+//! Bearer-token auth for the human door: every `/client/*` route goes through
+//! [`require_bearer`]. The expected token is non-empty by construction (the
+//! state refuses to build otherwise), comparison is CONSTANT TIME so a timing
+//! side channel cannot leak it prefix-by-prefix, and a missing/bad header is a
+//! bare 401 that never echoes or logs the token.
 
 use axum::{
     body::Body,
@@ -24,9 +15,8 @@ use subtle::ConstantTimeEq;
 
 use crate::state::ApiState;
 
-/// Constant-time equality over two byte slices. `ConstantTimeEq` is only defined
-/// for equal-length slices, so we branch on length first (length is not secret)
-/// and then compare in constant time.
+/// Constant-time byte equality. Length is branched on first (it is not secret);
+/// `ConstantTimeEq` is only defined for equal-length slices.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -36,9 +26,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Extract a `Bearer` token from an `Authorization` header value.
 fn parse_bearer(value: &str) -> Option<&str> {
-    // Case-insensitive scheme, single space, then the token.
     let rest = value.strip_prefix("Bearer ").or_else(|| {
-        // Tolerate lowercase / mixed-case scheme.
+        // The scheme is case-insensitive.
         let (scheme, rest) = value.split_once(' ')?;
         scheme.eq_ignore_ascii_case("bearer").then_some(rest)
     })?;
@@ -59,7 +48,6 @@ pub async fn require_bearer(
         .and_then(parse_bearer);
 
     match presented {
-        // Constant-time compare against the configured token.
         Some(tok) if ct_eq(tok.as_bytes(), state.token.as_bytes()) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }

@@ -1,10 +1,9 @@
 //! `/client/*` handlers for the human door.
 //!
-//! Handlers are thin: parse/validate query + path params, call one or two
-//! `Store` methods (via `spawn_blocking`, since the store is sync), and serialize
-//! core types straight to JSON. Sealed handling lives in the store; the reveal
-//! handler is the one place that intentionally surfaces a sealed body, and it
-//! audits every call first.
+//! Handlers are thin: validate params, call the store via `spawn_blocking`,
+//! serialize core types to JSON. Sealed handling lives in the store;
+//! [`reveal_sealed`] is the one place a sealed body is surfaced, and it audits
+//! before returning.
 
 use axum::{
     Json,
@@ -37,9 +36,8 @@ const AUDIT_ACTOR: &str = "human";
 
 // --- pagination cursor ------------------------------------------------------
 
-/// The pagination cursor is an opaque token that round-trips a row offset. It is
-/// intentionally minimal (`off:<n>`, then base64url) so a client treats it as
-/// opaque but we can decode it. Not security-sensitive; just a scroll position.
+/// An opaque token round-tripping a row offset (`off:<n>`, base64url). Not
+/// security-sensitive; it is a scroll position.
 mod cursor {
     use super::base64_lite::{decode, encode};
 
@@ -54,8 +52,8 @@ mod cursor {
     }
 }
 
-/// A tiny dependency-free base64url codec, kept local so squelch-api needs no
-/// extra crate just to opaque-ify an integer offset.
+/// A dependency-free base64url codec, so opaque-ifying an integer offset needs
+/// no extra crate.
 mod base64_lite {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -112,9 +110,8 @@ mod base64_lite {
     }
 }
 
-/// Resolve `(limit, offset)` from optional `limit`/`cursor` query params.
-/// A present `cursor` wins over any absent offset; `limit` is clamped to
-/// `[1, MAX_LIMIT]`. Returns 400 on a malformed cursor.
+/// Resolve `(limit, offset)` from the `limit`/`cursor` query params. `limit` is
+/// clamped to `[1, MAX_LIMIT]`; a malformed cursor is a 400.
 fn paginate(limit: Option<u32>, cursor: Option<&str>) -> Result<(u32, u32), ApiError> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = match cursor {
@@ -138,8 +135,8 @@ struct Page<T> {
     next_cursor: Option<String>,
 }
 
-/// Run a synchronous store closure off the async runtime. Panics inside the
-/// closure surface as a 500 (opaque).
+/// Run a synchronous store closure off the async runtime. A panic inside it
+/// surfaces as an opaque 500.
 pub(crate) async fn blocking<T, F>(f: F) -> Result<T, ApiError>
 where
     F: FnOnce() -> Result<T, squelch_core::CoreError> + Send + 'static,
@@ -199,9 +196,8 @@ pub async fn get_updates(
     let store = state.store.clone();
     let account_id = state.account_id;
     let items = blocking(move || {
-        // attention_updates excludes sealed rows in SQL and carries the
-        // lifecycle fields. status/band are applied server-side; tier filtering
-        // and pagination are applied over the ranked slice here.
+        // attention_updates excludes sealed rows in SQL. status/band filter
+        // server-side; tier and pagination apply over the ranked slice here.
         let mut all =
             store.attention_updates(account_id, since, min_importance, status_filter, band)?;
         if let Some(t) = tier_filter {
@@ -213,10 +209,9 @@ pub async fn get_updates(
             .take(limit as usize)
             .collect::<Vec<_>>();
 
-        // SEEN-LEDGER: the response carries the PRE-stamp surfaced_at (already in
-        // `page`), then we stamp this exact set: surfaced_at=now if NULL,
-        // new->open. Both doors stamp. Sealed rows can't be in `page` (SQL) and
-        // mark_surfaced re-guards sensitivity anyway.
+        // SEEN-LEDGER: the response carries the PRE-stamp surfaced_at, then this
+        // exact set is stamped (surfaced_at=now if NULL, new->open). Sealed rows
+        // cannot be in `page`, and mark_surfaced re-guards sensitivity anyway.
         let ids: Vec<i64> = page.iter().map(|u| u.update.id).collect();
         store.mark_surfaced(account_id, &ids)?;
 
@@ -256,7 +251,7 @@ pub async fn set_update_status(
         return Err(ApiError::not_found());
     }
 
-    // Audit the explicit dismiss/reopen (actor="client-api", no body content).
+    // Audited; no body content is recorded.
     audit_action(
         &state,
         "set_status",
@@ -270,15 +265,9 @@ pub async fn set_update_status(
 
 // --- POST /client/refresh ---------------------------------------------------
 
-/// Poke the Gmail sync loop to poll NOW instead of waiting out its interval.
-///
-/// Fire-and-forget: we wake the poll loop and return immediately — we do NOT
-/// block on the Gmail round trip. New mail lands in the store shortly after
-/// (typically under a second or two); the client re-reads the sitrep read model
-/// on its own cadence to pick it up. `triggered` is `false` only when no sync
-/// loop is wired to this door (standalone bin / tests), so the caller can tell a
-/// real poke from a no-op. This is a READ-path trigger — no write scope, no
-/// Gmail mutation, nothing to audit.
+/// Poke the Gmail sync loop to poll NOW. Fire-and-forget: it does not block on
+/// the round trip, and `triggered: false` means no sync loop is wired to this
+/// door. A READ-path trigger — no write scope, no mutation, nothing to audit.
 pub async fn refresh_now(State(state): State<ApiState>) -> impl IntoResponse {
     let triggered = match &state.refresh {
         Some(notify) => {
@@ -303,11 +292,9 @@ pub struct RetriageBody {
     days: Option<u32>,
 }
 
-/// DEV RE-TRIAGE: reset the LLM markers on the scoped non-sealed inbound rows so
-/// the stage-1 → stage-2 → extractor pipeline re-runs on them (fresh prompts,
-/// fresh verdicts). Rule-decided and sealed rows are never touched (store-level
-/// guard). Wakes the sync loop so the passes run immediately. Audited. A sealed
-/// or unknown `message_id` simply resets 0 rows — indistinguishable by design.
+/// DEV RE-TRIAGE: reset LLM markers on the scoped rows so the pipeline re-runs.
+/// Rule-decided and sealed rows are never touched (store-level guard), and a
+/// sealed or unknown `message_id` resets 0 rows — indistinguishable by design.
 pub async fn retriage(
     State(state): State<ApiState>,
     Json(body): Json<RetriageBody>,
@@ -337,9 +324,8 @@ pub async fn retriage(
 
 // --- GET /client/triage-debug/{message_id} (developer tool) ------------------
 
-/// DEV INSPECTOR: the full triage state of one non-sealed message — every
-/// verdict, model marker, and reason. Read-only, human door only; sealed and
-/// unknown are an indistinguishable 404. No body content is carried.
+/// DEV INSPECTOR: the full triage state of one non-sealed message. Read-only;
+/// sealed and unknown are an indistinguishable 404, and no body content is carried.
 pub async fn triage_debug(
     State(state): State<ApiState>,
     Path(message_id): Path<i64>,
@@ -360,24 +346,21 @@ pub async fn get_thread(
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.store.clone();
     let account_id = state.account_id;
-    // thread_view_with_html returns NotFound for sealed OR nonexistent threads,
-    // keeping the two indistinguishable exactly as on the MCP surface. Unlike the
-    // MCP `thread_view`, each message additionally carries its server-side-
-    // sanitized `html` (null for plain-text-only mail) for the client to render.
+    // Sealed and nonexistent threads are the SAME NotFound. Each message carries
+    // its server-sanitized `html`, null for plain-text-only mail.
     let view = blocking(move || store.thread_view_with_html(account_id, &thread_id)).await?;
     Ok(Json(view))
 }
 
 // --- GET /client/attachments/{id} -------------------------------------------
 
-/// Render-safety whitelist for the served `Content-Type`. The stored mime is
-/// echoed ONLY when it is `application/pdf` or an `image/*` OTHER THAN
-/// `image/svg+xml` (SVG is scriptable). Everything else — HTML, XML, SVG, JS,
-/// unknown — serves as `application/octet-stream`, so a hostile attachment can
-/// never be rendered inline from our origin. This header discipline IS the
-/// security story for the byte endpoint.
+/// Render-safety whitelist for the served `Content-Type`: the stored mime is
+/// echoed ONLY for `application/pdf` and non-SVG `image/*`. Everything else
+/// serves as `application/octet-stream`, so a hostile attachment can never
+/// render inline from our origin. This header discipline IS the security story
+/// for the byte endpoint.
 fn safe_content_type(mime: &str) -> String {
-    // Compare on the bare type, lowercased, ignoring any `; charset=...` params.
+    // Compare on the bare type, lowercased, ignoring `; charset=...` params.
     let base = mime
         .split(';')
         .next()
@@ -389,8 +372,7 @@ fn safe_content_type(mime: &str) -> String {
     }
     if let Some(sub) = base.strip_prefix("image/")
         && !sub.is_empty()
-        // Reject ANY svg/xml-ish image subtype (image/svg+xml, image/svg,
-        // vendor xml types) — scriptable content must never echo renderable.
+        // ANY svg/xml-ish image subtype is scriptable: never echo it renderable.
         && !sub.contains("svg")
         && !sub.contains("xml")
     {
@@ -399,10 +381,8 @@ fn safe_content_type(mime: &str) -> String {
     "application/octet-stream".to_string()
 }
 
-/// Sanitize a filename for a `Content-Disposition: attachment; filename="..."`
-/// header: strip path separators, control chars, quotes, and any non-ASCII byte
-/// (plain stripping — our clients don't need RFC 5987). Falls back to
-/// "attachment" when nothing usable survives.
+/// Sanitize a filename for `Content-Disposition`: strip path separators,
+/// control chars, quotes and non-ASCII, falling back to "attachment".
 fn sanitize_attachment_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -419,8 +399,8 @@ fn sanitize_attachment_filename(name: &str) -> String {
 }
 
 /// Serve one attachment's raw bytes. The parent-message sealed guard lives in
-/// [`Store::attachment_bytes`] (sealed/unknown are indistinguishable -> 404);
-/// this handler adds the header discipline and the over-cap 410.
+/// [`Store::attachment_bytes`]; this handler adds the header discipline (see
+/// [`safe_content_type`]) and the over-cap 410.
 pub async fn get_attachment(
     State(state): State<ApiState>,
     Path(attachment_id): Path<i64>,
@@ -440,8 +420,8 @@ pub async fn get_attachment(
         sanitize_attachment_filename(&filename)
     );
 
-    // Build the response directly (not via `Vec<u8>`'s IntoResponse) so we own the
-    // Content-Type exactly — no auto `application/octet-stream` sneaking in.
+    // Built by hand, not via `Vec<u8>`'s IntoResponse, so we own the
+    // Content-Type exactly.
     let mut resp = Response::new(Body::from(bytes));
     let h = resp.headers_mut();
     h.insert(
@@ -495,8 +475,7 @@ impl SearchMode {
         }
     }
 
-    /// The `match_kind` label echoed on the response so the client knows which
-    /// leg produced the results.
+    /// The `match_kind` label echoed on the response.
     fn as_str(self) -> &'static str {
         match self {
             SearchMode::Keyword => "keyword",
@@ -506,8 +485,7 @@ impl SearchMode {
     }
 }
 
-/// Search response envelope: a page of hits plus the resolved `match_kind` (the
-/// mode actually run, after default resolution).
+/// Search response envelope: a page of hits plus the mode actually run.
 #[derive(Debug, Serialize)]
 struct SearchPage<T> {
     items: Vec<T>,
@@ -526,12 +504,10 @@ pub async fn search(
     }
     let (limit, offset) = paginate(query.limit, query.cursor.as_deref())?;
 
-    // Does this store have a vector index? (an embedder attached => vectors are
-    // being written). Drives the default mode and gates semantic/hybrid.
+    // An attached embedder means vectors are being written; that gates
+    // semantic/hybrid and drives the default mode.
     let have_vectors = state.store.embedder().is_some();
 
-    // Resolve the mode: explicit value (400 on garbage) else the default —
-    // hybrid when vectors exist, keyword otherwise.
     let mode = match query.mode.as_deref() {
         Some(s) => SearchMode::parse(s).ok_or_else(|| {
             ApiError::bad_request("mode must be one of: keyword, semantic, hybrid")
@@ -545,9 +521,8 @@ pub async fn search(
         }
     };
 
-    // Semantic/hybrid need a vector index. If asked explicitly without one,
-    // fall back to keyword rather than erroring — but report the kind actually
-    // run so the client isn't misled.
+    // Semantic/hybrid asked for without a vector index degrade to keyword rather
+    // than erroring — but the response reports the kind actually run.
     let effective = match mode {
         SearchMode::Semantic | SearchMode::Hybrid if !have_vectors => SearchMode::Keyword,
         other => other,
@@ -555,9 +530,8 @@ pub async fn search(
 
     let store = state.store.clone();
     let account_id = state.account_id;
-    // Keyword paginates (limit/offset); semantic/hybrid are ranked recall over a
-    // top-k window (offset applied to the fused slice). All legs exclude sealed
-    // rows in SQL.
+    // Keyword paginates in SQL; semantic/hybrid rank a top-k window and offset
+    // the fused slice. EVERY leg excludes sealed rows in SQL.
     let items = blocking(move || match effective {
         SearchMode::Keyword => store.search(account_id, &term, limit, offset),
         SearchMode::Semantic => {
@@ -598,9 +572,8 @@ pub async fn get_shipments(
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.store.clone();
     let account_id = state.account_id;
-    // En-route only by default; delivered included with the flag. The shipments
-    // table holds no sealed rows by construction (detection never runs on sealed
-    // mail), so there is no sealed filtering to apply here.
+    // The shipments table holds no sealed rows by construction: detection never
+    // runs on sealed mail, so there is no sealed filtering to apply.
     let items = blocking(move || store.list_shipments(account_id, q.include_delivered)).await?;
     Ok(Json(items))
 }
@@ -623,24 +596,17 @@ pub async fn get_receipts(
     let store = state.store.clone();
     let account_id = state.account_id;
     let days = q.days.unwrap_or(DEFAULT_RECEIPTS_DAYS);
-    // Newest-first receipt rows. The receipts table holds no sealed rows by
-    // construction (detection never runs on sealed mail), so there is no sealed
-    // filtering to apply here.
+    // Newest-first. Structurally sealed-free, like shipments.
     let items = blocking(move || store.list_receipts(account_id, days)).await?;
     Ok(Json(items))
 }
 
 // --- GET /client/banking -----------------------------------------------------
 
-/// WIRE CONTRACT (the desktop Banking zone is built against exactly this): a JSON
-/// array, newest-received first, of
-/// `{id, message_id, kind, institution, amount, currency, account_hint,
-/// received_at}` where `kind` is "statement" | "transaction_alert" and every
-/// extracted field is nullable. `account_hint` is only ever a masked last-4 tail
-/// ("…1234") or null. The serialized shape is
-/// [`squelch_core::types::Banking`] — change that type and you change the
-/// contract. Sealed mail can never produce a banking row (structural, like
-/// receipts), so no sealed filtering is applied here.
+/// SERIALIZED SHAPE IS A WIRE CONTRACT — the desktop Banking zone decodes
+/// exactly [`squelch_core::types::Banking`], newest-received first, with every
+/// extracted field nullable and `account_hint` only ever a masked last-4 tail.
+/// Sealed mail can never produce a banking row (structural, like receipts).
 pub async fn get_banking(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -652,8 +618,8 @@ pub async fn get_banking(
 
 // --- GET /client/marketing ---------------------------------------------------
 
-/// Look-back window for the marketing surface, and its clamp bounds. Promos age
-/// out fast; a fortnight is already generous for "what is on offer".
+/// Look-back window and clamp bounds. Promos age out fast; a fortnight is
+/// already generous for "what is on offer".
 const DEFAULT_MARKETING_DAYS: u32 = 14;
 const MAX_MARKETING_DAYS: u32 = 90;
 const MARKETING_LIMIT: u32 = 200;
@@ -664,9 +630,8 @@ pub struct MarketingQuery {
     days: Option<u32>,
 }
 
-/// Extracted promotions, newest first. Structurally sealed-free: the `marketing`
-/// table can only ever hold rows an extractor wrote, and sealed mail never
-/// reaches an extractor (it carries a NULL category by construction).
+/// Extracted promotions, newest first. Structurally sealed-free: only an
+/// extractor writes this table, and sealed mail never reaches one.
 pub async fn get_marketing(
     State(state): State<ApiState>,
     Query(q): Query<MarketingQuery>,
@@ -680,29 +645,22 @@ pub async fn get_marketing(
 
 // --- GET /client/calendar ----------------------------------------------------
 
-/// Default look-back window (hours of MAIL ARRIVAL, not event start) for the
-/// calendar list, and the sane clamp bounds for the `hours` query param.
+/// Look-back window in hours of MAIL ARRIVAL, not event start, plus its clamp
+/// bounds.
 const DEFAULT_CALENDAR_HOURS: u32 = 24;
 const MIN_CALENDAR_HOURS: u32 = 1;
 const MAX_CALENDAR_HOURS: u32 = 168; // one week
 
 #[derive(Debug, Deserialize)]
 pub struct CalendarQuery {
-    /// Look-back window in hours over `received_at`. Default 24, clamped to
-    /// 1..=168 (out-of-range values are clamped, not rejected).
+    /// Window in hours over `received_at`. Out-of-range values clamp, not 400.
     hours: Option<u32>,
 }
 
-/// WIRE CONTRACT (the desktop sidebar is built against exactly this): a JSON
-/// array, newest-received first, of
-/// `{id, message_id, thread_id, kind, event_title, starts_at, organizer,
-/// received_at}` where `kind` is "invite" | "update" | "cancellation" |
-/// "response" and every extracted field is nullable. The serialized shape is
-/// [`squelch_core::types::CalendarUpdate`] — change that type and you change
-/// the contract. `thread_id` is the joined message's thread, so the client can
-/// open the mail instead of jumping to the mail page. Sealed mail can never
-/// produce a calendar row (structural, like receipts/banking), so no sealed
-/// filtering is applied here.
+/// SERIALIZED SHAPE IS A WIRE CONTRACT — the desktop sidebar decodes exactly
+/// [`squelch_core::types::CalendarUpdate`], newest-received first, with every
+/// extracted field nullable and `thread_id` the joined message's thread. Sealed
+/// mail can never produce a calendar row (structural, like receipts/banking).
 pub async fn get_calendar(
     State(state): State<ApiState>,
     Query(q): Query<CalendarQuery>,
@@ -713,9 +671,6 @@ pub async fn get_calendar(
         .hours
         .unwrap_or(DEFAULT_CALENDAR_HOURS)
         .clamp(MIN_CALENDAR_HOURS, MAX_CALENDAR_HOURS);
-    // Newest-received first. The calendar_updates table holds no sealed rows by
-    // construction (detection never runs on sealed mail), so there is no sealed
-    // filtering to apply here.
     let items = blocking(move || store.list_calendar_updates(account_id, hours)).await?;
     Ok(Json(items))
 }
@@ -755,9 +710,7 @@ pub async fn create_rule(
         store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
-    // Best-effort audit (actor="client-api"): the human is the actor here, so
-    // ledger completeness matters less than not breaking their edit. target is
-    // the match_pattern; detail records the resulting rule id.
+    // Best-effort audit: target is the match_pattern, detail the new rule id.
     audit_action(&state, "rule.create", Some(pattern), &id.to_string()).await;
     Ok((StatusCode::CREATED, Json(json!({ "rule_id": id }))))
 }
@@ -781,8 +734,7 @@ pub async fn update_rule(
     })
     .await?;
     if updated {
-        // Best-effort audit (actor="client-api"). Only a real edit is recorded; a
-        // 404 (unknown id) changed nothing, so it writes no row.
+        // Only a real edit is recorded; a 404 changed nothing, so no row.
         audit_action(&state, "rule.update", Some(pattern), &id.to_string()).await;
         Ok(Json(json!({ "rule_id": id })))
     } else {
@@ -798,8 +750,7 @@ pub async fn delete_rule(
     let account_id = state.account_id;
     let deleted = blocking(move || store.delete_sender_rule(account_id, id)).await?;
     if deleted {
-        // Best-effort audit (actor="client-api"). target is the rule id (the
-        // pattern is gone post-delete); only a real removal is recorded.
+        // target is the rule id — the pattern is gone post-delete.
         audit_action(&state, "rule.delete", Some(id.to_string()), "ok").await;
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -853,9 +804,8 @@ struct RevealedSealed {
     kind: Option<String>,
     received_at: DateTime<Utc>,
     body: String,
-    /// Server-sanitized (ammonia) HTML when the mail had one — rendered by the
-    /// client in the same hard-sandboxed EmailFrame as normal mail. Same single
-    /// audited reveal door; no-store like the text body.
+    /// Server-sanitized HTML when the mail had one, through the same single
+    /// audited reveal door and `no-store` like the text body.
     html: Option<String>,
 }
 
@@ -867,8 +817,8 @@ pub async fn reveal_sealed(
     let account_id = state.account_id;
 
     let sealed = blocking(move || {
-        // Audit BEFORE returning the body. The audit row records only the
-        // message id (no body/content) so the log itself never leaks secrets.
+        // Audit BEFORE returning the body, recording only the message id so the
+        // log itself never leaks a secret.
         store.append_audit(
             account_id,
             &NewAuditEntry {
@@ -937,15 +887,12 @@ pub async fn get_stats(
     })
     .await?;
 
-    // Cost = tokens/1e6 * per-MTok price, summed over input+output. Prices come
-    // from the config (default matches claude-haiku-4-5); switching the model
-    // means updating stage2_price_*_per_mtok so this stays accurate.
+    // tokens/1e6 * per-MTok price, over input+output. Switching the model means
+    // updating stage2_price_*_per_mtok or this drifts.
     let est_cost_usd_today = (usage.input_tokens as f64 / 1_000_000.0)
         * state.stage2_price_in_per_mtok
         + (usage.output_tokens as f64 / 1_000_000.0) * state.stage2_price_out_per_mtok;
 
-    // Serialize the core stats, then attach a `stage2` object alongside its
-    // existing fields.
     let mut body = serde_json::to_value(&stats)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
     body["stage2"] = json!({
@@ -978,8 +925,8 @@ struct UsageRow {
     output_tokens: u64,
 }
 
-/// Totals across the returned window, including the estimated cost computed from
-/// the same per-MTok price config `get_stats` uses.
+/// Totals across the returned window, costed from the same per-MTok prices
+/// `get_stats` uses.
 #[derive(Debug, Serialize)]
 struct UsageTotals {
     calls: u64,
@@ -988,9 +935,8 @@ struct UsageTotals {
     est_cost_usd: f64,
 }
 
-/// GET /client/usage — Stage-2 (triage) usage history + totals + model label.
-/// Bearer-authed; additive to `/client/stats` (which still carries today's
-/// `stage2` rollup untouched).
+/// GET /client/usage — triage usage history + totals + model label. Additive to
+/// `/client/stats`, which still carries today's `stage2` rollup.
 pub async fn get_usage(
     State(state): State<ApiState>,
     Query(q): Query<UsageQuery>,
@@ -1005,9 +951,8 @@ pub async fn get_usage(
     })
     .await?;
 
-    // Roll up per-category rows + totals + cost from that category's per-MTok
-    // prices. Stage-1 and Stage-2 are SEPARATE categories — the client renders
-    // whatever categories arrive.
+    // Stage-1 and Stage-2 are SEPARATE categories, each costed from its own
+    // per-MTok prices; the client renders whatever categories arrive.
     let rollup = |rows: Vec<squelch_core::store::Stage2UsageDay>,
                   price_in: f64,
                   price_out: f64|
@@ -1057,7 +1002,6 @@ pub async fn get_usage(
         "totals": s2_totals,
         "provider": state.stage2_provider.as_deref(),
         "model": state.stage2_model.as_ref(),
-        // Per-category breakdown (stage-1 + stage-2 as separate categories).
         "categories": {
             "stage1": {
                 "model": state.stage1_model.as_ref(),
@@ -1075,17 +1019,14 @@ pub async fn get_usage(
 
 // --- GET/POST /client/triage-config -----------------------------------------
 //
-// The Stage-2 (LLM triage) daily budget caps, configurable at runtime WITHOUT a
-// restart. GET reports the effective caps + where each came from + trailing-14d
-// volume/usage stats so the client can size them sensibly. POST persists a
-// runtime OVERRIDE (app_settings) that the sync engine's Stage-2 pass re-reads
-// at the start of each cycle. Precedence: override > config/env > default.
+// LLM-triage daily budget caps, configurable at runtime without a restart. POST
+// persists an app_settings OVERRIDE that the Stage-2 pass re-reads at the start
+// of each cycle. Precedence: override > config/env > default.
 
 /// Trailing window (days) for the volume/usage averages on the endpoint.
 const TRIAGE_CONFIG_TRAILING_DAYS: i64 = 14;
 
-/// Resolve one cap's wire "source": an override row wins; otherwise the
-/// config/env-layer source ("default" or "config") the state was built with.
+/// One cap's wire "source": an override row wins, else the config/env layer.
 fn cap_source_str(
     has_override: bool,
     config_source: squelch_core::config::CapSource,
@@ -1097,10 +1038,9 @@ fn cap_source_str(
     }
 }
 
-/// Build the `/client/triage-config` response body: effective caps (override >
-/// config/env > default), per-cap sources, trailing-14d inbound/usage averages,
-/// and the per-MTok prices. Shared by GET and POST (POST returns the fresh shape
-/// after persisting). Does all store reads in one blocking closure.
+/// The `/client/triage-config` response body: effective caps, per-cap sources,
+/// trailing-14d averages, prices. Shared by GET and POST, which returns this
+/// fresh shape after persisting.
 async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiError> {
     let store = state.store.clone();
     let account_id = state.account_id;
@@ -1158,10 +1098,8 @@ async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiEr
         "avg_tokens_out_per_call": avg_tokens_out_per_call,
         "price_in_per_mtok": state.stage2_price_in_per_mtok,
         "price_out_per_mtok": state.stage2_price_out_per_mtok,
-        // The escalation model id (Stage-2 runs on the more capable model).
         "stage2_model": state.stage2_model.as_ref(),
-        // Stage-1 (the SMALL model run on every non-rule email). Its only cap is
-        // GLOBAL; averages come from the stage-1 usage ledger (trailing 14d).
+        // Stage-1 runs on every non-rule email and its only cap is GLOBAL.
         "stage1": {
             "model": state.stage1_model.as_ref(),
             "global_daily_cap": stage1_global,
@@ -1184,10 +1122,9 @@ pub async fn get_triage_config(
     Ok(Json(triage_config_body(&state).await?))
 }
 
-/// POST body: any subset of the three caps. Fields are raw JSON values so a
-/// non-integer (float/string) is rejected with a 400 by our own validation
-/// rather than the extractor's 422 — the contract mandates 400 for any invalid
-/// value.
+/// POST body: any subset of the caps. Fields are raw JSON values on purpose, so
+/// a non-integer fails our own validation with the contractual 400 rather than
+/// the extractor's 422.
 #[derive(Debug, Deserialize)]
 pub struct TriageConfigBody {
     #[serde(default)]
@@ -1196,8 +1133,7 @@ pub struct TriageConfigBody {
     sender_daily_cap: Option<serde_json::Value>,
     #[serde(default)]
     global_daily_cap: Option<serde_json::Value>,
-    /// The Stage-1 GLOBAL daily cap (same validation/400 semantics as the others;
-    /// persisted as an app_settings override).
+    /// The Stage-1 GLOBAL daily cap; same validation and 400 as the others.
     #[serde(default)]
     stage1_global_daily_cap: Option<serde_json::Value>,
 }
@@ -1206,9 +1142,8 @@ pub async fn set_triage_config(
     State(state): State<ApiState>,
     Json(body): Json<TriageConfigBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Validate every PROVIDED cap up front (all-or-nothing: a bad value persists
-    // nothing). Each must be a JSON INTEGER in [STAGE2_CAP_MIN, STAGE2_CAP_MAX];
-    // a float/string/out-of-range value is a 400.
+    // ALL-OR-NOTHING: every provided cap is validated before anything is
+    // written, so a bad value persists nothing.
     let min = squelch_core::config::STAGE2_CAP_MIN as i64;
     let max = squelch_core::config::STAGE2_CAP_MAX as i64;
     let bad = || {
@@ -1224,7 +1159,6 @@ pub async fn set_triage_config(
         }
     };
 
-    // Collect (app_settings key, validated value) for each present field.
     let mut updates: Vec<(&'static str, u32)> = Vec::new();
     if let Some(v) = &body.thread_daily_cap {
         updates.push((squelch_core::config::APP_SETTING_THREAD_DAILY_CAP, validate(v)?));
@@ -1254,8 +1188,7 @@ pub async fn set_triage_config(
         })
         .await?;
 
-        // Audit the change (actor="client-api"). detail names the caps set, e.g.
-        // "thread=5,global=300" — order follows thread, sender, global.
+        // detail names the caps set, e.g. "thread=5,global=300".
         let detail = updates
             .iter()
             .map(|(key, value)| {
@@ -1280,15 +1213,10 @@ pub async fn set_triage_config(
 
 // --- ACTIONS: the ONLY write capability in the system -----------------------
 //
-// GATES (all non-negotiable, enforced here):
-//   (a) every action body MUST carry `"confirm": true`, else 400.
-//   (b) `send` runs the outbound secret guard; matches => 422 unless
-//       `"override_guard": true`.
-//   (c) EVERY action — attempted AND completed, success or failure — appends an
-//       audit row (actor="client-api").
-//
-// If no write credential is configured the action returns 403 with a hint to
-// run `squelchd auth --write`. Sync/triage/MCP never load the write token.
+// Non-negotiable gates: every body MUST carry `"confirm": true` (else 400);
+// `send` runs the outbound secret guard (422 unless `"override_guard": true`);
+// EVERY action, attempted or completed, appends an audit row. Without a write
+// credential the action is a 403 — sync/triage/MCP never load the write token.
 
 /// Actor written into the audit log for all write actions.
 const ACTION_ACTOR: &str = "client-api";
@@ -1297,9 +1225,8 @@ const ACTION_ACTOR: &str = "client-api";
 const CONFIRM_HINT: &str =
     "this action requires an explicit \"confirm\": true in the request body";
 
-/// Append an audit row for an action, best-effort. Audit failures must not mask
-/// the action's own outcome, so a failed insert is swallowed (it cannot leak
-/// anything and the action result is what the caller cares about).
+/// Append an audit row, best-effort: a failed insert is swallowed so it cannot
+/// mask the action's own outcome.
 pub(crate) async fn audit_action(
     state: &ApiState,
     action: &'static str,
@@ -1317,10 +1244,9 @@ pub(crate) async fn audit_action(
     let _ = tokio::task::spawn_blocking(move || store.append_audit(account_id, &entry)).await;
 }
 
-/// RESOLUTION: mark a message's triage row `done` (+ resolved_at) after a
-/// successful action (archive/send). Best-effort like the audit append —
-/// resolution bookkeeping must not mask the action's own success. Sealed rows
-/// are guarded in the store, so this can never touch sealed mail.
+/// RESOLUTION: mark a triage row `done` after a successful action. Best-effort,
+/// so bookkeeping cannot mask the action's success; sealed rows are guarded in
+/// the store, so this can never touch sealed mail.
 async fn resolve_done(state: &ApiState, message_id: i64) {
     let store = state.store.clone();
     let account_id = state.account_id;
@@ -1346,8 +1272,7 @@ fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
     }
 }
 
-/// Map a [`WriteError`] to an [`ApiError`]. A missing credential is 403 (with a
-/// hint); everything else is an opaque-ish 502/400 that never echoes secrets.
+/// Map a [`WriteError`] to an [`ApiError`], never echoing upstream detail.
 fn write_error(e: &WriteError) -> ApiError {
     match e {
         WriteError::MissingCredential(_) => ApiError::new(
@@ -1516,8 +1441,7 @@ pub async fn action_send(
         return Err(ApiError::bad_request("send requires a non-empty body"));
     }
 
-    // (b) OUTBOUND GUARD: scan the body for secret-looking patterns. Report only
-    // REDACTED kinds, never the matched text. Overridable with override_guard.
+    // OUTBOUND GUARD: report only REDACTED kinds, never the matched text.
     let matches = guard::scan_kinds(&body.body);
     if !matches.is_empty() && !body.override_guard {
         audit_action(&state, "send", target, "blocked:guard").await;
@@ -1549,7 +1473,6 @@ pub async fn action_send(
         }
     };
 
-    // Resolve the reply parent (if any) for recipient/subject/threading.
     let (parent, thread_id) = match body.reply_to_message_id {
         Some(id) => match resolve_target(&state, id).await {
             Ok(m) => {
@@ -1564,7 +1487,6 @@ pub async fn action_send(
         None => (None, None),
     };
 
-    // Recipient: explicit `to`, else the parent sender. Required.
     let to = match body.to.clone().filter(|s| !s.trim().is_empty()) {
         Some(t) => t,
         None => match &parent {
@@ -1587,8 +1509,8 @@ pub async fn action_send(
             None => String::new(),
         });
 
-    // Threading headers: fetched from Gmail using the WRITE token (gmail.modify
-    // grants read), never the read credential.
+    // Threading headers come from Gmail on the WRITE token (gmail.modify grants
+    // read), never the read credential.
     let (in_reply_to, references) = match &parent {
         Some(p) => match client.parent_headers(&p.gmail_msg_id).await {
             Ok(h) => {
@@ -1618,8 +1540,7 @@ pub async fn action_send(
 
     match client.send(&raw, thread_id.as_deref()).await {
         Ok(()) => {
-            // RESOLUTION: replying to a stored message auto-resolves it. A cold
-            // send (no reply_to_message_id) has no target row to resolve.
+            // A cold send has no target row to resolve.
             if let Some(id) = body.reply_to_message_id {
                 resolve_done(&state, id).await;
             }
@@ -1635,16 +1556,12 @@ pub async fn action_send(
 
 // --- UNSUBSCRIBE: human-door-only, no agent-door exposure --------------------
 //
-// POST /client/unsubscribe returns the message's first http(s) List-Unsubscribe
-// URL for the CLIENT to confirm with the user and open in their browser. The
-// server NEVER performs the unsubscribe itself (no outbound request). A sealed OR
-// unknown message is 404 (indistinguishable); a message with no http(s) link is
-// 422. GET /client/unsubscribes lists the ledger; POST .../resolution records the
-// user's blocked|dismissed decision on a repeat offender.
+// POST /client/unsubscribe hands the CLIENT the first http(s) List-Unsubscribe
+// URL to confirm and open; the server NEVER makes the request itself. Sealed and
+// unknown messages are an indistinguishable 404; no http(s) link is a 422.
 
-/// Upsert the unsubscribe ledger row for a 200 outcome (resets the violation
-/// clock — a fresh request restarts the 72h grace). Bubbles a store failure as
-/// a 500; the row write is the durable record the GET endpoint reads.
+/// Upsert the unsubscribe ledger row, resetting the violation clock: a fresh
+/// request restarts the 72h grace.
 async fn record_unsub(
     state: &ApiState,
     sender: &str,
@@ -1672,8 +1589,7 @@ pub async fn unsubscribe(
     let message_id = body.message_id;
     let target = Some(message_id.to_string());
 
-    // Load the stored unsubscribe fields. `None` => missing OR sealed message,
-    // indistinguishable, both 404 (mirrors GET /client/thread's sealed handling).
+    // `None` => missing OR sealed, indistinguishable, both 404.
     let store = state.store.clone();
     let account_id = state.account_id;
     let fields = blocking(move || store.message_unsub_fields(account_id, message_id))
@@ -1692,9 +1608,8 @@ pub async fn unsubscribe(
             ))
         }
         crate::unsubscribe::UnsubPlan::Browser { url } => {
-            // The client confirms with the user and opens the URL; the server makes
-            // no outbound request. Record the ledger row + audit the sender only
-            // (never the URL).
+            // No outbound request is made here. The audit records the sender
+            // only, never the URL.
             record_unsub(&state, &sender, "browser", message_id).await?;
             audit_action(&state, "unsubscribe", target, &format!("browser:{sender}")).await;
             Ok(Json(json!({ "method": "browser", "sender": sender, "url": url })))
@@ -1704,14 +1619,10 @@ pub async fn unsubscribe(
 
 // --- TRIAGE FEEDBACK (human corrections) ------------------------------------
 //
-// The capture point for "the pipeline got this one wrong". Applying the fix and
-// recording it are the same call on purpose: a correction the human sees take
-// effect but which never reaches the dataset is worse than useless, because it
-// looks like triage is doing better than it is.
-//
-// `to_value` is validated against TriageAxis::allowed, so a typo can never write
-// a label the pipeline would not itself produce — a training set full of
-// invented categories is not a training set.
+// Applying the fix and recording it are ONE call on purpose: a correction the
+// human sees take effect but that never reaches the dataset makes triage look
+// better than it is. `to_value` is validated against TriageAxis::allowed, so a
+// typo can never write a label the pipeline would not itself produce.
 
 /// How many corrections GET returns by default / at most.
 const FEEDBACK_DEFAULT_LIMIT: u32 = 200;
@@ -1789,7 +1700,7 @@ pub struct FeedbackQuery {
     limit: Option<u32>,
 }
 
-/// The refinement dataset. Read this to see where triage actually goes wrong.
+/// The refinement dataset: where triage actually goes wrong.
 pub async fn get_triage_feedback(
     State(state): State<ApiState>,
     Query(q): Query<FeedbackQuery>,
@@ -1806,23 +1717,12 @@ pub async fn get_triage_feedback(
 
 // --- AUTH-MAIL SHREDDER (retention) -----------------------------------------
 //
-// Auth mail is the one class of message with a natural expiry: a login code
-// from three weeks ago is pure liability — it can only ever be a thing someone
-// else reads. This pass moves auth mail older than the policy window to Gmail's
-// TRASH (never permanent delete; see GmailWriteClient::trash) and records each
-// one in `shred_log`, which is what makes the Auth page's counter a fact rather
-// than an estimate.
-//
-// SAFETY POSTURE, because this deletes a human's mail on a timer:
-//   * OFF by default. Nothing is ever trashed until the user turns it on.
-//   * Trash only — recoverable for 30 days, and `gmail.modify` cannot
-//     permanently delete even if we asked it to.
-//   * Requires the opt-in write credential; without one the pass is a no-op and
-//     the UI says so rather than pretending it ran.
-//   * Bounded per pass, oldest first, so a first run over a large backlog makes
-//     steady progress instead of one enormous burst of API calls.
-//   * Ledger row is written only AFTER Gmail confirms, and every shred writes an
-//     audit row — a deletion this app performed is always accounted for.
+// Moves auth mail older than the policy window to Gmail's TRASH and records it
+// in `shred_log`. Because this deletes a human's mail on a timer, the safety
+// posture is non-negotiable: OFF by default; trash only (recoverable for 30
+// days, and `gmail.modify` cannot permanently delete); a no-op without the
+// opt-in write credential; bounded per pass, oldest first; and the ledger row
+// lands only AFTER Gmail confirms, with an audit row for every shred.
 
 const SHRED_ENABLED_KEY: &str = "shred_enabled";
 const SHRED_AFTER_DAYS_KEY: &str = "shred_after_days";
@@ -1838,10 +1738,9 @@ const SHRED_BATCH: u32 = 50;
 /// Window for the headline "shredded recently" figure.
 const SHRED_RECENT_DAYS: i64 = 30;
 
-/// Interpret the two raw `app_settings` values into a policy. Unset or
-/// malformed falls back to the SAFE default (off / 30d) rather than erroring: a
-/// corrupted knob must never be able to start deleting mail, and must never
-/// take the Auth page down either. Pure, so it is directly unit-testable.
+/// Interpret the raw `app_settings` values into a policy. Unset or malformed
+/// falls back to the SAFE default (off / 30d) rather than erroring: a corrupted
+/// knob must never start deleting mail, nor take the Auth page down.
 fn parse_shred_policy(enabled: Option<String>, days: Option<String>) -> (bool, i64) {
     let enabled = enabled
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1891,18 +1790,15 @@ async fn shred_stats(state: &ApiState) -> Result<ShredStats, ApiError> {
         shredded_total,
         last_shredded_at,
         pending,
-        // Reported separately from `enabled` so the UI can distinguish "off" from
-        // "on but structurally unable to run".
+        // Separate from `enabled` so the UI can tell "off" from "on but unable".
         write_ready: state.write_creds().is_some(),
     })
 }
 
-/// Run one bounded retention pass. Returns how many messages were trashed.
-///
-/// A no-op (Ok(0)) when disabled or when no write credential is configured —
-/// both are ordinary states, not errors, so the caller can fire this on a timer
-/// without special-casing. A per-message Gmail failure is logged to the audit
-/// trail and skipped; it does NOT abort the pass or write a ledger row.
+/// Run one bounded retention pass, returning how many messages were trashed.
+/// Disabled or credential-less is `Ok(0)`, not an error, so a timer can fire it
+/// unconditionally. A per-message Gmail failure is audited and skipped — it
+/// neither aborts the pass nor writes a ledger row.
 pub async fn run_shred_pass(state: &ApiState) -> Result<u32, ApiError> {
     let (enabled, after_days) = shred_policy(state).await?;
     if !enabled {
@@ -1922,8 +1818,7 @@ pub async fn run_shred_pass(state: &ApiState) -> Result<u32, ApiError> {
     let mut shredded = 0u32;
     for candidate in candidates {
         if client.trash(&candidate.gmail_msg_id).await.is_err() {
-            // Gmail refused this one (already gone, transient, permissions).
-            // Skip it: no ledger row, so a later pass retries it naturally.
+            // Skipped with no ledger row, so a later pass retries it naturally.
             audit_action(
                 state,
                 "shred_failed",
@@ -1939,8 +1834,8 @@ pub async fn run_shred_pass(state: &ApiState) -> Result<u32, ApiError> {
         let recorded =
             blocking(move || store.record_shred(account_id, &c, Utc::now())).await;
         if recorded.is_err() {
-            // The mail IS trashed; only our bookkeeping failed. Say so loudly in
-            // the audit trail rather than silently under-counting.
+            // The mail IS trashed and only the bookkeeping failed: say so in the
+            // audit trail rather than silently under-counting.
             audit_action(
                 state,
                 "shred_unrecorded",
@@ -2006,8 +1901,7 @@ pub async fn set_shredder(
     Ok(Json(shred_stats(&state).await?))
 }
 
-/// POST /client/shredder/run — run a pass now. The Auth page fires this on open
-/// so the policy applies without waiting for the daemon's timer.
+/// POST /client/shredder/run — run a pass now, without waiting for the timer.
 pub async fn run_shredder(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
     let shredded = run_shred_pass(&state).await?;
     let stats = shred_stats(&state).await?;
@@ -2021,7 +1915,7 @@ pub async fn list_unsubscribes(
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.store.clone();
     let account_id = state.account_id;
-    // Newest requested_at first; the store type serializes to the wire contract.
+    // Newest requested_at first.
     let items = blocking(move || store.list_unsubscribes(account_id)).await?;
     Ok(Json(items))
 }
@@ -2057,7 +1951,6 @@ pub async fn unsubscribe_resolution(
     let r = resolution.clone();
     let updated = blocking(move || store.set_unsubscribe_resolution(account_id, &s, &r)).await?;
     if !updated {
-        // No unsubscribe record for that sender.
         return Err(ApiError::not_found());
     }
 
@@ -2077,7 +1970,7 @@ mod shred_policy_tests {
 
     #[test]
     fn unset_policy_is_off_at_the_default_window() {
-        // The whole point: an account that never opted in never deletes mail.
+        // An account that never opted in never deletes mail.
         assert_eq!(parse_shred_policy(None, None), (false, SHRED_DEFAULT_DAYS));
     }
 
@@ -2096,8 +1989,8 @@ mod shred_policy_tests {
     fn window_is_clamped_to_the_supported_range() {
         assert_eq!(parse_shred_policy(None, Some("90".into())).1, 90);
         assert_eq!(parse_shred_policy(None, Some(" 45 ".into())).1, 45);
-        // Below the floor, above the ceiling, and outright garbage all fall back
-        // to the default rather than deleting on an aggressive window.
+        // Out of range and garbage fall back to the default rather than
+        // deleting on an aggressive window.
         assert_eq!(
             parse_shred_policy(None, Some("1".into())).1,
             SHRED_DEFAULT_DAYS
@@ -2118,7 +2011,6 @@ mod shred_policy_tests {
 
     #[test]
     fn a_corrupt_knob_never_enables_deletion() {
-        // Belt and braces on the property that actually matters.
         for raw in ["", "  ", "off", "null", "2", "-1", "on"] {
             assert!(
                 !parse_shred_policy(Some(raw.into()), Some("30".into())).0,

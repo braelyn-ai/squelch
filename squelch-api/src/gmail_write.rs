@@ -1,20 +1,8 @@
-//! Gmail WRITE operations — the ONLY write capability in squelch.
-//!
-//! This module lives in squelch-api (the human door), NOT in squelch-core's
-//! sync engine, so the surfacer/sync/triage core stays provably write-free. It
-//! mirrors the read engine's reqwest+rustls patterns (see
-//! `squelch_core::sync`) but every request carries the WRITE credential
-//! ([`CredentialKind::Write`]).
-//!
-//! CREDENTIAL DISCIPLINE:
-//! - The write token is fetched PER REQUEST from a [`CredentialStore`] bound to
-//!   [`CredentialKind::Write`] and dropped when the call returns. It is never
-//!   held long-lived and is never reachable from any read/sync path.
-//! - `Authorization` headers, tokens, and message bodies are NEVER logged.
-//!
-//! The request-shaping functions ([`modify_request`], [`build_reply_rfc822`],
-//! [`send_request_body`]) are pure so their Gmail API shapes are unit-testable
-//! without a network.
+//! Gmail WRITE operations — the ONLY write capability in squelch. Lives here,
+//! not in squelch-core, so the sync/triage core stays provably write-free.
+//! The write token is fetched PER REQUEST from a [`CredentialStore`] bound to
+//! [`CredentialKind::Write`], dropped when the call returns, and never reachable
+//! from a read path. Tokens, auth headers and bodies are NEVER logged.
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -24,14 +12,14 @@ use squelch_core::credentials::CredentialStore;
 use squelch_core::store::ActionMessageRef;
 use squelch_core::types::AccountId;
 
-/// Gmail REST base for the authenticated user. Same host the read engine uses.
+/// Gmail REST base for the authenticated user.
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 
 /// The Gmail system label for the inbox. Archiving == removing this label.
 pub const LABEL_INBOX: &str = "INBOX";
 
-/// An error from a write operation. Kept deliberately coarse and free of any
-/// token/body content; callers map it to an HTTP status.
+/// An error from a write operation: deliberately coarse and free of any
+/// token/body content.
 #[derive(Debug)]
 pub enum WriteError {
     /// No write credential is configured/stored (run `squelchd auth --write`).
@@ -59,8 +47,8 @@ impl std::fmt::Display for WriteError {
 // Pure request shaping (unit-testable, no network).
 // ---------------------------------------------------------------------------
 
-/// The modify JSON body (`addLabelIds`/`removeLabelIds`). Empty arrays are still
-/// sent (harmless no-ops) so the shape is uniform. Pure and base-independent.
+/// The modify JSON body. Empty arrays are still sent (harmless no-ops) so the
+/// shape is uniform.
 pub fn modify_body(add: &[String], remove: &[String]) -> Value {
     json!({
         "addLabelIds": add,
@@ -93,12 +81,11 @@ pub struct ReplyParts {
     pub references: Option<String>,
 }
 
-/// Build a minimal RFC822 message from [`ReplyParts`]. Header values are guarded
-/// against CRLF injection (any header line containing a bare CR/LF is rejected
-/// component-by-component). Returns the raw bytes ready for base64url encoding.
+/// Build a minimal RFC822 message from [`ReplyParts`], guarded against CRLF
+/// header injection. Returns raw bytes ready for base64url encoding.
 pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
-    // Header-injection guard: no field that becomes a header line may contain a
-    // CR or LF. The body is allowed newlines (it lives after the blank line).
+    // No field that becomes a header line may contain CR or LF. The body may
+    // (it lives after the blank line).
     for (name, val) in [
         ("To", parts.to.as_str()),
         ("Subject", parts.subject.as_str()),
@@ -132,9 +119,8 @@ pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     Ok(out.into_bytes())
 }
 
-/// The `messages.send` JSON body. `raw` is RFC822 bytes, base64url-encoded (no
-/// padding) as Gmail expects. `threadId` is set only when threading a reply.
-/// Pure and base-independent.
+/// The `messages.send` JSON body: `raw` base64url-encoded WITHOUT padding as
+/// Gmail expects, `threadId` set only when threading a reply.
 pub fn send_body(raw: &[u8], thread_id: Option<&str>) -> Value {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
     let mut body = json!({ "raw": encoded });
@@ -160,8 +146,8 @@ pub fn reply_subject(original: &str) -> String {
     }
 }
 
-/// Build the `References` chain for a reply: append the parent `Message-ID` to
-/// any pre-existing references. Returns `None` when there is nothing to chain.
+/// The `References` chain for a reply: the parent `Message-ID` appended to any
+/// pre-existing references, or `None` when there is nothing to chain.
 pub fn build_references(parent_message_id: Option<&str>, parent_references: Option<&str>) -> Option<String> {
     match (parent_references, parent_message_id) {
         (Some(refs), Some(mid)) => Some(format!("{refs} {mid}")),
@@ -202,13 +188,12 @@ struct MetaHeader {
 }
 
 /// Executes Gmail write ops with a WRITE-bound credential store. The token is
-/// fetched per call from `creds` and never retained.
+/// fetched per call and never retained.
 pub struct GmailWriteClient {
     creds: std::sync::Arc<dyn CredentialStore>,
     account_id: AccountId,
     http: reqwest::Client,
-    /// API base URL. Defaults to Gmail's; overridable in tests to point at a
-    /// local mock server (production always uses the real base).
+    /// API base URL. Overridable in tests only; production uses Gmail's.
     base: String,
 }
 
@@ -236,8 +221,8 @@ impl GmailWriteClient {
         }
     }
 
-    /// Fetch a fresh write access token. Absent/failed credential => a
-    /// `MissingCredential` error (which the handler maps to 403 with a hint).
+    /// Fetch a fresh write access token; an absent/failed credential is
+    /// `MissingCredential`, which the handler maps to a 403.
     async fn write_token(&self) -> Result<String, WriteError> {
         match self.creds.token(self.account_id).await {
             Ok(t) => Ok(t.access_token),
@@ -247,8 +232,8 @@ impl GmailWriteClient {
         }
     }
 
-    /// POST a JSON body to `url` with the write bearer token. On success returns
-    /// the parsed JSON response. Never logs the token or the body.
+    /// POST a JSON body with the write bearer token. Never logs the token or
+    /// the body.
     async fn post_json(&self, url: &str, body: &Value) -> Result<Value, WriteError> {
         let token = self.write_token().await?;
         let resp = self
@@ -265,8 +250,7 @@ impl GmailWriteClient {
                 .await
                 .map_err(|e| WriteError::Transport(format!("gmail json decode: {e}")))
         } else {
-            // Do not echo the response body (may contain request context); report
-            // only the status code.
+            // Never echo the upstream body (it may carry request context).
             Err(WriteError::Api {
                 status: status.as_u16(),
                 message: "request rejected".into(),
@@ -291,23 +275,17 @@ impl GmailWriteClient {
         self.modify(gmail_msg_id, &[], &[LABEL_INBOX.to_string()]).await
     }
 
-    /// Move a message to Gmail's Trash — the strongest deletion this app can
-    /// perform, and deliberately so.
-    ///
-    /// This is `/trash`, NOT `messages.delete`. Trashed mail is recoverable by
-    /// the user for 30 days, and `messages.delete` (permanent, unrecoverable)
-    /// requires the full `https://mail.google.com/` scope, which squelch never
-    /// requests. The blast radius here is therefore capped by the OAuth scope
-    /// itself, not merely by our own restraint. Used by the auth-mail retention
-    /// pass; see the `shred_log` block in schema.sql.
+    /// Move a message to Gmail's Trash — `/trash`, NEVER `messages.delete`.
+    /// Trashed mail is recoverable for 30 days, and permanent delete requires
+    /// the full `https://mail.google.com/` scope, which squelch never requests:
+    /// the blast radius is capped by the OAuth scope, not by our restraint.
     pub async fn trash(&self, gmail_msg_id: &str) -> Result<(), WriteError> {
         let url = format!("{}/messages/{gmail_msg_id}/trash", self.base);
         self.post_json(&url, &serde_json::json!({})).await.map(|_| ())
     }
 
-    /// Read the parent message's threading headers (Message-ID, References) using
-    /// the WRITE token (gmail.modify grants read too). Used only to thread a
-    /// reply correctly; never exposes a body.
+    /// Read the parent's threading headers with the WRITE token (gmail.modify
+    /// grants read too). Metadata only — it never fetches a body.
     pub async fn parent_headers(&self, gmail_msg_id: &str) -> Result<ParentHeaders, WriteError> {
         let url = format!(
             "{}/messages/{gmail_msg_id}\
@@ -354,8 +332,7 @@ impl GmailWriteClient {
     }
 }
 
-/// Resolve the default reply recipient for an action target: the original
-/// sender's address.
+/// The default reply recipient: the original sender's address.
 pub fn default_recipient(msg: &ActionMessageRef) -> String {
     msg.from_addr.clone()
 }
@@ -534,7 +511,6 @@ mod tests {
         assert!(req.starts_with("POST "), "must be a POST");
         assert!(req.contains("/messages/gmail-123/modify"), "modify path");
         assert!(req.contains("authorization: Bearer WRITE-TOKEN") || req.contains("Authorization: Bearer WRITE-TOKEN"));
-        // Body carries removeLabelIds:["INBOX"] and empty addLabelIds.
         assert!(req.contains("\"removeLabelIds\":[\"INBOX\"]"));
         assert!(req.contains("\"addLabelIds\":[]"));
     }

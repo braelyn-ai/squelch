@@ -1,11 +1,8 @@
-//! Integration tests for push-device registration on the human door:
-//! `POST /client/devices` and `POST /client/devices/unregister`.
+//! Integration tests for push-device registration on the human door.
 //!
-//! The interesting properties are all about idempotence and about not leaking
-//! capability material: iOS re-registers on every launch, so a second POST must
-//! land on the same row, no response body may echo the token back, and the
-//! token never appears in a URL path (which is why unregister is a POST with a
-//! body rather than a DELETE with the token in the request line).
+//! The properties under test are idempotence (iOS re-registers on every launch,
+//! so a second POST lands on the same row) and not leaking capability material:
+//! no response echoes the token, and no token appears in a URL path.
 
 use std::sync::Arc;
 
@@ -49,8 +46,8 @@ fn post(uri: &str, body: Value, bearer: bool) -> Request<Body> {
     b.body(Body::from(body.to_string())).unwrap()
 }
 
-/// Unregister: the token rides in the BODY. If this ever needs a `{token}` path
-/// segment again, that is a privacy regression, not a refactor.
+/// Unregister: the token rides in the BODY. Moving it to a `{token}` path
+/// segment is a privacy regression, not a refactor.
 fn unregister(token: &str, bearer: bool) -> Request<Body> {
     post(
         "/client/devices/unregister",
@@ -64,8 +61,8 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
-/// The bearer layer covers the new routes exactly like every other `/client/*`
-/// route — no route is ever mounted outside it.
+/// The bearer layer covers these routes like every other `/client/*` route —
+/// nothing is ever mounted outside it.
 #[tokio::test]
 async fn registration_requires_the_bearer() {
     let h = harness();
@@ -150,10 +147,9 @@ async fn register_then_unregister_round_trips() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
-/// THE TOKEN NEVER RIDES IN A URL. Unregister carries it in a body, and the old
-/// `DELETE /client/devices/{token}` shape is gone — a path segment survives in
-/// access logs, proxy logs and error reports, which is the very reason this
-/// module refuses to echo a token in a RESPONSE body.
+/// THE TOKEN NEVER RIDES IN A URL: a path segment survives in access logs,
+/// proxy logs and error reports. `DELETE /client/devices/{token}` must not be a
+/// route.
 #[tokio::test]
 async fn the_token_travels_in_the_body_not_the_path() {
     let h = harness();
@@ -169,8 +165,7 @@ async fn the_token_travels_in_the_body_not_the_path() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(h.store.list_devices(h.acct).unwrap().is_empty());
 
-    // And the retired shape is not routed: a token in the path is a 405/404,
-    // never a working endpoint.
+    // A token in the path is a 405/404, never a working endpoint.
     h.store.upsert_device(h.acct, DEV_A, "ios").unwrap();
     let uri: Uri = format!("/client/devices/{DEV_A}").parse().unwrap();
     let req = Request::builder()
@@ -192,9 +187,8 @@ async fn the_token_travels_in_the_body_not_the_path() {
     );
 }
 
-/// iOS hands the app its token on EVERY launch. Re-registering must refresh the
-/// one row, never accumulate rows — otherwise a chatty app slowly turns one
-/// device into a hundred push targets.
+/// iOS hands the app its token on EVERY launch, so re-registering must refresh
+/// the one row — otherwise one device slowly becomes a hundred push targets.
 #[tokio::test]
 async fn re_registration_is_idempotent() {
     let h = harness();
@@ -227,9 +221,8 @@ async fn re_registration_is_idempotent() {
     assert_eq!(h.store.list_devices(h.acct).unwrap().len(), 1);
 }
 
-/// Token validation mirrors the relay's own bounds, so a token the relay would
-/// reject is refused at registration — where the client can actually see it —
-/// rather than becoming a silent per-token push failure later.
+/// Token validation mirrors the relay's bounds, so a token the relay would
+/// reject fails at registration instead of silently at push time.
 #[tokio::test]
 async fn a_token_the_relay_would_reject_is_refused_here() {
     let h = harness();

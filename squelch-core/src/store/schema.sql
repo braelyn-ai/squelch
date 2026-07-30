@@ -20,16 +20,14 @@ CREATE TABLE IF NOT EXISTS messages (
     received_at TEXT NOT NULL,
     snippet     TEXT NOT NULL,
     body        TEXT NOT NULL DEFAULT '',
-    -- Server-side-sanitized (ammonia) HTML body, NULL for plain-text-only mail.
-    -- Populated at ingest; served ONLY through the human door
-    -- (GET /client/thread/{id}). Never crosses /mcp: the agent door flattens to
-    -- `body` text only. Sealed mail stores this like `body` (storage is fine;
-    -- serving is guarded — sealed threads are NotFound on every non-local door).
+    -- Sanitized HTML body baked at ingest (docs/SECURITY.md §1), NULL for
+    -- plain-text-only mail. Served ONLY through the human door; never crosses
+    -- /mcp, which flattens to `body` text. Sealed mail stores it like `body` —
+    -- storage is fine, serving is guarded.
     body_html   TEXT,
     is_sent     INTEGER NOT NULL DEFAULT 0,
-    -- Raw `List-Unsubscribe` header value (comma-separated <mailto:…>/<https:…>
-    -- entries), NULL when the mail carried no such header. Captured at ingest;
-    -- consumed ONLY by the human door's unsubscribe endpoint (never /mcp).
+    -- Raw `List-Unsubscribe` header value, NULL when absent. Consumed ONLY by
+    -- the human door's unsubscribe endpoint.
     list_unsubscribe TEXT,
     -- 1 when the mail advertised RFC 8058 one-click unsubscribe
     -- (`List-Unsubscribe-Post: List-Unsubscribe=One-Click`).
@@ -60,15 +58,13 @@ CREATE TABLE IF NOT EXISTS sender_rules (
 
 -- ATTENTION LIFECYCLE (sitrep seen-ledger):
 --   status       'new' | 'open' | 'done'. A row starts 'new'; the first time it
---                flows OUT through a read door (MCP get_inbox_updates OR
---                GET /client/updates) it is promoted 'new' -> 'open' and stamped
---                surfaced_at. A successful archive/send, or an explicit dismiss,
---                sets status='done' + resolved_at.
---   surfaced_at  first time ANY door surfaced this row (NULL until then). The
---                seen-ledger: answers "did anyone (agent or human) see this yet".
+--                flows OUT through ANY read door it is promoted to 'open' and
+--                stamped surfaced_at. An archive/send/dismiss sets 'done' +
+--                resolved_at.
+--   surfaced_at  first time any door surfaced this row, NULL until then.
 --   resolved_at  when the row reached status='done'.
--- Sealed rows carry these columns like any other row, but stay structurally
--- absent from every non-local surface, so they never get surfaced/stamped.
+-- Sealed rows carry these columns but are structurally absent from every
+-- non-local surface, so they are never surfaced or stamped.
 CREATE TABLE IF NOT EXISTS triage (
     message_id      INTEGER PRIMARY KEY,
     account_id      INTEGER NOT NULL,
@@ -78,19 +74,16 @@ CREATE TABLE IF NOT EXISTS triage (
     sealed_kind     TEXT,
     one_line        TEXT NOT NULL DEFAULT '',
     reason          TEXT NOT NULL DEFAULT '',
-    -- Per-property triage justifications, a JSON object
-    -- {importance?,deadline?,tier?} of short human-readable reasons for each
-    -- property's value. NULL for rows written before this feature. HUMAN-DOOR
-    -- ONLY: served flattened into GET /client/updates; NEVER crosses /mcp (the
-    -- agent-door read path leaves it unset).
+    -- Per-property triage justifications: a JSON object
+    -- {importance?,deadline?,tier?} of short human-readable reasons. HUMAN-DOOR
+    -- ONLY — the agent-door read path leaves it unset, so it never crosses /mcp.
     field_reasons   TEXT,
     deadline        TEXT,
     matched_rule_id INTEGER,
-    -- STAGE-1 LLM marker. NULL = this row still needs the Stage-1 LLM refine
-    -- pass (its heuristic seed values are provisional). Stamped with the Stage-1
-    -- model id once refined, 'rule' for a row an explicit/Filtered sender rule
-    -- already decided (no Stage-1 model spend), or 'heuristic-only' when the
-    -- Stage-1 pass fell back to the seed (API down / refusal / permanent error).
+    -- STAGE-1 LLM marker. NULL = still needs the Stage-1 refine pass (its
+    -- heuristic seed values are provisional). Otherwise the Stage-1 model id,
+    -- 'rule' when a sender rule already decided the row (no model spend), or
+    -- 'heuristic-only' when the pass fell back to the seed.
     stage1_model_used TEXT,
     -- Set to 1 by the Stage-1 pass (confident=false), or at ingest for a Filtered
     -- rule needing want_text evaluation, to mark the row for Stage-2 escalation.
@@ -99,18 +92,15 @@ CREATE TABLE IF NOT EXISTS triage (
     -- predicate is `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
     -- model_used IS NULL AND sensitivity='normal'`.
     model_used      TEXT,
-    -- CATEGORIZE-THEN-EXTRACT. The stage-1 (and, on escalation, stage-2) LLM
-    -- assigns one coarse category: 'general' | 'invoice' | 'banking_statement' |
-    -- 'transaction_alert'. NULL = a pre-feature or heuristic-only row (the LLM
-    -- never looked). A category with a registered SPECIALIST EXTRACTOR (see
-    -- triage/extract/) queues the row for a second, structured extraction pass.
-    -- Sealed rows never run the LLM stages, so their category stays NULL — which
-    -- is exactly what structurally excludes them from every extractor queue.
+    -- CATEGORIZE-THEN-EXTRACT: one coarse LLM category ('general' | 'invoice' |
+    -- 'banking_statement' | 'transaction_alert'), NULL when no LLM ever looked.
+    -- A category with a registered specialist extractor queues the row for a
+    -- structured second pass. SEALED ROWS NEVER RUN THE LLM STAGES, so their
+    -- category stays NULL — which is what excludes them from every queue.
     category        TEXT,
-    -- SPECIALIST-EXTRACTOR marker. NULL = this row has not yet been through its
-    -- category's extractor (or its category has no extractor). Stamped with the
-    -- extractor model id once run, or a sentinel ('skip-*') when deliberately
-    -- skipped. The extractor queue predicate is `category IN (<extractable>) AND
+    -- SPECIALIST-EXTRACTOR marker. NULL = not yet through its category's
+    -- extractor (or the category has none); otherwise the extractor model id or
+    -- a 'skip-*' sentinel. Queue predicate: `category IN (<extractable>) AND
     -- extractor_model_used IS NULL AND sensitivity='normal'`.
     extractor_model_used TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
@@ -136,19 +126,14 @@ CREATE TABLE IF NOT EXISTS deadlines (
 
 CREATE INDEX IF NOT EXISTS idx_deadlines_due ON deadlines(account_id, due_at);
 
--- PACKAGE TRACKING. One row per (account, tracking_number): a shipment currently
--- (or formerly) in transit, extracted from NON-SEALED shipping/delivery mail by
--- the ingest pipeline. A new email about an existing tracking number UPDATES the
--- row (status state machine + last_update/last_message_id); a tracking number is
--- REQUIRED to create a row (it is the dedupe/track key — mail with no number is
--- skipped). `status` follows the ordered<shipped<out_for_delivery<delivered
--- ladder (exception is a flag); the ingest upsert never regresses a delivered
--- shipment.
+-- PACKAGE TRACKING. One row per (account, tracking_number), extracted from
+-- NON-SEALED shipping mail. The tracking number is REQUIRED — it is the dedupe
+-- key, so mail without one is skipped — and a later email about the same number
+-- UPDATES the row. `status` walks the ordered<shipped<out_for_delivery<delivered
+-- ladder (exception is a flag) and never regresses a delivered shipment.
 --
--- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A SHIPMENT. The
--- ingest path runs shipment detection ONLY for sensitivity='normal' mail, so this
--- table has no sealed rows BY CONSTRUCTION — there is nothing to leak and no
--- sealed join is needed on read.
+-- SECURITY: detection runs ONLY for sensitivity='normal' mail, so this table has
+-- no sealed rows BY CONSTRUCTION and needs no sealed join on read.
 CREATE TABLE IF NOT EXISTS shipments (
     id              INTEGER PRIMARY KEY,
     account_id      INTEGER NOT NULL,
@@ -165,24 +150,17 @@ CREATE TABLE IF NOT EXISTS shipments (
 
 CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status);
 
--- RECEIPTS. One row per (account, message): a record of money ALREADY PAID,
--- extracted from NON-SEALED past-transaction mail (payment received / receipt /
--- order confirmation / you were charged) by the ingest pipeline. Receipts are
--- records, not obligations and not signals — they live ONLY in the desktop
--- "Receipts" category and are auto-resolved (triage.status='done') at ingest so
--- they never surface as New/Attention/Aging clutter. `from_addr`/`from_name` are
--- stored so the client can render a clean merchant name with no extra join.
--- `amount`/`currency` are best-effort — a receipt with no parseable total is
--- still a receipt (amount NULL). A receipt and a shipment can COEXIST (an order
--- confirmation with a total AND tracking is both); receipt detection is
--- independent of shipment detection. A landing receipt may also AUTO-CLOSE one
--- matching open bill (conservative merchant+amount+recency rules, audited as
+-- RECEIPTS. One row per (account, message): money ALREADY PAID, extracted from
+-- NON-SEALED past-transaction mail. Records, not obligations — auto-resolved
+-- (triage.status='done') at ingest so they live only in the Receipts category.
+-- `from_addr`/`from_name` are stored so the client renders a merchant name with
+-- no extra join; `amount`/`currency` are best-effort (NULL is still a receipt).
+-- Detection is independent of shipment detection, so one mail can be both. A
+-- landing receipt may also AUTO-CLOSE one matching open bill (audited as
 -- bill.auto_close — see triage/receipt_match.rs).
 --
--- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A RECEIPT. The
--- ingest path runs receipt detection ONLY for sensitivity='normal' mail, so this
--- table has no sealed rows BY CONSTRUCTION — there is nothing to leak and no
--- sealed join is needed on read.
+-- SECURITY: detection runs ONLY for sensitivity='normal' mail, so this table has
+-- no sealed rows BY CONSTRUCTION and needs no sealed join on read.
 CREATE TABLE IF NOT EXISTS receipts (
     id          INTEGER PRIMARY KEY,
     account_id  INTEGER NOT NULL,
@@ -197,23 +175,16 @@ CREATE TABLE IF NOT EXISTS receipts (
 
 CREATE INDEX IF NOT EXISTS idx_receipts_received ON receipts(account_id, received_at);
 
--- CALENDAR UPDATES. One row per (account, message): an invite / updated
--- invitation / cancellation / RSVP response, extracted from NON-SEALED calendar
--- mail (Google Calendar notification subjects, Outlook invite shapes,
--- ics-bearing mail) by the ingest pipeline. Like receipts, these are RECORDS of
--- scheduling state (the user's real calendar is the source of truth) — they
--- live ONLY in the desktop "Calendar" zone and are auto-resolved
--- (triage.status='done') at ingest so they never surface as New/Attention/Aging
--- clutter. `kind` is invite|update|cancellation|response;
--- `event_title`/`starts_at`/`organizer` are best-effort (NULL is fine — the
--- classification is driven by the structural subject shape, not extraction).
--- The /client/calendar window filters on received_at (mail arrival), NOT
--- starts_at (event time).
+-- CALENDAR UPDATES. One row per (account, message): invite / update /
+-- cancellation / RSVP response, extracted from NON-SEALED calendar mail. Like
+-- receipts these are RECORDS (the user's real calendar is the source of truth),
+-- auto-resolved at ingest so they live only in the Calendar zone.
+-- `event_title`/`starts_at`/`organizer` are best-effort — classification comes
+-- from the structural subject shape, not extraction. The /client/calendar window
+-- filters on received_at (mail arrival), NOT starts_at (event time).
 --
--- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A CALENDAR
--- UPDATE. The ingest path runs calendar detection ONLY for sensitivity='normal'
--- mail, so this table has no sealed rows BY CONSTRUCTION — there is nothing to
--- leak and no sealed join is needed on read.
+-- SECURITY: detection runs ONLY for sensitivity='normal' mail, so this table has
+-- no sealed rows BY CONSTRUCTION and needs no sealed join on read.
 CREATE TABLE IF NOT EXISTS calendar_updates (
     id          INTEGER PRIMARY KEY,
     account_id  INTEGER NOT NULL,
@@ -228,32 +199,22 @@ CREATE TABLE IF NOT EXISTS calendar_updates (
 
 CREATE INDEX IF NOT EXISTS idx_calendar_received ON calendar_updates(account_id, received_at);
 
--- BANKING. One row per (account, message): a bank/credit-card STATEMENT (a
--- periodic record) or a TRANSACTION ALERT (a "you spent" / deposit / low-balance
--- notice), extracted by the banking SPECIALIST EXTRACTOR (triage/extract/banking.rs)
--- from a NON-SEALED row the LLM categorized 'banking_statement' or
--- 'transaction_alert'. Like receipts, these are RECORDS, not obligations — the
--- extractor auto-resolves the triage row (status='done') so they leave the
--- attention bands and live only in the desktop "Banking" zone. `kind` is
--- 'statement' | 'transaction_alert'. For a statement, `amount` is the TOTAL
--- statement balance (never the minimum payment / amount due); for an alert it is
--- the transaction amount. `institution` is a clean display name (e.g. "Chase").
--- `account_hint` is ONLY ever a masked last-4 tail ("…1234") — a full account
--- number is never stored (the extractor instructs the model AND post-validates,
--- reducing anything longer to a "…NNNN" tail or NULL). All extracted fields are
--- best-effort (NULL is fine).
+-- BANKING. One row per (account, message): a STATEMENT or a TRANSACTION ALERT,
+-- extracted by the banking specialist extractor from a NON-SEALED row the LLM
+-- categorized. Like receipts these are RECORDS, so the extractor auto-resolves
+-- the triage row (status='done') and they live only in the Banking zone. For a
+-- statement `amount` is the TOTAL balance, never the minimum payment; for an
+-- alert it is the transaction amount. `account_hint` is ONLY ever a masked
+-- last-4 tail ("…1234") — the extractor post-validates, reducing anything longer
+-- to a tail or NULL, so a full account number is never stored.
 --
--- Differentiation from receipts (documented invariant): a receipt (money paid
--- for a purchase) and a banking row must never DOUBLE-CREATE. The deterministic
--- receipt detector runs at INGEST, before the LLM categorizer; if a message
--- already produced a receipt, the banking extractor SKIPS it (the extractor
--- queue excludes messages that have a receipts row).
+-- A receipt and a banking row must never DOUBLE-CREATE: the deterministic
+-- receipt detector runs at INGEST, before the categorizer, and the extractor
+-- queue excludes any message that already has a receipts row.
 --
--- SECURITY (structural, not filtered): SEALED MAIL NEVER PRODUCES A BANKING ROW.
--- Sealed rows never run the LLM stages, so they carry category=NULL and are
--- structurally absent from the extractor queue; the extractor additionally
--- enforces the release-mode sealed guard. This table has no sealed rows BY
--- CONSTRUCTION — no sealed join is needed on read.
+-- SECURITY: sealed rows never run the LLM stages, so they carry category=NULL
+-- and are absent from the extractor queue (the extractor also enforces the
+-- release-mode sealed guard). No sealed rows here BY CONSTRUCTION.
 CREATE TABLE IF NOT EXISTS banking (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -269,25 +230,17 @@ CREATE TABLE IF NOT EXISTS banking (
 
 CREATE INDEX IF NOT EXISTS idx_banking_received ON banking(account_id, received_at);
 
--- MARKETING. One row per message the LLM categorized `marketing`, holding the
--- fields that make a promo worth keeping: brand, the offer in one line, the
--- discount, a promo code, and when it expires. Written by the marketing
--- specialist extractor (triage/extract/marketing.rs).
+-- MARKETING. One row per message the LLM categorized `marketing`: brand, the
+-- offer in one line, the discount, a promo code, and when it expires. Written by
+-- the marketing specialist extractor (triage/extract/marketing.rs).
 --
--- WHY A TABLE AND NOT A HEURISTIC: the client used to derive "this is a
--- newsletter" by pattern-matching Stage-1's `reason` prose — text documented as
--- an internal justification, written for another purpose, that nothing promised
--- to keep stable. It over-matched (every recurring robot sender qualified) and
--- could silently stop matching. This is the record that replaces that guess.
+-- SECURITY: like `banking`, NO sealed rows BY CONSTRUCTION — sealed mail never
+-- runs the LLM stages, so it carries a NULL category and is absent from every
+-- extractor queue.
 --
--- Like `banking`, this table has NO sealed rows BY CONSTRUCTION: sealed mail
--- never runs the LLM stages, so it carries a NULL category and is structurally
--- absent from every extractor queue. No sealed join is needed on read.
---
--- NOTE this extractor does NOT auto-resolve its triage row (banking does).
--- Marketing is noise-tier already so it is not crowding the attention bands,
--- and resolving it would drop it out of the flat Emails inbox, whose whole
--- promise is that it hides nothing.
+-- This extractor does NOT auto-resolve its triage row (banking does). Marketing
+-- is noise-tier already, and resolving it would drop it out of the flat Emails
+-- inbox, whose whole promise is that it hides nothing.
 CREATE TABLE IF NOT EXISTS marketing (
     id          INTEGER PRIMARY KEY,
     account_id  INTEGER NOT NULL,
@@ -307,22 +260,17 @@ CREATE TABLE IF NOT EXISTS marketing (
 CREATE INDEX IF NOT EXISTS idx_marketing_received ON marketing(account_id, received_at);
 
 -- UNSUBSCRIBES. One row per (account, sender_addr): the human-door record that
--- the user asked to stop hearing from a sender, plus the "did they honor it?"
--- violation ledger. Created/updated by POST /client/unsubscribe (upsert: a fresh
--- request RESETS violation_count/last_violation_at/resolution — the user
--- re-asked, so the 72h grace clock restarts). `method` is always 'browser' —
--- the client opens the unsubscribe link; the server never delivers anything
--- itself (legacy one_click/mailto values can only exist in pre-revision dev
--- DBs). `source_message_id` is the message the unsubscribe was actioned from
--- (nullable; the message may later be deleted). `resolution` is blocked|
--- dismissed|NULL — NULL means the request is still outstanding and the violation
--- detector is armed.
+-- the user asked a sender to stop, plus the "did they honor it?" violation
+-- ledger. A fresh request RESETS violation_count/last_violation_at/resolution,
+-- restarting the 72h grace clock. `method` is always 'browser' — the client
+-- opens the link; the server never delivers anything itself.
+-- `source_message_id` is nullable (the message may later be deleted).
+-- `resolution` is blocked|dismissed|NULL, NULL meaning the request is still
+-- outstanding and the violation detector armed.
 --
--- VIOLATION SEMANTICS (applied in the ingest transaction, store side): when a
--- NON-SENT inbound message is stored, if an unsubscribes row exists for
--- (account_id, lower(from_addr)) with resolution IS NULL and the message's
--- received_at is more than 72h after requested_at, violation_count is
--- incremented and last_violation_at set to that received_at.
+-- VIOLATION SEMANTICS, applied in the ingest transaction: storing a NON-SENT
+-- inbound message whose sender has an unresolved row, more than 72h after
+-- requested_at, increments violation_count and stamps last_violation_at.
 CREATE TABLE IF NOT EXISTS unsubscribes (
     id                INTEGER PRIMARY KEY,
     account_id        INTEGER NOT NULL,
@@ -339,26 +287,21 @@ CREATE TABLE IF NOT EXISTS unsubscribes (
 CREATE INDEX IF NOT EXISTS idx_unsubscribes_requested ON unsubscribes(account_id, requested_at);
 
 -- AUTH-MAIL SHREDDER (retention). One row per message the retention pass moved
--- to Gmail Trash, so the "N shredded" figure on the Auth page is a real ledger
--- rather than an estimate, and a message can never be shredded twice.
+-- to Gmail Trash, so the "N shredded" figure is a real ledger and a message can
+-- never be shredded twice.
 --
--- WHO WRITES IT: the human door only. The sync daemon holds a `gmail.readonly`
--- credential by hard invariant and physically cannot trash anything; the pass
--- runs in the API process against the opt-in write credential, exactly like
--- every other Gmail mutation in this app.
+-- WRITTEN BY THE HUMAN DOOR ONLY: the sync daemon holds a `gmail.readonly`
+-- credential by hard invariant and physically cannot trash anything.
 --
 -- POLICY (both keys live in `app_settings`, per account):
---   shred_enabled    '1' | '0'  — DEFAULT OFF. Deleting someone's mail on a
---                                 timer is destructive and irreversible-ish; it
---                                 only ever happens after a deliberate opt-in.
---   shred_after_days  integer   — default 30. Auth mail (the same
---                                 `triage.sensitivity = 'sealed'` set the Auth
---                                 page lists) older than this is trashed.
+--   shred_enabled    '1' | '0'  — DEFAULT OFF; deleting mail on a timer only
+--                                 ever happens after a deliberate opt-in.
+--   shred_after_days  integer   — default 30. Sealed mail older than this is
+--                                 trashed.
 --
--- TRASH, NEVER DELETE: the pass calls Gmail's /trash, so anything it touches
--- stays recoverable from Trash for 30 days. The write credential is
--- `gmail.modify`, which CANNOT permanently delete — the blast radius is capped
--- by the scope itself, not just by our code.
+-- TRASH, NEVER DELETE: the pass calls Gmail's /trash, so everything it touches
+-- stays recoverable. The write credential is `gmail.modify`, which CANNOT
+-- permanently delete — the blast radius is capped by the scope itself.
 CREATE TABLE IF NOT EXISTS shred_log (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -373,28 +316,20 @@ CREATE TABLE IF NOT EXISTS shred_log (
 
 CREATE INDEX IF NOT EXISTS idx_shred_at ON shred_log(account_id, shredded_at);
 
--- TRIAGE FEEDBACK. Every time a human overrules the triage pipeline, the
--- correction lands here. This table is a TRAINING SET, not a UI log: the point
--- is to accumulate real-world "the model said X, the human said Y" pairs so the
--- triage prompts and heuristics can be refined against what actually went wrong
--- rather than against what we imagine goes wrong.
+-- TRIAGE FEEDBACK. Every human override of the triage pipeline lands here. This
+-- is a TRAINING SET, not a UI log: "the model said X, the human said Y" pairs to
+-- refine prompts and heuristics against what actually went wrong.
 --
--- Two decisions worth stating, because both are what make the data usable later:
+-- 1. `original` carries a JSON SNAPSHOT of the whole triage row at correction
+--    time, including which model produced it — a label without the features that
+--    produced it is near-worthless for refinement.
+-- 2. `sender`/`subject` are DENORMALIZED rather than joined from `messages`,
+--    because the shredder and the user both delete mail, and a training set that
+--    silently loses its inputs cannot be told apart from an empty one.
 --
--- 1. `original` carries a JSON SNAPSHOT of the whole triage row at the moment of
---    correction — tier, category, importance, one_line, reason, and crucially
---    which model produced it. A label without the features that produced it is
---    almost worthless for refinement: "should have been invoice" tells you
---    nothing unless you know what the model saw and which model saw it.
--- 2. `sender`/`subject` are DENORMALIZED rather than joined from `messages`.
---    The shredder trashes old auth mail, users delete things, and rows go away —
---    a training set that silently loses its inputs is worse than no training set,
---    because you cannot tell the difference between "no corrections" and
---    "corrections whose emails are gone".
---
--- NOT unique per message: correcting the same email twice (tier, then category)
--- is two facts, and a human changing their mind is itself signal. Rows are
--- append-only and ordered by `corrected_at`.
+-- NOT unique per message: correcting the same email twice is two facts, and a
+-- human changing their mind is itself signal. Append-only, ordered by
+-- `corrected_at`.
 CREATE TABLE IF NOT EXISTS triage_feedback (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -406,9 +341,9 @@ CREATE TABLE IF NOT EXISTS triage_feedback (
     from_value   TEXT,
     -- What the human says it should have been.
     to_value     TEXT NOT NULL,
-    -- JSON snapshot of the triage row as it was. See note 1 above.
+    -- JSON snapshot of the triage row as it was (note 1 above).
     original     TEXT NOT NULL,
-    -- See note 2 above.
+    -- Denormalized on purpose (note 2 above).
     sender       TEXT NOT NULL,
     subject      TEXT NOT NULL,
     -- Optional free-text from the human ("this is a receipt, not a bill").
@@ -418,12 +353,9 @@ CREATE TABLE IF NOT EXISTS triage_feedback (
 CREATE INDEX IF NOT EXISTS idx_triage_feedback_at
     ON triage_feedback(account_id, corrected_at);
 
--- Gmail sync cursor, keyed by a logical mailbox string. The Gmail REST engine
--- stores exactly one row keyed mailbox='history': uidvalidity is unused (0) and
--- last_uid holds the account's historyId (a u64 that fits in SQLite's i64
--- INTEGER). Column names are retained from the IMAP era to avoid a migration
--- (the schema applies fresh on open; dev dbs must be deleted to pick up shape
--- changes).
+-- Gmail sync cursor, keyed by a logical mailbox string. Exactly one row is
+-- stored, keyed mailbox='history': uidvalidity is unused (0) and last_uid holds
+-- the account's historyId (a u64 that fits SQLite's i64 INTEGER).
 CREATE TABLE IF NOT EXISTS sync_state (
     account_id  INTEGER NOT NULL,
     mailbox     TEXT NOT NULL,
@@ -432,14 +364,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
     PRIMARY KEY(account_id, mailbox)
 );
 
--- STAGE-2 BUDGET (circuit breaker). model_calls counts Anthropic API attempts
--- (incremented BEFORE the call, so retry storms can't exceed the cap). Two
--- accounting scopes share this one table, keyed by thread_id:
+-- STAGE-2 BUDGET (circuit breaker). model_calls counts API attempts, incremented
+-- BEFORE the call so retry storms cannot exceed the cap. Two scopes share the
+-- table, keyed by thread_id:
 --   * per-thread-per-day: thread_id = the message's real thread id.
---   * global-per-account-per-day: thread_id = the sentinel '__global__' (no
---     real Gmail thread can collide — Gmail thread ids are hex, never that
---     literal). This avoids a schema addition; both caps are checked before
---     each call. (Schema applies fresh; dev dbs get reset.)
+--   * global-per-account-per-day: thread_id = the sentinel '__global__', which
+--     no real Gmail thread id (hex) can collide with.
 CREATE TABLE IF NOT EXISTS wake_budget (
     account_id  INTEGER NOT NULL,
     thread_id   TEXT NOT NULL,
@@ -448,16 +378,12 @@ CREATE TABLE IF NOT EXISTS wake_budget (
     PRIMARY KEY(account_id, thread_id, day)
 );
 
--- LLM USAGE LEDGER. One row per (account, UTC day, category): running totals of
--- the Messages API usage each triage stage consumed. `category` is 'stage1',
--- 'stage2', or a specialist-extractor line such as 'extract_banking' — each is a
--- SEPARATE category the client renders independently (extractors run on the
--- stage-1 model but bill to their own line for cost visibility). `calls` counts
--- SUCCESSFUL classify responses that carried a
--- usage block; input/output tokens are summed from each response's usage. Read
--- by GET /client/stats + /client/usage to surface usage + an estimated cost
--- (cost is computed at read time from the config-driven per-MTok prices, so it
--- is NOT stored here). Schema applies fresh on open; dev dbs get reset.
+-- LLM USAGE LEDGER. One row per (account, UTC day, category): running API usage
+-- totals. `category` is 'stage1', 'stage2', or a specialist-extractor line such
+-- as 'extract_banking' — extractors run on the stage-1 model but bill to their
+-- own line so per-specialist cost stays visible. `calls` counts SUCCESSFUL
+-- classify responses that carried a usage block. Cost is NOT stored: the human
+-- door computes it at read time from config-driven per-MTok prices.
 CREATE TABLE IF NOT EXISTS stage2_usage (
     account_id    INTEGER NOT NULL,
     day           TEXT NOT NULL,
@@ -468,14 +394,11 @@ CREATE TABLE IF NOT EXISTS stage2_usage (
     PRIMARY KEY(account_id, day, category)
 );
 
--- RUNTIME APP SETTINGS. A tiny per-account key/value table for operator knobs a
--- client can change at runtime WITHOUT editing config.toml or restarting the
--- daemon. Currently holds the Stage-2 daily-cap overrides
--- (stage2_thread_daily_cap / stage2_sender_daily_cap / stage2_global_daily_cap),
--- set via the human door's POST /client/triage-config. Precedence at read time:
--- an app_settings OVERRIDE wins over the config/env value, which wins over the
--- built-in default. `value` is stored as TEXT (parsed by the reader). Schema
--- applies fresh on open; dev dbs get reset.
+-- RUNTIME APP SETTINGS. A per-account key/value table for knobs a client can
+-- change WITHOUT editing config.toml or restarting the daemon — the Stage-2
+-- daily-cap overrides and the shredder policy keys. Precedence at read time: an
+-- app_settings OVERRIDE beats config/env, which beats the built-in default.
+-- `value` is TEXT, parsed by the reader.
 CREATE TABLE IF NOT EXISTS app_settings (
     account_id INTEGER NOT NULL,
     key        TEXT NOT NULL,
@@ -483,23 +406,16 @@ CREATE TABLE IF NOT EXISTS app_settings (
     UNIQUE(account_id, key)
 );
 
--- EMAIL ATTACHMENTS. One row per attachment part extracted from a message's
--- full RFC822 at ingest — real attachments (Content-Disposition: attachment) AND
--- cid-inline parts (Content-Disposition: inline with a Content-ID, the way
--- templates embed logos). `data` holds the decoded bytes, or NULL when the part
--- exceeded the ingest cap (per-attachment 10 MB / per-message total 25 MB): the
--- metadata still lands so the client can show the row, but the bytes were not
--- stored (downloadable=false on the wire; the byte endpoint returns 410).
--- `size_bytes` is always the part's real decoded size, whether or not the bytes
--- were kept.
+-- EMAIL ATTACHMENTS. One row per attachment part extracted from a message's full
+-- RFC822 at ingest — real attachments AND cid-inline parts. `data` holds the
+-- decoded bytes, or NULL when the part exceeded the ingest cap (10 MB per
+-- attachment / 25 MB per message): the metadata still lands (downloadable=false
+-- on the wire, byte endpoint 410). `size_bytes` is always the real decoded size.
 --
--- SECURITY: attachments are STORED for sealed mail exactly like the body
--- (storage is fine; serving is guarded). The byte-serving path
--- (`attachment_bytes`) JOINs `triage` and requires sensitivity='normal', so a
--- sealed parent makes an attachment indistinguishable from a nonexistent one
--- (both 404). The thread view that lists attachment metadata already 404s any
--- thread containing a sealed message, so sealed attachment metadata never leaks
--- there either.
+-- SECURITY: attachments are STORED for sealed mail like the body, and guarded on
+-- serving — `attachment_bytes` requires the parent's sensitivity='normal', so a
+-- sealed parent is indistinguishable from a nonexistent id (both 404), and the
+-- metadata-listing thread view already 404s any sealed thread.
 CREATE TABLE IF NOT EXISTS attachments (
     id          INTEGER PRIMARY KEY,
     account_id  INTEGER NOT NULL,
@@ -515,36 +431,29 @@ CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(account_id, me
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
 
--- ON-BOX SEMANTIC RECALL (v1). A sqlite-vec `vec0` virtual table holding one
--- embedding per NON-SEALED message. The rowid is the local `messages.id`, so a
--- KNN hit joins straight back to `messages`. `account_id` is a vec0 METADATA
--- column so KNN queries can constrain by account in the WHERE clause (multi-
--- tenant scoping, same as every other owned table).
+-- ON-BOX SEMANTIC RECALL. A sqlite-vec `vec0` table holding one embedding per
+-- NON-SEALED message; the rowid is `messages.id`, so a KNN hit joins straight
+-- back. `account_id` is a vec0 METADATA column so KNN queries can constrain by
+-- account in the WHERE clause.
 --
--- SECURITY (structural exclusion, not filtering): SEALED MESSAGES ARE NEVER
--- INSERTED HERE. The embed-at-write path is gated on `sensitivity='normal'`, so
--- sealed content is absent from the vector space entirely — there is nothing to
--- leak into semantic search. `semantic_search` additionally re-joins `triage`
--- and re-excludes sealed rows (belt-and-suspenders).
+-- SECURITY: SEALED MESSAGES ARE NEVER INSERTED HERE — the embed-at-write path is
+-- gated on `sensitivity='normal'`, so sealed content is absent from the vector
+-- space entirely. `semantic_search` re-excludes sealed rows anyway.
 --
--- DIMENSION: float[384] matches the default BGE-small-en-v1.5 model. The store
--- asserts the configured embedder's dims == 384 at open time. Changing the model
--- dimension requires editing this literal AND resetting the dev db (schema
--- applies fresh — no migrations). The vec0 extension is statically linked and
--- registered via sqlite3_auto_extension before the connection opens.
+-- DIMENSION: float[384] matches BGE-small-en-v1.5, and the store asserts the
+-- configured embedder matches at attach time. Changing it means editing this
+-- literal AND resetting the dev db — there are no migrations for a vec0 table.
 CREATE VIRTUAL TABLE IF NOT EXISTS message_vecs USING vec0(
     message_id INTEGER PRIMARY KEY,
     embedding  FLOAT[384],
     account_id INTEGER
 );
 
--- Audit log for the HUMAN DOOR (squelch-api /client/*). Every sealed-body
--- reveal (and, later, every write action) appends a row here BEFORE returning.
--- This table is never read or written by MCP. Besides the human door, ONE
--- internal writer exists: the ingest receipt->bill auto-close appends a row
--- (actor='ingest', action='bill.auto_close') when a receipt resolves an open
--- bill, so that state change is always explainable to the user. account_id
--- scopes rows to an account like every other owned table.
+-- Audit log for the HUMAN DOOR (squelch-api /client/*). Every sealed-body reveal
+-- and every write action appends a row here BEFORE returning; MCP never reads or
+-- writes it. One internal writer also exists: the ingest receipt->bill
+-- auto-close (actor='ingest', action='bill.auto_close'), so that state change
+-- stays explainable.
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY,
     account_id INTEGER NOT NULL,
@@ -557,37 +466,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_account_ts ON audit_log(account_id, ts);
 
--- NOTIFICATION EVENT LOG. The single source of truth for "something worth
--- interrupting the user happened", written by the SYNC ENGINE at each triage
--- verdict (never by the store write methods themselves — only the engine knows
--- which path it is on, and only the engine knows the mail is fresh). Read by
--- per-platform delivery adapters, each tracking its OWN monotonic cursor:
--- `GET /client/events` SSE for the resident macOS app, an APNs pusher for iOS.
--- Per-channel cursors, deliberately NOT a global 'delivered' flag — a
--- single-consumer assumption is what would make the second client a refactor.
+-- NOTIFICATION EVENT LOG. The source of truth for "something worth interrupting
+-- the user happened", written by the SYNC ENGINE at each triage verdict — never
+-- by a store write method, because only the engine knows which sync path it is
+-- on and whether the mail is fresh. Delivery adapters each track their OWN
+-- monotonic cursor; there is deliberately no global 'delivered' flag, which
+-- would make the second client a refactor.
 --
--- Every column besides the ids is a DENORMALIZED SNAPSHOT at emission time so a
--- client can render the notification from this row alone (the iOS Notification
--- Service Extension fetches exactly one row by id after an opaque push and has
--- no second round-trip to spend). Nothing here is recomputed on read.
+-- Every column besides the ids is a DENORMALIZED SNAPSHOT at emission time, so a
+-- client can render the notification from this row alone (the iOS NSE fetches
+-- one row by id after an opaque push and has no second round-trip to spend).
 --
 -- ONE EVENT PER MESSAGE, EVER: UNIQUE(message_id) plus INSERT OR IGNORE at the
--- writer. That is what makes re-ingest (history overlap, catch-up re-scan of the
--- whole backfill window) and the Stage-1/Stage-2 refine passes idempotent — a
--- message that already notified can never notify twice, whatever later verdicts
--- say. The storm guard proper is the freshness window in the emission decision
--- (see `triage::events`); this key is the belt to its suspenders.
+-- writer, which is what makes re-ingest and the refine passes idempotent. The
+-- storm guard proper is the freshness window in `triage::events`.
 --
--- SECURITY: sealed mail is never represented here. The emission decision
--- requires sensitivity='normal', and sealed rows are structurally
--- noise-tier/importance-0 with no Stage-1 pass — two independent reasons. An OTP
--- on a lock screen would undo the entire seal design, so this is load-bearing.
--- A human sealing a message AFTER it notified is the third: `correct_triage`
--- REDACTS the row (sender/one_line/deadline blanked, everything structural
--- kept), because a snapshot taken pre-seal would otherwise be replayed to every
--- client cursor forever. It does NOT delete: `id` is the rowid, and deleting the
--- newest row would let the next insert reuse that id, which every durable cursor
--- (`apns_push_cursor`, each client's `after=`) would then skip forever.
+-- SECURITY: sealed mail is never represented here — the emission decision
+-- requires sensitivity='normal', and sealed rows carry no Stage-1 pass. An OTP
+-- on a lock screen would undo the entire seal design. A human sealing a message
+-- AFTER it notified makes `correct_triage` REDACT the row (sender/one_line/
+-- deadline blanked, structure kept). It does NOT delete: `id` is the rowid, and
+-- deleting the newest row would let the next insert reuse that id, which every
+-- durable cursor would then skip forever.
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,   -- monotonic; the clients' cursor
     account_id  INTEGER NOT NULL,
@@ -605,32 +505,28 @@ CREATE TABLE IF NOT EXISTS events (
 -- The read pattern is exactly "rows after my cursor, for my account".
 CREATE INDEX IF NOT EXISTS idx_events_account_id ON events(account_id, id);
 
--- REGISTERED PUSH DEVICES. One row per APNs device token the user's phone has
--- handed to THEIR OWN daemon over the human door (`POST /client/devices`). The
--- daemon's pusher task fans an event id out to every row here via the blind
--- relay; nothing else reads this table.
+-- REGISTERED PUSH DEVICES. One row per APNs device token the user's phone handed
+-- to their own daemon over the human door. Only the pusher task reads it.
 --
 -- `token` is UNIQUE and re-registration is an UPSERT, because iOS hands the app
--- its token on EVERY launch: registration has to be idempotent or a chatty app
--- would grow one row per cold start. `last_registered_at` is the liveness
--- signal that distinguishes "same device, still here" from a stale row.
+-- its token on EVERY launch and a chatty app would otherwise grow one row per
+-- cold start. `last_registered_at` is the liveness signal.
 --
 -- Rows die exactly two ways: the human door's DELETE, and APNs answering `410
--- Unregistered` for that token — the relay passes that status back verbatim
--- precisely so this daemon, and not shared infrastructure, owns the cleanup.
--- The relay is stateless and remembers no token.
+-- Unregistered` — the relay passes that status back verbatim precisely so this
+-- daemon, not shared infrastructure, owns the cleanup.
 --
--- PRIVACY: a device token is a capability, not a secret Apple protects, but it
--- is still the user's. It is never logged (the pusher logs row ids, or an
--- 8-char prefix at most) and never crosses the agent door.
+-- PRIVACY: a device token is the user's capability material. It is never logged
+-- (the pusher logs row ids, or an 8-char prefix at most) and never crosses the
+-- agent door.
 CREATE TABLE IF NOT EXISTS devices (
     id                 INTEGER PRIMARY KEY,
     account_id         INTEGER NOT NULL,
-    -- Hex APNs device token. UNIQUE across accounts: one physical device is one
-    -- row. Re-registering a token that belongs to ANOTHER account is REFUSED,
-    -- not rebound — the upsert's conflict update carries
-    -- `WHERE devices.account_id = excluded.account_id`, so registration can
-    -- never silently repoint an existing device's pushes.
+    -- Hex APNs device token, UNIQUE across accounts (one device, one row).
+    -- Re-registering another account's token is REFUSED, not rebound: the
+    -- upsert's conflict update carries
+    -- `WHERE devices.account_id = excluded.account_id`, so registration can never
+    -- silently repoint an existing device's pushes.
     token              TEXT NOT NULL UNIQUE,
     platform           TEXT NOT NULL DEFAULT 'ios',
     created_at         TEXT NOT NULL,

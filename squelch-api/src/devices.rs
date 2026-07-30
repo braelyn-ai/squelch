@@ -1,30 +1,9 @@
 //! Push-device registration on the human door: `POST /client/devices` and
-//! `POST /client/devices/unregister`.
+//! `POST /client/devices/unregister`. Human door only, no message content.
 //!
-//! This is where a phone tells ITS OWN daemon "here is my APNs token". The
-//! daemon's pusher task ([`squelch_core::push`]) later fans event ids out to
-//! every registered token through the blind relay. Nothing about this surface
-//! exists on the agent door, and no message content is involved at any point.
-//!
-//! REGISTRATION IS IDEMPOTENT because iOS hands an app its device token on every
-//! single launch. A re-register refreshes `last_registered_at` on the same row;
-//! it never forks a second one. See `Store::upsert_device`.
-//!
-//! The token bounds here (16-200 characters, hex only) deliberately MIRROR the
-//! relay's own validation. Storing a token the relay would reject just moves the
-//! failure from registration time — where a client can see it — to push time,
-//! where it is a silent per-token error in a log.
-//!
-//! PRIVACY: a device token is user-owned capability material. It is never logged
-//! here, and the success response deliberately does NOT echo it back — the
-//! caller already has it, and a body that carries it is one more place it can
-//! end up in a proxy log for no benefit at all.
-//!
-//! The same rule is why unregistering is a POST carrying the token in a BODY
-//! rather than `DELETE /client/devices/{token}`: a path segment is the most
-//! copied part of a request — access logs, proxy logs, error reports, metrics
-//! labels all keep it by default — and it would be incoherent to refuse the
-//! token in a response body while putting it in the request line.
+//! A device token is capability material: never logged, never echoed in a
+//! response, never in a URL path (hence unregister POSTs it in a body).
+//! Registration is IDEMPOTENT — iOS hands the app its token on every launch.
 
 use axum::{
     Json,
@@ -40,13 +19,13 @@ use crate::error::ApiError;
 use crate::handlers::blocking;
 use crate::state::ApiState;
 
-/// Mirrors `squelch-relay`'s own `TOKEN_MIN_LEN`/`TOKEN_MAX_LEN`. Loose around
-/// today's 64-hex-character APNs token so a format change needs no release.
+/// Must stay in step with the relay's own bounds: a token the relay would
+/// reject is refused here, where a client sees it, not silently at push time.
 const TOKEN_MIN_LEN: usize = 16;
 const TOKEN_MAX_LEN: usize = 200;
 
-/// A platform tag is a label, not free text; keep it short and boring so it can
-/// never become a smuggling channel into the `devices` table.
+/// A platform tag is a label, not free text — short and boring so it can never
+/// become a smuggling channel into the `devices` table.
 const MAX_PLATFORM_LEN: usize = 32;
 const DEFAULT_PLATFORM: &str = "ios";
 
@@ -59,15 +38,13 @@ pub struct RegisterBody {
     pub platform: Option<String>,
 }
 
-/// The unregister body. One field, and the reason it is a body at all is in the
-/// module header: capability material does not belong in a URL path.
+/// The unregister body — the token rides here, never in the path.
 #[derive(Debug, Deserialize)]
 pub struct UnregisterBody {
     pub token: String,
 }
 
-/// The registration result. NOTE THE ABSENT `token` FIELD — see the module
-/// header.
+/// The registration result. The `token` field is deliberately absent.
 #[derive(Debug, Serialize)]
 pub struct DeviceView {
     pub id: i64,
@@ -87,9 +64,8 @@ impl From<Device> for DeviceView {
     }
 }
 
-/// Bounds-check a device token exactly as the relay does. The error message
-/// states the RULE, never the offending value: reflecting a rejected token into
-/// a response body is how it ends up in someone's proxy log.
+/// Bounds-check a device token exactly as the relay does. The error states the
+/// RULE, never the offending value.
 fn validate_token(token: &str) -> Result<&str, ApiError> {
     let token = token.trim();
     if token.len() < TOKEN_MIN_LEN || token.len() > TOKEN_MAX_LEN {
@@ -122,10 +98,8 @@ fn validate_platform(platform: Option<&str>) -> Result<String, ApiError> {
 }
 
 /// `POST /client/devices` — register (or refresh) one APNs device token.
-///
-/// Idempotent: registering an already-known token returns the same row with a
-/// refreshed `last_registered_at`, which is what makes it safe for the app to
-/// call on every launch.
+/// Idempotent: a known token returns the same row with a refreshed
+/// `last_registered_at`, so the app can call it on every launch.
 pub async fn register_device(
     State(state): State<ApiState>,
     Json(body): Json<RegisterBody>,
@@ -137,8 +111,7 @@ pub async fn register_device(
     let account_id = state.account_id;
     let device = blocking(move || store.upsert_device(account_id, &token, &platform)).await?;
 
-    // Audited like every other human-door state change, with the device ROW ID
-    // as the target. The token itself never reaches the audit log.
+    // Audited with the device ROW ID; the token never reaches the audit log.
     crate::handlers::audit_action(
         &state,
         "device.register",
@@ -150,15 +123,11 @@ pub async fn register_device(
     Ok(Json(DeviceView::from(device)))
 }
 
-/// `POST /client/devices/unregister` — unregister a device.
+/// `POST /client/devices/unregister` — a POST-with-a-body, never
+/// `DELETE /client/devices/{token}`: the token is capability material.
 ///
-/// A POST-with-a-body, NOT `DELETE /client/devices/{token}`: the token is a
-/// capability, and a URL path is the one part of a request every intermediary
-/// records by default. See the module header.
-///
-/// 204 whether or not a row was there. The caller's intent ("this token must not
-/// receive pushes") is satisfied either way, and a 404 would turn the endpoint
-/// into an oracle for which tokens this account has registered.
+/// 204 whether or not a row was there; a 404 would turn the endpoint into an
+/// oracle for which tokens this account has registered.
 pub async fn unregister_device(
     State(state): State<ApiState>,
     Json(body): Json<UnregisterBody>,
@@ -183,8 +152,7 @@ mod tests {
     fn token_bounds_mirror_the_relays() {
         let ok = "a".repeat(64);
         assert_eq!(validate_token(&ok).unwrap(), ok);
-        // Whitespace is trimmed, not rejected — a client that pastes a token
-        // with a stray newline meant the token.
+        // Whitespace is trimmed, not rejected.
         assert_eq!(validate_token(&format!(" {ok}\n")).unwrap(), ok);
 
         assert!(validate_token(&"a".repeat(15)).is_err(), "too short");

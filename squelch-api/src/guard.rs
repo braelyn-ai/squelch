@@ -1,21 +1,16 @@
-//! Outbound secret guard for `POST /client/actions/send`.
+//! Outbound secret guard for `POST /client/actions/send`: scan the body for
+//! secret-looking patterns and block with a 422 unless the caller passes
+//! `override_guard: true`.
 //!
-//! Before any message leaves the process we scan the outgoing body for
-//! secret-looking patterns: API-key shapes, long hex/base64 runs, OTP-looking
-//! codes near auth words, and PEM headers. A non-empty match set blocks the send
-//! (HTTP 422) UNLESS the caller passes `override_guard: true`.
-//!
-//! SECURITY: the guard NEVER returns or logs the matched text — only the KIND of
-//! match (e.g. `"api_key"`). The whole point is to avoid a second copy of the
-//! secret anywhere, including our own error responses.
+//! SECURITY: only the KIND of match ever leaves the process — never the matched
+//! text, in a response, a log, or an audit row. See docs/SECURITY.md §5.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// A category of secret-looking match. Rendered as a stable snake_case string in
-/// the 422 response so the client can explain what tripped the guard without
-/// ever seeing the offending substring.
+/// A category of secret-looking match, rendered as a stable snake_case label so
+/// the client can explain the block without seeing the offending substring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardMatch {
     /// Vendor API-key prefixes: `sk-`, `AKIA` (AWS), `ghp_`/`gho_` (GitHub), etc.
@@ -43,12 +38,11 @@ impl GuardMatch {
     }
 }
 
-// Compiled once. Each is deliberately conservative-but-broad; false positives
-// are acceptable because the guard is overridable.
+// Compiled once. Deliberately broad: false positives are acceptable because the
+// guard is overridable.
 
-/// Vendor key prefixes. `sk-` (OpenAI/Stripe-ish), `AKIA` (AWS access key id),
-/// `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` (GitHub tokens), `xox[baprs]-` (Slack),
-/// `AIza` (Google), `ya29.` (Google OAuth).
+/// Vendor key prefixes: `sk-` (OpenAI/Stripe-ish), `AKIA` (AWS), `gh?_`
+/// (GitHub), `xox?-` (Slack), `AIza`/`ya29.` (Google).
 static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)
@@ -71,8 +65,8 @@ static RE_LONG_HEX: LazyLock<Regex> =
 static RE_LONG_B64: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b").expect("b64 regex"));
 
-/// A 6-8 digit code near an auth word within a small window on the same-ish
-/// context. Two orders: word-then-code and code-then-word.
+/// A 6-8 digit code within 40 non-digit characters of an auth word, either
+/// order.
 static RE_OTP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?xi)
@@ -103,8 +97,8 @@ pub fn scan(body: &str) -> Vec<GuardMatch> {
     if RE_OTP.is_match(body) {
         hits.push(GuardMatch::OtpCode);
     }
-    // Long-run checks last: an API key often also trips base64/hex, but the more
-    // specific kind is more useful. We still include them for defense in depth.
+    // Long-run checks last: an API key usually also trips base64/hex, and the
+    // more specific kind reads first.
     if RE_LONG_HEX.is_match(body) {
         hits.push(GuardMatch::LongHex);
     }
@@ -161,7 +155,6 @@ mod tests {
 
     #[test]
     fn bare_number_without_auth_word_is_not_otp() {
-        // A plain 6-digit number with no auth context should not trip OTP.
         assert!(!kinds("The invoice total was 128456 dollars last year").contains(&"otp_code"));
     }
 
@@ -185,7 +178,7 @@ mod tests {
 
     #[test]
     fn never_returns_matched_text() {
-        // The API contract: only kinds, never substrings. This test documents it.
+        // The contract: only kinds, never substrings.
         let secret = "sk-abcDEF0123456789ghijKLMNopq";
         let out = scan_kinds(&format!("key {secret}"));
         assert!(out.iter().all(|k| !k.contains(secret)));

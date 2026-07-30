@@ -1,9 +1,9 @@
 //! `squelchd` — the squelch daemon / CLI.
 //!
 //! - `auth`: run the OAuth consent flow and store tokens (keyring or file).
-//! - `run`: sync-only loop (back-compat), no HTTP.
-//! - `serve`: the unified process — sync loop plus one axum server hosting the
-//!   agent door (`/mcp`) and the human door (`/client/*`).
+//! - `run`: sync-only loop, no HTTP.
+//! - `serve`: sync loop plus one axum server hosting the agent door (`/mcp`) and
+//!   the human door (`/client/*`).
 
 use clap::{Args, Parser, Subcommand};
 use squelch_core::auth::{AuthFlowOptions, AuthScopes, DEFAULT_HEADLESS_PORT, run_auth_flow};
@@ -41,33 +41,26 @@ enum Command {
     /// Authorize a Gmail account and store tokens in the configured backend
     /// (OS keyring, or a mode-0600 JSON file on headless hosts).
     ///
-    /// Plain `auth` mints ONLY the READ credential (gmail.readonly) used by the
-    /// sync daemon. `auth --write` mints BOTH, as two back-to-back consent
-    /// flows: first the WRITE credential (gmail.modify + gmail.send) used only
-    /// by human-door action endpoints, then the READ credential. They remain two
-    /// tokens in two distinct slots — sync/triage never touch the write one.
-    /// Renewing them together is the point: renewing write alone left the sync
-    /// daemon failing on a stale read token.
+    /// Plain `auth` mints only the READ credential (gmail.readonly) used by
+    /// sync. `--write` mints WRITE (gmail.modify + gmail.send) and re-mints
+    /// READ, as two consent flows into two distinct slots so the pair cannot
+    /// drift; sync/triage never touch the write one.
     ///
-    /// HEADLESS: on a box with no browser/keyring, run
-    /// `squelchd auth [--write] --headless [--port N]`. It prints the consent
-    /// URL and binds a FIXED loopback port (default 8847). Forward it from your
-    /// laptop with `ssh -L 8847:127.0.0.1:8847 <host>`, then open the URL in
-    /// your local browser to complete consent. With `--write` the two flows run
-    /// sequentially on that same port, so one tunnel covers both.
+    /// HEADLESS: `--headless [--port N]` prints the consent URL and binds a
+    /// FIXED loopback port (default 8847) to forward with
+    /// `ssh -L 8847:127.0.0.1:8847 <host>`; both flows reuse that one port.
     Auth(AuthArgs),
-    /// Run the sync loop ONLY (back-compat). No HTTP doors are served.
+    /// Run the sync loop only. No HTTP doors are served.
     Run,
-    /// Run the UNIFIED daemon: the sync loop plus one HTTP server hosting both
-    /// the agent door (`/mcp`) and the human door (`/client/*`).
+    /// Run the sync loop plus one HTTP server hosting both the agent door
+    /// (`/mcp`) and the human door (`/client/*`).
     Serve(ServeArgs),
 }
 
 #[derive(Args)]
 struct ServeArgs {
-    /// Address to bind the unified HTTP server to (both doors). Defaults to the
-    /// loopback `127.0.0.1:8848`, overridable via `SQUELCH_BIND`. Keep it on
-    /// loopback and front it with a reverse proxy (`tailscale serve`).
+    /// Address to bind both doors to; defaults to `127.0.0.1:8848`, overridable
+    /// via `SQUELCH_BIND`. Keep it on loopback behind a reverse proxy.
     #[arg(long)]
     bind: Option<String>,
 }
@@ -75,15 +68,12 @@ struct ServeArgs {
 #[derive(Args)]
 struct AuthArgs {
     /// Mint the WRITE credential (gmail.modify + gmail.send) AND re-mint the
-    /// read-only credential, as two consent flows into two separate slots, so
-    /// the pair cannot drift. Without this flag only the read-only credential
-    /// is minted.
+    /// read-only one, as two consent flows into two separate slots.
     #[arg(long)]
     write: bool,
 
     /// Headless mode: do NOT auto-open a browser, and bind the loopback
-    /// listener to a FIXED port so it can be SSH-forwarded from your laptop
-    /// (`ssh -L <port>:127.0.0.1:<port> <host>`).
+    /// listener to a FIXED port so it can be SSH-forwarded.
     #[arg(long)]
     headless: bool,
 
@@ -103,8 +93,8 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, squelch_core::CoreError> {
         .map_err(|e| other_err(format!("tokio runtime: {e}")))
 }
 
-/// Load config plus the Stage-2 cap sources (`serve` reports "default" vs
-/// "config" on `/client/triage-config`; the other subcommands ignore them).
+/// Load config plus the Stage-2 cap sources, which `serve` reports as "default"
+/// vs "config" on `/client/triage-config`.
 fn load_config(cli: &Cli) -> (Config, Stage2CapSources) {
     match &cli.config {
         Some(path) => Config::load_from_with_cap_sources(path),
@@ -130,8 +120,8 @@ fn make_credential_store(
     }
 }
 
-/// Build the semantic-recall embedder. `None` (with one redacted stderr notice)
-/// if construction fails — search then degrades to keyword-only.
+/// Build the semantic-recall embedder. `None` on failure — search then degrades
+/// to keyword-only.
 fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
     match FastEmbedder::new(&config.embed.settings()) {
         Ok(e) => Some(Arc::new(e) as Arc<dyn Embedder>),
@@ -145,9 +135,9 @@ fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
     }
 }
 
-/// Mirror the loaded `.env` into config.toml so the other binaries and non-repo
-/// CWDs resolve the same account/paths. Env-only secrets (`SQUELCH_API_TOKEN`)
-/// are never written. Best-effort: failure warns, never fatal.
+/// Mirror the loaded `.env` into config.toml so other binaries and non-repo CWDs
+/// resolve the same account/paths. Env-only secrets (`SQUELCH_API_TOKEN`) are
+/// never written. Best-effort: failure warns, never fatal.
 fn mirror_env_to_config(env_path: &std::path::Path) {
     let Some(config_path) = Config::default_path() else {
         return;
@@ -195,8 +185,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Uppercase tag for the progress banners; `{kind:?}` reads too quietly when
-/// two consent flows run back to back.
+/// Uppercase tag for the progress banners.
 fn scope_word(scopes: AuthScopes) -> &'static str {
     match scopes {
         AuthScopes::Read => "READ",
@@ -204,11 +193,9 @@ fn scope_word(scopes: AuthScopes) -> &'static str {
     }
 }
 
-/// Which credentials one `auth` invocation mints, in order. `--write` also
-/// re-mints READ: renewing the action credential alone left the sync daemon
-/// failing on a stale read token, and two slots that drift are worse than one
-/// extra consent screen. Still two scope sets, two flows, two slots — the
-/// two-door split is never collapsed into a single merged token.
+/// Which credentials one `auth` invocation mints, in order. `--write` re-mints
+/// READ too so the pair cannot drift, but it stays two scope sets, two flows,
+/// two slots — the two-door split is never collapsed into one merged token.
 fn auth_plan(args: &AuthArgs) -> Vec<AuthScopes> {
     if args.write {
         vec![AuthScopes::Write, AuthScopes::Read]
@@ -246,7 +233,7 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
             scope_word(scopes)
         );
         // Strictly sequential: each flow's loopback listener is dropped before
-        // the next one binds, so headless can reuse the one fixed port.
+        // the next binds, so headless can reuse the one fixed port.
         if let Err(e) = mint_credential(&client, &email, backend, &creds_path, scopes, args) {
             if step > 1 {
                 eprintln!(
@@ -261,8 +248,8 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
     Ok(())
 }
 
-/// One consent flow, persisted into that kind's own slot. Each call mints a
-/// distinct token; scopes from different kinds never share a slot.
+/// One consent flow, persisted into that kind's own slot; scopes from different
+/// kinds never share a slot.
 fn mint_credential(
     client: &OAuthClientConfig,
     email: &str,
@@ -310,9 +297,7 @@ fn mint_credential(
     Ok(())
 }
 
-/// Sync-only loop with graceful Ctrl-C shutdown. v0 resolves exactly one
-/// account, but `account_id` threads through the engine so multi-tenant is a
-/// data change, not a rewrite.
+/// Sync-only loop with graceful Ctrl-C shutdown.
 fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
     // Fail fast on config problems before spinning up the runtime.
     let email = config.require_account_email()?;
@@ -322,7 +307,7 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
     let account_id = store.ensure_account(&email)?;
 
     // Attach the embedder to both the store (query-side) and the engine
-    // (write-side). `None` keeps everything working without vector recall.
+    // (write-side); `None` keeps everything working without vector recall.
     let embedder = build_embedder(&config);
     if let Some(e) = &embedder {
         store = store.with_embedder(e.clone())?;
@@ -370,10 +355,9 @@ fn resolve_bind(args: &ServeArgs) -> Result<SocketAddr, squelch_core::CoreError>
         .map_err(|e| other_err(format!("invalid bind address `{raw}`: {e}")))
 }
 
-/// The unified axum router hosting both doors: `/mcp` (agent door, read-only,
-/// sealed-absent) and `/client/*` (human door, bearer-authed, the only write
-/// capability). Both share the store; the agent door never sees the write
-/// credential.
+/// The router hosting both doors: `/mcp` (agent door, read-only, sealed-absent)
+/// and `/client/*` (human door, bearer-authed, the only write capability). They
+/// share the store; the agent door never sees the write credential.
 fn build_serve_router(
     store: Arc<SqliteStore>,
     account_email: &str,
@@ -385,9 +369,9 @@ fn build_serve_router(
     Ok(app)
 }
 
-/// The unified daemon: one runtime hosting the sync loop (READ credential
-/// only), both HTTP doors, the auth-mail shredder, and background embedder
-/// init. Ctrl-C cancels MCP sessions, stops axum, then flushes sync.
+/// One runtime hosting the sync loop (READ credential only), both HTTP doors,
+/// the auth-mail shredder, and background embedder init. Ctrl-C cancels MCP
+/// sessions, stops axum, then flushes sync.
 fn cmd_serve(
     config: Config,
     cap_sources: Stage2CapSources,
@@ -406,25 +390,20 @@ fn cmd_serve(
     let creds_path = config.resolve_credentials_path();
 
     // Manual-refresh signal: `POST /client/refresh` fires it, the poll loop
-    // wakes early. One handle, two clones (API + engine).
+    // wakes early.
     let refresh = Arc::new(tokio::sync::Notify::new());
 
-    // Notification wake channel. The store pokes it on every real `append_event`
-    // (sync engine side); every open `GET /client/events` stream subscribes
-    // (human-door side) and re-reads the table past its own cursor. The payload
-    // is only a hint, so the capacity just bounds how far a slow reader may fall
-    // behind before it takes the (harmless) Lagged path.
+    // Wake channel: the store pokes it on every real `append_event`, and each
+    // open `GET /client/events` stream re-reads the table past its own cursor.
+    // The payload is only a hint, so capacity just bounds how far a slow reader
+    // falls behind before taking the harmless Lagged path.
     let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
     store.attach_event_notifier(event_tx.clone())?;
 
-    // The APNs pusher is the SECOND reader of that same log (SSE is the first),
-    // carrying its own persisted cursor. `None` unless a relay is configured —
-    // absence of `SQUELCH_RELAY_URL` is the whole feature flag, so a daemon that
-    // was never told about a relay never constructs a client aimed at one.
-    // A relay that IS configured but whose client cannot be built is a
-    // misconfiguration, not "the feature is off": say so loudly and keep serving
-    // mail, rather than printing the disabled line at an operator who set
-    // SQUELCH_RELAY_URL and would then go hunting for a typo that isn't there.
+    // The APNs pusher is the second reader of that log, with its own persisted
+    // cursor. Absence of `SQUELCH_RELAY_URL` is the whole feature flag. A relay
+    // that IS configured but whose client won't build is a misconfiguration, not
+    // "the feature is off" — say so loudly and keep serving mail.
     let pusher = match squelch_core::push::Pusher::from_config(
         store.clone() as Arc<dyn squelch_core::store::Store>,
         account_id,
@@ -439,14 +418,12 @@ fn cmd_serve(
         }
     };
     // Subscribe BEFORE the sender is handed to the human door, so nothing
-    // appended during startup can be missed. (It would only cost latency — the
-    // table is the truth and the pusher re-reads past its own cursor — but a
-    // receiver that exists is free.)
+    // appended during startup is missed.
     let pusher_wake = event_tx.subscribe();
 
-    // The human door refuses to build without SQUELCH_API_TOKEN. Attaching the
-    // WRITE-bound credential store here enables the action endpoints — the sync
-    // engine below gets a separate Read-bound store and never sees this one.
+    // The human door refuses to build without SQUELCH_API_TOKEN. The WRITE-bound
+    // credential store attached here is what enables the action endpoints; the
+    // sync engine below gets a separate READ-bound store and never sees this one.
     let api_state = squelch_api::ApiState::from_env(store.clone(), &email)
         .map_err(|e| other_err(format!("{e}")))?
         .with_write_credentials(backend, email.clone(), creds_path.clone(), client.clone())
@@ -475,16 +452,13 @@ fn cmd_serve(
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mcp_cancel = CancellationToken::new();
 
-        // Hand the human door the same shutdown signal the sync loop gets. Open
-        // SSE streams are infinite by construction and `with_graceful_shutdown`
-        // waits for open connections, so without this one resident client would
-        // hold the daemon open forever.
+        // The human door needs the same shutdown signal: SSE streams are
+        // infinite and `with_graceful_shutdown` waits for open connections, so
+        // without this one resident client holds the daemon open forever.
         let api_state = api_state.with_shutdown(shutdown_rx.clone());
 
-        // The APNs pusher: the events log's second delivery adapter, reading past
-        // its OWN cursor and POSTing opaque pings to the blind relay. Spawned
-        // ONLY when a relay is configured; same shutdown watch as the sync loop,
-        // and awaited on the way out so it stops gracefully.
+        // POSTs opaque pings to the blind relay. Shares the sync loop's shutdown
+        // watch and is awaited on the way out so it stops gracefully.
         let pusher_handle = match pusher {
             Some(pusher) => {
                 eprintln!("squelchd: APNs pusher enabled (relay configured)");
@@ -494,8 +468,7 @@ fn cmd_serve(
                 ))
             }
             None => {
-                // One quiet line. The absence of SQUELCH_RELAY_URL is the normal
-                // case (iOS push is opt-in), so this is a detail, not a warning.
+                // The normal case — iOS push is opt-in — so a detail, not a warning.
                 eprintln!(
                     "squelchd: APNs pusher disabled (no SQUELCH_RELAY_URL / [pusher] relay_url)"
                 );
@@ -503,8 +476,8 @@ fn cmd_serve(
             }
         };
 
-        // The sync loop. No embedder override: it resolves the embedder from the
-        // shared store each tick, so it picks up the background-attached one.
+        // No embedder override: the loop resolves it from the shared store each
+        // tick, so it picks up the background-attached one.
         let sync_handle = {
             let store = store.clone();
             let email = email.clone();
@@ -520,14 +493,13 @@ fn cmd_serve(
             })
         };
 
-        // Auth-mail retention. Runs here because this process owns the write
+        // Auth-mail retention runs here because this process owns the write
         // credential (sync is bound to gmail.readonly by hard invariant). No-op
         // unless the shredder is enabled AND a write credential exists.
         {
             let shred_state = api_state.clone();
             tokio::spawn(async move {
-                // Stagger past the startup sync burst; retention is measured in
-                // days, so hourly is plenty.
+                // Stagger past the startup sync burst; retention is in days.
                 tokio::time::sleep(std::time::Duration::from_secs(120)).await;
                 loop {
                     match squelch_api::run_shred_pass(&shred_state).await {
@@ -542,7 +514,7 @@ fn cmd_serve(
         }
 
         // Bind BEFORE building the embedder: its first-run model download must
-        // not leave the doors unreachable (issue #16).
+        // not leave the doors unreachable.
         let app = build_serve_router(store.clone(), &email, api_state, mcp_cancel.clone())
             .map_err(squelch_core::CoreError::Other)?;
         let listener = tokio::net::TcpListener::bind(bind)
@@ -554,8 +526,8 @@ fn cmd_serve(
             "squelchd: serving agent door http://{bound}/mcp and human door http://{bound}/client/*"
         );
 
-        // Background embedder init: build off the async workers, attach to the
-        // shared store when ready. Search is keyword-only until then.
+        // Build off the async workers and attach to the shared store when ready;
+        // search is keyword-only until then.
         {
             let store = store.clone();
             let config = config.clone();
@@ -599,8 +571,8 @@ fn cmd_serve(
             .with_graceful_shutdown(shutdown_signal)
             .await;
 
-        // Ensure sync is told to stop even if the server exited for another
-        // reason, then wait for it to flush.
+        // Tell sync to stop even if the server exited for another reason, then
+        // wait for it to flush.
         let _ = shutdown_tx.send(true);
         match sync_handle.await {
             Ok(Ok(())) => {}
@@ -650,9 +622,9 @@ mod tests {
         }
     }
 
-    /// Plain `auth` mints READ only; `--write` mints WRITE then READ. Two plan
-    /// entries means two consent flows into two slots — the two-door split must
-    /// survive as separate kinds with non-overlapping scopes.
+    /// Plain `auth` mints READ only; `--write` mints WRITE then READ. The
+    /// two-door split must survive as separate kinds, separate slots, and
+    /// non-overlapping scopes.
     #[test]
     fn auth_plan_write_mints_both_credentials() {
         use squelch_core::credentials::CredentialKind;
@@ -728,8 +700,8 @@ mod tests {
         assert!(resolve_bind(&args).is_err());
     }
 
-    /// The unified router mounts both doors: `/client/stats` is bearer-gated
-    /// (401, not 404; 200 with the token) and `/mcp` exists (not 404).
+    /// Both doors are mounted: `/client/stats` is bearer-gated (401, not 404)
+    /// and `/mcp` exists.
     #[tokio::test]
     async fn router_mounts_both_doors() {
         use axum::body::Body;

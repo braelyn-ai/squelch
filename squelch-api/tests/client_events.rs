@@ -1,9 +1,7 @@
 //! Integration tests for the notification door: `GET /client/events` (SSE) and
-//! `GET /client/events/{id}`.
-//!
-//! The stream is INFINITE by design, so nothing here may collect a whole body:
-//! every read pulls frames with a timeout and asserts on what arrived (or, for
-//! the live-only case, on what deliberately did not).
+//! `GET /client/events/{id}`. The stream is INFINITE by design, so nothing here
+//! may collect a whole body — every read pulls frames with a timeout and
+//! asserts on what arrived, or on what deliberately did not.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,9 +32,8 @@ struct Harness {
 }
 
 impl Harness {
-    /// Append one event for the harness account and return its id. Goes through
-    /// the real store, so the attached notifier fires exactly as it does in the
-    /// daemon.
+    /// Append one event and return its id, through the real store so the
+    /// attached notifier fires exactly as it does in the daemon.
     fn emit(&self, message_id: i64) -> i64 {
         self.store.append_event(&event_for(self.acct, message_id)).unwrap().unwrap()
     }
@@ -56,9 +53,8 @@ fn event_for(account_id: i64, message_id: i64) -> NewEvent {
     }
 }
 
-/// The production wiring: one broadcast sender attached to BOTH the store (which
-/// pokes it on append) and the state (which the SSE handler subscribes to), plus
-/// a shutdown watch like the one squelchd hands the human door.
+/// The production wiring: one broadcast sender attached to BOTH the store and
+/// the state, plus the shutdown watch squelchd hands the human door.
 fn harness(seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let acct = store.ensure_account("me@example.com").unwrap();
@@ -99,8 +95,8 @@ impl Frame {
     }
 }
 
-/// Incremental SSE reader over a response body. Frames are read one at a time
-/// with a timeout; `to_bytes` would hang forever on a live feed.
+/// Incremental SSE reader: one frame at a time with a timeout, since `to_bytes`
+/// would hang forever on a live feed.
 struct Reader {
     body: Body,
     buf: String,
@@ -140,8 +136,8 @@ impl Reader {
         None
     }
 
-    /// Next frame within `wait`. `None` means the stream ended OR nothing showed
-    /// up in time — [`Reader::ended`] tells the two apart.
+    /// Next frame within `wait`. `None` means ended OR nothing arrived in time;
+    /// `ended` tells the two apart.
     async fn next_within(&mut self, wait: Duration) -> Option<Frame> {
         loop {
             if let Some(frame) = self.take_buffered() {
@@ -363,8 +359,8 @@ async fn replay_then_live_on_one_connection() {
 
 #[tokio::test]
 async fn live_works_off_a_store_attached_notifier_alone() {
-    // Half-wired embedder: the notifier is on the store but never reached the
-    // state. The handler falls back to the store's, so live still works.
+    // Half-wired: the notifier is on the store but never reached the state, so
+    // the handler falls back to the store's.
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let acct = store.ensure_account("me@example.com").unwrap();
     let (event_tx, _) = broadcast::channel::<i64>(16);
@@ -409,8 +405,8 @@ async fn no_notifier_at_all_still_replays_and_holds_the_connection() {
 
 #[tokio::test]
 async fn stream_ends_when_the_daemon_shuts_down() {
-    // Without this, axum's graceful shutdown would wait on an infinite body
-    // forever and squelchd could never exit with a client connected.
+    // Without this, graceful shutdown waits on an infinite body forever and
+    // squelchd can never exit with a client connected.
     let h = harness(|_, _| {});
     let seeded = h.emit(1);
 

@@ -1,18 +1,8 @@
-//! Thin dev binary for the human door.
-//!
-//! Opens the store, builds [`squelch_api::ApiState`] from the environment
-//! (refusing to start without `SQUELCH_API_TOKEN`), and serves the `/client/*`
-//! router on a loopback address by default. On a headless Linux box a reverse
-//! proxy (e.g. `tailscale serve`) is expected to front this listener; we never
-//! default to a non-loopback interface.
-//!
-//! Env:
-//! - `SQUELCH_API_TOKEN` (required): bearer token for every `/client/*` route.
-//! - `SQUELCH_DB_PATH` (optional): SQLite path. Defaults to the XDG data dir.
-//!   Legacy `SQUELCH_DB` is still accepted (deprecated).
-//! - `SQUELCH_ACCOUNT_EMAIL` (optional): account email. Defaults to
-//!   `me@localhost`. Legacy `SQUELCH_ACCOUNT` is still accepted (deprecated).
-//! - `SQUELCH_API_HTTP` (optional): bind address. Defaults to 127.0.0.1:8849.
+//! Thin dev binary for the human door: opens the store, builds
+//! [`squelch_api::ApiState`] from the environment (refusing to start without
+//! `SQUELCH_API_TOKEN`), and serves `/client/*` on loopback — never a
+//! non-loopback interface, a reverse proxy is expected to front it. Also reads
+//! `SQUELCH_DB_PATH`, `SQUELCH_ACCOUNT_EMAIL` and `SQUELCH_API_HTTP`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,14 +14,12 @@ use squelch_core::store::SqliteStore;
 /// Loopback default. A reverse proxy fronts this; never widen it silently.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8849";
 
-/// SQLite path via core config's single source of truth: canonical
-/// `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecated) > shared XDG default.
+/// Canonical `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` > shared XDG default.
 fn db_path() -> std::path::PathBuf {
     squelch_core::config::resolve_db_path()
 }
 
-/// Account email: canonical `SQUELCH_ACCOUNT_EMAIL` > legacy `SQUELCH_ACCOUNT`
-/// (deprecated) > default.
+/// Canonical `SQUELCH_ACCOUNT_EMAIL` > legacy `SQUELCH_ACCOUNT` > default.
 fn account_email() -> String {
     squelch_core::config::resolve_account_email("me@localhost")
 }
@@ -49,34 +37,24 @@ async fn main() -> anyhow::Result<()> {
     // Refuses to build (and thus serve) without SQUELCH_API_TOKEN.
     let mut state = ApiState::from_env(store.clone(), &email)?;
 
-    // Enable action endpoints ONLY when OAuth client credentials are configured.
-    // The write credential store is bound to CredentialKind::Write inside
-    // `with_write_credentials`; the sync/triage read path never touches it. If
-    // the OAuth client isn't configured, actions return 403 with a hint.
-    // Load config PLUS the config/env-layer Stage-2 cap sources so
-    // /client/triage-config can report "default" vs "config" per cap.
+    // Action endpoints are enabled ONLY when OAuth client credentials are
+    // configured; the store built below is bound to CredentialKind::Write and
+    // the sync/triage read path never touches it. Without it, actions 403.
     let (cfg, cap_sources) = Config::load_with_cap_sources();
-    // Wire the Stage-2 per-MTok prices so /client/stats reports cost against the
-    // configured model's pricing.
     state = state.with_stage2_prices(
         cfg.stage2.price_in_per_mtok,
         cfg.stage2.price_out_per_mtok,
     );
-    // Surface the configured model + provider label on /client/usage.
     state = state.with_stage2_model(
         cfg.stage2.model.clone(),
         cfg.stage2.stage2_provider.map(|p| p.as_str().to_string()),
     );
-    // Surface the configured Stage-2 daily caps + their sources on
-    // /client/triage-config.
     state = state.with_stage2_caps(
         cfg.stage2.thread_daily_cap,
         cfg.stage2.sender_daily_cap,
         cfg.stage2.global_daily_cap,
         cap_sources,
     );
-    // Surface the Stage-1 (small model) config on /client/triage-config +
-    // /client/usage.
     state = state.with_stage1_config(
         cfg.stage1.model.clone(),
         cfg.stage1.price_in_per_mtok,
@@ -100,11 +78,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // SSE plumbing. This bin runs no sync loop, so nothing in the process
-    // appends events — the notifier is wired anyway so the shape matches the
-    // daemon's, and the shutdown signal is NOT optional: an open
-    // `/client/events` stream would otherwise keep `with_graceful_shutdown`
-    // waiting forever on Ctrl-C.
+    // SSE plumbing. Nothing here appends events, but the shutdown signal is NOT
+    // optional: an open `/client/events` stream would keep
+    // `with_graceful_shutdown` waiting forever on Ctrl-C.
     let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
     store.attach_event_notifier(event_tx.clone())?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

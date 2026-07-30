@@ -1,9 +1,7 @@
-//! Error -> HTTP response mapping for the human door.
-//!
-//! Errors are turned into a small JSON body `{"error": "..."}`. Internal error
-//! detail is never leaked: `CoreError` variants other than `NotFound` /
-//! `InvalidInput` collapse to an opaque 500, and nothing sensitive (tokens,
-//! bodies) is ever placed in an error message.
+//! Error -> HTTP response mapping for the human door: errors become
+//! `{"error": "..."}`. Internal detail never leaks — every `CoreError` other
+//! than `NotFound`/`InvalidInput` collapses to an opaque 500, and no token or
+//! body ever reaches an error message.
 
 use axum::{
     Json,
@@ -50,8 +48,7 @@ impl From<CoreError> for ApiError {
         match e {
             CoreError::NotFound => ApiError::not_found(),
             CoreError::InvalidInput(m) => ApiError::bad_request(m),
-            // Everything else is opaque: never leak internal/store/credential
-            // detail across the wire.
+            // Opaque: never leak internal/store/credential detail across the wire.
             _ => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         }
     }

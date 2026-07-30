@@ -29,26 +29,23 @@ use crate::types::{
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// The embedding dimension declared by the `message_vecs` vec0 table
-/// (`FLOAT[384]`). The store asserts the configured embedder matches this at
-/// registration time; the schema literal and this constant must move together.
+/// (`FLOAT[384]`). The schema literal and this constant must move together;
+/// attaching an embedder asserts they match.
 pub const VEC_DIMS: usize = 384;
 
 static VEC_EXT_INIT: Once = Once::new();
 
-/// Register the statically-linked sqlite-vec (`vec0`) extension with SQLite's
-/// auto-extension hook so EVERY connection opened afterwards has the `vec0`
-/// virtual table available. This is a process-global, one-time registration
-/// (guarded by [`Once`]); it must run BEFORE the schema (which creates a
-/// `message_vecs USING vec0(...)` table) is applied.
+/// Register the statically-linked sqlite-vec (`vec0`) extension on SQLite's
+/// auto-extension hook, so every later connection has the virtual table. Runs
+/// once per process and MUST run before the schema, which creates
+/// `message_vecs USING vec0(...)`.
 fn register_vec_extension() {
     VEC_EXT_INIT.call_once(|| {
-        // SAFETY: `sqlite3_vec_init` is the C entrypoint the sqlite-vec crate
-        // statically links; transmuting it to the auto-extension fn pointer type
-        // is the documented rusqlite integration pattern.
+        // SAFETY: `sqlite3_vec_init` is the C entrypoint sqlite-vec statically
+        // links; transmuting it to the auto-extension fn pointer type is the
+        // documented rusqlite integration pattern, spelled out explicitly here
+        // for clippy::missing_transmute_annotations.
         unsafe {
-            // Explicit transmute annotation (clippy::missing_transmute_annotations):
-            // the source is the C init fn as a bare pointer, the target is the
-            // auto-extension entrypoint signature rusqlite expects.
             let init: unsafe extern "C" fn(
                 *mut rusqlite::ffi::sqlite3,
                 *mut *mut std::os::raw::c_char,
@@ -63,28 +60,19 @@ fn register_vec_extension() {
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
-    /// The on-box embedder used by [`SqliteStore::semantic_search`] /
-    /// [`SqliteStore::hybrid_search`] to embed the QUERY text, and available to
-    /// callers for embedding message bodies at ingest/backfill. `None` when
-    /// semantic recall is not wired (e.g. plain unit tests) — the vector methods
-    /// then return [`CoreError::InvalidInput`] and hybrid search degrades to
-    /// keyword-only. Set at construction via [`SqliteStore::with_embedder`], OR
-    /// SWAPPED IN LATER via [`SqliteStore::attach_embedder`] while the store is
-    /// already shared behind an `Arc` — that is what lets `squelchd serve` bind
-    /// the HTTP port immediately and attach the embedder in the background once
-    /// the model has finished downloading. `RwLock` keeps concurrent readers
-    /// (every search) cheap; the single background write is rare.
+    /// The on-box embedder: embeds query text for the vector searches and message
+    /// bodies for callers. `None` when semantic recall is not wired — the vector
+    /// methods then return [`CoreError::InvalidInput`] and hybrid search degrades
+    /// to keyword-only. `RwLock` because it can be attached LATE, while the store
+    /// is already shared behind an `Arc`.
     embedder: RwLock<Option<std::sync::Arc<dyn crate::embed::Embedder>>>,
-    /// In-process wake signal for newly-appended `events` rows: every successful
-    /// [`Store::append_event`] best-effort sends the new id here. `None` until a
-    /// consumer attaches one via [`SqliteStore::attach_event_notifier`] — the
-    /// same runtime-attach shape as `embedder`, for the same reason (the store is
-    /// already behind an `Arc` by the time the SSE endpoint exists).
+    /// In-process wake signal for newly-appended `events` rows, attachable late
+    /// like `embedder`.
     ///
-    /// THE PAYLOAD IS ONLY A HINT. The `events` TABLE is the source of truth: a
-    /// reader wakes on any id and then re-reads every row past its own cursor, so
-    /// a lagged, dropped, or entirely missed broadcast message costs nothing but
-    /// latency. That is why send errors here are ignored.
+    /// THE PAYLOAD IS ONLY A HINT — the `events` TABLE is the source of truth. A
+    /// reader wakes on any id and re-reads every row past its own cursor, so a
+    /// lagged or missed broadcast costs only latency, which is why send errors
+    /// are ignored.
     event_tx: RwLock<Option<tokio::sync::broadcast::Sender<i64>>>,
 }
 
@@ -105,10 +93,9 @@ impl SqliteStore {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
-        // SCHEMA is all `CREATE TABLE IF NOT EXISTS`, so a pre-existing DB keeps
-        // its old `messages` shape and never picks up freshly-added columns from
-        // the CREATE. Run the additive column migrations so existing installs
-        // upgrade cleanly (new tables/indexes are covered by IF NOT EXISTS).
+        // SCHEMA is all `CREATE TABLE IF NOT EXISTS`, so a pre-existing DB never
+        // picks up freshly-added columns from the CREATE — `migrate` adds them.
+        // New tables/indexes need no migration (IF NOT EXISTS covers them).
         migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -118,9 +105,8 @@ impl SqliteStore {
     }
 
     /// Attach an [`Embedder`](crate::embed::Embedder) so the semantic-recall
-    /// methods work. Asserts the embedder's dimensionality matches the
-    /// `message_vecs` vec0 table ([`VEC_DIMS`]); a mismatch is a config/schema
-    /// error that would silently corrupt the index, so it fails loudly here.
+    /// methods work. Fails loudly on a dimensionality mismatch with [`VEC_DIMS`],
+    /// which would otherwise silently corrupt the index.
     pub fn with_embedder(
         self,
         embedder: std::sync::Arc<dyn crate::embed::Embedder>,
@@ -129,13 +115,10 @@ impl SqliteStore {
         Ok(self)
     }
 
-    /// Swap in (or replace) the embedder while the store may ALREADY be shared
-    /// behind an `Arc` (`&self`, not `self`). This is the hook `squelchd serve`
-    /// uses to attach the embedder in the BACKGROUND after binding the HTTP port:
-    /// search runs keyword-only until this fires, then upgrades to hybrid/semantic
-    /// live. Asserts the dimensionality matches [`VEC_DIMS`] (a mismatch would
-    /// silently corrupt the index, so it fails loudly). Returns the previous
-    /// embedder, if any.
+    /// Swap in the embedder while the store may ALREADY be shared behind an `Arc`
+    /// (`&self`): `squelchd serve` binds its HTTP port first and attaches in the
+    /// background, so search runs keyword-only until this fires. Fails loudly on
+    /// a [`VEC_DIMS`] mismatch. Returns the previous embedder.
     pub fn attach_embedder(
         &self,
         embedder: std::sync::Arc<dyn crate::embed::Embedder>,
@@ -153,9 +136,7 @@ impl SqliteStore {
         Ok(guard.replace(embedder))
     }
 
-    /// The attached embedder, if any. Used by the sync engine to embed message
-    /// bodies at ingest/backfill without holding a second handle, and by the
-    /// vector-search paths to embed the query text. Cheap clone of the `Arc`.
+    /// The attached embedder, if any — a cheap `Arc` clone.
     pub fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
         self.embedder
             .read()
@@ -163,16 +144,12 @@ impl SqliteStore {
             .and_then(|g| g.clone())
     }
 
-    /// Attach (or replace) the in-process broadcast every successful
-    /// [`Store::append_event`] pokes with the new event id, while the store may
-    /// ALREADY be shared behind an `Arc` (`&self`, not `self`) — the same
-    /// runtime-attach hook as [`SqliteStore::attach_embedder`], for the same
-    /// reason: the SSE endpoint is wired up after the store exists. Returns the
-    /// previous sender, if any.
+    /// Attach the in-process broadcast that every successful
+    /// [`Store::append_event`] pokes with the new event id, late-attachable like
+    /// [`SqliteStore::attach_embedder`]. Returns the previous sender.
     ///
-    /// Attaching one is OPTIONAL and changes no persisted behavior: the `events`
-    /// table is the source of truth and readers re-read past their own cursor on
-    /// every wake, so a consumer that never attaches simply polls instead.
+    /// OPTIONAL and persists nothing: the `events` table is the source of truth,
+    /// so a consumer that never attaches simply polls instead.
     pub fn attach_event_notifier(
         &self,
         tx: tokio::sync::broadcast::Sender<i64>,
@@ -214,10 +191,8 @@ impl SqliteStore {
     /// HUMAN-DOOR ACTION SUPPORT (squelch-api only): resolve a local message id
     /// to the Gmail ids + headers an action needs (archive/label/send).
     ///
-    /// SECURITY: this INTENTIONALLY excludes `sensitivity = 'sealed'` rows in
-    /// SQL, so an action can never target a sealed message (NotFound is returned
-    /// for a missing OR sealed message, keeping the two indistinguishable). It is
-    /// read-only and is never called by sync/triage/MCP. It does not touch bodies.
+    /// SECURITY: excludes `sensitivity = 'sealed'` in SQL, so an action can never
+    /// target sealed mail — missing and sealed both return NotFound.
     pub fn action_message_ref(
         &self,
         account_id: AccountId,
@@ -272,10 +247,9 @@ impl SqliteStore {
         deadline: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let conn = self.lock()?;
-        // TEST HELPER: rows created here are treated as Stage-1-finished and
-        // escalated (`stage1_model_used='rule'`, `needs_stage2=1`) so they land in
-        // the Stage-2 queue exactly as the old `model_used IS NULL` rows did —
-        // this is the migration of the pre-two-stage queue semantics.
+        // Rows created here are treated as Stage-1-finished and escalated
+        // (`stage1_model_used='rule'`, `needs_stage2=1`) so they land in the
+        // Stage-2 queue.
         conn.execute(
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
                  sealed_kind, one_line, reason, deadline,
@@ -321,10 +295,9 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Test/local helper: insert a single attachment row directly, returning its
-    /// id. Real attachments are written by the ingest pipeline
-    /// ([`Store::ingest_message`]); this lets tests seed the byte-serving endpoint
-    /// (including an over-cap, `data == None` row) without a full RFC822 fixture.
+    /// Test/local helper: insert one attachment row directly (real ones come from
+    /// [`Store::ingest_message`]), so tests can seed the byte-serving endpoint —
+    /// including an over-cap `data == None` row — without an RFC822 fixture.
     pub fn insert_attachment(
         &self,
         account_id: AccountId,
@@ -343,26 +316,20 @@ impl SqliteStore {
         Ok(conn.last_insert_rowid())
     }
 
-    // =====================================================================
-    // ON-BOX SEMANTIC RECALL (v1). Inherent methods (not on the `Store`
-    // trait) because they depend on the attached [`Embedder`] and the
-    // sqlite-vec `message_vecs` table, which not every `Store` impl carries.
+    // ON-BOX SEMANTIC RECALL. Inherent methods rather than `Store` ones because
+    // they need the attached [`Embedder`] and the sqlite-vec `message_vecs`
+    // table, which not every `Store` impl carries.
     //
-    // SECURITY: SEALED MESSAGES ARE NEVER EMBEDDED. Vector inserts here are
-    // callable for any id, but the ONLY caller (the sync ingest/backfill path)
-    // gates on `sensitivity='normal'`, and [`messages_missing_vectors`] selects
-    // ONLY normal rows, so sealed text is structurally absent from the vector
-    // space. Query-time methods additionally re-exclude sealed rows in SQL.
-    // =====================================================================
+    // SECURITY: SEALED MESSAGES ARE NEVER EMBEDDED — the write callers gate on
+    // `sensitivity='normal'`, so sealed text is structurally absent from the
+    // vector space; query-time methods re-exclude sealed rows anyway.
 
-    /// SEMANTIC RECALL. Embed `query_text` with the attached embedder and return
-    /// the `k` nearest messages as `(message_id, distance)` (smaller distance =
-    /// closer), scoped to `account_id`.
+    /// SEMANTIC RECALL: embed `query_text` and return the `k` nearest messages as
+    /// `(message_id, distance)`, smaller = closer, scoped to `account_id`.
     ///
-    /// SECURITY: the KNN hit set is JOINed back to `triage` and sealed rows are
-    /// re-excluded in SQL (belt: vectors were never written for sealed mail;
-    /// suspenders: this join re-checks). BOTH `is_sent` values are INCLUDED —
-    /// recall wants the user's own sent mail ("did I say I'd send X").
+    /// SECURITY: the KNN hit set is re-joined to `triage` to drop sealed rows
+    /// (they should never be indexed at all). BOTH `is_sent` values are INCLUDED
+    /// — recall wants the user's own sent mail ("did I say I'd send X").
     pub fn semantic_search(
         &self,
         account_id: AccountId,
@@ -393,9 +360,8 @@ impl SqliteStore {
         }
         let conn = self.lock()?;
         // vec0 KNN: MATCH the embedding, constrain by the account_id metadata
-        // column, and cap with `k = ?`. We over-fetch (k rows from the index)
-        // then re-join triage to drop any sealed row defensively; sealed rows
-        // should never be in the index, so this rarely trims anything.
+        // column, cap with `k = ?`, then re-join triage to drop any sealed row
+        // that should never have been indexed in the first place.
         let mut stmt = conn.prepare(
             "SELECT v.message_id, v.distance
              FROM message_vecs v
@@ -419,14 +385,11 @@ impl SqliteStore {
     }
 
     /// HYBRID RECALL: merge FTS5 keyword rank and vector distance with Reciprocal
-    /// Rank Fusion (RRF). Each candidate's score is `sum(1 / (rrf_k + rank))`
-    /// across the two lists it appears in; results are returned best-first as
-    /// [`SearchHit`]s. `rrf_k` is the standard smoothing constant (60). Both
-    /// lists exclude sealed rows; both `is_sent` values are INCLUDED (recall).
-    ///
-    /// This is the cheap "belt-and-suspenders" retrieval: keyword catches exact
-    /// tokens, vectors catch paraphrase. Falls back to whichever list is
-    /// available (e.g. FTS-only if the query embeds empty).
+    /// Rank Fusion — each candidate scores `sum(1 / (rrf_k + rank))` across the
+    /// lists it appears in, `rrf_k` being the standard smoothing constant (60).
+    /// Keyword catches exact tokens, vectors catch paraphrase, and either list
+    /// alone still produces results. Both exclude sealed rows and include sent
+    /// mail (recall).
     pub fn hybrid_search(
         &self,
         account_id: AccountId,
@@ -435,9 +398,7 @@ impl SqliteStore {
     ) -> Result<Vec<SearchHit>> {
         const RRF_K: f32 = 60.0;
 
-        // Vector ranks (if an embedder is attached; degrade gracefully to
-        // keyword-only if not — e.g. before the background embedder attaches under
-        // `squelchd serve`).
+        // No embedder (e.g. before the background attach) => keyword-only.
         let vec_hits: Vec<(i64, f32)> = match self.embedder() {
             Some(embedder) => {
                 let qvec = embedder.embed(query_text)?;
@@ -446,11 +407,9 @@ impl SqliteStore {
             None => Vec::new(),
         };
 
-        // FTS ranks over the SAME query text. `fts_recall` mirrors `search` but
-        // INCLUDES sent mail (recall) and returns bare ids in rank order.
+        // FTS ranks over the SAME query text, sent mail included.
         let fts_ids = self.fts_recall_ids(account_id, query_text, k)?;
 
-        // Fuse: accumulate RRF score per message id.
         use std::collections::HashMap;
         let mut score: HashMap<i64, f32> = HashMap::new();
         for (rank, (id, _dist)) in vec_hits.iter().enumerate() {
@@ -464,7 +423,6 @@ impl SqliteStore {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         ranked.truncate(k);
 
-        // Hydrate the winners into SearchHits in fused order.
         let mut out = Vec::with_capacity(ranked.len());
         for (id, _s) in ranked {
             if let Some(hit) = self.search_hit_by_id(account_id, id)? {
@@ -474,12 +432,9 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// SEMANTIC-ONLY recall as hydrated [`SearchHit`]s (vector KNN, no keyword
-    /// leg), best-first by distance. Used by the human door's
-    /// `mode=semantic` search. Requires an attached embedder; returns an empty
-    /// list when none is attached (nothing to embed against). Sealed rows are
-    /// excluded in SQL by [`knn_by_vector`] and re-checked by
-    /// [`search_hit_by_id`]; both `is_sent` values are included (recall).
+    /// SEMANTIC-ONLY recall as hydrated [`SearchHit`]s, best-first by distance,
+    /// for the human door's `mode=semantic` search. Empty without an attached
+    /// embedder. Sealed rows are excluded in SQL; sent mail is included (recall).
     pub fn semantic_search_hits(
         &self,
         account_id: AccountId,
@@ -496,11 +451,10 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// FTS5 recall helper for [`hybrid_search`]: keyword search returning bare
-    /// message ids in rank order. Unlike [`Store::search`] this INCLUDES sent
-    /// mail (`is_sent` not constrained) because recall wants the user's own
-    /// outbound mail. Sealed rows are excluded in SQL. A malformed FTS query
-    /// yields an empty list rather than an error (recall degrades to vectors).
+    /// FTS5 recall helper for [`hybrid_search`]: message ids in rank order.
+    /// Unlike [`Store::search`] it INCLUDES sent mail, because recall wants the
+    /// user's own outbound mail. Sealed rows are excluded in SQL, and a malformed
+    /// FTS query yields an empty list rather than an error.
     fn fts_recall_ids(&self, account_id: AccountId, query: &str, limit: usize) -> Result<Vec<i64>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -574,17 +528,13 @@ impl SqliteStore {
 }
 
 
-/// Add `column` (`decl` = its type + constraints) to `table` if the table does
-/// not already have it. Idempotent: the codebase has no schema-version counter,
-/// so we detect the existing columns via `PRAGMA table_info` and only `ALTER
-/// TABLE ADD COLUMN` when the column is genuinely missing. This upgrades
-/// pre-existing installs (whose `CREATE TABLE IF NOT EXISTS` left the old shape
-/// in place) without disturbing fresh DBs that already carry the column.
+/// Add `column` (`decl` = type + constraints) to `table` unless it is already
+/// there. There is no schema-version counter, so presence is detected via
+/// `PRAGMA table_info`, which keeps this idempotent across opens.
 ///
-/// Returns `true` iff the column was actually added this call (i.e. the DB was a
-/// pre-existing install missing it). Callers use that to run a ONE-TIME backfill
-/// only on the open that first introduces the column — never on fresh DBs (where
-/// `schema.sql` already carries it) and never on subsequent opens.
+/// Returns `true` ONLY on the call that actually adds the column, which is what
+/// lets a caller run a one-time backfill on the open that introduces it — never
+/// on a fresh DB (schema.sql already carries it) and never again after.
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -602,10 +552,8 @@ fn add_column_if_missing(
             break;
         }
     }
-    // An empty `table_info` means the table does not exist yet (every real table
-    // has >= 1 column). The real open path applies `schema.sql` before `migrate`,
-    // so the table is always present there; skipping when absent just keeps this
-    // seam robust to partial schemas (and independent per-table in tests).
+    // An empty `table_info` means the table does not exist yet; skipping then
+    // keeps this seam per-table independent for tests that build partial schemas.
     if any && !present {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
         return Ok(true);
@@ -617,7 +565,6 @@ fn add_column_if_missing(
 /// indexes are handled by `CREATE ... IF NOT EXISTS` in `schema.sql`; only new
 /// COLUMNS on an existing table need this seam.
 fn migrate(conn: &Connection) -> Result<()> {
-    // Unsubscribe capture (added with the unsubscribe feature).
     add_column_if_missing(conn, "messages", "list_unsubscribe", "TEXT")?;
     add_column_if_missing(
         conn,
@@ -628,27 +575,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Per-property triage reasons (JSON object). NULL on pre-existing rows.
     add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
 
-    // Two-stage triage split markers. `stage1_model_used` gates the Stage-1 LLM
-    // queue (NULL == still needs Stage-1); `needs_stage2` is the escalation flag.
-    // A pre-existing `triage` table predates BOTH, so the first INSERT/queue SQL
-    // that names them would fail with "no such column" until they are added.
+    // Two-stage triage markers: `stage1_model_used` gates the Stage-1 LLM queue
+    // (NULL == still needs Stage-1), `needs_stage2` is the escalation flag.
     let added_stage1 = add_column_if_missing(conn, "triage", "stage1_model_used", "TEXT")?;
     add_column_if_missing(conn, "triage", "needs_stage2", "INTEGER NOT NULL DEFAULT 0")?;
 
-    // CATEGORIZE-THEN-EXTRACT markers. `category` is the LLM's coarse route
-    // (NULL == pre-feature / heuristic-only row, never categorized);
-    // `extractor_model_used` gates the specialist-extractor queue (NULL == not
-    // yet extracted). A pre-existing `triage` table predates both, so the queue /
-    // apply SQL that names them would fail with "no such column" until added. No
-    // backfill is needed: NULL is the correct resting value (no category => never
-    // queued for extraction), so historical rows simply never re-run an extractor.
-    // stage2_usage grew a `category` column INSIDE ITS PRIMARY KEY (per-stage /
-    // per-extractor ledger lines). ALTER ADD COLUMN cannot change a PK, and the
-    // bump upsert's ON CONFLICT(account_id, day, category) needs that exact
-    // unique index — so an old table must be REBUILT (rename, create per
-    // schema.sql, copy with category='stage2', drop). Without this every ledger
-    // bump on a pre-existing DB fails ("no column named category") and LLM
-    // spend goes unrecorded.
+    // stage2_usage grew `category` INSIDE ITS PRIMARY KEY. ALTER ADD COLUMN
+    // cannot change a PK, and the bump upsert's ON CONFLICT(account_id, day,
+    // category) needs that exact unique index, so an old table must be REBUILT —
+    // otherwise every ledger bump fails and LLM spend goes unrecorded.
     let usage_has_category: bool = {
         let mut stmt = conn.prepare("PRAGMA table_info(stage2_usage)")?;
         let cols = stmt
@@ -675,28 +610,21 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // CATEGORIZE-THEN-EXTRACT markers. NULL is the correct resting value for
+    // both (no category => never queued for extraction), so no backfill.
     add_column_if_missing(conn, "triage", "category", "TEXT")?;
     add_column_if_missing(conn, "triage", "extractor_model_used", "TEXT")?;
 
-    // BACKFILL (runs ONCE, the open that first introduces `stage1_model_used`).
-    // The column add leaves `stage1_model_used = NULL` on EVERY historical row —
-    // which is exactly the Stage-1 LLM queue predicate — so without this the whole
-    // mailbox history would re-classify through the (paid) Stage-1 model. Mark
-    // every row the OLD single-stage pipeline already classified (`model_used`
-    // set) OR that the user has already seen/acted on (`status != 'new'`) as
-    // 'migrated' so it stays OUT of the Stage-1 queue.
+    // Adding `stage1_model_used` leaves it NULL on every historical row — exactly
+    // the Stage-1 queue predicate — so without this backfill the whole mailbox
+    // re-classifies through the paid model. Rows already classified or already
+    // seen are marked 'migrated' to stay out of the queue; the residual
+    // (`status='new' AND model_used IS NULL`) correctly does re-enter Stage-1,
+    // whose apply recomputes `needs_stage2` from model confidence.
     //
-    // The residual set — `status='new' AND model_used IS NULL` — keeps
-    // `stage1_model_used = NULL` and DOES re-enter Stage-1. That is correct: these
-    // are genuinely-unprocessed recent rows that were awaiting the OLD stage-2
-    // anyway. Their `needs_stage2` stays at the column-add default (0); Stage-1's
-    // apply recomputes it from model confidence when the row is classified, so the
-    // default is merely the pre-Stage-1 resting value, not a lost escalation.
-    //
-    // Guarded by `added_stage1` so it fires exactly once at introduction — NOT on
-    // fresh DBs (schema.sql already carries the column) and NOT on later opens
-    // (which would wrongly 'migrate' rows legitimately queued for Stage-1 that a
-    // read door had promoted past 'new').
+    // Guarded by `added_stage1` so it fires exactly once, at introduction: a
+    // later run would wrongly 'migrate' rows legitimately queued for Stage-1 that
+    // a read door had promoted past 'new'.
     if added_stage1 {
         conn.execute(
             "UPDATE triage SET stage1_model_used = 'migrated'
@@ -706,8 +634,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // ONE-SHOT CLEANUP (2026-07-23, the "54 weeks past due" year-slip bug):
-    // guarded on table existence — migration unit tests build partial schemas.
+    // Guarded on table existence — migration unit tests build partial schemas.
     let cleanup_tables_exist: bool = {
         let mut stmt = conn.prepare(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
@@ -719,16 +646,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !cleanup_tables_exist {
         return Ok(());
     }
-    //
-    // model-sourced deadlines whose date is far before the message's own
-    // receipt are hallucinated years ("July 24" emitted as LAST year's date —
-    // 364 days past slipped through the old 365-day sanity bound). The bound is
-    // now 45 days at apply time; retro-clean rows the old bound let through:
-    // null the bad deadline (the mail stays surfaced, just dateless), demote a
-    // stranded past_due tier to deadline, and drop the matching deadlines rows.
+    // A model-sourced deadline more than 45 days BEFORE its own message's
+    // receipt is a hallucinated year, so clear it (the mail stays surfaced, just
+    // dateless), demote a stranded past_due tier, and drop the deadlines row.
     // Deterministic parses (source not stage1/stage2) are untouched — explicit
-    // year text in an email is data. Idempotent by construction (the predicate
-    // can't re-match once cleared).
+    // year text in an email is data. Idempotent: the predicate cannot re-match
+    // once cleared.
     conn.execute(
         "UPDATE triage SET deadline = NULL,
                 tier = CASE WHEN tier = 'past_due' THEN 'deadline' ELSE tier END
@@ -755,12 +678,10 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 /// Apply the unsubscribe VIOLATION bump for a just-stored inbound message, in
-/// the caller's transaction. Contract: for a NON-SENT message, if an
-/// `unsubscribes` row exists for `(account_id, lower(from_addr))` with
-/// `resolution IS NULL` and the message's `received_at` is more than 72h after
-/// the request, increment `violation_count` and set `last_violation_at` to that
-/// `received_at`. A no-match (no row / already resolved / still within grace)
-/// is a silent no-op.
+/// the caller's transaction: an unresolved `unsubscribes` row for
+/// `(account_id, lower(from_addr))` whose request is more than 72h older than
+/// this `received_at` gets `violation_count + 1` and `last_violation_at`. No
+/// row, already resolved, or still within grace is a silent no-op.
 fn bump_unsub_violation_conn(
     conn: &Connection,
     account_id: AccountId,
@@ -771,8 +692,8 @@ fn bump_unsub_violation_conn(
     if sender.is_empty() {
         return Ok(());
     }
-    // Read the outstanding request (if any) to run the grace comparison in Rust
-    // against real timestamps rather than lexical string math.
+    // Read the outstanding request so the grace comparison runs on real
+    // timestamps in Rust rather than as lexical string math in SQL.
     let row: Option<String> = conn
         .query_row(
             "SELECT requested_at FROM unsubscribes
@@ -841,17 +762,14 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
         params![id, msg.subject, msg.body],
     )?;
 
-    // NOTE: contacts are NOT seeded here. Sent mail's From header is the user's
-    // OWN address, so seeding from it produced exactly one bogus self-contact.
-    // Contacts are instead seeded from the To/Cc recipients of Sent mail in
-    // `ingest_message` (which carries the pre-filtered recipient list).
+    // Contacts are NOT seeded here: Sent mail's From header is the user's own
+    // address. They come from the To/Cc recipients in `ingest_message`.
     Ok(id)
 }
 
-/// Seed the contacts table from the recipients of a Sent message. Each recipient
-/// increments its `sent_count`. Addresses are already de-duplicated and stripped
-/// of the account's own address at ingest, so no self-guard is needed here — but
-/// we defensively skip empties. Received mail passes an empty list (no-op).
+/// Seed the contacts table from a Sent message's recipients, each bumping its
+/// `sent_count`. Addresses arrive de-duplicated and stripped of the account's own
+/// address, so only empties are skipped. Received mail passes an empty list.
 fn seed_contacts_conn(
     conn: &Connection,
     account_id: AccountId,
@@ -872,14 +790,11 @@ fn seed_contacts_conn(
     Ok(())
 }
 
-/// Upsert a shipment against an explicit connection/transaction handle, keyed by
-/// `(account_id, tracking_number)`. On first sight it inserts; on a repeat it
-/// applies the no-regress status state machine
+/// Upsert a shipment keyed by `(account_id, tracking_number)` in the caller's
+/// transaction. A repeat applies the no-regress status state machine
 /// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
-/// walked back — refreshes `last_update`/`last_message_id`, and adopts a better
-/// `item_name` (a non-empty incoming name replaces an empty stored one, or a
-/// strictly longer one replaces a shorter one). `carrier`/`tracking_url` are also
-/// refreshed when the incoming carrier is more specific (not "unknown").
+/// walked back — refreshes `last_update`/`last_message_id`, and adopts a more
+/// informative `item_name` or a carrier more specific than "unknown".
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 fn upsert_shipment_conn(
@@ -893,8 +808,7 @@ fn upsert_shipment_conn(
 
     let ts = seen_at.to_rfc3339();
 
-    // Read any existing row to run the merge (status state machine + item-name
-    // preference) in Rust rather than a gnarly SQL CASE.
+    // Read any existing row so the merge runs in Rust rather than a SQL CASE.
     let existing: Option<(i64, String, String, String)> = conn
         .query_row(
             "SELECT id, status, item_name, carrier FROM shipments
@@ -986,9 +900,8 @@ fn upsert_shipment_conn(
     }
 }
 
-/// Upsert a receipt keyed by `(account_id, message_id)`. Idempotent: a re-ingest
-/// of the same message overwrites amount/currency/sender/received_at. Runs in the
-/// caller's connection/transaction.
+/// Upsert a receipt keyed by `(account_id, message_id)` in the caller's
+/// transaction; a re-ingest overwrites in place.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 fn upsert_receipt_conn(
@@ -1026,18 +939,15 @@ fn upsert_receipt_conn(
     Ok(id)
 }
 
-/// Replace this message's attachment rows with `attachments`, in the caller's
-/// transaction. DELETE-then-INSERT (mirrors the deadlines path) keeps re-ingest
-/// idempotent without leaning on the UNIQUE(account,message,filename,size)
-/// constraint. `data == None` writes a NULL blob (over-cap: metadata only);
-/// `size_bytes` is always the real decoded size.
+/// Replace this message's attachment rows, in the caller's transaction.
+/// DELETE-then-INSERT keeps re-ingest idempotent; `data == None` writes a NULL
+/// blob (over-cap, metadata only) while `size_bytes` stays the real decoded size.
+/// Written for sealed mail too — the byte-serving path guards sealed parents.
 ///
-/// Written for sealed mail too — the byte-serving path is what guards sealed
-/// parents, not the write.
-// INSERT OR IGNORE: a hostile (or merely clumsy) sender can attach the same
-// file twice — identical filename + size violates the UNIQUE key, and a plain
-// INSERT would roll back the ENTIRE message ingest (remote ingest DoS).
-// Identical duplicates collapsing to one stored row is the desired outcome.
+/// INSERT OR IGNORE, not plain INSERT: a sender can attach the same file twice,
+/// and a UNIQUE(account,message,filename,size) violation would roll back the
+/// ENTIRE message ingest — a remote ingest DoS. Collapsing identical duplicates
+/// to one row is the wanted outcome.
 fn insert_attachments_conn(
     conn: &Connection,
     account_id: AccountId,
@@ -1066,9 +976,8 @@ fn insert_attachments_conn(
 }
 
 /// Load one message's attachment metadata (NO bytes) as the human-door wire
-/// shape, ordered by row id. `downloadable` is `data IS NOT NULL`. Caller is
-/// responsible for the sealed guard (the only caller, `thread_view_with_html`,
-/// already 404s any sealed thread).
+/// shape, ordered by row id; `downloadable` is `data IS NOT NULL`. The CALLER
+/// owns the sealed guard.
 fn load_client_attachments_conn(
     conn: &Connection,
     account_id: AccountId,
@@ -1094,9 +1003,8 @@ fn load_client_attachments_conn(
     Ok(rows)
 }
 
-/// Upsert a banking row keyed by `(account_id, message_id)`. Idempotent: a
-/// re-run overwrites kind/institution/amount/currency/account_hint/received_at.
-/// Runs in the caller's connection/transaction.
+/// Upsert a banking row keyed by `(account_id, message_id)` in the caller's
+/// transaction; a re-run overwrites in place.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 fn upsert_banking_conn(
@@ -1130,9 +1038,8 @@ fn upsert_banking_conn(
     Ok(id)
 }
 
-/// Upsert a calendar update keyed by `(account_id, message_id)`. Idempotent: a
-/// re-ingest of the same message overwrites kind/title/start/organizer/
-/// received_at. Runs in the caller's connection/transaction.
+/// Upsert a calendar update keyed by `(account_id, message_id)` in the caller's
+/// transaction; a re-ingest overwrites in place.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 fn upsert_calendar_conn(
@@ -1168,32 +1075,21 @@ fn upsert_calendar_conn(
     Ok(id)
 }
 
-/// RECEIPT -> OPEN-BILL AUTO-CLOSE. Given a just-ingested receipt, find the one
-/// OPEN bill (a `deadlines` row whose triage status != 'done') this payment
-/// plausibly settles and resolve it to 'done'. Runs in the caller's ingest
-/// transaction so the receipt and the bill closure land atomically.
+/// RECEIPT -> OPEN-BILL AUTO-CLOSE: resolve the one OPEN bill (a `deadlines` row
+/// whose triage status != 'done') a just-ingested receipt plausibly settles,
+/// inside the caller's ingest transaction so both land atomically.
 ///
-/// The matching rules are the PURE logic in [`crate::triage::receipt_match`]
-/// (precision over recall — a false auto-close hides an unpaid bill):
-///   * merchant identity: same registrable domain or same normalized display
-///     name ([`receipt_match::merchant_matches`]);
-///   * amounts: both parsed => must agree within a couple cents; bill parsed
-///     but receipt not => refuse; bill unparsed => merchant + recency alone
-///     ([`receipt_match::amounts_permit_close`]), each with its recency window
-///     anchored on the two messages' `received_at` (bill before receipt);
-///   * at most ONE bill closes per receipt — the EARLIEST-due match. Recurring
-///     bills can leave two identical open months; one payment settles one, and
-///     you pay the oldest first. Closing both would hide an unpaid month.
+/// Matching is the pure logic in [`crate::triage::receipt_match`], biased to
+/// precision because a false auto-close hides an unpaid bill: merchant identity
+/// by registrable domain or normalized display name; amounts must agree within
+/// cents when both parse, and a parsed bill against an unparsed receipt refuses;
+/// recency windows anchored on the two `received_at`s. At most ONE bill closes
+/// per receipt, the EARLIEST-due match — recurring bills leave identical open
+/// months, and closing both would hide an unpaid one.
 ///
-/// The close uses the same status-transition shape as `set_attention_status`
-/// ('done' stamps `resolved_at`, sealed rows excluded in SQL) and appends an
-/// `audit_log` row (actor="ingest", action="bill.auto_close") recording WHY, so
-/// the human door can always answer "where did my bill go?". Idempotent: a
-/// re-ingest finds the bill already 'done' and does nothing (no audit spam).
-///
-/// SECURITY: receipts and deadlines are both structurally sealed-free, and the
-/// UPDATE re-excludes `sensitivity='sealed'` anyway (belt-and-suspenders).
-/// This is internal ingest logic — nothing here crosses the MCP surface.
+/// The close appends an `audit_log` row (actor="ingest",
+/// action="bill.auto_close") so the human door can answer "where did my bill
+/// go?". Idempotent: a re-ingest finds the bill already 'done'.
 fn auto_close_bill_for_receipt_conn(
     conn: &Connection,
     account_id: AccountId,
@@ -1205,9 +1101,9 @@ fn auto_close_bill_for_receipt_conn(
 ) -> Result<Option<i64>> {
     use crate::triage::receipt_match;
 
-    // Candidate OPEN bills: every deadline whose triage row is not yet done.
-    // The message join supplies the biller identity + recency anchor. The open
-    // set is small, so filtering happens in Rust against the pure rules.
+    // Candidate OPEN bills: every deadline whose triage row is not yet done, the
+    // message join supplying biller identity + recency anchor. The open set is
+    // small, so the pure rules filter it in Rust.
     let mut stmt = conn.prepare(
         "SELECT d.message_id, d.amount, d.currency, d.due_at,
                 m.from_addr, m.from_name, m.received_at
@@ -1272,8 +1168,8 @@ fn auto_close_bill_for_receipt_conn(
         return Ok(None);
     };
 
-    // Same transition shape as set_attention_status: 'done' stamps resolved_at;
-    // sealed excluded; the status guard makes a re-run a no-op.
+    // 'done' stamps resolved_at, sealed is excluded, and the status guard makes
+    // a re-run a no-op.
     let n = conn.execute(
         "UPDATE triage
          SET status = 'done', resolved_at = ?1
@@ -1312,12 +1208,10 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| CoreError::InvalidInput(format!("bad datetime {s:?}: {e}")))
 }
 
-/// Validate a sender-rule write (shared by set/set-audited/update). A FILTERED
-/// rule with an empty `want_text` is a contradiction: "filter everything from
-/// this sender except <nothing>". Stage-2 would have no instruction to evaluate
-/// (`stage2_queue` maps empty `want_text` to `None`), so the rule silently
-/// degrades to a no-instruction row while still reading as a rule in the UI.
-/// Reject it at write time instead — every door (client, agent) lands here.
+/// Validate a sender-rule write, on the path of every door. A FILTERED rule with
+/// an empty `want_text` is a contradiction ("filter everything except nothing"):
+/// Stage-2 would get no instruction to evaluate, so the rule would silently
+/// degrade while still reading as a rule in the UI.
 fn validate_sender_rule(want_text: &str, disposition: Disposition) -> Result<()> {
     if disposition == Disposition::Filtered && want_text.trim().is_empty() {
         return Err(CoreError::InvalidInput(
@@ -1330,8 +1224,8 @@ fn validate_sender_rule(want_text: &str, disposition: Disposition) -> Result<()>
 // ---- `events` row mapping (shared by events_after / event_by_id) -----------
 
 /// One raw `events` row, columns in SELECT order. Split from [`finish_event`]
-/// because the rusqlite mapper cannot fail with a [`CoreError`]: the mapper
-/// pulls the primitives, the parse of the two text timestamps happens after.
+/// because a rusqlite mapper cannot fail with a [`CoreError`], so the timestamp
+/// parse has to happen after it.
 type EventRow = (i64, i64, String, String, String, i64, String, String, Option<String>, String);
 
 fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
@@ -1350,9 +1244,8 @@ fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
 }
 
 /// Turn a raw [`EventRow`] into an [`Event`]. An unparseable `kind`/`tier` falls
-/// back to the least-alarming value rather than erroring — a stored row is
-/// already a fact, and refusing to serve it would silently stall a client's
-/// cursor at the bad row forever.
+/// back to the least-alarming value rather than erroring: refusing to serve a
+/// stored row would stall a client's cursor at it forever.
 fn finish_event(row: EventRow) -> Result<Event> {
     let (id, message_id, thread_id, kind, tier, importance, sender, one_line, deadline, created_at) =
         row;
@@ -1372,9 +1265,7 @@ fn finish_event(row: EventRow) -> Result<Event> {
 
 // ---- `devices` row mapping -------------------------------------------------
 
-/// One raw `devices` row, columns in SELECT order. Split from [`finish_device`]
-/// for the same reason [`EventRow`] is: the rusqlite mapper cannot fail with a
-/// [`CoreError`], so the timestamp parse happens after it.
+/// One raw `devices` row, columns in SELECT order; split like [`EventRow`].
 type DeviceRow = (i64, i64, String, String, String, String);
 
 fn map_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
@@ -1529,8 +1420,7 @@ impl Store for SqliteStore {
                 reason,
                 deadline,
                 matched_rule: rule,
-                // AGENT DOOR: never carries field_reasons — the human-door insight
-                // feature stays absent from the MCP payload (skip_serializing_if).
+                // AGENT DOOR: never carries field_reasons.
                 field_reasons: None,
                 has_attachments: None,
             });
@@ -1541,9 +1431,8 @@ impl Store for SqliteStore {
     fn thread_view(&self, account_id: AccountId, thread_id: &str) -> Result<ThreadView> {
         let conn = self.lock()?;
 
-        // SECURITY: if ANY message in this thread is sealed, treat the whole
-        // thread as NotFound (indistinguishable from nonexistent). Also, a
-        // thread with no visible messages is NotFound.
+        // SECURITY: if ANY message in this thread is sealed, the whole thread is
+        // NotFound — as is a thread with no visible messages.
         let sealed_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM triage
              WHERE account_id=?1 AND sensitivity='sealed'
@@ -1610,11 +1499,10 @@ impl Store for SqliteStore {
         message_id: i64,
     ) -> Result<Option<String>> {
         let conn = self.lock()?;
-        // SECURITY: exclude sealed rows in SQL. A sealed message id resolves to
-        // `None` exactly like a nonexistent one, so the `get_thread` message-id
-        // fallback can never confirm that a sealed message (or its thread)
-        // exists. A message with no triage row is treated as non-sealed
-        // (COALESCE) so plain mail still resolves.
+        // SECURITY: a sealed message id resolves to `None` exactly like a
+        // nonexistent one, so the `get_thread` fallback cannot confirm that a
+        // sealed message exists. A message with no triage row COALESCEs to
+        // non-sealed so plain mail still resolves.
         let thread_id: Option<String> = conn
             .query_row(
                 "SELECT m.thread_id
@@ -1636,10 +1524,8 @@ impl Store for SqliteStore {
     ) -> Result<ClientThreadView> {
         let conn = self.lock()?;
 
-        // SECURITY: identical sealed/nonexistent -> NotFound guard as
-        // `thread_view`. If ANY message in this thread is sealed, the whole
-        // thread is NotFound (indistinguishable from nonexistent), so this
-        // human-door variant never reveals a sealed thread's html either.
+        // SECURITY: same sealed/nonexistent -> NotFound guard as `thread_view`,
+        // so this human-door variant never reveals a sealed thread's html.
         let sealed_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM triage
              WHERE account_id=?1 AND sensitivity='sealed'
@@ -1668,8 +1554,8 @@ impl Store for SqliteStore {
              WHERE account_id=?1 AND thread_id=?2
              ORDER BY received_at ASC",
         )?;
-        // Collect the message rows first (releasing `stmt`'s borrow of `conn`) so
-        // the per-message attachment query below can run on the same connection.
+        // Collect first, releasing `stmt`'s borrow of `conn`, so the per-message
+        // attachment query below can run on the same connection.
         let rows = stmt
             .query_map(params![account_id, thread_id], |r| {
                 Ok((
@@ -1686,11 +1572,8 @@ impl Store for SqliteStore {
 
         let mut messages = Vec::new();
         for (id, from_addr, from_name, received_at, body, body_html) in rows {
-            // Attachment metadata for this message. `downloadable` is
-            // `data IS NOT NULL` — false when only over-cap metadata was kept.
-            // ALWAYS present on the wire ([] when none). No sealed guard is
-            // needed here: this whole view already 404s any thread containing a
-            // sealed message (checked above).
+            // ALWAYS present on the wire ([] when none). No sealed guard needed:
+            // the whole view 404s any thread containing a sealed message.
             let attachments = load_client_attachments_conn(&conn, account_id, id)?;
             messages.push(ClientMessage {
                 id,
@@ -1719,13 +1602,10 @@ impl Store for SqliteStore {
         attachment_id: i64,
     ) -> Result<Option<AttachmentBytes>> {
         let conn = self.lock()?;
-        // SECURITY: the parent message must be non-sealed. A LEFT JOIN + COALESCE
-        // treats a message with no triage row as 'normal' (like
-        // `thread_id_for_message`), but requires sensitivity='normal' otherwise —
-        // so a sealed parent yields no row and the caller returns 404,
-        // indistinguishable from an unknown id. When the row exists but `data` is
-        // NULL (over the ingest cap), `Some((.., .., None))` flows out and the
-        // endpoint answers 410.
+        // SECURITY: the parent message must be non-sealed (a missing triage row
+        // COALESCEs to 'normal'), so a sealed parent yields no row and the caller
+        // 404s, indistinguishable from an unknown id. An existing row with NULL
+        // `data` (over the ingest cap) flows out as `Some((.., None))` => 410.
         let row = conn
             .query_row(
                 "SELECT a.filename, a.mime, a.data
@@ -1823,10 +1703,8 @@ impl Store for SqliteStore {
         include_delivered: bool,
     ) -> Result<Vec<crate::types::Shipment>> {
         let conn = self.lock()?;
-        // En-route by default (status != 'delivered'); delivered included only on
-        // request. Ordered most-recently-updated first. No sealed filter needed:
-        // the table holds no sealed rows by construction (detection never runs on
-        // sealed mail).
+        // No sealed filter needed: detection never runs on sealed mail, so the
+        // table holds no sealed rows by construction.
         let sql = if include_delivered {
             "SELECT id, account_id, tracking_number, carrier, item_name, status,
                     tracking_url, first_seen, last_update
@@ -1903,9 +1781,8 @@ impl Store for SqliteStore {
 
     fn list_receipts(&self, account_id: AccountId, days: u32) -> Result<Vec<Receipt>> {
         let conn = self.lock()?;
-        // Newest-first, within the last `days`. No sealed filter needed: the table
-        // holds no sealed rows by construction (detection never runs on sealed
-        // mail).
+        // No sealed filter needed: detection never runs on sealed mail, so the
+        // table holds no sealed rows by construction.
         let since = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT rc.id, rc.account_id, rc.message_id, m.thread_id, rc.from_addr,
@@ -1957,13 +1834,9 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
         let conn = self.lock()?;
-        // Rows the LLM categorized into an EXTRACTABLE category that have not yet
-        // been through their extractor (extractor_model_used IS NULL), non-sealed,
-        // non-sent. A message that already produced a RECEIPT is excluded — a
-        // receipt (money paid for a purchase) and a banking row must never
-        // double-create (the deterministic receipt detector runs at ingest, before
-        // this categorizer). The category IN (...) list is built from the caller's
-        // slice (bound params, never string-interpolated).
+        // A message that already produced a RECEIPT is excluded: a receipt and a
+        // banking row must never double-create. The category IN (...) list is
+        // built from bound params, never string-interpolated.
         let placeholders = (0..categories.len())
             .map(|i| format!("?{}", i + 3))
             .collect::<Vec<_>>()
@@ -2031,14 +1904,12 @@ impl Store for SqliteStore {
     ) -> Result<u64> {
         let conn = self.lock()?;
         let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
-        // Scope: one message, or the trailing-days inbound window. Guards mirror
-        // the stage-1 queue: normal sensitivity only, and never rule-decided
-        // ('rule'), human-corrected ('human') or sealed/sent ('n/a') markers —
-        // rules are authoritative, a human who corrected a verdict is MORE
-        // authoritative still, and sealed mail re-enters no queue. Re-running the
-        // model over a row someone explicitly fixed would both undo their work
-        // and corrupt the feedback dataset, which would then record corrections
-        // that never actually stuck.
+        // Scope: one message, or the trailing-days inbound window. Normal
+        // sensitivity only, and never a rule-decided ('rule'), human-corrected
+        // ('human') or sealed/sent ('n/a') marker — rules are authoritative, a
+        // human is more authoritative still, and sealed mail re-enters no queue.
+        // Re-running the model over a row someone fixed would undo their work and
+        // record feedback corrections that never stuck.
         let scope_sql = match message_id {
             Some(_) => "m.id = ?2",
             None => "m.received_at >= ?2",
@@ -2059,8 +1930,8 @@ impl Store for SqliteStore {
                )"
         );
         let n = conn.execute(&update, rusqlite::params![account_id, scope_param])?;
-        // Drop stale specialist rows for the reset messages — re-extraction
-        // recreates them (possibly under a different category verdict).
+        // Drop stale specialist rows; re-extraction recreates them, possibly
+        // under a different category verdict.
         let del = format!(
             "DELETE FROM banking
              WHERE account_id = ?1
@@ -2093,13 +1964,11 @@ impl Store for SqliteStore {
     fn banking_apply(&self, applied: &BankingApplied) -> Result<i64> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        // 1. Upsert the banking row (keyed by account + message).
         let id = upsert_banking_conn(&tx, applied)?;
-        // 2. Stamp the extractor marker (leaving the extract queue) and, for a
-        //    RECORD (statement/alert), resolve the triage row to 'done' so it
-        //    leaves the attention bands — same transition shape as
-        //    set_attention_status ('done' stamps resolved_at). Guarded by
-        //    sensitivity='normal' so a sealed row can never be mutated here.
+        // Stamp the extractor marker (leaving the extract queue) and, for a
+        // RECORD (statement/alert), resolve the row to 'done' so it leaves the
+        // attention bands. The sensitivity='normal' guard keeps a sealed row from
+        // ever being mutated here.
         let now_s = Utc::now().to_rfc3339();
         tx.execute(
             "UPDATE triage SET
@@ -2144,9 +2013,8 @@ impl Store for SqliteStore {
             ],
         )?;
         // Stamp the extractor marker so the row leaves the queue. NO status
-        // change: marketing does not auto-resolve (see the extractor header).
-        // sensitivity='normal' guard mirrors banking_apply — a sealed row can
-        // never be mutated here even though one can never reach this path.
+        // change: marketing does not auto-resolve. The sensitivity='normal' guard
+        // keeps a sealed row from ever being mutated here.
         tx.execute(
             "UPDATE triage SET extractor_model_used = ?3
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
@@ -2212,8 +2080,8 @@ impl Store for SqliteStore {
 
     fn list_banking(&self, account_id: AccountId) -> Result<Vec<Banking>> {
         let conn = self.lock()?;
-        // Newest-received first. No sealed filter needed: the table holds no
-        // sealed rows by construction (extraction never runs on sealed mail).
+        // No sealed filter needed: extraction never runs on sealed mail, so the
+        // table holds no sealed rows by construction.
         let mut stmt = conn.prepare(
             "SELECT b.id, b.message_id, m.thread_id, m.from_addr, b.kind, b.institution,
                     b.amount, b.currency, b.account_hint, b.received_at
@@ -2283,10 +2151,8 @@ impl Store for SqliteStore {
         hours: u32,
     ) -> Result<Vec<CalendarUpdate>> {
         let conn = self.lock()?;
-        // Newest-RECEIVED first, within the last `hours` of mail arrival (the
-        // window is on received_at, NOT the event's starts_at). No sealed filter
-        // needed: the table holds no sealed rows by construction (detection
-        // never runs on sealed mail).
+        // The window is on received_at, NOT the event's starts_at. No sealed
+        // filter needed: detection never runs on sealed mail.
         let since = (Utc::now() - chrono::Duration::hours(hours as i64)).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.message_id, m.thread_id, c.kind, c.event_title, c.starts_at,
@@ -2366,9 +2232,9 @@ impl Store for SqliteStore {
         audit: &NewAuditEntry,
     ) -> Result<i64> {
         validate_sender_rule(want_text, disposition)?;
-        // FAIL-CLOSED: the rule write and its audit row share ONE transaction. If
-        // the audit INSERT errors, `?` bails before commit and the tx is rolled
-        // back on drop — so the agent-door rule write never lands untraced.
+        // FAIL-CLOSED: the rule write and its audit row share ONE transaction, so
+        // a failed audit INSERT rolls the rule back and an agent-door write can
+        // never land untraced.
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -2471,9 +2337,7 @@ impl Store for SqliteStore {
         // 1. Upsert the message row (+ FTS).
         let id = upsert_message_conn(&tx, &triaged.message)?;
 
-        // 1b. Seed contacts from Sent-mail recipients (To/Cc), in the SAME
-        //     transaction. `recipients` is empty for received mail and already
-        //     excludes the account's own address.
+        // 1b. Contacts from Sent-mail To/Cc, in the SAME transaction.
         seed_contacts_conn(
             &tx,
             triaged.message.account_id,
@@ -2481,12 +2345,10 @@ impl Store for SqliteStore {
             &triaged.message.received_at.to_rfc3339(),
         )?;
 
-        // 1c. UNSUBSCRIBE VIOLATION LEDGER: a NON-SENT inbound message from a
-        //     sender the user asked to unsubscribe from — arriving past the 72h
-        //     grace, with the request still unresolved — bumps that sender's
-        //     violation_count. In the SAME transaction as the message insert so
-        //     the ledger can never drift from the mail that drives it. No-op when
-        //     there is no outstanding unsubscribe for this sender.
+        // 1c. UNSUBSCRIBE VIOLATION LEDGER: inbound mail from a sender the user
+        //     unsubscribed from, past the 72h grace, bumps that sender's
+        //     violation_count — in the SAME transaction as the message insert, so
+        //     the ledger cannot drift from the mail that drives it.
         if !triaged.message.is_sent {
             bump_unsub_violation_conn(
                 &tx,
@@ -2496,21 +2358,16 @@ impl Store for SqliteStore {
             )?;
         }
 
-        // 2. Write the triage row IN THE SAME TRANSACTION. For sealed mail this
-        //    is the whole point: sensitivity='sealed' is committed atomically
-        //    with the message so there is no window where it is queryable as
-        //    normal mail. `model_used` stays NULL; combined with
-        //    sensitivity='normal' that is the Stage-2 queue predicate for
-        //    non-confident rows.
+        // 2. Write the triage row IN THE SAME TRANSACTION. That is the whole
+        //    point for sealed mail: sensitivity='sealed' commits atomically with
+        //    the message, so there is no window in which it is queryable as
+        //    normal mail. `model_used` stays NULL, which with
+        //    sensitivity='normal' is the Stage-2 queue predicate.
         let deadline_dt = triaged.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
         // AUTO-RESOLVE receipts and calendar updates: both are RECORDS, not
-        // something the user must act on (money already moved; the real calendar
-        // is the source of truth). We set the attention-lifecycle status to the
-        // terminal 'done' at ingest (stamping resolved_at) so the row is excluded
-        // from the New/Attention/Aging bands and never becomes inbox clutter — it
-        // lives ONLY in its category (Receipts / Calendar). Other rows start
-        // 'new' as usual. Sealed mail never carries a receipt or calendar update,
-        // so this only ever fires on non-sealed rows.
+        // things to act on, so they start terminal ('done' + resolved_at), stay
+        // out of the New/Attention/Aging bands, and live only in their category.
+        // Other rows start 'new'.
         let now_s = Utc::now().to_rfc3339();
         let auto_resolved = triaged.sensitivity != Sensitivity::Sealed
             && (triaged.receipt.is_some() || triaged.calendar.is_some());
@@ -2519,32 +2376,27 @@ impl Store for SqliteStore {
         } else {
             ("new", None)
         };
-        // On re-ingest of a non-auto-resolved row we must PRESERVE the existing
-        // attention lifecycle (status/resolved_at) — a re-sync must not reopen an
-        // item the user dismissed. A receipt/calendar row, however, is
-        // force-resolved to 'done' on every ingest (a record is always a record).
-        // The CASE keys off `excluded.status`: 'done' (only auto-resolved rows
-        // pass 'done' in) overwrites; otherwise the existing lifecycle is kept.
-        // Per-property Stage-1 reasons as a JSON blob (NULL when empty — sealed /
-        // sent mail carry none). HUMAN-DOOR ONLY on read.
+        // Re-ingest PRESERVES the existing attention lifecycle: a re-sync must not
+        // reopen an item the user dismissed. Receipt/calendar rows are the
+        // exception, force-resolved on every ingest — the CASE keys off
+        // `excluded.status`, and only auto-resolved rows pass 'done' in.
+        //
+        // Per-property Stage-1 reasons as JSON (NULL when empty, as for sealed /
+        // sent mail). HUMAN-DOOR ONLY on read.
         let field_reasons_json = if triaged.field_reasons.is_empty() {
             None
         } else {
             serde_json::to_string(&triaged.field_reasons).ok()
         };
-        // STAGE-1/STAGE-2 QUEUE MARKERS. `stage1_model_used` decides whether the
-        // Stage-1 LLM refine pass will look at this row; `needs_stage2` is the
-        // escalation seed. See the module docs in `triage/stage1_llm.rs`.
-        //   * Sealed / Sent mail: never queued for any LLM (marked 'n/a').
-        //   * Explicit Squelch/Surface rule (matched_rule set, confident): the
-        //     user already ruled on this sender — NO Stage-1 model spend and no
-        //     Stage-2 ('rule', needs_stage2=0).
-        //   * Filtered rule (matched_rule set, NOT confident): skip Stage-1, go
-        //     straight to Stage-2 for want_text ('rule', needs_stage2=1).
-        //   * Everything else (matched_rule NONE): enter the Stage-1 LLM queue
-        //     (stage1_model_used NULL); the `needs_stage2` seed = !confident is
-        //     preserved on a heuristic-only fallback and overwritten by the LLM
-        //     apply otherwise.
+        // STAGE-1/STAGE-2 QUEUE MARKERS: `stage1_model_used` decides whether the
+        // Stage-1 pass looks at this row, `needs_stage2` is the escalation seed.
+        //   * Sealed / Sent: never queued for any LLM ('n/a').
+        //   * Explicit Squelch/Surface rule: the user already ruled on this
+        //     sender, so no model spend at all ('rule', needs_stage2=0).
+        //   * Filtered rule: skip Stage-1, straight to Stage-2 for the want_text
+        //     ('rule', needs_stage2=1).
+        //   * Everything else: enter the Stage-1 queue (NULL), seeding
+        //     `needs_stage2` from heuristic confidence.
         let (stage1_model_used, needs_stage2): (Option<&str>, i64) =
             if triaged.sensitivity != Sensitivity::Normal || triaged.message.is_sent {
                 (Some("n/a"), 0)
@@ -2553,16 +2405,12 @@ impl Store for SqliteStore {
             } else {
                 (None, if triaged.confident { 0 } else { 1 })
             };
-        // RE-INGEST CLASSIFICATION GUARD. A re-delivery / backfill re-ingest carries
-        // only the HEURISTIC SEED values (the LLM stages do not re-run at ingest).
-        // If the existing row was already LLM-classified — Stage-2 stamped
-        // `model_used`, or Stage-1 stamped a real model id (anything other than the
-        // 'rule'/'n/a' sentinels) — clobbering importance/tier/one_line/reason/
-        // field_reasons/deadline back to the seed would silently discard paid
-        // classification while the model markers (untouched by this SET) stay put,
-        // so the row would never re-queue to recover it. This predicate keeps the
-        // paid columns on conflict for such rows; a genuinely-new or
-        // still-heuristic-seed row (markers NULL) refreshes exactly as before.
+        // RE-INGEST CLASSIFICATION GUARD. A re-ingest carries only HEURISTIC SEED
+        // values, so for a row an LLM already classified (`model_used` set, or a
+        // `stage1_model_used` other than the 'rule'/'n/a' sentinels) writing the
+        // seed back would discard paid classification while the model markers
+        // stay put — the row would never re-queue to recover it. This predicate
+        // keeps those columns on conflict; still-seed rows refresh normally.
         const PROCESSED: &str = "(triage.model_used IS NOT NULL \
              OR (triage.stage1_model_used IS NOT NULL \
                  AND triage.stage1_model_used NOT IN ('rule', 'n/a')))";
@@ -2607,9 +2455,8 @@ impl Store for SqliteStore {
             ],
         )?;
 
-        // 3. Deadlines: only ever present for non-sealed mail (Stage-1 does not
-        //    run on sealed content). Replace any prior deadline for this message
-        //    so re-ingest is idempotent.
+        // 3. Deadlines: non-sealed mail only (Stage-1 never runs on sealed
+        //    content). Replace any prior row so re-ingest is idempotent.
         tx.execute(
             "DELETE FROM deadlines WHERE message_id=?1",
             params![id],
@@ -2634,12 +2481,9 @@ impl Store for SqliteStore {
                 )?;
         }
 
-        // 4. Shipment: only ever present for NON-SEALED mail (detection is not run
-        //    on sealed content). Upsert into the tracker in the SAME transaction
-        //    so a package's state and its source message land atomically. The
-        //    upsert applies the no-regress status state machine. Sealed mail
-        //    carries `shipment == None`, so this branch never runs for it — the
-        //    `shipments` table is sealed-free by construction.
+        // 4. Shipment: NON-SEALED mail only, so `shipments` is sealed-free by
+        //    construction. Upserted in the SAME transaction so a package's state
+        //    and its source message land atomically.
         if triaged.sensitivity != Sensitivity::Sealed
             && let Some(s) = &triaged.shipment
         {
@@ -2652,14 +2496,9 @@ impl Store for SqliteStore {
             )?;
         }
 
-        // 5. Receipt: only ever present for NON-SEALED mail (detection is not run
-        //    on sealed content). Insert into the receipts category in the SAME
-        //    transaction. Independent of shipment detection — an order
-        //    confirmation with a total AND tracking lands in BOTH tables. The
-        //    triage row was already force-resolved to status='done' above so this
-        //    message never surfaces as inbox clutter. Sealed mail carries
-        //    `receipt == None`, so this branch never runs for it — the `receipts`
-        //    table is sealed-free by construction.
+        // 5. Receipt: NON-SEALED mail only, so `receipts` is sealed-free by
+        //    construction. Independent of shipment detection — an order
+        //    confirmation with a total AND tracking lands in BOTH tables.
         if triaged.sensitivity != Sensitivity::Sealed
             && let Some(r) = &triaged.receipt
         {
@@ -2673,13 +2512,9 @@ impl Store for SqliteStore {
                 triaged.message.received_at,
             )?;
 
-            // 5b. RECEIPT -> OPEN-BILL AUTO-CLOSE, in the SAME transaction: if
-            //     this payment plausibly settles an open bill (conservative
-            //     merchant + amount + recency rules, see
-            //     `auto_close_bill_for_receipt_conn`), resolve that bill's
-            //     triage row to 'done' and audit why. A missed match is fine;
-            //     a false close would hide an unpaid bill, so the rules prefer
-            //     precision.
+            // 5b. RECEIPT -> OPEN-BILL AUTO-CLOSE, in the SAME transaction:
+            //     resolve the bill this payment settles and audit why. A missed
+            //     match is fine; a false close would hide an unpaid bill.
             auto_close_bill_for_receipt_conn(
                 &tx,
                 triaged.message.account_id,
@@ -2691,15 +2526,10 @@ impl Store for SqliteStore {
             )?;
         }
 
-        // 6. Calendar update: only ever present for NON-SEALED mail (detection
-        //    is not run on sealed content). Insert into the calendar category in
-        //    the SAME transaction. Independent of the other detectors, exactly
-        //    like receipts. The triage row was already force-resolved to
-        //    status='done' above so a calendar notification never surfaces as
-        //    inbox clutter — it lives only in the Calendar zone. Sealed mail
-        //    carries `calendar == None`, so this branch never runs for it — the
-        //    `calendar_updates` table is sealed-free by construction. NOTE:
-        //    nothing is written back to Gmail; "resolved" is squelch-internal.
+        // 6. Calendar update: NON-SEALED mail only, so `calendar_updates` is
+        //    sealed-free by construction. Independent of the other detectors,
+        //    exactly like receipts. Nothing is written back to Gmail — "resolved"
+        //    is squelch-internal.
         if triaged.sensitivity != Sensitivity::Sealed
             && let Some(c) = &triaged.calendar
         {
@@ -2712,10 +2542,9 @@ impl Store for SqliteStore {
             )?;
         }
 
-        // 7. Attachments: written for BOTH sealed and non-sealed mail (storage is
-        //    fine; the byte-serving endpoint guards sealed parents). Replace any
-        //    prior rows for this message so re-ingest is idempotent, then insert
-        //    each part (over-cap parts carry `data == None` -> a NULL blob).
+        // 7. Attachments: written for sealed mail too — the byte-serving endpoint
+        //    guards sealed parents. Replaces prior rows so re-ingest is
+        //    idempotent; over-cap parts store a NULL blob.
         insert_attachments_conn(&tx, triaged.message.account_id, id, &triaged.attachments)?;
 
         tx.commit()?;
@@ -2818,10 +2647,9 @@ impl Store for SqliteStore {
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
         let conn = self.lock()?;
-        // SECURITY: join triage and exclude sealed rows in SQL, exactly like
-        // ranked_updates. A message with no triage row is treated as non-sealed
-        // (LEFT JOIN) so freshly-ingested-but-untriaged mail is still findable,
-        // but a sealed classification always hides the row.
+        // SECURITY: sealed rows excluded in SQL. An untriaged message COALESCEs
+        // to non-sealed so freshly-ingested mail is still findable, but a sealed
+        // classification always hides the row.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
                     m.received_at, m.snippet
@@ -2877,19 +2705,13 @@ impl Store for SqliteStore {
         let conn = self.lock()?;
         let min = min_importance.unwrap_or(0) as i64;
 
-        // Base predicate mirrors ranked_updates (sealed excluded, sent excluded,
-        // since/importance window). Band/status add clauses; the ORDER BY differs
-        // for the `open` band (age*importance) — documented below.
-        //
-        // Band semantics:
+        // Base predicate: sealed excluded, sent excluded, since/importance window.
+        // Bands:
         //   standing = tier IN ('past_due','deadline') AND status != 'done'
         //   new      = surfaced_at IS NULL AND status != 'done'
         //   open     = status = 'open'
-        // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts (done at
-        // ingest, never surfaced) out of the Attention/New band — a receipt is a
-        // record, not new inbox clutter. Only receipt-classified rows are auto-
-        // done at ingest; every other row starts 'new', so genuine mail is
-        // unaffected.
+        // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts out of the
+        // band — a receipt is a record, not new inbox clutter.
         let mut sql = String::from(
             "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
                     t.reason, t.deadline, t.matched_rule_id,
@@ -2922,10 +2744,9 @@ impl Store for SqliteStore {
             Some(SitrepBand::Open) => sql.push_str(" AND t.status = 'open'"),
             None => {}
         }
-        // The `open` band is the aging/escalating band: sort by age*importance so
-        // long-unresolved-and-important items float. `age` is (now - received_at)
-        // in seconds; we compute it in SQL via julianday so the ordering lives
-        // server-side. Other bands keep the ranked_updates ordering.
+        // The `open` band is the aging one: age*importance floats
+        // long-unresolved-and-important items, computed in SQL via julianday so
+        // the ordering stays server-side. Other bands sort by importance.
         if band == Some(SitrepBand::Open) {
             sql.push_str(
                 " ORDER BY (julianday(?4) - julianday(m.received_at)) * t.importance DESC,
@@ -2990,9 +2811,8 @@ impl Store for SqliteStore {
                 Some(s) => Some(parse_dt(&s)?),
                 None => None,
             };
-            // Parse the per-property reasons JSON. A NULL column (row predates the
-            // feature) or a malformed value yields None — defensive: a bad blob
-            // must never fail the whole updates read.
+            // A NULL or malformed reasons blob yields None: one bad row must
+            // never fail the whole updates read.
             let field_reasons: Option<crate::types::FieldReasons> = field_reasons_s
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
@@ -3035,10 +2855,9 @@ impl Store for SqliteStore {
         let tx = conn.transaction()?;
         let mut first_surfaced = 0usize;
         {
-            // Stamp surfaced_at only if NULL, and promote new->open. The
-            // sensitivity guard means a sealed row is NEVER stamped, so it can
-            // never leak into a "new since last check" delta. Idempotent: a
-            // second call finds surfaced_at already set and changes nothing.
+            // Stamp surfaced_at only if NULL and promote new->open. The
+            // sensitivity guard means a sealed row is NEVER stamped, so it cannot
+            // leak into a "new since last check" delta. Idempotent.
             let mut stmt = tx.prepare(
                 "UPDATE triage
                  SET surfaced_at = COALESCE(surfaced_at, ?1),
@@ -3159,9 +2978,8 @@ impl Store for SqliteStore {
     fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>> {
         let inserted = {
             let conn = self.lock()?;
-            // INSERT OR IGNORE on UNIQUE(message_id): one event per message ever.
-            // A no-op insert reports 0 changed rows, which is how a re-ingest or a
-            // second (refined) verdict for the same message stays silent.
+            // INSERT OR IGNORE on UNIQUE(message_id): one event per message ever,
+            // so a re-ingest or a second refined verdict stays silent (0 rows).
             let n = conn.execute(
                 "INSERT OR IGNORE INTO events(account_id, message_id, thread_id, kind, tier,
                      importance, sender, one_line, deadline, created_at)
@@ -3184,9 +3002,8 @@ impl Store for SqliteStore {
             }
             conn.last_insert_rowid()
         };
-        // Poke the in-process broadcast AFTER dropping the connection lock. The
-        // payload is only a hint (readers re-read past their own cursor), so a
-        // send error — which here means nobody is listening — is not a failure.
+        // Poke the broadcast AFTER dropping the connection lock. The payload is
+        // only a hint, so a send error (nobody listening) is not a failure.
         if let Some(tx) = self.event_notifier() {
             let _ = tx.send(inserted);
         }
@@ -3248,20 +3065,14 @@ impl Store for SqliteStore {
     fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device> {
         let conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
-        // UPSERT on UNIQUE(token). `created_at` is deliberately NOT touched on
+        // UPSERT on UNIQUE(token); `created_at` is deliberately NOT touched on
         // conflict — first sight is a fact worth keeping.
         //
-        // THE CONFLICT UPDATE IS ACCOUNT-SCOPED, and that WHERE is the security
-        // property. Adopting `excluded.account_id` would mean anyone who can
-        // register a device could re-register a token ALREADY OWNED by another
-        // account and silently move it — every subsequent push for that physical
-        // phone would then be aimed by whoever rebound it. Single-account
-        // daemons make that theoretical today; the store is the wrong layer to
-        // leave it true in.
-        //
-        // A cross-account collision therefore updates NOTHING (0 rows changed),
-        // and 0-rows is reported rather than swallowed: a silent no-op that
-        // returned the other account's row would be worse than the rebind.
+        // The conflict update's account-scoped WHERE is the security property:
+        // adopting `excluded.account_id` would let a re-registration silently
+        // repoint another account's device. A cross-account collision therefore
+        // changes 0 rows, and that is reported rather than swallowed — returning
+        // the other account's row would be worse than the rebind.
         let changed = conn.execute(
             "INSERT INTO devices(account_id, token, platform, created_at, last_registered_at)
              VALUES(?1,?2,?3,?4,?4)
@@ -3272,7 +3083,7 @@ impl Store for SqliteStore {
             params![account_id, token, platform, now],
         )?;
         if changed == 0 {
-            // States the RULE, never the token — this string reaches the human
+            // States the RULE, never the token: this string reaches the human
             // door as a 400 body.
             return Err(CoreError::InvalidInput(
                 "device token is already registered to another account".to_string(),
@@ -3364,9 +3175,8 @@ impl Store for SqliteStore {
         message_id: i64,
     ) -> Result<Option<MessageUnsub>> {
         let conn = self.lock()?;
-        // SECURITY: exclude sealed rows in SQL so an unsubscribe against a sealed
-        // message resolves to `None` (=> 404) exactly like an unknown id. A
-        // message with no triage row is treated as non-sealed (COALESCE).
+        // SECURITY: sealed rows excluded in SQL, so an unsubscribe against sealed
+        // mail resolves to `None` (=> 404) exactly like an unknown id.
         let row = conn
             .query_row(
                 "SELECT m.from_addr, m.list_unsubscribe, m.list_unsub_one_click
@@ -3400,9 +3210,8 @@ impl Store for SqliteStore {
         requested_at: DateTime<Utc>,
     ) -> Result<()> {
         let conn = self.lock()?;
-        // A fresh request RESETS the ledger: the user re-asked, so violation_count
-        // -> 0, last_violation_at -> NULL, resolution -> NULL (the 72h grace clock
-        // restarts from this requested_at).
+        // A fresh request RESETS the ledger — the user re-asked, so the 72h grace
+        // clock restarts from this `requested_at`.
         conn.execute(
             "INSERT INTO unsubscribes(account_id, sender_addr, requested_at, method,
                  source_message_id, violation_count, last_violation_at, resolution)
@@ -3487,9 +3296,8 @@ impl Store for SqliteStore {
         let tx = conn.transaction()?;
 
         // Snapshot the row BEFORE touching it. Sealed rows are included on
-        // purpose: this is the local store and a human correcting a
-        // misclassified auth message is exactly the signal we want. No body is
-        // read — only the triage verdict and the envelope.
+        // purpose — a human correcting a misclassified auth message is exactly
+        // the signal wanted — and no body is read, only verdict and envelope.
         let row = tx
             .query_row(
                 "SELECT m.from_addr, m.subject, t.tier, t.category, t.importance,
@@ -3541,8 +3349,8 @@ impl Store for SqliteStore {
             TriageAxis::Sensitivity => Some(sensitivity.clone()),
         };
 
-        // The features that produced the verdict, alongside the verdict itself.
-        // Refinement needs both; see the schema note.
+        // The features that produced the verdict, alongside the verdict itself —
+        // refinement needs both.
         let original = serde_json::json!({
             "tier": tier,
             "category": category,
@@ -3556,12 +3364,10 @@ impl Store for SqliteStore {
             "matched_rule_id": matched_rule_id,
         });
 
-        // Apply the correction, and stamp the row HUMAN-DECIDED. 'human' in the
-        // model columns takes the row out of both LLM queue predicates
-        // (stage1: stage1_model_used IS NULL; stage2: model_used IS NULL AND
-        // needs_stage2=1), so a later pass cannot quietly overwrite the person
-        // who corrected it. That would be maddening, and it would also corrupt
-        // the dataset by making corrections look like they never stuck.
+        // Apply the correction and stamp the row HUMAN-DECIDED: 'human' in the
+        // model columns takes it out of both LLM queue predicates, so a later
+        // pass cannot overwrite the person who corrected it and make the
+        // feedback dataset record corrections that never stuck.
         let column = match axis {
             TriageAxis::Tier => "tier",
             TriageAxis::Category => "category",
@@ -3579,17 +3385,12 @@ impl Store for SqliteStore {
             params![account_id, message_id, to_value],
         )?;
 
-        // SEALING has consequences beyond the one column. The schema documents
-        // that sealed rows carry a NULL category and that the specialist tables
-        // hold no sealed rows BY CONSTRUCTION — true because sealed mail never
-        // reaches the LLM stages. A human sealing a row AFTER it was categorized
-        // and extracted would quietly falsify both, and would leave the message
-        // sitting in the Marketing/Banking zones while the Auth page also claims
-        // it. So: drop the category and any extracted rows.
-        //
-        // (Neither specialist table crosses the agent door, so this is about
-        // keeping a stated invariant true and the surfaces coherent, not about
-        // patching a /mcp leak.)
+        // SEALING has consequences beyond the one column: sealed rows carry a
+        // NULL category and the specialist tables hold no sealed rows BY
+        // CONSTRUCTION. Sealing a row that was already categorized and extracted
+        // would falsify both and leave the message in the Marketing/Banking zones
+        // while the Auth page also claims it, so drop the category and the
+        // extracted rows.
         if matches!(axis, TriageAxis::Sensitivity) && to_value == "sealed" {
             tx.execute(
                 "UPDATE triage SET category = NULL, extractor_model_used = NULL
@@ -3604,29 +3405,17 @@ impl Store for SqliteStore {
                 "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
-            // And the NOTIFICATION EVENT, if this message already emitted one.
-            // An `events` row is a denormalized snapshot — sender + one_line,
-            // captured pre-seal — that every client cursor replays forever,
-            // including an iOS notification-service extension putting it on a
-            // lock screen. Sealing must retract that: the seal invariant says
-            // sealed content never reaches a notification surface, and it is not
-            // upheld by refusing to emit ONE event if the row already emitted is
-            // served indefinitely. No path re-emits it either — `worthy_kind`
-            // refuses non-normal sensitivity and the row is now human-stamped.
+            // And the NOTIFICATION EVENT, if one was already emitted: its
+            // sender + one_line snapshot replays to every client cursor forever,
+            // including onto a lock screen, and sealed content must not reach a
+            // notification surface.
             //
-            // REDACT, NEVER DELETE. `events.id` is `INTEGER PRIMARY KEY` with no
-            // AUTOINCREMENT, so it IS the rowid and SQLite hands the largest
-            // free one to the next insert: deleting the newest event would let
-            // the next `append_event` REUSE that id. Every consumer of this log
-            // holds a durable cursor (the pusher's `apns_push_cursor` row, each
-            // client's `after=<id>`), and a cursor already past the reused id
-            // skips that event permanently — a lost notification, forever, for
-            // an unrelated message. So the row STAYS and only its content goes:
-            // id/message_id/thread_id/kind/tier/importance/created_at are
-            // structure, and the seal requirement is that CONTENT is gone. The
-            // notification itself already fired pre-seal (nothing can unring
-            // that), and a replaying client renders its generic fallback for an
-            // empty sender/one_line.
+            // REDACT, NEVER DELETE. `events.id` is `INTEGER PRIMARY KEY` without
+            // AUTOINCREMENT, so it is the rowid and SQLite hands the largest free
+            // one to the next insert — deleting the newest event would let the
+            // next `append_event` REUSE that id, and every durable cursor already
+            // past it would skip that event permanently. The row stays and only
+            // its CONTENT goes; a replaying client renders its generic fallback.
             tx.execute(
                 "UPDATE events SET sender = '', one_line = '', deadline = NULL
                  WHERE account_id = ?1 AND message_id = ?2",
@@ -3709,8 +3498,7 @@ impl Store for SqliteStore {
                 dimension,
                 from_value,
                 to_value,
-                // A row written by an older build (or hand-edited) must not take
-                // the whole list down; fall back to a null snapshot.
+                // One unparseable snapshot must not take the whole list down.
                 original: serde_json::from_str(&original).unwrap_or(serde_json::Value::Null),
                 sender,
                 subject,
@@ -3729,11 +3517,9 @@ impl Store for SqliteStore {
         limit: u32,
     ) -> Result<Vec<ShredCandidate>> {
         let conn = self.lock()?;
-        // Same predicate as sealed_messages (sensitivity='sealed'), narrowed to
-        // rows older than the cutoff and not already shredded. OLDEST FIRST so a
-        // capped pass always chews through the deepest backlog first and makes
-        // monotonic progress across runs. `gmail_msg_id <> ''` because a row we
-        // cannot address is a row we cannot trash.
+        // Sealed rows older than the cutoff and not already shredded. OLDEST
+        // FIRST so a capped pass makes monotonic progress across runs, and
+        // `gmail_msg_id <> ''` because an unaddressable row cannot be trashed.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.gmail_msg_id, m.from_addr, t.sealed_kind, m.received_at
              FROM messages m
@@ -3842,13 +3628,11 @@ impl Store for SqliteStore {
 
     fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>> {
         let conn = self.lock()?;
-        // Enrich each row with the targeted message's sender/subject when `target`
-        // parses as a message id that exists for this account. `target` is TEXT and
-        // often holds non-numeric values (rule patterns, senders); CAST of such a
-        // value yields 0 in SQLite (never errors), which cannot match a real id
-        // (message ids are positive), so the LEFT JOIN just yields NULLs. Sealed
-        // messages ARE included (human door): their sender/subject already show on
-        // the Auth tab; sealed CONTENT is never selected here.
+        // Enrich each row with the targeted message's sender/subject. `target` is
+        // TEXT and often non-numeric (rule patterns, senders); SQLite CASTs those
+        // to 0, which cannot match a real id, so the LEFT JOIN yields NULLs
+        // instead of erroring. Sealed messages ARE joined (human door) — their
+        // sender/subject already show on the Auth tab, and no CONTENT is selected.
         let mut stmt = conn.prepare(
             "SELECT a.id, a.account_id, a.ts, a.actor, a.action, a.target, a.detail,
                     m.from_addr, m.from_name, m.subject
@@ -3874,8 +3658,8 @@ impl Store for SqliteStore {
         let mut out = Vec::new();
         for row in rows {
             let (id, acct, ts, actor, action, target, detail, from_addr, from_name, subject) = row?;
-            // Sender = from_name if present, else from_addr. Both are None when the
-            // join found no message (non-numeric target or unknown id).
+            // from_name if present, else from_addr; both None when the join found
+            // no message.
             let target_sender = from_name.filter(|s| !s.is_empty()).or(from_addr);
             out.push(AuditEntry {
                 id,
@@ -3926,8 +3710,8 @@ impl Store for SqliteStore {
             )
             .optional()?;
 
-        // Sitrep band counts over non-sealed rows. Definitions match the `band`
-        // query on attention_updates so the header and the list agree.
+        // Sitrep band counts over non-sealed rows. These definitions MUST match
+        // the `band` query on attention_updates, or header and list disagree.
         let (standing, new_count, open_count): (i64, i64, i64) = conn.query_row(
             "SELECT
                  COUNT(*) FILTER (
@@ -3969,9 +3753,9 @@ impl Store for SqliteStore {
 
     fn stage1_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage1Queued>> {
         let conn = self.lock()?;
-        // Rows still needing the Stage-1 LLM refine pass: heuristic seed values
-        // in place (stage1_model_used IS NULL), non-sealed, non-sent. Rows a
-        // sender rule decided carry stage1_model_used='rule' and are excluded.
+        // Rows still needing Stage-1: heuristic seed values in place
+        // (stage1_model_used IS NULL), non-sealed, non-sent. Rule-decided rows
+        // carry stage1_model_used='rule' and are excluded.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
                     m.received_at,
@@ -4027,9 +3811,9 @@ impl Store for SqliteStore {
         } else {
             serde_json::to_string(&applied.field_reasons).ok()
         };
-        // Overwrite the heuristic seed values, stamp stage1_model_used (leaving
-        // the Stage-1 queue), and set the escalation flag. `model_used` (the
-        // Stage-2 marker) is left untouched. Guarded by sensitivity='normal'.
+        // Overwrite the seed values, stamp stage1_model_used (leaving the queue),
+        // and set the escalation flag, leaving `model_used` (the Stage-2 marker)
+        // untouched. Guarded by sensitivity='normal'.
         let n = tx.execute(
             "UPDATE triage SET
                  importance = ?3,
@@ -4056,12 +3840,11 @@ impl Store for SqliteStore {
                 applied.category,
             ],
         )?;
-        // TOCTOU: the row can be sealed BY HAND between the queue SELECT and this
-        // apply. When the guard matched nothing, the verdict did NOT land — skip
-        // the deadlines rewrite too (a sealed message must not grow a fresh
-        // deadline row) and report `false` so the caller emits no event.
+        // TOCTOU: a row sealed by hand between the queue SELECT and this apply
+        // makes the guard match nothing. The verdict did NOT land, so skip the
+        // deadlines rewrite too — a sealed message must not grow a fresh deadline
+        // row — and report `false` so the caller emits no event.
         if n > 0 {
-            // (Re)write the deadlines row idempotently.
             tx.execute(
                 "DELETE FROM deadlines WHERE message_id=?1",
                 params![applied.message_id],
@@ -4140,13 +3923,9 @@ impl Store for SqliteStore {
 
     fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>> {
         let conn = self.lock()?;
-        // The Stage-2 queue predicate: Stage-1 finished with the row
-        // (stage1_model_used IS NOT NULL) AND flagged it for escalation
-        // (needs_stage2=1) AND Stage-2 hasn't processed it yet (model_used IS
-        // NULL). Sealed rows carry sensitivity='sealed' and are structurally
-        // excluded. Join the message for context and LEFT JOIN the matched sender
-        // rule for its want_text (Filtered rules escalate here). is_known_contact
-        // is derived from a correlated EXISTS against contacts.
+        // Queue predicate: Stage-1 finished the row, flagged it for escalation,
+        // and Stage-2 has not processed it. Sealed rows are structurally
+        // excluded. The LEFT JOIN carries a matched Filtered rule's want_text.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
                     sr.want_text, m.received_at,
@@ -4243,13 +4022,11 @@ impl Store for SqliteStore {
     fn stage2_apply(&self, applied: &Stage2Applied) -> Result<bool> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        // Overwrite triage fields and stamp model_used. Guarded by
-        // sensitivity='normal' so a sealed row can never be mutated here even if
-        // a caller mis-targets one (defense in depth; the queue already excludes
-        // sealed rows).
+        // Overwrite triage fields and stamp model_used, guarded by
+        // sensitivity='normal' so a mis-targeted sealed row is never mutated.
         let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
-        // Stage-2 owns all three properties on apply, so its reasons fully replace
-        // any Stage-1 blob. NULL when empty (defensive; apply always sets some).
+        // Stage-2 owns all three properties on apply, so its reasons fully
+        // replace any Stage-1 blob.
         let field_reasons_json = if applied.field_reasons.is_empty() {
             None
         } else {
@@ -4279,11 +4056,10 @@ impl Store for SqliteStore {
                 applied.category,
             ],
         )?;
-        // TOCTOU: same as `stage1_apply` — a row sealed by hand mid-pass makes
-        // the guard match nothing. No verdict landed, no deadline row, `false`
-        // back to the caller so no notification event is emitted.
+        // TOCTOU, as in `stage1_apply`: a row sealed mid-pass makes the guard
+        // match nothing, so no verdict landed, no deadline row is written, and
+        // `false` keeps the caller from emitting an event.
         if n > 0 {
-            // (Re)write the deadlines row idempotently.
             tx.execute(
                 "DELETE FROM deadlines WHERE message_id=?1",
                 params![applied.message_id],
@@ -4511,9 +4287,8 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    /// Trait override: expose the swappable, possibly-late-attached embedder so a
-    /// generic `S: Store` caller (the sync engine) resolves the CURRENT embedder,
-    /// including one attached in the background after `serve` bound its port.
+    /// Trait override so a generic `S: Store` caller resolves the CURRENT
+    /// embedder, including one attached late in the background.
     fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
         SqliteStore::embedder(self)
     }
@@ -4580,10 +4355,9 @@ mod tests {
 
     #[test]
     fn double_attached_identical_file_cannot_kill_ingest() {
-        // REMOTE INGEST DoS REGRESSION: two parts with the SAME filename and
-        // size (trivial for a hostile sender; plausible accidentally) violated
-        // the UNIQUE key and rolled back the whole message ingest. INSERT OR
-        // IGNORE collapses them to one row; the ingest must succeed.
+        // REMOTE INGEST DoS: two parts with the SAME filename and size violate
+        // the UNIQUE key, which must collapse to one row rather than roll back
+        // the whole message ingest.
         use crate::config::Stage1Config;
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
@@ -4786,10 +4560,8 @@ mod tests {
 
     #[test]
     fn migrate_adds_field_reasons_to_a_preexisting_triage_table() {
-        // Simulate an existing install whose `triage` predates field_reasons.
-        // `model_used`/`status` are original triage columns (they predate this
-        // feature and the two-stage split), so a realistic pre-existing table
-        // carries them — the two-stage backfill in migrate() reads them.
+        // An install whose `triage` has no field_reasons. `model_used`/`status`
+        // are present because the two-stage backfill in migrate() reads them.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE triage(
@@ -4811,10 +4583,9 @@ mod tests {
 
     #[test]
     fn migrate_adds_two_stage_columns_so_ingest_and_both_queues_work() {
-        // Simulate a PRE-TWO-STAGE install: a `triage` table that predates
-        // stage1_model_used / needs_stage2 (and field_reasons). The additive
-        // migration must add them so the first ingest + both queue SELECTs (which
-        // NAME those columns) don't fail with "no such column".
+        // A `triage` table with no stage1_model_used / needs_stage2 /
+        // field_reasons. The migration must add them so ingest and both queue
+        // SELECTs, which NAME those columns, don't fail with "no such column".
         register_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -4828,8 +4599,8 @@ mod tests {
                  created_at TEXT NOT NULL);",
         )
         .unwrap();
-        // init applies SCHEMA (IF NOT EXISTS keeps the old triage shape) then
-        // migrate() (adds the two columns + backfill).
+        // init applies SCHEMA (IF NOT EXISTS preserves the existing triage
+        // shape) then migrate(), which adds the two columns + backfill.
         let store = SqliteStore::init(conn).unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
 
@@ -4893,9 +4664,9 @@ mod tests {
 
     #[test]
     fn migrate_cleans_year_slipped_stage_deadlines() {
-        // The "54 weeks past due" retro-clean: a stage-sourced deadline far
-        // before its message's receipt is nulled (tier demoted from past_due),
-        // the deadlines row deleted; deterministic-source rows are untouched.
+        // A stage-sourced deadline far before its message's receipt is nulled
+        // (tier demoted from past_due) and its deadlines row deleted;
+        // deterministic-source rows are untouched.
         let store = SqliteStore::open_in_memory().unwrap();
         let conn = store.lock().unwrap();
         conn.execute_batch(
@@ -5328,11 +5099,9 @@ mod tests {
 
     #[test]
     fn sealing_by_hand_clears_the_category_and_specialist_rows() {
-        // A human can seal a message the pipeline already categorized and
-        // extracted. Two documented invariants would otherwise become false:
-        // "sealed rows carry a NULL category", and "the specialist tables hold
-        // no sealed rows BY CONSTRUCTION". The message would also sit in the
-        // Marketing zone while the Auth page claimed it.
+        // Sealing a message the pipeline already categorized and extracted must
+        // keep both invariants true — sealed rows carry a NULL category, and the
+        // specialist tables hold no sealed rows.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let t0 = Utc::now();
@@ -5376,17 +5145,12 @@ mod tests {
 
     #[test]
     fn sealing_by_hand_retracts_the_notification_event() {
-        // A message can notify FIRST and be sealed by hand after. The `events` row
-        // is a denormalized pre-seal snapshot (sender + one_line) that every
-        // client cursor replays forever — and an iOS notification-service
-        // extension renders exactly that row on a lock screen. So sealing has to
-        // retract it; refusing to emit a SECOND event is not the same thing.
+        // A message can notify FIRST and be sealed by hand after, so sealing has
+        // to retract the pre-seal snapshot every client cursor replays forever.
         //
         // Retraction is REDACTION, not deletion: `events.id` is the rowid, so
         // deleting the newest row would free that id for the next append, and
-        // every durable cursor past it (`apns_push_cursor`, a client's `after=`)
-        // would silently skip the reused event forever. The row therefore stays,
-        // keyed and ordered exactly as before, with its CONTENT emptied.
+        // every durable cursor past it would skip the reused event forever.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let t0 = Utc::now();
@@ -7004,7 +6768,6 @@ mod tests {
         assert_eq!(rows2[0].input_tokens, 500);
     }
 
-    /// Local mirror of `triage::stage1_llm::HEURISTIC_ONLY` for the tests above.
     const HEURISTIC_ONLY_MARKER: &str = "heuristic-only";
 
     #[test]
@@ -7142,12 +6905,10 @@ mod tests {
 
     #[test]
     fn stage2_prompt_carries_only_the_matched_rules_want_text() {
-        // DETERMINISM: with N sender rules in the db, a Stage-2 prompt must carry
-        // AT MOST the ONE rule's want_text whose id equals the row's
-        // matched_rule_id (chosen by Stage-1's pure `match_sender_rule`), and NONE
-        // of the others'. Rule selection is pure code: the queue LEFT JOINs
-        // exactly `sr.id = t.matched_rule_id`, so the full rule list is NEVER fed
-        // to the prompt.
+        // DETERMINISM: a Stage-2 prompt carries AT MOST the one want_text whose
+        // rule id equals the row's matched_rule_id, never the others'. The queue
+        // LEFT JOINs exactly `sr.id = t.matched_rule_id`, so the full rule list
+        // is never fed to the prompt.
         use crate::triage::stage2::{RowContext, build_user_message};
 
         let store = SqliteStore::open_in_memory().unwrap();
@@ -7246,12 +7007,10 @@ mod tests {
 
     #[test]
     fn mailing_list_storm_capped_at_thread_daily_cap() {
-        // Audit (c): a mailing-list storm — 30 messages, all in ONE thread —
-        // must result in AT MOST `thread_daily_cap` API calls. This models the
-        // exact check-BEFORE-increment discipline stage2_pass runs per row:
-        // read the per-thread counter, skip if it's already at the cap, else
-        // increment (which is what "make a call" costs). Any global cap is set
-        // high so the per-thread cap is the binding constraint.
+        // A mailing-list storm — 30 messages in ONE thread — must cost AT MOST
+        // `thread_daily_cap` API calls. Models the check-BEFORE-increment
+        // discipline stage2_pass runs per row, with the global cap set high so
+        // the per-thread cap binds.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let day = "2026-07-09";
@@ -7282,8 +7041,8 @@ mod tests {
 
     #[test]
     fn one_sender_across_many_threads_capped_at_sender_daily_cap() {
-        // TASK 3: a chatty sender fanning 10 messages across 10 DIFFERENT threads
-        // must cost AT MOST `sender_daily_cap` calls. Models the per-sender
+        // A chatty sender fanning 10 messages across 10 DIFFERENT threads must
+        // cost AT MOST `sender_daily_cap` calls. Models the per-sender
         // check-BEFORE-increment the pass runs (keyed by sender:<addr>), with the
         // per-thread and global caps set high so the per-sender cap binds.
         let store = SqliteStore::open_in_memory().unwrap();
@@ -7316,8 +7075,8 @@ mod tests {
 
     #[test]
     fn stage2_usage_ledger_bumps_and_reads() {
-        // TASK 5: bumping the usage ledger accumulates calls + tokens per day, and
-        // reading returns the running totals (zeroed for an untouched day).
+        // Bumping the ledger accumulates calls + tokens per day, and reading
+        // returns the running totals (zeroed for an untouched day).
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let day = "2026-07-09";
@@ -7428,11 +7187,8 @@ mod tests {
 
     #[test]
     fn override_cap_binds_below_config_default() {
-        // The Stage-2 pass reads stage2_cap_overrides at the START of each cycle
-        // and uses override > config/env > default. Here a runtime override of 1
-        // caps a thread that the config default (3) would have allowed 3 calls on.
-        // Models the exact check-BEFORE-increment discipline stage2_pass runs,
-        // driving the effective cap the same way the pass computes it.
+        // Precedence is override > config/env > default: a runtime override of 1
+        // caps a thread the config default (3) would have allowed 3 calls on.
         use crate::config::APP_SETTING_THREAD_DAILY_CAP;
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
@@ -7526,8 +7282,7 @@ mod tests {
 
     #[test]
     fn update_sender_rule_edits_by_id_and_404s_unknown() {
-        // TASK 6 (store layer): update_sender_rule overwrites pattern/want/disp by
-        // id, returns false for an unknown id.
+        // Overwrites pattern/want/disposition by id; false for an unknown id.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let id = store
@@ -7552,9 +7307,9 @@ mod tests {
 
     #[test]
     fn stale_skip_marks_processed_without_budget() {
-        // TASK 4: a row older than the cutoff is stale-skipped: marked processed
-        // with model_used='stale-skip' (keeping Stage-1 values), leaving the
-        // queue, and NOT touching any budget row. Models the pass-loop decision.
+        // A row older than the cutoff is stale-skipped: marked processed with
+        // model_used='stale-skip' (keeping Stage-1 values), leaving the queue,
+        // and spending no budget.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let max_age_days: i64 = 7;
@@ -7612,8 +7367,7 @@ mod tests {
 
     #[test]
     fn stage2_queue_carries_received_at() {
-        // TASK 4 support: the queue surfaces received_at so the pass can skip
-        // stale rows.
+        // The queue surfaces received_at so the pass can skip stale rows.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let mut m = sample_msg(acct, "g1", "t1");
@@ -7707,9 +7461,8 @@ mod tests {
             }),
             category: Some("general".into()),
         };
-        // TOCTOU report: the guard matched nothing, and the caller must know —
-        // a bare Ok here is what would let a message sealed mid-pass emit a
-        // notification event anyway.
+        // TOCTOU report: the guard matched nothing and the caller must know —
+        // a bare Ok would let a message sealed mid-pass emit an event anyway.
         assert!(!store.stage2_apply(&applied).unwrap(), "sealed row: apply reports false");
         // The sealed row's triage must be unchanged (guarded by sensitivity),
         // and the verdict's deadline must NOT have been written either.
@@ -7729,10 +7482,9 @@ mod tests {
     #[test]
     fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
         use crate::triage::DeadlineHit;
-        // TOCTOU: the Stage-1 pass SELECTs its queue, then a human seals one of
-        // the rows before the pass gets around to applying its verdict. The
-        // guarded UPDATE matches nothing; the apply must say so, or the engine
-        // would emit a notification event for a now-sealed message.
+        // TOCTOU: a human seals a row between the Stage-1 queue SELECT and its
+        // apply. The guarded UPDATE matches nothing, and the apply must say so or
+        // the engine emits a notification event for a now-sealed message.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let id = seed_triage_row(&store, acct, "g-race", "t1", Sensitivity::Normal);
@@ -8127,11 +7879,9 @@ mod tests {
         assert_eq!(all[0].id, first.id, "listed oldest-first");
     }
 
-    /// Devices are account-scoped on read, and a token that already belongs to
-    /// another account CANNOT be taken over by re-registering it: the conflict
-    /// update is scoped to the owning account, so the collision is an error and
-    /// the original row is untouched. Otherwise a bearer for account B could
-    /// silently repoint account A's phone at itself.
+    /// A token belonging to another account CANNOT be taken over by
+    /// re-registering it: the collision is an error and the original row is
+    /// untouched, or account B could repoint account A's phone at itself.
     #[test]
     fn a_cross_account_token_collision_is_refused_not_rebound() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -8231,11 +7981,9 @@ mod tests {
 
     #[test]
     fn sealed_message_is_never_embedded() {
-        // The structural gate lives at the CALLER (ingest/backfill only embed
-        // non-sealed rows). `messages_missing_vectors` — the backfill's source —
-        // must NEVER return a sealed row, so a sealed message can never acquire a
-        // vector through the supported path. We assert both: the sealed row is
-        // absent from the missing-vector list, and its vec slot stays empty.
+        // The structural gate lives at the CALLER, so `messages_missing_vectors`
+        // — the backfill's source — must NEVER return a sealed row. Both halves
+        // are asserted: absent from the list, and its vec slot stays empty.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
 
@@ -8276,9 +8024,9 @@ mod tests {
 
     #[test]
     fn sent_raw_body_is_stored_and_embeddable() {
-        // TASK 3/7: a SENT message stores its full body (recall covers what the
-        // USER wrote), and that body flows through the missing-vector backfill so
-        // it becomes embeddable — even though sent mail is excluded from triage.
+        // A SENT message stores its full body (recall covers what the USER
+        // wrote), and that body flows through the missing-vector backfill so it
+        // becomes embeddable — even though sent mail is excluded from triage.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
 
@@ -8443,13 +8191,10 @@ mod tests {
 
     #[test]
     fn keyword_search_works_before_embedder_then_attaches_live() {
-        // BUG 3 (issue #16) serve-bind model. This mirrors `squelchd serve`: the
-        // store is already SHARED (behind Arc) and serving, with NO embedder yet.
-        // 1) hybrid_search must work KEYWORD-ONLY (no embedder) — proving both
-        //    doors stay useful while the model downloads in the background.
-        // 2) semantic_search must fail gracefully (no embedder attached).
-        // 3) attach_embedder on &self (post-Arc) must swap the embedder in live.
-        // 4) semantic_search must then work — no restart, no rebind.
+        // The serve-bind model: the store is already SHARED behind an Arc and
+        // serving with NO embedder yet, so hybrid_search must work keyword-only,
+        // semantic_search must fail gracefully, and an attach on &self must swap
+        // the embedder in live with no restart.
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@example.com").unwrap();
 

@@ -1,61 +1,10 @@
-//! The APNs PUSHER: the second delivery adapter on the `events` log.
+//! The APNs pusher: the second delivery adapter on the durable `events` log.
 //!
-//! One task, one job. It reads the durable `events` table past ITS OWN cursor
-//! and POSTs an opaque ping — an event id and a collapse id — to the blind
-//! relay (`squelch-relay`), which signs an APNs JWT and forwards it to Apple.
-//! The phone's Notification Service Extension then fetches the real event from
-//! the user's own daemon over their tailnet and rewrites the notification.
-//!
-//! # THE RELAY IS BLIND. That is the whole feature.
-//!
-//! This module reads FULL [`Event`] rows — sender, subject line, tier,
-//! importance, deadline — because it has to read the row to learn its id and
-//! thread. **None of that is ever serialized onto the wire.** The request body
-//! is a fixed, closed shape ([`PushRequest`]) carrying exactly:
-//!
-//! - `device_tokens` — this account's registered tokens
-//! - `event_id`      — the monotonic id, opaque to everyone downstream
-//! - `collapse_id`   — `thread-<thread id>`, so a busy thread coalesces on the
-//!   lock screen instead of stacking
-//! - `topic` / `environment` — operator pass-throughs, when configured
-//!
-//! A relay operator (and Apple) learns that *a* notification happened, when, and
-//! to which device. Never what it was about. Adding a field to [`PushRequest`]
-//! is therefore a security change, not a feature change — `body_is_blind` in the
-//! tests below fails the build if content ever leaks in.
-//!
-//! # Cursor and delivery semantics
-//!
-//! Per-channel cursors, never a global "delivered" flag: the Mac's SSE consumer
-//! carries its own `after=<id>` and this task keeps its own in `sync_state` under
-//! [`CURSOR_KEY`]. Neither can stall the other.
-//!
-//! - **At-least-once.** The cursor advances only AFTER the relay answered 200
-//!   for that event AND APNs took at least one token, so an outage on EITHER
-//!   hop delays pushes but never skips them. The relay reports an unreachable
-//!   or timed-out APNs as a per-token `status: 0` inside an otherwise-200
-//!   batch, so "the relay answered" is not by itself evidence of delivery. The
-//!   duplicate a crash-after-push/before-commit produces is absorbed by APNs'
-//!   own collapse id.
-//! - **A PARTIAL delivery still advances.** If even one token landed, the event
-//!   was delivered; retrying the whole event to punish one failed token would
-//!   re-notify every healthy device, and the collapse id only merges the
-//!   lock-screen entry, not the wake. The failed token's own status is logged.
-//! - **One POST per event**, oldest first — the phone gets ids in the order they
-//!   happened.
-//! - **No devices, no request.** With nothing registered, an unpushed event is
-//!   not a backlog; the cursor advances and the relay is never called.
-//! - **Cold start joins at the head.** The first run with no persisted cursor
-//!   adopts `latest_event_id` rather than replaying history, exactly as a
-//!   cursorless SSE client does: a phone registering today must not be handed
-//!   last week's mail as a notification storm.
-//!
-//! # Privacy of the logs
-//!
-//! The relay bearer is never logged. Device tokens are never logged — the
-//! failure lines carry a device ROW ID or an 8-character prefix at most, which is
-//! enough to correlate with the `devices` table and useless to anyone reading a
-//! log file.
+//! THE RELAY IS BLIND — this task reads full [`Event`] rows but serializes only
+//! [`PushRequest`] (event id + collapse id), so adding a field there is a
+//! security change. Its own `sync_state` cursor ([`CURSOR_KEY`]) advances only
+//! after a delivery: at-least-once, never a skip. Bearer and device tokens are
+//! never logged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,9 +17,9 @@ use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
 use crate::types::{AccountId, Event};
 
-/// The pusher's own cursor row in `sync_state` (`uidvalidity` unused, `last_uid`
-/// holds the last event id we know the relay accepted). A distinct key from the
-/// Gmail engine's `'history'` row: per-channel cursors are the design law.
+/// The pusher's cursor row in `sync_state`: `uidvalidity` unused, `last_uid`
+/// holds the last event id the relay accepted. A key of its own, distinct from
+/// the sync engine's `'history'` row, so neither channel can stall the other.
 pub const CURSOR_KEY: &str = "apns_push_cursor";
 
 /// Events read per store round-trip. The drain loops until the table is caught
@@ -88,9 +37,8 @@ const MAX_COLLAPSE_ID: usize = 64;
 /// missed or `Lagged` wake and a daemon that started with a stale cursor.
 const IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Backoff after a relay failure. Base 5s, doubling, capped at 5 minutes — the
-/// events are already durable, so there is no rush and no reason to hammer a
-/// relay that is down.
+/// Backoff after a relay failure: the events are already durable, so there is no
+/// reason to hammer a relay that is down.
 const BACKOFF_BASE: Duration = Duration::from_secs(5);
 const BACKOFF_CAP: Duration = Duration::from_secs(300);
 
@@ -99,14 +47,13 @@ const BACKOFF_CAP: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The complete wire body. THIS IS THE PRIVACY BOUNDARY — see the module header
-/// before adding a field. Content-bearing fields of [`Event`] (sender, one_line,
-/// tier, importance, kind, deadline) are deliberately absent and must stay so.
+/// The complete wire body, and THE PRIVACY BOUNDARY: the content-bearing fields
+/// of [`Event`] (sender, one_line, tier, importance, kind, deadline) are absent
+/// and must stay absent. Adding a field here is a security change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PushRequest<'a> {
     pub device_tokens: &'a [String],
-    /// The monotonic event id. The relay forwards it verbatim and never
-    /// interprets it.
+    /// Monotonic event id; the relay forwards it verbatim, never interprets it.
     pub event_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collapse_id: Option<String>,
@@ -130,11 +77,9 @@ struct PushResponse {
     results: Vec<PushResult>,
 }
 
-/// What one event's fan-out actually produced, across every token chunk.
-///
-/// The relay answering 200 only means the RELAY is up; each token still carries
-/// its own APNs status. This is the tally that decides whether the cursor may
-/// move.
+/// What one event's fan-out produced across every token chunk. The relay
+/// answering 200 only means the RELAY is up; each token carries its own APNs
+/// status, and this tally decides whether the cursor may move.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PushOutcome {
     /// Tokens APNs retired (`410`), for the caller to delete.
@@ -147,12 +92,10 @@ struct PushOutcome {
 }
 
 impl PushOutcome {
-    /// Nothing landed and something retryable failed: the APNs hop is out even
-    /// though the relay hop is fine. Treated exactly like a relay outage —
-    /// leave the cursor, back off, try again.
-    ///
-    /// Deliberately NOT "any failure": a partial delivery advances, because the
-    /// alternative re-pushes the event to every device that already got it.
+    /// Nothing landed and something retryable failed: the APNs hop is out while
+    /// the relay hop is fine — leave the cursor, back off, retry. Deliberately
+    /// NOT "any failure": a partial delivery advances, because retrying would
+    /// re-push the event to every device that already got it.
     fn nothing_landed(&self) -> bool {
         self.delivered == 0 && self.failed > 0
     }
@@ -171,7 +114,6 @@ fn collapse_id(thread_id: &str) -> String {
     format!("{PREFIX}{}", &thread_id[..end])
 }
 
-/// The next backoff delay: base on the first failure, doubling after, capped.
 fn next_backoff(current: Option<Duration>) -> Duration {
     match current {
         None => BACKOFF_BASE,
@@ -179,9 +121,8 @@ fn next_backoff(current: Option<Duration>) -> Duration {
     }
 }
 
-/// A device token reduced to something safe to put in a log line: at most the
-/// first 8 characters. Enough to correlate with a `devices` row, useless as a
-/// capability.
+/// A device token reduced to something safe to log: at most 8 characters, enough
+/// to correlate with a `devices` row and useless as a capability.
 fn token_prefix(token: &str) -> &str {
     let mut end = token.len().min(8);
     while end > 0 && !token.is_char_boundary(end) {
@@ -190,14 +131,10 @@ fn token_prefix(token: &str) -> &str {
     &token[..end]
 }
 
-/// The pusher's HTTP client.
-///
-/// REDIRECTS ARE REFUSED. Every request this client makes carries the relay
-/// bearer, and reqwest's default policy follows up to 10 hops — so a compromised
-/// or merely misconfigured relay could answer `307` and walk a token-bearing
-/// POST to a host of its choosing. With the policy off, a 3xx is simply a
-/// non-2xx: it lands in the existing backoff with the cursor unmoved, which is
-/// the correct handling of a relay that stopped answering properly.
+/// The pusher's HTTP client. REDIRECTS ARE REFUSED: every request carries the
+/// relay bearer, and reqwest's default policy would let a `307` walk that
+/// token-bearing POST to a host of the relay's choosing. Off, a 3xx is simply a
+/// non-2xx — backoff, cursor unmoved.
 fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -206,9 +143,8 @@ fn http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// The APNs pusher task. Construct with [`Pusher::from_config`] — which returns
-/// `Ok(None)` when no relay is configured, so "the feature is off" is a value,
-/// not a branch every caller has to remember.
+/// The APNs pusher task. Construct with [`Pusher::from_config`], which returns
+/// `Ok(None)` when no relay is configured.
 pub struct Pusher {
     store: Arc<dyn Store>,
     account_id: AccountId,
@@ -222,15 +158,10 @@ pub struct Pusher {
 }
 
 impl Pusher {
-    /// Build the pusher from config, or `Ok(None)` when `pusher.relay_url` is
-    /// unset — which is the feature flag for the whole thing. A daemon with no
-    /// relay configured never constructs an HTTP client aimed at one.
-    ///
-    /// DISABLED AND BROKEN ARE DIFFERENT ANSWERS. `Ok(None)` means the operator
-    /// named no relay; `Err` means they named one and the HTTP client could not
-    /// be built (a TLS backend that failed to initialize, say). Collapsing the
-    /// second into the first would have the daemon print "pusher disabled (no
-    /// SQUELCH_RELAY_URL)" at an operator who set exactly that variable.
+    /// Build the pusher, or `Ok(None)` when `pusher.relay_url` is unset — the
+    /// feature flag for the whole thing, so a daemon with no relay configured
+    /// never builds a client aimed at one. Disabled and broken stay distinct
+    /// answers: `Err` means a relay WAS named and the client could not be built.
     pub fn from_config(
         store: Arc<dyn Store>,
         account_id: AccountId,
@@ -245,8 +176,7 @@ impl Pusher {
         else {
             return Ok(None);
         };
-        // The error carries no url and no bearer: a client-BUILD failure is
-        // about local TLS/config, and neither was ever handed to the builder.
+        // The error carries no url and no bearer; neither reached the builder.
         let http = http_client()
             .map_err(|e| CoreError::Other(anyhow::anyhow!("APNs relay HTTP client: {e}")))?;
         Ok(Some(Self {
@@ -285,8 +215,7 @@ impl Pusher {
     }
 
     /// The pusher's persisted cursor. A first-ever start has none and joins at
-    /// the HEAD of the log (see the module header): a phone registering today
-    /// must not be handed the backlog.
+    /// the HEAD of the log: a phone registering today must not get the backlog.
     fn cursor(&self) -> Result<i64> {
         match self.store.sync_state(self.account_id, CURSOR_KEY)? {
             Some(s) => Ok(s.last_uid as i64),
@@ -309,13 +238,10 @@ impl Pusher {
         )
     }
 
-    /// Push everything past the cursor, oldest first, advancing the cursor one
-    /// event at a time.
-    ///
-    /// Returns `Err` the moment the relay stops answering 200, or the moment a
-    /// 200 from the relay carries no delivered token at all — with the cursor
-    /// left exactly where the last accepted event put it, so the caller backs off
-    /// and the unsent events are retried rather than skipped.
+    /// Push everything past the cursor, oldest first, one event at a time.
+    /// Returns `Err` the moment the relay stops answering 200 — or a 200 carries
+    /// no delivered token — with the cursor left where the last accepted event
+    /// put it, so unsent events are retried rather than skipped.
     async fn drain(&self) -> Result<()> {
         let mut cursor = self.cursor()?;
         loop {
@@ -330,9 +256,8 @@ impl Pusher {
                 .map(|d| d.token)
                 .collect();
 
-            // NOTHING REGISTERED => nothing to deliver to, and an event nobody
-            // can receive is history rather than backlog. Advance without ever
-            // opening a socket to the relay.
+            // Nothing registered: an event nobody can receive is history, not
+            // backlog. Advance without opening a socket to the relay.
             if tokens.is_empty() {
                 if let Some(last) = batch.last() {
                     cursor = last.id;
@@ -345,8 +270,8 @@ impl Pusher {
                 let outcome = self.push_event(ev, &tokens).await?;
                 let dead = &outcome.dead;
                 for token in dead {
-                    // The relay passed APNs' 410 back verbatim precisely so THIS
-                    // daemon owns the cleanup; the relay itself remembers nothing.
+                    // The relay passes APNs' 410 back verbatim so THIS daemon
+                    // owns the cleanup; the relay remembers nothing.
                     match self.store.delete_device_by_token(self.account_id, token) {
                         Ok(true) => eprintln!(
                             "squelch: APNs pusher dropped an unregistered device (token {}…)",
@@ -366,11 +291,9 @@ impl Pusher {
                         break;
                     }
                 }
-                // THE RELAY ANSWERED, APNs DID NOT. Every surviving token came
-                // back 0/429/5xx, so this event reached nobody. Bail with the
-                // cursor unmoved — an APNs outage has to delay pushes for the
-                // same reason a relay outage does, and the relay's own 200 is
-                // not evidence of delivery.
+                // The relay answered, APNs did not: every surviving token came
+                // back 0/429/5xx, so this event reached nobody. The relay's own
+                // 200 is not evidence of delivery — bail, cursor unmoved.
                 if outcome.nothing_landed() {
                     eprintln!(
                         "squelch: APNs took none of {} device(s) for this event; cursor unmoved",
@@ -378,9 +301,8 @@ impl Pusher {
                     );
                     return Err(relay_failure());
                 }
-                // ADVANCE ONLY AFTER A DELIVERY. This is the at-least-once
-                // guarantee: a hop that dies mid-batch leaves the cursor on the
-                // last event that landed, and the rest are retried.
+                // Advance only after a delivery — the at-least-once guarantee:
+                // a hop dying mid-batch leaves the rest to be retried.
                 cursor = ev.id;
                 self.set_cursor(cursor)?;
             }
@@ -388,9 +310,8 @@ impl Pusher {
     }
 
     /// POST one event to the relay for every registered token (chunked to the
-    /// relay's 100-token ceiling). Returns the per-token tally — who retired,
-    /// who landed, who failed — because a 200 from the relay says nothing about
-    /// whether APNs took anything.
+    /// relay's ceiling), returning the per-token tally: a 200 from the relay
+    /// says nothing about whether APNs took anything.
     async fn push_event(&self, ev: &Event, tokens: &[String]) -> Result<PushOutcome> {
         let collapse = collapse_id(&ev.thread_id);
         let mut outcome = PushOutcome::default();
@@ -406,9 +327,8 @@ impl Pusher {
             if let Some(token) = &self.relay_token {
                 req = req.bearer_auth(token);
             }
-            // The error is deliberately NOT propagated: reqwest's Display embeds
-            // the URL and the request builder held the bearer. Only the class of
-            // failure is logged and returned.
+            // The error is NOT propagated: reqwest's Display embeds the URL and
+            // the builder held the bearer. Only the class of failure escapes.
             let resp = req.send().await.map_err(|_| {
                 eprintln!("squelch: APNs relay unreachable; cursor unmoved");
                 relay_failure()
@@ -427,16 +347,12 @@ impl Pusher {
             })?;
             for result in parsed.results {
                 match result.status {
-                    // Delivered.
                     200 => outcome.delivered += 1,
                     // The device is gone. Data, not an error.
                     410 => outcome.dead.push(result.token),
-                    // Retryable: `0` is the relay's word for an APNs it could
-                    // not reach or that ran past its fan-out budget; 429/5xx
-                    // come through verbatim. One of these is one token's
-                    // problem — ALL of them are the event's, which the caller
-                    // decides. Status code only, never the token value or a
-                    // reason string that might echo it.
+                    // Retryable: `0` is the relay's word for an unreachable or
+                    // timed-out APNs; 429/5xx come through verbatim. Log the
+                    // status only — never the token value or a reason string.
                     other => {
                         outcome.failed += 1;
                         eprintln!(
@@ -450,13 +366,10 @@ impl Pusher {
         Ok(outcome)
     }
 
-    /// Run until shutdown.
-    ///
-    /// Wakes on (a) the events broadcast, (b) a coarse [`IDLE_INTERVAL`] tick
-    /// that covers a missed or `Lagged` wake, and (c) the daemon shutdown watch.
-    /// After a relay failure the loop serves a backoff penalty that only shutdown
-    /// may cut short — a wake must not be able to turn a dead relay into a hot
-    /// retry loop.
+    /// Run until shutdown, waking on the events broadcast, a coarse
+    /// [`IDLE_INTERVAL`] tick, or the shutdown watch. After a relay failure only
+    /// shutdown may cut the backoff short — a wake must not turn a dead relay
+    /// into a hot retry loop.
     pub async fn run(
         self,
         mut wake: broadcast::Receiver<i64>,
@@ -494,9 +407,8 @@ impl Pusher {
                     tokio::select! {
                         _ = tokio::time::sleep(IDLE_INTERVAL) => {}
                         recv = wake.recv() => {
-                            // A new id, or `Lagged` because we fell behind —
-                            // identical handling: the payload is a hint and the
-                            // table is the truth, so we re-read past our cursor.
+                            // A new id and `Lagged` are handled identically:
+                            // the payload is a hint, the table is the truth.
                             if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
                                 return Ok(());
                             }
@@ -538,9 +450,7 @@ mod tests {
         }
     }
 
-    /// THE INVARIANT. The body carries an id and a collapse id; every
-    /// content-bearing field of the event it was built from is absent. If this
-    /// test fails, the relay stopped being blind.
+    /// THE INVARIANT: if this test fails, the relay stopped being blind.
     #[test]
     fn body_is_blind() {
         let ev = event(4711, "abc123");
@@ -633,9 +543,8 @@ mod tests {
         assert_eq!(next_backoff(Some(BACKOFF_CAP * 4)), BACKOFF_CAP);
     }
 
-    /// The relay answering 200 is NOT delivery. An outcome where APNs took
-    /// nothing is a failure the cursor must not survive; a partial one is not,
-    /// and all-retired is cleanup rather than failure.
+    /// The relay answering 200 is not delivery: APNs taking nothing is a failure
+    /// the cursor must not survive; a partial delivery is not.
     #[test]
     fn nothing_landed_is_the_apns_hop_being_out() {
         let outcome = |delivered, failed, dead: &[&str]| PushOutcome {
@@ -666,9 +575,8 @@ mod tests {
         assert_eq!(token_prefix(""), "");
     }
 
-    /// No relay configured => no pusher. The absence of the config IS the off
-    /// switch; nothing else needs to know the feature exists. `Ok(None)` and not
-    /// `Err`: disabled is the normal case, never a misconfiguration.
+    /// No relay configured => no pusher, and `Ok(None)` rather than `Err`:
+    /// disabled is the normal case, not a misconfiguration.
     #[test]
     fn from_config_is_none_without_a_relay_url() {
         let store: Arc<dyn Store> = Arc::new(crate::store::SqliteStore::open_in_memory().unwrap());

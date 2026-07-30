@@ -1,15 +1,9 @@
-//! Unsubscribe support for the human door: `List-Unsubscribe` header parsing and
-//! http(s) URL selection.
+//! `List-Unsubscribe` parsing for the human door.
 //!
-//! The server NEVER performs the unsubscribe itself. The client confirms with the
-//! user and opens the returned URL in the user's browser. This module is therefore
-//! PURE (no network, no host resolution): it extracts the first http(s) URL from a
-//! message's stored `List-Unsubscribe` header, or `None` when there is none.
-//!
-//! The RFC 8058 one-click flag (`List-Unsubscribe-Post`) is ignored for selection
-//! — we no longer distinguish one-click from a plain link — though ingest keeps
-//! storing it for possible future use. Only `http`/`https` URLs are ever returned;
-//! `mailto:` and non-web schemes are discarded.
+//! The server NEVER performs the unsubscribe itself — the client confirms with
+//! the user and opens the URL — so this module is PURE (no network, no host
+//! resolution). Only `http`/`https` URLs are ever returned; the RFC 8058
+//! one-click flag is not part of the selection.
 
 /// The unsubscribe outcome for a message, derived purely from its stored
 /// `List-Unsubscribe` header value.
@@ -21,10 +15,8 @@ pub enum UnsubPlan {
     None,
 }
 
-/// Select the first http(s) unsubscribe URL from the raw header value. The
-/// one-click flag is irrelevant to selection and is not a parameter. Returns
-/// [`UnsubPlan::Browser`] with that URL, or [`UnsubPlan::None`] when the header is
-/// absent or carries no http(s) URL. PURE (no network) so it is fully unit-testable.
+/// Select the first http(s) unsubscribe URL from the raw header value, or
+/// [`UnsubPlan::None`] when the header is absent or carries none.
 pub fn classify_unsubscribe(list_unsubscribe: Option<&str>) -> UnsubPlan {
     let Some(header) = list_unsubscribe else {
         return UnsubPlan::None;
@@ -35,10 +27,9 @@ pub fn classify_unsubscribe(list_unsubscribe: Option<&str>) -> UnsubPlan {
     }
 }
 
-/// Return the first `http`/`https` URL among the `<…>`-bracketed entries of a
-/// `List-Unsubscribe` value. Non-web schemes (`mailto:`, `ftp:`, `javascript:`,
-/// …) and anything outside the brackets are ignored, so the caller never hands a
-/// non-web scheme to the client.
+/// The first `http`/`https` URL among the `<…>`-bracketed entries. Non-web
+/// schemes and anything outside the brackets are ignored, so a non-web scheme
+/// can never reach the client.
 fn first_http_url(header: &str) -> Option<String> {
     let bytes = header.as_bytes();
     let mut i = 0;

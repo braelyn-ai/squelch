@@ -1,19 +1,8 @@
-//! End-to-end tests for the APNs pusher against a MOCK RELAY.
-//!
-//! The mock is an axum app on an ephemeral loopback port, so every assertion is
-//! made on the bytes that actually left the daemon. That matters most for
-//! `the_relay_never_sees_content`: the pusher reads full `events` rows (sender,
-//! one-line, tier, deadline) and the entire point of the design is that none of
-//! it is ever serialized. A struct-level assertion could be satisfied by a
-//! second, chattier code path; a wire-level one cannot.
-//!
-//! Cursor rules under test:
-//! - a 200 advances it, one event at a time;
-//! - a relay failure leaves it exactly where it was, and the task retries;
-//! - an APNs failure INSIDE a 200 (the relay is up, Apple is not) leaves it too;
-//! - a partial delivery still advances it;
-//! - no registered devices advances it WITHOUT any request at all;
-//! - a first-ever start joins at the head instead of replaying history.
+//! End-to-end tests for the APNs pusher against a mock relay: an axum app on an
+//! ephemeral loopback port, so every assertion is made on the bytes that
+//! actually left the daemon. `the_relay_never_sees_content` needs exactly that —
+//! a struct-level assertion could be satisfied by a second, chattier code path.
+//! The rest pin the cursor rules: at-least-once, and never a skip.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,9 +40,8 @@ struct Relay {
     auth: Arc<Mutex<Vec<Option<String>>>>,
     /// When set, answer 500 instead of pushing (relay outage).
     fail: Arc<AtomicBool>,
-    /// When set, the RELAY is fine and APNs is not: HTTP 200 with every token
-    /// reported `status: 0`, exactly as the relay reports an unreachable or
-    /// timed-out Apple.
+    /// When set, the relay is fine and APNs is not: HTTP 200 with every token
+    /// reported `status: 0`.
     apns_down: Arc<AtomicBool>,
     /// Tokens APNs considers retired: reported back as `410 Unregistered`.
     dead: Arc<Mutex<Vec<String>>>,
@@ -404,10 +392,9 @@ async fn a_relay_failure_leaves_the_cursor_and_retries() {
     h.stop().await;
 }
 
-/// THE OTHER HOP. The relay is up and answers 200; APNs behind it is not, so
-/// every token comes back `status: 0`. The event reached nobody, so it must be
-/// retried on exactly the same terms as a relay outage — a 200 from the relay
-/// is not evidence of delivery.
+/// THE OTHER HOP: the relay answers 200 while APNs behind it takes nothing, so
+/// the event must be retried on the same terms as a relay outage — a 200 from
+/// the relay is not evidence of delivery.
 #[tokio::test]
 async fn an_apns_failure_inside_a_200_leaves_the_cursor_and_retries() {
     let (base, relay) = spawn_relay().await;
@@ -452,12 +439,9 @@ async fn an_apns_failure_inside_a_200_leaves_the_cursor_and_retries() {
     h.stop().await;
 }
 
-/// THE BEARER STOPS AT THE CONFIGURED RELAY. Every push carries the relay
-/// bearer, and reqwest follows up to 10 redirects by default — so a relay that
-/// turned hostile (or a host with a sloppy rewrite rule) could answer `307` and
-/// have the daemon re-POST the token-bearing request somewhere else entirely.
-/// The pusher's client refuses redirects outright, which turns that into an
-/// ordinary non-2xx: cursor unmoved, backoff, retry.
+/// THE BEARER STOPS AT THE CONFIGURED RELAY. A hostile relay (or a host with a
+/// sloppy rewrite rule) answering `307` must not walk the token-bearing POST
+/// elsewhere; refusing redirects makes that an ordinary non-2xx.
 #[tokio::test]
 async fn a_relay_redirect_is_refused_and_never_carries_the_bearer() {
     let (elsewhere_base, elsewhere) = spawn_relay().await;

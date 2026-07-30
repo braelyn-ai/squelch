@@ -1,12 +1,8 @@
-//! Startup configuration, read once from the environment.
+//! Startup configuration, read once from the environment. Every field is
+//! validated at load time and the process refuses to start on a bad value.
 //!
-//! Every field is validated at load time and the process refuses to start on a
-//! bad value: a relay that boots with an unusable APNs key would fail only on
-//! the first real push, which is exactly the wrong time to find out.
-//!
-//! The `.p8` PEM is held in memory for the life of the process. It is never
-//! logged, never echoed in an error message, and never leaves this crate except
-//! as an ES256 signature.
+//! The `.p8` PEM is held in memory for the life of the process: never logged,
+//! never echoed in an error, and it leaves only as an ES256 signature.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -61,9 +57,8 @@ impl ConfigError {
     }
 }
 
-/// Shortest accepted `SQUELCH_RELAY_AUTH_TOKEN`. A constant-time compare
-/// against a four-character token guards nothing; 32 chars is one
-/// `openssl rand -hex 16`.
+/// Shortest accepted `SQUELCH_RELAY_AUTH_TOKEN`: a constant-time compare
+/// against a four-character token guards nothing.
 pub const MIN_AUTH_TOKEN_LEN: usize = 32;
 
 /// Validated startup configuration.
@@ -78,20 +73,17 @@ pub struct Config {
     /// used when a request omits `topic`.
     pub apns_topics: Vec<String>,
     pub apns_env: Environment,
-    /// Bearer token for `POST /v1/push`. `None` serves the push route open
-    /// (rate-limited only), which `from_env` only produces when the operator
-    /// asked for it with `SQUELCH_RELAY_ALLOW_ANONYMOUS=1`.
+    /// Bearer token for `POST /v1/push`. `None` serves the route open
+    /// (rate-limited only), which `from_env` produces only under an explicit
+    /// `SQUELCH_RELAY_ALLOW_ANONYMOUS=1`.
     pub auth_token: Option<String>,
-    /// TEST-ONLY base-URL override for the APNs host. Production deployments
-    /// must leave this unset; when set it wins over `apns_env`'s host so an
-    /// integration test can point the relay at a local mock.
+    /// TEST-ONLY base-URL override for the APNs host; wins over `apns_env`'s
+    /// host. Production deployments must leave this unset.
     pub apns_url_override: Option<String>,
 }
 
 /// Hand-written so neither the `.p8` nor the bearer token can reach a log
-/// through a stray `{:?}` — a `tracing::debug!(?config)` or an error context
-/// added years from now would otherwise dump the APNs signing key this crate
-/// exists to custody. Mirrors [`crate::JwtSigner`]'s impl.
+/// through a stray `{:?}`.
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -126,8 +118,7 @@ impl Config {
             ConfigError::invalid(format!("invalid SQUELCH_RELAY_BIND `{bind_raw}`: {e}"))
         })?;
 
-        // Exactly one key source: two would leave "which one is live?" ambiguous
-        // for the operator, and zero cannot sign.
+        // Exactly one key source: two leave "which one is live?" ambiguous.
         let key_path = var("SQUELCH_RELAY_APNS_KEY_PATH").map(PathBuf::from);
         let key_inline = var("SQUELCH_RELAY_APNS_KEY");
         let apns_key_pem = match (key_path, key_inline) {
@@ -147,11 +138,9 @@ impl Config {
                     p.display()
                 ))
             })?,
-            // Secret managers and env editors love to flatten a pasted PEM onto
-            // one line with literal `\n` two-character sequences. A real PEM
-            // never contains a backslash, so when there are no actual newlines
-            // the sequences are unambiguously mangled framing — undo it rather
-            // than fail the boot over paste mechanics.
+            // Secret managers flatten a pasted PEM onto one line with literal
+            // `\n` sequences. A real PEM has no backslash, so with no actual
+            // newlines these are unambiguously mangled framing — undo it.
             (None, Some(pem)) if !pem.contains('\n') && pem.contains("\\n") => {
                 pem.replace("\\n", "\n")
             }
@@ -179,11 +168,9 @@ impl Config {
             })?,
         };
 
-        // Serving the push route open is a legitimate v1 choice, but it must be
-        // a TYPED one: a forgotten variable would otherwise silently expose the
-        // relay's resources (and Apple's goodwill) to anyone on the internet,
-        // with only a per-IP bucket — one shared bucket, behind the proxy —
-        // between them and the fan-out.
+        // Serving the push route open is legitimate but must be a TYPED choice:
+        // a forgotten variable must never silently expose the fan-out to the
+        // internet behind nothing but one shared per-IP bucket.
         let allow_anonymous = match var("SQUELCH_RELAY_ALLOW_ANONYMOUS") {
             None => false,
             Some(v) => match v.to_ascii_lowercase().as_str() {
@@ -242,12 +229,11 @@ impl Config {
         })
     }
 
-    /// Resolve a requested topic against the allowlist. `None` yields the
-    /// default (the first configured topic); an unlisted topic is rejected so a
-    /// caller can never push to a bundle id this deployment was not configured
-    /// for. Every field is `pub`, so a hand-built Config CAN carry an empty
-    /// list `parse_topics` would have refused — `first()` turns that into a
-    /// rejected request instead of a panic in the push handler.
+    /// Resolve a requested topic against the allowlist: `None` yields the first
+    /// configured topic, an unlisted topic is rejected so a caller can never
+    /// push to a bundle id this deployment was not configured for. `first()`
+    /// (not indexing) so a hand-built empty list is a rejected request, not a
+    /// panic in the push handler.
     pub fn resolve_topic<'a>(&'a self, requested: Option<&str>) -> Option<&'a str> {
         match requested {
             None => self.apns_topics.first().map(String::as_str),
@@ -307,8 +293,8 @@ mod tests {
         }
     }
 
-    /// The crate exists to custody the `.p8`; a derived `Debug` would hand it
-    /// to the first `tracing::debug!(?config)` anyone ever writes.
+    /// A derived `Debug` would hand the `.p8` to the first
+    /// `tracing::debug!(?config)` anyone ever writes.
     #[test]
     fn debug_redacts_the_key_and_the_bearer() {
         let mut c = cfg(&["dev.squelch.ios"]);

@@ -1,8 +1,6 @@
-//! Configuration. Everything tunable lives here, loaded from
-//! `~/.config/squelch/config.toml` with env-var overrides. Nothing magic is
-//! hardcoded: the Stage-1 triage importance ladder, thresholds, and paths are
-//! all fields on [`Config`] with sane defaults so a missing config file still
-//! yields a working system.
+//! Configuration: `~/.config/squelch/config.toml`, with env-var overrides that
+//! always win. Every threshold and path is a [`Config`] field with a default, so
+//! a missing config file still yields a working system.
 
 use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
@@ -16,17 +14,13 @@ pub const ENV_DB_PATH_LEGACY: &str = "SQUELCH_DB";
 pub const ENV_ACCOUNT_EMAIL: &str = "SQUELCH_ACCOUNT_EMAIL";
 /// Legacy alias for [`ENV_ACCOUNT_EMAIL`], silently accepted with a deprecation note.
 pub const ENV_ACCOUNT_EMAIL_LEGACY: &str = "SQUELCH_ACCOUNT";
-/// Env var listing extra hostnames (comma-separated) the agent door's MCP
-/// Streamable HTTP DNS-rebinding guard should accept, additive to the loopback
-/// defaults. Needed when a reverse proxy (`tailscale serve`) rewrites `Host`.
+/// Comma-separated extra hostnames for the agent door's DNS-rebinding guard,
+/// additive to the loopback defaults (a `tailscale serve` proxy rewrites `Host`).
 pub const ENV_MCP_ALLOWED_HOSTS: &str = "SQUELCH_MCP_ALLOWED_HOSTS";
 
-/// The single, canonical default SQLite path: `~/.local/share/squelch/squelch.db`
-/// (XDG data dir). Every binary resolves to THIS when no path is configured, so
-/// the MCP server, the TUI, `squelchd`, and the API all agree on one db file.
-///
-/// Creates the parent directory best-effort. Falls back to a CWD-relative
-/// `squelch.db` only when `HOME` is unset (unusual).
+/// The one canonical default SQLite path, `~/.local/share/squelch/squelch.db`:
+/// every binary resolves here when no path is configured, so they cannot drift
+/// onto different db files. CWD-relative only when `HOME` is unset.
 pub fn default_db_path() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let dir = PathBuf::from(home).join(".local/share/squelch");
@@ -36,9 +30,8 @@ pub fn default_db_path() -> PathBuf {
     PathBuf::from("squelch.db")
 }
 
-/// Read a canonical env var, falling back to a legacy alias. When only the
-/// legacy name is set, emit a one-line deprecation note to stderr (no values are
-/// logged) and return its value. Returns `None` if neither is set/non-empty.
+/// Read a canonical env var, falling back to a legacy alias with a deprecation
+/// note to stderr (the note carries no value).
 fn env_with_legacy(canonical: &str, legacy: &str) -> Option<String> {
     if let Ok(v) = std::env::var(canonical)
         && !v.is_empty()
@@ -56,34 +49,25 @@ fn env_with_legacy(canonical: &str, legacy: &str) -> Option<String> {
     None
 }
 
-/// Resolve the SQLite path used by ALL binaries, in one place.
-///
-/// Precedence: canonical `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecation
-/// note) > [`default_db_path`]. This is the single source of truth; bins call it
-/// so they can never drift.
+/// The SQLite path for ALL binaries: `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` >
+/// [`default_db_path`]. Single source of truth, so binaries cannot drift.
 pub fn resolve_db_path() -> PathBuf {
     env_with_legacy(ENV_DB_PATH, ENV_DB_PATH_LEGACY)
         .map(PathBuf::from)
         .unwrap_or_else(default_db_path)
 }
 
-/// Resolve the account email used by ALL binaries, in one place.
-///
-/// Precedence: canonical `SQUELCH_ACCOUNT_EMAIL` > legacy `SQUELCH_ACCOUNT`
-/// (deprecation note) > the provided `default_email`.
+/// The account email for ALL binaries: `SQUELCH_ACCOUNT_EMAIL` > legacy
+/// `SQUELCH_ACCOUNT` > `default_email`.
 pub fn resolve_account_email(default_email: &str) -> String {
     env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY)
         .unwrap_or_else(|| default_email.to_string())
 }
 
-/// The MCP agent-door DNS-rebinding allow-list: the loopback defaults rmcp ships
-/// with (`localhost`, `127.0.0.1`, `::1`) PLUS any comma-separated hostnames in
-/// `SQUELCH_MCP_ALLOWED_HOSTS`. Additive by design — we never drop the loopback
-/// entries — so fronting the door with `tailscale serve` (which rewrites `Host`
-/// to `*.ts.net`) stops returning 403 without opening the guard entirely.
-///
-/// Entries may be bare hosts or `host:port` authorities (rmcp matches either).
-/// Blank entries are ignored.
+/// The agent-door DNS-rebinding allow-list: rmcp's loopback defaults PLUS
+/// `SQUELCH_MCP_ALLOWED_HOSTS`. Strictly additive — the loopback entries are
+/// never dropped and the guard is never widened to "any host". Entries may be
+/// bare hosts or `host:port` authorities; blanks are ignored.
 pub fn mcp_allowed_hosts() -> Vec<String> {
     let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
     if let Ok(raw) = std::env::var(ENV_MCP_ALLOWED_HOSTS) {
@@ -102,23 +86,18 @@ pub fn mcp_allowed_hosts() -> Vec<String> {
 /// `const`. See [`WRITE_SCOPES`] for the separate, opt-in action credential.
 pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
 
-/// The WRITE scopes, requested ONLY by `squelchd auth --write` and loaded ONLY
-/// by human-door action endpoints — never by sync/triage. `gmail.modify` covers
-/// label/read-state/archive mutations; `gmail.send` covers sending. Kept as a
-/// distinct grep-obvious constant from [`GMAIL_READONLY_SCOPE`] so the two
-/// credentials can never be conflated.
+/// The WRITE scopes: requested ONLY by `squelchd auth --write`, loaded ONLY by
+/// human-door action endpoints, never by sync/triage. Deliberately a separate
+/// constant from [`GMAIL_READONLY_SCOPE`] so the two can never be conflated.
 pub const GMAIL_MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
 pub const GMAIL_SEND_SCOPE: &str = "https://www.googleapis.com/auth/gmail.send";
 
 /// Convenience: the full set of scopes for the write credential.
 pub const WRITE_SCOPES: &[&str] = &[GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE];
 
-/// Which backend persists OAuth tokens.
-///
-/// `Keyring` uses the OS secret service (macOS Keychain, Linux Secret Service).
-/// `File` writes a mode-0600 JSON file — the only viable option on a headless
-/// Linux box with no desktop keyring. Default is [`CredentialBackend::default`]:
-/// keyring on macOS, file on Linux.
+/// Which backend persists OAuth tokens: the OS secret service, or a mode-0600
+/// JSON file (the only option on a headless box with no desktop keyring).
+/// Defaults to keyring on macOS, file on Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialBackend {
@@ -128,8 +107,7 @@ pub enum CredentialBackend {
 
 impl Default for CredentialBackend {
     fn default() -> Self {
-        // Headless Linux typically has no Secret Service; default to a file.
-        // macOS always has Keychain.
+        // Headless Linux typically has no Secret Service.
         if cfg!(target_os = "macos") {
             CredentialBackend::Keyring
         } else {
@@ -139,9 +117,8 @@ impl Default for CredentialBackend {
 }
 
 impl CredentialBackend {
-    /// Parse from the `credential_backend` config / `SQUELCH_CRED_BACKEND` env
-    /// string. Case-insensitive. Unknown values fall back to the platform
-    /// default.
+    /// Case-insensitive parse of `credential_backend` / `SQUELCH_CRED_BACKEND`;
+    /// an unknown value leaves the caller on the platform default.
     pub fn from_str_lenient(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "keyring" => Some(CredentialBackend::Keyring),
@@ -162,9 +139,8 @@ pub enum Stage2Provider {
 }
 
 impl Stage2Provider {
-    /// Parse from the `stage2_provider` config / `SQUELCH_STAGE2_PROVIDER` env
-    /// string. Case-insensitive. Unknown values return `None` (caller falls back
-    /// to prefix sniffing).
+    /// Case-insensitive parse of `stage2_provider` / `SQUELCH_STAGE2_PROVIDER`;
+    /// an unknown value leaves the caller on prefix sniffing.
     pub fn from_str_lenient(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "anthropic" => Some(Stage2Provider::Anthropic),
@@ -181,9 +157,7 @@ impl Stage2Provider {
         }
     }
 
-    /// Per-provider default cost-ledger prices (USD per MTok input, output).
-    /// Anthropic: claude-haiku-4-5 (1.0 / 5.0). OpenAI: gpt-4o-mini (0.15 / 0.60)
-    /// — change with the model.
+    /// Default cost-ledger prices (USD per MTok in, out) — change with the model.
     pub fn default_prices(self) -> (f64, f64) {
         match self {
             Stage2Provider::Anthropic => (1.0, 5.0),
@@ -192,16 +166,14 @@ impl Stage2Provider {
     }
 }
 
-/// Sync-related tunables. Real config, not constants, so the sync engine can
-/// wire them in without a schema change.
+/// Sync tunables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
     /// How many days of history to backfill on the initial sync.
     pub backfill_days: u32,
-    /// How often (seconds) the incremental poll loop wakes to call
-    /// `history.list`. A poll batch IS the coalesced batch — polling replaces
-    /// the old IDLE wake-coalescing entirely.
+    /// How often (seconds) the incremental poll loop calls `history.list`; one
+    /// poll batch is the coalesced batch.
     pub poll_secs: u64,
 }
 
@@ -214,29 +186,22 @@ impl Default for SyncConfig {
     }
 }
 
-/// Notification-event tunables. The sync engine writes a row to the `events`
-/// table at each triage verdict that is worth interrupting the user for; these
-/// two numbers are the whole emission policy that is not structural.
+/// Notification-event tunables: these two numbers are the whole non-structural
+/// policy for what earns a row in the `events` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
-    /// Importance at or above which a message earns an event on the strength of
-    /// its score alone (past_due/deadline tiers and detected deadlines bypass it
-    /// entirely, exactly as they bypass the squelch line). Default 50 — the same
-    /// number the TUI starts its in-session squelch line at, so "notified" and
-    /// "above the line" mean the same thing. Env:
-    /// `SQUELCH_NOTIFY_MIN_IMPORTANCE`.
+    /// Importance at or above which a message earns an event on score alone
+    /// (past_due/deadline tiers bypass it entirely). Default 50, deliberately the
+    /// same number as the TUI's starting squelch line, so "notified" and "above
+    /// the line" mean the same thing. Env: `SQUELCH_NOTIFY_MIN_IMPORTANCE`.
     pub min_importance: u8,
-    /// THE STORM GUARD. Mail received longer than this many seconds ago can
-    /// never produce an event, whatever its verdict says. Without it, the
-    /// Stage-1/Stage-2 passes chewing through a fresh install's backfilled
-    /// backlog — or `catch_up()` re-scanning the whole backfill window after an
-    /// expired history cursor — would fire hundreds of notifications at once.
-    /// This is what implements "never on initial backfill" ROBUSTLY, across
-    /// restarts and re-syncs, rather than by trusting a code path to know which
-    /// pass it is on. Mail dated in the FUTURE is out of the window too (a
-    /// sender-controlled `Date:` header must not be able to buy freshness — see
-    /// [`crate::triage::events::is_fresh`]). Default 900 (15 minutes).
+    /// THE STORM GUARD: mail received longer ago than this can never produce an
+    /// event, whatever its verdict — that is what makes "never on initial
+    /// backfill" hold across restarts and re-syncs, instead of trusting a code
+    /// path to know which pass it is on. Mail dated in the FUTURE is out of the
+    /// window too, so a sender-controlled `Date:` cannot buy freshness (see
+    /// [`crate::triage::events::is_fresh`]). Default 900.
     pub freshness_window_secs: u64,
 }
 
@@ -249,18 +214,12 @@ impl Default for NotifyConfig {
     }
 }
 
-/// APNs PUSHER config: where the blind relay lives and how to authenticate to
-/// it. See [`crate::push`] for the task itself.
+/// APNs pusher config; see [`crate::push`] for the task itself.
 ///
-/// `relay_url` IS THE FEATURE FLAG. Absent (the default), the daemon never spawns
-/// the pusher and never opens a socket toward anyone — iOS push is strictly
-/// opt-in, and a squelch install that has not been told about a relay is
-/// structurally incapable of talking to one.
-///
-/// PRIVACY: the relay is BLIND on purpose. Nothing here configures content,
-/// because no content is ever sent — the push carries an event id and a collapse
-/// id and nothing else. `topic`/`environment` are pass-throughs for operators
-/// running a relay with more than one bundle id or a sandbox build.
+/// `relay_url` IS THE FEATURE FLAG: absent (the default), the pusher is never
+/// spawned and no socket is ever opened toward anyone. Nothing here configures
+/// content, because the relay is blind — the push carries an event id and a
+/// collapse id and nothing else.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PusherConfig {
@@ -280,9 +239,8 @@ pub struct PusherConfig {
     pub environment: Option<String>,
 }
 
-/// The default embedding-weights cache dir: `~/.local/share/squelch/models`
-/// (a sibling of the sqlite db under the XDG data dir). Falls back to a
-/// CWD-relative `squelch-models` only when `HOME` is unset.
+/// Default embedding-weights cache dir, a sibling of the sqlite db under the
+/// XDG data dir; CWD-relative only when `HOME` is unset.
 pub fn default_embed_cache_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
@@ -292,11 +250,10 @@ pub fn default_embed_cache_dir() -> PathBuf {
     PathBuf::from("squelch-models")
 }
 
-/// On-box semantic-recall (v1) tunables. Embeddings run locally via fastembed
-/// (ONNX, CPU); weights download ONCE to `cache_dir` on first run. `model` and
-/// `dims` MUST agree with each other and with the `message_vecs` vec0 table's
-/// `float[N]` declaration in `store/schema.sql` — the store asserts this at open
-/// time. Schema applies fresh; changing `dims` means resetting the dev db.
+/// On-box semantic-recall tunables (fastembed, ONNX, CPU; weights download once
+/// to `cache_dir`). `model` and `dims` MUST agree with each other and with the
+/// `message_vecs` vec0 `float[N]` in `store/schema.sql` — the store asserts this
+/// at open time, and changing `dims` means resetting the db.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedConfig {
@@ -364,21 +321,18 @@ pub struct Stage1Config {
     pub noise_importance: u8,
     /// Ambiguous fall-through (unknown sender, no pattern) -> Stage-2.
     pub fallthrough_importance: u8,
-    /// Importance for a bill-shaped message from an UNKNOWN sender. Deliberately
-    /// moderate: it should surface for a Stage-2 look, not scream. See bug #3
-    /// (scam "past-due" from an unknown sender must never land CONFIDENT PastDue).
+    /// Bill-shaped mail from an UNKNOWN sender. Deliberately moderate: a scam
+    /// "past-due" must surface for a Stage-2 look, never land confident PastDue.
     pub bill_unknown_sender_importance: u8,
     /// Sanity dampener: an extracted bill amount strictly greater than this
     /// (dollars) is treated as absurd and shaves confidence (never raises tier).
     /// Default $50,000 — a real household bill essentially never exceeds this.
     pub bill_absurd_amount_threshold: f64,
 
-    // ---- Stage-1 LLM pass (the SMALL model run on every non-rule email) ----
-    //
-    // The heuristic fields above are the SEED / FALLBACK; these tune the LLM
-    // refine pass. The Stage-1 pass reuses Stage-2's key/provider resolution
-    // ([`Stage2Config::resolve_key_and_provider`]) — only the model, prices,
-    // batch size, and (global-only) daily cap are Stage-1-specific.
+    // ---- Stage-1 LLM pass (the small model run on every non-rule email) ----
+    // The heuristic fields above are its seed/fallback. Key and provider come
+    // from [`Stage2Config::resolve_key_and_provider`]; only the fields below are
+    // Stage-1's own.
     /// The Stage-1 model id string. Default `claude-haiku-4-5` (a small, cheap
     /// model — it sees nearly every email). Env: `SQUELCH_STAGE1_MODEL`.
     pub model: String,
@@ -388,9 +342,8 @@ pub struct Stage1Config {
     /// How many queued rows to refine per sync cycle. Env:
     /// `SQUELCH_STAGE1_BATCH_PER_CYCLE`.
     pub batch_per_cycle: usize,
-    /// GLOBAL-per-account-per-day Stage-1 API-call cap. Stage-1 needs ONLY a
-    /// global cap — it must see every email, so per-thread/sender caps make no
-    /// sense here. Default 1000. Env: `SQUELCH_STAGE1_GLOBAL_DAILY_CAP`.
+    /// Global per-account-per-day call cap — the only cap Stage-1 has, since it
+    /// must see every email. Env: `SQUELCH_STAGE1_GLOBAL_DAILY_CAP`.
     pub global_daily_cap: u32,
     /// Per-million-input-token price (USD) for the Stage-1 model. Default 1.0
     /// (claude-haiku-4-5). Env: `SQUELCH_STAGE1_PRICE_IN_PER_MTOK`.
@@ -424,34 +377,22 @@ impl Default for Stage1Config {
     }
 }
 
-/// Stage-2 LLM triage tunables. The Anthropic API pass runs ONLY over rows
-/// Stage-1 refined but left non-confident. The queue predicate is the four
-/// clauses: `stage1_model_used IS NOT NULL AND needs_stage2=1 AND model_used IS
-/// NULL AND sensitivity='normal'` (Stage-1 has looked, escalation is flagged,
-/// Stage-2 hasn't processed it yet, and it is non-sealed). Runs under a strict
-/// per-thread + per-sender + per-account daily budget.
-///
-/// Stage-2 is ENABLED BY KEY PRESENCE: it turns on only when an API key is
-/// resolvable ([`Stage2Config::api_key`] / `ANTHROPIC_API_KEY`). The `model`,
-/// caps, and budgets are all config so an operator can retune without a
-/// recompile. Env overrides follow the existing naming (`SQUELCH_MODEL`,
-/// `SQUELCH_STAGE2_*`).
+/// Stage-2 LLM triage tunables. The pass runs only over rows Stage-1 refined but
+/// left non-confident: `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
+/// model_used IS NULL AND sensitivity='normal'` — that last clause is what keeps
+/// sealed mail away from the model. Enabled by key presence alone; env overrides
+/// are `SQUELCH_MODEL` and `SQUELCH_STAGE2_*`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stage2Config {
-    /// Anthropic API key. Resolved from the config file's `anthropic_api_key`
-    /// or the standard `ANTHROPIC_API_KEY` env var (env wins). When absent,
-    /// Stage-2 is DISABLED gracefully (one stderr notice; rows stay queued).
-    /// Never logged.
+    /// Anthropic API key; the `ANTHROPIC_API_KEY` env var wins over it. Absent,
+    /// Stage-2 disables gracefully and rows stay queued. NEVER logged.
     pub anthropic_api_key: Option<String>,
-    /// Force the Stage-2 provider, overriding key-prefix sniffing. `anthropic`
-    /// or `openai`. When `None` (default), the provider is inferred from which
-    /// key is resolved and its prefix. Env: `SQUELCH_STAGE2_PROVIDER`.
+    /// Force the provider (`anthropic` / `openai`), overriding key-prefix
+    /// sniffing. Env: `SQUELCH_STAGE2_PROVIDER`.
     pub stage2_provider: Option<Stage2Provider>,
-    /// The model id string. Default `claude-haiku-4-5` (Anthropic). For OpenAI,
-    /// set this to an OpenAI model such as `gpt-4o-mini` (config-driven so the
-    /// provider can change without code). Written verbatim into the `model`
-    /// request field and stored as `model_used` on applied rows.
+    /// Model id, written verbatim into the request's `model` field and stored as
+    /// `model_used` on applied rows.
     pub model: String,
     /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
     /// The body is truncated to this and the truncation is noted in-band.
@@ -461,32 +402,25 @@ pub struct Stage2Config {
     /// Per-thread-per-day API-call cap (the circuit breaker). Incremented
     /// BEFORE the call so retry storms can't exceed it.
     pub thread_daily_cap: u32,
-    /// NEW global-per-account-per-day API-call cap. Same increment-before
+    /// Global per-account-per-day API-call cap. Same increment-before
     /// discipline, counted via a `thread_id='__global__'` sentinel row in
     /// `wake_budget`.
     pub global_daily_cap: u32,
-    /// Per-SENDER-per-day API-call cap. Same increment-before discipline as the
-    /// thread/global caps, counted via a `thread_id='sender:<addr>'` sentinel
-    /// row in `wake_budget` (no real Gmail thread id starts with `sender:`).
-    /// Stops one chatty sender fanning many DIFFERENT threads from burning the
-    /// budget. Env: `SQUELCH_STAGE2_SENDER_DAILY_CAP`.
+    /// Per-sender-per-day API-call cap, so one chatty sender fanning many
+    /// threads cannot burn the budget. Counted via a `thread_id='sender:<addr>'`
+    /// sentinel row in `wake_budget` (no real Gmail thread id starts with
+    /// `sender:`). Env: `SQUELCH_STAGE2_SENDER_DAILY_CAP`.
     pub sender_daily_cap: u32,
-    /// Skip (don't spend a model call on) any queued row whose message
-    /// `received_at` is older than this many days: it is marked processed with
-    /// `model_used='stale-skip'`, keeping its Stage-1 values, so it neither
-    /// consumes budget nor sits queued forever. Env: `SQUELCH_STAGE2_MAX_AGE_DAYS`.
+    /// Queued rows older than this are marked `model_used='stale-skip'` instead
+    /// of spending a call: they keep their Stage-1 values, and neither consume
+    /// budget nor sit queued forever. Env: `SQUELCH_STAGE2_MAX_AGE_DAYS`.
     pub max_age_days: u32,
-    /// Per-million-input-token price (USD) for the configured model, used only to
-    /// compute the `est_cost_usd_today` figure surfaced by `/client/stats`.
-    /// Default 1.0 matches claude-haiku-4-5 (Anthropic); the OpenAI default is
-    /// 0.15 (gpt-4o-mini). NOTE: change-with-model — if you change `model` or
-    /// provider, update this and `price_out_per_mtok` to that model's pricing.
-    /// Env: `SQUELCH_STAGE2_PRICE_IN_PER_MTOK`.
+    /// Per-MTok input price (USD), used only for the `est_cost_usd_today` figure
+    /// on `/client/stats`. Change-with-model, together with
+    /// `price_out_per_mtok`. Env: `SQUELCH_STAGE2_PRICE_IN_PER_MTOK`.
     pub price_in_per_mtok: f64,
-    /// Per-million-output-token price (USD) for the configured model. Default 5.0
-    /// matches claude-haiku-4-5 (Anthropic); the OpenAI default is 0.60
-    /// (gpt-4o-mini). Change-with-model. See [`Stage2Config::price_in_per_mtok`].
-    /// Env: `SQUELCH_STAGE2_PRICE_OUT_PER_MTOK`.
+    /// Per-MTok output price (USD). Change-with-model. Env:
+    /// `SQUELCH_STAGE2_PRICE_OUT_PER_MTOK`.
     pub price_out_per_mtok: f64,
 }
 
@@ -511,19 +445,11 @@ impl Default for Stage2Config {
 }
 
 impl Stage2Config {
-    /// Resolve the Stage-2 API key AND its provider.
-    ///
-    /// Resolution order (first match wins):
-    ///   1. `SQUELCH_STAGE2_API_KEY` — explicit, provider SNIFFED from the key
-    ///      prefix: `sk-ant-` => Anthropic, otherwise OpenAI.
-    ///   2. `ANTHROPIC_API_KEY` — provider = Anthropic.
-    ///   3. `OPENAI_API_KEY` — provider = OpenAI.
-    ///   4. config-file `anthropic_api_key` — provider = Anthropic.
-    ///
-    /// The `stage2_provider` config field / `SQUELCH_STAGE2_PROVIDER` env var
-    /// (already folded into `stage2_provider` by `apply_env_overrides`) FORCE-
-    /// OVERRIDES the inferred provider when set. Empty strings are treated as
-    /// absent. Key material is never logged by callers.
+    /// Resolve the Stage-2 API key and its provider, first match wins:
+    /// `SQUELCH_STAGE2_API_KEY` (provider sniffed from an `sk-ant-` prefix) >
+    /// `ANTHROPIC_API_KEY` > `OPENAI_API_KEY` > config `anthropic_api_key`.
+    /// `stage2_provider` force-overrides the inferred provider; empty strings
+    /// count as absent, and key material is never logged.
     pub fn resolve_key_and_provider(&self) -> Option<(String, Stage2Provider)> {
         let (key, inferred) = if let Some(key) = env_nonempty("SQUELCH_STAGE2_API_KEY") {
             // Explicit var: sniff the provider from the prefix.
@@ -548,8 +474,7 @@ impl Stage2Config {
         Some((key, provider))
     }
 
-    /// Resolve just the API key (provider-agnostic). Retained for callers that
-    /// only need presence/the key string. See [`resolve_key_and_provider`].
+    /// Just the API key, for callers that only need presence.
     pub fn resolve_api_key(&self) -> Option<String> {
         self.resolve_key_and_provider().map(|(k, _)| k)
     }
@@ -566,14 +491,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 }
 
 // ---- Stage-2 daily-cap runtime-override plumbing ---------------------------
-//
-// The three Stage-2 daily caps are configurable at THREE layers, highest wins:
-//   1. runtime OVERRIDE — an `app_settings` row (key below), set by the human
-//      door's POST /client/triage-config. Applied without a restart.
-//   2. config/env — the TOML `[stage2]` key OR its `SQUELCH_STAGE2_*` env var.
-//   3. built-in default — [`Stage2Config::default`].
-// These constants are the shared `app_settings.key` names so the store (writer),
-// the sync pass (reader), and the API (reader/writer) never drift.
+// Three layers, highest wins: an `app_settings` runtime override (applied
+// without a restart) > config/env > [`Stage2Config::default`]. These constants
+// are the shared `app_settings.key` names, so store, sync pass, and API cannot
+// drift.
 
 /// `app_settings.key` for the per-thread-per-day Stage-2 cap override.
 pub const APP_SETTING_THREAD_DAILY_CAP: &str = "stage2_thread_daily_cap";
@@ -589,12 +510,9 @@ pub const APP_SETTING_STAGE1_GLOBAL_DAILY_CAP: &str = "stage1_global_daily_cap";
 pub const STAGE2_CAP_MIN: u32 = 1;
 pub const STAGE2_CAP_MAX: u32 = 100_000;
 
-/// Which layer supplied a Stage-2 daily cap, reported by the human door's
-/// triage-config endpoint. `Config` covers BOTH the TOML file and env overrides
-/// (indistinguishable to the client and both mean "operator-set"); `Default`
-/// means the built-in default was used. The runtime `app_settings` OVERRIDE
-/// layer is reported separately by the API (as "override" when a row exists), so
-/// it is not represented here.
+/// Which layer supplied a Stage-2 daily cap. `Config` covers both TOML and env
+/// (both mean "operator-set"); the runtime override layer is reported separately
+/// by the API, so it has no variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapSource {
     Default,
@@ -611,9 +529,8 @@ impl CapSource {
     }
 }
 
-/// The config/env-layer source of each Stage-2 daily cap. Computed at config
-/// load and threaded to the human door so it can report "default" vs "config"
-/// (the "override" case is decided at read time from `app_settings`).
+/// The config/env-layer source of each Stage-2 daily cap, computed at load and
+/// threaded to the human door ("override" is decided later from `app_settings`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stage2CapSources {
     pub thread_daily_cap: CapSource,
@@ -646,10 +563,8 @@ fn cap_source(stage2_tbl: Option<&toml::Table>, key: &str, env_var: &str) -> Cap
     }
 }
 
-/// Compute the config/env-layer [`Stage2CapSources`] for a (possibly absent)
-/// config file path, consulting both the TOML `[stage2]` keys and the
-/// `SQUELCH_STAGE2_*` env vars. A missing/unparseable file contributes no TOML
-/// keys (env may still promote a cap to `Config`).
+/// [`Stage2CapSources`] for a (possibly absent) config path. A missing or
+/// unparseable file contributes no TOML keys; env can still promote a cap.
 fn stage2_cap_sources_for(path: Option<&std::path::Path>) -> Stage2CapSources {
     let parsed: Option<toml::Table> = path
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -717,8 +632,6 @@ impl Default for Config {
             client_id: None,
             client_secret: None,
             account_email: None,
-            // The single canonical default, shared with every other binary (see
-            // `default_db_path`). NOT a CWD-relative "squelch.db".
             db_path: default_db_path(),
             credential_backend: CredentialBackend::default(),
             credentials_path: None,
@@ -753,10 +666,8 @@ impl Config {
         cfg
     }
 
-    /// Like [`Config::load`], but ALSO returns the config/env-layer
-    /// [`Stage2CapSources`] (whether each Stage-2 daily cap came from the
-    /// default or from config/env). Wire the sources into the human door so it
-    /// can report "default" vs "config" on `/client/triage-config`.
+    /// [`Config::load`], plus where each Stage-2 daily cap came from — the human
+    /// door reports that on `/client/triage-config`.
     pub fn load_with_cap_sources() -> (Self, Stage2CapSources) {
         let path = Self::default_path();
         let mut cfg = match &path {
@@ -770,8 +681,8 @@ impl Config {
         (cfg, sources)
     }
 
-    /// Like [`Config::load_from`], but ALSO returns the config/env-layer
-    /// [`Stage2CapSources`]. See [`Config::load_with_cap_sources`].
+    /// [`Config::load_from`], plus the cap sources. See
+    /// [`Config::load_with_cap_sources`].
     pub fn load_from_with_cap_sources(path: &std::path::Path) -> (Self, Stage2CapSources) {
         let mut cfg = Self::from_path(path).unwrap_or_default();
         let sources = stage2_cap_sources_for(Some(path));
@@ -789,7 +700,6 @@ impl Config {
     /// Env-var overrides (highest precedence). Env always wins over the file so
     /// operators can override without editing config.
     fn apply_env_overrides(&mut self) {
-        // Canonical SQUELCH_DB_PATH, with legacy SQUELCH_DB accepted (deprecated).
         if let Some(p) = env_with_legacy(ENV_DB_PATH, ENV_DB_PATH_LEGACY) {
             self.db_path = PathBuf::from(p);
         }
@@ -808,8 +718,6 @@ impl Config {
         {
             self.client_secret = Some(v);
         }
-        // Canonical SQUELCH_ACCOUNT_EMAIL, with legacy SQUELCH_ACCOUNT accepted
-        // (deprecated).
         if let Some(v) = env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY) {
             self.account_email = Some(v);
         }
@@ -834,9 +742,7 @@ impl Config {
             self.notify.min_importance = n;
         }
         // ---- APNs pusher (blind relay) -------------------------------------
-        // `relay_url` is the on/off switch for the whole feature, so it is read
-        // exactly like every other override and nothing derives from its absence
-        // beyond "do not spawn the task". The TOKEN is never echoed anywhere.
+        // The relay token is never echoed anywhere.
         for (name, slot) in [
             ("SQUELCH_RELAY_URL", &mut self.pusher.relay_url),
             ("SQUELCH_RELAY_TOKEN", &mut self.pusher.relay_token),
@@ -946,14 +852,10 @@ impl Config {
             self.stage1.price_out_per_mtok = n;
         }
 
-        // RANGE-GUARD the daily caps from config/env, matching the POST
-        // /client/triage-config validation (1..=100000). Without this, a cap of
-        // 0 from toml/env silently blocks EVERY stage-2 row each cycle (used >=
-        // cap is always true at 0) with only a once-daily notice to show for
-        // it. Out-of-range values clamp with a startup warning rather than
-        // erroring — a misconfigured cap shouldn't take the daemon down. Runs
-        // here (the tail of env application, which itself runs after TOML
-        // parse) so it guards BOTH layers.
+        // Range-guard the caps, matching POST /client/triage-config's
+        // validation: a cap of 0 would silently block EVERY row each cycle
+        // (`used >= cap` holds at 0). Clamps with a warning rather than
+        // erroring, and runs last so it guards the TOML and env layers both.
         for (name, cap) in [
             ("stage2.thread_daily_cap", &mut self.stage2.thread_daily_cap),
             ("stage2.sender_daily_cap", &mut self.stage2.sender_daily_cap),
@@ -1031,20 +933,13 @@ impl Config {
     }
 }
 
-/// Mirror config-representable keys from parsed `.env` pairs into the TOML
-/// config file at `path`, merging with any existing content.
+/// Mirror config-representable `.env` pairs into the TOML config at `path`, so a
+/// repo-root `.env` reaches binaries launched from any CWD.
 ///
-/// A repo-root `.env` only works when a binary is launched from that CWD;
-/// mirroring it into `~/.config/squelch/config.toml` makes the same
-/// account/paths visible to every binary (`squelch-tui`, `squelch-mcp`,
-/// standalone `squelch-api`) regardless of CWD. Only keys that are actual
-/// [`Config`] fields are written — env-only secrets (`SQUELCH_API_TOKEN`,
-/// `ANTHROPIC_API_KEY`, …) never land on disk here. Existing unrelated keys in
-/// the file are preserved; keys the `.env` defines win. Refuses to touch a file
-/// it cannot parse (never clobbers a broken-but-hand-written config).
-///
-/// Returns `Ok(true)` if the file was (re)written, `Ok(false)` if there was
-/// nothing to change.
+/// ONLY keys that are real [`Config`] fields are written — env-only secrets
+/// (`SQUELCH_API_TOKEN`, `ANTHROPIC_API_KEY`, …) never land on disk here.
+/// Unrelated keys are preserved, `.env` wins on conflicts, and an unparseable
+/// file is refused rather than clobbered. `Ok(true)` if the file was rewritten.
 pub fn mirror_env_pairs_to_config(
     pairs: &[(String, String)],
     path: &std::path::Path,
@@ -1117,10 +1012,10 @@ pub fn mirror_env_pairs_to_config(
     }
     let rendered = toml::to_string_pretty(&table)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    // Write-then-rename so a crash mid-write can't leave a half-written config
-    // (which we would then refuse to touch). The tmp file is CREATED 0600 —
-    // client_secret lives in here, so it must never exist world-readable even
-    // for the instant before a chmod. Any failure removes the tmp file.
+    // Write-then-rename so a crash can't leave a half-written config we would
+    // then refuse to touch. The tmp is CREATED 0600 — client_secret lives here
+    // and must never exist world-readable, not even for the instant before a
+    // chmod. Any failure removes the tmp file.
     let tmp = path.with_extension("toml.tmp");
     // A leftover tmp from a crashed prior run may carry old (possibly 0644)
     // permissions; mode(0o600) only applies at CREATE, so clear it first.
