@@ -67,9 +67,12 @@ final class HeroCache {
         return entry
     }
 
-    #if ZONE_PROFILE
-        func seed(_ threadId: String, _ hero: Hero?) { cache[threadId] = hero }
-    #endif
+    /// Whether this thread has a VERDICT — art, or a cached "has none".
+    /// `cached` cannot answer that: it flattens both to nil. A card checks this
+    /// before starting its `.task`, because on a hit the resolve would only
+    /// hand back what the card already drew, at the price of a suspension and a
+    /// second body pass.
+    func isResolved(_ threadId: String) -> Bool { cache.index(forKey: threadId) != nil }
 
     /// Resolve one hero, deduped and memoized.
     @discardableResult

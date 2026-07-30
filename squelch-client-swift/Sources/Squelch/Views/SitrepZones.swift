@@ -373,20 +373,13 @@ struct NewslettersZone: View {
         }
     }
 
-    @ViewBuilder private var grid: some View {
-        #if ZONE_PROFILE
-            if ZoneProfile.useLazy {
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: Self.cardMinimum), spacing: Self.gap)],
-                    spacing: Self.gap
-                ) { cards }.coordinateSpace(.named("zoneGrid"))
-            } else {
-                AdaptiveGrid(minimum: Self.cardMinimum, spacing: Self.gap) { cards }
-                    .coordinateSpace(.named("zoneGrid"))
-            }
-        #else
-            AdaptiveGrid(minimum: Self.cardMinimum, spacing: Self.gap) { cards }
-        #endif
+    /// NON-LAZY on purpose — see AdaptiveGrid. A LazyVGrid destroys and rebuilds
+    /// cards as they cross the viewport, and each rebuild costs a hero lookup
+    /// and a fresh `.task`, which is what made scrolling past this zone stutter.
+    /// A week of recurring senders is a bounded list; holding all of it is
+    /// cheaper than rebuilding the visible part over and over.
+    private var grid: some View {
+        AdaptiveGrid(minimum: Self.cardMinimum, spacing: Self.gap) { cards }
     }
 
     @ViewBuilder private var cards: some View {
@@ -400,7 +393,6 @@ struct NewslettersZone: View {
                 onEdit: { edit(nl) },
                 onHover: { over in hovered = over ? nl.address : nil }
             )
-            .zoneProfileFrame(nl.address)
         }
     }
 
@@ -448,18 +440,11 @@ private struct NewsletterCard: View {
     @State private var hovering = false
 
     private var summaryText: String {
-        #if ZONE_PROFILE
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            defer { ZoneProfile.summaryNanos += DispatchTime.now().uptimeNanoseconds - t0 }
-        #endif
-        return Newsletters.truncate(Newsletters.cleanSummary(newsletter.summary), 90)
+        Newsletters.truncate(Newsletters.cleanSummary(newsletter.summary), 90)
     }
 
     var body: some View {
-        #if ZONE_PROFILE
-            ZoneProfile.cardBody += 1
-        #endif
-        return Button(action: onOpen) {
+        Button(action: onOpen) {
             // Hero LEFT as a square thumb, text right — the card reads as a row
             // at a glance instead of a banner you have to scan vertically, and
             // a fixed square keeps every card in the grid the same height
@@ -560,14 +545,15 @@ private struct NewsletterHero: View {
     private var hero: HeroCache.Hero? { resolved ?? HeroCache.shared.cached(threadId) }
 
     var body: some View {
-        #if ZONE_PROFILE
-            ZoneProfile.heroBody += 1
-        #endif
-        return content
+        content
             .task(id: threadId) {
-                #if ZONE_PROFILE
-                    ZoneProfile.heroTask += 1
-                #endif
+                // Already answered — `hero` is drawing that answer. Resolving
+                // again would suspend, publish the same value and cost a second
+                // body pass. The guard is INSIDE the task, not around it: a card
+                // whose hero is not cached yet is the only reason this fetch
+                // exists, and a conditional modifier would change identity as
+                // the verdict lands.
+                guard !HeroCache.shared.isResolved(threadId) else { return }
                 resolved = await HeroCache.shared.resolve(threadId)
             }
     }
@@ -654,9 +640,8 @@ struct AdaptiveGrid: Layout {
     var spacing: CGFloat
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.replacingUnspecifiedDimensions().width
-        let metrics = metrics(width: width, subviews: subviews)
-        return CGSize(width: width, height: metrics.height)
+        let metrics = metrics(width: proposal.width, subviews: subviews)
+        return CGSize(width: metrics.width, height: metrics.height)
     }
 
     func placeSubviews(
@@ -684,12 +669,18 @@ struct AdaptiveGrid: Layout {
         var columnWidth: CGFloat
         var heights: [CGFloat]
         var rowHeights: [CGFloat]
+        var width: CGFloat
         var height: CGFloat
     }
 
     /// Column count is the most that fit at `minimum` with a gutter between
     /// each; the leftover is then split evenly so the row reaches both edges.
-    private func metrics(width: CGFloat, subviews: Subviews) -> Metrics {
+    ///
+    /// A nil or infinite proposal is one of SwiftUI's sizing probes, not a real
+    /// width — answer it with a single column at `minimum` rather than feeding
+    /// infinity into the column arithmetic, which traps on the `Int` conversion.
+    private func metrics(width proposed: CGFloat?, subviews: Subviews) -> Metrics {
+        let width = (proposed?.isFinite == true) ? max(0, proposed!) : minimum
         let columns = max(1, Int((width + spacing) / (minimum + spacing)))
         let columnWidth = max(0, (width - spacing * CGFloat(columns - 1)) / CGFloat(columns))
         let heights = subviews.map {
@@ -705,7 +696,7 @@ struct AdaptiveGrid: Layout {
         let total = rowHeights.reduce(0, +) + spacing * CGFloat(max(0, rowHeights.count - 1))
         return Metrics(
             columns: columns, columnWidth: columnWidth, heights: heights, rowHeights: rowHeights,
-            height: total)
+            width: width, height: total)
     }
 }
 
@@ -742,16 +733,3 @@ struct RecordRowStyle: ButtonStyle {
     }
 }
 
-// MARK: - profiling shim (temporary, ZONE_PROFILE only)
-
-extension View {
-    #if ZONE_PROFILE
-        @ViewBuilder func zoneProfileFrame(_ id: String) -> some View {
-            onGeometryChange(for: CGRect.self) { $0.frame(in: .named("zoneGrid")) } action: {
-                ZoneProfile.frames[id] = $0
-            }
-        }
-    #else
-        func zoneProfileFrame(_ id: String) -> some View { self }
-    #endif
-}
