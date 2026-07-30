@@ -440,7 +440,8 @@ async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     let keys: std::collections::BTreeSet<_> =
         items[0].as_object().unwrap().keys().cloned().collect();
     let expect: std::collections::BTreeSet<String> =
-        ["id", "message_id", "kind", "event_title", "starts_at", "organizer", "received_at"]
+        ["id", "message_id", "thread_id", "kind", "event_title", "starts_at", "organizer",
+         "received_at"]
             .into_iter()
             .map(String::from)
             .collect();
