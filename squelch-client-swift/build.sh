@@ -75,6 +75,22 @@ sed -e 's/\$(EXECUTABLE_NAME)/Squelch/g' \
     "$SRC_DIR/Info.plist" > "$APP/Contents/Info.plist"
 
 cp -R "$RES_DIR/." "$APP/Contents/Resources/" 2>/dev/null || true
+
+# App icon. ./Squelch.icon is the only icon source in the repo; actool compiles
+# it to the Assets.car that CFBundleIconName points at — macOS 26 shrinks any
+# bundle without one onto a plain squircle as an unadopted legacy icon — and
+# also emits the flattened Squelch.icns fallback that CFBundleIconFile names.
+# actool ships with full Xcode, not the CommandLineTools; a machine without it
+# just builds an iconless bundle instead of failing.
+if ! xcrun actool Squelch.icon \
+    --compile "$APP/Contents/Resources" \
+    --platform macosx --minimum-deployment-target 26.0 \
+    --app-icon Squelch \
+    --output-partial-info-plist build/actool-partial.plist \
+    --output-format human-readable-text >/dev/null; then
+  echo "    WARNING: actool failed; bundle has no app icon" >&2
+fi
+
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Sign with the Developer ID when the machine has one, ad-hoc otherwise.

@@ -16,6 +16,11 @@
 	<string>Squelch</string>
 	<key>CFBundleIconFile</key>
 	<string>Squelch</string>
+	<!-- The new-format icon compiled from ./Squelch.icon into Assets.car;
+	     without this name macOS 26 falls back to the icns and renders it
+	     shrunken on a plain squircle as an unadopted legacy icon. -->
+	<key>CFBundleIconName</key>
+	<string>Squelch</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

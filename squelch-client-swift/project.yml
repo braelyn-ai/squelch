@@ -36,6 +36,10 @@ targets:
       - path: Sources/Squelch/Resources
         type: folder
         buildPhase: resources
+      # Icon Composer document; Xcode 26 hands it to actool, which emits the
+      # Assets.car + fallback icns pair that build.sh produces by hand.
+      - path: Squelch.icon
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.squelch.client
@@ -45,7 +49,7 @@ targets:
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         COMBINE_HIDPI_IMAGES: YES
-        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        ASSETCATALOG_COMPILER_APPICON_NAME: Squelch
         CODE_SIGN_ENTITLEMENTS: Sources/Squelch/Squelch.entitlements
     dependencies:
       - sdk: WebKit.framework
