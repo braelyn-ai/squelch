@@ -9,9 +9,15 @@
 //
 // The assistant key is the strictest slot: `AssistantKeyStore` can report
 // whether a key exists and which provider it routes to, and it can make a
-// completion call — but `read()` is fileprivate to this file and the value is
-// never returned to the view layer. That mirrors the Rust shell, where the key
-// lived only inside `llm_complete`.
+// completion call — `read()` stays fileprivate so the request path (`LLMProxy`)
+// is the only thing that handles the secret, which is why that type lives in
+// this file. That mirrors the Rust shell, where the key lived only inside
+// `llm_complete`.
+//
+// The ONE exception is `revealAsync()`: Settings shows the stored key behind a
+// Show / Edit affordance, and both need the plaintext. It is an explicit,
+// human-initiated disclosure to the person who typed the key in the first
+// place — not a general read. Nothing else may call it.
 
 import Foundation
 import Security
@@ -202,6 +208,17 @@ enum AssistantKeyStore {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: status())
+            }
+        }
+    }
+
+    /// Hand the stored key to the Settings UI so it can be shown or edited.
+    /// The deliberate hole in the rule above — see this file's header. Off the
+    /// main actor for the same prompt-blocking reason as `statusAsync`.
+    static func revealAsync() async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: read())
             }
         }
     }

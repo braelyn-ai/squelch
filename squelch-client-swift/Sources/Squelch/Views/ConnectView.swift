@@ -96,24 +96,43 @@ struct Field<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(label)
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaint)
-                .textCase(.lowercase)
-            content
-                .font(.system(size: 13))
-                .foregroundStyle(Palette.ink)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Palette.canvas.opacity(0.65))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75)
-                )
+            FieldLabel(label)
+            content.fieldWell()
         }
+    }
+}
+
+/// The caption above a well. Split out so a field that needs a custom row under
+/// its label — `SecretField`, which parks icons beside the well — still labels
+/// itself identically.
+struct FieldLabel: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(Typo.micro)
+            .foregroundStyle(Palette.inkFaint)
+            .textCase(.lowercase)
+    }
+}
+
+extension View {
+    /// The well itself: the near-opaque plate an input sits on.
+    func fieldWell() -> some View {
+        self
+            .font(.system(size: 13))
+            .foregroundStyle(Palette.ink)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Palette.canvas.opacity(0.65))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75)
+            )
     }
 }
 
