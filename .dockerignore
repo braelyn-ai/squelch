@@ -1,0 +1,10 @@
+target/
+.git/
+squelch-client-swift/
+squelch-desktop/
+docs/
+deploy/
+scripts/
+*.md
+.dockerignore
+Dockerfile
