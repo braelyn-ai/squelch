@@ -81,8 +81,15 @@ struct Avatar: View {
 final class FaviconLoader {
     static let shared = FaviconLoader()
 
-    private var images: [String: NSImage] = [:]
-    private var inflight: [String: Task<NSImage?, Never>] = [:]
+    /// A logo per domain, so this only bounds how many distinct BRANDS a session
+    /// keeps art for. Icons are tiny; the cap is here so the table cannot grow
+    /// without end, not because it is expected to fill.
+    private static let cacheMax = 512
+
+    /// FAILURES ARE NOT MEMOIZED HERE: `FaviconCache` owns the negative verdict
+    /// and ages it out after a week, so a domain that was merely offline stays
+    /// re-fetchable rather than pinned dead for the life of the process.
+    private let memo = AsyncMemo<String, NSImage?>(limit: cacheMax, keep: { $0 != nil })
 
     private let session = Sessions.ephemeral(timeout: 8, cookies: .neverSent)
 
@@ -90,33 +97,27 @@ final class FaviconLoader {
 
     /// Already-loaded image, no async hop — lets a rebuilt `Avatar` draw on its
     /// first frame.
-    func cached(_ domain: String) -> NSImage? { images[domain] }
+    func cached(_ domain: String) -> NSImage? { memo.cached(domain) ?? nil }
 
+    /// Fetch once per domain per launch, joiners included. The verdict is
+    /// recorded from INSIDE the fetch so it lands before any joiner resumes.
     func load(url: URL, domain: String) async -> NSImage? {
-        if let cached = images[domain] { return cached }
-        if let task = inflight[domain] { return await task.value }
-
-        let task = Task<NSImage?, Never> { [session] in
-            var req = URLRequest(url: url)
-            req.setValue("", forHTTPHeaderField: "Referer")
-            guard let (data, response) = try? await session.data(for: req),
-                let http = response as? HTTPURLResponse, http.statusCode == 200,
-                let image = NSImage(data: data)
-            else { return nil }
-            // Blank/tiny responses (DDG's fallback) aren't real logos.
-            guard image.size.width > 1, image.size.height > 1 else { return nil }
+        await memo.resolve(domain) { [session] in
+            let image = await Self.fetch(url, session)
+            FaviconCache.shared.record(domain, image == nil ? .failed : .ok)
             return image
         }
-        inflight[domain] = task
-        let result = await task.value
-        inflight[domain] = nil
+    }
 
-        if let result {
-            images[domain] = result
-            FaviconCache.shared.record(domain, .ok)
-        } else {
-            FaviconCache.shared.record(domain, .failed)
-        }
-        return result
+    private static func fetch(_ url: URL, _ session: URLSession) async -> NSImage? {
+        var req = URLRequest(url: url)
+        req.setValue("", forHTTPHeaderField: "Referer")
+        guard let (data, response) = try? await session.data(for: req),
+            let http = response as? HTTPURLResponse, http.statusCode == 200,
+            let image = NSImage(data: data)
+        else { return nil }
+        // Blank/tiny responses (DDG's fallback) aren't real logos.
+        guard image.size.width > 1, image.size.height > 1 else { return nil }
+        return image
     }
 }

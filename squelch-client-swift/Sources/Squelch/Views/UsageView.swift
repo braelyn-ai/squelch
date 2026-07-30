@@ -8,9 +8,7 @@ import SwiftUI
 
 struct UsageView: View {
     @Environment(AppStore.self) private var store
-    @State private var usage: UsageResponse?
-    @State private var error: String?
-    @State private var loading = true
+    @State private var usageState: Loadable<UsageResponse> = .loading
     @State private var assistant = AssistantUsage()
 
     /// A category resolved for rendering: the wire map's KEY promoted to `id`,
@@ -46,7 +44,7 @@ struct UsageView: View {
     /// The per-stage `categories` breakdown — an OBJECT MAP keyed by id, so each
     /// key is enumerated and promoted — else the flat legacy shape.
     private var categories: [ResolvedCategory] {
-        guard let usage else { return [] }
+        guard let usage = usageState.value else { return [] }
         if let map = usage.categories, !map.isEmpty {
             return map.keys.sorted().map { id in
                 let c = map[id]!
@@ -68,9 +66,9 @@ struct UsageView: View {
             RoutedHeader(title: "Usage")
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if loading {
+                    if usageState.isLoading {
                         SectionCard(label: "Triage") { EmptyNote("loading…") }
-                    } else if let error {
+                    } else if let error = usageState.error {
                         SectionCard(label: "Triage") {
                             Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
                         }
@@ -96,12 +94,11 @@ struct UsageView: View {
     }
 
     private func load() async {
-        do {
-            usage = try await APIClient.shared.getUsage(days: 30)
-        } catch {
-            self.error = errText(error, "failed to load usage")
+        await $usageState.load("failed to load usage") {
+            try await APIClient.shared.getUsage(days: 30)
         }
-        loading = false
+        // Local ledger, read after the server spend lands so both sections
+        // appear in the same frame.
         assistant = AssistantUsageLedger.read()
     }
 

@@ -119,7 +119,7 @@ final class EventStream {
     /// stream: the daily reconnect replays the seam for one round trip.
     private static let resourceTimeout: TimeInterval = 24 * 60 * 60
 
-    private var task: Task<Void, Never>?
+    private let resident = ResidentTask()
     private var cursor: Int?
     private var cursorLoaded = false
 
@@ -141,13 +141,11 @@ final class EventStream {
 
     /// Start following the feed. Idempotent.
     func start() {
-        guard task == nil else { return }
-        task = Task { [weak self] in await self?.run() }
+        resident.start { [weak self] in await self?.run() }
     }
 
     func stop() {
-        task?.cancel()
-        task = nil
+        resident.stop()
     }
 
     // MARK: - reconnect loop
@@ -157,24 +155,18 @@ final class EventStream {
         // prompt should arrive when the app has a reason to notify.
         await Notifier.shared.requestAuthorizationIfNeeded()
 
-        var backoff = Self.backoffBase
+        var backoff = Backoff(base: Self.backoffBase, cap: Self.backoffCap)
         while !Task.isCancelled {
             let opened = Date()
             await connect()
             if Task.isCancelled { return }
+            // A connection is "successful" by how long it LIVED, not by how it
+            // ended: every one of them ends in a failure eventually.
             if Date().timeIntervalSince(opened) >= Self.healthyAfter {
-                backoff = Self.backoffBase
+                backoff.reset()
             }
-            try? await Task.sleep(for: .seconds(Self.jittered(backoff)))
-            backoff = min(backoff * 2, Self.backoffCap)
+            await backoff.sleep()
         }
-    }
-
-    /// Full jitter over the lower half of the window. Jitter is not decoration:
-    /// a daemon restart drops every client at once, and identical backoffs mean
-    /// they all come back in the same millisecond, forever.
-    private static func jittered(_ seconds: TimeInterval) -> TimeInterval {
-        .random(in: (seconds / 2)...seconds)
     }
 
     /// Hold ONE connection until it ends. Never throws: every failure mode here

@@ -132,35 +132,14 @@ enum Trackers {
     // MARK: - the pass
 
     /// Drop the `<img>` elements that meet a strip signal. Every other byte is
-    /// preserved verbatim — no reserialization, because a DOM round-trip would
-    /// rewrite markup the sanitizer already vetted.
+    /// preserved verbatim — see `HTMLImg` for why nothing is reserialized.
     static func strip(_ html: String) -> StripResult {
-        var out = ""
         var blocked = 0
-        var rest = Substring(html)
-
-        while let open = rest.range(of: "<img", options: [.caseInsensitive]) {
-            // Only treat it as a tag start if the next char ends the token.
-            let afterIdx = open.upperBound
-            let isTagStart =
-                afterIdx == rest.endIndex
-                || rest[afterIdx].isWhitespace || rest[afterIdx] == ">" || rest[afterIdx] == "/"
-            guard isTagStart else {
-                out += rest[rest.startIndex..<afterIdx]
-                rest = rest[afterIdx...]
-                continue
-            }
-            out += rest[rest.startIndex..<open.lowerBound]
-            // Find the tag's closing ">" — a sanitized attribute never holds a raw ">".
-            guard let close = rest[afterIdx...].firstIndex(of: ">") else {
-                out += rest[open.lowerBound...]
-                return StripResult(html: out, blocked: blocked)
-            }
-            let tag = String(rest[open.lowerBound...close])
-            if shouldStrip(tag) { blocked += 1 } else { out += tag }
-            rest = rest[rest.index(after: close)...]
+        let out = HTMLImg.walk(html) { tag in
+            guard shouldStrip(tag) else { return .keep }
+            blocked += 1
+            return .drop
         }
-        out += rest
         return StripResult(html: out, blocked: blocked)
     }
 
@@ -177,22 +156,21 @@ enum Trackers {
     /// present) ≥ 80px and height ≥ 40px, which skips social icons and spacer
     /// gifs. Protocol-relative srcs resolve to https.
     static func extractHeroSrc(_ html: String) -> String? {
-        var rest = Substring(strip(html).html)
-        while let open = rest.range(of: "<img", options: [.caseInsensitive]) {
-            guard let close = rest[open.upperBound...].firstIndex(of: ">") else { return nil }
-            let tag = String(rest[open.lowerBound...close])
-            rest = rest[rest.index(after: close)...]
-
+        var hero: String?
+        // Read-only pass: the spliced html is discarded, `.stop` just ends the
+        // walk at the first hero the way an early `return` used to.
+        _ = HTMLImg.walk(strip(html).html) { tag in
             guard var src = attrValue(tag, "src")?.trimmingCharacters(in: .whitespaces),
                 !src.isEmpty
-            else { continue }
+            else { return .keep }
             if src.hasPrefix("//") { src = "https:" + src }
-            guard src.lowercased().hasPrefix("http") else { continue }
-            if let w = pxDim(attrValue(tag, "width")), w < 80 { continue }
-            if let h = pxDim(attrValue(tag, "height")), h < 40 { continue }
-            return src
+            guard src.lowercased().hasPrefix("http") else { return .keep }
+            if let w = pxDim(attrValue(tag, "width")), w < 80 { return .keep }
+            if let h = pxDim(attrValue(tag, "height")), h < 40 { return .keep }
+            hero = src
+            return .stop
         }
-        return nil
+        return hero
     }
 
     /// Anchor hrefs in document order, de-duped by href, labelled with the

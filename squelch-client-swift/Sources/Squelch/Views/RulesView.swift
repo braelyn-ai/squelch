@@ -10,10 +10,12 @@ struct RulesView: View {
     @Environment(AppStore.self) private var store
     @Namespace private var rulesGlass
 
-    @State private var rules: [SenderRule] = []
-    @State private var error: String?
-    @State private var loading = true
+    @State private var rulesState: Loadable<[SenderRule]> = .loading
     @State private var index = 0
+
+    /// The loaded rules, which a reload deliberately keeps on screen while the
+    /// next fetch is in flight.
+    private var rules: [SenderRule] { rulesState.value ?? [] }
 
     /// How many currently-loaded updates each rule matched, counted client-side
     /// from the store rather than through a new endpoint.
@@ -27,9 +29,9 @@ struct RulesView: View {
 
     var body: some View {
         Group {
-            if loading && rules.isEmpty {
+            if rulesState.isLoading && rules.isEmpty {
                 BandNote("loading rules…")
-            } else if let error {
+            } else if let error = rulesState.error {
                 BandNote(error)
             } else if rules.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -120,7 +122,7 @@ struct RulesView: View {
         do {
             try await APIClient.shared.deleteRule(rule.id)
             // Optimistic removal; a re-fetch happens on undo or next open.
-            rules.removeAll { $0.id == rule.id }
+            rulesState.value?.removeAll { $0.id == rule.id }
             // The undo toast recreates the rule from these cached values.
             store.pushUndo(
                 kind: .ruleDelete, messageId: rule.id,
@@ -138,15 +140,9 @@ struct RulesView: View {
     }
 
     private func load() async {
-        loading = true
-        defer { loading = false }
-        do {
-            rules = try await APIClient.shared.listRules()
-            error = nil
-        } catch {
-            self.error = errText(error, "rules failed")
+        await $rulesState.load("rules failed") {
+            try await APIClient.shared.listRules()
         }
-
     }
 }
 

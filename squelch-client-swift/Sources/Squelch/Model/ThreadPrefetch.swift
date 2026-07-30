@@ -23,9 +23,11 @@ final class ThreadPrefetch {
         var fresh: TimeInterval
     }
 
-    private var cache: [String: Entry] = [:]
-    /// Insertion order for LRU eviction (most-recent last).
-    private var order: [String] = []
+    private var cache = LRUMap<String, Entry>(limit: cacheMax)
+    /// Ids being fetched. A Set rather than parked tasks because prefetch is
+    /// fire-and-forget: nobody joins a running fetch, they take the cache hit
+    /// it leaves behind (which is why this is not an `AsyncMemo` — a hit here
+    /// is a hit only while it is FRESH, and freshness is not memoizable).
     private var inflight: Set<String> = []
     /// threadId -> the warmer's repeated-image map. Rides the same LRU as the
     /// view it was derived from, being meaningful only beside one.
@@ -34,13 +36,10 @@ final class ThreadPrefetch {
     private init() {}
 
     private func put(_ threadId: String, _ view: ClientThreadView, fresh: TimeInterval) {
-        cache[threadId] = Entry(view: view, ts: Date(), fresh: fresh)
-        order.removeAll { $0 == threadId }
-        order.append(threadId)
-        while order.count > Self.cacheMax {
-            let oldest = order.removeFirst()
-            cache.removeValue(forKey: oldest)
-            repeated.removeValue(forKey: oldest)
+        // A view leaving the cache takes its repeated-image map with it — the
+        // map is meaningful only beside the view it was derived from.
+        if let evicted = cache.set(threadId, Entry(view: view, ts: Date(), fresh: fresh)) {
+            repeated.removeValue(forKey: evicted)
         }
         warmBodies(threadId, view)
     }
@@ -51,10 +50,10 @@ final class ThreadPrefetch {
     func prefetch(_ threadId: String, fresh: TimeInterval? = nil) {
         guard !threadId.isEmpty else { return }
         let ttl = fresh ?? Self.freshDefault
-        if var hit = cache[threadId], Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
+        if var hit = cache.get(threadId), Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
             if ttl > hit.fresh {
                 hit.fresh = ttl
-                cache[threadId] = hit
+                cache.set(threadId, hit)
             }
             return
         }
@@ -70,7 +69,7 @@ final class ThreadPrefetch {
 
     /// A fresh cached view for instant render, or nil.
     func cached(_ threadId: String) -> ClientThreadView? {
-        guard let hit = cache[threadId], Date().timeIntervalSince(hit.ts) < hit.fresh else {
+        guard let hit = cache.get(threadId), Date().timeIntervalSince(hit.ts) < hit.fresh else {
             return nil
         }
         return hit.view
@@ -79,7 +78,7 @@ final class ThreadPrefetch {
     /// Fetch THROUGH the cache: a fresh hit resolves immediately.
     func fetch(_ threadId: String, fresh: TimeInterval? = nil) async throws -> ClientThreadView {
         let ttl = fresh ?? Self.freshDefault
-        if let hit = cache[threadId], Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
+        if let hit = cache.get(threadId), Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
             return hit.view
         }
         let view = try await APIClient.shared.getThread(threadId)
@@ -124,7 +123,8 @@ final class ThreadPrefetch {
     /// Only remember the map while the view it describes is still cached — a
     /// thread evicted mid-scan must not leave its map behind.
     private func noteRepeated(_ threadId: String, _ map: [Int: Set<String>]) {
-        guard cache[threadId] != nil else { return }
+        // `peek`: a bookkeeping check must not keep a cold entry alive by asking.
+        guard cache.peek(threadId) != nil else { return }
         repeated[threadId] = map
     }
 
@@ -181,25 +181,22 @@ final class PreparedBodies: @unchecked Sendable {
     private static let cap = 300
 
     private let lock = NSLock()
-    private var entries: [Int: EmailWebView.Prepared] = [:]
-    /// Insertion order for LRU eviction (most-recent last).
-    private var order: [Int] = []
+    /// The LRU is not thread-safe on its own; the lock that publishes these
+    /// entries across isolation domains is what makes touching it safe.
+    private var entries = LRUMap<Int, EmailWebView.Prepared>(limit: cap)
 
     private init() {}
 
     func get(_ key: Int) -> EmailWebView.Prepared? {
         lock.lock()
         defer { lock.unlock() }
-        return entries[key]
+        return entries.get(key)
     }
 
     func set(_ key: Int, _ prepared: EmailWebView.Prepared) {
         lock.lock()
         defer { lock.unlock() }
-        if entries.updateValue(prepared, forKey: key) == nil { order.append(key) }
-        while order.count > Self.cap {
-            entries.removeValue(forKey: order.removeFirst())
-        }
+        entries.set(key, prepared)
     }
 }
 

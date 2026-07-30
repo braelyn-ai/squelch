@@ -10,16 +10,14 @@ struct AuditView: View {
     @Environment(AppStore.self) private var store
     @Namespace private var auditGlass
 
-    @State private var entries: [AuditEntry] = []
-    @State private var error: String?
-    @State private var loading = true
+    @State private var auditState: Loadable<[AuditEntry]> = .loading
     @State private var index = 0
 
     private static let inboxLabel = "INBOX"
 
     /// Newest first by ts, falling back to id — never trust server ordering.
     private var rows: [AuditEntry] {
-        entries.sorted { a, b in
+        (auditState.value ?? []).sorted { a, b in
             let ta = Fmt.date(a.ts)
             let tb = Fmt.date(b.ts)
             if let ta, let tb, ta != tb { return ta > tb }
@@ -29,9 +27,9 @@ struct AuditView: View {
 
     var body: some View {
         Group {
-            if loading {
+            if auditState.isLoading {
                 BandNote("loading audit…")
-            } else if let error {
+            } else if let error = auditState.error {
                 BandNote(error)
             } else if rows.isEmpty {
                 BandNote("No agent or app actions recorded yet.")
@@ -74,13 +72,8 @@ struct AuditView: View {
     }
 
     private func load() async {
-        loading = true
-        defer { loading = false }
-        do {
-            entries = try await APIClient.shared.getAudit(limit: 200)
-            error = nil
-        } catch {
-            self.error = errText(error, "audit failed")
+        await $auditState.load("audit failed") {
+            try await APIClient.shared.getAudit(limit: 200)
         }
     }
 

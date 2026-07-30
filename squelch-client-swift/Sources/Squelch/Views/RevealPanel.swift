@@ -10,9 +10,7 @@ struct RevealPanel: View {
     let meta: SealedMeta
     let onClose: () -> Void
 
-    @State private var revealed: RevealedSealed?
-    @State private var error: String?
-    @State private var loading = true
+    @State private var revealState: Loadable<RevealedSealed> = .loading
 
     var body: some View {
         OverlayScrim(onDismiss: onClose) {
@@ -41,12 +39,12 @@ struct RevealPanel: View {
 
                 ScrollView {
                     Group {
-                        if loading {
+                        if revealState.isLoading {
                             Text("revealing…")
                                 .font(Typo.rowSub).foregroundStyle(Palette.inkFaintest)
-                        } else if let error {
+                        } else if let error = revealState.error {
                             Text(error).font(Typo.rowSub).foregroundStyle(Palette.danger)
-                        } else if let revealed {
+                        } else if let revealed = revealState.value {
                             if let html = revealed.html, !html.isEmpty {
                                 EmailWebView(html: html)
                             } else {
@@ -83,8 +81,9 @@ struct RevealPanel: View {
             KeyBinding("Escape", "close reveal", allowInInput: true) { onClose() }
         ])
         .task { await load() }
-        // Clear the sensitive body when this view goes away.
-        .onDisappear { revealed = nil }
+        // Clear the sensitive body when this view goes away — `.idle` drops the
+        // decoded value, which is the only copy of it.
+        .onDisappear { revealState = .idle }
     }
 
     private var banner: some View {
@@ -106,18 +105,13 @@ struct RevealPanel: View {
     }
 
     private var fromLine: String {
-        let name = revealed?.from_name.map { "\($0) · " } ?? ""
+        let name = revealState.value?.from_name.map { "\($0) · " } ?? ""
         return "\(name)\(meta.sender) · \(Fmt.dateTime(meta.received_at))"
     }
 
     private func load() async {
-        loading = true
-        error = nil
-        do {
-            revealed = try await APIClient.shared.revealSealed(meta.id)
-        } catch {
-            self.error = errText(error, "reveal failed")
+        await $revealState.load("reveal failed") {
+            try await APIClient.shared.revealSealed(meta.id)
         }
-        loading = false
     }
 }

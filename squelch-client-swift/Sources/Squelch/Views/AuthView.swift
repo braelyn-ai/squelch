@@ -521,7 +521,7 @@ private struct DecisionCard: View {
     let onMine: () -> Void
     let onNotMine: () -> Void
 
-    private var isReset: Bool { meta.kind == "password_reset" }
+    private var isReset: Bool { meta.kind == .passwordReset }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {

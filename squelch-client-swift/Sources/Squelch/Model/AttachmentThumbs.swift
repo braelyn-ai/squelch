@@ -24,33 +24,26 @@ final class AttachmentThumbs {
     /// display class this app ships on. `nonisolated` for the detached render task.
     private nonisolated static let maxPixel = 76
 
-    /// attachment id -> verdict. Membership IS "already resolved".
-    private var cache: [Int: Tile] = [:]
-    /// In-flight resolves, so two cards for one attachment share a download.
-    private var inFlight: [Int: Task<Tile, Never>] = [:]
+    /// How many resolved tiles to keep. Each is a 76px thumbnail, so this is a
+    /// few megabytes at worst — deep enough that walking a mailbox never
+    /// re-downloads, bounded so a long session cannot grow forever.
+    private static let cacheMax = 512
+
+    /// attachment id -> verdict, `.blank` included. Membership IS "already
+    /// resolved", which is what makes the negative cache work.
+    private let memo = AsyncMemo<Int, Tile>(limit: cacheMax)
 
     private init() {}
 
     /// A resolved tile for instant render, without starting any work — a recycled
     /// card reads this in `body` instead of flashing a spinner while its `.task`
     /// re-confirms what we hold. nil means "not resolved yet", NOT "no art".
-    func cached(_ id: Int) -> Tile? { cache[id] }
+    func cached(_ id: Int) -> Tile? { memo.cached(id) }
 
     /// Resolve one tile, deduped and memoized.
     @discardableResult
     func resolve(_ attachment: Attachment, as source: Source) async -> Tile {
-        let id = attachment.id
-        if let entry = cache[id] { return entry }
-        if let running = inFlight[id] { return await running.value }
-
-        let task = Task<Tile, Never> { [weak self] in
-            let tile = await Self.fetch(attachment, source)
-            self?.cache[id] = tile
-            self?.inFlight[id] = nil
-            return tile
-        }
-        inFlight[id] = task
-        return await task.value
+        await memo.resolve(attachment.id) { await Self.fetch(attachment, source) }
     }
 
     // MARK: - resolution

@@ -498,12 +498,57 @@ struct TriageConfigPatch: Codable, Sendable {
 
 // MARK: - sealed
 
+/// core::types::SealedKind — why a message was sealed out of the sitrep.
+/// Lenient like the rest, but it must NOT collapse an unknown value onto a known
+/// case: otp/verification auto-reveal, so a kind this build has never heard of
+/// keeps its raw string in `.unknown`, stays inert, and re-encodes verbatim.
+enum SealedKind: LenientRawEnum {
+    case otp
+    case passwordReset
+    case magicLink
+    case loginAlert
+    case verification
+    case unknown(String)
+
+    var rawValue: String {
+        switch self {
+        case .otp: "otp"
+        case .passwordReset: "password_reset"
+        case .magicLink: "magic_link"
+        case .loginAlert: "login_alert"
+        case .verification: "verification"
+        case .unknown(let raw): raw
+        }
+    }
+
+    /// Total, so the LenientRawEnum decode never has to fall back — and so no
+    /// wire string is ever dropped on the way in.
+    init(rawValue: String) {
+        switch rawValue {
+        case "otp": self = .otp
+        case "password_reset": self = .passwordReset
+        case "magic_link": self = .magicLink
+        case "login_alert": self = .loginAlert
+        case "verification": self = .verification
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    /// Unreachable — `init(rawValue:)` never fails; the protocol still wants it.
+    static var unknownFallback: SealedKind { .unknown("") }
+
+    /// Identity IS the wire string, so `.unknown("otp")` can never become a
+    /// second spelling of `.otp` that set membership would miss.
+    static func == (a: SealedKind, b: SealedKind) -> Bool { a.rawValue == b.rawValue }
+    func hash(into hasher: inout Hasher) { hasher.combine(rawValue) }
+}
+
 struct SealedMeta: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var thread_id: String
     var sender: String
     var subject: String
-    var kind: String?
+    var kind: SealedKind?
     var received_at: String
 }
 
@@ -515,7 +560,7 @@ struct RevealedSealed: Codable, Sendable {
     var sender: String
     var from_name: String?
     var subject: String
-    var kind: String?
+    var kind: SealedKind?
     var received_at: String
     var body: String
     var html: String?

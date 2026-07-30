@@ -11,10 +11,10 @@ import SwiftUI
 
 enum AuthCode {
     /// Kinds that warrant the code modal; the rest (resets/alerts/links) get the
-    /// ring only. Wire values from `SealedKind` (squelch-core/src/types.rs).
-    static let codeKinds: Set<String> = ["otp", "verification"]
+    /// ring only. An unknown wire kind is never one of these.
+    static let codeKinds: Set<SealedKind> = [.otp, .verification]
 
-    static func isCodeKind(_ kind: String?) -> Bool {
+    static func isCodeKind(_ kind: SealedKind?) -> Bool {
         guard let kind else { return false }
         return codeKinds.contains(kind)
     }
@@ -93,25 +93,26 @@ enum AuthCode {
 /// User-facing copy for auth mail. "Sealed" is internal jargon and must never
 /// reach the UI, so wire `sealed_kind` values map to auth-centric labels.
 enum AuthCopy {
-    static func label(_ kind: String?) -> String {
+    static func label(_ kind: SealedKind?) -> String {
         switch kind {
-        case "otp": "Login code"
-        case "password_reset": "Password reset"
-        case "magic_link": "Sign-in link"
-        case "login_alert": "Sign-in alert"
-        case "verification": "Verification"
-        default: "Auth message"
+        case .otp: "Login code"
+        case .passwordReset: "Password reset"
+        case .magicLink: "Sign-in link"
+        case .loginAlert: "Sign-in alert"
+        case .verification: "Verification"
+        // A kind we don't know stays generic — its raw string is never shown.
+        case .unknown, nil: "Auth message"
         }
     }
 
-    static func symbol(_ kind: String?) -> String {
+    static func symbol(_ kind: SealedKind?) -> String {
         switch kind {
-        case "otp": "key.fill"
-        case "password_reset": "lock.rotation"
-        case "magic_link": "envelope.badge.shield.half.filled"
-        case "login_alert": "exclamationmark.shield.fill"
-        case "verification": "checkmark.seal.fill"
-        default: "key.fill"
+        case .otp: "key.fill"
+        case .passwordReset: "lock.rotation"
+        case .magicLink: "envelope.badge.shield.half.filled"
+        case .loginAlert: "exclamationmark.shield.fill"
+        case .verification: "checkmark.seal.fill"
+        case .unknown, nil: "key.fill"
         }
     }
 }
@@ -132,9 +133,9 @@ final class AuthDecisions {
     static let shared = AuthDecisions()
 
     /// Kinds that ask the human a question rather than handing them a code.
-    static let decisionKinds: Set<String> = ["login_alert", "password_reset", "magic_link"]
+    static let decisionKinds: Set<SealedKind> = [.loginAlert, .passwordReset, .magicLink]
 
-    static func needsDecision(_ kind: String?) -> Bool {
+    static func needsDecision(_ kind: SealedKind?) -> Bool {
         guard let kind else { return false }
         return decisionKinds.contains(kind)
     }

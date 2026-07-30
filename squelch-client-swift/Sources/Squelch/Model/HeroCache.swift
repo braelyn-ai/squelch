@@ -28,48 +28,45 @@ final class HeroCache {
     /// meant to smooth.
     private static let preloadWidth = 4
 
+    /// How many resolved heroes to keep. Each is a 108px thumbnail, so the
+    /// ceiling is tens of megabytes at worst — generous enough that a session's
+    /// newsletters never re-fetch, bounded so a long one cannot grow forever.
+    private static let cacheMax = 512
+
     /// threadId -> resolved hero, or nil for "checked, has none". The outer
     /// Optional is cache membership; the inner one is the verdict.
-    private var cache: [String: Hero?] = [:]
-    /// In-flight resolves, so a preload and a card scrolling into view share a fetch.
-    private var inFlight: [String: Task<Hero?, Never>] = [:]
+    private let memo = AsyncMemo<String, Hero?>(limit: cacheMax)
 
     private init() {}
 
     /// A cached hero for instant render, without starting any work — a recycled card
     /// reads this in `body` instead of flashing empty while its `.task` re-confirms.
     func cached(_ threadId: String) -> Hero? {
-        guard let entry = cache[threadId] else { return nil }
+        guard let entry = memo.cached(threadId) else { return nil }
         return entry
     }
 
     /// Whether this thread has a VERDICT — art, or a cached "has none". `cached`
     /// flattens both to nil and cannot answer it; a card checks this before
     /// starting a `.task` that would only re-hand it what it already drew.
-    func isResolved(_ threadId: String) -> Bool { cache.index(forKey: threadId) != nil }
+    func isResolved(_ threadId: String) -> Bool { memo.cached(threadId) != nil }
 
-    /// Resolve one hero, deduped and memoized.
+    /// Resolve one hero, deduped and memoized. The remote-images gate is checked
+    /// AFTER the cache and any running fetch: a pref flipped off mid-flight must
+    /// not throw away an answer already paid for, nor cache a "no" it never asked.
     @discardableResult
     func resolve(_ threadId: String) async -> Hero? {
-        if let entry = cache[threadId] { return entry }
-        if let running = inFlight[threadId] { return await running.value }
+        if let entry = memo.cached(threadId) { return entry }
+        if let joined = await memo.joinPending(threadId) { return joined }
         guard Prefs.shared.loadRemoteImages, !threadId.isEmpty else { return nil }
-
-        let task = Task<Hero?, Never> { [weak self] in
-            let hero = await Self.fetch(threadId)
-            self?.cache[threadId] = hero
-            self?.inFlight[threadId] = nil
-            return hero
-        }
-        inFlight[threadId] = task
-        return await task.value
+        return await memo.resolve(threadId) { await Self.fetch(threadId) }
     }
 
     /// Warm the cache for a whole zone's worth of senders, `preloadWidth` at a
     /// time. Fire-and-forget: already-cached and in-flight ids fall straight
     /// through `resolve`, so calling this on every refresh is near-free.
     func preload(_ threadIds: [String]) {
-        let pending = threadIds.filter { !$0.isEmpty && cache[$0] == nil }
+        let pending = threadIds.filter { !$0.isEmpty && memo.cached($0) == nil }
         guard !pending.isEmpty, Prefs.shared.loadRemoteImages else { return }
         Task {
             await withBoundedTaskGroup(width: Self.preloadWidth, over: pending) { [weak self] id in

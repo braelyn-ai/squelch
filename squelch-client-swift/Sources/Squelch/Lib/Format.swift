@@ -20,14 +20,15 @@ enum Fmt {
 
     /// Parsed timestamps, memoized: every visible row parses an age and a
     /// deadline chip per render, and RFC3339 parsing is a measurable frame cost.
-    nonisolated(unsafe) private static var dateCache: [String: Date?] = [:]
+    /// A failed parse is cached too — the same bad stamp must not re-parse.
+    nonisolated(unsafe) private static var dateCache = LRUMap<String, Date?>(limit: dateCacheCap)
     private static let dateCacheLock = NSLock()
     private static let dateCacheCap = 4000
 
     static func date(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
         dateCacheLock.lock()
-        if let hit = dateCache[iso] {
+        if let hit = dateCache.get(iso) {
             dateCacheLock.unlock()
             return hit
         }
@@ -36,8 +37,7 @@ enum Fmt {
         let parsed = parseISO(iso)
 
         dateCacheLock.lock()
-        if dateCache.count >= dateCacheCap { dateCache.removeAll(keepingCapacity: true) }
-        dateCache[iso] = parsed
+        dateCache.set(iso, parsed)
         dateCacheLock.unlock()
         return parsed
     }
@@ -219,14 +219,15 @@ enum Fmt {
 /// was costing frames.
 @MainActor
 enum MoneyScan {
-    private static var cache: [String: String?] = [:]
+    /// "no amount in this line" is a verdict worth keeping, so the value is
+    /// itself optional: a hit is an answer, a miss is an unscanned line.
+    private static var cache = LRUMap<String, String?>(limit: cap)
     private static let cap = 2000
 
     static func amount(in text: String) -> String? {
-        if let hit = cache[text] { return hit }
+        if let hit = cache.get(text) { return hit }
         let value = scan(text)
-        if cache.count >= cap { cache.removeAll(keepingCapacity: true) }
-        cache[text] = value
+        cache.set(text, value)
         return value
     }
 

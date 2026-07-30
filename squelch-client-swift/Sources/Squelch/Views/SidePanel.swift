@@ -227,12 +227,12 @@ struct BrowseView: View {
     @Environment(AppStore.self) private var store
     @Namespace private var browseGlass
 
-    @State private var all: [AttentionUpdate] = []
-    @State private var error: String?
-    @State private var loading = true
+    @State private var browseState: Loadable<[AttentionUpdate]> = .loading
     /// Client-side min importance — the squelch knob.
     @State private var squelch: Double = 0
     @State private var index = 0
+
+    private var all: [AttentionUpdate] { browseState.value ?? [] }
 
     private var visible: [AttentionUpdate] {
         all.filter { Double($0.importance) >= squelch }
@@ -255,9 +255,9 @@ struct BrowseView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
 
-            if loading {
+            if browseState.isLoading {
                 BandNote("loading all mail…")
-            } else if let error {
+            } else if let error = browseState.error {
                 BandNote(error)
             } else if visible.isEmpty {
                 BandNote("nothing above the noise line.")
@@ -307,15 +307,10 @@ struct BrowseView: View {
     }
 
     private func load() async {
-        loading = true
-        defer { loading = false }
-        do {
+        await $browseState.load("load failed") {
             let page = try await APIClient.shared.getUpdates(UpdatesParams(limit: 500))
             // Highest importance first — the ranked board.
-            all = page.items.sorted { $0.importance > $1.importance }
-            error = nil
-        } catch {
-            self.error = errText(error, "load failed")
+            return page.items.sorted { $0.importance > $1.importance }
         }
     }
 }

@@ -25,12 +25,13 @@ enum ImageRepeats {
     /// Every dedupable `<img src>` in document order.
     static func sources(_ html: String) -> [String] {
         var found: [String] = []
-        _ = rewrite(html) { tag in
+        // Read-only pass: every tag is kept and the spliced html is discarded.
+        _ = HTMLImg.walk(html) { tag in
             if let src = Trackers.attrValue(tag, "src") {
                 let k = key(src)
                 if isDedupable(k) { found.append(k) }
             }
-            return true
+            return .keep
         }
         return found
     }
@@ -39,46 +40,12 @@ enum ImageRepeats {
     /// (`alreadySeen`) or earlier in this same html.
     static func dropRepeats(_ html: String, alreadySeen: Set<String>) -> String {
         var seen = alreadySeen
-        return rewrite(html) { tag in
-            guard let src = Trackers.attrValue(tag, "src") else { return true }
+        return HTMLImg.walk(html) { tag in
+            guard let src = Trackers.attrValue(tag, "src") else { return .keep }
             let k = key(src)
-            guard isDedupable(k) else { return true }
+            guard isDedupable(k) else { return .keep }
             // `inserted == false` means we have already shown this exact image.
-            return seen.insert(k).inserted
+            return seen.insert(k).inserted ? .keep : .drop
         }
-    }
-
-    /// Walk `<img>` tags in document order, copying every other byte verbatim;
-    /// `keep` returns false to drop one. Hand-walked rather than parsed: a DOM
-    /// round-trip would reserialize markup the server-side sanitizer vetted,
-    /// and re-vetting here would mean two sanitizers to keep in step.
-    private static func rewrite(_ html: String, keep: (String) -> Bool) -> String {
-        var out = ""
-        var rest = Substring(html)
-
-        while let open = rest.range(of: "<img", options: [.caseInsensitive]) {
-            // Only a tag start if the next character ends the token — otherwise
-            // `<images>` would be mistaken for one.
-            let afterIdx = open.upperBound
-            let isTagStart =
-                afterIdx == rest.endIndex
-                || rest[afterIdx].isWhitespace || rest[afterIdx] == ">" || rest[afterIdx] == "/"
-            guard isTagStart else {
-                out += rest[rest.startIndex..<afterIdx]
-                rest = rest[afterIdx...]
-                continue
-            }
-            out += rest[rest.startIndex..<open.lowerBound]
-            // A sanitized attribute never holds a raw ">".
-            guard let close = rest[afterIdx...].firstIndex(of: ">") else {
-                out += rest[open.lowerBound...]
-                return out
-            }
-            let tag = String(rest[open.lowerBound...close])
-            if keep(tag) { out += tag }
-            rest = rest[rest.index(after: close)...]
-        }
-        out += rest
-        return out
     }
 }

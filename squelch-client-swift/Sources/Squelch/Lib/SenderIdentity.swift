@@ -318,15 +318,14 @@ final class FaviconCache {
 /// helpers can run off the main actor.
 @MainActor
 enum SenderCache {
-    private static var cache: [String: SenderID.Resolved] = [:]
+    private static var cache = LRUMap<String, SenderID.Resolved>(limit: cap)
     /// Bound the table — a long session can see a lot of distinct senders.
     private static let cap = 4000
 
     static func resolved(_ sender: String) -> SenderID.Resolved {
-        if let hit = cache[sender] { return hit }
+        if let hit = cache.get(sender) { return hit }
         let value = SenderID.resolve(sender)
-        if cache.count >= cap { cache.removeAll(keepingCapacity: true) }
-        cache[sender] = value
+        cache.set(sender, value)
         return value
     }
 }
