@@ -322,7 +322,13 @@ struct SitrepView: View {
         // Bulk-resolve every aggregated update; one toast, optimistic drop.
         store.zones.newsletters.removeAll { $0.address == nl.address }
         do {
-            for item in nl.items { try await APIClient.shared.setStatus(item.id, .done) }
+            for item in nl.items {
+                try await APIClient.shared.setStatus(item.id, .done)
+                // Unpin as each one lands, not at the end: a throw partway
+                // through still leaves the resolved ones correctly released.
+                // No undo on this path, so nothing re-pins.
+                await ImageStore.shared.release(messageId: item.id)
+            }
             store.pushToast(
                 "done: \(SenderCache.resolved(nl.sender).displayName) (\(nl.items.count))", .info)
         } catch {

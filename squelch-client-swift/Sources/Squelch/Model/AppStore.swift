@@ -583,6 +583,9 @@ final class AppStore {
 
         HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))
         warmZoneThreads()
+        // Half of the launch image warm's input (the newsletter zone); the
+        // bands are the other half. It runs once both have landed.
+        ImageWarmer.shared.noteZonesLanded()
     }
 
     /// How long a zone refresh stays good. Long enough that flipping between

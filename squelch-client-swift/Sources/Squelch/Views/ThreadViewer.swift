@@ -343,6 +343,13 @@ struct ThreadViewer: View {
             if let newestChrono = thread?.messages.last {
                 do {
                     try await APIClient.shared.setStatus(newestChrono.id, .done)
+                    // Same unpin as Actions.done — this path resolves the
+                    // message without going through it.
+                    await ImageStore.shared.release(messageId: newestChrono.id)
+                    // And the same optimistic drop: the surface underneath is
+                    // still mounted, so without this the reader closes back
+                    // onto a row for mail that is already done.
+                    store.noteResolved(newestChrono.id)
                     store.pushToast("done", .info)
                 } catch {
                     store.pushToast(errText(error, "done failed"), .error)

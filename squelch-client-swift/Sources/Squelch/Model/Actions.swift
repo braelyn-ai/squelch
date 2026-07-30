@@ -43,10 +43,14 @@ enum Actions {
         let restore = store.removeFromBands(u.id)
         do {
             try await APIClient.shared.setStatus(u.id, .done)
-            // The message leaves the working set — drop its remembered height.
+            // The message leaves the working set — drop its remembered height,
+            // and unpin its images so they rejoin the LRU. The bytes stay on
+            // disk: the undo below is five seconds away and re-pins them.
             FrameHeights.shared.clear(String(u.id))
+            await ImageStore.shared.release(messageId: u.id)
             store.pushUndo(kind: .done, messageId: u.id, label: "done \(u.sender)") {
                 try await APIClient.shared.setStatus(u.id, .open)
+                await ImageStore.shared.repin(messageId: u.id)
             }
         } catch {
             restore()

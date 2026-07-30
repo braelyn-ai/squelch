@@ -14,23 +14,35 @@
 //  3. A `<meta http-equiv="Content-Security-Policy">` is injected as the FIRST
 //     child of <head>, so it applies before any resource is fetched:
 //        default-src 'none'; style-src 'unsafe-inline'; img-src <gate>
-//     There is no script-src at all. The img-src gate is the per-message remote
-//     image decision (see REMOTE IMAGES).
+//     There is no script-src at all, and NO `http:`/`https:` anywhere in the
+//     policy: the frame cannot reach the network directly at all. The img-src
+//     gate is the per-message remote image decision (see REMOTE IMAGES).
 //  4. NAVIGATION IS REFUSED. The delegate allows exactly one load — the initial
 //     `loadHTMLString` — and cancels every other navigation. A click inside the
 //     frame therefore cannot take the view anywhere; instead we hand the URL to
 //     the SYSTEM BROWSER via Opener (which re-guards to http/https only).
-//  5. No cookies, no persistent storage: a NON-persistent
-//     `WKWebsiteDataStore`, so the frame has no jar to read or write and
-//     nothing survives the message being closed.
+//  5. No cookies, no persistent storage, and no WebKit-driven image loads: a
+//     NON-persistent `WKWebsiteDataStore`, so the frame has no jar to read or
+//     write and nothing survives the message being closed. Images do not ride
+//     that loader at all — they ride ours (see REMOTE IMAGES).
 //
 // REMOTE IMAGES. Images load by default (real images are the point of HTML
 // mail) but tracking pixels are stripped in a preprocessing pass first (see
-// Trackers) and `Referrer-Policy: no-referrer` is set in the document, so hosts
-// learn nothing about which mail — or reader — asked for them. When the
-// Settings "load on demand" pref is on, `img-src` collapses to `data:` and the
-// message shows a per-email opt-in bar instead: NO network request is made for
-// mail the reader has not opted into.
+// Trackers) and every surviving reference is REWRITTEN to `squelch-img:` (see
+// ImageProxy), so the fetch happens in our own audited path — ImageStore:
+// ephemeral session, no cookies ever, empty referrer, image/* responses only,
+// redirects re-guarded per hop, bytes cached to disk under our own eviction
+// policy — rather than inside WebKit where we could only watch. That is also
+// what lets `img-src` drop `http: https:` and close the CSS-background tracking
+// gap the sanitizer documents (squelch-core/src/sync/html.rs, "KNOWN
+// TRADE-OFF"): a `url()` in a kept `<style>` block goes through the same proxy
+// as an `<img>`, and anything the rewrite misses is simply blocked.
+// `Referrer-Policy: no-referrer` remains set in the document too, so hosts learn
+// nothing about which mail — or reader — asked for an image. When the Settings
+// "load on demand" pref is on, `img-src` collapses to `data:` and the message
+// shows a per-email opt-in bar instead: NO network request is made for mail the
+// reader has not opted into, because the proxy scheme itself is refused by the
+// CSP before any request reaches the handler.
 //
 // LINKS. Because navigation is refused the in-frame links are inert. We extract
 // the http(s) hrefs from the same sanitized html and render them as REAL native
@@ -43,6 +55,18 @@
 // ResizeObserver tick. A remembered height (FrameHeights, keyed by message id)
 // means a reopened message paints at its final size on the FIRST frame, which
 // is what the reader perceives as "no flicker".
+//
+// FRAME REUSE. A rendered frame is POOLED on teardown (WebFramePool) and handed
+// back to the SAME message on reopen, so the second read costs no content-process
+// attach, no parse, no layout and no measuring pass — FrameHeights makes a
+// reopened message the right size, this makes it already drawn. It is also the
+// one thing that outlives "the message being closed" (LAYER 5), so it is fenced
+// rather than merely capped: the key is the message id AND the exact document
+// AND the remote-image policy, so a frame can only ever be re-shown to the mail
+// it already held, under the CSP it was built with. A body with no message id —
+// the sealed-record reveal, which promises the opposite — is never pooled at
+// all. Nothing new reaches disk: the store is the same non-persistent one, and
+// the html is already resident in PreparedBodies either way.
 //
 // QUOTED HISTORY. Collapsed by default, using the same conservative heuristic
 // as the plain-text path (Quotes): the first top-level <blockquote> after which
@@ -74,7 +98,8 @@ struct EmailWebView: View {
     @State private var quotedHidden = true
     @State private var measured = false
 
-    /// The tracker-strip + dedupe + link-extraction pass for THIS body.
+    /// The tracker-strip + dedupe + link-extraction + image-proxy pass for THIS
+    /// body.
     ///
     /// Warmed at PREFETCH time (ThreadPrefetch fills PreparedBodies off the
     /// main actor as soon as a thread lands in the cache) and read back in
@@ -105,9 +130,15 @@ struct EmailWebView: View {
         var blocked: Int
         var hasRemoteCandidates: Bool
         var links: [EmailLink]
+        /// The ORIGINAL http(s) urls behind this body's proxied references, in
+        /// document order, CAPPED (ImageProxy.maxWarmURLs). What the launch
+        /// warmer pre-fetches and pins — not the full set of what the body
+        /// renders, which is uncapped and loads on demand.
+        var imageURLs: [String]
 
         static let empty = Prepared(
-            sourceHash: 0, html: "", blocked: 0, hasRemoteCandidates: false, links: [])
+            sourceHash: 0, html: "", blocked: 0, hasRemoteCandidates: false, links: [],
+            imageURLs: [])
 
         static func make(from html: String, seenEarlier: Set<String>) -> Prepared {
             // ORDER MATTERS: trackers come out FIRST, so a tracking pixel can
@@ -116,15 +147,22 @@ struct EmailWebView: View {
             // pass, never in place of it.
             let stripped = Trackers.strip(html)
             let deduped = ImageRepeats.dropRepeats(stripped.html, alreadySeen: seenEarlier)
+            // Read off the DEDUPED html: a message whose only images were
+            // repeats has nothing left to fetch, so it must not offer the
+            // "load remote images" bar for images it will never show.
+            let hasRemoteCandidates = Trackers.hasNetworkImages(deduped)
+            let links = Trackers.extractLinks(deduped)
+            // LAST, and only after the two reads above: the proxy rewrite
+            // replaces every http(s) image reference with a `squelch-img:` one,
+            // which those scans would no longer recognise as remote.
+            let proxied = ImageProxy.rewrite(deduped)
             return Prepared(
                 sourceHash: cacheKey(html, seenEarlier),
-                html: deduped,
+                html: proxied.html,
                 blocked: stripped.blocked,
-                // Read off the DEDUPED html: a message whose only images were
-                // repeats has nothing left to fetch, so it must not offer the
-                // "load remote images" bar for images it will never show.
-                hasRemoteCandidates: Trackers.hasNetworkImages(deduped),
-                links: Trackers.extractLinks(deduped))
+                hasRemoteCandidates: hasRemoteCandidates,
+                links: links,
+                imageURLs: proxied.urls)
         }
 
         /// The suppression set is an input, so it has to be part of the identity
@@ -179,6 +217,9 @@ struct EmailWebView: View {
                 html: prepared.html,
                 allowRemote: allowRemote,
                 collapseQuotes: quotedHidden,
+                // The pool's message identity. nil is not "unkeyed", it is
+                // NOT POOLABLE — see WebFramePool.Key.
+                poolKey: cacheKey,
                 onHeight: { h in
                     guard h > 0 else { return }
                     height = h
@@ -355,12 +396,22 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
     let html: String
     let allowRemote: Bool
     let collapseQuotes: Bool
+    /// Message id, or nil for a body that must never be pooled.
+    let poolKey: String?
     let onHeight: (CGFloat) -> Void
     let onQuotedFound: (Bool) -> Void
     let onLink: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onHeight: onHeight, onQuotedFound: onQuotedFound, onLink: onLink)
+    }
+
+    /// What a LIVE frame would have to be holding to be reusable here, or nil
+    /// if this render cannot use one (nothing to render yet, or no message id).
+    private var renderKey: WebFramePool.Key? {
+        guard let poolKey, !html.isEmpty else { return nil }
+        return WebFramePool.Key(
+            message: poolKey, allowRemote: allowRemote, document: html.hashValue)
     }
 
     /// ONE ephemeral data store shared by every email view.
@@ -375,7 +426,18 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
     @MainActor
     fileprivate static let sharedDataStore: WKWebsiteDataStore = .nonPersistent()
 
-    func makeNSView(context: Context) -> WKWebView {
+    func makeNSView(context: Context) -> PassthroughWebView {
+        // POOL HIT: this exact document, for this exact message, under this
+        // exact image policy, still parsed and laid out in a live frame. Adopt
+        // it and DO NOT LOAD — `adopt` seeds the load guard so the updateNSView
+        // that immediately follows is a no-op instead of a reload, which is the
+        // entire point (a reload would throw the rendered frame away and flash
+        // an empty one on the way back to the same pixels).
+        if let key = renderKey, let entry = WebFramePool.shared.checkout(key) {
+            context.coordinator.adopt(entry, key: key)
+            return entry.webView
+        }
+
         let config = WKWebViewConfiguration()
 
         // LAYER 2: page content cannot execute script, whatever it contains.
@@ -383,9 +445,17 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         // LAYER 5: no cookie jar, no persistent storage, nothing survives close.
         config.websiteDataStore = Self.sharedDataStore
+        // Images are the ONE resource an email body is allowed to load, and they
+        // come from here rather than from WebKit's loader — see ImageProxy. One
+        // shared handler across every configuration is legal and keeps the
+        // in-flight bookkeeping in a single place.
+        config.setURLSchemeHandler(ImageSchemeHandler.shared, forURLScheme: ImageProxy.scheme)
 
+        // The relay, not the coordinator, is what gets wired to the frame — it
+        // outlives every coordinator that borrows the frame. See FrameRelay.
+        let relay = FrameRelay()
         let controller = WKUserContentController()
-        controller.add(context.coordinator, name: "squelch")
+        controller.add(relay, name: FrameRelay.name)
         controller.addUserScript(
             WKUserScript(
                 source: Self.measuringScript, injectionTime: .atDocumentEnd,
@@ -393,24 +463,36 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         config.userContentController = controller
 
         let webView = PassthroughWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
-        webView.uiDelegate = context.coordinator
+        // WKWebView holds its delegates WEAKLY; the relay stays alive because
+        // the content controller retains its message handlers and the frame
+        // retains the controller. That retention is load-bearing — removing the
+        // handler (WebFramePool.discard) is therefore also what unwires the
+        // delegates for good.
+        webView.navigationDelegate = relay
+        webView.uiDelegate = relay
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
 
-        context.coordinator.load(webView, html: html, allowRemote: allowRemote)
+        context.coordinator.attach(relay)
+        context.coordinator.load(webView, html: html, allowRemote: allowRemote, poolKey: poolKey)
         return webView
     }
 
-    func updateNSView(_ webView: WKWebView, context: Context) {
+    func updateNSView(_ webView: PassthroughWebView, context: Context) {
         context.coordinator.onHeight = onHeight
         context.coordinator.onQuotedFound = onQuotedFound
         context.coordinator.onLink = onLink
         // A content/policy change is a genuine reload; a quote toggle is not
         // (reloading for it would flash an empty frame).
-        context.coordinator.load(webView, html: html, allowRemote: allowRemote)
+        context.coordinator.load(webView, html: html, allowRemote: allowRemote, poolKey: poolKey)
         context.coordinator.setQuotesCollapsed(webView, collapsed: collapseQuotes)
+    }
+
+    /// Return the frame to the pool rather than dropping it — the whole reason
+    /// reopening a read message is instant.
+    static func dismantleNSView(_ webView: PassthroughWebView, coordinator: Coordinator) {
+        coordinator.release(webView)
     }
 
     /// Injected AFTER document end. Does four things, none of which the message
@@ -546,6 +628,18 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
             new ResizeObserver(measure).observe(document.body);
           }
 
+          // Called by the host when a POOLED frame is handed to a new view.
+          // Nothing here re-runs on a document that was not reloaded, so the
+          // new host would otherwise know neither the height nor whether there
+          // is a quoted chain to offer. Clearing `last` is the whole trick:
+          // measure() suppresses an unchanged height, and for a frame being
+          // re-shown unchanged is exactly what it is.
+          window.__squelchResend = function () {
+            send({ kind: 'quoted', value: quoteNodes.length > 0 });
+            last = -1;
+            measure();
+          };
+
           // ---- links -------------------------------------------------------
           // Navigation is refused by the delegate anyway; reporting the href up
           // to native is what makes an in-frame click actually DO something.
@@ -560,16 +654,26 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         """
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate,
-        WKScriptMessageHandler
-    {
+    final class Coordinator: NSObject {
         var onHeight: (CGFloat) -> Void
         var onQuotedFound: (Bool) -> Void
         var onLink: (String) -> Void
 
+        /// The frame's permanent hinge, borrowed for as long as this
+        /// representable owns the frame. Held strongly so `release` can still
+        /// hand it to the pool after WebKit has let go of everything else.
+        private var relay: FrameRelay?
+
         /// What is currently loaded, so `updateNSView` only reloads on a real
         /// content/policy change (a reload flashes an empty frame).
         private var loadedSignature: String?
+        /// The pool identity of what the frame CURRENTLY HOLDS — re-derived on
+        /// every real load, never remembered from checkout. The two diverge
+        /// exactly when getting it wrong would matter: the remote-image opt-in
+        /// reloads a frame that is already checked out, so a frame borrowed
+        /// under `allowRemote: false` can go back holding a permissive-CSP
+        /// document, and must be filed as such.
+        private var loadedPoolKey: WebFramePool.Key?
         /// Set for exactly the initial load; every other navigation is refused.
         /// Navigations WE started that have not yet been through the policy
         /// gate. A COUNTER, not a flag: `loadHTMLString` is asynchronous, so two
@@ -589,21 +693,93 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
             self.onLink = onLink
         }
 
-        func load(_ webView: WKWebView, html: String, allowRemote: Bool) {
+        /// The load guard and the pool key say the same thing about a document,
+        /// so they are derived from one place: if they could drift, an adopted
+        /// frame would fail its own guard and reload the document it is already
+        /// showing.
+        private static func signature(allowRemote: Bool, document: Int) -> String {
+            "\(allowRemote)|\(document)"
+        }
+
+        func load(_ webView: WKWebView, html: String, allowRemote: Bool, poolKey: String?) {
             // NEVER LOAD THE PLACEHOLDER. `prepared` starts empty and is filled
             // by a `.task`, so the first body pass used to load a blank document
             // and the real one landed as a SECOND navigation a beat later. That
             // is what made the race below reachable at all.
             guard !html.isEmpty else { return }
-            let signature = "\(allowRemote)|\(html.hashValue)"
+            let document = html.hashValue
+            let signature = Self.signature(allowRemote: allowRemote, document: document)
             guard signature != loadedSignature else { return }
             loadedSignature = signature
+            loadedPoolKey = poolKey.map {
+                WebFramePool.Key(message: $0, allowRemote: allowRemote, document: document)
+            }
+            relay?.noteLoadStarted()
             pendingOwnLoads += 1
             webView.loadHTMLString(
                 Self.document(html: html, allowRemote: allowRemote),
                 // A nil base URL gives the document a unique opaque origin, so
                 // relative references resolve to nothing rather than to us.
                 baseURL: nil)
+        }
+
+        /// Take ownership of a freshly built frame.
+        func attach(_ relay: FrameRelay) {
+            self.relay = relay
+            relay.owner = self
+        }
+
+        /// Take ownership of a frame that is ALREADY showing this document.
+        ///
+        /// Re-pointing `relay.owner` is the entire handover: the frame's
+        /// message handler and both delegates are the relay, permanently, so
+        /// there is nothing on the frame to rewire and no window in which a
+        /// callback could reach the previous message's coordinator.
+        func adopt(_ entry: WebFramePool.Entry, key: WebFramePool.Key) {
+            attach(entry.relay)
+            // The frame is already loaded, so no load may be started for it —
+            // and `pendingOwnLoads` stays 0, which is correct: LAYER 4 has no
+            // permission outstanding to grant.
+            loadedSignature = Self.signature(allowRemote: key.allowRemote, document: key.document)
+            loadedPoolKey = key
+
+            // A document that was not reloaded never re-runs the measuring
+            // script, so a reused frame would sit at zero height behind the
+            // paint-hold and the quoted-history chip would vanish. Two answers,
+            // both wanted: the relay already knows what THIS document last
+            // reported, which releases the hold on the very next main-actor
+            // turn with no round trip; and the page is asked to re-send, which
+            // is what makes it right if the frame comes back at a new width.
+            //
+            // The hop is not optional — makeNSView runs inside a view update,
+            // and these callbacks write @State.
+            let height = entry.relay.lastHeight
+            let quoted = entry.relay.lastQuoted
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.onQuotedFound(quoted)
+                if height > 0 { self.onHeight(height) }
+            }
+            entry.webView.evaluateJavaScript("window.__squelchResend && window.__squelchResend()")
+        }
+
+        /// Give the frame up: to the pool if it is worth keeping, otherwise to
+        /// the teardown path.
+        func release(_ webView: PassthroughWebView) {
+            guard let relay else { return }
+            relay.owner = nil
+            let entry = WebFramePool.Entry(webView: webView, relay: relay)
+            self.relay = nil
+            // An unfinished or failed load is not merely worthless to keep, it
+            // is a trap: the next owner adopts with no pending-load permission,
+            // so the still-in-flight navigation would be refused by LAYER 4 and
+            // the frame would come back blank. `loadedPoolKey` is nil for a body
+            // with no message id, which is what keeps sealed reveals out.
+            guard relay.loaded, let key = loadedPoolKey else {
+                WebFramePool.discard(entry)
+                return
+            }
+            WebFramePool.shared.checkIn(entry, key: key)
         }
 
         func setQuotesCollapsed(_ webView: WKWebView, collapsed: Bool) {
@@ -614,18 +790,12 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         /// LAYER 4: allow exactly the in-memory loads WE started; refuse everything
         /// else. A link click cannot navigate this view anywhere.
         ///
-        /// NOTE the exact signature — the closure must be `@MainActor @Sendable`
-        /// or Swift treats this as an unrelated near-miss method, the delegate
-        /// requirement goes unimplemented, and WebKit silently defaults to
-        /// ALLOWING every navigation. This is a security layer; it has to match.
-        func webView(
-            _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
-        ) {
+        /// Called by the relay, which is the frame's actual delegate — the
+        /// counter lives here because only the owner starts loads.
+        func decideNavigation(_ navigationAction: WKNavigationAction) -> WKNavigationActionPolicy {
             if pendingOwnLoads > 0 {
                 pendingOwnLoads -= 1
-                decisionHandler(.allow)
-                return
+                return .allow
             }
             // A user-initiated link becomes a SYSTEM BROWSER open (re-guarded to
             // http/https by Opener); anything else is silently dropped.
@@ -634,33 +804,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
             {
                 onLink(url.absoluteString)
             }
-            decisionHandler(.cancel)
-        }
-
-        /// No popups, ever.
-        func webView(
-            _ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-            for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures
-        ) -> WKWebView? {
-            if let url = navigationAction.request.url { onLink(url.absoluteString) }
-            return nil
-        }
-
-        func userContentController(
-            _ controller: WKUserContentController, didReceive message: WKScriptMessage
-        ) {
-            guard let payload = message.body as? [String: Any],
-                let kind = payload["kind"] as? String
-            else { return }
-            switch kind {
-            case "height":
-                if let value = payload["value"] as? Double { onHeight(CGFloat(value)) }
-            case "quoted":
-                if let value = payload["value"] as? Bool { onQuotedFound(value) }
-            case "link":
-                if let value = payload["value"] as? String { onLink(value) }
-            default: break
-            }
+            return .cancel
         }
 
         /// Build the full document. The CSP meta MUST be the first thing in
@@ -671,7 +815,16 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         /// is unreadable. Mail also ships its own colors assuming a white
         /// canvas, so anything else breaks a large fraction of real messages.
         nonisolated static func document(html: String, allowRemote: Bool) -> String {
-            let imgSrc = allowRemote ? "http: https: data:" : "data:"
+            // `squelch-img:` and NOT `http: https:` — every remote image was
+            // rewritten to the proxy scheme (ImageProxy), so the network is
+            // reachable only through ImageSchemeHandler and anything the rewrite
+            // missed fails closed. `data:` stays for inline art.
+            //
+            // This is ALSO the load-on-demand gate, and it is the whole gate: an
+            // un-opted message has no `squelch-img:` in its policy, so the
+            // request is refused by the document and the handler is never
+            // reached. Nothing downstream has to re-check the pref.
+            let imgSrc = allowRemote ? "squelch-img: data:" : "data:"
             let csp = "default-src 'none'; style-src 'unsafe-inline'; img-src \(imgSrc)"
             return """
                 <!doctype html><html><head>\
@@ -690,5 +843,242 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
                 </head><body>\(html)</body></html>
                 """
         }
+    }
+}
+
+// MARK: - the live frame pool
+
+/// A frame's ONE permanent connection to native code: script message handler,
+/// navigation delegate and UI delegate, installed at construction and never
+/// replaced.
+///
+/// A pooled frame outlives the representable that built it, so the naive
+/// handover — re-`add` each new Coordinator as the "squelch" handler — is not
+/// available: `WKUserContentController` retains its handlers and will not hold
+/// two under one name, so that path either throws or pins the previous
+/// message's coordinator (and its closures into a torn-down SwiftUI view) to
+/// the frame for good. Instead the wiring never changes and OWNERSHIP does, in
+/// one assignment. A callback can therefore never reach a stale coordinator:
+/// there is exactly one owner slot, and it is nil while the frame sits in the
+/// pool.
+///
+/// Being unowned also has to be SAFE, not merely quiet, so this is where LAYER
+/// 4 is anchored: a frame with no owner refuses every navigation outright. And
+/// the height/quoted values keep being recorded with no owner attached, which
+/// is what lets a check-in settle the frame back to its collapsed default and
+/// still leave the pool a truthful measurement for the next open.
+@MainActor
+private final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
+    WKUIDelegate
+{
+    static let name = "squelch"
+
+    /// Weak on purpose: SwiftUI owns coordinators, and a frame must never be
+    /// the reason a dead view's callbacks stay alive.
+    weak var owner: EmailWebViewRepresentable.Coordinator?
+
+    /// What THIS document last told us. Read at checkout, because the measuring
+    /// script does not re-run for a frame that was not reloaded.
+    private(set) var lastHeight: CGFloat = 0
+    private(set) var lastQuoted = false
+    /// Whether the current document finished loading. Only a settled frame is
+    /// worth pooling, and only a settled frame is safe to pool — see
+    /// Coordinator.release.
+    private(set) var loaded = false
+
+    func noteLoadStarted() {
+        loaded = false
+        lastHeight = 0
+        lastQuoted = false
+    }
+
+    func userContentController(
+        _ controller: WKUserContentController, didReceive message: WKScriptMessage
+    ) {
+        guard let payload = message.body as? [String: Any],
+            let kind = payload["kind"] as? String
+        else { return }
+        switch kind {
+        case "height":
+            guard let value = payload["value"] as? Double, value > 0 else { return }
+            lastHeight = CGFloat(value)
+            owner?.onHeight(lastHeight)
+        case "quoted":
+            guard let value = payload["value"] as? Bool else { return }
+            lastQuoted = value
+            owner?.onQuotedFound(value)
+        // Dropped when there is no owner, which is right: a pooled frame is off
+        // screen and cannot be clicked, so the only such message would be a
+        // stale one.
+        case "link":
+            if let value = payload["value"] as? String { owner?.onLink(value) }
+        default: break
+        }
+    }
+
+    /// LAYER 4 — see Coordinator.decideNavigation for the policy itself.
+    ///
+    /// NOTE the exact signature — the closure must be `@MainActor @Sendable`
+    /// or Swift treats this as an unrelated near-miss method, the delegate
+    /// requirement goes unimplemented, and WebKit silently defaults to ALLOWING
+    /// every navigation. This is a security layer; it has to match.
+    func webView(
+        _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
+    ) {
+        // No owner means the frame is parked in the pool: nobody is entitled to
+        // navigate it, so nothing may.
+        guard let owner else {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(owner.decideNavigation(navigationAction))
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loaded = true
+    }
+
+    func webView(
+        _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
+    ) {
+        loaded = false
+    }
+
+    func webView(
+        _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        loaded = false
+    }
+
+    /// No popups, ever.
+    func webView(
+        _ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if let url = navigationAction.request.url { owner?.onLink(url.absoluteString) }
+        return nil
+    }
+}
+
+/// LRU pool of LIVE, ALREADY-RENDERED email frames.
+///
+/// Reopening a message the reader just read used to redo all of it: content
+/// process attach, parse, layout, measuring pass, image reattachment.
+/// FrameHeights already made the reopened frame the right SIZE on the first
+/// paint; this makes it the same frame, still drawn.
+@MainActor
+private final class WebFramePool {
+    static let shared = WebFramePool()
+
+    /// SMALL ON PURPOSE. Each entry is a live WebKit content-process attachment
+    /// plus a retained layout tree for a whole email — the expensive thing we
+    /// are keeping is precisely the thing that costs memory, so this is not a
+    /// cache to be generous with. Six covers walking a thread back and forth
+    /// and flipping between the last few messages, which is the motion the pool
+    /// exists for; beyond that the parse we are avoiding is cheaper than the
+    /// residency we would be paying for.
+    private static let capacity = 6
+
+    /// The identity of a RENDERED DOCUMENT, not of a message.
+    ///
+    /// All three fields, exactly, or it is not a match and a fresh frame is
+    /// built:
+    ///  - `message` makes cross-message reuse structurally impossible. The
+    ///    document hash alone would already have to collide for two bodies to
+    ///    be confused, but "one sender's mail inside another's frame" is not a
+    ///    thing to leave to a hash, so the message id is part of the key.
+    ///  - `allowRemote` IS the CSP. It is baked into the document text, and a
+    ///    WKWebView's configuration is immutable after creation besides, so a
+    ///    frame rendered under `img-src squelch-img: data:` is unreachable from
+    ///    a render that asked for `img-src data:`. The remote-image opt-in is a
+    ///    pool MISS, never a silently permissive reuse.
+    ///  - `document` is the exact html handed to the frame, which already folds
+    ///    in the tracker strip, the cross-message image dedupe and the proxy
+    ///    rewrite (Prepared) — it is the same value Coordinator's load guard
+    ///    uses, for the same reason.
+    ///
+    /// Which together give the property the reuse actually rests on: what the
+    /// frame is showing is `Coordinator.document(html:allowRemote:)`, a pure
+    /// function of two of these three fields, so a key match means the parked
+    /// frame is displaying a BYTE-IDENTICAL document — same CSP meta, same
+    /// referrer policy, same everything. Nothing about a recycled frame is
+    /// weaker than a fresh one; the rest of the sandbox rides its configuration,
+    /// which WebKit will not let anyone change after construction anyway.
+    ///
+    /// Quote collapse is deliberately NOT in the key: it is a JS call on the
+    /// live document, never a reload, so it cannot invalidate a frame. Frames
+    /// are checked in collapsed instead, so a hit matches a fresh open's
+    /// default state and nothing has to snap on reopen.
+    struct Key: Hashable {
+        let message: String
+        let allowRemote: Bool
+        let document: Int
+    }
+
+    struct Entry {
+        let webView: PassthroughWebView
+        let relay: FrameRelay
+    }
+
+    private var frames: [Key: Entry] = [:]
+    /// Least-recently-used first.
+    private var order: [Key] = []
+
+    private init() {}
+
+    /// A parked frame holding exactly this document, or nil.
+    ///
+    /// Checkout REMOVES it, which is the whole answer to a frame being in use:
+    /// a borrowed frame is not in the pool, so two views of one message (a
+    /// reader and a reveal, say) can never be handed the same WKWebView — the
+    /// second builds fresh, and whichever is torn down last is the one that
+    /// ends up parked.
+    func checkout(_ key: Key) -> Entry? {
+        guard let entry = frames.removeValue(forKey: key) else { return nil }
+        order.removeAll { $0 == key }
+        return entry
+    }
+
+    func checkIn(_ entry: Entry, key: Key) {
+        entry.relay.owner = nil
+        entry.webView.removeFromSuperview()
+        // Settle back to the state a fresh open expects. Without this a frame
+        // parked with its quoted history expanded would be re-shown tall and
+        // then snap shorter when the new view applied its own (collapsed)
+        // default — a flash, in the one code path whose entire purpose is not
+        // having one. The relay records the resulting height with no owner
+        // attached, so it is the height the next checkout reports.
+        entry.webView.evaluateJavaScript(
+            "window.__squelchSetQuotes && window.__squelchSetQuotes(true)")
+
+        // Two frames of one document: keep the one just used.
+        if let incumbent = frames.removeValue(forKey: key) {
+            order.removeAll { $0 == key }
+            Self.discard(incumbent)
+        }
+        frames[key] = entry
+        order.append(key)
+
+        while order.count > Self.capacity {
+            let oldest = order.removeFirst()
+            if let evicted = frames.removeValue(forKey: oldest) { Self.discard(evicted) }
+        }
+    }
+
+    /// A dropped frame has to be UNWIRED, not just released: the content
+    /// controller retains the relay and the relay is the frame's delegate, so
+    /// simply letting go leaves a live object WebKit can still deliver a late
+    /// navigation or script callback into.
+    static func discard(_ entry: Entry) {
+        entry.relay.owner = nil
+        entry.webView.stopLoading()
+        entry.webView.navigationDelegate = nil
+        entry.webView.uiDelegate = nil
+        let controller = entry.webView.configuration.userContentController
+        controller.removeScriptMessageHandler(forName: FrameRelay.name)
+        controller.removeAllUserScripts()
+        entry.webView.removeFromSuperview()
     }
 }
