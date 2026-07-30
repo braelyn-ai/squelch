@@ -230,6 +230,17 @@ private struct RailButton: View {
 
                 if showRings { AuthRingsOverlay() }
             }
+            // THE WHOLE TILE IS THE TARGET. Without this the hit region is the
+            // GLYPH, and every rail symbol is an OUTLINE — a click through the
+            // middle of the envelope, or between the slider bars, lands in a
+            // hole and the tab silently ignores it. That is the "takes one to
+            // four clicks" bug: the misses are wherever the strokes are not.
+            //
+            // The hover wash never showed it, because `.onHover` and the
+            // background below sit OUTSIDE the button and always covered the
+            // full tile — so the rail lit up everywhere it would not click.
+            // Same trap TextActionStyle documents for text labels.
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .background {
