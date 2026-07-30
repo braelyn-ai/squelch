@@ -13,7 +13,9 @@
 // LAYERED / ESC RETURNS YOU: this is a fullscreen overlay ABOVE everything,
 // including the browse/search side panels. The surface underneath stays
 // mounted, so opening a thread from search keeps the results under it and Esc
-// drops you right back where you were.
+// drops you right back where you were. Clicking the empty gutter beside the
+// column does the same — the mail is the page, so the space around it is a way
+// out and not dead pixels.
 //
 // Ported from squelch-desktop/src/components/ThreadViewer.tsx.
 
@@ -151,6 +153,15 @@ struct ThreadViewer: View {
                 .help("dev: reset this email's LLM verdicts and re-run triage")
             }
 
+            Button { openSenderRule() } label: {
+                HStack(spacing: 4) {
+                    Kbd("r")
+                    Text("new rule").font(Typo.micro)
+                }
+            }
+            .buttonStyle(.textAction)
+            .help("write a rule for this sender — shows the ones already in effect")
+
             Button {
                 confirmMode = .ask
             } label: {
@@ -209,14 +220,54 @@ struct ThreadViewer: View {
                     }
                     .padding(.horizontal, 22)
                     .padding(.vertical, 4)
-                    .frame(maxWidth: 900)
+                    .frame(maxWidth: Self.columnWidth)
                     .frame(maxWidth: .infinity)
+                    // INSIDE the scroll content deliberately: an overlay on the
+                    // ScrollView itself sits above the scroll view and would eat
+                    // the wheel wherever it covers, and the pointer parks in the
+                    // gutter constantly.
+                    .overlay { gutterDismiss }
                 }
                 .onChange(of: index) { _, i in
                     withAnimation(.easeOut(duration: 0.14)) { proxy.scrollTo(i, anchor: .top) }
                 }
             }
         }
+    }
+
+    /// The mail's measure. The dismissible gutter is defined as the complement
+    /// of it, so the two can never drift apart.
+    private static let columnWidth: CGFloat = 900
+
+    /// CLICK BESIDE THE MAIL TO LEAVE IT — the same exit as Esc.
+    ///
+    /// Only the two strips FLANKING the column take hits: the middle is exactly
+    /// the column's own footprint and is inert, so a click on a message card
+    /// still selects it, and a link, button or selection inside a web frame is
+    /// never intercepted. In a window narrower than the full measure the strips
+    /// collapse to nothing, which is right — there is no gutter to click.
+    private var gutterDismiss: some View {
+        HStack(spacing: 0) {
+            gutterStrip
+            Color.clear
+                .frame(width: Self.columnWidth)
+                .allowsHitTesting(false)
+            gutterStrip
+        }
+    }
+
+    private var gutterStrip: some View {
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                // Every modal here owns a full-window scrim and already takes
+                // the click before this layer sees it. The guard is what keeps
+                // that true if one ever stops doing so: dismissing a dialog must
+                // never also throw away the email behind it.
+                guard confirmMode == nil, debugInfo == nil, !store.modalOverlayOpen else { return }
+                store.closeThread()
+            }
     }
 
     private func centeredNote(_ text: String, tone: Color = Palette.inkFaintest) -> some View {
@@ -252,7 +303,20 @@ struct ThreadViewer: View {
             KeyBinding("e", "done + next") { Task { await doneAndNext() } },
             KeyBinding("d", "done + next") { Task { await doneAndNext() } },
             KeyBinding("u", "unsubscribe") { confirmMode = .ask },
+            // `r` rather than `k`: k is this context's newer-message step. The
+            // list surfaces spell the same verb `t` (tune), which is taken here
+            // by nothing — but `t` on a row acts on the SELECTED row, and in the
+            // reader the sender is the thread's, so a distinct key keeps the two
+            // from reading as the same command with different targets.
+            KeyBinding("r", "new sender rule") { openSenderRule() },
         ]
+    }
+
+    /// The rule composer for THIS thread's sender — the same request shape `t`
+    /// uses on a list row, so there is one composer in the app, not two.
+    private func openSenderRule() {
+        guard let newestSender else { return }
+        Actions.tune(sender: newestSender)
     }
 
     // MARK: - queue navigation

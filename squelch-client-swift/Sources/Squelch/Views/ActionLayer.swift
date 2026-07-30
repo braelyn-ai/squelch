@@ -258,6 +258,7 @@ struct ShortcutsOverlay: View {
                 (["h", "l"], "previous / next queued email"),
                 (["e", "d"], "done + next"),
                 (["u"], "unsubscribe from this sender"),
+                (["r"], "new rule for this sender"),
                 (["Esc"], "back"),
             ]),
         Group(

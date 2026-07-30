@@ -177,6 +177,18 @@ final class RulesReload {
     func reload() async { await handler?() }
 }
 
+/// The chip colour a disposition carries. Lives here rather than on the wire
+/// type so the model layer stays free of SwiftUI.
+extension Disposition {
+    fileprivate var tone: Color {
+        switch self {
+        case .surface: Palette.positive
+        case .squelch: Palette.inkFaint
+        case .filtered: Palette.danger
+        }
+    }
+}
+
 private struct RuleRow: View {
     let glassNamespace: Namespace.ID
     let rule: SenderRule
@@ -187,13 +199,7 @@ private struct RuleRow: View {
 
     @State private var hovering = false
 
-    private var dispositionTone: Color {
-        switch rule.disposition {
-        case .surface: Palette.positive
-        case .squelch: Palette.inkFaint
-        case .filtered: Palette.danger
-        }
-    }
+    private var dispositionTone: Color { rule.disposition.tone }
 
     var body: some View {
         Button(action: onSelect) {
@@ -248,6 +254,10 @@ private struct RuleRow: View {
 /// EDIT is create-new THEN delete-old, in that order, so a mid-flight failure
 /// can never lose the rule (worst case: a transient duplicate). The server has
 /// no PUT /client/rules/{id}; when it grows one this becomes a single call.
+///
+/// OPENED FOR A SENDER, it first shows what already governs that sender. Adding
+/// a second rule blind to the first is how a mailbox ends up with three
+/// contradictory ones and no idea which is winning.
 struct RuleEditor: View {
     let request: RuleEditorRequest
     let onClose: () -> Void
@@ -259,6 +269,9 @@ struct RuleEditor: View {
     @State private var disposition: Disposition
     @State private var saving = false
     @State private var error: String?
+    /// Rules whose match_pattern already covers `request.sender`. Nil until the
+    /// fetch settles, so "none yet" is never claimed before we know.
+    @State private var inEffect: [SenderRule]?
     @FocusState private var focusedField: FocusTarget?
 
     private enum FocusTarget { case pattern, want }
@@ -306,6 +319,8 @@ struct RuleEditor: View {
                     subtitle
                 }
                 .padding(.bottom, 4)
+
+                alreadyInEffect
 
                 Field(label: "match pattern") {
                     TextField("*@example.com", text: $pattern)
@@ -377,6 +392,69 @@ struct RuleEditor: View {
             // From-scratch create starts on the (empty) pattern field;
             // otherwise the pattern is prefilled so focus lands on the want text.
             focusedField = mode == .create ? .pattern : .want
+        }
+        .task { await loadInEffect() }
+    }
+
+    /// WHAT ALREADY GOVERNS THIS SENDER, above the fields that would add
+    /// another. Scoped by the same glob the triage pipeline matches with, so the
+    /// list is the rules that actually fire on this address rather than every
+    /// rule in the account.
+    ///
+    /// Only for the sender flows: a from-scratch create has no address to scope
+    /// by, and an edit is already looking at the rule it is about to replace.
+    @ViewBuilder
+    private var alreadyInEffect: some View {
+        if mode == .tune, let inEffect {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(inEffect.isEmpty ? "nothing covers this sender yet" : "already in effect")
+                    .font(Typo.sectionLabel)
+                    .foregroundStyle(Palette.inkFaint)
+                    .textCase(.uppercase)
+                if !inEffect.isEmpty {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(inEffect) { rule in
+                                HStack(spacing: 9) {
+                                    Chip(
+                                        text: rule.disposition.label,
+                                        tone: rule.disposition.tone, filled: true
+                                    )
+                                    .frame(width: 62, alignment: .leading)
+                                    Text(rule.match_pattern)
+                                        .font(Typo.mono(11))
+                                        .foregroundStyle(Palette.ink)
+                                        .lineLimit(1)
+                                    Text(rule.want_text.isEmpty ? "—" : rule.want_text)
+                                        .font(Typo.micro)
+                                        .foregroundStyle(
+                                            rule.want_text.isEmpty
+                                                ? Palette.inkFaintest : Palette.inkDim
+                                        )
+                                        .lineLimit(1)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .help(rule.want_text)
+                                }
+                            }
+                        }
+                    }
+                    // A sender with a pile of rules must not push the fields that
+                    // write the next one off the bottom of the card.
+                    .frame(maxHeight: 92)
+                }
+            }
+            .padding(.bottom, 2)
+        }
+    }
+
+    /// Best-effort: a failed lookup leaves the strip absent rather than
+    /// asserting the sender is unruled, which would be the one wrong answer.
+    private func loadInEffect() async {
+        guard mode == .tune, let sender = request.sender else { return }
+        guard let all = try? await APIClient.shared.listRules() else { return }
+        let address = SenderID.address(sender)
+        inEffect = all.filter {
+            Newsletters.ruleMatches(pattern: $0.match_pattern, address: address)
         }
     }
 
