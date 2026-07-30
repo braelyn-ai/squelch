@@ -187,37 +187,72 @@ struct SitrepView: View {
         ZoneCard(
             symbol: "eye", title: "For your eyes", count: store.sitrep.standing.count
         ) {
-            GlassEffectContainer(spacing: 2) {
             VStack(spacing: 1) {
-                ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
-                    // No closures passed down: a stored closure is never equal to
-                    // last render's, so handing rows their actions this way meant
-                    // SwiftUI could not skip a single one when the parent redrew.
-                    ObligationRow(
-                        update: u, index: i, cursor: cursor, glassNamespace: zoneGlass)
-                }
-                if overflow > 0 {
-                    Button {
-                        withAnimation(.smooth(duration: 0.28)) { cursor.expanded.toggle() }
-                    } label: {
-                        Text(cursor.expanded ? "show less" : "\(overflow) more")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaint)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.glass)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 6)
-                }
+                eyesRows(visible)
+                if overflow > 0 { expander(overflow) }
             }
-            // Only leaving the zone ends the hover; moving BETWEEN rows keeps the
-            // phase .active, so a sweep never flickers actionable off and on.
-            .onContinuousHover { phase in
-                if case .ended = phase, cursor.hovering { cursor.hovering = false }
-            }
+            // Only LEAVING the zone ends the hover — crossing between rows never
+            // fires a parent's hover, so a sweep still can't flicker actionable
+            // off and on. This was `.onContinuousHover`, which delivers every
+            // mouse-moved event over the whole zone; it only ever needed .ended,
+            // and the rest was a stream of hit-tests during the exact scroll
+            // this zone is supposed to stay out of the way of.
+            .onHover { over in
+                if !over, cursor.hovering { cursor.hovering = false }
             }
         }
+    }
+
+    /// THE GLASS CONTAINER IS MOUNTED ONLY WHILE THE KEYBOARD DRIVES.
+    ///
+    /// Its whole job is morphing the focus glass from row to row, and that glass
+    /// exists only when `kbActive` — with the mouse driving, every row takes
+    /// `selectionGlass`'s plain-background branch and the container holds no
+    /// glass at all. Mounted unconditionally it still re-coordinates its
+    /// descendants whenever one of them changes, and a hovered row changes. THAT
+    /// is the entire difference between a mouse sweep over this zone, which
+    /// stuttered, and the identical sweep over the newsletter grid, which did
+    /// not: same per-row re-render, only one of them inside a glass container.
+    ///
+    /// Yes, the branch is two view identities and flipping it rebuilds the rows.
+    /// That is exactly the trade `selectionGlass` already documents — fine once,
+    /// when the keyboard takes over; ruinous once per mouse-move.
+    @ViewBuilder
+    private func eyesRows(_ visible: [AttentionUpdate]) -> some View {
+        if cursor.kbActive {
+            GlassEffectContainer(spacing: 2) { rowStack(visible) }
+        } else {
+            rowStack(visible)
+        }
+    }
+
+    private func rowStack(_ visible: [AttentionUpdate]) -> some View {
+        VStack(spacing: 1) {
+            ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
+                // No closures passed down: a stored closure is never equal to
+                // last render's, so handing rows their actions that way meant
+                // SwiftUI could not skip a single one when the parent redrew.
+                ObligationRow(update: u, index: i, cursor: cursor, glassNamespace: zoneGlass)
+            }
+        }
+    }
+
+    /// Outside the container on purpose: it carries its own glass and no
+    /// `glassEffectID`, so it was never morphing with anything, and leaving it
+    /// in would let it merge with the top row in one branch and not the other.
+    private func expander(_ overflow: Int) -> some View {
+        Button {
+            withAnimation(.smooth(duration: 0.28)) { cursor.expanded.toggle() }
+        } label: {
+            Text(cursor.expanded ? "show less" : "\(overflow) more")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaint)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 4)
+        }
+        .buttonStyle(.glass)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 6)
     }
 
     // MARK: - (b) attention
