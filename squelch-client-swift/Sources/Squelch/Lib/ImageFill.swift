@@ -1,10 +1,5 @@
 // Newsletter-thumb fill colour: sample the hero's pixels and reduce them to the
-// ONE colour the rest of the square should be painted.
-//
-// Ported 1:1 from squelch-desktop/src/lib/imageFill.ts, minus its transport —
-// the Tauri build had to fetch bytes through a Rust command and decode them in a
-// same-origin blob to dodge webview CORS taint. Here the image is already an
-// NSImage in hand, so this starts at the pixels.
+// ONE colour the rest of the square is painted.
 //
 // Every failure path returns nil and the card keeps its neutral well; nothing
 // here ever throws to the caller.
@@ -13,9 +8,8 @@ import AppKit
 import SwiftUI
 
 enum ImageFill {
-    /// A sampled colour, as plain components so it can cross actor boundaries —
-    /// the sampling runs off the main actor (see HeroCache) and `Color` is a
-    /// view type, not a transport one.
+    /// A sampled colour as plain components so it can cross actor boundaries:
+    /// sampling runs off the main actor, and `Color` is a view type.
     struct RGB: Sendable {
         let r: Double, g: Double, b: Double
 
@@ -54,14 +48,9 @@ enum ImageFill {
         var r = 0, g = 0, b = 0, n = 0
     }
 
-    /// DOMINANT colour of an image, not the average: newsletter heroes are
-    /// mostly white margin, so a plain average washes out to near-white.
-    ///
-    /// 16x16 downsample; skip transparent, near-white and near-black pixels
-    /// (margins, backgrounds, text ink); coarse-quantize the rest to 3 bits per
-    /// channel and take the biggest bucket's true average. Falls back to the
-    /// overall average when nothing mid-tone dominated, and to nil if the image
-    /// could not be sampled at all.
+    /// DOMINANT colour, not the average: heroes are mostly white margin, so an
+    /// average washes out to near-white. 16x16 downsample, skip transparent /
+    /// near-white / near-black, then the biggest 3-bit bucket's true average.
     nonisolated static func dominantRGB(_ image: CGImage) -> RGB? {
         guard let px = samples(image) else { return nil }
 

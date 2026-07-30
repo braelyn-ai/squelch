@@ -1,20 +1,8 @@
-// AUDIT LOG. Human review of what the AI agent (over the /mcp door) and this
-// app (the /client door) have done. GET /client/audit, newest first. Read-only
-// scrollback with j/k selection: the selected row expands its full target +
-// detail; everything else truncates.
-//
-// READABLE ENTRIES: action slugs map to verb phrases and, when the server
-// resolved the target to a message, we render "{sender} · {subject}" (text
-// only — mail-derived, so never as markup) in place of the raw numeric target.
-// Sealed sender/subject appearing here is a deliberate accepted decision (the
-// Auth page already shows those to the human); sealed CONTENT never reaches
-// this surface.
-//
-// UNDO: rows whose action has a safe inverse AND whose detail marks success get
-// a small undo button. The undo itself lands as a NEW audit row, which is
-// correct and desired.
-//
-// Ported from squelch-desktop/src/components/AuditView.tsx.
+// Audit log: what the agent (/mcp door) and this app (/client door) have done.
+// GET /client/audit, newest first, read-only; j/k selection expands a row.
+// Mail-derived sender/subject render as text only, never markup. Sealed
+// sender/subject are deliberately shown here (as on the Auth page), sealed
+// content never is — see docs/SECURITY.md. An undo lands as a new audit row.
 
 import SwiftUI
 
@@ -29,8 +17,7 @@ struct AuditView: View {
 
     private static let inboxLabel = "INBOX"
 
-    /// Newest first — sort defensively by ts (falling back to id) so we don't
-    /// depend on the server's ordering.
+    /// Newest first by ts, falling back to id — never trust server ordering.
     private var rows: [AuditEntry] {
         entries.sorted { a, b in
             let ta = Fmt.date(a.ts)
@@ -122,8 +109,8 @@ struct AuditView: View {
         var tone: Color
     }
 
-    /// Actors we treat as "the agent" (visually distinct). The server-side agent
-    /// door is still landing, so tolerate a few likely spellings.
+    /// Actors rendered as "the agent"; several spellings tolerated because the
+    /// agent door's actor string isn't pinned.
     static func actorChip(_ actor: String) -> ActorChip {
         let lower = actor.lowercased()
         if ["agent", "mcp", "assistant", "ai"].contains(where: lower.hasPrefix) {
@@ -136,9 +123,8 @@ struct AuditView: View {
         return ActorChip(label: actor.isEmpty ? "?" : actor, tone: Palette.inkFaint)
     }
 
-    /// Map raw action slugs to a readable verb phrase. Covers the dotted server
-    /// slugs and their underscore variants so a rename on either side degrades
-    /// gracefully. set_status is detail-driven.
+    /// Both dotted and underscore slug spellings, so a rename on either side
+    /// degrades gracefully. set_status is detail-driven.
     private static let actionVerbs: [String: String] = [
         "archive": "archived",
         "label": "relabeled a message",
@@ -172,16 +158,14 @@ struct AuditView: View {
         return e.action.isEmpty ? "did something" : e.action
     }
 
-    /// An available undo: a human label + the exact inverse call.
     struct UndoSpec {
         var label: String
         var run: () async throws -> Void
     }
 
-    /// Strict decimal id parse for audit targets — mirrors the server's SQLite
-    /// CAST semantics. A permissive parse would accept hex/exponent forms that
-    /// CAST maps to 0, so an undo could fire against a DIFFERENT id than the row
-    /// displayed. Digits-only, positive, in-range.
+    /// Strict decimal parse, mirroring the server's SQLite CAST: a permissive
+    /// parse accepts hex/exponent forms CAST maps to 0, so an undo could fire
+    /// against a different id than the row displayed.
     static func parseAuditId(_ raw: String?) -> Int? {
         guard let raw, !raw.isEmpty,
             raw.allSatisfy({ $0.isASCII && $0.isNumber }),
@@ -192,11 +176,9 @@ struct AuditView: View {
         return id
     }
 
-    /// The safe inverse for a row, or nil. Only SUCCESSFUL rows with a
-    /// reversible action qualify.
+    /// The safe inverse for a row, or nil — only successful, reversible actions.
     static func undoFor(_ e: AuditEntry) -> UndoSpec? {
         if e.action == "archive", e.detail == "ok", let id = parseAuditId(e.target) {
-            // Same inverse the 5s archive undo toast fires.
             return UndoSpec(label: "restore") {
                 try await APIClient.shared.actionLabel(id, add: [inboxLabel])
             }
@@ -207,8 +189,7 @@ struct AuditView: View {
             }
         }
         if e.action == "rule.create" || e.action == "create_rule" {
-            // handlers.rs stores the created rule id in `detail` (target is the
-            // pattern). Only offer undo when that id is actually parseable.
+            // The new rule id arrives in `detail`; `target` is the pattern.
             if let id = parseAuditId(e.detail) {
                 return UndoSpec(label: "delete rule") {
                     try await APIClient.shared.deleteRule(id)

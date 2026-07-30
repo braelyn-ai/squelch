@@ -1,12 +1,6 @@
-// PROCESS MODE — the `p` triage deck.
-//
-// Card-by-card walk of the NEW + STILL OPEN bands with the same verbs as the
-// list (r reply, e archive, d done, t tune, Space skip). archive/done resolve
-// the item, drop it from the queue, and advance; the counter ticks down to an
-// empty-queue "cleared" state. Reads the live bands from the store so items the
-// user resolves elsewhere fall out too.
-//
-// Ported from squelch-desktop/src/components/ProcessMode.tsx.
+// The `p` triage deck: a card-by-card walk of the new + still-open bands with the
+// list's verbs (r reply, e archive, d done, t tune, Space skip). Reads the live
+// bands from the store, so items resolved elsewhere drop out of the queue too.
 
 import SwiftUI
 
@@ -20,8 +14,8 @@ struct ProcessMode: View {
     @State private var handled: Set<Int> = []
     @State private var index = 0
 
-    /// An item is "still pending" if it hasn't been handled here AND still
-    /// exists in a live band (someone may resolve it elsewhere).
+    /// Pending means not handled here *and* still in a live band — the item may
+    /// have been resolved elsewhere.
     private var pending: [AttentionUpdate] {
         let live = Set((store.sitrep.new + store.sitrep.open).map(\.id))
         return queue.filter { !handled.contains($0.id) && live.contains($0.id) }
@@ -156,8 +150,7 @@ struct ProcessMode: View {
             KeyBinding("e", "archive") {
                 guard let current else { return }
                 Task { await Actions.archive(current) }
-                // Cursor stays put; the handled item drops out and the next
-                // slides in.
+                // Cursor stays put: the handled item drops out, the next slides in.
                 handled.insert(current.id)
             },
             KeyBinding("d", "done") {

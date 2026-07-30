@@ -1,14 +1,8 @@
-// ⌘K "ASK YOUR INBOX" — the embedded assistant's command bar. A top-anchored
-// overlay: type a question, get a cited answer, jump to a thread if you want
-// the detail. The whole loop runs on this machine with the user's own key
-// (BYOK); the squelch server never sees it.
-//
-// GLASS: the bar and its answer share one glassEffectID inside a
-// GlassEffectContainer, so the material GROWS downward as the answer arrives
-// rather than a second panel appearing beneath a first. That continuity is the
-// whole reason to use the real material here.
-//
-// Ported from squelch-desktop/src/components/AskBar.tsx.
+// ⌘K "ask your inbox": top-anchored overlay — type a question, get a cited
+// answer, jump to a thread. The loop runs locally on the user's own key (BYOK);
+// the squelch server never sees the question or the answer.
+// Bar and answer share one glassEffectID inside a GlassEffectContainer, so the
+// material grows downward instead of a second panel appearing beneath a first.
 
 import SwiftUI
 
@@ -41,8 +35,8 @@ struct AskBar: View {
             }
         }
         .keyContext(.modal)
-        // Enter submits from the field directly (below), not via the keymap, so
-        // it never collides with list keys.
+        // Enter submits from the field itself, not the keymap, so it can never
+        // collide with list keys.
         .keyBindings(.modal, [
             KeyBinding("Escape", "close", allowInInput: true) { onClose() }
         ])

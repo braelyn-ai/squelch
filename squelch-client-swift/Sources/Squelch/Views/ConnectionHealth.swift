@@ -1,18 +1,8 @@
-// Connection-health surfaces for the daemon link. Two states, deliberately
-// distinct so a dead daemon can never masquerade as inbox zero:
-//
-//   DaemonDownPane — the read model has NEVER loaded this session and refreshes
-//     are failing. Replaces the routed main view entirely: there is no data to
-//     show, so showing empty bands would lie. Offers retry + Settings.
-//
-//   ConnectionBanner — we HAVE synced data but the poller is now failing. Keeps
-//     the (stale) data on screen and pins a banner saying how old it is.
-//
-// A 401 is called out separately from a transport failure: "token rejected"
-// sends you to Settings, "unreachable" sends you to the daemon. Never echoes
-// the server URL or token.
-//
-// Ported from squelch-desktop/src/components/ConnectionHealth.tsx.
+// Daemon-link health in two deliberately distinct states, so a dead daemon can
+// never masquerade as inbox zero: DaemonDownPane replaces the routed view when
+// nothing ever loaded this session (empty bands would lie), ConnectionBanner
+// keeps already-synced data on screen behind a staleness note. A 401 ("token
+// rejected") reads apart from a transport failure; neither echoes URL or token.
 
 import SwiftUI
 
@@ -64,8 +54,8 @@ struct ConnectionBanner: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
-        // Renders nothing while healthy, or while DaemonDownPane owns the
-        // failure (i.e. before any successful sync).
+        // Nothing while healthy, or before any successful sync — that failure
+        // belongs to DaemonDownPane.
         if let error = store.refreshError, let last = store.lastRefresh {
             let auth = error.isAuthFailure
             let age = Fmt.relAge(ISO8601DateFormatter().string(from: last))

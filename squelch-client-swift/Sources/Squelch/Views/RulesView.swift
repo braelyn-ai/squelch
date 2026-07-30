@@ -1,13 +1,8 @@
-// RULES MANAGEMENT. The full sender-rule surface: every rule from
-// GET /client/rules as a dense table — match pattern, disposition chip,
-// want_text (truncated; full on selection), a client-side match count against
-// the currently-loaded updates (0 = a likely-dead rule, rendered dim), and a
-// relative updated-at.
-//
-// Keys: j/k select · n new (blank editor) · Enter/e edit · x delete
-// (undo-first: the 5s toast recreates the rule).
-//
-// Ported from squelch-desktop/src/components/{RulesView,RuleEditor}.tsx.
+// Sender rules from GET /client/rules as a dense table: pattern, disposition,
+// want_text (full only on the selected row), a client-side match count against
+// the loaded updates (0 means likely dead, rendered dim), and updated-at.
+// Keys: j/k select · n new · Enter/e edit · x delete, undo-first — the 5s toast
+// recreates the deleted rule.
 
 import SwiftUI
 
@@ -20,8 +15,8 @@ struct RulesView: View {
     @State private var loading = true
     @State private var index = 0
 
-    /// Client-side match counts: how many currently-loaded updates each rule
-    /// matched. No new endpoint — we read the store's updates.
+    /// How many currently-loaded updates each rule matched, counted client-side
+    /// from the store rather than through a new endpoint.
     private var matchCounts: [Int: Int] {
         var counts: [Int: Int] = [:]
         for u in store.sitrep.standing + store.sitrep.new + store.sitrep.open {
@@ -135,7 +130,7 @@ struct RulesView: View {
             try await APIClient.shared.deleteRule(rule.id)
             // Optimistic removal; a re-fetch happens on undo or next open.
             rules.removeAll { $0.id == rule.id }
-            // Undo-first: the 5s toast recreates the rule from its cached values.
+            // The undo toast recreates the rule from these cached values.
             store.pushUndo(
                 kind: .ruleDelete, messageId: rule.id,
                 label: "deleted rule \(rule.match_pattern)"
@@ -164,21 +159,20 @@ struct RulesView: View {
     }
 }
 
-/// A tiny hook so an undo fired from the global toast stack — which outlives
-/// this view's closures, and may fire after the view has gone away — can still
-/// ask the rules list to re-pull if it is still on screen.
+/// Lets an undo fired from the global toast stack — which outlives this view's
+/// closures — ask the rules list to re-pull if it is still on screen.
 @MainActor
 final class RulesReload {
     static let shared = RulesReload()
-    /// Set while a RulesView is mounted; nil otherwise (the undo then simply
-    /// has nothing to refresh, which is correct).
+    /// Set only while a RulesView is mounted; nil means the undo has nothing to
+    /// refresh, which is correct.
     var handler: (@MainActor () async -> Void)?
     private init() {}
     func reload() async { await handler?() }
 }
 
-/// The chip colour a disposition carries. Lives here rather than on the wire
-/// type so the model layer stays free of SwiftUI.
+/// Chip colour per disposition, kept off the wire type so the model layer stays
+/// free of SwiftUI.
 extension Disposition {
     fileprivate var tone: Color {
         switch self {
@@ -246,18 +240,9 @@ private struct RuleRow: View {
 
 // MARK: - rule editor
 
-/// RULE EDITOR — the `t` (tune sender) modal, and the rules view's create/edit.
-///
-/// Prefilled with `*@domain` derived from the selected sender, a free want-text
-/// field describing the desired behavior, and a disposition cycled with Tab.
-///
-/// EDIT is create-new THEN delete-old, in that order, so a mid-flight failure
-/// can never lose the rule (worst case: a transient duplicate). The server has
-/// no PUT /client/rules/{id}; when it grows one this becomes a single call.
-///
-/// OPENED FOR A SENDER, it first shows what already governs that sender. Adding
-/// a second rule blind to the first is how a mailbox ends up with three
-/// contradictory ones and no idea which is winning.
+/// The `t` tune-sender modal, and the rules view's create/edit. Edit is
+/// create-new *then* delete-old, in that order, so a mid-flight failure can only
+/// leave a transient duplicate, never lose the rule — there is no PUT route.
 struct RuleEditor: View {
     let request: RuleEditorRequest
     let onClose: () -> Void
@@ -269,7 +254,7 @@ struct RuleEditor: View {
     @State private var disposition: Disposition
     @State private var saving = false
     @State private var error: String?
-    /// Rules whose match_pattern already covers `request.sender`. Nil until the
+    /// Rules whose match_pattern already covers `request.sender`; nil until the
     /// fetch settles, so "none yet" is never claimed before we know.
     @State private var inEffect: [SenderRule]?
     @FocusState private var focusedField: FocusTarget?
@@ -389,20 +374,16 @@ struct RuleEditor: View {
             KeyBinding("Enter", "save rule", allowInInput: true) { Task { await save() } },
         ])
         .onAppear {
-            // From-scratch create starts on the (empty) pattern field;
-            // otherwise the pattern is prefilled so focus lands on the want text.
+            // Create starts on the empty pattern field; the other modes prefill
+            // it, so focus lands on the want text instead.
             focusedField = mode == .create ? .pattern : .want
         }
         .task { await loadInEffect() }
     }
 
-    /// WHAT ALREADY GOVERNS THIS SENDER, above the fields that would add
-    /// another. Scoped by the same glob the triage pipeline matches with, so the
-    /// list is the rules that actually fire on this address rather than every
-    /// rule in the account.
-    ///
-    /// Only for the sender flows: a from-scratch create has no address to scope
-    /// by, and an edit is already looking at the rule it is about to replace.
+    /// What already governs this sender, above the fields that would add another
+    /// — scoped by the same glob the triage pipeline matches with. Tune mode only:
+    /// create has no address to scope by, edit already shows the rule it replaces.
     @ViewBuilder
     private var alreadyInEffect: some View {
         if mode == .tune, let inEffect {
@@ -439,7 +420,7 @@ struct RuleEditor: View {
                         }
                     }
                     // A sender with a pile of rules must not push the fields that
-                    // write the next one off the bottom of the card.
+                    // write the next one off the card.
                     .frame(maxHeight: 92)
                 }
             }
@@ -447,8 +428,8 @@ struct RuleEditor: View {
         }
     }
 
-    /// Best-effort: a failed lookup leaves the strip absent rather than
-    /// asserting the sender is unruled, which would be the one wrong answer.
+    /// Best-effort: a failed lookup leaves the strip absent rather than claiming
+    /// the sender is unruled, which is the one wrong answer.
     private func loadInEffect() async {
         guard mode == .tune, let sender = request.sender else { return }
         guard let all = try? await APIClient.shared.listRules() else { return }

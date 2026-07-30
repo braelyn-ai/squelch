@@ -1,39 +1,11 @@
-// THE EMAIL IMAGE CACHE — bytes on disk, fetched by us, pinned to the mail that
-// needs them.
-//
-// Before this, email images rode WebKit's own loader against a NON-PERSISTENT
-// data store: a memory cache that dies with the process, so every launch
-// re-downloaded every hero, logo and signature in the sitrep. This owns the
-// fetch instead (see ImageProxy / ImageSchemeHandler for how a body reaches it)
-// and keeps the bytes across launches.
-//
-// AN ACTOR, not a lock. Every operation here is already asynchronous — a disk
-// read, a network fetch, a manifest write — and the two pieces of state that
-// matter (the manifest and the in-flight map) are mutated from the scheme
-// handler on the main thread, from the launch warmer, and from N concurrent
-// warm tasks at once. In-flight de-duplication in particular wants to PARK a
-// caller on someone else's task, which a lock cannot express without either
-// holding it across an await or hand-rolling continuations. PreparedBodies is
-// lock-based for the opposite reason: it has to answer synchronously from a
-// SwiftUI initializer, and nothing here does.
-//
-// PRIVACY. Files are named sha256(url) and the manifest holds no URLs. A cache
-// directory that listed the image URLs of the reader's mail would be a readable
-// index of who mails them and what those messages contain, sitting in the clear
-// on disk long after the mail was read. The hash is one-way: we can look up what
-// we already have, and nothing else can enumerate it.
-//
-// PINS. An entry referenced by at least one message id is held out of the
-// ordinary LRU, so the mail the sitrep still shows keeps its art across
-// launches; the pin is dropped the moment that mail is marked done
-// (Actions.done). A pin is a PREFERENCE, NOT A GUARANTEE: pinned bytes have a
-// budget of their own and the oldest are evicted past it, exactly like unpinned
-// ones. The count of pinning MESSAGES is bounded by the sitrep, but the bytes
-// per message are bounded by nothing on the wire — one mail with a few hundred
-// image references would otherwise claim the disk permanently. (ImageProxy caps
-// how many urls one body contributes for the same reason; this is the backstop
-// that does not depend on that cap being right.) An unpinned entry is ordinary
-// LRU: kept while there is room, evicted oldest-first past the cap.
+// THE EMAIL IMAGE CACHE — bytes on disk, fetched by us (ImageProxy mints the
+// references, ImageSchemeHandler answers them), pinned to the mail that needs them
+// and kept across launches. AN ACTOR, not a lock: every operation awaits, and
+// in-flight dedupe PARKS a caller on someone else's task, which a lock cannot
+// express without holding it across an await. Files are named sha256(url) and the
+// manifest holds no URLs — see docs/SECURITY.md §3. A pin is privilege, not
+// exemption: pinned bytes have a budget of their own and evict oldest-first past
+// it, because nothing on the wire bounds how many images one message can cite.
 
 import CryptoKit
 import Foundation
@@ -47,10 +19,9 @@ actor ImageStore {
         var mime: String
     }
 
-    /// Per-hash cache metadata. NO URLS — see the header. `mime` is here
-    /// because a disk hit still has to answer with a content type, and sniffing
-    /// the bytes back into one would be both slower and less accurate than what
-    /// the server told us at fetch time.
+    /// Per-hash cache metadata, holding NO URLS. `mime` is kept because a disk hit
+    /// still has to answer with a content type, and sniffing the bytes back into one
+    /// is slower and less accurate than what the server said at fetch time.
     private struct Entry: Codable {
         var size: Int
         var mime: String
@@ -76,15 +47,14 @@ actor ImageStore {
     /// Concurrent fetches during a warm. Matches HeroCache's preload width: wide
     /// enough to hide latency, narrow enough not to saturate the link at launch.
     private static let warmWidth = 4
-    /// How long a manifest write is deferred after a change. lastAccess churns
-    /// on every image of every opened message; the manifest is an index we can
-    /// rebuild, so batching its writes costs nothing worth having.
+    /// How long a manifest write is deferred after a change. lastAccess churns on
+    /// every image of every opened message, and the manifest is a rebuildable index.
     private static let saveDelay: Duration = .seconds(3)
     /// How many released message ids keep their tombstone (see `release`).
     private static let releaseMemory = 32
-    /// Ceiling on the buffer a declared Content-Length is allowed to reserve.
-    /// The header is attacker-controlled, so honouring it up to the 25MB cap
-    /// would let a request that transfers nothing still allocate 25MB.
+    /// Ceiling on the buffer a declared Content-Length may reserve. The header is
+    /// attacker-controlled: honouring it to the 25MB cap would let a request that
+    /// transfers nothing still allocate 25MB.
     private static let reserveCeiling = 1 << 20
 
     private let dir: URL
@@ -96,10 +66,9 @@ actor ImageStore {
     /// url -> the fetch already running for it, so ten <img> tags pointing at
     /// one signature logo cost one request.
     private var inflight: [String: Task<Fetched?, Never>] = [:]
-    /// messageId -> hashes it was pinning when it was released. The undo window
-    /// is five seconds and the bytes are still on disk, so a re-pin has to know
-    /// what to re-reference. In memory only: a tombstone that outlived the
-    /// launch would re-pin mail the reader finished with.
+    /// messageId -> hashes it was pinning when released, so the five-second undo
+    /// knows what to re-reference. In memory only: a tombstone outliving the launch
+    /// would re-pin mail the reader finished with.
     private var released: [Int: Set<String>] = [:]
     private var releaseOrder: [Int] = []
     /// url -> message ids that asked to pin it while its fetch was still in

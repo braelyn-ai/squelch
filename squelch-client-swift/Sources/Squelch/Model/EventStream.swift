@@ -1,18 +1,12 @@
 // THE RESIDENT NOTIFICATION FEED: one long-lived SSE connection to
 // `GET /client/events`, every frame handed to the notifier.
 //
-// The daemon's events table is the source of truth and this client carries its
-// OWN cursor (`?after=<id>`, persisted in UserDefaults). Nothing about the
-// connection is server-side state, which is why a second client (an iPhone,
-// later) is a bolt-on rather than a refactor — see squelch-api/src/events.rs.
-//
-// FIRST RUN CONNECTS CURSORLESS, on purpose: with no `after` the server starts
-// at the head of the log and sends live events only. A fresh install must not
-// be handed a week of backlog as a notification storm.
-//
-// SECURITY: the bearer token goes in the Authorization header and NOWHERE else
-// — never in the URL (a query string lands in logs, referrers and crash
-// reports), never in an error message.
+// The daemon's events table is the truth; this client carries its OWN cursor
+// (`?after=<id>`, persisted in UserDefaults) and no connection state is
+// server-side. FIRST RUN CONNECTS CURSORLESS on purpose — with no `after` the
+// server sends live events only, so a fresh install is not handed a week of
+// backlog as a notification storm. The bearer token goes in the Authorization
+// header and NOWHERE else: never in the URL, never in an error message.
 
 import Foundation
 
@@ -25,27 +19,17 @@ struct SSEFrame: Equatable, Sendable {
     var data: String
 }
 
-/// Incremental SSE frame assembler, fed one line at a time.
+/// Incremental SSE frame assembler, fed one line at a time. A pure value type, so
+/// the whole protocol surface is testable without a network in the room.
 ///
-/// A pure value type on purpose: every decision here comes from one line plus
-/// the accumulated buffer, so the whole protocol surface can be read and
-/// reasoned about without a network in the room.
-///
-/// It handles all of what is actually on this wire:
-/// - `:` comment lines — axum's `KeepAlive` writes one every 15s. Ignored, and
-///   NOT a frame boundary (treating one as a blank line would dispatch a
-///   half-read frame every 15 seconds).
-/// - CRLF — the splitter in `connect()` cuts on the LF and leaves the CR
-///   attached, which would otherwise ride along inside the JSON and the id.
-/// - Several `data:` lines per frame, joined with "\n" as the spec requires.
-/// - `id:` persisting across frames as the connection's last-event-id.
-/// - Unknown fields (`event:`, `retry:`, whatever a future daemon adds) —
-///   skipped, never fatal.
+/// What is on this wire: `:` keep-alive comments (ignored, and NOT a frame
+/// boundary — treating one as blank dispatches a half-read frame every 15s), a
+/// trailing CR the LF splitter leaves behind, several `data:` lines joined with
+/// "\n", `id:` persisting across frames, and unknown fields skipped.
 struct SSEParser {
     /// Hard cap on one frame's accumulated data. A frame is display copy for a
     /// notification; past this the server is broken or hostile, and the only
-    /// alternative to a cap is an unbounded buffer on a connection we hold open
-    /// for days.
+    /// alternative is an unbounded buffer on a connection we hold open for days.
     static let maxFrameBytes = 256 * 1024
 
     private var data: [String] = []
@@ -101,9 +85,8 @@ struct SSEParser {
             bytes = 0
             overflowed = false
         }
-        // A blank line with an empty buffer dispatches nothing — that is what
-        // the double newline after every frame produces, and what a keep-alive
-        // ping's own trailing blank line produces.
+        // A blank line with an empty buffer dispatches nothing — which is what both
+        // the double newline after a frame and a keep-alive ping produce.
         guard !overflowed, !data.isEmpty else { return nil }
         return SSEFrame(id: lastEventId, data: data.joined(separator: "\n"))
     }
@@ -128,16 +111,12 @@ final class EventStream {
     /// restarts nightly would creep up to the 60s cap and stay there.
     private static let healthyAfter: TimeInterval = 30
 
-    /// Inactivity watchdog, NOT a request deadline: URLSession resets this
-    /// timer on every byte received. The server pings every 15s, so ~4 missed
-    /// pings means the flow is dead (a NAT or a sleeping Wi-Fi router drops it
-    /// silently, with no FIN for us to notice). Set to hours instead, a dropped
-    /// flow would cost hours of missed notifications — which is the exact
-    /// failure the server's keep-alive exists to expose.
+    /// Inactivity watchdog, NOT a request deadline: URLSession resets it on every
+    /// byte. The server pings every 15s, so this is ~4 missed pings — enough to
+    /// call a silently-dropped flow (a NAT, a sleeping router, no FIN) dead.
     private static let inactivityTimeout: TimeInterval = 60
-    /// Whole-connection lifetime. A day is effectively "never" for a stream we
-    /// reconnect with a cursor: the daily reconnect replays anything the seam
-    /// missed and costs one round trip.
+    /// Whole-connection lifetime. A day is effectively "never" for a cursored
+    /// stream: the daily reconnect replays the seam for one round trip.
     private static let resourceTimeout: TimeInterval = 24 * 60 * 60
 
     private var task: Task<Void, Never>?
@@ -145,10 +124,9 @@ final class EventStream {
     private var cursorLoaded = false
     private let session: URLSession
 
-    /// Refuses every redirect, in the ImageStore `FetchPolicy` mold. The feed
-    /// URL is operator-configured and carries the bearer header; a 3xx from it
-    /// is a misconfiguration, not a hop to follow — refusal surfaces the 3xx
-    /// itself, which fails the 200 check and lands in the normal backoff.
+    /// Refuses every redirect: the feed URL is operator-configured and carries the
+    /// bearer header, so a 3xx from it is a misconfiguration, not a hop to follow.
+    /// Refusal surfaces the 3xx, which fails the 200 check and backs off.
     private static let pinned = NoRedirects()
     private final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         func urlSession(
@@ -174,7 +152,7 @@ final class EventStream {
         session = URLSession(configuration: cfg)
     }
 
-    /// Start following the feed. Idempotent, like SitrepPoller.start().
+    /// Start following the feed. Idempotent.
     func start() {
         guard task == nil else { return }
         task = Task { [weak self] in await self?.run() }
@@ -188,9 +166,8 @@ final class EventStream {
     // MARK: - reconnect loop
 
     private func run() async {
-        // Ask for the notification grant on the FIRST connect rather than at
-        // launch: the prompt should arrive when the app has a reason to notify,
-        // not while the user is still reading the Connect screen.
+        // Ask for the notification grant on the FIRST connect, not at launch: the
+        // prompt should arrive when the app has a reason to notify.
         await Notifier.shared.requestAuthorizationIfNeeded()
 
         var backoff = Self.backoffBase
@@ -220,27 +197,23 @@ final class EventStream {
         do {
             let (bytes, response) = try await session.bytes(for: request, delegate: Self.pinned)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                // 401 (token rotated), 404 (daemon predates /client/events),
-                // 5xx — all identical from here: back off and retry. The
-                // Connect gate and the sitrep poller are what tell the human
-                // their token is wrong; a notification feed that started
-                // shouting about it would be the third voice saying so.
+                // 401 (token rotated), 404 (older daemon) and 5xx are identical
+                // from here: back off and retry. The Connect gate and the sitrep
+                // poller are what tell the human their token is wrong.
                 return
             }
             var parser = SSEParser()
-            // Split the byte stream by hand rather than with `bytes.lines`.
-            // Foundation's AsyncLineSequence silently DROPS empty lines, and
-            // the blank line between frames is the only frame terminator SSE
-            // has — every event would sit in the parser's buffer unread and
-            // the cursor would never advance. Splitting on the LF is safe on
-            // UTF-8: 0x0A cannot appear inside a multi-byte sequence.
+            // Split by hand rather than with `bytes.lines`: AsyncLineSequence
+            // silently DROPS empty lines, and the blank line between frames is
+            // SSE's only frame terminator, so every event would sit unread in the
+            // buffer. Splitting on LF is safe on UTF-8 — 0x0A cannot appear
+            // inside a multi-byte sequence.
             var line: [UInt8] = []
             for try await byte in bytes {
                 guard byte == UInt8(ascii: "\n") else {
-                    // A stream that never sends a newline would grow this
-                    // buffer for as long as we hold the connection — days.
-                    // Past the frame cap the server is broken or hostile, so
-                    // drop the connection and let the backoff loop retry.
+                    // A stream that never sends a newline would grow this buffer
+                    // for as long as we hold the connection — days. Past the cap,
+                    // drop it and let the backoff loop retry.
                     guard line.count < SSEParser.maxFrameBytes else { return }
                     line.append(byte)
                     continue
@@ -250,10 +223,9 @@ final class EventStream {
                 line.removeAll(keepingCapacity: true)
             }
         } catch {
-            // Refused / DNS / inactivity timeout / cancellation. Deliberately
-            // silent AND deliberately not stored anywhere: the error text can
-            // embed the server URL, and this is a background reconnect, not
-            // something the human asked for and is waiting on.
+            // Refused / DNS / inactivity timeout / cancellation. Silent and stored
+            // nowhere: the error text can embed the server URL, and this is a
+            // background reconnect nobody is waiting on.
         }
     }
 
@@ -269,7 +241,7 @@ final class EventStream {
         } else if let id = frame.id.flatMap({ Int($0) }) {
             // An undecodable frame still ADVANCES the cursor, mirroring the
             // server's pump: otherwise one malformed row replays on every
-            // reconnect forever and wedges the feed behind it.
+            // reconnect and wedges the feed behind it.
             note(seen: id)
         }
     }

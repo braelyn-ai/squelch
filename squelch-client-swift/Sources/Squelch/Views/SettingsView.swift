@@ -1,22 +1,8 @@
-// SETTINGS — a routed main view (bottom rail group), with a left sub-nav whose
-// last-active section is persisted so reopening restores it.
-//
-//   GENERAL   — connection (server URL + token — clicking away from either
-//               validates the pair against /client/stats and persists it only
-//               if it works; "Test" re-checks on demand), appearance, developer
-//               mode, your display name.
-//   MAIL      — remote images.
-//   TRIAGE    — the pipeline explainer, the daily caps + spend estimator, and
-//               the For-your-eyes ranking blend.
-//   ASSISTANT — the BYOK key (write-only) + model.
-//   ACCOUNT   — read-only meta + disconnect.
-//
-// No keys are registered here, so the global 1..5 / ⌘[ ] nav keeps working and
-// Esc is a no-op (nothing to close). The dispatch input-guard already prevents
-// single-letter binds from firing while a field is focused.
-//
-// Ported from squelch-desktop/src/views/SettingsView.tsx and
-// src/components/TriagePipeline.tsx.
+// Settings: a routed main view with a left sub-nav whose section is persisted.
+// General (connection, appearance, developer, name), mail, triage (pipeline
+// explainer, caps + spend estimate, ranking blend), assistant (BYOK key, model),
+// account. Escape is the only key bound here, so global 1..5 / ⌘[ ] nav keeps
+// working and the dispatcher's input guard covers the typed fields.
 
 import SwiftUI
 
@@ -57,11 +43,8 @@ struct SettingsView: View {
                 }
             }
         }
-        // Esc leaves, like every other routed page. Settings is full of text
-        // fields, and Escape is exempt from the dispatcher's input guard for
-        // exactly this reason — a surface you type on must not become one you
-        // cannot leave. Auth/Rules/Audit get this from RoutedHost; Settings
-        // owns its whole surface, so it registers directly.
+        // Escape is exempt from the dispatcher's input guard precisely so a
+        // surface this full of text fields can still be left.
         .keyContext(.modal)
         .keyBindings(.modal, [
             KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
@@ -101,8 +84,7 @@ struct SettingsView: View {
 
 // MARK: - shared section chrome
 
-/// An engraved section on one glass pane. Brass (the accent) is used sparingly
-/// — the label, the connected dot, and focus. Everything else is ink.
+/// One engraved section on a single glass pane.
 struct SettingsSectionCard<Content: View>: View {
     let label: String
     @ViewBuilder var content: Content
@@ -149,25 +131,11 @@ struct GlassSegmented<T: Hashable>: View {
     }
 }
 
-/// A STORED SECRET: masked at rest, with an eye to reveal it and a pencil to
-/// change it, both parked to the right of the well. Editing prefills the
-/// current value, so fixing one wrong character does not mean re-pasting the
-/// whole key.
-///
-/// The plaintext is pulled through `load` only when the eye or the pencil is
-/// pressed — a secret nobody asked to see never enters view state. With nothing
-/// stored yet (`hasStored == false`) there is nothing to mask, so it is a plain
-/// input and the icons that would unlock it are omitted.
-///
-/// NO SAVE BUTTON, AND NO CANCEL. Clicking away commits through `onCommit`, and
-/// only when the value actually changed. A cancel affordance is impossible to
-/// build honestly against that: pressing it blurs the field, so the save it was
-/// supposed to prevent has already fired.
-///
-/// That is also why an edit in progress is shown in the clear — masking a value
-/// you deliberately opened for editing is theatre when it arrived prefilled,
-/// and it hides where the caret is. FIRST entry still uses a SecureField, where
-/// there is a real shoulder-surfing story and nothing to prefill.
+/// A stored secret: masked at rest, eye to reveal, pencil to edit (prefilled).
+/// Plaintext is pulled through `load` only when one of those is pressed, so a
+/// secret nobody asked to see never enters view state. Blur is the save — a
+/// cancel button is unbuildable here, since pressing it blurs the field and
+/// fires the very save it means to prevent. Only first entry uses SecureField.
 struct SecretField: View {
     let label: String
     let placeholder: String
@@ -175,7 +143,7 @@ struct SecretField: View {
     let hasStored: Bool
     /// Fetches the plaintext on demand. May prompt (keychain), so it's async.
     let load: @MainActor () async -> String?
-    /// Persist a CHANGED value. Never called with one that matches storage.
+    /// Persist a changed value. Never called with one that matches storage.
     let onCommit: @MainActor (String) async -> Void
     /// The edit buffer. Meaningful to the caller while `editing` is true.
     @Binding var text: String
@@ -183,8 +151,8 @@ struct SecretField: View {
 
     @State private var revealed = false
     @State private var loading = false
-    /// The value as last read from storage — what `text` is diffed against, so
-    /// opening a field and clicking straight back out writes nothing.
+    /// Last value read from storage; `text` is diffed against it so opening a
+    /// field and clicking straight back out writes nothing.
     @State private var baseline = ""
     @FocusState private var focused: Bool
 
@@ -223,10 +191,9 @@ struct SecretField: View {
         }
     }
 
-    /// Two branches rather than one field with a toggled mask: swapping
-    /// TextField for SecureField in place destroys and rebuilds it, which drops
-    /// focus — and a dropped focus here means a save. The swap therefore only
-    /// happens across a commit, when focus is going away anyway.
+    /// Two branches rather than one field with a toggled mask: swapping TextField
+    /// for SecureField in place rebuilds it and drops focus — and a dropped focus
+    /// here is a save. The swap only happens across a commit, as focus leaves.
     @ViewBuilder private var input: some View {
         if hasStored {
             TextField(placeholder, text: $text).focused($focused)
@@ -243,8 +210,8 @@ struct SecretField: View {
 
     @ViewBuilder private var controls: some View {
         if inputMode {
-            // Nothing to unmask (the text is already legible) — this is just an
-            // explicit "done" that drops focus, which is what saves.
+            // Nothing to unmask; this is an explicit "done" that drops focus,
+            // which is what saves.
             icon("checkmark", help: "Done") { focused = false }
         } else {
             icon(revealed ? "eye.slash" : "eye", help: revealed ? "Hide" : "Show") {
@@ -261,8 +228,8 @@ struct SecretField: View {
                 Task {
                     await pull()
                     editing = true
-                    // Focus only lands once the field actually exists, which is
-                    // the render pass after `editing` flips.
+                    // Focus only lands once the field exists — the render pass
+                    // after `editing` flips.
                     DispatchQueue.main.async { focused = true }
                 }
             }
@@ -317,11 +284,10 @@ struct SettingsHint: View {
     }
 }
 
-/// A key/control row: label on the left, control on the right.
 struct InlineRow<Content: View>: View {
     let key: String
-    /// `.top` for controls taller than one line (a radio group), so the key
-    /// doesn't float against the middle of the stack.
+    /// `.top` for controls taller than one line, so the key doesn't float
+    /// against the middle of the stack.
     var alignment: VerticalAlignment = .center
     @ViewBuilder var content: Content
 
@@ -372,8 +338,8 @@ private struct ConnectionSection: View {
             )
             .onChange(of: token) { _, _ in result = nil }
             HStack(spacing: 10) {
-                // Not "Save" — clicking away already did that. This is here for
-                // re-checking a connection that worked yesterday.
+                // Not "Save" — clicking away already did that. This re-checks a
+                // connection that worked yesterday.
                 Button(busy ? "testing…" : "Test") { Task { await testSave() } }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.accent)
@@ -401,11 +367,9 @@ private struct ConnectionSection: View {
         }
     }
 
-    /// Clicking away from either field saves the pair — but only on a real
-    /// change, and only through `revalidate`, which proves the credentials
-    /// against /client/stats BEFORE it writes them. A fat-fingered paste is
-    /// reported and discarded rather than persisted, so blur-to-save can never
-    /// strand you at the connect gate with a token that doesn't work.
+    /// Blur saves the pair, but only on a real change and only through
+    /// `revalidate`, which proves the credentials against /client/stats before
+    /// writing them — so blur-to-save can't strand you at the connect gate.
     private func commitIfChanged() async {
         let (u, t) = (url.trimmed, token.trimmed)
         guard !u.isEmpty, !t.isEmpty else { return }
@@ -430,10 +394,9 @@ private struct AppearanceSection: View {
         @Bindable var prefs = prefs
         SettingsSectionCard(label: "Appearance") {
             InlineRow(key: "theme", alignment: .top) {
-                // Three-state, so a Toggle can't hold it. A .segmented Picker
-                // is native too, but macOS 26 draws segmented controls in glass
-                // — which made it indistinguishable from the hand-rolled
-                // GlassSegmented it replaced. Radios read as stock AppKit.
+                // Three-state, so a Toggle can't hold it. macOS 26 draws
+                // segmented Pickers in glass, indistinguishable from our own
+                // GlassSegmented; radios read as stock AppKit.
                 Picker("theme", selection: $prefs.theme) {
                     ForEach(ThemeChoice.allCases, id: \.self) { choice in
                         Text(choice.label).tag(choice)
@@ -447,10 +410,9 @@ private struct AppearanceSection: View {
     }
 }
 
-/// DEVELOPER — when on, re-triage affordances appear in the sitrep masthead
-/// (last 7 days) and the thread viewer (this email): they reset the LLM
-/// verdicts so the pipeline re-runs. Rule-decided and sealed rows are never
-/// touched.
+/// Dev mode adds re-triage affordances (sitrep masthead, thread viewer) that
+/// reset LLM verdicts so the pipeline re-runs. Rule-decided and sealed rows are
+/// never touched.
 private struct DeveloperSection: View {
     @Environment(Prefs.self) private var prefs
 
@@ -487,9 +449,9 @@ private struct YouSection: View {
 
 // MARK: - mail
 
-/// Remote images: "Always" renders network images automatically in every email;
-/// "On demand" blocks them at the frame CSP until the reader opts in per
-/// message. Tracking pixels are stripped either way.
+/// Remote images: "Always" renders them in every email, "On demand" blocks them
+/// at the frame CSP until the reader opts in per message. Tracking pixels are
+/// stripped either way — see docs/SECURITY.md.
 private struct MailSection: View {
     @Environment(Prefs.self) private var prefs
 
@@ -509,10 +471,9 @@ private struct MailSection: View {
 
 // MARK: - triage
 
-/// The "How triage works" explainer, mounted above the budget fields as their
-/// legend. Stage cards show the LIVE model names + daily caps from
-/// GET /client/triage-config. Self-contained: it fetches its own config, so the
-/// budget section's logic stays untouched.
+/// The "how triage works" explainer above the budget fields. Stage cards show
+/// live model names and daily caps from GET /client/triage-config, fetched here
+/// rather than shared with the budget section.
 private struct TriagePipelineSection: View {
     @State private var config: TriageConfig?
 
@@ -590,14 +551,9 @@ private struct TriagePipelineSection: View {
     }
 }
 
-/// THE DAILY CAPS for the two triage stages plus a spend estimator computed
-/// from trailing-14d usage and configured prices. Stage 1 (a small LLM) runs on
-/// EVERY email and has one cap. Stage 2 (a capable LLM) runs only on
-/// escalations and keeps the three per-thread / per-sender / global caps.
-///
-/// Caps are integers 1..=100000; Save posts ONLY changed fields. Values can
-/// originate from the built-in default, the server config file, or a live app
-/// override — the per-field note reflects that provenance.
+/// Daily caps for both triage stages, plus a spend estimate from trailing-14d
+/// usage and configured prices. Stage 1 runs on every email (one cap), stage 2
+/// only on escalations (thread/sender/global). Save posts only changed fields.
 private struct TriageBudgetSection: View {
     @Environment(AppStore.self) private var store
 
@@ -738,10 +694,9 @@ private struct TriageBudgetSection: View {
             ceilingDaily: Double(cap) * costPerCall)
     }
 
-    /// Text-only estimator. Each stage's "typical" uses its trailing-14d average
-    /// call rate × its per-call token means; the combined "hard ceiling" sums
-    /// each stage's cap × its per-call cost. Stages with no usage history are
-    /// SKIPPED rather than printed as $0.00 — a confident zero would be a lie.
+    /// Each stage's "typical" is its trailing-14d call rate × per-call token
+    /// means; the ceiling sums cap × per-call cost. Stages with no usage history
+    /// are skipped rather than printed as a confident $0.00.
     private func estimator(_ config: TriageConfig) -> some View {
         let s1 = estimate(
             tokensIn: config.stage1.avg_tokens_in_per_call,
@@ -796,7 +751,7 @@ private struct TriageBudgetSection: View {
 
     private func save() async {
         guard let config else { return }
-        // Post ONLY fields whose parsed integer differs from the loaded value.
+        // Post only fields whose parsed integer differs from the loaded value.
         var patch = TriageConfigPatch()
         var changed = false
         for key in FormKey.allCases {
@@ -830,10 +785,9 @@ private struct TriageBudgetSection: View {
     }
 }
 
-/// The blend that orders the Sitrep "For your eyes" zone. A single slider
-/// between time (urgency) and severity (importance). The stored pref is the
-/// URGENCY share; the slider is inverted so dragging RIGHT toward "severity"
-/// lowers it, matching the label. The sitrep re-ranks live — no save button.
+/// The blend ordering the sitrep "For your eyes" zone: one slider between time
+/// and severity. The stored pref is the *urgency* share, and the slider is
+/// inverted so dragging right toward "severity" lowers it. No save button.
 private struct RankingSection: View {
     @Environment(Prefs.self) private var prefs
 
@@ -863,14 +817,10 @@ private struct RankingSection: View {
 
 // MARK: - assistant
 
-/// The BYOK "ask your inbox" (⌘K) settings: paste your OWN Anthropic key
-/// (stored in the OS keychain, never sent to the squelch server) and pick the
-/// model.
-///
-/// The key rests MASKED and is read back out of the keychain only when Show or
-/// Edit is pressed — see `AssistantKeyStore.revealAsync`, the one sanctioned
-/// way for a view to hold this secret. The request path still never surfaces
-/// it: `LLMProxy` reads the keychain itself.
+/// BYOK settings for the ⌘K assistant: the user's own Anthropic key, kept in the
+/// OS keychain and never sent to the squelch server. It rests masked and is read
+/// back only through `AssistantKeyStore.revealAsync`, the one sanctioned way for
+/// a view to hold it; the request path never does — `LLMProxy` reads the keychain.
 private struct AssistantSection: View {
     @Environment(Prefs.self) private var prefs
 
@@ -937,9 +887,8 @@ private struct AssistantSection: View {
         .task { status = await AssistantKeyStore.statusAsync() }
     }
 
-    /// Called by the field on blur, with the value it holds. Clearing `keyInput`
-    /// afterwards keeps the plaintext out of view state once it is safely in the
-    /// keychain — the next Show or Edit reads it back.
+    /// Called by the field on blur. Clearing `keyInput` afterwards keeps the
+    /// plaintext out of view state once it is safely in the keychain.
     private func saveKey(_ value: String) async {
         let key = value.trimmed
         guard !key.isEmpty else { return }

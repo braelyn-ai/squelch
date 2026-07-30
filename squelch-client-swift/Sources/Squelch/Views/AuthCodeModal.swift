@@ -1,18 +1,8 @@
-// AUTH CODE MODAL — the payoff of the 2FA "present, don't read" flow. When an
-// otp/verification message arrives we auto-reveal (audited) and
-// extract the code; this presents it BIG so the human copies it and moves on
-// without ever reading the email.
-//
-// AUTO-DISMISS after 30s with a visible countdown: a code you haven't grabbed
-// in half a minute is a code you're not grabbing, and a secret shouldn't sit on
-// screen indefinitely. The timer is PER CODE (advancing the queue restarts it)
-// and COPYING PAUSES IT — you clearly still want the code (some flows need it
-// pasted more than once), so it stays until you dismiss.
-//
-// The code lives in store state only (never persisted) and is dropped from the
-// queue on dismiss. Multiple codes queue newest-first; dismissing advances.
-//
-// Ported from squelch-desktop/src/components/AuthCodeModal.tsx.
+// The "present, don't read" payoff: an arriving otp/verification message is
+// auto-revealed (audited) and its code shown big, so the human copies it without
+// reading the mail. The code lives in store state only, never persisted, and is
+// dropped from the queue on dismiss. Auto-dismisses after 30s so a secret never
+// sits on screen; the timer is per code, and copying pauses it.
 
 import SwiftUI
 
@@ -70,8 +60,7 @@ struct AuthCodeModal: View {
                     .padding(.horizontal, 18)
                     .padding(.bottom, 10)
 
-                    // A slim draining countdown bar along the card's bottom
-                    // edge. Freezes once the code has been copied.
+                    // Draining countdown bar; freezes green once copied.
                     GeometryReader { geo in
                         Rectangle()
                             .fill(paused ? Palette.positive : Palette.lock)
@@ -93,7 +82,6 @@ struct AuthCodeModal: View {
                 KeyBinding("Enter", "dismiss") { store.dismissAuthCode() },
                 KeyBinding("c", "copy code") { copy() },
             ])
-            // The timer is PER CODE: advancing the queue restarts it.
             .task(id: entry.id) { await runTimer() }
             .onChange(of: entry.id) { _, _ in
                 copied = false
@@ -176,7 +164,6 @@ struct AuthCodeModal: View {
         guard let code, !code.isEmpty else { return }
         if Clip.copy(code) {
             copied = true
-            // You grabbed it — stop the countdown; dismissal is yours now.
             paused = true
             Task {
                 try? await Task.sleep(for: .milliseconds(1400))

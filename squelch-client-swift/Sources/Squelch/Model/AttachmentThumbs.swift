@@ -1,26 +1,9 @@
-// ATTACHMENT TILE CACHE — resolve each attachment's 38pt tile ONCE, off the
-// main actor, keyed by attachment id.
-//
-// WHY THIS EXISTS: the strip used to fetch and decode inside the card's own
-// `.task`. Message cards live in a LazyVStack, so every recycle re-ran the
-// whole chain — a fresh DOWNLOAD of the bytes plus a full-size decode of a 2MB
-// photo to fill a 38pt square. That is the trap HeroCache was written to close,
-// and it is closed here the same three ways:
-//   1. RESOLVE ONCE per attachment id, including the NEGATIVE result, so a
-//      tile that already failed is not re-fetched on every scroll pass.
-//   2. DOWNSAMPLE TO THE TILE. ImageIO decodes straight to thumbnail size and
-//      PDFs rasterize page 1 at tile size, so the bytes we keep are the bytes
-//      we draw — never a full-resolution render held for a 38pt square.
-//   3. DO IT OFF THE MAIN ACTOR. Decode and rasterize happen in a detached
-//      task; only encoded Data crosses back.
-//
-// Bytes ride the AUTHENTICATED door through APIClient. A bearer token cannot
-// ride an <img src>, so there is no URL shortcut available here and none is
-// wanted: this cache never learns the token, it just asks the client.
-//
-// The caller decides WHICH bucket an attachment falls in (see AttachmentStrip's
-// mime bucketing, which is the security-relevant half); this type only knows
-// how to rasterize the two it is handed.
+// ATTACHMENT TILE CACHE — each attachment's 38pt tile resolved ONCE per id
+// (negative results included, so a failed tile is not re-fetched on every scroll
+// pass), downsampled at decode time so the bytes kept are the bytes drawn, and
+// rendered in a detached task with only encoded Data crossing back. Bytes ride
+// the authenticated door via APIClient — a bearer token cannot ride an <img src>,
+// and this cache never learns it. The caller picks the bucket.
 
 import AppKit
 import CoreGraphics
@@ -31,33 +14,28 @@ import UniformTypeIdentifiers
 final class AttachmentThumbs {
     static let shared = AttachmentThumbs()
 
-    /// How to rasterize the bytes. Deliberately NOT derived from the mime here
-    /// — the strip owns that decision so the "svg is never rendered inline"
-    /// rule lives in exactly one place.
+    /// How to rasterize the bytes. Deliberately NOT derived from the mime here —
+    /// the strip owns that, so "svg is never rendered inline" lives in one place.
     enum Source: Sendable { case image, pdf }
 
     /// A resolved tile. `.blank` is a real verdict ("this one produces no
     /// art"), not a missing entry, which is what makes the negative cache work.
     enum Tile { case art(NSImage), blank }
 
-    /// The tile's size in PIXELS: the 38pt square at 2x. Retina is the only
-    /// display class this app ships on, and over-rendering "just in case" is
-    /// the cost this whole type exists to remove.
-    /// `nonisolated` because the detached render task reads it.
+    /// The tile's size in PIXELS: the 38pt square at 2x, retina being the only
+    /// display class this app ships on. `nonisolated` for the detached render task.
     private nonisolated static let maxPixel = 76
 
     /// attachment id -> verdict. Membership IS "already resolved".
     private var cache: [Int: Tile] = [:]
-    /// In-flight resolves, so two cards for the same attachment (or a card that
-    /// recycles mid-fetch) share one download instead of racing.
+    /// In-flight resolves, so two cards for one attachment share a download.
     private var inFlight: [Int: Task<Tile, Never>] = [:]
 
     private init() {}
 
-    /// A resolved tile for instant render, without starting any work. Cards
-    /// read this on the way into `body` so a recycled card paints immediately
-    /// rather than flashing a spinner while its `.task` re-confirms what we
-    /// already hold. nil means "not resolved yet", NOT "no art".
+    /// A resolved tile for instant render, without starting any work — a recycled
+    /// card reads this in `body` instead of flashing a spinner while its `.task`
+    /// re-confirms what we hold. nil means "not resolved yet", NOT "no art".
     func cached(_ id: Int) -> Tile? { cache[id] }
 
     /// Resolve one tile, deduped and memoized.
@@ -99,8 +77,8 @@ final class AttachmentThumbs {
         return .art(image)
     }
 
-    /// ImageIO decodes DIRECTLY to thumbnail size, so a 2MB photo is never
-    /// fully rasterized just to fill a 38pt square.
+    /// ImageIO decodes DIRECTLY to thumbnail size, so a 2MB photo is never fully
+    /// rasterized to fill a 38pt square.
     private nonisolated static func downsample(_ bytes: Data, maxPixel: Int) -> Data? {
         guard let source = CGImageSourceCreateWithData(bytes as CFData, nil) else { return nil }
         let options: [CFString: Any] = [
@@ -114,10 +92,9 @@ final class AttachmentThumbs {
         return encodePNG(thumb)
     }
 
-    /// Rasterize page 1 at tile size. CoreGraphics rather than PDFKit on
-    /// purpose: `CGPDFDocument` draws into a context we own on whatever thread
-    /// we are on, while PDFKit's thumbnail API hands back an AppKit `NSImage`
-    /// that would have to cross back from the detached task.
+    /// Rasterize page 1 at tile size. CoreGraphics rather than PDFKit on purpose:
+    /// `CGPDFDocument` draws into a context we own on whatever thread we are on,
+    /// while PDFKit hands back an `NSImage` that cannot cross out of the task.
     private nonisolated static func renderFirstPage(_ bytes: Data, maxPixel: Int) -> Data? {
         guard let provider = CGDataProvider(data: bytes as CFData),
             let document = CGPDFDocument(provider),
@@ -127,10 +104,9 @@ final class AttachmentThumbs {
         let box = page.getBoxRect(.cropBox)
         guard box.width > 0, box.height > 0 else { return nil }
 
-        // /Rotate is a page ATTRIBUTE, not something already applied to the
-        // crop box: a landscape scan stored as a quarter-turned portrait page
-        // has to be measured after the turn or the tile comes out with the
-        // wrong aspect and the page letterboxed sideways inside it.
+        // /Rotate is a page ATTRIBUTE, not something already applied to the crop
+        // box: a landscape scan stored as a quarter-turned portrait page must be
+        // measured after the turn or the tile gets the wrong aspect.
         let quarterTurned = page.rotationAngle % 180 != 0
         let width = quarterTurned ? box.height : box.width
         let height = quarterTurned ? box.width : box.height
@@ -146,21 +122,19 @@ final class AttachmentThumbs {
                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue)
         else { return nil }
 
-        // A PDF page paints no background of its own. Skip this and the tile is
-        // a transparent sheet of black-on-nothing text, which over the card's
-        // dark fill reads as noise rather than paper.
+        // A PDF page paints no background of its own; without this the tile is
+        // transparent black-on-nothing text, which over a dark card reads as noise.
         let full = CGRect(x: 0, y: 0, width: pxWidth, height: pxHeight)
         ctx.setFillColor(CGColor(gray: 1, alpha: 1))
         ctx.fill(full)
 
         ctx.interpolationQuality = .high
-        // `rotate: 0` means "no EXTRA turn" — the transform already folds in
-        // the page's own /Rotate.
+        // `rotate: 0` means "no EXTRA turn" — the transform folds in /Rotate.
         ctx.concatenate(
             page.getDrawingTransform(
                 .cropBox, rect: full, rotate: 0, preserveAspectRatio: true))
-        // Content outside the crop box is not part of the page; without the
-        // clip a document with bleed marks paints them over the tile.
+        // Content outside the crop box is not part of the page; without the clip a
+        // document with bleed marks paints them over the tile.
         ctx.clip(to: box)
         ctx.drawPDFPage(page)
 
@@ -168,8 +142,8 @@ final class AttachmentThumbs {
         return encodePNG(image)
     }
 
-    /// PNG on the way out because `CGImage` is not Sendable and `Data` is —
-    /// re-encoding at tile size is what lets the render stay off the main actor.
+    /// PNG on the way out because `CGImage` is not Sendable and `Data` is — that
+    /// re-encode is what lets the render stay off the main actor.
     private nonisolated static func encodePNG(_ image: CGImage) -> Data? {
         let out = NSMutableData()
         guard

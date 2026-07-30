@@ -1,23 +1,8 @@
-// FULLSCREEN THREAD VIEWER — the email reading surface.
-//
-// Fetches GET /client/thread/{id} and renders ALL messages stacked NEWEST-FIRST
-// — the mail you came for is at the top, the history reads downward. j/k move
-// the selected message (j = older); click a card to select it. HTML renders in
-// the hard-sandboxed EmailWebView; plain text falls back to a selectable card
-// with its quoted history collapsed by the same heuristic.
-//
-// ONE SCROLL SURFACE: the outer column is the single scroll. Each web view
-// measures its own content and sizes to it exactly, so message frames NEVER
-// scroll internally and the stacked cards flow like one long document.
-//
-// LAYERED / ESC RETURNS YOU: this is a fullscreen overlay ABOVE everything,
-// including the browse/search side panels. The surface underneath stays
-// mounted, so opening a thread from search keeps the results under it and Esc
-// drops you right back where you were. Clicking the empty gutter beside the
-// column does the same — the mail is the page, so the space around it is a way
-// out and not dead pixels.
-//
-// Ported from squelch-desktop/src/components/ThreadViewer.tsx.
+// FULLSCREEN THREAD VIEWER. Fetches GET /client/thread/{id} and stacks every
+// message NEWEST-FIRST; j/k move the selection (j = older). HTML renders in the
+// hard-sandboxed EmailWebView, plain text in a selectable card. The outer column
+// is the ONE scroll surface — message frames size to their content and never
+// scroll internally. Esc, or a gutter click, closes back onto the surface below.
 
 import SwiftUI
 
@@ -41,8 +26,7 @@ struct ThreadViewer: View {
     @State private var retriaging = false
     @State private var debugInfo: TriageDebug?
     /// messageId -> image srcs an earlier message in this thread already showed.
-    /// Rebuilt with the thread and thrown away with it — nothing crosses
-    /// threads. See `ThreadPrefetch.repeatedImages(in:)`.
+    /// Rebuilt with the thread and thrown away with it; nothing crosses threads.
     @State private var repeatedImages: [Int: Set<String>] = [:]
 
     enum ConfirmMode: Equatable { case ask, noLink }
@@ -58,10 +42,9 @@ struct ThreadViewer: View {
     }
     private var senderName: String { newest.map { SenderCache.resolved($0.senderString).displayName } ?? "" }
 
-    /// EVERY participant, in first-appearance order, deduped by canonical
-    /// address. Reads `thread.messages` (chronological) rather than the
-    /// newest-first display order, so the list starts with whoever started the
-    /// thread. Naming only the newest sender hides half of what a thread is.
+    /// EVERY participant, in first-appearance order, deduped by canonical address.
+    /// Reads `thread.messages` (chronological), not the newest-first display order,
+    /// so the list starts with whoever started the thread.
     private var participants: [String] {
         var seen = Set<String>()
         var names: [String] = []
@@ -73,9 +56,8 @@ struct ThreadViewer: View {
         return names
     }
 
-    /// "Alice, Bob, Carol +3". The header is a fixed strip above a scroll —
-    /// a long thread must collapse into a count rather than wrap and shove the
-    /// mail down the screen.
+    /// "Alice, Bob, Carol +3" — the header is a fixed strip above a scroll, so a
+    /// long thread must collapse into a count rather than shove the mail down.
     private var participantLine: String {
         let names = participants
         guard names.count > 3 else { return names.joined(separator: ", ") }
@@ -204,9 +186,8 @@ struct ThreadViewer: View {
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    // spacing 0: each message owns its own vertical rhythm so
-                    // the hairline between two of them lands in the middle of
-                    // the gap instead of hugging one side of it.
+                    // spacing 0: each message owns its vertical rhythm, so the
+                    // hairline between two lands mid-gap instead of hugging one.
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                             MessageCard(
@@ -223,9 +204,8 @@ struct ThreadViewer: View {
                     .frame(maxWidth: Self.columnWidth)
                     .frame(maxWidth: .infinity)
                     // INSIDE the scroll content deliberately: an overlay on the
-                    // ScrollView itself sits above the scroll view and would eat
-                    // the wheel wherever it covers, and the pointer parks in the
-                    // gutter constantly.
+                    // ScrollView itself would sit above it and eat the wheel
+                    // wherever it covers, and the pointer parks in the gutter.
                     .overlay { gutterDismiss }
                 }
                 .onChange(of: index) { _, i in

@@ -1,26 +1,9 @@
-// NEWSLETTER HERO CACHE — resolve each sender's thumbnail ONCE, off the main
-// actor, and hand the grid something cheap to draw.
-//
-// WHY THIS EXISTS: the hero used to resolve itself inside the card. In a
-// LazyVGrid that is a trap — cards are created and destroyed as they cross the
-// viewport, so every recycle re-ran the whole chain, and the expensive half of
-// it (decode the full-size art, draw it into a 16x16 buffer to sample the
-// dominant colour) ran ON THE MAIN ACTOR. Scrolling past the zone therefore
-// paid for a decode per card per pass, which is exactly what it felt like.
-//
-// Three things fix it, and all three matter:
-//   1. RESOLVE ONCE, keyed by thread id, including a NEGATIVE result — a sender
-//      with no art must not re-walk its thread on every recycle looking for
-//      one it will not find.
-//   2. DOWNSAMPLE TO THE SQUARE. Heroes are routinely 1200px wide and were
-//      being rescaled into a 54pt box on every frame. ImageIO decodes straight
-//      to thumbnail size, so the bytes we keep are the bytes we draw.
-//   3. DO IT OFF THE MAIN ACTOR. Decode, downsample and sampling all happen in
-//      a detached task; only Sendable values (the encoded thumbnail and three
-//      colour components) come back across.
-//
-// Preloading is then just "resolve everything the zone is about to show" —
-// see SitrepView, which kicks it off as soon as the newsletter list lands.
+// NEWSLETTER HERO CACHE — each sender's thumbnail resolved ONCE per thread id,
+// negative results included (a sender with no art must not re-walk its thread on
+// every LazyVGrid recycle), downsampled at decode time so the bytes kept are the
+// bytes drawn, and decoded/sampled in a detached task with only Sendable values
+// (the encoded thumbnail and three colour components) crossing back. Preloading
+// is just "resolve everything the zone is about to show".
 
 import AppKit
 import CoreGraphics
@@ -39,39 +22,33 @@ final class HeroCache {
         let fill: Color?
     }
 
-    /// The rendered size, in PIXELS: the 54pt square at 2x. Retina is the only
-    /// display class this app ships on, and over-decoding "just in case" is the
-    /// cost this whole type exists to remove.
-    /// `nonisolated` because the detached render task reads it.
+    /// The rendered size in PIXELS: the 54pt square at 2x, retina being the only
+    /// display class this app ships on. `nonisolated` for the detached render task.
     private nonisolated static let maxPixel = 108
 
-    /// How many heroes resolve at once during a preload. The work is network-
-    /// bound per item but each one ends in a decode, so a wide fan-out just
-    /// queues CPU behind the scroll it is meant to smooth.
+    /// How many heroes resolve at once during a preload. Each item is network-bound
+    /// but ends in a decode, so a wide fan-out queues CPU behind the scroll it is
+    /// meant to smooth.
     private static let preloadWidth = 4
 
     /// threadId -> resolved hero, or nil for "checked, has none". The outer
     /// Optional is cache membership; the inner one is the verdict.
     private var cache: [String: Hero?] = [:]
-    /// In-flight resolves, so a preload and a card that scrolls into view at the
-    /// same moment share one fetch instead of racing.
+    /// In-flight resolves, so a preload and a card scrolling into view share a fetch.
     private var inFlight: [String: Task<Hero?, Never>] = [:]
 
     private init() {}
 
-    /// A cached hero for instant render, without starting any work. Cards read
-    /// this on the way into `body` so a recycled card paints immediately rather
-    /// than flashing empty while its `.task` re-confirms what we already know.
+    /// A cached hero for instant render, without starting any work — a recycled card
+    /// reads this in `body` instead of flashing empty while its `.task` re-confirms.
     func cached(_ threadId: String) -> Hero? {
         guard let entry = cache[threadId] else { return nil }
         return entry
     }
 
-    /// Whether this thread has a VERDICT — art, or a cached "has none".
-    /// `cached` cannot answer that: it flattens both to nil. A card checks this
-    /// before starting its `.task`, because on a hit the resolve would only
-    /// hand back what the card already drew, at the price of a suspension and a
-    /// second body pass.
+    /// Whether this thread has a VERDICT — art, or a cached "has none". `cached`
+    /// flattens both to nil and cannot answer it; a card checks this before
+    /// starting a `.task` that would only re-hand it what it already drew.
     func isResolved(_ threadId: String) -> Bool { cache.index(forKey: threadId) != nil }
 
     /// Resolve one hero, deduped and memoized.
@@ -128,8 +105,7 @@ final class HeroCache {
             let bytes = await HeroBytes.shared.load(url)
         else { return nil }
 
-        // Decode, downsample and sample OFF the main actor; only the encoded
-        // thumbnail and the colour components come back.
+        // Off the main actor; only the thumbnail and colour components come back.
         let rendered = await Task.detached(priority: .utility) {
             render(bytes, maxPixel: maxPixel)
         }.value
@@ -144,10 +120,9 @@ final class HeroCache {
         let rgb: ImageFill.RGB?
     }
 
-    /// ImageIO decodes DIRECTLY to thumbnail size, so a 1200px hero never gets
-    /// fully rasterized. PNG on the way out because the transparent-logo case
-    /// depends on the alpha surviving — that transparency is what lets the
-    /// sampled fill show through behind the mark.
+    /// ImageIO decodes DIRECTLY to thumbnail size, so a 1200px hero is never fully
+    /// rasterized. PNG on the way out because a transparent logo needs its alpha to
+    /// survive — that is what lets the sampled fill show through behind the mark.
     private nonisolated static func render(_ bytes: Data, maxPixel: Int) -> Rendered? {
         guard let source = CGImageSourceCreateWithData(bytes as CFData, nil) else { return nil }
         let options: [CFString: Any] = [
@@ -171,21 +146,17 @@ final class HeroCache {
     }
 }
 
-/// Fetches hero bytes. Referrer-suppressed and cookie-free, matching the posture
-/// of every other remote-image fetch in the app. It hands back BYTES rather than
-/// an image: decoding belongs off the main actor, and the decoded result is
-/// cached by HeroCache anyway, so caching whole images here would be a second
-/// copy of the same art at full size.
+/// Fetches hero bytes: ephemeral, cookie-free and referrer-suppressed, like every
+/// other remote-image fetch here. Hands back BYTES rather than an image — decoding
+/// belongs off the main actor, and HeroCache already keeps the decoded result.
 @MainActor
 final class HeroBytes {
     static let shared = HeroBytes()
 
-    /// Ephemeral, and every knob that could leak the reader is off — the same
-    /// lockdown as `ImageStore`, because this fetches the same kind of thing:
-    /// a URL an email chose. `urlCache` is nil because HeroCache holds the only
-    /// copy worth keeping (the downsampled thumbnail); a URL cache underneath
-    /// would keep the full-size art as well, on disk, keyed by a mail-supplied
-    /// URL.
+    /// Every knob that could leak the reader is off — this fetches a URL an email
+    /// chose. `urlCache` is nil because HeroCache holds the only copy worth keeping;
+    /// a cache underneath would keep the full-size art on disk too, keyed by a
+    /// mail-supplied URL.
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpShouldSetCookies = false
@@ -197,7 +168,7 @@ final class HeroBytes {
         return URLSession(configuration: cfg)
     }()
 
-    /// 8MB per image, matching the Rust shell's cap.
+    /// 8MB per image.
     private static let maxBytes = 8 * 1024 * 1024
 
     private init() {}

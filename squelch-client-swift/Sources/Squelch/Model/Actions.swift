@@ -1,14 +1,8 @@
 // ACTION DISPATCH — the canonical verb API the read views call.
 //
-// Design law: UNDO-FIRST. archive/done/label fire instantly (the API client
-// already sends confirm:true). The row leaves its band the instant the key is
-// pressed (optimistic), a 5s undo toast is queued, and the inverse call is the
-// toast's `revert`. `send` is the only ceremony path and lives in the compose
-// overlay, reached here via reply().
-//
-// Nothing here logs the token or any sealed body; errors surface as toasts.
-//
-// Ported from squelch-desktop/src/actions/{useActions,blockSender}.ts.
+// UNDO-FIRST: archive/done/label fire instantly, the row leaves its band
+// optimistically, and a 5s undo toast carries the inverse call as its `revert`.
+// `send` is the only ceremony path (the compose overlay, reached via reply()).
 
 import Foundation
 
@@ -43,9 +37,9 @@ enum Actions {
         let restore = store.removeFromBands(u.id)
         do {
             try await APIClient.shared.setStatus(u.id, .done)
-            // The message leaves the working set — drop its remembered height,
-            // and unpin its images so they rejoin the LRU. The bytes stay on
-            // disk: the undo below is five seconds away and re-pins them.
+            // The message leaves the working set: drop its remembered height and
+            // unpin its images. The bytes stay on disk — the undo below is five
+            // seconds away and re-pins them.
             FrameHeights.shared.clear(String(u.id))
             await ImageStore.shared.release(messageId: u.id)
             store.pushUndo(kind: .done, messageId: u.id, label: "done \(u.sender)") {
@@ -74,7 +68,6 @@ enum Actions {
         do {
             try await APIClient.shared.actionLabel(u.id, add: add, remove: remove)
             store.pushUndo(kind: .label, messageId: u.id, label: "labeled \(u.sender)") {
-                // Inverse: swap add <-> remove.
                 try await APIClient.shared.actionLabel(u.id, add: remove, remove: add)
             }
         } catch {
@@ -100,9 +93,7 @@ enum Actions {
     }
 
     /// Create a squelch rule matching `sender` EXACTLY (not *@domain) — this one
-    /// sender abused the situation, not necessarily its whole domain. Shared by
-    /// the unsubscribe-violation prompt and the thread viewer's no-link
-    /// fallback, so the rule shape lives in exactly one place.
+    /// sender abused the situation, not necessarily its whole domain.
     static func createBlockRule(sender: String) async throws {
         try await APIClient.shared.createRule(
             CreateRuleBody(

@@ -1,17 +1,12 @@
 // Small pure formatters for the read side. Dense output: relative time as
 // compact tokens ("2h", "5d", "3w"), deadline chips, importance coloring, and
 // age weighting for the STILL OPEN escalation.
-//
-// Ported from squelch-desktop/src/lib/format.ts.
 
 import Foundation
 
 enum Fmt {
-    /// Shared RFC3339 parser. The daemon emits fractional seconds on some
+    /// Shared RFC3339 parser — the daemon emits fractional seconds on some
     /// fields and not others, so try both.
-    // ISO8601DateFormatter is documented thread-safe for parsing but is not
-    // marked Sendable; these are immutable after init, so the unchecked
-    // annotation is accurate rather than a suppression.
     nonisolated(unsafe) private static let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -23,9 +18,8 @@ enum Fmt {
         return f
     }()
 
-    /// Parsed timestamps, memoized. Every visible row asks for a relative age
-    /// and a deadline chip on every render, and RFC3339 parsing is not cheap —
-    /// uncached it was a measurable share of each frame in a long list.
+    /// Parsed timestamps, memoized: every visible row parses an age and a
+    /// deadline chip per render, and RFC3339 parsing is a measurable frame cost.
     nonisolated(unsafe) private static var dateCache: [String: Date?] = [:]
     private static let dateCacheLock = NSLock()
     private static let dateCacheCap = 4000
@@ -51,8 +45,8 @@ enum Fmt {
     private static func parseISO(_ iso: String) -> Date? {
         dateCacheLock.lock()
         defer { dateCacheLock.unlock() }
-        // The formatters are not thread-safe for concurrent use; the lock that
-        // guards the cache guards them too.
+        // ISO8601DateFormatter is not safe for concurrent use, so the lock that
+        // guards the cache guards the formatters too.
         if let d = isoFractional.date(from: iso) { return d }
         if let d = isoPlain.date(from: iso) { return d }
         // Bare "YYYY-MM-DD" (marketing expires_at).
@@ -168,8 +162,7 @@ enum Fmt {
         return d.formatted(.dateTime.hour().minute())
     }
 
-    /// True if an RFC3339 timestamp falls on the current LOCAL calendar day.
-    /// Parses defensively: a missing/unparseable stamp returns false.
+    /// True if the stamp falls on the current LOCAL calendar day; nil → false.
     static func isToday(_ iso: String?) -> Bool {
         guard let d = date(iso) else { return false }
         return Calendar.current.isDateInToday(d)
@@ -216,10 +209,9 @@ enum Fmt {
     }
 }
 
-/// Pulls the first "$1,234.56"-shaped run out of a one-liner.
-///
-/// Hand-rolled and memoized on purpose: the sitrep evaluates this for every
-/// visible row on every render, and a `Regex` there was costing frames.
+/// The first "$1,234.56"-shaped run in a one-liner. Hand-rolled and memoized on
+/// purpose: the sitrep runs this per visible row per render, and a `Regex` there
+/// was costing frames.
 @MainActor
 enum MoneyScan {
     private static var cache: [String: String?] = [:]

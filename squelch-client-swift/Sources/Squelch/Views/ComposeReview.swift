@@ -1,19 +1,8 @@
-// COMPOSE / REVIEW — the send ceremony.
-//
-// Send is the one irreversible action in the app, so it gets friction
-// proportional to that:
-//   EDIT   — to / subject / body. ⌘Enter → REVIEW.
-//   REVIEW — recipients + body preview + the outbound-guard verdict. We submit
-//            ONCE without override_guard to get that verdict:
-//              * clean pass → the send actually fired; we close on success.
-//              * 422 guard  → show the redacted guard kinds plus a DISTINCT
-//                             "override and send" affordance (shift+Enter or
-//                             the danger button). A second plain Enter without
-//                             a surfaced guard just re-fires.
-//   403    — no write credential: render the `squelchd auth --write` hint.
-// Esc backs REVIEW → EDIT, and EDIT → cancel.
-//
-// Ported from squelch-desktop/src/components/ComposeReview.tsx.
+// The send ceremony — the one irreversible action in the app, so it gets two
+// phases: edit (⌘Enter → review), then review, which submits once *without*
+// override_guard to get the outbound-guard verdict. A clean pass has already
+// sent; a 422 shows the redacted guard kinds and demands a distinct override
+// (shift+Enter or the danger button). 403 means no write credential.
 
 import SwiftUI
 
@@ -224,8 +213,8 @@ struct ComposeReview: View {
                     store.closeCompose()
                 }
             },
-            // In the body field, plain Enter is a newline; ⌘Enter reviews. The
-            // review phase's Enter fires WITHOUT override (phase 1 = verdict).
+            // In the body field plain Enter is a newline; ⌘Enter reviews. In
+            // review, Enter fires without override — that call is the verdict.
             KeyBinding(declining: "Enter", inReview ? "send" : "review", allowInInput: true) {
                 guard let compose = store.compose else { return false }
                 if compose.phase == .edit {
@@ -266,7 +255,6 @@ struct ComposeReview: View {
 
     private func toReview() {
         guard let compose = store.compose else { return }
-        // Guard against an empty body — nothing to review.
         guard !compose.body.trimmed.isEmpty else {
             patch { $0.error = "body is empty" }
             return
@@ -293,8 +281,8 @@ struct ComposeReview: View {
             store.pushToast("sent", .success)
             store.closeCompose()
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
-            // Surface the redacted verdict; stay in review, offer an explicit
-            // override rather than re-firing the same call.
+            // Stay in review with the redacted verdict; the override must be an
+            // explicit second act, not a re-fire of the same call.
             patch {
                 $0.phase = .review
                 $0.guardKinds = apiError.guardKinds ?? []

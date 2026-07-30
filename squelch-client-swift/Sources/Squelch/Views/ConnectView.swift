@@ -1,10 +1,5 @@
-// First-run Connect screen: server URL + API token, tested via /client/stats,
-// saved into the OS keychain. No token is ever logged.
-//
-// This is the app's first impression, so it is where the brand speaks loudest:
-// the serif wordmark on one big tinted glass card floating over the desktop.
-//
-// Ported from squelch-desktop/src/views/Connect.tsx.
+// First-run connect screen: server URL + API token, tested via /client/stats and
+// saved into the OS keychain. The token is never logged.
 
 import SwiftUI
 
@@ -88,8 +83,8 @@ struct ConnectView: View {
     }
 }
 
-/// A labelled input well. Near-opaque on purpose: typed text must stay crisp,
-/// and a fully-translucent field over a busy wallpaper is unreadable.
+/// A labelled input well. Near-opaque on purpose: a fully translucent field
+/// over a busy wallpaper leaves typed text unreadable.
 struct Field<Content: View>: View {
     let label: String
     @ViewBuilder var content: Content
@@ -102,9 +97,8 @@ struct Field<Content: View>: View {
     }
 }
 
-/// The caption above a well. Split out so a field that needs a custom row under
-/// its label — `SecretField`, which parks icons beside the well — still labels
-/// itself identically.
+/// The caption above a well. Split out so a field needing its own row under the
+/// label still labels itself identically.
 struct FieldLabel: View {
     let text: String
     init(_ text: String) { self.text = text }
@@ -118,7 +112,6 @@ struct FieldLabel: View {
 }
 
 extension View {
-    /// The well itself: the near-opaque plate an input sits on.
     func fieldWell() -> some View {
         self
             .font(.system(size: 13))

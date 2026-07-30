@@ -1,24 +1,8 @@
-// AUTH PAGE — the dedicated home for auth mail: login codes, password resets,
-// sign-in alerts, verifications. Metadata-only by default (bodies are NEVER
-// fetched to render the list), with one deliberate exception under REVEAL.
-//
-// SHAPE. Two columns. The main column leads with IN FOCUS — the selected
-// message blown up, and for a code kind its digits in individual boxes with a
-// copy button, because "get the code and get out" is the entire job of this
-// page. Under it: filter chips, then the messages split into LIVE (last hour)
-// and ARCHIVE. The right rail holds NEEDS A DECISION — sign-in alerts and reset
-// requests, which do not hand you a code but do ask you a question — plus the
-// shredder panel.
-//
-// REVEAL is the one place a body is touched, and it is always a human action.
-// A reveal writes an audit row server-side, so this page never reveals on load:
-// digits appear immediately ONLY for codes the arrival flow already revealed
-// this session (that reveal is already paid for and already audited).
-// Everything else shows a covered placeholder until you press R. Revealed codes
-// live in this view's state and die with it — never persisted, never lifted
-// into the global store.
-//
-// Ported from squelch-desktop/src/components/AuthView.tsx.
+// Auth mail: login codes, password resets, sign-in alerts, verifications.
+// Metadata only — a body is never fetched to render the list. Reveal is always a
+// human action and writes a server-side audit row, so this page never reveals on
+// load; digits appear immediately only for codes the arrival flow already
+// revealed. Revealed codes live in this view's state and are never persisted.
 
 import SwiftUI
 
@@ -26,7 +10,7 @@ struct AuthView: View {
     @Environment(AppStore.self) private var store
     @Namespace private var authGlass
 
-    /// Anything newer than this counts as LIVE and heads the list.
+    /// Newer than this counts as live and heads the list.
     private static let liveWindow: TimeInterval = 60 * 60
     /// Cards in the decision rail before it stops growing.
     private static let maxDecisionCards = 6
@@ -49,8 +33,8 @@ struct AuthView: View {
     @State private var revealing: SealedMeta?
     @State private var copied = false
     @State private var busy: Int?
-    /// Codes revealed THIS SESSION, by message id. A present key with a nil
-    /// value = revealed but no code could be read. View state only.
+    /// Codes revealed this session, by message id; a present key with a nil
+    /// value means revealed but unreadable. View state only, never persisted.
     @State private var codes: [Int: String?] = [:]
     /// Ids archived from this page, hidden optimistically (the list is a poll).
     @State private var archived: Set<Int> = []
@@ -119,8 +103,6 @@ struct AuthView: View {
                 RevealPanel(meta: revealing) { self.revealing = nil }
             }
         }
-        // Seed from the arrival flow: a code auto-revealed as it landed is
-        // already in memory and already audited, so showing it costs nothing.
         .onChange(of: store.authQueue.count) { _, _ in seedFromArrivals() }
         .onAppear { seedFromArrivals() }
         .onChange(of: shown.count) { _, count in
@@ -193,7 +175,6 @@ struct AuthView: View {
         .frame(maxWidth: .infinity, alignment: .top)
     }
 
-    /// One labelled group of rows. Renders nothing when the group is empty.
     @ViewBuilder
     private func section(_ label: String, rows: [SealedMeta]) -> some View {
         if !rows.isEmpty {
@@ -239,9 +220,8 @@ struct AuthView: View {
                             meta: m,
                             onMine: { decisions.set(m.id, .mine) },
                             onNotMine: {
-                                // NOT a dismissal: record the verdict, then open
-                                // the message so the human can read what
-                                // actually happened and act.
+                                // Not a dismissal: record the verdict, then open
+                                // the message so the human can act on it.
                                 decisions.set(m.id, .notMine)
                                 revealing = m
                             })
@@ -273,9 +253,8 @@ struct AuthView: View {
 
     // MARK: - actions
 
-    /// Reveal one message. Code kinds resolve to digits inline; everything else
-    /// opens the full one-time reveal panel, which is the honest affordance for
-    /// a message whose point is its prose, not a number.
+    /// Code kinds resolve to digits inline; anything whose point is its prose
+    /// opens the full one-time reveal panel instead.
     private func reveal(_ m: SealedMeta) async {
         guard AuthCode.isCodeKind(m.kind) else {
             revealing = m
@@ -304,7 +283,6 @@ struct AuthView: View {
         }
     }
 
-    /// "Used it — archive": the code is spent, get it out of the inbox.
     private func archiveFocused(_ m: SealedMeta) async {
         busy = m.id
         defer { busy = nil }
@@ -595,10 +573,9 @@ private struct DecisionCard: View {
 
 // MARK: - shredder
 
-/// The shredder panel. Every number here comes from the server's `shred_log`
-/// ledger — nothing on this card is estimated. The switch is the ONLY way
-/// automatic deletion ever turns on, and the card is explicit that shredding
-/// means Gmail's Trash (recoverable for 30 days), never a permanent delete.
+/// Shredder panel. Every number comes from the server's `shred_log` ledger,
+/// nothing is estimated. This switch is the only way automatic deletion turns
+/// on, and shredding means Gmail Trash (recoverable 30 days), never a purge.
 private struct ShredderCard: View {
     @Environment(AppStore.self) private var store
     @State private var stats: ShredStats?
@@ -680,9 +657,8 @@ private struct ShredderCard: View {
     }
 
     private func load() async {
-        // Ask the server to apply the policy now rather than waiting out its
-        // hourly timer; it is a no-op server-side when the shredder is off or
-        // unable to run, so this is safe to fire on every open.
+        // Apply the policy now instead of waiting out the server's hourly timer;
+        // it is a server-side no-op when the shredder is off or can't run.
         if let run = try? await APIClient.shared.runShredder() {
             stats = run.stats
         } else {

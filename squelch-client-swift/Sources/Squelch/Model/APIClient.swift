@@ -1,11 +1,9 @@
 // Typed client for the squelch human door (/client/*). One method per route.
-// Bearer token + base URL come from the keychain; call `configure()` once after
-// Connect / on load, before any request.
+// Bearer token + base URL come from the keychain; call `configure()` once before
+// any request.
 //
-// SECURITY: the token is sent only in the Authorization header. It is never
-// logged, never placed in a thrown error message, never persisted here.
-//
-// Ported 1:1 from squelch-desktop/src/api/client.ts.
+// Invariant: the token rides the Authorization header and nowhere else — never
+// logged, never in a thrown message, never persisted here.
 
 import Foundation
 
@@ -36,10 +34,8 @@ actor APIClient {
     private var config: Config?
     private let session: URLSession
 
-    /// 15s is generous for a local daemon. Without a hard timeout a daemon
-    /// dying mid-request leaves the request hanging forever — which wedged the
-    /// desktop client's poller in-flight guard and made "connection lost"
-    /// immortal.
+    /// 15s is generous for a local daemon. Without a hard timeout a daemon dying
+    /// mid-request hangs forever and wedges a poller's in-flight guard with it.
     private static let requestTimeout: TimeInterval = 15
     private static let attachmentTimeout: TimeInterval = 30
 
@@ -134,8 +130,8 @@ actor APIClient {
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
-        // Drop nil optionals rather than emitting nulls — matches the desktop
-        // client's JSON.stringify behavior, which the server's serde expects.
+        // Nil optionals are dropped rather than emitted as nulls, which is what
+        // the server's serde expects.
         return e
     }()
 
@@ -331,8 +327,8 @@ actor APIClient {
 
     func listSealed() async throws -> [SealedMeta] { try await get("/client/sealed") }
 
-    /// Reveal exactly one sealed body. Audited server-side; response is
-    /// no-store. The returned body must live in view state only.
+    /// Reveal exactly one sealed body: audited server-side, `no-store`, and the
+    /// returned body must live in view state only — see docs/SECURITY.md §4.
     func revealSealed(_ id: Int) async throws -> RevealedSealed {
         try await post("/client/sealed/\(id)/reveal")
     }
@@ -419,14 +415,10 @@ actor APIClient {
         var note: String?
     }
 
-    /// Record that triage got one wrong, and apply the fix. Server-side this is
-    /// a single transaction: the triage row moves AND the correction is stored
-    /// as a training row.
-    ///
-    /// The response body is deliberately NOT decoded. The only caller needs
-    /// success/failure, and coupling "the correction landed" to "the feedback
-    /// row decoded exactly as expected" would surface a scary error toast for a
-    /// write that actually succeeded.
+    /// Record that triage got one wrong and apply the fix (one server-side
+    /// transaction: the triage row moves AND a training row is stored). The
+    /// response is deliberately NOT decoded — a decode failure would toast an
+    /// error for a write that succeeded.
     func correctTriage(messageId: Int, dimension: TriageAxis, toValue: String, note: String? = nil)
         async throws
     {

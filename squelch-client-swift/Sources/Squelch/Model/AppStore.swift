@@ -1,15 +1,9 @@
-// THE app store. One observable object, several logical slices:
-//   settings   — connection state + Connect flow
-//   sitrep     — the three bands, stats, sealed metadata (the read model)
-//   selection  — cursor position, stable by message id across refresh
-//   undo       — pending-undo queue for undo-first actions
-//   routing    — the routed main view + a browser-style history stack
-//   surfaces   — side panel / thread viewer / overlays
+// THE app store: one observable object holding connection state, the sitrep read
+// model, selection (stable by message id across refresh), the undo queue, the
+// routed view + history stack, and the overlay surfaces.
 //
-// The store holds DATA and coordination only. Network calls live in APIClient
-// and are invoked by the poller / views, which write results back here.
-//
-// Ported from squelch-desktop/src/state/store.ts.
+// DATA and coordination only — network calls live in APIClient, and the poller
+// and views write their results back here.
 
 import Foundation
 import Observation
@@ -22,9 +16,8 @@ import SwiftUI
 enum MainView: String, Sendable, Hashable, CaseIterable {
     case sitrep, emails, auth, rules, audit, usage, settings
 
-    /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings
-    /// are DELIBERATELY excluded: they live in a bottom group reached by click,
-    /// so adding them never renumbers 1..5.
+    /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
+    /// excluded so that adding them never renumbers 1..5.
     static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
@@ -66,9 +59,8 @@ let historyCap = 50
 
 // MARK: - side views
 
-/// Side panels remaining after Auth/Rules/Audit were promoted to routed views.
-/// The thread drill-in is NOT a side view — it's the fullscreen viewer, layered
-/// ABOVE these panels so opening a thread from search keeps the panel mounted
+/// The side panels. The thread drill-in is NOT one — it is the fullscreen viewer,
+/// layered ABOVE these, so opening a thread from search keeps the panel mounted
 /// underneath and Esc returns to it.
 enum SideView: Equatable, Sendable {
     case none
@@ -91,19 +83,11 @@ enum SideView: Equatable, Sendable {
 /// and two numbers drifting apart would leave a seam or a covered strip.
 let sidePanelWidth: CGFloat = 460
 
-/// EVERYTHING THE SITREP'S ZONES RENDER, held in the store rather than in the
-/// zones themselves.
-///
-/// A zone that owns its rows in `@State` throws them away the moment you
-/// navigate off the dashboard and re-fetches on the way back — so every visit
-/// showed empty cards until four or five round-trips landed. Held here, the
-/// last good answer is already on screen when the view mounts and the refresh
-/// happens UNDERNEATH it: rows are only ever replaced by newer rows, never
-/// cleared first, so there is no flash and no empty state on a revisit.
-///
-/// `loadedAt` is what keeps that honest in the other direction — see
-/// `AppStore.refreshZones`, which skips a refetch that just happened so
-/// bouncing between views cannot turn into a request storm.
+/// Everything the sitrep's zones render, held here rather than in the zones: a
+/// view's `@State` dies on unmount, so the last good answer is already on screen
+/// when the dashboard re-mounts and the refresh happens UNDERNEATH it — rows are
+/// only ever replaced by newer rows, never cleared first. `loadedAt` keeps that
+/// honest in the other direction (see `refreshZones`).
 struct SitrepZoneCache: Sendable {
     var calendar: [CalendarUpdate] = []
     var shipments: [Shipment] = []
@@ -115,19 +99,17 @@ struct SitrepZoneCache: Sendable {
     var loadedAt: Date?
 }
 
-/// The search panel's state, held OUT of the panel. SwiftUI throws away a view's
-/// `@State` the instant it unmounts, so parking the query and results here is
-/// what makes `/` a RESUMABLE surface: close it, read a thread, reopen — same
+/// The search panel's state, held OUT of the panel: SwiftUI discards a view's
+/// `@State` on unmount, and parking it here is what makes `/` resumable — same
 /// query, same hits, same selection, no refetch and no empty flash.
 struct SearchSession: Sendable, Equatable {
     var query = ""
     var hits: [SearchHit] = []
     var index = 0
     var error: String?
-    /// The term `hits` actually came from. Reopening on an unchanged query skips
-    /// the round-trip entirely rather than flashing "searching…" over results
-    /// that are already correct. nil = whatever is on screen is not authoritative
-    /// (never fetched, or the last fetch failed), so reopening retries.
+    /// The term `hits` actually came from, so reopening on an unchanged query
+    /// skips the round-trip. nil = what is on screen is not authoritative (never
+    /// fetched, or the last fetch failed), so reopening retries.
     var fetchedQuery: String?
 }
 
@@ -141,9 +123,8 @@ enum ConnStatus: Sendable, Equatable {
     case error
 }
 
-/// Why a refresh failed, kept alongside the message so the UI can distinguish
-/// "daemon unreachable" (fix: start squelchd) from "token rejected" (fix: open
-/// Settings) rather than lumping every failure into one vague state.
+/// Why a refresh failed, so the UI can distinguish "daemon unreachable" (fix:
+/// start squelchd) from "token rejected" (fix: open Settings).
 struct RefreshError: Equatable, Sendable {
     var message: String
     var kind: APIErrorKind
@@ -156,9 +137,8 @@ struct RefreshError: Equatable, Sendable {
 
 enum UndoKind: Sendable { case archive, done, label, ruleDelete }
 
-/// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click.
-/// Undo-first design: the forward action already fired; this lets the human
-/// take it back.
+/// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
+/// the forward action has already gone out.
 struct PendingUndo: Identifiable, Sendable {
     let id = UUID()
     var kind: UndoKind
@@ -178,18 +158,17 @@ struct Toast: Identifiable, Sendable {
 
 // MARK: - 2FA present-don't-read
 
-/// A live countdown ring on the auth rail icon. One per freshly-arrived auth
-/// message; the ring sweeps over RING_SECONDS then removes itself. The ring +
-/// the seen-set ARE the read state (Gmail read-marking is impossible and
-/// unwanted under gmail.readonly).
+/// A live countdown ring on the auth rail icon, one per freshly-arrived auth
+/// message, sweeping over `ringSeconds` then removing itself. The ring plus the
+/// seen-set ARE the read state — read-marking is impossible under
+/// gmail.readonly.
 struct AuthRing: Identifiable, Sendable, Equatable {
     var id: Int
     var startedAt: Date
 }
 
 /// A queued code-modal entry. `code` is nil when extraction failed (the modal
-/// shows an "Open Auth" affordance instead). Held in memory only, never
-/// persisted.
+/// shows an "Open Auth" affordance instead). In memory only, never persisted.
 struct AuthCodeEntry: Identifiable, Sendable, Equatable {
     var meta: SealedMeta
     var code: String?
@@ -220,13 +199,11 @@ struct ComposeState: Sendable, Equatable {
 /// The email currently being reclassified by the `v` palette.
 struct TriageFixTarget: Sendable, Equatable {
     var messageId: Int
-    /// Shown so you can see what you are reclassifying.
     var sender: String
     var subject: String
-    /// Current values, for the "was" labels. nil = unknown, and a dimension the
-    /// caller does not know is OMITTED rather than shown as "unset" — claiming a
-    /// value is unset when we simply never fetched it would be a small lie in
-    /// the one place accuracy matters.
+    /// Current values for the "was" labels. Double optional: an outer nil means
+    /// the caller does not know, and that dimension is OMITTED rather than shown
+    /// as "unset" — which would claim a fact we never fetched.
     var tier: String??
     var category: String??
 }
@@ -272,11 +249,10 @@ final class AppStore {
     var lastRefresh: Date?
     var refreshError: RefreshError?
 
-    /// Daemon health. "Down" = refreshes failing AND nothing has ever loaded
-    /// this session — there is no data worth rendering, so the routed view is
-    /// replaced by the down pane (Settings excepted: it must stay reachable to
-    /// fix the token/URL). Once a sync HAS landed, failures degrade to a
-    /// stale-data banner and the (stale) view stays up.
+    /// Down = refreshes failing AND nothing has ever loaded this session, so the
+    /// routed view is replaced by the down pane (Settings excepted: it must stay
+    /// reachable to fix the token/URL). Once a sync HAS landed, failures degrade
+    /// to a stale-data banner and the stale view stays up.
     var daemonDown: Bool { refreshError != nil && lastRefresh == nil }
 
     // MARK: routing slice
@@ -366,10 +342,9 @@ final class AppStore {
         }
     }
 
-    /// Settings-screen re-validate: test a candidate and, on success, persist +
+    /// Settings-screen re-validate: test a candidate and, on success, persist and
     /// swap the live client — WITHOUT dropping connStatus out of "connected" on
-    /// failure (so the Settings view stays mounted rather than bouncing to the
-    /// Connect gate).
+    /// failure, so Settings stays mounted instead of bouncing to the Connect gate.
     func revalidate(serverURL: String, apiToken: String) async -> (ok: Bool, error: String?) {
         let prev = settings
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
@@ -380,8 +355,8 @@ final class AppStore {
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             return (true, nil)
         } catch {
-            // Restore the prior working client — never leave the app pointed at
-            // a bad config because the human fat-fingered the token.
+            // Restore the prior working client — a fat-fingered token must not
+            // leave the app pointed at a bad config.
             if let prev {
                 await APIClient.shared.configure(baseURL: prev.serverURL, token: prev.apiToken)
             }
@@ -427,33 +402,29 @@ final class AppStore {
         historyIndex = trimmed.count - 1
     }
 
-    /// Whether the last route came from the POINTER. The rail slides its
-    /// selector for a click and snaps for everything else: a click is a
-    /// continuous gesture that the eye can follow across the rail, while
-    /// `3` is instantaneous and animating it only puts 300ms between the
-    /// keypress and the answer.
-    ///
-    /// Read by the rail as it re-renders, which is the same update that
-    /// carries the new `activeView`, so the two can never disagree.
+    /// Whether the last route came from the POINTER: the rail slides its selector
+    /// for a click (a continuous gesture the eye follows) and snaps for
+    /// everything else (`3` is instantaneous; animating it just puts 300ms
+    /// between the keypress and the answer). Read by the rail in the same update
+    /// that carries the new `activeView`, so the two cannot disagree.
     private(set) var routeWasPointer = false
 
     /// EVERY route goes through here, so the flag can never be left describing
-    /// the previous one. `goBack`/`viewInEmails` used to assign `activeView`
-    /// directly, which would have inherited whatever the last click set and
-    /// slid the rail for a keyboard route.
+    /// the previous one — assigning `activeView` directly would inherit whatever
+    /// the last click set and slide the rail for a keyboard route.
     private func route(to view: MainView, viaPointer: Bool = false) {
         routeWasPointer = viaPointer
         activeView = view
     }
 
     func setView(_ view: MainView, viaPointer: Bool = false) {
-        // Navigating ANYWHERE dismisses an open thread viewer — the rail is
-        // visible beside it, so a rail click means "leave this email and go
-        // there", not "change the page underneath the overlay".
+        // Navigating ANYWHERE dismisses an open thread viewer: the rail is visible
+        // beside it, so a click there means "leave this email", not "change the
+        // page underneath the overlay".
         threadId = nil
         threadQueue = []
-        // No-op if we're already on this exact view+selection — a repeat press
-        // shouldn't spam identical history entries.
+        // No-op on the same view+selection, so a repeat press cannot spam
+        // identical history entries.
         let cur = history.indices.contains(historyIndex) ? history[historyIndex] : nil
         if let cur, cur.view == view, cur.selectedId == selectedId {
             route(to: view, viaPointer: viaPointer)
@@ -463,9 +434,8 @@ final class AppStore {
         pushHistory(HistoryEntry(view: view, selectedId: selectedId))
     }
 
-    /// Switch to the Emails view with a specific update selected. Used by the
-    /// Sitrep dashboard's "view" affordances to hand off to the band list with
-    /// the right row focused.
+    /// Switch to the Emails view with a specific update selected — the sitrep's
+    /// "view" affordances hand off to the band list with the right row focused.
     func viewInEmails(_ id: Int) {
         route(to: .emails)
         selectedId = id
@@ -524,13 +494,10 @@ final class AppStore {
         threadQueue = []
     }
 
-    /// True while a modal owns the screen. The surfaces UNDER it get blurred so
-    /// the modal reads as FOCUS rather than as a new page — the board stays
-    /// visible, just out of focus.
-    ///
-    /// Toasts are deliberately absent: a toast is not a modal and must never
-    /// defocus the app you are working in. So are the side panels and the thread
-    /// viewer, which are surfaces you interact with, not overlays on one.
+    /// True while a modal owns the screen; the surfaces under it blur so the modal
+    /// reads as focus rather than as a new page. Toasts are deliberately absent (a
+    /// toast must never defocus the app), as are the side panels and the thread
+    /// viewer — those are surfaces you interact with, not overlays on one.
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen || compose != nil
             || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
@@ -538,13 +505,10 @@ final class AppStore {
 
     // MARK: - sitrep zones
 
-    /// Refresh every zone CONCURRENTLY, replacing rows only once new ones
-    /// arrive. Skips entirely if the last refresh is still fresh, so navigating
-    /// back to the dashboard costs nothing — that is what makes the sitrep load
-    /// instantly on a revisit instead of re-fetching five endpoints.
-    ///
-    /// Pass `force` for the deliberate cases (an explicit sync, a rule save)
-    /// where the caller knows the cache is stale regardless of its age.
+    /// Refresh every zone CONCURRENTLY, replacing rows only once new ones arrive,
+    /// and skip entirely while the last refresh is still fresh — that is what
+    /// makes a revisit instant instead of five round-trips. `force` is for callers
+    /// that just changed the data (an explicit sync, a rule save).
     func refreshZones(force: Bool = false) async {
         if !force, let loadedAt = zones.loadedAt,
             Date().timeIntervalSince(loadedAt) < Self.zoneTTL
@@ -552,16 +516,12 @@ final class AppStore {
             return
         }
         // JOIN an in-flight refresh rather than starting a second one. The TTL
-        // above cannot do this job: `loadedAt` is only stamped when a refresh
-        // COMPLETES, and all five zones plus the dashboard call this from their
-        // own `.task` the moment the sitrep mounts — so on a cold load every one
-        // of them would sail past the TTL check and fire its own copy of all
-        // five requests.
+        // cannot do this job: `loadedAt` is stamped only when a refresh COMPLETES,
+        // and on a cold load all five zones plus the dashboard sail past it from
+        // their own `.task` and each fire a full copy of the five requests.
         //
-        // A FORCED caller does not get to stop there. It forces because it just
-        // changed the data, and a pass already in flight may have read the
-        // daemon BEFORE that change landed — joining it would answer with rows
-        // the caller already knows are stale.
+        // A FORCED caller does not stop there: a pass already in flight may have
+        // read the daemon BEFORE the change it forced for landed.
         if let running = zoneRefresh {
             await running.value
             if !force { return }
@@ -569,9 +529,9 @@ final class AppStore {
         let refresh = Task { await performZoneRefresh() }
         zoneRefresh = refresh
         await refresh.value
-        // Only clear our OWN marker: a forced caller can have replaced it while
-        // we were suspended, and nil-ing that one would let the next joiner
-        // start a redundant third pass.
+        // Only clear our OWN marker: a forced caller can have replaced it while we
+        // were suspended, and nil-ing that one lets the next joiner start a third
+        // redundant pass.
         if zoneRefresh == refresh { zoneRefresh = nil }
     }
 
@@ -579,8 +539,8 @@ final class AppStore {
     private var zoneRefresh: Task<Void, Never>?
 
     private func performZoneRefresh() async {
-        // Kicked off together: these are five independent endpoints and running
-        // them in series made the FIRST paint wait for the sum of them.
+        // Five independent endpoints, kicked off together so the first paint does
+        // not wait on the sum of them.
         async let calendar = APIClient.shared.getCalendar()
         async let shipments = APIClient.shared.getShipments(includeDelivered: true)
         async let banking = APIClient.shared.getBanking()
@@ -602,19 +562,18 @@ final class AppStore {
 
         HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))
         warmZoneThreads()
-        // Half of the launch image warm's input (the newsletter zone); the
-        // bands are the other half. It runs once both have landed.
+        // The newsletter half of the launch image warm's input; the bands are the
+        // other half, and it starts once both have landed.
         ImageWarmer.shared.noteZonesLanded()
     }
 
-    /// How long a zone refresh stays good. Long enough that flipping between
-    /// views is free, short enough that a dashboard left open still tracks the
-    /// mail — the 10s sitrep poll drives the bands, which is what actually
-    /// changes minute to minute.
+    /// How long a zone refresh stays good: long enough that flipping between views
+    /// is free, short enough that a dashboard left open still tracks the mail (the
+    /// 10s sitrep poll drives the bands, which change minute to minute).
     private static let zoneTTL: TimeInterval = 45
 
     /// Preload the emails behind the records the columns show, so clicking one
-    /// opens instantly. Same intent as the sitrep's own row prefetch.
+    /// opens instantly.
     private func warmZoneThreads() {
         ThreadPrefetch.shared.warm(zones.banking.prefix(6).compactMap(\.thread_id), immediate: 2)
         // Receipts rotate at local midnight, so match the cache TTL to that.
@@ -631,8 +590,8 @@ final class AppStore {
     func openSide(_ view: SideView) { sideView = view }
     func closeSide() { sideView = .none }
 
-    /// Open search. By default it RESUMES the last one; pass `seed` to force a
-    /// fresh term (nothing does yet, but a "search this sender" affordance would).
+    /// Open search. By default it RESUMES the last one; `seed` forces a fresh term
+    /// (nothing does yet, but a "search this sender" affordance would).
     func openSearch(seed: String? = nil) {
         if let seed {
             search.query = seed
@@ -660,7 +619,6 @@ final class AppStore {
     ) {
         let entry = PendingUndo(kind: kind, messageId: messageId, label: label, revert: revert)
         undos.append(entry)
-        // Auto-expire from the queue after the window.
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.undoTTL))
             self?.undos.removeAll { $0.id == entry.id }
@@ -691,8 +649,8 @@ final class AppStore {
     func pushToast(_ text: String, _ tone: Toast.Tone = .info) -> UUID {
         let toast = Toast(text: text, tone: tone)
         toasts.append(toast)
-        // Notices are ephemeral (undos own their own 5s window and a click
-        // target); auto-dismiss so the stack cannot accumulate forever.
+        // Auto-dismiss so the stack cannot accumulate; undos own their own 5s
+        // window and a click target.
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(6))
             self?.toasts.removeAll { $0.id == toast.id }
@@ -726,15 +684,11 @@ final class AppStore {
 
     // MARK: - band mutation (optimistic)
 
-    /// Ids resolved during this session, so a list that keeps its OWN copy of
-    /// the rows can drop them the moment it is looked at again.
-    ///
-    /// The bands live in `sitrep` and update in place, but EmailsView holds a
-    /// local `items` snapshot and only reloads on `lastRefresh` — the 10s poll.
-    /// Resolving from the reader therefore left the row sitting on the mail page
-    /// for up to a full poll after the mail was gone, which reads as the action
-    /// not having worked. This is the shared record of "already done" that any
-    /// such list can filter against; the poll still supplies the truth.
+    /// Ids resolved during this session. The bands in `sitrep` update in place,
+    /// but a list holding its own snapshot (EmailsView reloads only on the 10s
+    /// `lastRefresh`) would keep showing a resolved row for up to a full poll —
+    /// which reads as the action not working. This is the shared record such a
+    /// list filters against; the poll still supplies the truth.
     private(set) var resolvedIds: Set<Int> = []
 
     /// Optimistically pull a message id out of whatever band holds it and keep
@@ -766,15 +720,15 @@ final class AppStore {
             self.sitrep.new = prev.new
             self.sitrep.open = prev.open
             self.selectedId = messageId
-            // An undone resolve must be undone EVERYWHERE, or the row returns
-            // to the bands while the mail page keeps filtering it out.
+            // An undone resolve must be undone EVERYWHERE, or the row returns to
+            // the bands while the mail page keeps filtering it out.
             self.resolvedIds.remove(messageId)
         }
     }
 
-    /// Record a resolve that did NOT go through the bands — the reader can
-    /// finish a thread it was not opened from a queue with, and that mail may
-    /// still be sitting in a list somewhere behind it.
+    /// Record a resolve that did NOT go through the bands: the reader can finish a
+    /// thread it was not opened from a queue with, and that mail may still be
+    /// sitting in a list behind it.
     func noteResolved(_ messageId: Int) {
         resolvedIds.insert(messageId)
         sitrep.standing.removeAll { $0.id == messageId }
@@ -782,16 +736,12 @@ final class AppStore {
         sitrep.open.removeAll { $0.id == messageId }
     }
 
-    /// Optimistically pull a message out of the STANDING band ONLY — the one a
-    /// tier correction actually empties.
-    ///
-    /// For-your-eyes is tier-defined server-side (`tier IN
-    /// ('past_due','deadline') AND status != 'done'`); `new` and `open` are
-    /// defined by surfaced_at and status, which a tier correction leaves
-    /// untouched. A fresh deadline email sits in standing AND new, so pulling it
-    /// from all three would blank it out of Attention for the half second before
-    /// the refresh puts it back. No restore thunk: the write has already
-    /// succeeded by the time this runs.
+    /// Optimistically pull a message out of the STANDING band ONLY — the one a tier
+    /// correction empties. Standing is tier-defined server-side (`tier IN
+    /// ('past_due','deadline') AND status != 'done'`) while `new`/`open` come from
+    /// surfaced_at and status, which a tier correction leaves alone; a fresh
+    /// deadline email sits in both, so pulling all three blanks it out of Attention
+    /// until the refresh. No restore thunk — the write has already succeeded.
     func removeFromStanding(_ messageId: Int) {
         sitrep.standing.removeAll { $0.id == messageId }
     }

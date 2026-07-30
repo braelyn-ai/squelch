@@ -1,22 +1,8 @@
-// SIDE VIEWS — browse-all + search, as a right-hand glass panel.
-//
-// Renders whichever side view store.sideView selects and owns the modal
-// KeyContext + Esc-to-close for the whole panel. Each inner view registers its
-// own list-style keys into this same modal context; they must NOT push a
-// second context.
-//
-// CRITICAL: this panel is mounted ONLY while a side view is open. If the modal
-// context were pushed unconditionally it would sit on the stack forever,
-// permanently gating out the entire "list" keymap and leaving Escape as the
-// only working key — the exact bug the desktop client's header warns about.
-//
-// The thread drill-in is NOT a side view: it's the viewer, layered ABOVE this
-// panel and INSET by `sidePanelWidth` while a panel is open, so opening a hit
-// from search leaves the results sitting right there beside the email instead of
-// swallowing them. Esc closes the reader; a second Esc closes the panel.
-//
-// Ported from squelch-desktop/src/views/SideViews.tsx and
-// src/components/{SearchView,BrowseView}.tsx.
+// Browse-all + search as a right-hand glass panel. It owns the modal KeyContext
+// and Esc-to-close; inner views register their list keys into that same context
+// and must not push a second one. Mounted only while a side view is open —
+// pushing the modal context unconditionally would gate out the whole "list"
+// keymap forever. The thread viewer layers above it, inset by sidePanelWidth.
 
 import AppKit
 import SwiftUI
@@ -67,12 +53,9 @@ struct SidePanel: View {
 
 // MARK: - search
 
-/// Search side view. Debounced to GET /client/search; results with j/k
-/// selection; click or Enter opens a hit in the reader beside these results.
-///
-/// EVERY piece of durable state lives in `store.search`, not here — see
-/// SearchSession. This view owns only `loading`, which is transient by
-/// definition: an in-flight request dies with the panel anyway.
+/// Search: debounced GET /client/search, j/k selection, click or Enter opens a
+/// hit in the reader beside the results. Every durable piece of state lives in
+/// `store.search`; only `loading`, which dies with the panel, is local.
 struct SearchView: View {
     @Environment(AppStore.self) private var store
     @State private var loading = false
@@ -103,9 +86,8 @@ struct SearchView: View {
                 ScrollView {
                     LazyVStack(spacing: 6) {
                         ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
-                            // ONE click opens. The reader sits beside this list,
-                            // so opening a hit costs nothing and the double-click
-                            // this used to require was pure undiscoverable tax.
+                            // One click opens: the reader sits beside this list,
+                            // so opening a hit costs the results nothing.
                             HitRow(hit: hit, selected: i == store.search.index) {
                                 store.search.index = i
                                 store.openThread(hit.thread_id)
@@ -122,8 +104,8 @@ struct SearchView: View {
                         proxy.scrollTo(hit.id, anchor: .center)
                     }
                 }
-                // Reopening restores the selection, so restore the scroll to
-                // match — a preserved index you have to hunt for isn't preserved.
+                // Reopening restores the selection, so restore the scroll too —
+                // an index you have to hunt for isn't preserved.
                 .onAppear {
                     guard let hit = store.search.hits[safe: store.search.index] else { return }
                     Task { @MainActor in proxy.scrollTo(hit.id, anchor: .center) }
@@ -132,8 +114,8 @@ struct SearchView: View {
         }
         .keyBindings(.modal, bindings)
         .onAppear { focused = true }
-        // The remembered query lands SELECTED, so `/` serves both callers:
-        // arrow straight down into the old results, or just type to replace it.
+        // The remembered query lands selected, so `/` serves both callers: arrow
+        // down into the old results, or type to replace it.
         .onChange(of: focused) { _, on in
             guard on, !store.search.query.isEmpty else { return }
             Task { @MainActor in
@@ -174,8 +156,8 @@ struct SearchView: View {
             loading = false
             return
         }
-        // Already holding this term's results: show them. This is the whole
-        // point of the hoisted session — reopening must not re-fetch and flash.
+        // Already holding this term's results: reopening must not re-fetch and
+        // flash, which is the point of hoisting the session into the store.
         guard term != store.search.fetchedQuery else { return }
         loading = true
         // Debounce: a fresh keystroke cancels this task before the request.

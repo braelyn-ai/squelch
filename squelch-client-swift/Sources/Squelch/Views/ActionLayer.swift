@@ -1,22 +1,8 @@
-// ACTION LAYER — the global action surface, above every other layer.
-//
-// Renders the always-on overlays and wires the action-side keys:
-//   - undo + notice toast stack (bottom-left), 5s undo with `u` / click
-//   - the unsubscribe-violation prompt
-//   - compose/review send ceremony
-//   - rule editor (`t` tune) and process mode (`p`)
-//   - the 2FA code modal, the triage-fix palette, the ⌘K ask bar
-//   - the shortcuts overlay
-//
-// The read views own their list keymap; this layer EXTENDS the same "list"
-// context with the two action verbs whose overlays live here (t, p). The
-// modal-context keys live inside each overlay.
-//
-// GLASS: the toast stack is its own GlassEffectContainer, so stacked toasts
-// merge into one pill of material and separate as they expire — the material
-// doing the work a fade would otherwise have to.
-//
-// Ported from squelch-desktop/src/views/ActionLayer.tsx.
+// The global action surface, above every other layer: undo/notice toasts, the
+// unsubscribe-violation prompt, compose review, rule editor, process mode, the
+// 2FA modal, triage-fix palette, ⌘K ask bar, shortcuts overlay.
+// Read views own the list keymap; this layer extends that same "list" context
+// with t and p. Modal-context keys live inside each overlay.
 
 import SwiftUI
 
@@ -25,21 +11,15 @@ struct ActionLayer: View {
 
     @State private var blockPrompt: UnsubscribeRecord?
     @State private var blockBusy = false
-    /// Senders the human already blocked/kept THIS session, so a lagging read
-    /// model can't re-nag.
+    /// Senders acted on this session, so a lagging read model can't re-nag.
     @State private var acted: Set<String> = []
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            // Toast stack — bottom-left, above every fullscreen surface, so an
-            // undo is never buried by the email it was fired from.
-            //
-            // Spacers + fixedSize are load-bearing, not tidiness: a
-            // GlassEffectContainer expands to the size it is offered, so an
-            // unconstrained one here became an invisible full-window pane that
-            // swallowed every scroll and click in the app. Sizing it to its
-            // content means only the toasts themselves are hit-testable, and
-            // Spacers never take hits.
+            // Toast stack, bottom-left above every fullscreen surface. The
+            // Spacers + fixedSize are load-bearing: a GlassEffectContainer
+            // expands to the size it is offered, so an unconstrained one here
+            // is an invisible full-window pane that eats every scroll and click.
             VStack(spacing: 0) {
                 Spacer(minLength: 0)
                 HStack(spacing: 0) {
@@ -69,7 +49,6 @@ struct ActionLayer: View {
             },
             KeyBinding("p", "process mode") { store.processModeOpen = true },
         ])
-        // Re-scan for unsubscribe violations whenever the read model ticks.
         .task(id: store.lastRefresh) { await scanViolations() }
     }
 
@@ -78,9 +57,8 @@ struct ActionLayer: View {
     private var toastStack: some View {
         GlassEffectContainer(spacing: 10) {
             VStack(alignment: .leading, spacing: 7) {
-                // Unsubscribe-violation prompt — an action card above the
-                // toasts. Sender strings are email-derived → rendered as TEXT
-                // only, never as markup.
+                // Sender strings are email-derived: rendered as Text only,
+                // never as markup.
                 if let prompt = blockPrompt {
                     violationPrompt(prompt)
                 }
@@ -188,7 +166,7 @@ struct ActionLayer: View {
 
     private func scanViolations() async {
         guard let rows = try? await APIClient.shared.getUnsubscribes() else { return }
-        // Surface ONE at a time: a stack of these would be a nag, not a prompt.
+        // Surface one at a time: a stack of these is a nag, not a prompt.
         blockPrompt = rows.first {
             $0.violation_count > 0 && $0.resolution == nil && !acted.contains($0.sender)
         }
@@ -200,7 +178,7 @@ struct ActionLayer: View {
         // Mark acted immediately so a refresh mid-flight can't re-surface it.
         acted.insert(record.sender)
         do {
-            // Squelch rule on the EXACT sender address.
+            // Exact sender address, not the domain.
             try await Actions.createBlockRule(sender: record.sender)
             try await APIClient.shared.setUnsubResolution(
                 sender: record.sender, resolution: .blocked)
@@ -226,9 +204,8 @@ struct ActionLayer: View {
 
 // MARK: - shortcuts overlay
 
-/// Keyboard-shortcuts help, opened with '?'. A curated, grouped cheat-sheet —
-/// clearer than dumping the raw keymap registry, which carries per-context
-/// duplicates.
+/// Keyboard-shortcuts help ('?'). Curated and grouped by hand rather than
+/// dumped from the keymap registry, which carries per-context duplicates.
 struct ShortcutsOverlay: View {
     let onClose: () -> Void
 

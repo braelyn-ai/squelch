@@ -1,17 +1,8 @@
-// A small circular sender avatar.
-//
-// HUMAN senders: initials over a deterministic, theme-aware background derived
-// purely from the sender string — LOCAL-ONLY, no network fetch ever. Remote
-// avatars would leak the human correspondent graph, which is the one thing this
-// app must never do.
-//
-// ROBOT / BRAND senders (no-reply@, notifications@, billing@, eBay@eBay.com):
-// the domain's favicon, fetched at most once per domain with the verdict cached
-// across launches. On failure we fall back to initials seamlessly. Robot
-// mailboxes name a service, not a person, so this leaks nothing about who a
-// human talks to.
-//
-// Ported from squelch-desktop/src/components/Avatar.tsx.
+// Small circular sender avatar. Human senders get initials over a deterministic
+// theme-aware background derived from the sender string — local only, never a
+// network fetch, because a remote avatar leaks the human correspondent graph.
+// Robot/brand senders (no-reply@, notifications@, billing@) get the domain
+// favicon, fetched once per domain, falling back to initials on failure.
 
 import SwiftUI
 
@@ -27,11 +18,10 @@ struct Avatar: View {
     private var resolved: SenderID.Resolved { SenderCache.resolved(sender) }
     private var domain: String? { resolved.faviconDomain }
 
-    /// Prefer this frame's loaded image, but fall back to a SYNCHRONOUS read of
-    /// the in-memory cache. A list row that gets rebuilt — SwiftUI re-creates the
-    /// subtree whenever a selection flip switches which branch of a conditional
-    /// modifier it lives in — loses `@State` and would otherwise flash initials
-    /// for the frame it takes `.task` to hand the same cached image back.
+    /// Prefer this frame's image, else a synchronous cache read: a row rebuilt
+    /// because a selection flip switched which branch of a conditional modifier
+    /// it lives in loses `@State`, and would flash initials for the frame
+    /// `.task` takes to hand the same cached image back.
     private var image: NSImage? {
         favicon ?? domain.flatMap { FaviconLoader.shared.cached($0) }
     }
@@ -84,9 +74,9 @@ struct Avatar: View {
     }
 }
 
-/// Fetches + memoizes favicons. One request per domain per launch, with the
-/// ok/failed verdict persisted so a dead domain is never retried across
-/// sessions either. Sends no referrer and no credentials.
+/// Fetches + memoizes favicons: one request per domain per launch, verdict
+/// persisted so a dead domain is never retried across sessions. Ephemeral
+/// session, no cookies, no referrer.
 @MainActor
 final class FaviconLoader {
     static let shared = FaviconLoader()
@@ -103,8 +93,8 @@ final class FaviconLoader {
 
     private init() {}
 
-    /// Already-loaded image for a domain, with no async hop. Lets a rebuilt
-    /// `Avatar` draw the right thing on its first frame.
+    /// Already-loaded image, no async hop — lets a rebuilt `Avatar` draw on its
+    /// first frame.
     func cached(_ domain: String) -> NSImage? { images[domain] }
 
     func load(url: URL, domain: String) async -> NSImage? {

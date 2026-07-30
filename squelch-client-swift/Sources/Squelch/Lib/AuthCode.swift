@@ -1,11 +1,8 @@
 // Client-side 2FA code extraction, auth-mail copy, and the device-local
 // "needs a decision" ledger.
 //
-// The "present, don't read" flow: when a login code arrives we auto-reveal the
-// body (server-side audited) and pull the code out here so the human never has
-// to open the email — the code just appears.
-//
-// Ported from squelch-desktop/src/lib/{authCode,authCopy,authDecisions}.ts.
+// "Present, don't read": a login code's body is auto-revealed (audited
+// server-side) and the code pulled out here, so the human never opens the mail.
 
 import Foundation
 import SwiftUI
@@ -13,15 +10,10 @@ import SwiftUI
 // MARK: - code extraction
 
 enum AuthCode {
-    /// Kinds that warrant the code modal. Others (resets/alerts/links) get the
-    /// ring only.
-    ///
-    /// These are wire values from `SealedKind` (squelch-core/src/types.rs) — the
-    /// server only ever sends otp, password_reset, magic_link, login_alert,
-    /// verification. Anything not in that enum is dead weight here.
+    /// Kinds that warrant the code modal; the rest (resets/alerts/links) get the
+    /// ring only. Wire values from `SealedKind` (squelch-core/src/types.rs).
     static let codeKinds: Set<String> = ["otp", "verification"]
 
-    /// True if this sealed kind should pop the code modal (vs. ring-only).
     static func isCodeKind(_ kind: String?) -> Bool {
         guard let kind else { return false }
         return codeKinds.contains(kind)
@@ -31,13 +23,9 @@ enum AuthCode {
     nonisolated(unsafe) private static let codeWordPattern =
         /(?i)\b(?:one[-\s]?time|verification|verify|passcode|pass[-\s]?code|security\s+code|access\s+code|auth(?:entication)?\s+code|login\s+code|sign[-\s]?in\s+code|confirmation\s+code|OTP|PIN|code)\b/
 
-    /// A standalone 4-8 digit run, allowing one space/hyphen split (some
-    /// providers format longer codes as "123 456" for readability).
-    ///
-    /// The desktop version used a lookbehind for the left boundary; Swift Regex
-    /// has no lookbehind, so the boundary is an explicit alternation and the
-    /// run is capture group 1 — which is why every read below uses `m.1` rather
-    /// than the whole match.
+    /// A standalone 4-8 digit run, allowing one space/hyphen split ("123 456").
+    /// Swift Regex has no lookbehind, so the left boundary is an explicit
+    /// alternation and the run is capture group 1 — hence every read uses `m.1`.
     nonisolated(unsafe) private static let digitRunPattern =
         /(?:^|[^\w-])(\d{4,8}|\d{3}[\s-]\d{3}|\d{2}[\s-]\d{2}[\s-]\d{2})(?![\w-])/
 
@@ -59,14 +47,9 @@ enum AuthCode {
         return best
     }
 
-    /// Extract the most likely login code from a revealed body.
-    ///
-    /// Strategy, in order of confidence:
-    ///   1. Prefer a 4-8 digit run within ±80 chars of a code word, ranked by
-    ///      how CLOSE it sits — proximity beats length, so "login code is
-    ///      55231" wins over a longer order number nearby.
-    ///   2. Fallback: the longest standalone 4-8 digit run in the body.
-    /// Returns nil when nothing plausible is found.
+    /// The most likely login code in a revealed body: a 4-8 digit run within ±80
+    /// chars of a code word, closest first (proximity beats length), else the
+    /// longest standalone run. nil when nothing plausible is found.
     static func extract(_ body: String?) -> String? {
         guard let body, !body.isEmpty else { return nil }
         // Codes live near the top; bound the work.
@@ -79,8 +62,7 @@ enum AuthCode {
         var runs: [Run] = []
         for m in text.matches(of: digitRunPattern) {
             guard let code = cleanRun(String(m.1)) else { continue }
-            // Index the DIGITS, not the boundary character the pattern consumed
-            // (the capture's own startIndex is an index into `text`).
+            // Index the DIGITS, not the boundary char the pattern consumed.
             runs.append(
                 Run(
                     code: code,
@@ -108,9 +90,8 @@ enum AuthCode {
 
 // MARK: - auth copy
 
-/// User-facing copy for auth-related mail. "Sealed" is internal jargon and must
-/// never reach the UI — this maps wire-level `sealed_kind` strings to
-/// auth-centric labels the user actually understands.
+/// User-facing copy for auth mail. "Sealed" is internal jargon and must never
+/// reach the UI, so wire `sealed_kind` values map to auth-centric labels.
 enum AuthCopy {
     static func label(_ kind: String?) -> String {
         switch kind {
@@ -123,7 +104,6 @@ enum AuthCopy {
         }
     }
 
-    /// Per-kind SF Symbol, mirroring the desktop client's lucide choices.
     static func symbol(_ kind: String?) -> String {
         switch kind {
         case "otp": "key.fill"
@@ -138,16 +118,9 @@ enum AuthCopy {
 
 // MARK: - decisions ledger
 
-/// "Needs a decision" state — which sign-in alerts and password resets the
-/// human has already ruled on.
-///
-/// DEVICE-LOCAL BY DESIGN. There is no server field for this: /client/sealed is
-/// read-only metadata, and squelch cannot mark Gmail read either. So the
-/// decision lives in UserDefaults, exactly like the arrival seen-set.
-///
-/// What that costs, stated plainly: decisions do not follow you to another
-/// machine. If these ever need to be a RECORD (audited, cross-device), that is
-/// the moment to promote them server-side rather than to grow this file.
+/// The human's verdict on a sign-in alert or password reset. Device-local by
+/// design: there is no server field (/client/sealed is read-only metadata), so
+/// decisions live in UserDefaults and do not follow the user to another machine.
 enum AuthVerdict: String, Sendable {
     case mine
     case notMine = "not-mine"
@@ -182,12 +155,8 @@ final class AuthDecisions {
         return AuthVerdict(rawValue: raw)
     }
 
-    /// Record a verdict.
-    ///
-    /// Note the asymmetry in what the two answers mean. "That was me" is a
-    /// dismissal — it resolves the card and nothing else happens. "Not me" is
-    /// NOT a dismissal: it is the start of an investigation, so the caller
-    /// opens the message so the human can read what happened and act on it.
+    /// Record a verdict. Asymmetric by design: `mine` just resolves the card,
+    /// while `notMine` starts an investigation — the caller opens the message.
     func set(_ id: Int, _ verdict: AuthVerdict) {
         var next = store
         next[String(id)] = verdict.rawValue

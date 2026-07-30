@@ -1,19 +1,11 @@
-// ARRIVAL DETECTION for the 2FA "present, don't read" flow.
+// ARRIVAL DETECTION for the 2FA "present, don't read" flow: watches the polled
+// sealed metadata and fires once per genuinely-new auth message — a countdown
+// ring, plus (for otp/verification only) an audited auto-reveal and a code modal.
 //
-// The app already polls sealed metadata (SitrepPoller, 10s). This watches that
-// list and fires a one-shot flow the first time a genuinely-new auth message
-// appears: a countdown ring on the auth rail, and — for code kinds (otp /
-// verification) — an auto-reveal (server-side audited) plus client-side code
-// extraction that pops a modal. Password resets, sign-in links, and sign-in
-// alerts get the ring but no modal.
-//
-// A message counts as a fresh arrival when it is NOT in the persisted seen-set
-// AND its received time is within ~2 minutes (so history never fires). On the
-// very first run we silently seed ALL current ids so the backlog stays quiet.
-// The seen-set + ring expiry ARE the read state — Gmail read-marking is
-// impossible under gmail.readonly and isn't wanted.
-//
-// Ported from squelch-desktop/src/state/useAuthArrival.ts.
+// Fresh means NOT in the persisted seen-set AND received within ~2 minutes, and
+// the first run seeds every current id silently so a backlog stays quiet. The
+// seen-set plus ring expiry ARE the read state — read-marking is impossible
+// under gmail.readonly.
 
 import Foundation
 
@@ -55,8 +47,8 @@ final class AuthArrival {
         if seen == nil { seen = loadSeen() }
         guard var seen else { return }
 
-        // First run of this session: seed the entire current backlog silently
-        // so we only ever fire for messages that arrive AFTER we're watching.
+        // First run of this session: seed the backlog silently, so we only ever
+        // fire for messages that arrive AFTER we are watching.
         if !seeded {
             seeded = true
             var changed = false
@@ -73,8 +65,8 @@ final class AuthArrival {
         for m in sealed {
             if seen.contains(m.id) { continue }
             seen.insert(m.id)  // mark immediately so a re-poll never double-fires
-            // Only genuinely-fresh messages fire the flow; late-arriving history
-            // stays quiet but is still recorded as seen above.
+            // Only fresh messages fire the flow; late-arriving history stays quiet
+            // but is still recorded as seen above.
             if ageSeconds(m.received_at) <= Self.freshWindow { arrivals.append(m) }
         }
         self.seen = seen
@@ -97,8 +89,8 @@ final class AuthArrival {
             let revealed = try await APIClient.shared.revealSealed(m.id)
             store.pushAuthCode(AuthCodeEntry(meta: m, code: AuthCode.extract(revealed.body)))
         } catch {
-            // Reveal failed (network / write-guard / already-consumed): still
-            // show the modal so the human can jump to Auth. No code retained.
+            // Reveal failed (network / write-guard / already-consumed): show the
+            // modal anyway so the human can jump to Auth. No code retained.
             store.pushAuthCode(AuthCodeEntry(meta: m, code: nil))
         }
     }

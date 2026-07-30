@@ -1,6 +1,5 @@
 // Central error type for the human-door client. Every non-2xx response becomes
 // an APIError; callers switch on `kind` rather than sniffing status codes.
-// Ported from squelch-desktop/src/api/errors.ts.
 
 import Foundation
 
@@ -45,7 +44,7 @@ extension APIError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// The 422 send-guard message is a human sentence containing the redacted kinds:
+/// The 422 send-guard message is a sentence carrying the redacted kinds:
 ///   "outbound guard blocked send; matched (redacted) kinds: aws_key, jwt. …"
 /// Parse the comma list between "kinds:" and the trailing period.
 func parseGuardKinds(_ message: String) -> [String] {
