@@ -147,6 +147,14 @@ impl Config {
                     p.display()
                 ))
             })?,
+            // Secret managers and env editors love to flatten a pasted PEM onto
+            // one line with literal `\n` two-character sequences. A real PEM
+            // never contains a backslash, so when there are no actual newlines
+            // the sequences are unambiguously mangled framing — undo it rather
+            // than fail the boot over paste mechanics.
+            (None, Some(pem)) if !pem.contains('\n') && pem.contains("\\n") => {
+                pem.replace("\\n", "\n")
+            }
             (None, Some(pem)) => pem,
         };
 

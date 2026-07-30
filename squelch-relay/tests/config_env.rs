@@ -84,6 +84,17 @@ fn config_reads_the_environment() {
     let cfg = Config::from_env().unwrap();
     assert!(cfg.apns_key_pem.contains("BEGIN PRIVATE KEY"));
 
+    // A PEM flattened onto one line with literal `\n` sequences — what a
+    // secret-manager paste box produces — is unmangled, and still signs.
+    unsafe { std::env::remove_var("SQUELCH_RELAY_APNS_KEY_PATH") };
+    set("SQUELCH_RELAY_APNS_KEY", &KEY.trim_end().replace('\n', "\\n"));
+    let cfg = Config::from_env().unwrap();
+    assert!(cfg.apns_key_pem.contains('\n'), "sequences became real newlines");
+    assert!(!cfg.apns_key_pem.contains('\\'), "no backslash survives");
+    RelayState::new(cfg).unwrap();
+    unsafe { std::env::remove_var("SQUELCH_RELAY_APNS_KEY") };
+    set("SQUELCH_RELAY_APNS_KEY_PATH", "tests/fixture_test_key.p8");
+
     const BEARER: &str = "0123456789abcdef0123456789abcdef";
     set("SQUELCH_RELAY_APNS_ENV", "sandbox");
     set("SQUELCH_RELAY_AUTH_TOKEN", BEARER);
