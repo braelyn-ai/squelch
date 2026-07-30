@@ -8,7 +8,6 @@ import SwiftUI
 
 struct EmailsView: View {
     @Environment(AppStore.self) private var store
-    @Namespace private var listGlass
 
     /// One generous page — the read model is local, this is cheap.
     private static let fetchLimit = 500
@@ -52,7 +51,6 @@ struct EmailsView: View {
                                 UpdateRow(
                                     update: u,
                                     selected: kbActive && i == index,
-                                    glassNamespace: listGlass,
                                     onHover: {
                                         // A hover must NOT follow-scroll: a row near
                                         // the viewport edge would jump the list out

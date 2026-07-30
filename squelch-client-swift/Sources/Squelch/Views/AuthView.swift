@@ -8,7 +8,6 @@ import SwiftUI
 
 struct AuthView: View {
     @Environment(AppStore.self) private var store
-    @Namespace private var authGlass
 
     /// Newer than this counts as live and heads the list.
     private static let liveWindow: TimeInterval = 60 * 60
@@ -155,11 +154,13 @@ struct AuthView: View {
                 }
 
                 ScrollViewReader { proxy in
-                    GlassEffectContainer(spacing: 2) {
-                        VStack(spacing: 1) {
-                            section("Live · last hour", rows: live)
-                            section("Archive", rows: archive)
-                        }
+                    // No GlassEffectContainer: these rows select with a fill, not
+                    // a material, so there is nothing here to morph — and a
+                    // container re-coordinates its descendants every time a
+                    // hovered row redraws, which is a cost with no matching gain.
+                    VStack(spacing: 1) {
+                        section("Live · last hour", rows: live)
+                        section("Archive", rows: archive)
                     }
                     .onChange(of: index) { _, i in
                         guard let m = shown[safe: i] else { return }
@@ -186,7 +187,6 @@ struct AuthView: View {
             ForEach(rows) { m in
                 let i = shown.firstIndex(of: m) ?? 0
                 AuthRow(
-                    glassNamespace: authGlass,
                     meta: m, selected: i == index, code: codes[m.id] ?? nil,
                     onSelect: { index = i },
                     onOpen: { Task { await reveal(m) } })
@@ -462,7 +462,6 @@ private struct FocusPanel: View {
 // MARK: - rows
 
 private struct AuthRow: View {
-    let glassNamespace: Namespace.ID
     let meta: SealedMeta
     let selected: Bool
     let code: String?
@@ -507,9 +506,7 @@ private struct AuthRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .selectionGlass(
-            selected, hovering: hovering, tint: Palette.lock, cornerRadius: 8,
-            id: "auth-selection", in: glassNamespace)
+        .selectionFill(selected, hovering: hovering, tint: Palette.lock, cornerRadius: 8)
         .onHover { hovering = $0 }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen() })
     }

@@ -225,7 +225,6 @@ private struct HitRow: View {
 /// re-fetching. j/k selects, Enter opens the thread.
 struct BrowseView: View {
     @Environment(AppStore.self) private var store
-    @Namespace private var browseGlass
 
     @State private var browseState: Loadable<[AttentionUpdate]> = .loading
     /// Client-side min importance — the squelch knob.
@@ -267,7 +266,7 @@ struct BrowseView: View {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
                                 BrowseRow(
-                                    update: u, selected: i == index, glassNamespace: browseGlass
+                                    update: u, selected: i == index
                                 ) { index = i } open: {
                                     store.openThread(u.thread_id)
                                 }
@@ -318,7 +317,6 @@ struct BrowseView: View {
 private struct BrowseRow: View {
     let update: AttentionUpdate
     let selected: Bool
-    let glassNamespace: Namespace.ID
     let onSelect: () -> Void
     let open: () -> Void
 
@@ -352,9 +350,7 @@ private struct BrowseRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .selectionGlass(
-            selected, tint: Palette.tierColor(update.tier), cornerRadius: 7,
-            id: "browse-selection", in: glassNamespace)
+        .selectionFill(selected, tint: Palette.tierColor(update.tier), cornerRadius: 7)
         .overlay(alignment: .leading) {
             if selected {
                 RoundedRectangle(cornerRadius: 1)

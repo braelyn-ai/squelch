@@ -91,41 +91,49 @@ extension View {
         }
     }
 
-    /// The selection material for a list row. Only the selected row carries
-    /// glass; unselected rows get a cheap hover wash, because glass on 500
-    /// simultaneous rows would be both illegible and slow.
+    /// Selection + hover for a list row: a tinted fill, ONE view identity, and
+    /// no material anywhere.
     ///
-    /// COST OF THE BRANCH, and why both lists gate the glass on `kbActive`:
-    /// this is a conditional modifier, so the two branches are separate view
-    /// identities and flipping `selected` re-creates the row's ENTIRE subtree —
-    /// `@State` reset, `.task` re-run, layout rebuilt. Fine a few times per
-    /// keypress; ruinous twice for every row a mouse crosses. Moving the glass
-    /// into a `.background` layer would keep row identity stable and renders
-    /// correctly on its own, but NOT inside a `GlassEffectContainer`, which
-    /// hoists glass above the container's content and so draws the material
-    /// over the row's own text.
-    @ViewBuilder
-    func selectionGlass(
+    /// THIS USED TO BE GLASS and it cost twice over. The branch was two view
+    /// identities, so flipping `selected` tore down and rebuilt the row's whole
+    /// subtree — `@State` reset, `.task` re-run, layout rebuilt. And glass on a
+    /// row means a `GlassEffectContainer` around the list to morph it, which
+    /// re-coordinates every descendant whenever ANY of them changes; a hovered
+    /// row changes, so a mouse sweep over a list paid a glass pass per event
+    /// even while nothing in the container was selected. At row size the
+    /// material bought nothing a tint doesn't: it was reading as a coloured
+    /// rectangle already.
+    ///
+    /// One identity also means these alphas interpolate, which the branch could
+    /// never do.
+    func selectionFill(
         _ selected: Bool,
         hovering: Bool = false,
         tint: Color = Palette.accent,
-        cornerRadius: CGFloat = 9,
-        id: String,
-        in namespace: Namespace.ID
+        cornerRadius: CGFloat = 9
     ) -> some View {
-        if selected {
-            self.glassEffect(
-                .regular.tint(tint.opacity(0.28)).interactive(),
-                in: .rect(cornerRadius: cornerRadius, style: .continuous)
-            )
-            .glassEffectID(id, in: namespace)
-        } else {
-            self.background(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(hovering ? Palette.hairline.opacity(0.55) : .clear)
-            )
-        }
+        background(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(
+                    selected
+                        ? tint.opacity(SelectionTone.selected)
+                        : (hovering ? Palette.hairline.opacity(SelectionTone.hover) : .clear))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(
+                    selected ? tint.opacity(SelectionTone.border) : .clear, lineWidth: 1)
+        )
     }
+}
+
+/// Row selection alphas. These carry ALL of a selection's weight now that no
+/// material sits under them, so they are the knob to turn if selection reads
+/// too faint or too loud.
+enum SelectionTone {
+    static let selected: Double = 0.3
+    static let border: Double = 0.45
+    static let hover: Double = 0.55
 }
 
 // MARK: - zone card
@@ -284,6 +292,14 @@ struct ModalCard<Content: View>: View {
 /// bleeds through and light mode reads as a muddy dark one; much above and the
 /// wallpaper stops reading through at all.
 struct WindowBackdrop: View {
+    /// THE APP'S TRANSPARENCY KNOBS — lower is more wallpaper. There is a floor:
+    /// far below these the backdrop bleeds through until light mode reads as a
+    /// muddy dark one over a dark wallpaper, which is the case they are tuned
+    /// against. The canvas carries the theme, so it stays denser than the wash.
+    static let canvasTop: Double = 0.54
+    static let canvasBottom: Double = 0.6
+    static let brandWash: Double = 0.44
+
     var body: some View {
         ZStack {
             VisualEffectBackdrop()
@@ -292,12 +308,12 @@ struct WindowBackdrop: View {
             // black, so the accent still has somewhere to sit.
             LinearGradient(
                 colors: [
-                    Color(light: 0xE6EFFC, dark: 0x0C1420).opacity(0.66),
-                    Color(light: 0xD5E5F8, dark: 0x080E19).opacity(0.72),
+                    Color(light: 0xE6EFFC, dark: 0x0C1420).opacity(Self.canvasTop),
+                    Color(light: 0xD5E5F8, dark: 0x080E19).opacity(Self.canvasBottom),
                 ],
                 startPoint: .top, endPoint: .bottom)
             // The brand wash on top, so empty window area is squelch's too.
-            Palette.glassTint.opacity(0.55)
+            Palette.glassTint.opacity(Self.brandWash)
         }
     }
 }

@@ -8,7 +8,6 @@ import SwiftUI
 
 struct AuditView: View {
     @Environment(AppStore.self) private var store
-    @Namespace private var auditGlass
 
     @State private var auditState: Loadable<[AuditEntry]> = .loading
     @State private var index = 0
@@ -39,7 +38,6 @@ struct AuditView: View {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(rows.enumerated()), id: \.element.id) { i, entry in
                                 AuditRow(
-                                    glassNamespace: auditGlass,
                                     entry: entry, selected: i == index,
                                     undo: Self.undoFor(entry),
                                     onSelect: { index = i },
@@ -183,7 +181,6 @@ struct AuditView: View {
 }
 
 private struct AuditRow: View {
-    let glassNamespace: Namespace.ID
     let entry: AuditEntry
     let selected: Bool
     let undo: AuditView.UndoSpec?
@@ -253,9 +250,7 @@ private struct AuditRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .selectionGlass(
-            selected, hovering: hovering, cornerRadius: 8,
-            id: "audit-selection", in: glassNamespace)
+        .selectionFill(selected, hovering: hovering, cornerRadius: 8)
         .onHover { hovering = $0 }
     }
 }

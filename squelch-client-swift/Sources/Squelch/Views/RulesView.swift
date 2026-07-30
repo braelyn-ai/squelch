@@ -8,7 +8,6 @@ import SwiftUI
 
 struct RulesView: View {
     @Environment(AppStore.self) private var store
-    @Namespace private var rulesGlass
 
     @State private var rulesState: Loadable<[SenderRule]> = .loading
     @State private var index = 0
@@ -53,7 +52,6 @@ struct RulesView: View {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(rules.enumerated()), id: \.element.id) { i, rule in
                                 RuleRow(
-                                    glassNamespace: rulesGlass,
                                     rule: rule, selected: i == index,
                                     matchCount: matchCounts[rule.id] ?? 0,
                                     onSelect: { index = i },
@@ -171,7 +169,6 @@ extension Disposition {
 }
 
 private struct RuleRow: View {
-    let glassNamespace: Namespace.ID
     let rule: SenderRule
     let selected: Bool
     let matchCount: Int
@@ -217,9 +214,7 @@ private struct RuleRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .selectionGlass(
-            selected, hovering: hovering, cornerRadius: 8,
-            id: "rules-selection", in: glassNamespace)
+        .selectionFill(selected, hovering: hovering, cornerRadius: 8)
         .onHover { hovering = $0 }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onEdit() })
     }

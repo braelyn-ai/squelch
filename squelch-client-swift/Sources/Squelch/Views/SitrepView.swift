@@ -1,8 +1,7 @@
 // SITREP VIEW — the abstracted dashboard and default surface on launch: ranked
 // standing items, an attention aggregate, newsletters, a status strip and the
 // records rail. Owns the "sitrep" KeyContext. No persistent selection — the
-// focus glass renders only while the keyboard drives, and hover must NOT drag it:
-// `selectionGlass` is conditional, so flipping branches re-creates the subtree.
+// focus fill renders only while the keyboard drives, and hover must NOT drag it.
 
 import SwiftUI
 
@@ -48,7 +47,6 @@ final class SitrepCursor {
 struct SitrepView: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
-    @Namespace private var zoneGlass
 
     /// Hover + keyboard cursor. A reference, deliberately — see `SitrepCursor`.
     @State private var cursor = SitrepCursor()
@@ -77,10 +75,6 @@ struct SitrepView: View {
 
         return VStack(spacing: 0) {
             masthead
-            // GlassEffectContainers live INSIDE this scroll view, one per
-            // column: a container sizes itself to what it is offered, so
-            // wrapping the whole scrollable body in one leaves the ScrollView
-            // with a content height it cannot scroll.
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 18) {
                     DashHero(standing: store.sitrep.standing)
@@ -188,7 +182,12 @@ struct SitrepView: View {
             symbol: "eye", title: "For your eyes", count: store.sitrep.standing.count
         ) {
             VStack(spacing: 1) {
-                eyesRows(visible)
+                ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
+                    // No closures passed down: a stored closure is never equal to
+                    // last render's, so handing rows their actions that way meant
+                    // SwiftUI could not skip a single one when the parent redrew.
+                    ObligationRow(update: u, index: i, cursor: cursor)
+                }
                 if overflow > 0 { expander(overflow) }
             }
             // Only LEAVING the zone ends the hover — crossing between rows never
@@ -203,43 +202,6 @@ struct SitrepView: View {
         }
     }
 
-    /// THE GLASS CONTAINER IS MOUNTED ONLY WHILE THE KEYBOARD DRIVES.
-    ///
-    /// Its whole job is morphing the focus glass from row to row, and that glass
-    /// exists only when `kbActive` — with the mouse driving, every row takes
-    /// `selectionGlass`'s plain-background branch and the container holds no
-    /// glass at all. Mounted unconditionally it still re-coordinates its
-    /// descendants whenever one of them changes, and a hovered row changes. THAT
-    /// is the entire difference between a mouse sweep over this zone, which
-    /// stuttered, and the identical sweep over the newsletter grid, which did
-    /// not: same per-row re-render, only one of them inside a glass container.
-    ///
-    /// Yes, the branch is two view identities and flipping it rebuilds the rows.
-    /// That is exactly the trade `selectionGlass` already documents — fine once,
-    /// when the keyboard takes over; ruinous once per mouse-move.
-    @ViewBuilder
-    private func eyesRows(_ visible: [AttentionUpdate]) -> some View {
-        if cursor.kbActive {
-            GlassEffectContainer(spacing: 2) { rowStack(visible) }
-        } else {
-            rowStack(visible)
-        }
-    }
-
-    private func rowStack(_ visible: [AttentionUpdate]) -> some View {
-        VStack(spacing: 1) {
-            ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
-                // No closures passed down: a stored closure is never equal to
-                // last render's, so handing rows their actions that way meant
-                // SwiftUI could not skip a single one when the parent redrew.
-                ObligationRow(update: u, index: i, cursor: cursor, glassNamespace: zoneGlass)
-            }
-        }
-    }
-
-    /// Outside the container on purpose: it carries its own glass and no
-    /// `glassEffectID`, so it was never morphing with anything, and leaving it
-    /// in would let it merge with the top row in one branch and not the other.
     private func expander(_ overflow: Int) -> some View {
         Button {
             withAnimation(.smooth(duration: 0.28)) { cursor.expanded.toggle() }
@@ -441,7 +403,6 @@ private struct ObligationRow: View {
     let update: AttentionUpdate
     let index: Int
     let cursor: SitrepCursor
-    let glassNamespace: Namespace.ID
 
     /// Drives the hover wash. LOCAL on purpose: the row's own feedback never
     /// depends on the dashboard re-rendering.
@@ -513,12 +474,10 @@ private struct ObligationRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // The KEYBOARD-focused row is glass tinted by urgency; a hovered row gets
-        // a wash on the SAME branch as a plain row, so a mouse sweep only
-        // recolors a fill instead of rebuilding the row.
-        .selectionGlass(
-            focused, hovering: hovering, tint: overdue ? Palette.danger : Palette.accent,
-            id: "eyes-selection", in: glassNamespace)
+        // Focus and hover are the same fill at different alphas, on ONE identity:
+        // a sweep recolours a rectangle and never rebuilds the row.
+        .selectionFill(
+            focused, hovering: hovering, tint: overdue ? Palette.danger : Palette.accent)
         .overlay(alignment: .leading) {
             if overdue {
                 RoundedRectangle(cornerRadius: 1)
