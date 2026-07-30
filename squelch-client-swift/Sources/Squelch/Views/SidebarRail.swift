@@ -4,10 +4,33 @@
 // MainView.mainViews), Usage + Settings pinned below a divider and deliberately
 // OUT of the digit sequence so adding them never renumbers 1..5.
 //
-// GLASS: the rail is one GlassEffectContainer, and the ACTIVE item carries a
-// shared glassEffectID. Moving between views makes that material FLOW from one
-// icon to the next rather than cross-fading — the clearest demonstration of the
-// real material in the app, and something the CSS build could not do at all.
+// GLASS: ONE selector pane lives in a layer BEHIND the icons and travels to
+// whichever is active, so the material slides between tabs while every glyph
+// stays exactly where it is.
+//
+// It was built the other way first — the effect applied to each icon, with a
+// shared `glassEffectID` inside a `GlassEffectContainer`, so the container
+// would morph it from one to the next. Two things were wrong with that, both
+// visible on screen:
+//
+//   * The glass's CONTENT is whatever it is applied to, so morphing carried the
+//     ICON along with the material and the glyph flew between tabs.
+//   * `.glassEffect` on every button put an interactive material over all seven
+//     of them, which swallowed clicks — a tab often needed three or four
+//     presses to route.
+//
+// A conditional `if active { glassEffect(…) }` avoids both, but a conditional
+// modifier is two view identities, so every selection change tore the icon's
+// subtree down and built a new one: that is the deselect FLICKER, and it is
+// also why the morph never worked (a glassEffectID cannot be matched across a
+// view that no longer exists). Hence one long-lived pane that moves, addressed
+// by geometry rather than by identity.
+//
+// NO GlassEffectContainer HERE. A container hoists its descendants above its
+// content view, which is what made a background pane render ON TOP of the glyph
+// and forced the effect onto the icon in the first place. With a single pane
+// there is nothing to merge or morph, so the container earns nothing and costs
+// the one layering property this layout depends on.
 //
 // No count badges: the auth arrival flow already announces a fresh code loudly
 // (a countdown ring, and a modal that presents the code), so a permanent number
@@ -15,12 +38,32 @@
 
 import SwiftUI
 
+/// The rail's coordinate space. FILE-SCOPE rather than a static on the view:
+/// the buttons read it from inside `onGeometryChange`'s Sendable closure, and a
+/// static on a `@MainActor` View is main-actor isolated there.
+private let railSpace = "sidebar-rail"
+
 struct SidebarRail: View {
     @Environment(AppStore.self) private var store
     let namespace: Namespace.ID
-    @Namespace private var railGlass
+
+    /// Where each icon sits, in the rail's own space, so the selector can be
+    /// placed over the active one. Written by the buttons as they lay out.
+    @State private var slots: [MainView: CGRect] = [:]
+    /// True for the span of a slide, so the pane can firm up while it moves.
+    @State private var traveling = false
 
     static let railWidth: CGFloat = 60
+    static let iconWidth: CGFloat = 44
+    static let iconHeight: CGFloat = 36
+    static let selectorRadius: CGFloat = 11
+
+    /// How long the pane takes to cross. Short enough to feel like a response
+    /// to the click rather than a thing you wait out.
+    private static let travel: Animation = .smooth(duration: 0.32)
+    /// Tint the pane carries at rest, and the extra it picks up mid-travel.
+    private static let restTint: Double = 0.26
+    private static let travelTint: Double = 0.16
 
     /// Height of the strip the traffic lights live in, left unpainted by the
     /// rail's material below. Sits in the ~21pt of clear space between the
@@ -28,7 +71,73 @@ struct SidebarRail: View {
     static let titleBarHeight: CGFloat = 24
 
     var body: some View {
-        GlassEffectContainer(spacing: 14) {
+        railStack
+            .coordinateSpace(.named(railSpace))
+            // BEHIND the icons, and behind them for real: this is the layering
+            // a GlassEffectContainer would have inverted. Ordered before the
+            // rail material below so the material stays further back still.
+            .background(alignment: .topLeading) { selector }
+            // WHAT MAKES IT SLIDE — and only for a click. The selector is one
+            // view whose offset is a function of the active view, so animating
+            // that value moves it; handing `nil` instead snaps it.
+            //
+            // A pointer route is a continuous gesture and the travel reads as
+            // the answer to it. A digit is instantaneous, so the same travel
+            // only delays the answer by its own duration — those want opposite
+            // treatment, and `routeWasPointer` is set in the very update that
+            // changes `activeView`, so the right one is always in hand.
+            //
+            // Scoped HERE rather than a `withAnimation` at the call site: the
+            // main content swap hangs off the same property, and a transaction
+            // around `setView` would animate that too.
+            .animation(store.routeWasPointer ? Self.travel : nil, value: store.activeView)
+            .onChange(of: store.activeView) { _, _ in
+                guard store.routeWasPointer else { return }
+                // FIRMER IN FLIGHT. The pane gains a little opacity while it
+                // crosses the gap and gives it back on arrival, so the motion
+                // reads as one object moving rather than a tint fading along
+                // the rail. Rising faster than it falls keeps the weight at the
+                // start of the travel, where the eye picks it up.
+                withAnimation(.easeOut(duration: 0.10)) { traveling = true }
+                Task {
+                    try? await Task.sleep(for: .seconds(0.12))
+                    withAnimation(.easeIn(duration: 0.20)) { traveling = false }
+                }
+            }
+            .background { railMaterial }
+    }
+
+    /// The travelling pane. Absent only until the first layout pass has
+    /// reported where anything is; after that it is ONE view for the life of
+    /// the rail, which is what lets its offset animate instead of it being
+    /// rebuilt somewhere else.
+    @ViewBuilder
+    private var selector: some View {
+        if let slot = slots[store.activeView] {
+            Color.clear
+                .frame(width: slot.width, height: slot.height)
+                .glassEffect(
+                    .regular.tint(Palette.accent.opacity(Self.restTint)),
+                    in: .rect(cornerRadius: Self.selectorRadius, style: .continuous)
+                )
+                // The travel tint is an OVERLAY, not a change to the Glass
+                // value: `Glass` is not animatable, so tinting the material
+                // itself would jump to the new value and back. A colour's
+                // opacity interpolates, so the firming reads as continuous.
+                .overlay {
+                    RoundedRectangle(cornerRadius: Self.selectorRadius, style: .continuous)
+                        .fill(Palette.accent.opacity(traveling ? Self.travelTint : 0))
+                }
+                // NOT `.interactive()`. That material tracks the pointer and
+                // takes the hits it tracks, and this pane sits over whichever
+                // button is active — an interactive selector is what made a
+                // tab need several clicks to route.
+                .allowsHitTesting(false)
+                .offset(x: slot.minX, y: slot.minY)
+        }
+    }
+
+    private var railStack: some View {
             VStack(spacing: 6) {
                 // NO TOP SPACER. The first icon sits on the SAME LINE as the
                 // "squelch" wordmark beside it, which is what makes the rail
@@ -40,7 +149,7 @@ struct SidebarRail: View {
                 ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in
                     RailButton(
                         view: view, keyNumber: index + 1, active: store.activeView == view,
-                        namespace: railGlass, showRings: view == .auth)
+                        showRings: view == .auth, onSlot: { slots[view] = $0 })
                 }
 
                 Spacer(minLength: 8)
@@ -53,27 +162,15 @@ struct SidebarRail: View {
                 ForEach(MainView.bottomViews, id: \.self) { view in
                     RailButton(
                         view: view, keyNumber: nil, active: store.activeView == view,
-                        namespace: railGlass, showRings: false)
+                        showRings: false, onSlot: { slots[view] = $0 })
                 }
             }
             .padding(.vertical, 10)
             .frame(width: Self.railWidth)
             .frame(maxHeight: .infinity)
-        }
-        // WHAT MAKES IT SLIDE. The shared glassEffectID above is only half the
-        // trick: the material morphs between icons only if the change lands in
-        // an animated transaction, and `setView` mutates `activeView` plainly —
-        // so without this the selector popped from one icon to the next.
-        //
-        // It hangs off the VALUE rather than the click, which is the point:
-        // every route in gets the same motion — the 1..5 keys, ⌘[ / ], the
-        // View menu, a health banner deep-linking into Settings.
-        //
-        // NOT in `setView` itself. A `withAnimation` there would also animate
-        // the main content swap hanging off the same property, which is a much
-        // bigger (and unrequested) behaviour change.
-        .animation(.smooth(duration: 0.32), value: store.activeView)
-        .background {
+    }
+
+    private var railMaterial: some View {
             // The rail is the most translucent surface in the window, but not
             // arbitrarily thin: it has to hold its own value regardless of what
             // the wallpaper is doing, or its icons stop being legible over a
@@ -99,7 +196,6 @@ struct SidebarRail: View {
                 }
                 .padding(.top, Self.titleBarHeight)
                 .ignoresSafeArea(edges: .bottom)
-        }
     }
 }
 
@@ -108,38 +204,41 @@ private struct RailButton: View {
     let view: MainView
     let keyNumber: Int?
     let active: Bool
-    let namespace: Namespace.ID
     let showRings: Bool
+    /// Where this icon landed, in the rail's space, so the rail can park the
+    /// selector on it.
+    let onSlot: (CGRect) -> Void
 
     @State private var hovering = false
 
     var body: some View {
         Button {
-            store.setView(view)
+            store.setView(view, viaPointer: true)
         } label: {
             ZStack {
                 Image(systemName: view.symbol)
                     .font(.system(size: 17, weight: active ? .semibold : .regular))
                     .foregroundStyle(active ? Palette.accent : Palette.inkDim)
-                    .frame(width: 44, height: 36)
-                    // The material goes on the ICON ITSELF, not in a background
-                    // layer. A GlassEffectContainer deliberately raises its
-                    // descendants above its content view, so a glass pane added
-                    // as a sibling background rendered ON TOP of the glyph and
-                    // washed it out. Applying the effect here makes the icon the
-                    // glass's content, which is where it belongs anyway.
-                    .glassSelector(active, id: "rail-active", in: namespace)
+                    .frame(width: SidebarRail.iconWidth, height: SidebarRail.iconHeight)
+                    // The rail's selector is drawn from this, one layer down —
+                    // nothing about the glyph itself changes with selection
+                    // except its weight and colour, so it never moves and its
+                    // subtree is never rebuilt.
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .named(railSpace))
+                    } action: { onSlot($0) }
 
                 if showRings { AuthRingsOverlay() }
             }
         }
         .buttonStyle(.plain)
         .background {
-            if hovering && !active {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(Palette.hairline.opacity(0.7))
-                    .frame(width: 44, height: 36)
-            }
+            // Opacity rather than an `if`: a conditional here is two view
+            // identities, and swapping between them on hover throws away the
+            // button's subtree for the sake of a wash.
+            RoundedRectangle(cornerRadius: SidebarRail.selectorRadius, style: .continuous)
+                .fill(Palette.hairline.opacity(hovering && !active ? 0.7 : 0))
+                .frame(width: SidebarRail.iconWidth, height: SidebarRail.iconHeight)
         }
         .onHover { hovering = $0 }
         .help(keyNumber.map { "\(view.label) · \($0)" } ?? view.label)

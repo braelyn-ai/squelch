@@ -407,7 +407,7 @@ final class AppStore {
         lastRefresh = nil
         refreshError = nil
         selectedId = nil
-        activeView = .sitrep
+        route(to: .sitrep)
         threadId = nil
         threadQueue = []
         sideView = .none
@@ -427,7 +427,26 @@ final class AppStore {
         historyIndex = trimmed.count - 1
     }
 
-    func setView(_ view: MainView) {
+    /// Whether the last route came from the POINTER. The rail slides its
+    /// selector for a click and snaps for everything else: a click is a
+    /// continuous gesture that the eye can follow across the rail, while
+    /// `3` is instantaneous and animating it only puts 300ms between the
+    /// keypress and the answer.
+    ///
+    /// Read by the rail as it re-renders, which is the same update that
+    /// carries the new `activeView`, so the two can never disagree.
+    private(set) var routeWasPointer = false
+
+    /// EVERY route goes through here, so the flag can never be left describing
+    /// the previous one. `goBack`/`viewInEmails` used to assign `activeView`
+    /// directly, which would have inherited whatever the last click set and
+    /// slid the rail for a keyboard route.
+    private func route(to view: MainView, viaPointer: Bool = false) {
+        routeWasPointer = viaPointer
+        activeView = view
+    }
+
+    func setView(_ view: MainView, viaPointer: Bool = false) {
         // Navigating ANYWHERE dismisses an open thread viewer — the rail is
         // visible beside it, so a rail click means "leave this email and go
         // there", not "change the page underneath the overlay".
@@ -437,10 +456,10 @@ final class AppStore {
         // shouldn't spam identical history entries.
         let cur = history.indices.contains(historyIndex) ? history[historyIndex] : nil
         if let cur, cur.view == view, cur.selectedId == selectedId {
-            activeView = view
+            route(to: view, viaPointer: viaPointer)
             return
         }
-        activeView = view
+        route(to: view, viaPointer: viaPointer)
         pushHistory(HistoryEntry(view: view, selectedId: selectedId))
     }
 
@@ -448,7 +467,7 @@ final class AppStore {
     /// Sitrep dashboard's "view" affordances to hand off to the band list with
     /// the right row focused.
     func viewInEmails(_ id: Int) {
-        activeView = .emails
+        route(to: .emails)
         selectedId = id
         threadId = nil
         threadQueue = []
@@ -462,7 +481,7 @@ final class AppStore {
         guard historyIndex > 0 else { return }
         historyIndex -= 1
         let entry = history[historyIndex]
-        activeView = entry.view
+        route(to: entry.view)
         selectedId = entry.selectedId
     }
 
@@ -470,7 +489,7 @@ final class AppStore {
         guard historyIndex < history.count - 1 else { return }
         historyIndex += 1
         let entry = history[historyIndex]
-        activeView = entry.view
+        route(to: entry.view)
         selectedId = entry.selectedId
     }
 
