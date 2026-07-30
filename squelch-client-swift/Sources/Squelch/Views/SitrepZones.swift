@@ -510,6 +510,13 @@ private struct NewsletterHero: View {
     /// Side of the square thumb.
     private static let side: CGFloat = 54
 
+    /// TUNABLE. The widest a hero is allowed to be DRAWN, as a width:height
+    /// ratio. Art wider than this is cropped to exactly this ratio instead of
+    /// letterboxed whole: a 728x90 masthead fitted into the square becomes a
+    /// strip a few points tall — technically present, unreadable in practice —
+    /// and the ends of a masthead are the part nobody misses.
+    private static let maxAspect: CGFloat = 7
+
     /// Falling back to the cache INSIDE the read is what keeps a recycled card
     /// from flashing empty: `@State` is gone the moment LazyVGrid drops the
     /// card, but the resolved hero is not, so it repaints from the cache on the
@@ -531,9 +538,7 @@ private struct NewsletterHero: View {
     @ViewBuilder
     private var content: some View {
         if let hero {
-            Image(nsImage: hero.image)
-                .resizable()
-                .aspectRatio(contentMode: fit(hero.image))
+            art(hero)
                 .frame(width: Self.side, height: Self.side)
                 // The REST OF THE SQUARE, in the art's own dominant colour —
                 // see ImageFill. Falls back to the neutral well when sampling
@@ -548,10 +553,39 @@ private struct NewsletterHero: View {
         }
     }
 
+    /// The art itself, unclipped and unbacked — the square frame and the fill
+    /// behind it belong to the caller.
+    @ViewBuilder
+    private func art(_ hero: HeroCache.Hero) -> some View {
+        if ultraWide(hero.image) {
+            // Past `maxAspect` letterboxing stops paying: the strip it leaves
+            // is too short to read the wordmark off. Draw the art at the capped
+            // ratio and let the ENDS crop instead — `.fill` into a frame this
+            // shape overflows on the long axis, and `.clipped` takes the middle
+            // of that overflow, which is where the mark lives.
+            Image(nsImage: hero.image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: Self.side, height: Self.side / Self.maxAspect)
+                .clipped()
+        } else {
+            Image(nsImage: hero.image)
+                .resizable()
+                .aspectRatio(contentMode: fit(hero.image))
+        }
+    }
+
+    /// Wider than the cap, and guarded against a zero-height decode.
+    private func ultraWide(_ image: NSImage) -> Bool {
+        image.size.height > 0 && image.size.width > image.size.height * Self.maxAspect
+    }
+
     /// Fit by shape, and it matters MORE in a square than it did in the old
     /// full-width banner: tall/square heroes crop to fill (photos survive a
     /// crop), WIDE art letterboxes. Filling the square with a wordmark would
     /// leave a meaningless slice of two letters.
+    ///
+    /// Only reached for art within `maxAspect`; see `art` for the rest.
     private func fit(_ image: NSImage) -> ContentMode {
         image.size.width > image.size.height * 1.2 ? .fit : .fill
     }
