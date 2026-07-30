@@ -661,8 +661,10 @@ struct RetriageButton: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
             }
-            .buttonStyle(.glass)
-            .foregroundStyle(Palette.inkFaint)
+            // Text-only, like every other action in the masthead: an outlined
+            // pill for a DEV control put the loudest shape on the page around
+            // the one button most readers never use.
+            .buttonStyle(.textAction)
             .disabled(busy)
             .help(
                 "dev: reset LLM verdicts for the last \(Self.days) days and re-run triage "
