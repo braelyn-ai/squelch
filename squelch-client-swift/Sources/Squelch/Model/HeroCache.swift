@@ -67,6 +67,10 @@ final class HeroCache {
         return entry
     }
 
+    #if ZONE_PROFILE
+        func seed(_ threadId: String, _ hero: Hero?) { cache[threadId] = hero }
+    #endif
+
     /// Resolve one hero, deduped and memoized.
     @discardableResult
     func resolve(_ threadId: String) async -> Hero? {

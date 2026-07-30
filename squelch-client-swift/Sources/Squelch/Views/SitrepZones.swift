@@ -352,6 +352,12 @@ struct NewslettersZone: View {
     /// Re-derive after a rule save, so the chip/CTA reflects it immediately.
     let reload: () async -> Void
 
+    /// Narrowest a card may be drawn; the grid fits as many equal columns of at
+    /// least this width as the zone allows.
+    private static let cardMinimum: CGFloat = 190
+    /// Gutter, both axes.
+    private static let gap: CGFloat = 10
+
     var body: some View {
         // ALWAYS on the board, empty or not (owner call, 2026-07-28). A zone
         // that vanishes reads as a missing feature, not as "nothing this week".
@@ -362,21 +368,39 @@ struct NewslettersZone: View {
             if newsletters.isEmpty {
                 EmptyNote("No recurring senders this week.")
             } else {
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], spacing: 10
-                ) {
-                    ForEach(newsletters) { nl in
-                        NewsletterCard(
-                            newsletter: nl,
-                            onOpen: {
-                                guard !nl.latestThreadId.isEmpty else { return }
-                                store.openThread(nl.latestThreadId, queue: nl.items)
-                            },
-                            onEdit: { edit(nl) },
-                            onHover: { over in hovered = over ? nl.address : nil })
-                    }
-                }
+                grid
             }
+        }
+    }
+
+    @ViewBuilder private var grid: some View {
+        #if ZONE_PROFILE
+            if ZoneProfile.useLazy {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: Self.cardMinimum), spacing: Self.gap)],
+                    spacing: Self.gap
+                ) { cards }.coordinateSpace(.named("zoneGrid"))
+            } else {
+                AdaptiveGrid(minimum: Self.cardMinimum, spacing: Self.gap) { cards }
+                    .coordinateSpace(.named("zoneGrid"))
+            }
+        #else
+            AdaptiveGrid(minimum: Self.cardMinimum, spacing: Self.gap) { cards }
+        #endif
+    }
+
+    @ViewBuilder private var cards: some View {
+        ForEach(newsletters) { nl in
+            NewsletterCard(
+                newsletter: nl,
+                onOpen: {
+                    guard !nl.latestThreadId.isEmpty else { return }
+                    store.openThread(nl.latestThreadId, queue: nl.items)
+                },
+                onEdit: { edit(nl) },
+                onHover: { over in hovered = over ? nl.address : nil }
+            )
+            .zoneProfileFrame(nl.address)
         }
     }
 
@@ -423,8 +447,19 @@ private struct NewsletterCard: View {
 
     @State private var hovering = false
 
+    private var summaryText: String {
+        #if ZONE_PROFILE
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            defer { ZoneProfile.summaryNanos += DispatchTime.now().uptimeNanoseconds - t0 }
+        #endif
+        return Newsletters.truncate(Newsletters.cleanSummary(newsletter.summary), 90)
+    }
+
     var body: some View {
-        Button(action: onOpen) {
+        #if ZONE_PROFILE
+            ZoneProfile.cardBody += 1
+        #endif
+        return Button(action: onOpen) {
             // Hero LEFT as a square thumb, text right — the card reads as a row
             // at a glance instead of a banner you have to scan vertically, and
             // a fixed square keeps every card in the grid the same height
@@ -444,7 +479,7 @@ private struct NewsletterCard: View {
                             .fixedSize()
                     }
                     if !newsletter.summary.isEmpty {
-                        Text(Newsletters.truncate(Newsletters.cleanSummary(newsletter.summary), 90))
+                        Text(summaryText)
                             .font(Typo.micro)
                             .foregroundStyle(Palette.inkFaint)
                             .lineLimit(2)
@@ -525,8 +560,16 @@ private struct NewsletterHero: View {
     private var hero: HeroCache.Hero? { resolved ?? HeroCache.shared.cached(threadId) }
 
     var body: some View {
-        content
-            .task(id: threadId) { resolved = await HeroCache.shared.resolve(threadId) }
+        #if ZONE_PROFILE
+            ZoneProfile.heroBody += 1
+        #endif
+        return content
+            .task(id: threadId) {
+                #if ZONE_PROFILE
+                    ZoneProfile.heroTask += 1
+                #endif
+                resolved = await HeroCache.shared.resolve(threadId)
+            }
     }
 
     /// The no-hero branch is a REAL zero-size leaf, not an implicit EmptyView.
@@ -591,6 +634,81 @@ private struct NewsletterHero: View {
     }
 }
 
+// MARK: - adaptive grid
+
+/// A NON-LAZY `LazyVGrid(columns: [.adaptive(minimum:spacing:)], spacing:)`.
+///
+/// Same geometry, deliberately without the laziness: as many equal-width
+/// columns as fit at `minimum` or wider, each row as tall as its tallest card,
+/// shorter cards centred in it — that is what `GridItem`'s default `.center`
+/// alignment does, and the newsletter cards differ in height (0/1/2 summary
+/// lines, rule chip or none), so getting it wrong is visible.
+///
+/// A `Layout` sees every subview on every pass, so nothing is created or
+/// destroyed by scrolling. That is the whole point; see the note at the call
+/// site.
+struct AdaptiveGrid: Layout {
+    /// Narrowest a column may be. Columns then stretch to divide the width
+    /// evenly, matching `.adaptive`'s default unbounded maximum.
+    var minimum: CGFloat
+    var spacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.replacingUnspecifiedDimensions().width
+        let metrics = metrics(width: width, subviews: subviews)
+        return CGSize(width: width, height: metrics.height)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        let metrics = metrics(width: bounds.width, subviews: subviews)
+        var y = bounds.minY
+        var index = 0
+        for rowHeight in metrics.rowHeights {
+            for column in 0..<metrics.columns where index < subviews.count {
+                let height = metrics.heights[index]
+                subviews[index].place(
+                    at: CGPoint(
+                        x: bounds.minX + CGFloat(column) * (metrics.columnWidth + spacing),
+                        y: y + (rowHeight - height) / 2),
+                    proposal: ProposedViewSize(width: metrics.columnWidth, height: height))
+                index += 1
+            }
+            y += rowHeight + spacing
+        }
+    }
+
+    private struct Metrics {
+        var columns: Int
+        var columnWidth: CGFloat
+        var heights: [CGFloat]
+        var rowHeights: [CGFloat]
+        var height: CGFloat
+    }
+
+    /// Column count is the most that fit at `minimum` with a gutter between
+    /// each; the leftover is then split evenly so the row reaches both edges.
+    private func metrics(width: CGFloat, subviews: Subviews) -> Metrics {
+        let columns = max(1, Int((width + spacing) / (minimum + spacing)))
+        let columnWidth = max(0, (width - spacing * CGFloat(columns - 1)) / CGFloat(columns))
+        let heights = subviews.map {
+            $0.sizeThatFits(ProposedViewSize(width: columnWidth, height: nil)).height
+        }
+        var rowHeights: [CGFloat] = []
+        var index = 0
+        while index < heights.count {
+            let row = heights[index..<min(index + columns, heights.count)]
+            rowHeights.append(row.max() ?? 0)
+            index += columns
+        }
+        let total = rowHeights.reduce(0, +) + spacing * CGFloat(max(0, rowHeights.count - 1))
+        return Metrics(
+            columns: columns, columnWidth: columnWidth, heights: heights, rowHeights: rowHeights,
+            height: total)
+    }
+}
+
 // MARK: - shared bits
 
 /// The rail's empty state. Present rather than hidden: a column that vanishes
@@ -622,4 +740,18 @@ struct RecordRowStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.7 : 1)
             .onHover { hovering = $0 }
     }
+}
+
+// MARK: - profiling shim (temporary, ZONE_PROFILE only)
+
+extension View {
+    #if ZONE_PROFILE
+        @ViewBuilder func zoneProfileFrame(_ id: String) -> some View {
+            onGeometryChange(for: CGRect.self) { $0.frame(in: .named("zoneGrid")) } action: {
+                ZoneProfile.frames[id] = $0
+            }
+        }
+    #else
+        func zoneProfileFrame(_ id: String) -> some View { self }
+    #endif
 }
