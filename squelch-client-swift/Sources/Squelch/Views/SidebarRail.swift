@@ -34,9 +34,10 @@ struct SidebarRail: View {
     private static let travelTint: Double = 0.16
 
     /// Height of the strip the traffic lights live in, left unpainted by the
-    /// rail's material below. Sits in the ~21pt of clear space between the
-    /// bottom of the dots and the top of the first rail icon.
-    static let titleBarHeight: CGFloat = 24
+    /// rail's material below. Measured from the TRUE window top (the material
+    /// ignores the top safe area): the dots bottom out ~20pt down, so this
+    /// stops just under them.
+    static let titleBarHeight: CGFloat = 22
 
     var body: some View {
         railStack
@@ -124,12 +125,12 @@ struct SidebarRail: View {
     private var railMaterial: some View {
             // The most translucent surface in the window, but not arbitrarily
             // thin: it must hold its value over any wallpaper or its icons stop
-            // being legible. It STARTS BELOW THE TITLE BAR — the window is
-            // .hiddenTitleBar with a full-size content view, so material running
-            // up behind the traffic lights reads as the dots clipping the rail.
-            // The strip must stay UNPAINTED rather than take a second copy of the
-            // backdrop: that gradient is relative to its own frame, so a 24pt box
-            // compresses it and the seam shows.
+            // being legible. It runs up INTO the top safe area and stops just
+            // below the traffic lights — material running up BEHIND them reads
+            // as the dots clipping the rail. The strip above stays UNPAINTED
+            // rather than take a second copy of the backdrop: that gradient is
+            // relative to its own frame, so a small box compresses it and the
+            // seam shows.
             Rectangle()
                 .fill(.thinMaterial)
                 .overlay(Palette.glassTint.opacity(0.5))
@@ -137,7 +138,7 @@ struct SidebarRail: View {
                     Rectangle().fill(Palette.hairline).frame(width: 0.5)
                 }
                 .padding(.top, Self.titleBarHeight)
-                .ignoresSafeArea(edges: .bottom)
+                .ignoresSafeArea(edges: [.top, .bottom])
     }
 }
 
