@@ -38,6 +38,10 @@ struct ThreadViewer: View {
     @State private var confirmBusy = false
     @State private var retriaging = false
     @State private var debugInfo: TriageDebug?
+    /// messageId -> image srcs an earlier message in this thread already showed.
+    /// Rebuilt with the thread and thrown away with it — nothing crosses
+    /// threads. See `repeatedImages(in:)`.
+    @State private var repeatedImages: [Int: Set<String>] = [:]
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -194,7 +198,10 @@ struct ThreadViewer: View {
                     // the gap instead of hugging one side of it.
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
-                            MessageCard(message: m, selected: i == index, ruled: i > 0) {
+                            MessageCard(
+                                message: m, selected: i == index, ruled: i > 0,
+                                seenEarlier: repeatedImages[m.id] ?? []
+                            ) {
                                 index = i
                             }
                             .id(i)
@@ -294,10 +301,9 @@ struct ThreadViewer: View {
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
-            thread = cached
+            adopt(cached)
             error = nil
             loading = false
-            index = 0
             return
         }
         loading = true
@@ -305,12 +311,46 @@ struct ThreadViewer: View {
         do {
             let view = try await APIClient.shared.getThread(threadId)
             ThreadPrefetch.shared.note(threadId, view)  // instant reopen
-            thread = view
-            index = 0  // newest renders first — land on it
+            adopt(view)
         } catch {
             self.error = errText(error, "thread load failed")
         }
         loading = false
+    }
+
+    /// Take a loaded thread and derive everything per-thread from it ONCE.
+    ///
+    /// The repeated-image pass in particular must not be a computed property:
+    /// it strips and scans every message body, and the surrounding view
+    /// re-evaluates on every scroll frame — the same trap EmailWebView's
+    /// `Prepared` cache exists to close.
+    private func adopt(_ view: ClientThreadView) {
+        thread = view
+        repeatedImages = Self.repeatedImages(in: view)
+        index = 0  // newest renders first — land on it
+    }
+
+    /// messageId -> image srcs already shown by an earlier message.
+    ///
+    /// "EARLIER" MEANS CHRONOLOGICALLY EARLIER, so this walks `view.messages`
+    /// (server order, oldest first) and NOT the newest-first order the reader
+    /// sees. Walking the display order instead would keep the newest copy of a
+    /// signature and suppress the original — hiding the image in the message
+    /// that actually introduced it.
+    ///
+    /// Scans TRACKER-STRIPPED html for the same reason the strip runs first in
+    /// EmailWebView: a tracking pixel is removed from every message anyway, so
+    /// letting one register as a "first occurrence" here could suppress a real
+    /// image that shares its src and leave the thread showing none at all.
+    private static func repeatedImages(in view: ClientThreadView) -> [Int: Set<String>] {
+        var seen = Set<String>()
+        var out: [Int: Set<String>] = [:]
+        for message in view.messages {
+            out[message.id] = seen
+            guard let html = message.html, !html.isEmpty else { continue }
+            seen.formUnion(ImageRepeats.sources(Trackers.strip(html).html))
+        }
+        return out
     }
 
     /// Best-effort: a failed lookup just leaves the hint in its default state.
@@ -397,6 +437,8 @@ private struct MessageCard: View {
     /// The first message needs no divider above it: that is the top of the
     /// document, not a seam between two messages.
     let ruled: Bool
+    /// Image srcs an earlier message already showed; dropped from this body.
+    let seenEarlier: Set<String>
     let onSelect: () -> Void
 
     var body: some View {
@@ -413,7 +455,8 @@ private struct MessageCard: View {
             }
 
             if let html = message.html, !html.isEmpty {
-                EmailWebView(html: html, cacheKey: String(message.id))
+                EmailWebView(
+                    html: html, cacheKey: String(message.id), seenEarlier: seenEarlier)
             } else {
                 PlainBody(content: message.content)
             }

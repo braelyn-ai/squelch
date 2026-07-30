@@ -56,6 +56,14 @@ struct EmailWebView: View {
     let html: String
     /// Stable id (message id) for the height memory.
     var cacheKey: String?
+    /// Image srcs already shown by a CHRONOLOGICALLY EARLIER message in this
+    /// thread; each is dropped from this one.
+    ///
+    /// The default is empty, not "off": a lone message still de-duplicates
+    /// against ITSELF, which is what collapses the stack of signature copies a
+    /// quoted history drags along behind it. Only cross-message suppression
+    /// needs a thread to supply this.
+    var seenEarlier: Set<String> = []
 
     @Environment(Prefs.self) private var prefs
     @Environment(AppStore.self) private var store
@@ -84,14 +92,32 @@ struct EmailWebView: View {
         static let empty = Prepared(
             sourceHash: 0, html: "", blocked: 0, hasRemoteCandidates: false, links: [])
 
-        static func make(from html: String) -> Prepared {
+        static func make(from html: String, seenEarlier: Set<String>) -> Prepared {
+            // ORDER MATTERS: trackers come out FIRST, so a tracking pixel can
+            // never be the "first occurrence" that suppresses a real image
+            // further down the thread. Dedupe is layered on top of the security
+            // pass, never in place of it.
             let stripped = Trackers.strip(html)
+            let deduped = ImageRepeats.dropRepeats(stripped.html, alreadySeen: seenEarlier)
             return Prepared(
-                sourceHash: html.hashValue,
-                html: stripped.html,
+                sourceHash: cacheKey(html, seenEarlier),
+                html: deduped,
                 blocked: stripped.blocked,
-                hasRemoteCandidates: Trackers.hasNetworkImages(stripped.html),
-                links: Trackers.extractLinks(stripped.html))
+                // Read off the DEDUPED html: a message whose only images were
+                // repeats has nothing left to fetch, so it must not offer the
+                // "load remote images" bar for images it will never show.
+                hasRemoteCandidates: Trackers.hasNetworkImages(deduped),
+                links: Trackers.extractLinks(deduped))
+        }
+
+        /// The suppression set is an input, so it has to be part of the identity
+        /// of what was prepared — keying on the html alone would hand a message
+        /// the previous thread's dedupe result.
+        static func cacheKey(_ html: String, _ seenEarlier: Set<String>) -> Int {
+            var hasher = Hasher()
+            hasher.combine(html)
+            hasher.combine(seenEarlier)
+            return hasher.finalize()
         }
     }
 
@@ -177,8 +203,10 @@ struct EmailWebView: View {
             }
         }
         // Prepare once per content change, never per render.
-        .task(id: html) {
-            if prepared.sourceHash != html.hashValue { prepared = Prepared.make(from: html) }
+        .task(id: preparedKey) {
+            if prepared.sourceHash != preparedKey {
+                prepared = Prepared.make(from: html, seenEarlier: seenEarlier)
+            }
         }
         // SAFETY NET: the view is sized purely from what the measuring script
         // reports, so if that never arrives (a pathological document, a load
@@ -192,6 +220,7 @@ struct EmailWebView: View {
         }
     }
 
+    private var preparedKey: Int { Prepared.cacheKey(html, seenEarlier) }
     private var rememberedHeight: CGFloat? { cacheKey.flatMap { FrameHeights.shared.get($0) } }
     private var displayHeight: CGFloat {
         height > 0 ? height : (rememberedHeight ?? Self.placeholderHeight)
@@ -358,6 +387,13 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
             try { window.webkit.messageHandlers.squelch.postMessage(payload); } catch (e) {}
           };
 
+          // Declared UP HERE because the quoted-history collapse below runs
+          // before the height section and calls measure() itself. Left where it
+          // read more naturally, `last` was still undefined on that first call,
+          // every comparison against it was NaN, and the first measurement — the
+          // one that sizes the frame — was silently thrown away.
+          var last = -1;
+
           // ---- quoted history --------------------------------------------
           // Mirrors Quotes.swift: the first TOP-LEVEL <blockquote> after which
           // the document has no substantial text of its own anchors the
@@ -429,12 +465,28 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
           send({ kind: 'quoted', value: quoteNodes.length > 0 });
 
           // ---- height ------------------------------------------------------
-          var last = -1;
+          // Measure the CONTENT, never documentElement.scrollHeight.
+          //
+          // The root's scrollHeight is floored at the VIEWPORT height, and the
+          // viewport here IS the frame we are trying to size. Once the frame had
+          // grown to show quoted history, collapsing it again measured the grown
+          // frame (2240) instead of the shrunken content (112) — an unchanged
+          // number, which `last` then swallowed, so the host was never told and
+          // the mail kept a screenful of blank space under it. Only the body
+          // reports what the document actually needs.
+          //
+          // Both readings are content-based: scrollHeight also covers children
+          // that overflow the body box (floats, absolutely positioned tables),
+          // which the bounding rect alone would miss.
+          function contentHeight() {
+            var b = document.body;
+            if (!b) {
+              return document.documentElement ? document.documentElement.scrollHeight : 0;
+            }
+            return Math.max(b.scrollHeight, Math.ceil(b.getBoundingClientRect().height));
+          }
           function measure() {
-            var h = Math.max(
-              document.documentElement ? document.documentElement.scrollHeight : 0,
-              document.body ? document.body.scrollHeight : 0
-            );
+            var h = contentHeight();
             if (h > 0 && Math.abs(h - last) > 1) {
               last = h;
               send({ kind: 'height', value: h });
