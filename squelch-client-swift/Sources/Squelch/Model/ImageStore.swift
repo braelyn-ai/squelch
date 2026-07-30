@@ -78,26 +78,24 @@ actor ImageStore {
     /// BEFORE the await and applied by whoever writes the entry.
     private var pendingPins: [String: Set<Int>] = [:]
 
-    /// Ephemeral, and every knob that could leak the reader is off. `urlCache`
-    /// is nil because WE are the cache — a second one underneath would hold a
-    /// copy of the same bytes with none of the pinning.
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.httpShouldSetCookies = false
-        cfg.httpCookieAcceptPolicy = .never
-        cfg.httpCookieStorage = nil
-        cfg.urlCache = nil
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.timeoutIntervalForRequest = 20
-        // The WALL CLOCK for one image, which the line above is NOT: that one is
-        // an idle gap, and a host dribbling a byte a second never idles out.
-        // Unset, this defaults to seven days.
-        cfg.timeoutIntervalForResource = 60
-        return URLSession(configuration: cfg)
-    }()
+    /// Ephemeral, and every knob that could leak the reader is off. No `urlCache`
+    /// because WE are the cache — a second one underneath would hold a copy of
+    /// the same bytes with none of the pinning.
+    private let session = Sessions.ephemeral(
+        timeout: 20, resource: 60, cookies: .off, urlCache: false,
+        cachePolicy: .reloadIgnoringLocalCacheData)
 
-    /// Per-task delegate: re-guards every redirect hop.
-    private let policy = FetchPolicy()
+    /// Per-task delegate, re-guarding every redirect hop for http/https so a 302
+    /// cannot walk a fetch onto `file:`.
+    ///
+    /// That is its ONLY job because it is the only callback that ARRIVES. The
+    /// async APIs resolve response disposition and body delivery internally and
+    /// never ask a delegate — `didReceive response:` and `didReceive data:` are
+    /// both dead on this path, whether the object is installed as the task
+    /// delegate or the session's (measured: zero calls to either). Status, type
+    /// and size are therefore checked in `fetch`, against the stream, which is
+    /// the only place a transfer can still be stopped.
+    private let policy = SchemePinned(allow: ["http", "https"])
 
     /// Paths only — the disk work is in `ensureLoaded`, so it lands on the
     /// actor rather than on whichever thread first mentioned `shared`.
@@ -177,27 +175,11 @@ actor ImageStore {
             }
         }
 
-        if !toFetch.isEmpty {
-            await withTaskGroup(of: Void.self) { group in
-                var next = 0
-                var running = 0
-                while next < toFetch.count || running > 0 {
-                    while running < Self.warmWidth, next < toFetch.count {
-                        let url = toFetch[next]
-                        next += 1
-                        running += 1
-                        // Pinned AS IT LANDS, not in a pass after the batch:
-                        // every `store` runs the LRU, so an entry fetched early
-                        // can be gone before the batch ends, and a pin applied
-                        // to an entry that is no longer there is a silent no-op.
-                        group.addTask { [weak self] in
-                            _ = await self?.data(for: url, pin: messageId)
-                        }
-                    }
-                    await group.next()
-                    running -= 1
-                }
-            }
+        // Pinned AS IT LANDS, not in a pass after the batch: every `store` runs
+        // the LRU, so an entry fetched early can be gone before the batch ends,
+        // and a pin applied to an entry that is no longer there is a silent no-op.
+        await withBoundedTaskGroup(width: Self.warmWidth, over: toFetch) { [weak self] url in
+            _ = await self?.data(for: url, pin: messageId)
         }
         scheduleSave()
     }
@@ -419,33 +401,6 @@ actor ImageStore {
     }
 
     private static func hash(_ url: String) -> String {
-        SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-/// Transfer policy for image fetches, applied per task.
-///
-/// ONE job: re-check every redirect hop for http/https, so a 302 cannot walk the
-/// fetch onto `file:` or any other scheme this process can reach.
-///
-/// It is the only job because it is the only callback that ARRIVES. The async
-/// APIs resolve response disposition and body delivery internally and never ask
-/// a delegate — `didReceive response:` and `didReceive data:` are both dead on
-/// this path, whether the object is installed as the task delegate or the
-/// session's (measured: zero calls to either). Status, type and size are
-/// therefore checked in `fetch`, against the stream, which is the only place a
-/// transfer can still be stopped.
-private final class FetchPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-    func urlSession(
-        _ session: URLSession, task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        let scheme = request.url?.scheme?.lowercased()
-        guard scheme == "http" || scheme == "https" else {
-            completionHandler(nil)
-            return
-        }
-        completionHandler(request)
+        SHA256.hash(data: Data(url.utf8)).hex
     }
 }

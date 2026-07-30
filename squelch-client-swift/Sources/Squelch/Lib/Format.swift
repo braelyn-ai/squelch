@@ -57,6 +57,11 @@ enum Fmt {
     /// Compact relative age from an ISO timestamp, e.g. "12m", "4h", "5d", "3w".
     static func relAge(_ iso: String?, now: Date = Date()) -> String {
         guard let then = date(iso) else { return "" }
+        return relAge(then, now: now)
+    }
+
+    /// Same, for a Date already in hand — no round trip through a formatter.
+    static func relAge(_ then: Date, now: Date = Date()) -> String {
         let ms = now.timeIntervalSince(then)
         if ms < 0 { return "now" }
         let min = ms / 60

@@ -40,12 +40,9 @@ actor APIClient {
     private static let attachmentTimeout: TimeInterval = 30
 
     init() {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = Self.requestTimeout
-        cfg.timeoutIntervalForResource = 60
-        cfg.httpAdditionalHeaders = [:]
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: cfg)
+        session = Sessions.ephemeral(
+            timeout: Self.requestTimeout, resource: 60,
+            cachePolicy: .reloadIgnoringLocalCacheData, emptyHeaders: true)
     }
 
     /// Set the base URL + bearer token used by all subsequent requests.

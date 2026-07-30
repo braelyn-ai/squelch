@@ -170,7 +170,7 @@ struct ThreadViewer: View {
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 13)
-        .overlay(alignment: .bottom) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+        .overlay(alignment: .bottom) { Hairline() }
     }
 
     @ViewBuilder
@@ -512,10 +512,7 @@ private struct MessageCard: View {
                 .opacity(selected ? 1 : 0)
         }
         .overlay(alignment: .top) {
-            Rectangle()
-                .fill(Palette.hairline)
-                .frame(height: 0.5)
-                .opacity(ruled ? 1 : 0)
+            Hairline().opacity(ruled ? 1 : 0)
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)

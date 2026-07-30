@@ -27,6 +27,24 @@ extension LenientRawEnum {
     }
 }
 
+// MARK: - sender pair
+
+/// A wire type carrying the `from_name` / `from_addr` pair, so the one true
+/// rendering of a sender lives in a single place.
+protocol SenderStringConvertible {
+    var from_addr: String { get }
+    var from_name: String? { get }
+}
+
+extension SenderStringConvertible {
+    /// "Name <addr>" when a display name exists, else the bare address — the
+    /// shape `SenderID.parse` expects.
+    var senderString: String {
+        if let n = from_name, !n.isEmpty { return "\(n) <\(from_addr)>" }
+        return from_addr
+    }
+}
+
 // MARK: - core enums
 
 enum Tier: String, LenientRawEnum {
@@ -153,7 +171,7 @@ struct Attachment: Codable, Sendable, Identifiable, Hashable {
 
 /// core::types::ClientMessage — the HUMAN-door message shape. `html` is a
 /// server-side-sanitized (ammonia) string, or nil for plain-text-only mail.
-struct ClientMessage: Codable, Sendable, Identifiable, Hashable {
+struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringConvertible {
     var id: Int
     var from_addr: String
     var from_name: String?
@@ -163,13 +181,6 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable {
     var attachments: [Attachment]?
 
     var attachmentList: [Attachment] { attachments ?? [] }
-
-    /// "Name <addr>" when a display name exists, else the bare address — the
-    /// shape `SenderID.parse` expects.
-    var senderString: String {
-        if let n = from_name, !n.isEmpty { return "\(n) <\(from_addr)>" }
-        return from_addr
-    }
 }
 
 /// core::types::ClientThreadView (GET /client/thread/{id}).
@@ -239,7 +250,7 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
 
 // MARK: - receipts / calendar / banking
 
-struct Receipt: Codable, Sendable, Identifiable, Hashable {
+struct Receipt: Codable, Sendable, Identifiable, Hashable, SenderStringConvertible {
     var id: Int
     var account_id: Int
     var message_id: Int
@@ -249,11 +260,6 @@ struct Receipt: Codable, Sendable, Identifiable, Hashable {
     var amount: Double?
     var currency: String?
     var received_at: String
-
-    var senderString: String {
-        if let n = from_name, !n.isEmpty { return "\(n) <\(from_addr)>" }
-        return from_addr
-    }
 }
 
 enum CalendarKind: String, LenientRawEnum {

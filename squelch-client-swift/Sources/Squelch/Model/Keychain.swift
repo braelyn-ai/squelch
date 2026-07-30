@@ -31,16 +31,23 @@ enum KeychainError: Error, LocalizedError {
 }
 
 enum Keychain {
-    /// Read one generic-password slot. A missing entry is `nil` (first run);
-    /// any other failure throws. Never logs the value.
-    static func read(account: String, service: String = keychainService) throws -> String? {
-        let query: [String: Any] = [
+    /// The three attributes that IDENTIFY one slot. Every query below starts
+    /// here: a read, a write and a delete that disagreed on any of them would
+    /// address different items and quietly stop being each other's inverse.
+    private static func baseQuery(account: String, service: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+    }
+
+    /// Read one generic-password slot. A missing entry is `nil` (first run);
+    /// any other failure throws. Never logs the value.
+    static func read(account: String, service: String = keychainService) throws -> String? {
+        var query = baseQuery(account: account, service: service)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
@@ -53,11 +60,7 @@ enum Keychain {
 
     /// Upsert one generic-password slot.
     static func write(account: String, value: String, service: String = keychainService) throws {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        let base = baseQuery(account: account, service: service)
         let data = Data(value.utf8)
         // Try update first (the common path after first run).
         let update = SecItemUpdate(
@@ -76,14 +79,22 @@ enum Keychain {
 
     /// Remove one slot entirely. A missing entry is a no-op.
     static func delete(account: String, service: String = keychainService) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        let query = baseQuery(account: account, service: service)
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.write(status)
+        }
+    }
+}
+
+/// Run one keychain call OFF the main actor. Every read here can raise the
+/// system's "allow access?" panel and block until the human answers — on the
+/// main actor that is a frozen UI, so the `…Async` wrappers below are the only
+/// entry points the app is allowed to use.
+private func offMain<T>(_ work: @escaping @Sendable () -> T) async -> T {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: work())
         }
     }
 }
@@ -112,11 +123,7 @@ enum SettingsStore {
     /// The safe entry point: runs the (possibly prompting) read on a background
     /// executor so the UI keeps painting.
     static func loadAsync() async -> Result<ConnectionSettings?, Error> {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: Result { try load() })
-            }
-        }
+        await offMain { Result { try load() } }
     }
 
     /// Persist settings into the OS keychain. The token never touches disk or logs.
@@ -127,11 +134,7 @@ enum SettingsStore {
 
     /// Off-main-actor write, for the same reason as `loadAsync`.
     static func saveAsync(_ settings: ConnectionSettings) async -> Result<Void, Error> {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: Result { try save(settings) })
-            }
-        }
+        await offMain { Result { try save(settings) } }
     }
 
     /// Clear stored settings (Disconnect) so the next boot lands on the
@@ -189,22 +192,14 @@ enum AssistantKeyStore {
     /// Off-main-actor status read — same prompt-blocking reason as
     /// `SettingsStore.loadAsync`. Still never yields the key itself.
     static func statusAsync() async -> AssistantKeyStatus {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: status())
-            }
-        }
+        await offMain { status() }
     }
 
     /// Hand the stored key to Settings' Show / Edit affordance — the one
     /// deliberate hole in the rule above, and nothing else may call it. Off the
     /// main actor for the same prompt-blocking reason as `statusAsync`.
     static func revealAsync() async -> String? {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: read())
-            }
-        }
+        await offMain { read() }
     }
 
     /// Store the user's assistant key. Never logged, never echoed.
@@ -246,11 +241,7 @@ enum LLMError: Error, LocalizedError {
 /// caller-supplied provider. The key never leaves this type — not a parameter,
 /// not a return value, not in any error.
 enum LLMProxy {
-    private static let session: URLSession = {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 120
-        return URLSession(configuration: cfg)
-    }()
+    private static let session = Sessions.ephemeral(timeout: 120)
 
     /// Make ONE completion call. `body` is a fully-formed provider request body
     /// MINUS auth (model, messages, tools, max_tokens, …).

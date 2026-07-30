@@ -72,12 +72,10 @@ struct AuthView: View {
         VStack(spacing: 0) {
             RoutedHeader(title: "Auth — codes, alerts & resets") {
                 HStack(spacing: 12) {
-                    HStack(spacing: 5) {
-                        Circle().fill(Palette.lock).frame(width: 5, height: 5)
-                        Text("\(live.count) live · \(openDecisions.count) awaiting you")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaint)
-                    }
+                    StatusDot(
+                        color: Palette.lock,
+                        label: "\(live.count) live · \(openDecisions.count) awaiting you",
+                        tone: Palette.inkFaint, size: 5)
                     HStack(spacing: 3) {
                         Kbd("j")
                         Kbd("k")
@@ -165,7 +163,7 @@ struct AuthView: View {
                     }
                     .onChange(of: index) { _, i in
                         guard let m = shown[safe: i] else { return }
-                        withAnimation(.easeOut(duration: 0.12)) {
+                        withAnimation(Motion.scrollFollow) {
                             proxy.scrollTo(m.id, anchor: .center)
                         }
                     }
@@ -274,13 +272,7 @@ struct AuthView: View {
 
     private func copy() {
         guard let focus, let code = codes[focus.id] ?? nil else { return }
-        if Clip.copy(code) {
-            copied = true
-            Task {
-                try? await Task.sleep(for: .milliseconds(1400))
-                copied = false
-            }
-        }
+        Clip.copy(code, flashing: $copied)
     }
 
     private func archiveFocused(_ m: SealedMeta) async {

@@ -58,7 +58,7 @@ struct ConnectionBanner: View {
         // belongs to DaemonDownPane.
         if let error = store.refreshError, let last = store.lastRefresh {
             let auth = error.isAuthFailure
-            let age = Fmt.relAge(ISO8601DateFormatter().string(from: last))
+            let age = Fmt.relAge(last)
             let staleNote = (!age.isEmpty && age != "now") ? " — showing mail from \(age) ago" : ""
 
             HStack(spacing: 9) {
@@ -83,9 +83,7 @@ struct ConnectionBanner: View {
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity)
             .background((auth ? Palette.lockSoft : Palette.warnSoft).opacity(0.9))
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(Palette.hairline).frame(height: 0.5)
-            }
+            .overlay(alignment: .bottom) { Hairline() }
             .transition(.move(edge: .top).combined(with: .opacity))
         }
     }

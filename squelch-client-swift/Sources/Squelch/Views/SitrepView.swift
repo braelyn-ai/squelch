@@ -308,7 +308,7 @@ private struct SyncLabel: View {
 
     private var label: String {
         guard let last = store.lastRefresh else { return "syncing…" }
-        let rel = Fmt.relAge(ISO8601DateFormatter().string(from: last))
+        let rel = Fmt.relAge(last)
         return (rel == "now" || rel.isEmpty) ? "synced just now" : "synced \(rel) ago"
     }
 }
@@ -518,7 +518,7 @@ private struct StatusStrip: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            Button {
+            ChromeChip(tone: Palette.inkDim, help: "check for new mail now") {
                 guard !refreshing else { return }
                 refreshing = true
                 Task {
@@ -533,13 +533,8 @@ private struct StatusStrip: View {
                     Text(syncedLabel)
                 }
                 .font(Typo.micro)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
             }
-            .buttonStyle(.glass)
-            .foregroundStyle(Palette.inkDim)
             .disabled(refreshing)
-            .help("check for new mail now")
 
             if let cost = store.sitrep.stats?.stage2?.est_cost_usd_today {
                 Text("triage: \(String(format: "$%.2f", cost)) today")
@@ -549,20 +544,11 @@ private struct StatusStrip: View {
             }
 
             if let rulesCount {
-                Button {
-                    store.setView(.rules)
-                } label: {
-                    Label(
-                        "\(rulesCount) \(rulesCount == 1 ? "rule" : "rules")",
-                        systemImage: "slider.horizontal.3"
-                    )
-                    .font(Typo.micro)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 4)
-                }
-                .buttonStyle(.glass)
-                .foregroundStyle(Palette.inkDim)
-                .help("sender rules")
+                ChromeChip(
+                    text: "\(rulesCount) \(rulesCount == 1 ? "rule" : "rules")",
+                    icon: "slider.horizontal.3",
+                    tone: Palette.inkDim, help: "sender rules"
+                ) { store.setView(.rules) }
             }
             Spacer(minLength: 0)
         }
@@ -571,8 +557,9 @@ private struct StatusStrip: View {
 
     /// "synced 4m ago" / "synced just now" — never the nonsense "synced now ago".
     private var syncedLabel: String {
-        let iso = store.lastRefresh.map { ISO8601DateFormatter().string(from: $0) }
-        let age = Fmt.relAge(iso ?? store.sitrep.stats?.last_surfaced_at)
+        let age =
+            store.lastRefresh.map { Fmt.relAge($0) }
+            ?? Fmt.relAge(store.sitrep.stats?.last_surfaced_at)
         return (age.isEmpty || age == "now") ? "synced just now" : "synced \(age) ago"
     }
 }

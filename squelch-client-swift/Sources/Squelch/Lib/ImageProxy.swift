@@ -132,7 +132,7 @@ enum ImageProxy {
     private static func signature(for target: String) -> String {
         var mac = HMAC<SHA256>(key: signingKey)
         mac.update(data: Data(target.utf8))
-        return mac.finalize().map { String(format: "%02x", $0) }.joined()
+        return mac.finalize().hex
     }
 
     // MARK: - css
@@ -267,4 +267,11 @@ enum ImageProxy {
         ("&amp;", "&"), ("&#38;", "&"), ("&lt;", "<"), ("&gt;", ">"),
         ("&quot;", "\""), ("&#34;", "\""), ("&apos;", "'"), ("&#39;", "'"),
     ]
+}
+
+/// Lowercase hex — the one spelling this app writes a digest in, shared by the
+/// signature above and ImageStore's cache filenames. Both a CryptoKit digest and
+/// a MAC are just byte sequences, so this reaches them without unwrapping.
+extension Sequence<UInt8> {
+    var hex: String { map { String(format: "%02x", $0) }.joined() }
 }

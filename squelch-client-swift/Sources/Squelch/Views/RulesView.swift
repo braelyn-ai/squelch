@@ -64,7 +64,7 @@ struct RulesView: View {
                     }
                     .onChange(of: index) { _, i in
                         guard let rule = rules[safe: i] else { return }
-                        withAnimation(.easeOut(duration: 0.12)) {
+                        withAnimation(Motion.scrollFollow) {
                             proxy.scrollTo(rule.id, anchor: .center)
                         }
                     }
@@ -85,21 +85,12 @@ struct RulesView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 4) {
-            Kbd("j"); Kbd("k")
-            Text("select").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            Text("·").foregroundStyle(Palette.inkFaintest)
-            Kbd("n"); Text("new").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            Text("·").foregroundStyle(Palette.inkFaintest)
-            Kbd("e"); Kbd("↵")
-            Text("edit").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            Text("·").foregroundStyle(Palette.inkFaintest)
-            Kbd("x"); Text("delete").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            Spacer()
-        }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 10)
-        .overlay(alignment: .top) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+        KeyHintBar(hints: [
+            KeyHint(["j", "k"], "select"),
+            KeyHint("n", "new"),
+            KeyHint(["e", "↵"], "edit"),
+            KeyHint("x", "delete"),
+        ])
     }
 
     private var bindings: [KeyBinding] {
@@ -327,24 +318,9 @@ struct RuleEditor: View {
                         Kbd("tab")
                         Text("to cycle").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                     }
-                    HStack(spacing: 7) {
-                        ForEach(Disposition.allCases, id: \.self) { d in
-                            Button {
-                                disposition = d
-                            } label: {
-                                Text(d.label)
-                                    .font(Typo.chip)
-                                    .padding(.horizontal, 11).padding(.vertical, 4)
-                            }
-                            .buttonStyle(
-                                disposition == d
-                                    ? AnyButtonStyle(GlassProminentButtonStyle())
-                                    : AnyButtonStyle(GlassButtonStyle())
-                            )
-                            .tint(Palette.accent)
-                            .foregroundStyle(disposition == d ? .white : Palette.inkFaint)
-                        }
-                    }
+                    GlassSegmented(
+                        options: Disposition.allCases.map { ($0, $0.label) },
+                        selection: $disposition)
                     Text(disposition.hint)
                         .font(Typo.micro)
                         .foregroundStyle(Palette.inkFaintest)

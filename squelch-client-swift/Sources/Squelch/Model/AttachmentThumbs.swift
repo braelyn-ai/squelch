@@ -7,8 +7,6 @@
 
 import AppKit
 import CoreGraphics
-import ImageIO
-import UniformTypeIdentifiers
 
 @MainActor
 final class AttachmentThumbs {
@@ -77,19 +75,9 @@ final class AttachmentThumbs {
         return .art(image)
     }
 
-    /// ImageIO decodes DIRECTLY to thumbnail size, so a 2MB photo is never fully
-    /// rasterized to fill a 38pt square.
     private nonisolated static func downsample(_ bytes: Data, maxPixel: Int) -> Data? {
-        guard let source = CGImageSourceCreateWithData(bytes as CFData, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-        ]
-        guard
-            let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return nil }
-        return encodePNG(thumb)
+        guard let thumb = Raster.thumbnail(bytes, maxPixel: maxPixel) else { return nil }
+        return Raster.png(thumb)
     }
 
     /// Rasterize page 1 at tile size. CoreGraphics rather than PDFKit on purpose:
@@ -139,19 +127,6 @@ final class AttachmentThumbs {
         ctx.drawPDFPage(page)
 
         guard let image = ctx.makeImage() else { return nil }
-        return encodePNG(image)
-    }
-
-    /// PNG on the way out because `CGImage` is not Sendable and `Data` is — that
-    /// re-encode is what lets the render stay off the main actor.
-    private nonisolated static func encodePNG(_ image: CGImage) -> Data? {
-        let out = NSMutableData()
-        guard
-            let dest = CGImageDestinationCreateWithData(
-                out as CFMutableData, UTType.png.identifier as CFString, 1, nil)
-        else { return nil }
-        CGImageDestinationAddImage(dest, image, nil)
-        guard CGImageDestinationFinalize(dest) else { return nil }
-        return out as Data
+        return Raster.png(image)
     }
 }

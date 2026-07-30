@@ -240,9 +240,7 @@ struct RoutedHeader<Trailing: View>: View {
         .padding(.horizontal, 22)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Palette.hairline).frame(height: 0.5)
-        }
+        .overlay(alignment: .bottom) { Hairline() }
     }
 }
 

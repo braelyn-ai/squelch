@@ -32,11 +32,9 @@ struct ProcessMode: View {
                         .foregroundStyle(Palette.inkFaint)
                         .textCase(.uppercase)
                     Text("·").foregroundStyle(Palette.inkFaintest)
-                    Kbd("space")
-                    Text("skip").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    KeyHint("space", "skip")
                     Text("·").foregroundStyle(Palette.inkFaintest)
-                    Kbd("esc")
-                    Text("exit").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    KeyHint("esc", "exit")
                     Spacer()
                     Text("\(cleared) / \(queue.count) cleared · \(pending.count) left")
                         .font(Typo.num(11))
@@ -92,11 +90,11 @@ struct ProcessMode: View {
             }
 
             HStack(spacing: 12) {
-                verb("r", "reply")
-                verb("e", "archive")
-                verb("d", "done")
-                verb("t", "tune")
-                verb("space", "skip")
+                KeyHint("r", "reply")
+                KeyHint("e", "archive")
+                KeyHint("d", "done")
+                KeyHint("t", "tune")
+                KeyHint("space", "skip")
                 Spacer()
             }
             .padding(.top, 4)
@@ -105,13 +103,6 @@ struct ProcessMode: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .squelchGlass(.pane, cornerRadius: 20, tint: Palette.glassTint)
         .shadow(color: .black.opacity(0.3), radius: 44, y: 18)
-    }
-
-    private func verb(_ key: String, _ label: String) -> some View {
-        HStack(spacing: 4) {
-            Kbd(key)
-            Text(label).font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-        }
     }
 
     private var emptyState: some View {

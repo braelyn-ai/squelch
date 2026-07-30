@@ -84,12 +84,7 @@ final class FaviconLoader {
     private var images: [String: NSImage] = [:]
     private var inflight: [String: Task<NSImage?, Never>] = [:]
 
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 8
-        cfg.httpShouldSetCookies = false
-        return URLSession(configuration: cfg)
-    }()
+    private let session = Sessions.ephemeral(timeout: 8, cookies: .neverSent)
 
     private init() {}
 

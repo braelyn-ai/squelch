@@ -26,9 +26,7 @@ struct SidePanel: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 13)
-                .overlay(alignment: .bottom) {
-                    Rectangle().fill(Palette.hairline).frame(height: 0.5)
-                }
+                .overlay(alignment: .bottom) { Hairline() }
 
                 Group {
                     switch store.sideView {
@@ -100,7 +98,7 @@ struct SearchView: View {
                 }
                 .onChange(of: store.search.index) { _, i in
                     guard let hit = store.search.hits[safe: i] else { return }
-                    withAnimation(.easeOut(duration: 0.12)) {
+                    withAnimation(Motion.scrollFollow) {
                         proxy.scrollTo(hit.id, anchor: .center)
                     }
                 }
@@ -281,7 +279,7 @@ struct BrowseView: View {
                     }
                     .onChange(of: index) { _, i in
                         guard let u = visible[safe: i] else { return }
-                        withAnimation(.easeOut(duration: 0.12)) {
+                        withAnimation(Motion.scrollFollow) {
                             proxy.scrollTo(u.id, anchor: .center)
                         }
                     }

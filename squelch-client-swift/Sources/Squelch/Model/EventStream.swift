@@ -122,35 +122,22 @@ final class EventStream {
     private var task: Task<Void, Never>?
     private var cursor: Int?
     private var cursorLoaded = false
-    private let session: URLSession
 
-    /// Refuses every redirect: the feed URL is operator-configured and carries the
-    /// bearer header, so a 3xx from it is a misconfiguration, not a hop to follow.
-    /// Refusal surfaces the 3xx, which fails the 200 check and backs off.
-    private static let pinned = NoRedirects()
-    private final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-        func urlSession(
-            _ session: URLSession, task: URLSessionTask,
-            willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
-            completionHandler: @escaping (URLRequest?) -> Void
-        ) {
-            completionHandler(nil)
-        }
-    }
+    /// NOT waitsForConnectivity: it would park a connect to a dead daemon for the
+    /// whole resource timeout instead of failing fast, and this class's own
+    /// backoff is the retry policy we actually want.
+    private let session = Sessions.ephemeral(
+        timeout: EventStream.inactivityTimeout, resource: EventStream.resourceTimeout,
+        cookies: .neverSent, cachePolicy: .reloadIgnoringLocalCacheData,
+        emptyHeaders: true, waitsForConnectivity: false)
 
-    private init() {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = Self.inactivityTimeout
-        cfg.timeoutIntervalForResource = Self.resourceTimeout
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.httpAdditionalHeaders = [:]
-        cfg.httpShouldSetCookies = false
-        // NOT waitsForConnectivity. It would park a connect to a dead daemon
-        // for the whole resource timeout instead of failing fast, and this
-        // class's own backoff is the retry policy we actually want.
-        cfg.waitsForConnectivity = false
-        session = URLSession(configuration: cfg)
-    }
+    /// Refuses every redirect — an empty allow-list: the feed URL is
+    /// operator-configured and carries the bearer header, so a 3xx from it is a
+    /// misconfiguration, not a hop to follow. Refusal surfaces the 3xx, which
+    /// fails the 200 check and backs off.
+    private static let pinned = SchemePinned(allow: [])
+
+    private init() {}
 
     /// Start following the feed. Idempotent.
     func start() {

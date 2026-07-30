@@ -69,9 +69,9 @@ struct UsageView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if loading {
-                        section(label: "Triage") { EmptyNote("loading…") }
+                        SectionCard(label: "Triage") { EmptyNote("loading…") }
                     } else if let error {
-                        section(label: "Triage") {
+                        SectionCard(label: "Triage") {
                             Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
                         }
                     } else {
@@ -107,37 +107,13 @@ struct UsageView: View {
 
     // MARK: - sections
 
-    @ViewBuilder
-    private func section<Content: View>(
-        label: String, model: String? = nil, @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(label)
-                    .font(Typo.sectionLabel)
-                    .foregroundStyle(Palette.accent)
-                    .textCase(.uppercase)
-                Spacer()
-                if let model {
-                    Text(model)
-                        .font(Typo.mono(10))
-                        .foregroundStyle(Palette.inkFaintest)
-                }
-            }
-            content()
-        }
-        .zonePadding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .squelchGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
-    }
-
     private func categorySection(_ category: ResolvedCategory) -> some View {
         let dayTotals = category.rows.map { $0.input_tokens + $0.output_tokens }
         let peak = max(1, dayTotals.max() ?? 1)
 
-        return section(
+        return SectionCard(
             label: category.label,
-            model: category.model + (category.provider.map { " · \($0)" } ?? "")
+            note: category.model + (category.provider.map { " · \($0)" } ?? "")
         ) {
             Text(category.subtitle)
                 .font(Typo.micro)
@@ -162,9 +138,7 @@ struct UsageView: View {
                     .font(Typo.micro)
                     .foregroundStyle(Palette.inkFaintest)
                     .padding(.vertical, 4)
-                    .overlay(alignment: .bottom) {
-                        Rectangle().fill(Palette.hairline).frame(height: 0.5)
-                    }
+                    .overlay(alignment: .bottom) { Hairline() }
 
                     ForEach(Array(category.rows.enumerated()), id: \.element.day) { i, row in
                         let total = dayTotals[i]
@@ -201,7 +175,7 @@ struct UsageView: View {
     }
 
     private var assistantSection: some View {
-        section(label: "Assistant", model: assistant.lastModel) {
+        SectionCard(label: "Assistant", note: assistant.lastModel) {
             Text(
                 "The ⌘K \"ask your inbox\" assistant (your own key, tracked on this machine)."
             )

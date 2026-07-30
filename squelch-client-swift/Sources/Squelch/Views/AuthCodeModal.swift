@@ -162,14 +162,8 @@ struct AuthCodeModal: View {
 
     private func copy() {
         guard let code, !code.isEmpty else { return }
-        if Clip.copy(code) {
-            copied = true
-            paused = true
-            Task {
-                try? await Task.sleep(for: .milliseconds(1400))
-                copied = false
-            }
-        }
+        // Copying is the human acting on the code — stop the auto-dismiss clock.
+        if Clip.copy(code, flashing: $copied) { paused = true }
     }
 
     private func runTimer() async {

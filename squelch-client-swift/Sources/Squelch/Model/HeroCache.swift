@@ -6,10 +6,7 @@
 // is just "resolve everything the zone is about to show".
 
 import AppKit
-import CoreGraphics
-import ImageIO
 import SwiftUI
-import UniformTypeIdentifiers
 
 @MainActor
 final class HeroCache {
@@ -74,22 +71,9 @@ final class HeroCache {
     func preload(_ threadIds: [String]) {
         let pending = threadIds.filter { !$0.isEmpty && cache[$0] == nil }
         guard !pending.isEmpty, Prefs.shared.loadRemoteImages else { return }
-        Task { [weak self] in
-            await withTaskGroup(of: Void.self) { group in
-                var next = 0
-                var running = 0
-                while next < pending.count || running > 0 {
-                    while running < Self.preloadWidth, next < pending.count {
-                        let id = pending[next]
-                        next += 1
-                        running += 1
-                        group.addTask { [weak self] in
-                            await self?.resolve(id)
-                        }
-                    }
-                    await group.next()
-                    running -= 1
-                }
+        Task {
+            await withBoundedTaskGroup(width: Self.preloadWidth, over: pending) { [weak self] id in
+                await self?.resolve(id)
             }
         }
     }
@@ -120,29 +104,14 @@ final class HeroCache {
         let rgb: ImageFill.RGB?
     }
 
-    /// ImageIO decodes DIRECTLY to thumbnail size, so a 1200px hero is never fully
-    /// rasterized. PNG on the way out because a transparent logo needs its alpha to
-    /// survive — that is what lets the sampled fill show through behind the mark.
+    /// Sampled BEFORE the encode, off the thumbnail we are about to keep: the
+    /// fill has to come from the same pixels the card draws, and the PNG is what
+    /// preserves the alpha that lets that fill show through behind the mark.
     private nonisolated static func render(_ bytes: Data, maxPixel: Int) -> Rendered? {
-        guard let source = CGImageSourceCreateWithData(bytes as CFData, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-        ]
-        guard let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return nil }
-
+        guard let thumb = Raster.thumbnail(bytes, maxPixel: maxPixel) else { return nil }
         let rgb = ImageFill.dominantRGB(thumb)
-
-        let out = NSMutableData()
-        guard
-            let dest = CGImageDestinationCreateWithData(
-                out as CFMutableData, UTType.png.identifier as CFString, 1, nil)
-        else { return nil }
-        CGImageDestinationAddImage(dest, thumb, nil)
-        guard CGImageDestinationFinalize(dest) else { return nil }
-        return Rendered(thumbnail: out as Data, rgb: rgb)
+        guard let png = Raster.png(thumb) else { return nil }
+        return Rendered(thumbnail: png, rgb: rgb)
     }
 }
 
@@ -154,19 +123,12 @@ final class HeroBytes {
     static let shared = HeroBytes()
 
     /// Every knob that could leak the reader is off — this fetches a URL an email
-    /// chose. `urlCache` is nil because HeroCache holds the only copy worth keeping;
+    /// chose. No `urlCache` because HeroCache holds the only copy worth keeping;
     /// a cache underneath would keep the full-size art on disk too, keyed by a
     /// mail-supplied URL.
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.httpShouldSetCookies = false
-        cfg.httpCookieAcceptPolicy = .never
-        cfg.httpCookieStorage = nil
-        cfg.urlCache = nil
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.timeoutIntervalForRequest = 10
-        return URLSession(configuration: cfg)
-    }()
+    private let session = Sessions.ephemeral(
+        timeout: 10, cookies: .off, urlCache: false,
+        cachePolicy: .reloadIgnoringLocalCacheData)
 
     /// 8MB per image.
     private static let maxBytes = 8 * 1024 * 1024

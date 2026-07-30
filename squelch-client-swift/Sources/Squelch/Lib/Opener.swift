@@ -7,6 +7,7 @@
 
 import AppKit
 import Foundation
+import SwiftUI
 import UniformTypeIdentifiers
 
 enum Opener {
@@ -34,6 +35,9 @@ enum Opener {
 }
 
 enum Clip {
+    /// How long a "copied" confirmation stays lit.
+    static let flashWindow: Duration = .milliseconds(1400)
+
     /// Copy text to the general pasteboard. Returns whether it landed.
     @MainActor
     @discardableResult
@@ -41,6 +45,20 @@ enum Clip {
         let pb = NSPasteboard.general
         pb.clearContents()
         return pb.setString(text, forType: .string)
+    }
+
+    /// Copy, then hold `flash` true for the confirmation window so a button can
+    /// read "copied" and revert itself. Returns whether the copy landed.
+    @MainActor
+    @discardableResult
+    static func copy(_ text: String, flashing flash: Binding<Bool>) -> Bool {
+        guard copy(text) else { return false }
+        flash.wrappedValue = true
+        Task {
+            try? await Task.sleep(for: flashWindow)
+            flash.wrappedValue = false
+        }
+        return true
     }
 }
 

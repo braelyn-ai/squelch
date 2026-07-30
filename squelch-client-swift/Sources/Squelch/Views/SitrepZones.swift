@@ -137,17 +137,10 @@ private struct ShipmentCard: View {
                     filled: shipment.status == .outForDelivery)
                 Spacer(minLength: 0)
                 if let url = shipment.tracking_url {
-                    Button {
-                        Opener.open(url)
-                    } label: {
-                        Label("Track", systemImage: "arrow.up.right")
-                            .font(Typo.micro)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2.5)
-                    }
-                    .buttonStyle(.glass)
-                    .foregroundStyle(Palette.accent)
-                    .help("track \(shipment.tracking_number) · \(shipment.carrier.label)")
+                    ChromeChip(
+                        text: "Track", icon: "arrow.up.right", tone: Palette.accent,
+                        help: "track \(shipment.tracking_number) · \(shipment.carrier.label)"
+                    ) { Opener.open(url) }
                 }
             }
         }
@@ -449,7 +442,7 @@ private struct NewsletterCard: View {
                     }
                     if let rule = newsletter.rule {
                         // A ruled card keeps its chip as the EDIT affordance.
-                        Button(action: onEdit) {
+                        ChromeChip(help: "edit this rule", action: onEdit) {
                             HStack(spacing: 5) {
                                 Text(rule.disposition.label)
                                     .font(Typo.micro)
@@ -464,11 +457,7 @@ private struct NewsletterCard: View {
                                     .font(.system(size: 9))
                                     .foregroundStyle(Palette.inkFaintest)
                             }
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
                         }
-                        .buttonStyle(.glass)
-                        .help("edit this rule")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

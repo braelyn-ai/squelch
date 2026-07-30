@@ -73,7 +73,7 @@ struct EmailsView: View {
                 .onChange(of: index) { _, i in
                     // Follow the KEYBOARD selection only.
                     guard kbActive, let u = rows[safe: i] else { return }
-                    withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(u.id, anchor: .center) }
+                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(u.id, anchor: .center) }
                 }
             }
             .onContinuousHover { phase in
@@ -135,29 +135,20 @@ struct EmailsView: View {
             }
             RetriageButton()
             if !store.sitrep.sealed.isEmpty {
-                Button { store.setView(.auth) } label: {
-                    Label("\(store.sitrep.sealed.count)", systemImage: "key.fill")
-                        .font(Typo.micro)
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                }
-                .buttonStyle(.glass)
-                .foregroundStyle(Palette.lock)
-                .help("login codes, password resets & sign-in alerts (g)")
+                ChromeChip(
+                    text: "\(store.sitrep.sealed.count)", icon: "key.fill",
+                    tone: Palette.lock,
+                    help: "login codes, password resets & sign-in alerts (g)"
+                ) { store.setView(.auth) }
             }
-            Button { store.setView(.audit) } label: {
-                Image(systemName: "scroll").font(.system(size: 12))
-                    .padding(.horizontal, 6).padding(.vertical, 3)
-            }
-            .buttonStyle(.glass)
-            .foregroundStyle(Palette.inkFaint)
-            .help("audit log — agent & app actions (A)")
-            Button { store.shortcutsOpen = true } label: {
-                Text("?").font(.system(size: 12, weight: .semibold))
-                    .padding(.horizontal, 7).padding(.vertical, 3)
-            }
-            .buttonStyle(.glass)
-            .foregroundStyle(Palette.inkFaint)
-            .help("keyboard shortcuts (?)")
+            ChromeChip(
+                icon: "scroll", font: .system(size: 12),
+                help: "audit log — agent & app actions (A)"
+            ) { store.setView(.audit) }
+            ChromeChip(
+                text: "?", font: .system(size: 12, weight: .semibold),
+                help: "keyboard shortcuts (?)"
+            ) { store.shortcutsOpen = true }
             ThemeToggle()
         }
         // These metrics must match the sitrep masthead's: the rail icon beside
@@ -165,7 +156,7 @@ struct EmailsView: View {
         .padding(.horizontal, 24)
         .padding(.top, 16)
         .padding(.bottom, 12)
-        .overlay(alignment: .bottom) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+        .overlay(alignment: .bottom) { Hairline() }
     }
 
     // MARK: - keymap

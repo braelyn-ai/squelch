@@ -84,53 +84,6 @@ struct SettingsView: View {
 
 // MARK: - shared section chrome
 
-/// One engraved section on a single glass pane.
-struct SettingsSectionCard<Content: View>: View {
-    let label: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(label)
-                .font(Typo.sectionLabel)
-                .foregroundStyle(Palette.accent)
-                .textCase(.uppercase)
-            content
-        }
-        .zonePadding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .squelchGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
-    }
-}
-
-/// A two-state (or n-state) segmented control drawn in glass.
-struct GlassSegmented<T: Hashable>: View {
-    let options: [(value: T, label: String)]
-    @Binding var selection: T
-
-    var body: some View {
-        HStack(spacing: 5) {
-            ForEach(options, id: \.value) { option in
-                Button {
-                    selection = option.value
-                } label: {
-                    Text(option.label)
-                        .font(Typo.chip)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
-                }
-                .buttonStyle(
-                    selection == option.value
-                        ? AnyButtonStyle(GlassProminentButtonStyle())
-                        : AnyButtonStyle(GlassButtonStyle())
-                )
-                .tint(Palette.accent)
-                .foregroundStyle(selection == option.value ? .white : Palette.inkFaint)
-            }
-        }
-    }
-}
-
 /// A stored secret: masked at rest, eye to reveal, pencil to edit (prefilled).
 /// Plaintext is pulled through `load` only when one of those is pressed, so a
 /// secret nobody asked to see never enters view state. Blur is the save — a
@@ -317,7 +270,7 @@ private struct ConnectionSection: View {
     private enum Result<T, E> { case ok, err(E) }
 
     var body: some View {
-        SettingsSectionCard(label: "Connection") {
+        SectionCard(label: "Connection") {
             Field(label: "server url") {
                 TextField("http://127.0.0.1:8848", text: $url)
                     .textFieldStyle(.plain)
@@ -346,11 +299,7 @@ private struct ConnectionSection: View {
                     .disabled(busy || url.trimmed.isEmpty || token.trimmed.isEmpty)
                 switch result {
                 case .ok:
-                    HStack(spacing: 5) {
-                        Circle().fill(Palette.positive).frame(width: 6, height: 6)
-                        Text("connected · saved")
-                            .font(Typo.micro).foregroundStyle(Palette.positive)
-                    }
+                    StatusDot(color: Palette.positive, label: "connected · saved")
                 case .err(let message):
                     Text(message).font(Typo.micro).foregroundStyle(Palette.danger)
                 case nil:
@@ -392,7 +341,7 @@ private struct AppearanceSection: View {
 
     var body: some View {
         @Bindable var prefs = prefs
-        SettingsSectionCard(label: "Appearance") {
+        SectionCard(label: "Appearance") {
             InlineRow(key: "theme", alignment: .top) {
                 // Three-state, so a Toggle can't hold it. macOS 26 draws
                 // segmented Pickers in glass, indistinguishable from our own
@@ -418,7 +367,7 @@ private struct DeveloperSection: View {
 
     var body: some View {
         @Bindable var prefs = prefs
-        SettingsSectionCard(label: "Developer") {
+        SectionCard(label: "Developer") {
             InlineRow(key: "dev mode") {
                 Toggle("dev mode", isOn: $prefs.developerMode)
                     .toggleStyle(.switch)
@@ -437,7 +386,7 @@ private struct YouSection: View {
 
     var body: some View {
         @Bindable var prefs = prefs
-        SettingsSectionCard(label: "You") {
+        SectionCard(label: "You") {
             Field(label: "name") {
                 TextField("shown in the sitrep greeting", text: $prefs.userName)
                     .textFieldStyle(.plain)
@@ -457,7 +406,7 @@ private struct MailSection: View {
 
     var body: some View {
         @Bindable var prefs = prefs
-        SettingsSectionCard(label: "Mail") {
+        SectionCard(label: "Mail") {
             InlineRow(key: "images") {
                 GlassSegmented(
                     options: [(true, "Always"), (false, "On demand")],
@@ -478,7 +427,7 @@ private struct TriagePipelineSection: View {
     @State private var config: TriageConfig?
 
     var body: some View {
-        SettingsSectionCard(label: "How triage works") {
+        SectionCard(label: "How triage works") {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 7) {
                     node("mail arrives", note: nil, tint: Palette.inkFaint)
@@ -599,7 +548,7 @@ private struct TriageBudgetSection: View {
     }
 
     var body: some View {
-        SettingsSectionCard(label: "Triage budget") {
+        SectionCard(label: "Triage budget") {
             if let loadError {
                 Text(loadError).font(Typo.micro).foregroundStyle(Palette.danger)
             } else if let config {
@@ -625,10 +574,7 @@ private struct TriageBudgetSection: View {
                         .disabled(busy)
                     switch note {
                     case .saved:
-                        HStack(spacing: 5) {
-                            Circle().fill(Palette.positive).frame(width: 6, height: 6)
-                            Text("saved").font(Typo.micro).foregroundStyle(Palette.positive)
-                        }
+                        StatusDot(color: Palette.positive, label: "saved")
                     case .error(let message):
                         Text(message).font(Typo.micro).foregroundStyle(Palette.danger)
                     case nil:
@@ -792,7 +738,7 @@ private struct RankingSection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
-        SettingsSectionCard(label: "For your eyes") {
+        SectionCard(label: "For your eyes") {
             Text("Rank For your eyes by: time ←→ severity")
                 .font(Typo.rowSub)
                 .foregroundStyle(Palette.inkDim)
@@ -837,7 +783,7 @@ private struct AssistantSection: View {
 
     var body: some View {
         @Bindable var prefs = prefs
-        SettingsSectionCard(label: "Assistant") {
+        SectionCard(label: "Assistant") {
             SecretField(
                 label: "api key (yours)", placeholder: "sk-ant-…",
                 hasStored: status.present,
@@ -851,14 +797,9 @@ private struct AssistantSection: View {
                     Text("saving…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                 }
                 if status.present {
-                    HStack(spacing: 5) {
-                        Circle().fill(Palette.positive).frame(width: 6, height: 6)
-                        Text(
-                            "key set"
-                                + (status.provider.map { " · \($0.label)" } ?? "")
-                        )
-                        .font(Typo.micro).foregroundStyle(Palette.positive)
-                    }
+                    StatusDot(
+                        color: Palette.positive,
+                        label: "key set" + (status.provider.map { " · \($0.label)" } ?? ""))
                     Button("forget") { Task { await forgetKey() } }
                         .buttonStyle(.plain)
                         .font(Typo.micro)
@@ -926,12 +867,12 @@ private struct AccountSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SettingsSectionCard(label: "Account") {
+            SectionCard(label: "Account") {
                 meta("server", store.settings?.serverURL ?? "—")
                 meta("triage model", usage?.model ?? "—")
                 meta("provider", usage?.provider ?? "—")
             }
-            SettingsSectionCard(label: "Danger") {
+            SectionCard(label: "Danger") {
                 HStack(spacing: 12) {
                     Button("Disconnect") { store.disconnect() }
                         .buttonStyle(.glassProminent)

@@ -161,7 +161,7 @@ struct TriageFixPalette: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .overlay(alignment: .top) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+        .overlay(alignment: .top) { Hairline() }
     }
 
     /// allowInInput is REQUIRED, not polish: the palette autofocuses its field,

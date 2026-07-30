@@ -54,18 +54,12 @@ struct AuditView: View {
                     }
                     .onChange(of: index) { _, i in
                         guard let entry = rows[safe: i] else { return }
-                        withAnimation(.easeOut(duration: 0.12)) {
+                        withAnimation(Motion.scrollFollow) {
                             proxy.scrollTo(entry.id, anchor: .center)
                         }
                     }
                 }
-                HStack(spacing: 4) {
-                    Kbd("j"); Kbd("k")
-                    Text("select").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    Spacer()
-                }
-                .padding(.horizontal, 22).padding(.vertical, 10)
-                .overlay(alignment: .top) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+                KeyHintBar(hints: [KeyHint(["j", "k"], "select")])
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -104,23 +98,18 @@ struct AuditView: View {
 
     // MARK: - readable entries
 
-    struct ActorChip {
-        var label: String
-        var tone: Color
-    }
-
     /// Actors rendered as "the agent"; several spellings tolerated because the
     /// agent door's actor string isn't pinned.
-    static func actorChip(_ actor: String) -> ActorChip {
+    static func actorChip(_ actor: String) -> Chip {
         let lower = actor.lowercased()
         if ["agent", "mcp", "assistant", "ai"].contains(where: lower.hasPrefix) {
-            return ActorChip(label: "Agent", tone: Palette.lock)
+            return Chip(text: "Agent", tone: Palette.lock, filled: true)
         }
         if ["client-api", "client", "app", "user"].contains(lower) {
-            return ActorChip(label: "You", tone: Palette.accent)
+            return Chip(text: "You", tone: Palette.accent, filled: true)
         }
         // Unknown actor: show it verbatim rather than mislabeling.
-        return ActorChip(label: actor.isEmpty ? "?" : actor, tone: Palette.inkFaint)
+        return Chip(text: actor.isEmpty ? "?" : actor, tone: Palette.inkFaint, filled: true)
     }
 
     /// Both dotted and underscore slug spellings, so a rename on either side
@@ -215,10 +204,9 @@ private struct AuditRow: View {
     }
 
     var body: some View {
-        let chip = AuditView.actorChip(entry.actor)
         Button(action: onSelect) {
             HStack(alignment: .top, spacing: 10) {
-                Chip(text: chip.label, tone: chip.tone, filled: true)
+                AuditView.actorChip(entry.actor)
                     .frame(width: 58, alignment: .leading)
                 Text(AuditView.actionVerb(entry))
                     .font(Typo.rowSub)

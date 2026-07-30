@@ -140,16 +140,10 @@ struct ThemeToggle: View {
     }
 
     var body: some View {
-        Button {
-            prefs.flipTheme()
-        } label: {
-            Image(systemName: isDark ? "sun.max" : "moon")
-                .font(.system(size: 12))
-                .padding(.horizontal, 6).padding(.vertical, 3)
-        }
-        .buttonStyle(.glass)
-        .foregroundStyle(Palette.inkFaint)
-        .help("\(isDark ? "light" : "dark") mode (\\)")
+        ChromeChip(
+            icon: isDark ? "sun.max" : "moon", font: .system(size: 12),
+            help: "\(isDark ? "light" : "dark") mode (\\)"
+        ) { prefs.flipTheme() }
         .accessibilityLabel("switch to \(isDark ? "light" : "dark") mode")
     }
 }

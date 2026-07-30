@@ -230,13 +230,9 @@ private struct PDFPreview: View {
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Button(action: onDownload) {
-                    Label("download", systemImage: "arrow.down.circle")
-                        .font(Typo.micro)
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                }
-                .buttonStyle(.glass)
-                .foregroundStyle(Palette.accent)
+                ChromeChip(
+                    text: "download", icon: "arrow.down.circle", tone: Palette.accent,
+                    action: onDownload)
                 // The Esc hint has to be a real button too, or the keyboard is
                 // the only exit.
                 Button(action: onClose) {
