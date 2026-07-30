@@ -41,9 +41,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        // Before launch finishes: a notification tapped while Squelch was not
+        // running is delivered the moment a delegate exists, and a center
+        // without one drops it.
+        Notifier.shared.install()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // FALSE, because the app is a notifier now. Closing the window means "get
+    // out of my way", not "quit" — terminating on last-window-close would drop
+    // the event stream, and the notification the window was closed to wait for
+    // would never arrive. ⌘Q and the app menu still quit.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Dock click with nothing on screen: put the window back.
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication, hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag { MainWindow.show() }
+        return true
+    }
 }
 
 /// Native menu equivalents for the app's global chords. These duplicate

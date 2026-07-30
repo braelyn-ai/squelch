@@ -37,7 +37,13 @@ struct RootView: View {
             await store.loadSettings()
         }
         .onChange(of: store.connStatus) { _, status in
-            if status == .connected { SitrepPoller.shared.start() } else { SitrepPoller.shared.stop() }
+            if status == .connected {
+                SitrepPoller.shared.start()
+                EventStream.shared.start()
+            } else {
+                SitrepPoller.shared.stop()
+                EventStream.shared.stop()
+            }
         }
     }
 }

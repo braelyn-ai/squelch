@@ -76,6 +76,42 @@ enum Band: String, Sendable, CaseIterable {
     case standing, new, open
 }
 
+// MARK: - notification events
+
+/// core::types::EventKind — why an event was emitted. Server-side precedence
+/// when classifying a verdict is urgent > deadline > surfaced.
+enum EventKind: String, LenientRawEnum {
+    /// Tier is past_due/deadline — the standing band, immune to thresholds.
+    case urgent
+    /// A deadline on a message that is not itself urgent-tier.
+    case deadline
+    /// Importance landed at or above the notify threshold.
+    case surfaced
+    /// A kind this build has never heard of is still worth a banner — it only
+    /// loses the urgent styling.
+    static var unknownFallback: EventKind { .surfaced }
+}
+
+/// core::types::Event — one row of the durable notification log, delivered as
+/// SSE frames on GET /client/events.
+///
+/// Every field is a snapshot taken at emission time, deliberately: a client
+/// renders the whole notification from this row alone, with no second round
+/// trip to spend. SEALED MAIL CAN NEVER APPEAR HERE (enforced server-side).
+struct Event: Codable, Sendable, Identifiable, Hashable {
+    var id: Int
+    var kind: EventKind
+    var message_id: Int
+    var thread_id: String
+    var tier: Tier
+    var importance: Int
+    var sender: String
+    var one_line: String
+    /// Snapshotted RFC3339 text, or nil. Display copy only.
+    var deadline: String?
+    var created_at: String
+}
+
 // MARK: - updates
 
 /// Per-property triage justifications. An absent key means no reason was

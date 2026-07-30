@@ -50,6 +50,7 @@ targets:
     dependencies:
       - sdk: WebKit.framework
       - sdk: Security.framework
+      - sdk: UserNotifications.framework
 
 schemes:
   Squelch:

@@ -42,6 +42,7 @@ SWIFT_FLAGS=(
   -framework Security
   -framework UniformTypeIdentifiers
   -framework PDFKit
+  -framework UserNotifications
 )
 
 case "$MODE" in
