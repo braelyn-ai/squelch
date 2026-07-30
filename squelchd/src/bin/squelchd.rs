@@ -409,6 +409,14 @@ fn cmd_serve(
     // wakes early. One handle, two clones (API + engine).
     let refresh = Arc::new(tokio::sync::Notify::new());
 
+    // Notification wake channel. The store pokes it on every real `append_event`
+    // (sync engine side); every open `GET /client/events` stream subscribes
+    // (human-door side) and re-reads the table past its own cursor. The payload
+    // is only a hint, so the capacity just bounds how far a slow reader may fall
+    // behind before it takes the (harmless) Lagged path.
+    let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
+    store.attach_event_notifier(event_tx.clone())?;
+
     // The human door refuses to build without SQUELCH_API_TOKEN. Attaching the
     // WRITE-bound credential store here enables the action endpoints — the sync
     // engine below gets a separate Read-bound store and never sees this one.
@@ -416,6 +424,7 @@ fn cmd_serve(
         .map_err(|e| other_err(format!("{e}")))?
         .with_write_credentials(backend, email.clone(), creds_path.clone(), client.clone())
         .with_refresh(refresh.clone())
+        .with_event_notifier(event_tx)
         .with_stage2_prices(config.stage2.price_in_per_mtok, config.stage2.price_out_per_mtok)
         .with_stage2_model(
             config.stage2.model.clone(),
@@ -438,6 +447,12 @@ fn cmd_serve(
     runtime.block_on(async move {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mcp_cancel = CancellationToken::new();
+
+        // Hand the human door the same shutdown signal the sync loop gets. Open
+        // SSE streams are infinite by construction and `with_graceful_shutdown`
+        // waits for open connections, so without this one resident client would
+        // hold the daemon open forever.
+        let api_state = api_state.with_shutdown(shutdown_rx.clone());
 
         // The sync loop. No embedder override: it resolves the embedder from the
         // shared store each tick, so it picks up the background-attached one.

@@ -140,7 +140,7 @@ struct Page<T> {
 
 /// Run a synchronous store closure off the async runtime. Panics inside the
 /// closure surface as a 500 (opaque).
-async fn blocking<T, F>(f: F) -> Result<T, ApiError>
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T, ApiError>
 where
     F: FnOnce() -> Result<T, squelch_core::CoreError> + Send + 'static,
     T: Send + 'static,

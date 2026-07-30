@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SqliteStore::open(db_path())?);
     let email = account_email();
     // Refuses to build (and thus serve) without SQUELCH_API_TOKEN.
-    let mut state = ApiState::from_env(store, &email)?;
+    let mut state = ApiState::from_env(store.clone(), &email)?;
 
     // Enable action endpoints ONLY when OAuth client credentials are configured.
     // The write credential store is bound to CredentialKind::Write inside
@@ -100,6 +100,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // SSE plumbing. This bin runs no sync loop, so nothing in the process
+    // appends events — the notifier is wired anyway so the shape matches the
+    // daemon's, and the shutdown signal is NOT optional: an open
+    // `/client/events` stream would otherwise keep `with_graceful_shutdown`
+    // waiting forever on Ctrl-C.
+    let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
+    store.attach_event_notifier(event_tx.clone())?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
+
     let app = router(state);
 
     let addr = bind_addr()?;
@@ -108,9 +118,11 @@ async fn main() -> anyhow::Result<()> {
     // Single startup line. No token or message content is ever logged.
     eprintln!("squelch-api: serving human door on http://{bound}/client/*");
 
-    let shutdown = async {
+    let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("squelch-api: shutting down");
+        // Ends open SSE streams so the drain below can actually finish.
+        let _ = shutdown_tx.send(true);
     };
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

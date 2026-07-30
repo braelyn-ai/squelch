@@ -24,6 +24,9 @@ thiserror = { workspace = true }
 # same axum 0.8 line squelch-mcp pins.
 axum = { version = "0.8" }
 tower = "0.5"
+# `ReceiverStream` only: the SSE endpoint hands axum a stream fed by a per-
+# connection pump task. Default features (no `sync`) are enough.
+tokio-stream = "0.1"
 # CORS for the desktop client's webview (tauri://localhost / vite dev origin).
 # CORS is a browser courtesy, not the security boundary — bearer auth is.
 tower-http = { version = "0.6", features = ["cors"] }

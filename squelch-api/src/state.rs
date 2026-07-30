@@ -69,6 +69,21 @@ pub struct ApiState {
     /// sync loop is wired in (standalone `squelch-api` bin / tests): the endpoint
     /// then reports `triggered: false` rather than pretending to have poked one.
     pub(crate) refresh: Option<Arc<tokio::sync::Notify>>,
+    /// Wake channel for `GET /client/events`. The SAME sender is attached to the
+    /// store ([`SqliteStore::attach_event_notifier`]), which pokes it on every
+    /// real `append_event`. THE PAYLOAD IS ONLY A HINT — the `events` table is
+    /// the source of truth and every SSE connection re-reads past its own cursor
+    /// — so a missed or lagged message costs latency, never an event. `None`
+    /// (standalone bin / tests) just means the live path never fires; replay
+    /// still works.
+    ///
+    /// [`SqliteStore::attach_event_notifier`]: squelch_core::store::SqliteStore::attach_event_notifier
+    pub(crate) event_notifier: Option<tokio::sync::broadcast::Sender<i64>>,
+    /// The daemon's shutdown signal. An SSE stream is infinite by construction,
+    /// and axum's graceful shutdown waits for open connections — so without this
+    /// one resident client would hold squelchd open forever. Every stream selects
+    /// on it and ends cleanly when it flips. `None` => nothing to wait on.
+    pub(crate) shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Why [`ApiState`] could not be constructed.
@@ -124,6 +139,8 @@ impl ApiState {
                 .price_out_per_mtok,
             stage1_global_daily_cap: squelch_core::config::Stage1Config::default().global_daily_cap,
             refresh: None,
+            event_notifier: None,
+            shutdown: None,
         })
     }
 
@@ -136,6 +153,32 @@ impl ApiState {
     pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
         self.refresh = Some(refresh);
         self
+    }
+
+    /// Share the event-notification broadcast so `GET /client/events` wakes on a
+    /// new event instead of polling. Wire the SAME sender here that you pass to
+    /// [`SqliteStore::attach_event_notifier`]; without it the SSE endpoint still
+    /// replays and still holds the connection open, it just never goes live.
+    ///
+    /// [`SqliteStore::attach_event_notifier`]: squelch_core::store::SqliteStore::attach_event_notifier
+    pub fn with_event_notifier(mut self, tx: tokio::sync::broadcast::Sender<i64>) -> Self {
+        self.event_notifier = Some(tx);
+        self
+    }
+
+    /// Share the process shutdown signal so open SSE streams end when the daemon
+    /// stops. REQUIRED anywhere `axum::serve(..).with_graceful_shutdown(..)` is
+    /// used: a never-ending stream would otherwise keep the server from ever
+    /// finishing its drain. Wire the same [`watch`](tokio::sync::watch) channel
+    /// the sync loop gets.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// The event-notification broadcast, if one was wired in.
+    pub(crate) fn event_notifier(&self) -> Option<&tokio::sync::broadcast::Sender<i64>> {
+        self.event_notifier.as_ref()
     }
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`. Wire
