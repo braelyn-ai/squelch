@@ -99,7 +99,18 @@ extension View {
     /// Applied to the CONTENT, never as a sibling background: a
     /// `GlassEffectContainer` deliberately raises its descendants above its
     /// content view, so glass added behind an icon renders on top of it.
-    @ViewBuilder
+    ///
+    /// UNCONDITIONAL, and that is the whole design of it. Written as
+    /// `if active { self.glassEffect(…) } else { self }` the two branches are
+    /// separate view identities, so every selection change TORE DOWN the icon's
+    /// subtree and built a new one — visible as a flicker on the item being
+    /// deselected, and fatal to the motion: a `glassEffectID` cannot be matched
+    /// across a view that no longer exists, so the material popped between icons
+    /// instead of travelling. `Glass.identity` is the inactive state (the
+    /// modifier stays applied and renders nothing) and the shared id is handed
+    /// over via the OPTIONAL `glassEffectID`, so exactly one icon claims the
+    /// selector at a time and the container animates it from the old owner to
+    /// the new one.
     func glassSelector(
         _ active: Bool,
         tint: Color = Palette.accent,
@@ -107,15 +118,11 @@ extension View {
         id: String,
         in namespace: Namespace.ID
     ) -> some View {
-        if active {
-            self.glassEffect(
-                .regular.tint(tint.opacity(0.26)).interactive(),
-                in: .rect(cornerRadius: cornerRadius, style: .continuous)
-            )
-            .glassEffectID(id, in: namespace)
-        } else {
-            self
-        }
+        self.glassEffect(
+            active ? .regular.tint(tint.opacity(0.26)).interactive() : .identity,
+            in: .rect(cornerRadius: cornerRadius, style: .continuous)
+        )
+        .glassEffectID(active ? id : nil, in: namespace)
     }
 
     /// Unselected rows get a cheap hover wash instead: putting glass on 500
