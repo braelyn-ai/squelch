@@ -1,7 +1,6 @@
 //! App state, data loading, and pure view logic for the squelch TUI.
 //!
-//! This is a LOCAL debug/setup viewer over `squelch-core`'s `Store`. It only
-//! ever reads mail; the single write it performs is `Store::set_sender_rule`.
+//! Reads mail only; the single write it performs is `Store::set_sender_rule`.
 
 use std::sync::Arc;
 
@@ -18,8 +17,7 @@ const LOOKBACK_DAYS: i64 = 30;
 pub enum Mode {
     /// The plain ranked list.
     List,
-    /// Thread detail drill-in. Holds the fetched view (or None if unavailable)
-    /// plus the scroll offset inside the pane.
+    /// Thread detail drill-in; `None` view when the fetch was unavailable.
     Detail { view: Option<ThreadView>, scroll: u16 },
     /// Sender rule editor for a selected message.
     RuleEdit(RuleEditor),
@@ -66,7 +64,7 @@ impl RuleEditor {
         };
     }
 
-    /// Cycle disposition Surface -> Squelch -> Filtered -> Surface.
+    /// Cycle the disposition.
     pub fn cycle_disposition(&mut self) {
         self.disposition = match self.disposition {
             Disposition::Surface => Disposition::Squelch,
@@ -76,7 +74,7 @@ impl RuleEditor {
     }
 }
 
-/// A minimal single-line text editor (chars, backspace, left/right).
+/// A minimal single-line text editor.
 #[derive(Default)]
 pub struct TextInput {
     chars: Vec<char>,
@@ -125,11 +123,9 @@ impl TextInput {
 pub enum Row {
     Update(Update),
     Sealed(SealedMessage),
-    /// Rendered position of the squelch line (not selectable).
     SquelchLine,
-    /// Collapsed noise summary (not selectable when collapsed).
+    /// Collapsed count of the below-line updates.
     NoiseSummary(usize),
-    /// Section header (not selectable).
     Header(String),
 }
 
@@ -160,7 +156,7 @@ pub struct App {
     /// Reveal sealed content (subjects). Defaults to hidden.
     pub reveal_sealed: bool,
     /// In-session squelch threshold. Items below fall under the line.
-    /// TODO(persist): persist to config instead of resetting each session.
+    /// TODO(persist): read/write config instead of resetting each session.
     pub min_importance: u8,
     pub mode: Mode,
     pub quit: bool,
@@ -194,7 +190,6 @@ impl App {
         self.sealed = self.store.sealed_messages(self.account)?;
         self.empty = self.updates.is_empty() && self.sealed.is_empty();
 
-        // Re-anchor selection to the same message/sealed id if it still exists.
         if let Some(prev) = prev {
             let rows = self.rows();
             let sel = Self::selectable_indices(&rows);
@@ -225,9 +220,7 @@ impl App {
             .count()
     }
 
-    /// Whether an update sits ABOVE the squelch line. PastDue and Deadline
-    /// tiers ALWAYS stay above (they bypass the threshold by design); everything
-    /// else must clear the in-session `min_importance`.
+    /// Whether an update sits above the squelch line, at the in-session threshold.
     pub fn above_line(&self, u: &Update) -> bool {
         above_line(u, self.min_importance)
     }
@@ -236,7 +229,7 @@ impl App {
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
 
-        // Pinned tiers first, in priority order, always above the line.
+        // Pinned tiers first, in priority order; they bypass the threshold.
         let pinned = |t: Tier| self.updates.iter().filter(move |u| u.tier == t);
         for u in pinned(Tier::PastDue) {
             rows.push(Row::Update(u.clone()));
@@ -244,8 +237,7 @@ impl App {
         for u in pinned(Tier::Deadline) {
             rows.push(Row::Update(u.clone()));
         }
-        // Remaining above-line updates (Signal/Noise that clear the threshold),
-        // most important first.
+        // Then everything else that clears the threshold, most important first.
         let mut above: Vec<&Update> = self
             .updates
             .iter()
@@ -258,7 +250,6 @@ impl App {
 
         rows.push(Row::SquelchLine);
 
-        // Below-line updates (fell under the threshold).
         let mut below: Vec<&Update> = self
             .updates
             .iter()
@@ -336,7 +327,6 @@ impl App {
         }
     }
 
-    /// True when the current selection is a sealed row.
     pub fn selected_is_sealed(&self) -> bool {
         let rows = self.rows();
         let sel = Self::selectable_indices(&rows);
@@ -349,15 +339,12 @@ impl App {
         self.move_selection(0);
     }
 
-    // --- actions that touch the store -------------------------------------
-
-    /// Open the thread detail pane for the selected update via `thread_view`.
-    /// NotFound (also what sealed threads return) degrades to an empty pane.
+    /// Open the thread detail pane for the selected update. Any error —
+    /// including the NotFound a sealed thread returns — degrades to an empty pane.
     pub fn open_detail(&mut self) {
         let Some(u) = self.selected_update() else {
             return;
         };
-        // NotFound (also what sealed threads return) / any error: no detail.
         let view = self.store.thread_view(self.account, &u.thread_id).ok();
         self.mode = Mode::Detail { view, scroll: 0 };
     }
@@ -483,7 +470,6 @@ mod tests {
     fn past_due_and_deadline_stay_above_line_regardless_of_threshold() {
         let past = upd(1, Tier::PastDue, 0);
         let dead = upd(2, Tier::Deadline, 3);
-        // Even with the threshold maxed out, pinned tiers stay above.
         assert!(above_line(&past, 100));
         assert!(above_line(&dead, 100));
     }
@@ -529,12 +515,12 @@ mod tests {
     #[test]
     fn text_input_editing() {
         let mut t = TextInput::from("ab");
-        t.insert('c'); // "abc", cursor at 3
+        t.insert('c');
         assert_eq!(t.value(), "abc");
         t.left();
-        t.insert('X'); // "abXc"
+        t.insert('X');
         assert_eq!(t.value(), "abXc");
-        t.backspace(); // "abc"
+        t.backspace();
         assert_eq!(t.value(), "abc");
         assert_eq!(t.cursor(), 2);
     }

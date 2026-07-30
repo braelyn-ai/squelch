@@ -1,46 +1,22 @@
-//! Calendar-update detection for the ingest pipeline.
+//! Calendar-update detection: pure classification of invites, updates,
+//! cancellations, and RSVP responses, plus a best-effort title, start time, and
+//! organizer ([`CalendarInfo`]). A calendar update is a RECORD — noise-tier and
+//! auto-resolved at ingest, where "resolved" means inside squelch's attention
+//! ledger only (sync never writes to Gmail). Never run for sealed mail (see
+//! docs/SECURITY.md).
 //!
-//! This is a PURE detection/extraction module in the same spirit as
-//! [`crate::triage::receipt`] and [`crate::triage::shipment`]: given a message's
-//! surfaces (from-address, subject, body) it decides whether the message is a
-//! CALENDAR UPDATE — an invite, an updated invitation, a cancellation, or an
-//! RSVP response (Google Calendar notifications, Outlook meeting mail,
-//! ics-bearing invites) — and, if so, extracts the event title, a best-effort
-//! start time, and the organizer ([`CalendarInfo`]).
-//!
-//! A calendar update is a RECORD of scheduling state, not something the user
-//! must act on from the inbox (their actual calendar is the source of truth).
-//! Like receipts, it is noise-tier for the ranked inbox and AUTO-RESOLVED to
-//! 'done' at ingest — it lives only in the desktop "Calendar" zone.
-//!
-//! ## Conservatism (documented invariant)
-//!
-//! Detection requires STRUCTURAL signals, never topical keywords: a newsletter
-//! that merely mentions "calendar" must not match. Concretely, the subject must
-//! carry a calendar-system prefix shape ("Invitation: …", "Updated invitation:
-//! …", "Canceled event: …", "Accepted: …", …) AND, for the prefixes that
-//! ordinary humans/marketers also use ("Invitation:", "Updated:", "Accepted:",
-//! …), a CORROBORATING calendar signal: Google's trailing "@ <date>" subject
-//! clause, a calendar-notifier sender, or calendar machinery in the body
-//! (text/calendar, .ics, "When:/Where:" blocks, "Add to calendar", …).
-//! Uniquely calendar-system shapes ("Updated invitation:", "Canceled event:",
-//! "Tentatively accepted:", "New time proposed:") are structural on their own,
-//! as is the relayed-RSVP subject TEMPLATE "<Name> accepted|declined your
-//! <title> invitation (<dates>)" — RSVPs relayed from PERSONAL addresses carry
-//! no calendar-service sender, so the full structured template is the signal
-//! (prose like a body's "I accepted your invitation" never matches).
-//!
-//! SECURITY: this is NEVER run for sealed (auth/2FA) mail — the caller gates on
-//! `sensitivity='normal'` exactly like the shipment/deadline/receipt paths. No
-//! bodies are logged. NOTE: nothing here writes to Gmail — "resolved" means
-//! resolved inside squelch's attention ledger only; sync stays read-only.
+//! INVARIANT — detection is STRUCTURAL, never topical: a calendar-system subject
+//! prefix, with the prefixes humans also use ("Invitation:", "Accepted:", …)
+//! additionally demanding corroboration (an "@ <date>" clause, a calendar-
+//! notifier sender, or invite machinery in the body), or the full relayed-RSVP
+//! subject template. A newsletter that merely mentions "calendar" must not match.
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// What kind of calendar update this message is. Serialized (via [`as_str`])
-/// into the `calendar_updates.kind` column and the /client/calendar wire shape:
+/// What kind of calendar update this message is. [`as_str`] is a WIRE CONTRACT:
+/// it serializes into `calendar_updates.kind` AND the /client/calendar shape —
 /// "invite" | "update" | "cancellation" | "response".
 ///
 /// [`as_str`]: CalendarKind::as_str
@@ -78,28 +54,23 @@ impl CalendarKind {
     }
 }
 
-/// A detected calendar update. Mirrors the shape persisted in the
-/// `calendar_updates` table minus the DB identity/timestamp columns (those are
-/// supplied by the ingest pipeline from the message). Every extracted field is
-/// best-effort — a calendar update with nothing but its kind is still a
-/// calendar update (classification is driven by the structural subject shape).
+/// A detected calendar update: the `calendar_updates` table shape minus the DB
+/// identity/timestamp columns. Every extracted field is best-effort — the
+/// structural subject shape alone makes it a calendar update.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalendarInfo {
     pub kind: CalendarKind,
-    /// The event title from the subject with the kind prefix and Google's
-    /// trailing "@ <date> …" clause stripped. `None` when stripping leaves
-    /// nothing.
+    /// The subject with the kind prefix and any trailing "@ <date> …" clause
+    /// stripped; `None` when that leaves nothing.
     pub event_title: Option<String>,
-    /// Best-effort event start parsed from Google's "@ Wed Jul 22, 2026 10am …"
-    /// subject clause. LIMITATION (v0): the wall-clock time is stored AS UTC —
-    /// subject timezone abbreviations ("(PDT)") are ambiguous and unparsed, and
-    /// date-only clauses land at midnight. Good enough for a sidebar label;
-    /// never used for scheduling math.
+    /// Best-effort start parsed from an "@ Wed Jul 22, 2026 10am …" clause.
+    /// LIMITATION (v0): the wall-clock time is stored AS UTC (subject timezone
+    /// abbreviations are ambiguous and unparsed) and date-only clauses land at
+    /// midnight — fine for a label, never for scheduling math.
     pub starts_at: Option<DateTime<Utc>>,
-    /// Best-effort organizer: an explicit "Organizer: …" body line wins; else
-    /// the sender's display name / address — except for RSVP [`responses`],
-    /// where the sender is the ATTENDEE, so without a body line this stays
-    /// `None` rather than mislabeling the responder as organizer.
+    /// Best-effort organizer: an "Organizer: …" body line wins, else the
+    /// sender's name/address — except for RSVP [`responses`], whose sender is
+    /// the ATTENDEE, so it stays `None` rather than mislabeling the responder.
     ///
     /// [`responses`]: CalendarKind::Response
     pub organizer: Option<String>,
@@ -115,40 +86,31 @@ struct PrefixRule {
 }
 
 struct CalendarDetector {
-    /// Ordered prefix rules — more-specific shapes first ("Updated invitation:"
-    /// never falls through to "Invitation:", "Tentatively accepted:" never to
-    /// "Accepted:"; first match wins).
+    /// Ordered prefix rules, more-specific shapes FIRST so "Updated invitation:"
+    /// never falls through to "Invitation:" — first match wins.
     prefixes: Vec<PrefixRule>,
     /// Corroborating calendar machinery for WEAK prefixes: sender shapes and
-    /// body phrases only a real calendar/invite email carries. Topical words
-    /// like a bare "calendar" in prose deliberately do NOT appear here.
+    /// body phrases only a real invite carries. Topical words like a bare
+    /// "calendar" in prose deliberately do NOT appear here.
     corroborate_sender: Vec<Regex>,
     corroborate_text: Vec<Regex>,
     /// Relayed-RSVP subject TEMPLATE: "<Name> accepted your <title> invitation
-    /// (Aug 5–10, 2026)". RSVP notifications relayed from PERSONAL addresses
-    /// (or event apps) carry no calendar-service sender and no prefix — the
-    /// structured template itself is the structural signal: leading name, the
-    /// verb phrase, "your … invitation", optional trailing parenthesized date
-    /// range. A human writing "I accepted your invitation" in a BODY never
-    /// matches (detection is subject-shape only), and the subject "I accepted
-    /// your invitation" fails too (the template requires a non-empty title
-    /// between "your" and "invitation").
+    /// (Aug 5–10, 2026)". Such RSVPs carry no calendar-service sender and no
+    /// prefix, so the full structured form is itself the structural signal.
+    /// Prose never matches: detection is subject-shape only, and the template
+    /// requires a non-empty title between "your" and "invitation".
     rsvp_template: Regex,
     /// "Organizer: …" body line (Google/Outlook both emit one).
     organizer_line: Regex,
-    /// A date-ish leadin for the clause after " @ " in a Google subject:
-    /// weekday/month names or recurrence words. Used to split the title from
-    /// the trailing date clause without truncating titles that contain "@".
+    /// Date-ish leadin (weekday/month/recurrence word) for the clause after
+    /// " @ ", so the title/date split never truncates a title containing "@".
     dateish_leadin: Regex,
     /// Month-day(-year) fragment inside the date clause.
     month_day: Regex,
     /// Clock time inside the date clause ("10am", "9:30pm").
     clock: Regex,
-    /// A standalone 4-digit year ("2026") trailing a date-RANGE clause like
-    /// "Aug 5–10, 2026", where the year is separated from the first month-day
-    /// by the range tail and so misses the inline year group of [`month_day`].
-    ///
-    /// [`month_day`]: CalendarDetector::month_day
+    /// Standalone 4-digit year trailing a date-RANGE clause ("Aug 5–10, 2026"),
+    /// where the range tail puts it out of `month_day`'s inline year group.
     year: Regex,
 }
 
@@ -163,7 +125,7 @@ fn detector() -> &'static CalendarDetector {
         let weak = |p: &str, kind| PrefixRule { re: rx(p), kind, strong: false };
         CalendarDetector {
             prefixes: vec![
-                // STRONG: essentially only calendar systems produce these.
+                // STRONG: only calendar systems produce these.
                 strong(r"^updated invitation:\s*", CalendarKind::Update),
                 strong(r"^cancell?ed event:\s*", CalendarKind::Cancellation),
                 strong(r"^tentatively accepted:\s*", CalendarKind::Response),
@@ -179,7 +141,6 @@ fn detector() -> &'static CalendarDetector {
                 weak(r"^tentative:\s*", CalendarKind::Response),
             ],
             corroborate_sender: vec![
-                // Google Calendar's notification senders.
                 rx(r"calendar-notification@"),
                 rx(r"@calendar\."),
                 rx(r"calendar-server\."),
@@ -216,20 +177,18 @@ fn detector() -> &'static CalendarDetector {
     })
 }
 
-/// Does anything corroborate the calendar reading of a WEAK subject prefix?
-/// The Google "@ <date>" subject clause is checked separately by the caller
-/// (via the title/clause split).
+/// Does anything corroborate a WEAK subject prefix? The "@ <date>" subject
+/// clause is checked separately by the caller, via the title/clause split.
 fn has_corroboration(from_addr: &str, body: &str) -> bool {
     let d = detector();
     d.corroborate_sender.iter().any(|re| re.is_match(from_addr))
         || d.corroborate_text.iter().any(|re| re.is_match(body))
 }
 
-/// Split the post-prefix subject remainder into `(title, date_clause)` on
-/// Google's " @ <date>" convention. Scans " @ " occurrences left-to-right and
-/// splits at the FIRST whose suffix starts date-ish (weekday/month/recurrence
-/// word), so a title containing a literal "@" ("Coffee @ Blue Bottle") is not
-/// truncated. No date-ish suffix => the whole remainder is the title.
+/// Split the post-prefix subject into `(title, date_clause)` on the " @ <date>"
+/// convention, at the FIRST " @ " whose suffix starts date-ish — so a title
+/// containing a literal "@" ("Coffee @ Blue Bottle") is not truncated. No
+/// date-ish suffix means the whole remainder is the title.
 fn split_title_clause(rest: &str) -> (String, Option<&str>) {
     let d = detector();
     for (i, _) in rest.match_indices('@') {
@@ -249,10 +208,9 @@ fn split_title_clause(rest: &str) -> (String, Option<&str>) {
     (rest.trim().to_string(), None)
 }
 
-/// Resolve a year-less (month, day) to the nearest occurrence relative to the
-/// message's receipt: same-year unless that lands more than 14 days before
-/// `received_at`, in which case roll forward a year. Mirrors the deadline
-/// module's rule so year-less dates behave identically across extractors.
+/// Resolve a year-less (month, day) to the nearest occurrence relative to
+/// receipt: same year, unless that lands more than 14 days before `received_at`,
+/// in which case roll forward a year.
 fn resolve_yearless(month: u32, day: u32, received_at: DateTime<Utc>) -> Option<NaiveDate> {
     let recv = received_at.date_naive();
     let same_year = NaiveDate::from_ymd_opt(recv.year(), month, day)?;
@@ -263,11 +221,9 @@ fn resolve_yearless(month: u32, day: u32, received_at: DateTime<Utc>) -> Option<
     }
 }
 
-/// Best-effort start time from a Google "@ …" date clause, e.g.
-/// "Wed Jul 22, 2026 10am – 11am (PDT) (you@gmail.com)". Takes the FIRST
-/// month-day (year optional — year-less anchors to `received_at`) and the FIRST
-/// clock time after it. See [`CalendarInfo::starts_at`] for the v0 timezone
-/// limitation (wall time stored as UTC).
+/// Best-effort start time from an "@ …" date clause: the FIRST month-day (a
+/// year-less one anchors to `received_at`) and the FIRST clock time after it.
+/// See [`CalendarInfo::starts_at`] for the v0 timezone limitation.
 fn parse_starts_at(clause: &str, received_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let d = detector();
     let cap = d.month_day.captures(clause)?;
@@ -281,8 +237,7 @@ fn parse_starts_at(clause: &str, received_at: DateTime<Utc>) -> Option<DateTime<
     let date = match cap.get(3) {
         Some(y) => NaiveDate::from_ymd_opt(y.as_str().parse().ok()?, month, day)?,
         // A range clause ("Aug 5–10, 2026") separates the year from the first
-        // month-day: look for a standalone trailing year before falling back to
-        // year-less resolution.
+        // month-day: try a standalone trailing year before resolving year-less.
         None => match d.year.captures(after) {
             Some(y) => NaiveDate::from_ymd_opt(y.get(1)?.as_str().parse().ok()?, month, day)?,
             None => resolve_yearless(month, day, received_at)?,
@@ -305,13 +260,11 @@ fn parse_starts_at(clause: &str, received_at: DateTime<Utc>) -> Option<DateTime<
     Some(Utc.from_utc_datetime(&ndt))
 }
 
-/// Detect a calendar update from a message's surfaces. Returns `None` when the
-/// subject carries no calendar-system prefix shape, or a weak prefix has no
-/// corroborating calendar machinery (so "Invitation: VIP sale!" marketing and
-/// newsletters that merely mention calendars never match).
+/// Detect a calendar update from a message's surfaces. `None` when the subject
+/// carries no calendar-system prefix shape, or a weak prefix has no
+/// corroboration (so "Invitation: VIP sale!" never matches).
 ///
-/// SECURITY: callers MUST NOT invoke this for sealed mail. It reads only the
-/// provided text and never logs.
+/// SECURITY: callers MUST NOT invoke this for sealed mail (docs/SECURITY.md).
 pub fn detect_calendar(
     from_addr: &str,
     from_name: Option<&str>,
@@ -322,17 +275,9 @@ pub fn detect_calendar(
     let d = detector();
     let subject = subject.trim();
 
-    // 1. Structural subject shape. Two families, tried in order:
-    //    a. PREFIX rules (first match wins; specific shapes are listed before
-    //       the generic ones they'd otherwise shadow), with the WEAK ones
-    //       demanding corroboration — the Google "@ <date>" clause, a
-    //       calendar-notifier sender, or invite machinery in the body.
-    //    b. The relayed-RSVP TEMPLATE ("<Name> accepted your <title>
-    //       invitation (…)"), whose full structured form is a structural
-    //       signal on its own — RSVPs relayed from PERSONAL addresses carry no
-    //       calendar-ish sender to corroborate with. `who` is the RESPONDER.
-    //    Anything else — including a body-only "I accepted your invitation" —
-    //    is not a calendar update.
+    // 1. Structural subject shape, in order: PREFIX rules (first match wins,
+    //    WEAK ones demanding corroboration), then the relayed-RSVP TEMPLATE
+    //    (whose `who` is the RESPONDER). Anything else is not a calendar update.
     let (kind, title, clause, responder) = if let Some((rule, rest)) =
         d.prefixes.iter().find_map(|rule| {
             rule.re
@@ -340,8 +285,8 @@ pub fn detect_calendar(
                 .filter(|m| m.start() == 0)
                 .map(|m| (rule, &subject[m.end()..]))
         }) {
-        // Title / "@ <date>" clause split — the clause is ALSO the strongest
-        // corroboration a subject can carry.
+        // The "@ <date>" clause is also the strongest corroboration a subject
+        // can carry, so the split has to happen before the weak-prefix check.
         let (title, clause) = split_title_clause(rest);
         if !rule.strong && clause.is_none() && !has_corroboration(from_addr, body) {
             return None;
@@ -368,10 +313,9 @@ pub fn detect_calendar(
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim().to_string())
         .or_else(|| match kind {
-            // Relayed-RSVP template: the update is ABOUT the responder — carry
-            // their leading name (falling back to the from-address). A bare
-            // prefix RSVP ("Accepted: …") has no such name and its sender is
-            // the attendee, not the organizer, so it stays None.
+            // A relayed RSVP is ABOUT the responder, so carry their name (else
+            // the from-address). A bare prefix RSVP has no such name and its
+            // sender is the attendee, not the organizer: stays None.
             CalendarKind::Response => responder.or_else(|| {
                 d.rsvp_template
                     .is_match(subject)
@@ -516,8 +460,8 @@ mod tests {
 
     #[test]
     fn relayed_rsvp_from_personal_address_is_response() {
-        // The real case: an RSVP relayed from a PERSONAL address — no calendar
-        // service sender, no prefix. The structured subject template carries it.
+        // An RSVP relayed from a PERSONAL address: no calendar-service sender
+        // and no prefix, so the structured subject template has to carry it.
         let c = detect_calendar(
             "ellie@elliehuxtable.com",
             Some("Ellie Huxtable"),
@@ -738,7 +682,7 @@ mod tests {
 
     #[test]
     fn otp_shaped_email_is_not_a_calendar_update() {
-        // Belt (ingest never calls this for sealed mail) + suspenders.
+        // Ingest never calls this for sealed mail; it must not match anyway.
         let c = detect_calendar(
             "noreply@bank.com",
             None,

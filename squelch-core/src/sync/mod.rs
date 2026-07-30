@@ -1,26 +1,8 @@
-//! The Gmail sync engine (REST API, polling).
-//!
-//! Responsibilities:
-//! - Talk to the Gmail REST API at `https://gmail.googleapis.com/gmail/v1/users/me/...`
-//!   over HTTPS (reqwest + rustls) using a Bearer access token from the existing
-//!   [`CredentialStore`]. The read-only `gmail.readonly` OAuth scope is honored
-//!   by the REST API (unlike IMAP XOAUTH2, which rejects it) — this is the whole
-//!   reason the transport is REST and not IMAP.
-//! - On first run, backfill the last `backfill_days` of INBOX (`format=raw` ->
-//!   RFC822 bytes) plus SENT headers (`format=metadata`) to seed contacts, then
-//!   record the account's `historyId`.
-//! - Then poll `history.list` every `poll_secs` for `messageAdded` events on
-//!   INBOX, fetch each new message `format=raw`, and ingest, advancing the
-//!   `historyId` cursor. A 404 (expired historyId) triggers a fresh catch-up.
-//!
-//! SECURITY INVARIANTS honored here:
-//! - The OAuth scope is fixed read-only upstream; we only ever *read* mail.
-//! - Every fetched message goes through
-//!   [`crate::sync::ingest::ingest_with_rules`] which runs seal detection FIRST,
-//!   so sealed mail is classified and stored `sensitivity='sealed'` in the same
-//!   transaction with importance 0 and never reaches Stage-2 or any LLM.
-//! - Tokens / `Authorization` headers / message bodies are NEVER logged. Only
-//!   counts and redacted context.
+//! Gmail sync: REST + polling. REST, not IMAP — the read-only `gmail.readonly`
+//! scope works over REST and IMAP XOAUTH2 rejects it. First run backfills
+//! `backfill_days` of INBOX+SENT and records the `historyId`; after that
+//! `history.list` polls `messageAdded`, a 404 falling back to a full catch-up.
+//! Tokens, headers and bodies are NEVER logged; ingest seals first (SECURITY.md).
 
 pub mod html;
 pub mod ingest;
@@ -55,34 +37,26 @@ const LABEL_SENT: &str = "SENT";
 /// The single `sync_state` row key for the REST engine's historyId cursor.
 const HISTORY_KEY: &str = "history";
 
-/// The `wake_budget.thread_id` sentinel for the global-per-account-per-day
-/// Stage-2 budget. No real Gmail thread id can collide (Gmail thread ids are
-/// hex, never this literal). Keeping global counting in the same table avoids a
-/// schema addition.
+/// `wake_budget.thread_id` sentinel for the per-account-per-day Stage-2 budget.
+/// Gmail thread ids are hex, so no real thread can collide with it.
 const GLOBAL_BUDGET_KEY: &str = "__global__";
 
-/// Prefix for the per-SENDER-per-day Stage-2 budget key stored in the same
-/// `wake_budget` table (`thread_id = "sender:<addr>"`). No real Gmail thread id
-/// starts with `sender:` (they are hex), so this never collides with a real
-/// per-thread row or the `__global__` sentinel. Mirrors the `__global__`
-/// pattern; avoids a schema addition. (Schema applies fresh; dev dbs get reset.)
+/// Prefix for the per-SENDER-per-day Stage-2 budget key in the same
+/// `wake_budget` table (`thread_id = "sender:<addr>"`). Gmail thread ids are
+/// hex, so this collides with neither a real thread nor `__global__`.
 const SENDER_BUDGET_PREFIX: &str = "sender:";
 
-/// The `wake_budget.thread_id` sentinel for the GLOBAL-per-account-per-day
-/// Stage-1 budget. Stage-1 needs only a global cap (it must see every email), so
-/// there is no per-thread/sender Stage-1 scope. Distinct from the Stage-2
-/// `__global__` sentinel so the two stages' daily counts never collide. No real
-/// Gmail thread id can match (they are hex).
+/// `wake_budget.thread_id` sentinel for the Stage-1 daily budget. Stage-1 must
+/// see every email, so a global cap is its only scope; the key is distinct from
+/// the Stage-2 sentinel so the two stages' daily counts never collide.
 const STAGE1_GLOBAL_BUDGET_KEY: &str = "__stage1_global__";
 
-/// Which sync path an ingest batch is running on. It decides ONE thing: whether
-/// a notification-worthy verdict may append an `events` row.
-///
-/// The INITIAL BACKFILL never notifies — a fresh install must not fire a hundred
-/// pushes for a month of already-read mail. Every incremental path may, and the
-/// freshness window plus the one-event-per-message key are what make that safe
-/// even for `catch_up()`, which re-scans the ENTIRE backfill window whenever the
-/// history cursor expires.
+/// Which sync path an ingest batch is on. Decides ONE thing: whether a
+/// notification-worthy verdict may append an `events` row. Backfill never
+/// notifies (a fresh install must not fire a hundred pushes for a month of
+/// already-read mail); every incremental path may, kept safe by the freshness
+/// window plus the one-event-per-message key even when `catch_up()` re-scans
+/// the whole backfill window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngestOrigin {
     /// First-run backfill. Structurally silent.
@@ -91,20 +65,18 @@ enum IngestOrigin {
     Incremental,
 }
 
-/// Model id stamped on a row skipped for being older than `stage2_max_age_days`:
-/// it is marked processed WITHOUT a model call so it neither consumes budget nor
-/// sits queued forever, keeping its Stage-1 values.
+/// Model id stamped on a row older than `stage2_max_age_days`: marked processed
+/// WITHOUT a model call, keeping its Stage-1 values, so it neither spends budget
+/// nor sits queued forever.
 const STALE_SKIP_MODEL: &str = "stale-skip";
 
 /// Reconnect / retry backoff bounds for the outer driver loop.
 const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
-/// Collapse an untrusted, header-derived string down to a short run of printable
-/// ASCII for safe logging. Non-printable/non-ASCII bytes (control chars, ANSI
-/// escapes, newlines that could forge log lines) become `.`, and the result is
-/// capped so a pathological header can't flood the log. Used on values that
-/// originate from mail headers before they reach the daemon log.
+/// Collapse an untrusted header-derived string to printable ASCII before it
+/// reaches the log: control chars, ANSI escapes and log-forging newlines become
+/// `.`, and the result is capped so a pathological header can't flood the log.
 fn sanitize_ascii(s: &str, max: usize) -> String {
     s.chars()
         .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '.' })
@@ -112,11 +84,9 @@ fn sanitize_ascii(s: &str, max: usize) -> String {
         .collect()
 }
 
-/// A stable, non-reversible tag for a sender address, safe to print in the
-/// once-daily budget notices. The raw `from_addr` is UNTRUSTED (hostile-header
-/// derived) PII, so instead of logging it we log the first 12 hex chars of its
-/// SHA-256 as `sender#<hex>` — enough to correlate repeated notices for the same
-/// sender across a day without ever writing the address itself.
+/// A stable, non-reversible tag (`sender#<12 hex of sha256>`) for a sender
+/// address. `from_addr` is untrusted header-derived PII and must never be
+/// logged; the tag still correlates repeated notices for the same sender.
 fn redact_sender(from_addr: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(from_addr.as_bytes());
@@ -127,14 +97,12 @@ fn redact_sender(from_addr: &str) -> String {
     format!("sender#{hex}")
 }
 
-/// Decode a base64url (Gmail `format=raw`) payload into RFC822 bytes.
-///
-/// Gmail returns the raw message web-safe base64url encoded, usually WITHOUT
-/// padding. We accept both padded and unpadded input. Errors are surfaced (not
-/// logged with content) so a single bad message doesn't poison the batch.
+/// Decode a base64url (Gmail `format=raw`) payload into RFC822 bytes. Gmail
+/// usually omits padding; both padded and unpadded input are accepted. Errors
+/// are surfaced without content so one bad message can't poison the batch.
 pub fn decode_raw_b64url(s: &str) -> Result<Vec<u8>> {
-    // MEMORY GUARD: bound peak ingest memory ourselves instead of inheriting
-    // Gmail's ~50MB message limit. b64 length upper-bounds the decoded size.
+    // MEMORY GUARD: bound peak ingest memory ourselves rather than inheriting
+    // Gmail's ~50MB limit. b64 length upper-bounds the decoded size.
     const MAX_RAW_BYTES: usize = 64 * 1024 * 1024;
     let t = s.trim();
     if t.len() / 4 * 3 > MAX_RAW_BYTES {
@@ -149,13 +117,10 @@ pub fn decode_raw_b64url(s: &str) -> Result<Vec<u8>> {
         .map_err(|e| CoreError::InvalidInput(format!("base64url decode failed: {e}")))
 }
 
-/// Decide, given the persisted historyId cursor, whether the incremental poll
-/// can proceed (Some(history_id)) or a fresh backfill-style catch-up is required
-/// (None). Pure so the 404-fallback path is unit-testable without a network.
-///
-/// `expired` reflects an HTTP 404 from `history.list` (Gmail drops history
-/// older than ~a week). `cursor` is the stored historyId (0 / absent means we
-/// never established one, i.e. first run).
+/// Decide whether the incremental poll can proceed or a fresh catch-up is
+/// required. `expired` reflects an HTTP 404 from `history.list` (Gmail drops
+/// history older than ~a week); a 0/absent `cursor` means first run. Pure, so
+/// the 404-fallback path is unit-testable without a network.
 pub fn history_poll_decision(cursor: Option<u64>, expired: bool) -> HistoryDecision {
     match cursor {
         Some(id) if id > 0 && !expired => HistoryDecision::Incremental(id),
@@ -172,9 +137,8 @@ pub enum HistoryDecision {
     FullCatchUp,
 }
 
-/// Advance a historyId cursor: take the max of the current cursor and every
-/// `historyId` observed in a `history.list` page, never moving backwards. Pure
-/// and network-free so cursor arithmetic is unit-testable.
+/// Advance a historyId cursor to the max of itself and every `historyId`
+/// observed in a page — never backwards. Pure, so it is unit-testable.
 pub fn advance_history_cursor(current: u64, observed: impl IntoIterator<Item = u64>) -> u64 {
     observed.into_iter().fold(current, u64::max)
 }
@@ -210,10 +174,8 @@ struct RawMessage {
     internal_date: Option<String>,
 }
 
-/// A single Gmail metadata header. Test-only now that SENT backfill fetches full
-/// bodies (`format=raw`) rather than headers — the contacts-seeding tests build
-/// these to exercise the header-parsing ingest path via
-/// [`synthesize_rfc822_headers`].
+/// A single Gmail metadata header. Test-only: the contacts-seeding tests build
+/// these to exercise header parsing via [`synthesize_rfc822_headers`].
 #[cfg(test)]
 struct MessageHeader {
     name: String,
@@ -258,8 +220,8 @@ fn parse_history_id(s: &str) -> u64 {
     s.trim().parse::<u64>().unwrap_or(0)
 }
 
-/// Which Stage-2 daily cap a budget-exhausted notice is about. Used to rate-
-/// limit each notice to at most once per UTC day (see [`SyncEngine::warn_days`]).
+/// Which daily cap a budget-exhausted notice is about; each is rate-limited to
+/// once per UTC day (see [`SyncEngine::warn_days`]).
 #[derive(Debug, Clone, Copy)]
 enum CapKind {
     Thread,
@@ -268,9 +230,8 @@ enum CapKind {
     Stage1Global,
 }
 
-/// The last UTC day (`YYYY-MM-DD`) a budget-exhausted notice was emitted for each
-/// cap kind. Re-armed when the day rolls over, so a persistently-capped account
-/// logs each notice once a day instead of every ~45s poll.
+/// The last UTC day (`YYYY-MM-DD`) each cap kind's notice was emitted; re-armed
+/// when the day rolls over, so a capped account logs once a day, not per poll.
 #[derive(Default)]
 struct WarnDays {
     thread: Option<String>,
@@ -289,28 +250,20 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     account_email: String,
     config: Config,
     http: reqwest::Client,
-    /// The resolved Stage-2 API key and its provider, if present at startup.
-    /// When `None`, Stage-2 is DISABLED gracefully (rows stay queued, one stderr
-    /// notice, sync continues). The key is never logged.
+    /// Stage-2 API key + provider, resolved once at startup. `None` disables
+    /// Stage-2 gracefully: rows stay queued, one stderr notice, sync continues.
+    /// The key is never logged.
     stage2_key: Option<(String, Stage2Provider)>,
-    /// On-box embedder OVERRIDE for v1 semantic recall. Usually `None`: the
-    /// effective embedder is resolved via [`SyncEngine::embedder`], which falls
-    /// back to the STORE's embedder. Reading it from the store each time means a
-    /// LATE-attached embedder (e.g. `squelchd serve` attaches it in the background
-    /// after binding the port) is picked up automatically — until it is ready,
-    /// ingest simply skips the vector write and the startup/periodic backfill pass
-    /// fills the gap once the embedder appears. CPU work runs under
-    /// `spawn_blocking` so the poll loop never stalls on it.
+    /// Embedder OVERRIDE; usually `None`, with [`SyncEngine::embedder`] falling
+    /// back to the store's. Resolving per tick is what lets a LATE-attached
+    /// embedder be picked up without a restart.
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
-    /// Manual-refresh signal. The poll loop sleeps `poll_secs` between ticks;
-    /// notifying this wakes it EARLY so it runs a fresh Gmail poll now instead of
-    /// waiting out the interval. The human door's `POST /client/refresh` holds a
-    /// clone and fires it on user request. Coalescing is intentional: several
-    /// pokes during one in-flight poll collapse into a single extra tick.
+    /// Manual-refresh signal: notifying it wakes the sleeping poll loop early.
+    /// Coalescing is intentional — several pokes during one in-flight poll
+    /// collapse into a single extra tick.
     refresh: Arc<tokio::sync::Notify>,
-    /// Per-cap-kind last-warned UTC day, so budget-exhausted notices fire at most
-    /// once per day rather than every poll. In-memory only (a restart re-arms
-    /// them, which is fine — a fresh notice on restart is acceptable).
+    /// Per-cap-kind last-warned UTC day. In-memory only; a restart re-arms them,
+    /// and one fresh notice on restart is acceptable.
     warn_days: std::sync::Mutex<WarnDays>,
 }
 
@@ -322,15 +275,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         account_email: String,
         config: Config,
     ) -> Self {
-        // rustls-only client; no native-tls. Timeouts keep a hung connection
-        // from wedging the poll loop.
+        // Timeouts keep a hung connection from wedging the poll loop.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client build");
-        // Resolve the Stage-2 API key + provider once. Absence => graceful
-        // disable with a single stderr notice (no key material logged).
+        // Absence => graceful disable, one notice, no key material logged.
         let stage2_key = config.stage2.resolve_key_and_provider();
         if stage2_key.is_none() {
             eprintln!(
@@ -353,42 +304,35 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Share a manual-refresh [`Notify`](tokio::sync::Notify) with the engine so
-    /// an external caller (the human door's `POST /client/refresh`) can wake the
-    /// poll loop between intervals. Create ONE `Notify` at daemon startup, hand a
-    /// clone here and a clone to the API state, and the button's poke turns into
-    /// an immediate Gmail poll. Chainable with [`new`]; without it the engine
+    /// Share a manual-refresh [`Notify`](tokio::sync::Notify) so the human door's
+    /// `POST /client/refresh` can wake the poll loop between intervals: create
+    /// ONE at daemon startup and hand a clone to each side. Without it the engine
     /// still polls on its own interval, just never early.
     pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
         self.refresh = refresh;
         self
     }
 
-    /// Attach an on-box [`Embedder`](crate::embed::Embedder) OVERRIDE so ingest
-    /// and the startup backfill populate the semantic-recall vector index. Usually
-    /// unnecessary — the engine falls back to the STORE's embedder (see
-    /// [`SyncEngine::embedder`]) — but kept for callers (`run`) that build the
-    /// embedder eagerly and want it used even if the store's copy differs. Absence
-    /// keeps sync fully functional (no vectors written). Chainable with [`new`].
+    /// Attach an [`Embedder`](crate::embed::Embedder) OVERRIDE, for callers that
+    /// build one eagerly and want it used even if the store's copy differs.
+    /// Usually unnecessary — [`SyncEngine::embedder`] falls back to the store's —
+    /// and absence keeps sync fully functional, just writing no vectors.
     pub fn with_embedder(mut self, embedder: Arc<dyn crate::embed::Embedder>) -> Self {
         self.embedder = Some(embedder);
         self
     }
 
-    /// Resolve the EFFECTIVE embedder for this tick: the explicit override if set,
-    /// else whatever is currently attached to the store. Reading the store each
-    /// time means a background-attached embedder (`squelchd serve`) is picked up
-    /// automatically once it becomes ready — before that, this returns `None` and
-    /// ingest simply skips the vector write (the backfill pass fills it in later).
+    /// The EFFECTIVE embedder for this tick: the override, else whatever is
+    /// attached to the store RIGHT NOW — so an embedder attached in the
+    /// background after startup is picked up without a restart. Until then this
+    /// is `None`, ingest skips the vector write, and the backfill pass fills in.
     fn embedder(&self) -> Option<Arc<dyn crate::embed::Embedder>> {
         self.embedder.clone().or_else(|| self.store.embedder())
     }
 
-    /// Perform an authenticated GET returning parsed JSON. On a 401 we re-request
-    /// the token once (the [`CredentialStore`] auto-refreshes) and retry exactly
-    /// once. A 404 is surfaced as [`CoreError::NotFound`] so callers can branch
-    /// (used for the expired-historyId fallback). The `Authorization` header and
-    /// response body are NEVER logged.
+    /// Authenticated GET returning parsed JSON. A 404 surfaces as
+    /// [`CoreError::NotFound`] so callers can branch on it (the
+    /// expired-historyId fallback). Header and body are NEVER logged.
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T> {
         let resp = self.send_get(url).await?;
         match resp.status() {
@@ -409,7 +353,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let token = self.creds.token(self.account_id).await?;
         let resp = self.bearer_get(url, &token.access_token).await?;
         if resp.status() == StatusCode::UNAUTHORIZED {
-            // Redacted: no token/header content, just the fact of a retry.
+            // Redacted: the fact of a retry, never token/header content.
             eprintln!("squelch: gmail 401; refreshing token and retrying once");
             let token = self.creds.token(self.account_id).await?;
             return self.bearer_get(url, &token.access_token).await;
@@ -435,19 +379,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let cursor = self.load_history_cursor()?;
         if cursor.is_none() {
             self.backfill().await?;
-            // Stage-1 LLM refine pass over the backfill batch, then Stage-2 over
-            // any rows Stage-1 escalated, then the specialist-extractor pass over
-            // rows either stage categorized into an extractable category.
+            // Stage-1, then Stage-2 over what Stage-1 escalated, then the
+            // specialist extractors over each row's FINAL category.
             self.stage1_pass().await;
             self.stage2_pass().await;
             self.extract_pass().await;
         }
 
-        // VECTOR BACKFILL: embed any NON-SEALED messages still missing a vector.
-        // Covers pre-existing rows (schema/model added after a prior sync) and
-        // ingest-time embed failures. Sealed rows are structurally excluded by
-        // `messages_missing_vectors` (it selects sensitivity='normal' only), so
-        // this can never embed sealed content. No-op when no embedder is attached.
         self.backfill_missing_vectors().await;
 
         self.poll_loop(shutdown).await
@@ -467,14 +405,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .await?;
         eprintln!("squelch: backfilled {n} INBOX messages");
 
-        // SENT bodies (format=raw). Fetching full bodies (not just headers) is
-        // what makes v1 semantic recall cover WHAT THE USER WROTE ("did I say
-        // I'd send X"). The is_sent ingest path is otherwise unchanged: contacts
-        // are still derived from To/Cc recipients, the row is stored neutral
-        // (tier=noise, importance=0) and stays out of triage/updates/search via
-        // the existing is_sent exclusions. The extra win over the old
-        // headers-only path is that the sent BODY lands in `messages.body`, so
-        // it is embeddable for recall.
+        // SENT bodies, not just headers, so semantic recall covers WHAT THE USER
+        // WROTE. Contacts still come from To/Cc; the row is stored neutral
+        // (tier=noise, importance=0) and the is_sent exclusions keep it out of
+        // triage/updates/search.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
         let seeded = self
             .fetch_raw_and_ingest(&sent_ids, /* is_sent */ true, IngestOrigin::Backfill)
@@ -497,26 +431,21 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 return Ok(());
             }
             self.poll_once().await?;
-            // Stage-1 LLM refine pass after each ingest batch, then Stage-2 over
-            // any rows Stage-1 escalated (both refine within the same cycle).
-            // Never crashes the sync loop (all failures handled internally).
+            // Both stages refine within the same cycle; neither can crash the
+            // loop (all failures are handled internally).
             self.stage1_pass().await;
             self.stage2_pass().await;
-            // Specialist-extractor pass runs AFTER both stages so it sees each
-            // row's FINAL category (Stage-2 may have overwritten Stage-1's).
+            // AFTER both stages, so it sees each row's FINAL category (Stage-2
+            // may have overwritten Stage-1's).
             self.extract_pass().await;
 
-            // VECTOR BACKFILL each tick. Cheap no-op when no embedder is attached
-            // or the queue is empty. This is what makes a BACKGROUND-attached
-            // embedder (`squelchd serve` attaches it after binding the port) catch
-            // up WITHOUT a daemon restart: rows ingested while the embedder was not
-            // yet ready are picked up on the next tick once it becomes available.
+            // Per-tick, so an embedder attached after startup catches up on rows
+            // ingested before it was ready, no restart needed.
             self.backfill_missing_vectors().await;
 
-            // Sleep the poll interval, waking early on shutdown OR on a manual
-            // refresh poke (human door). A poke that arrives mid-poll is not lost:
-            // `Notify` stores one permit, so the next `notified()` returns at once
-            // and the loop runs one more immediate tick.
+            // A refresh poke that arrives mid-poll is not lost: `Notify` stores
+            // one permit, so the next `notified()` returns at once and the loop
+            // runs one more immediate tick.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = self.refresh.notified() => {
@@ -610,10 +539,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     async fn catch_up(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
-        // INCREMENTAL: a catch-up can carry genuinely new mail, so it is allowed
-        // to notify — but it re-scans the WHOLE backfill window, so what keeps it
-        // from storming is the freshness window in `triage::events` plus the
-        // one-event-per-message key, not this flag.
+        // A catch-up may carry genuinely new mail, so it is allowed to notify.
+        // What keeps the whole-window re-scan from storming is the freshness
+        // window in `triage::events` plus the one-event-per-message key.
         let n = self
             .fetch_raw_and_ingest(&ids, false, IngestOrigin::Incremental)
             .await?;
@@ -651,8 +579,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     }
 
     /// Fetch each id `format=raw`, base64url-decode to RFC822, and run through
-    /// the (unchanged) ingest pipeline. Sequential — rate limits are a non-issue
-    /// at this volume. Returns the count ingested.
+    /// the ingest pipeline. Sequential — rate limits are a non-issue at this
+    /// volume. Returns the count ingested.
     async fn fetch_raw_and_ingest(
         &self,
         ids: &[String],
@@ -698,13 +626,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         Ok(count)
     }
 
-    /// Run one fetched message through the unchanged seal-first ingest pipeline
-    /// and commit it atomically. Returns `Some((message_id, embed_text))` for a
-    /// NORMAL-sensitivity message so the caller can embed it for semantic recall,
-    /// or `None` for a SEALED message — the STRUCTURAL GATE that keeps sealed
-    /// content out of the vector space (there is nothing to embed, not a filtered
-    /// embedding). `embed_text` is the same subject+body flattening used at query
-    /// time, truncated per config.
+    /// Run one fetched message through the seal-first ingest pipeline and commit
+    /// it atomically. Returns `Some((message_id, embed_text))` for a NORMAL row,
+    /// `None` for a SEALED one — the structural gate keeping sealed content out
+    /// of the vector space (nothing to embed, not a filtered embedding).
+    /// `embed_text` is the same flattening used at query time.
     fn ingest_one(
         &self,
         fetched: &RawFetched,
@@ -720,16 +646,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             |addr| self.store.is_known_contact(self.account_id, addr).unwrap_or(false),
         );
         let id = self.store.ingest_message(&triaged)?;
-        // NOTIFICATION EVENT (heuristic verdict). Only on an incremental path, and
-        // only for a CONFIDENT seed — a guess is not grounds for waking anyone, so
-        // non-confident rows wait for the Stage-1/Stage-2 apply sites. Worthiness
-        // and the freshness storm guard are decided in `triage::events`.
-        //
-        // ACCEPTED v1 TRADEOFF (fast notify vs accuracy): a confident seed is
-        // still refined by Stage-1 later, which may DOWNGRADE it — but by then
-        // the push has fired and the events row keeps the seed's snapshot
-        // (UNIQUE(message_id): no second, corrected event). Notifying now beats
-        // sitting on mail that looks urgent until an LLM pass gets around to it.
+        // Notify on a CONFIDENT heuristic seed only; a guess waits for the
+        // Stage-1/Stage-2 apply sites. ACCEPTED TRADEOFF: Stage-1 may later
+        // DOWNGRADE the seed, but the push has already fired and
+        // UNIQUE(message_id) means no second, corrected event.
         if origin == IngestOrigin::Incremental && triaged.confident {
             self.emit_event(&events::ingest_context(&triaged, id, rules), now);
         }
@@ -745,30 +665,22 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         Ok(Some((id, text)))
     }
 
-    /// Append the `events` row for a verdict that just landed, if it earns one.
-    ///
-    /// The single emission point for all three verdict sites (ingest heuristic,
-    /// Stage-1 apply, Stage-2 apply). The DECISION lives in [`events::event_for`]
-    /// — pure, config-driven, and the owner of both the seal invariant and the
-    /// freshness storm guard; this method is only the plumbing.
-    ///
-    /// BEST-EFFORT BY DESIGN: a notification is never worth failing triage over,
-    /// so a store error is logged (redacted — ids only) and swallowed. Dedup lives
-    /// in the store (`UNIQUE(message_id)`), so calling this for a message that
-    /// already notified is a silent no-op — which is exactly what makes the refine
-    /// passes and `catch_up()`'s window re-scan safe to hook.
     /// The sender's CURRENT rule disposition, for the refine emission sites —
     /// see [`events::current_rule`] for why a queued row cannot answer this
-    /// itself. One small SELECT per refined row, alongside an LLM call.
-    ///
-    /// A store error reads as "no rule", which is the pre-existing behavior of
-    /// these sites; the surrounding pass has already logged any real store
-    /// trouble by the time we get here.
+    /// itself. A store error reads as "no rule"; the surrounding pass has already
+    /// logged any real store trouble by then.
     fn current_rule(&self, from_addr: &str) -> Option<crate::types::Disposition> {
         let rules = self.store.list_sender_rules(self.account_id).ok()?;
         events::current_rule(from_addr, &rules)
     }
 
+    /// The single emission point for all three verdict sites (ingest heuristic,
+    /// Stage-1 apply, Stage-2 apply); the decision itself lives in
+    /// [`events::event_for`], which owns the seal invariant and the freshness
+    /// storm guard. BEST-EFFORT: a store error is logged (ids only) and
+    /// swallowed — a notification is never worth failing triage over. Store-side
+    /// `UNIQUE(message_id)` makes a repeat call a silent no-op, which is what
+    /// makes the refine passes and `catch_up()`'s re-scan safe to hook.
     fn emit_event(&self, ctx: &events::EventContext<'_>, now: DateTime<Utc>) {
         let Some(ev) = events::event_for(ctx, &self.config.notify, now) else {
             return;
@@ -788,18 +700,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Embed `text` off the async runtime (CPU work) and write the vector for
-    /// `message_id`. No-op when no embedder is attached. A failure logs a
-    /// REDACTED one-liner (id + error kind only, never body) and never
-    /// propagates — the vector can be recovered by the backfill pass, so an embed
-    /// failure must never block or crash ingest.
+    /// Embed `text` off the async runtime and write the vector for
+    /// `message_id`. No-op without an embedder. A failure logs a redacted
+    /// one-liner (id + error kind, never body) and never propagates — the
+    /// backfill pass recovers the vector, so ingest must not block on it.
     async fn embed_and_store(&self, message_id: i64, text: String) {
         let Some(embedder) = self.embedder() else {
             return;
         };
         let account_id = self.account_id;
         let store = self.store.clone();
-        // spawn_blocking: ONNX inference is CPU-bound; keep it off the poll loop.
+        // ONNX inference is CPU-bound; keep it off the poll loop.
         let result = tokio::task::spawn_blocking(move || {
             let vec = embedder.embed(&text)?;
             store.upsert_message_vector(account_id, message_id, &vec)
@@ -812,16 +723,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// STARTUP VECTOR BACKFILL: embed every NON-SEALED message that still lacks a
-    /// vector, in throttled batches, so semantic recall covers pre-existing rows
-    /// and any ingest-time embed failures.
-    ///
-    /// SECURITY: [`Store::messages_missing_vectors`] selects ONLY
-    /// `sensitivity='normal'` rows, so sealed content is structurally absent from
-    /// this pass — there is nothing sealed to embed. Each batch's embedding is CPU
-    /// work run under `spawn_blocking` so the async runtime never stalls; a failure
-    /// logs a redacted one-liner and moves on (the row stays missing and is retried
-    /// next startup). No-op when no embedder is attached.
+    /// Embed every message still missing a vector, in throttled batches, so
+    /// recall covers pre-existing rows and ingest-time embed failures. Sealed
+    /// content is structurally absent — `messages_missing_vectors` selects only
+    /// `sensitivity='normal'` (see docs/SECURITY.md). A failed batch logs a
+    /// redacted one-liner and is retried on a later pass. No-op with no embedder.
     async fn backfill_missing_vectors(&self) {
         let Some(embedder) = self.embedder() else {
             return;
@@ -843,8 +749,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 break;
             }
             let n = missing.len();
-            // Flatten each message the SAME way ingest/query does, then embed the
-            // whole batch in one blocking ONNX pass and write the vectors.
+            // Flatten each message the SAME way ingest and query do.
             let store = self.store.clone();
             let embedder = embedder.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -886,21 +791,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Run one Stage-2 LLM triage pass over the queued (non-confident) rows.
-    ///
-    /// Fetch up to `batch_per_cycle` rows (`model_used IS NULL AND
-    /// sensitivity='normal'`), process sequentially (no rate limiter needed at
-    /// this volume). For each row: enforce the sealed guard, check the
-    /// per-thread and global daily budgets, increment BEFORE the call (so retry
-    /// storms can't exceed the cap), classify, and apply the result. Budget
-    /// exhaustion skips the row (it stays queued) and logs at most one notice
-    /// per cycle. Any per-row failure is logged (redacted) and never crashes the
-    /// sync loop — the whole pass returns `Ok(())` regardless.
-    ///
-    /// Return `true` at most once per UTC `day` for the given cap `kind`, so a
-    /// persistently-capped account logs each budget-exhausted notice once a day
-    /// instead of on every ~45s poll. Updates the stored day as a side effect. A
-    /// poisoned lock defaults to warning (never silently swallow the notice).
+    /// True at most once per UTC `day` per cap `kind`, so a persistently-capped
+    /// account logs each notice once a day rather than every poll. Stamps the
+    /// day as a side effect; a poisoned lock defaults to warning, never to
+    /// silently swallowing the notice.
     fn warn_once_per_day(&self, kind: CapKind, day: &str) -> bool {
         let mut guard = match self.warn_days.lock() {
             Ok(g) => g,
@@ -920,22 +814,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Run one Stage-1 LLM refine pass over the queued (not-yet-refined) rows.
-    ///
-    /// Every non-sealed, non-rule-decided row was stored at ingest with HEURISTIC
-    /// seed values and `stage1_model_used IS NULL`. This pass fetches up to
-    /// `stage1.batch_per_cycle` of them, enforces the sealed guard, checks the
-    /// GLOBAL Stage-1 budget (increment-before-call so retries can't exceed it),
-    /// classifies with the small model, and applies the result — which stamps
-    /// `stage1_model_used` (leaving the Stage-1 queue) and sets `needs_stage2`
-    /// (escalation). On API-down / refusal / permanent-error the row keeps its
-    /// heuristic seed values, stamped `heuristic-only`; the seed's own confidence
-    /// (the `needs_stage2` seed written at ingest) then decides escalation. Budget
-    /// exhaustion DEFERS the remaining rows without loss (they stay queued). Never
-    /// crashes the sync loop.
-    ///
-    /// No-op when the LLM is disabled (no API key) — rows keep their heuristic
-    /// seed values and are re-attempted once a key is present.
+    /// Run one Stage-1 LLM refine pass over rows still carrying their ingest
+    /// heuristic seed (`stage1_model_used IS NULL`): sealed guard, GLOBAL
+    /// Stage-1 budget with increment-before-call so retries can't exceed it,
+    /// classify, apply — which stamps `stage1_model_used` and sets
+    /// `needs_stage2`. On refusal or permanent error the row keeps its seed
+    /// values stamped `heuristic-only` and the seed's own `needs_stage2` decides
+    /// escalation. Budget exhaustion defers rows without loss; no failure
+    /// crashes the sync loop. No-op when the LLM is disabled (no API key).
     async fn stage1_pass(&self) {
         let Some((api_key, provider)) = self.stage2_key.as_ref() else {
             return; // disabled; notice already emitted at startup
@@ -944,9 +830,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let provider = *provider;
         let cfg = &self.config.stage1;
 
-        // RUNTIME OVERRIDE: re-read the Stage-1 global cap at the START of the
-        // pass so a client change via POST /client/triage-config applies within a
-        // cycle. Precedence: override > config/env > default.
+        // Re-read the cap at the START of the pass so a client change via
+        // POST /client/triage-config applies within a cycle, no restart.
+        // Precedence: override > config/env > default.
         let caps = self
             .store
             .stage2_cap_overrides(self.account_id)
@@ -968,7 +854,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         let now = Utc::now();
         let day = now.format("%Y-%m-%d").to_string();
-        // Reuse the Stage-2 max-age as the staleness cutoff for parity.
+        // Deliberately the Stage-2 max-age, so both stages age out together.
         let stale_cutoff = now - ChronoDuration::days(self.config.stage2.max_age_days as i64);
         let mut refined = 0usize;
         let mut fallback = 0usize;
@@ -977,15 +863,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut out_tok = 0u64;
 
         for row in &queued {
-            // SEALED GUARD (defense in depth): the queue excludes sealed rows in
-            // SQL, but re-check before every classify call.
+            // SEALED GUARD: the queue already excludes sealed rows in SQL;
+            // re-check before every classify call (docs/SECURITY.md).
             if let Err(e) = stage1_sealed_guard(row) {
                 eprintln!("squelch: stage-1 sealed guard tripped ({e}); skipping row");
                 continue;
             }
 
-            // SKIP-STALE: a row older than max_age_days is marked processed with
-            // 'heuristic-only' WITHOUT a model call, keeping its seed values.
+            // SKIP-STALE: mark processed WITHOUT a model call, keeping the seed.
             if row.received_at < stale_cutoff {
                 let _ = self.store.stage1_mark_processed(
                     self.account_id,
@@ -997,7 +882,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
 
             // GLOBAL budget check (Stage-1's ONLY scope). Once hit, every
-            // remaining row this cycle is deferred (stays queued) with no stamp.
+            // remaining row this cycle stays queued, unstamped.
             match self
                 .store
                 .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
@@ -1048,17 +933,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             eprintln!("squelch: stage-1 apply failed ({e}); row stays queued");
                         }
                         // TOCTOU: the row was sealed by hand while this pass held
-                        // it — the guarded UPDATE matched nothing, so no verdict
-                        // landed and there is nothing to notify for. (The seal
-                        // invariant would otherwise leak: emitting on a bare Ok
-                        // would snapshot sender+one_line for a now-sealed row.)
+                        // it, so the guarded UPDATE matched nothing and no verdict
+                        // landed. Emitting on a bare Ok would snapshot sender +
+                        // one_line for a now-sealed row.
                         Ok(false) => {}
                         Ok(true) => {
                             refined += 1;
-                            // NOTIFICATION EVENT: the refined verdict is final, so
-                            // it emits regardless of what the heuristic seed
-                            // thought. The freshness window is what stops this pass
-                            // from storming through a fresh install's backlog.
+                            // The refined verdict is final, so it emits whatever
+                            // the seed thought; the freshness window is what stops
+                            // this pass storming a fresh install's backlog.
                             self.emit_event(
                                 &events::EventContext {
                                     account_id: self.account_id,
@@ -1070,10 +953,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     sensitivity: row.sensitivity,
                                     // The Stage-1 queue selects `m.is_sent = 0`.
                                     is_sent: false,
-                                    // The queue excludes rows a rule decided AT
-                                    // INGEST (stage1_model_used='rule'), but says
-                                    // nothing about a rule added since — so read
-                                    // the rule list as it stands now.
+                                    // The queue only excludes rows a rule decided
+                                    // AT INGEST, so read the rule list as it
+                                    // stands NOW to catch rules added since.
                                     rule: self.current_rule(&row.from_addr),
                                     tier: applied.tier,
                                     importance: applied.importance,
@@ -1086,9 +968,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
                 | Ok(stage1_llm::ClassifyOutcome::Failed(_)) => {
-                    // HEURISTIC FALLBACK: keep the seed values, mark processed so
-                    // the row does not loop; the ingest-time needs_stage2 seed
-                    // (= !heuristic-confident) is preserved and drives escalation.
+                    // HEURISTIC FALLBACK: keep the seed values and mark processed
+                    // so the row cannot loop; the ingest-time needs_stage2 seed
+                    // survives and drives escalation.
                     let _ = self.store.stage1_mark_processed(
                         self.account_id,
                         row.message_id,
@@ -1113,19 +995,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Run one SPECIALIST-EXTRACTOR pass over rows the LLM categorized into a
-    /// category that has a registered extractor (currently banking).
-    ///
-    /// Runs AFTER the stage passes so it sees each row's FINAL category. For each
-    /// queued row: enforce the sealed guard, skip stale rows, check + increment
-    /// the SHARED Stage-1 global daily budget (extractors run on the Stage-1
-    /// model and share its cap — simplest), dispatch to the category's extractor,
-    /// and apply the result (which writes the specialist row and auto-resolves the
-    /// triage row). Token usage bills to the extractor's OWN ledger category.
-    /// Budget exhaustion defers remaining rows without loss (they stay queued).
-    /// Any per-row failure is logged (redacted) and never crashes the sync loop.
-    ///
-    /// No-op when the LLM is disabled (no API key) or no category has an extractor.
+    /// Run one SPECIALIST-EXTRACTOR pass over rows whose FINAL category has a
+    /// registered extractor — hence AFTER both stage passes. Per row: sealed
+    /// guard, stale skip, then check + increment the SHARED Stage-1 daily budget
+    /// (extractors run on the Stage-1 model and share its cap) before
+    /// dispatching. Token usage bills to the extractor's OWN ledger category.
+    /// Budget exhaustion defers rows without loss; per-row failures are logged
+    /// redacted and never crash the sync loop. No-op when there is no API key.
     async fn extract_pass(&self) {
         let Some((api_key, provider)) = self.stage2_key.as_ref() else {
             return; // disabled; notice already emitted at startup
@@ -1140,8 +1016,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             return;
         }
 
-        // Shared Stage-1 global cap (runtime override honored, exactly like the
-        // Stage-1 pass — extract calls count against the SAME daily counter).
+        // Extract calls count against the SAME daily counter as Stage-1, runtime
+        // override included.
         let caps = self
             .store
             .stage2_cap_overrides(self.account_id)
@@ -1171,14 +1047,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut out_tok = 0u64;
 
         for row in &queued {
-            // SEALED GUARD (defense in depth): the queue excludes sealed rows in
-            // SQL (and sealed rows carry a NULL category), but re-check anyway.
+            // SEALED GUARD: the queue already excludes sealed rows in SQL (they
+            // carry a NULL category); re-check anyway (docs/SECURITY.md).
             if let Err(e) = extract::extract_sealed_guard(row) {
                 eprintln!("squelch: extract sealed guard tripped ({e}); skipping row");
                 continue;
             }
 
-            // SKIP-STALE: an old row is marked extracted WITHOUT a model call so it
+            // SKIP-STALE: mark extracted WITHOUT a model call, so an old row
             // neither spends budget nor sits queued forever.
             if row.received_at < stale_cutoff {
                 let _ = self.store.extract_mark_processed(
@@ -1190,8 +1066,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 continue;
             }
 
-            // Dispatch by category. Only banking is registered today; a row whose
-            // category has no handler is marked processed so it cannot loop.
+            // A row whose category has no handler is marked processed so it
+            // cannot loop.
             if !banking::CATEGORIES.contains(&row.category.as_str()) {
                 let _ = self.store.extract_mark_processed(
                     self.account_id,
@@ -1202,8 +1078,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 continue;
             }
 
-            // SHARED Stage-1 global budget check. Once hit, every remaining row
-            // this cycle is deferred (stays queued) with no stamp.
+            // SHARED Stage-1 global budget. Once hit, every remaining row this
+            // cycle stays queued, unstamped.
             match self
                 .store
                 .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
@@ -1231,9 +1107,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 continue;
             }
 
-            // ROUTE BY CATEGORY. Each specialist owns its own prompt, schema
-            // and ledger line, so the row's category decides which one runs.
-            // Marketing is handled in its own arm below.
+            // ROUTE BY CATEGORY: each specialist owns its own prompt, schema and
+            // ledger line, so the row's category decides which one runs.
             if marketing::CATEGORIES.contains(&row.category.as_str()) {
                 match marketing::classify(&self.http, api_key, cfg, provider, row).await {
                     Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
@@ -1252,9 +1127,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         }
                         let applied = marketing::apply_result(row, &out, &cfg.model);
                         if let Err(e) = self.store.marketing_apply(&applied) {
-                            // Same reasoning as the banking arm: the call is
-                            // already paid for, so mark processed rather than
-                            // re-buying it every cycle.
+                            // The call is already paid for: mark processed rather
+                            // than re-buying it every cycle.
                             eprintln!(
                                 "squelch: marketing apply failed ({e}); row marked apply-failed"
                             );
@@ -1301,12 +1175,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                     let applied = banking::apply_result(row, &out, &cfg.model);
                     if let Err(e) = self.store.banking_apply(&applied) {
-                        // Mark processed with a failure sentinel: the model call
-                        // is already paid for, and leaving the row queued would
-                        // re-buy a call EVERY cycle until the daily cap absorbs
-                        // it (a store-level failure is unlikely to heal by
-                        // retrying with fresh spend). The email itself still
-                        // lives in the inbox; only the Banking record is lost.
+                        // Failure sentinel rather than a re-queue: the call is
+                        // already paid for, a store failure is unlikely to heal
+                        // on a retry, and leaving the row queued would re-buy a
+                        // call every cycle. Only the Banking record is lost — the
+                        // email itself is still in the inbox.
                         eprintln!("squelch: banking apply failed ({e}); row marked apply-failed");
                         let _ = self.store.extract_mark_processed(
                             self.account_id,
@@ -1318,8 +1191,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(banking::ExtractOutcome::Refused) | Ok(banking::ExtractOutcome::Failed(_)) => {
-                    // Mark processed so the row does not loop; no specialist row is
-                    // written (the record simply won't appear in the Banking zone).
+                    // Mark processed so the row cannot loop; no specialist row is
+                    // written, so nothing appears in the Banking zone.
                     let _ = self.store.extract_mark_processed(
                         self.account_id,
                         row.message_id,
@@ -1328,8 +1201,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     skipped += 1;
                 }
                 Err(e) => {
-                    // Retryable class exhausted / transport error. Leave the row
-                    // queued (extractor_model_used stays NULL) for a future cycle.
+                    // Retryable class exhausted / transport error: leave the row
+                    // queued (extractor_model_used stays NULL) for a later cycle.
                     eprintln!("squelch: extract {e}; row stays queued");
                 }
             }
@@ -1344,6 +1217,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
+    /// Run one Stage-2 LLM triage pass over the queued (non-confident) rows:
+    /// up to `batch_per_cycle` rows (`model_used IS NULL AND
+    /// sensitivity='normal'`), sequentially. Per row — sealed guard, the three
+    /// daily budget checks, increment BEFORE the call so retry storms can't
+    /// exceed a cap, classify, apply. Budget exhaustion leaves rows queued. Any
+    /// per-row failure is logged redacted and never crashes the sync loop.
     /// No-op when Stage-2 is disabled (no API key).
     async fn stage2_pass(&self) {
         let Some((api_key, provider)) = self.stage2_key.as_ref() else {
@@ -1353,10 +1232,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let provider = *provider;
         let cfg = &self.config.stage2;
 
-        // RUNTIME OVERRIDES: re-read the three daily caps at the START of the pass
-        // (one cheap SELECT) so a client change via POST /client/triage-config
-        // applies within a cycle, no restart. Precedence: override > config/env >
-        // default (the config/env value already folded into `cfg`).
+        // Re-read the three caps at the START of the pass so a client change via
+        // POST /client/triage-config applies within a cycle, no restart.
+        // Precedence: override > config/env > default.
         let caps = self
             .store
             .stage2_cap_overrides(self.account_id)
@@ -1379,26 +1257,22 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // UTC date key for the budget rows; one value for the whole pass.
         let now = Utc::now();
         let day = now.format("%Y-%m-%d").to_string();
-        // The staleness cutoff: rows received before this are stale-skipped.
         let stale_cutoff = now - ChronoDuration::days(cfg.max_age_days as i64);
-        // Budget-exhausted notices name the offending thread/sender and fire at
-        // most once per UTC day (via `warn_once_per_day`), not every poll.
         let mut processed = 0usize;
         let mut stale_skipped = 0usize;
         let mut in_tok = 0u64;
         let mut out_tok = 0u64;
 
         for row in &queued {
-            // SEALED GUARD (defense in depth): the queue excludes sealed rows in
-            // SQL, but re-check before every classify call.
+            // SEALED GUARD: the queue already excludes sealed rows in SQL;
+            // re-check before every classify call (docs/SECURITY.md).
             if let Err(e) = stage2_sealed_guard(row) {
                 eprintln!("squelch: stage-2 sealed guard tripped ({e}); skipping row");
                 continue;
             }
 
-            // SKIP-STALE: a queued row older than max_age_days is marked processed
-            // WITHOUT a model call (model_used='stale-skip'), keeping Stage-1
-            // values. It neither consumes budget nor sits queued forever.
+            // SKIP-STALE: mark processed WITHOUT a model call, keeping Stage-1
+            // values, so the row neither spends budget nor sits queued forever.
             if row.received_at < stale_cutoff {
                 let _ = self.store.stage2_mark_processed(
                     self.account_id,
@@ -1409,9 +1283,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 continue;
             }
 
-            // GLOBAL budget check (per-account-per-day). Keeps its BREAK semantics
-            // — once the account cap is hit every remaining row this cycle is
-            // blocked — but the notice now fires at most once per UTC day.
+            // GLOBAL budget check: once the account cap is hit, BREAK — every
+            // remaining row this cycle is blocked.
             match self
                 .store
                 .stage2_budget_used(self.account_id, GLOBAL_BUDGET_KEY, &day)
@@ -1432,16 +1305,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
             }
 
-            // PER-THREAD budget check. The notice NAMES the capped thread and
-            // fires at most once per UTC day.
+            // PER-THREAD budget check; the notice names the capped thread.
             match self
                 .store
                 .stage2_budget_used(self.account_id, &row.thread_id, &day)
             {
                 Ok(used) if used >= thread_daily_cap => {
                     if self.warn_once_per_day(CapKind::Thread, &day) {
-                        // thread_id is Gmail hex (safe), but sanitize defensively
-                        // in case a malformed cursor ever supplies otherwise.
+                        // thread_id is Gmail hex, but sanitize defensively in
+                        // case a malformed cursor ever supplies otherwise.
                         eprintln!(
                             "squelch: stage-2 per-thread daily budget exhausted for thread {} \
                              ({used}/{thread_daily_cap}); those rows stay queued",
@@ -1457,10 +1329,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
             }
 
-            // PER-SENDER budget check (per-account-per-day, keyed by from_addr).
-            // Stops one chatty sender fanning many DIFFERENT threads from burning
-            // the budget. Same sentinel-row pattern as __global__. The notice
-            // NAMES the capped sender and fires at most once per UTC day.
+            // PER-SENDER budget check, keyed by from_addr: stops one chatty
+            // sender fanning many DIFFERENT threads from burning the budget.
             let sender_key = format!("{SENDER_BUDGET_PREFIX}{}", row.from_addr);
             match self
                 .store
@@ -1468,8 +1338,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             {
                 Ok(used) if used >= sender_daily_cap => {
                     if self.warn_once_per_day(CapKind::Sender, &day) {
-                        // from_addr is UNTRUSTED header PII — log a non-reversible
-                        // sha256 tag, never the address itself.
+                        // from_addr is UNTRUSTED header PII: log the
+                        // non-reversible tag, never the address.
                         eprintln!(
                             "squelch: stage-2 per-sender daily budget exhausted for sender {} \
                              ({used}/{sender_daily_cap}); those rows stay queued",
@@ -1509,7 +1379,6 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 continue;
             }
 
-            // Classify.
             let ctx = RowContext::from_queued(row, cfg.max_body_chars);
             let outcome = stage2::classify(&self.http, api_key, cfg, provider, &ctx).await;
 
@@ -1518,9 +1387,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     if let Some(u) = usage {
                         in_tok += u.input_tokens;
                         out_tok += u.output_tokens;
-                        // USAGE LEDGER: record this successful call's token usage
-                        // per account per day. Best-effort — a ledger write
-                        // failure must not affect triage.
+                        // USAGE LEDGER, best-effort: a ledger write failure must
+                        // not affect triage.
                         if let Err(e) = self.store.stage2_bump_usage(
                             self.account_id,
                             &day,
@@ -1535,13 +1403,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         Err(e) => {
                             eprintln!("squelch: stage-2 apply failed ({e}); row stays queued");
                         }
-                        // TOCTOU: sealed by hand mid-pass; no verdict landed, so
-                        // nothing to notify for (same as the Stage-1 site).
+                        // TOCTOU: sealed by hand mid-pass, so no verdict landed
+                        // and there is nothing to notify for.
                         Ok(false) => {}
                         Ok(true) => {
                             processed += 1;
-                            // NOTIFICATION EVENT: same discipline as the Stage-1
-                            // site.
                             self.emit_event(
                                 &events::EventContext {
                                     account_id: self.account_id,
@@ -1553,12 +1419,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     sensitivity: row.sensitivity,
                                     // The Stage-2 queue selects `m.is_sent = 0`.
                                     is_sent: false,
-                                    // Read NOW, not at ingest: `rule_want_text`
-                                    // only reflects the Filtered rule that was in
-                                    // force when the row was queued (Squelch/
-                                    // Surface decide confidently and never reach
-                                    // this queue), so a sender squelched since
-                                    // then would still push.
+                                    // Read NOW, not at ingest: the row only
+                                    // records the rule in force when it was
+                                    // queued, so a sender squelched since then
+                                    // would otherwise still push.
                                     rule: self.current_rule(&row.from_addr),
                                     tier: applied.tier,
                                     importance: applied.importance,
@@ -1581,8 +1445,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 Ok(ClassifyOutcome::Failed(kind)) => {
                     // Permanent failure (400/401/truncation/parse): mark the row
-                    // failed (processed) so it does not loop forever. `kind` is
-                    // already redacted (status/error-type only).
+                    // processed so it cannot loop. `kind` is already redacted.
                     eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
@@ -1591,8 +1454,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     );
                 }
                 Err(e) => {
-                    // Retryable class exhausted / transport error. Leave the row
-                    // queued for a future cycle. `e` is redacted.
+                    // Retryable class exhausted / transport error: leave the row
+                    // queued for a later cycle. `e` is redacted.
                     eprintln!("squelch: stage-2 {e}; row stays queued");
                 }
             }
@@ -1639,8 +1502,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     }
 
     fn rules_for_stage2_note() -> &'static str {
-        // Documentation anchor: non-confident rows are left with model_used NULL;
-        // the Stage-2 queue predicate is `model_used IS NULL AND sensitivity='normal'`.
+        // Documentation anchor for the Stage-2 queue predicate: non-confident
+        // rows are the ones left with model_used NULL.
         "model_used IS NULL AND sensitivity='normal'"
     }
 
@@ -1659,7 +1522,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     if *shutdown.borrow() {
                         return Ok(());
                     }
-                    // Redacted: error strings from this crate never carry secrets.
+                    // Error strings from this crate never carry secrets.
                     eprintln!(
                         "squelch: sync error ({e}); retrying in {}s",
                         backoff.as_secs()
@@ -1677,9 +1540,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     }
 }
 
-/// Minimal percent-encoding for a Gmail `q` value (space -> `%20`, and the few
-/// reserved characters a search query can contain). Enough for `newer_than:Nd`
-/// and simple queries; we don't build arbitrary user queries here.
+/// Minimal percent-encoding for a Gmail `q` value. Enough for `newer_than:Nd`
+/// and simple queries; arbitrary user queries are never built here.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1700,19 +1562,15 @@ fn parse_internal_date(s: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_millis(ms)
 }
 
-/// Rebuild a header-only RFC822 blob from Gmail metadata headers so the existing
-/// mail-parser-based ingest path runs unchanged. A trailing blank line ends the
-/// header section (empty body).
-///
-/// Test-only since SENT backfill switched to `format=raw` (full bodies for
-/// recall); retained because the contacts-seeding tests exercise the header
-/// parsing path through it.
+/// Rebuild a header-only RFC822 blob from Gmail metadata headers so the
+/// mail-parser ingest path runs over it unchanged; the trailing blank line ends
+/// the header section (empty body). Test-only, for the contacts-seeding tests.
 #[cfg(test)]
 fn synthesize_rfc822_headers(headers: &[MessageHeader]) -> String {
     let mut out = String::new();
     for h in headers {
-        // Skip anything with embedded CR/LF defensively (header injection guard);
-        // Gmail values are single-line but we never trust upstream blindly.
+        // HEADER INJECTION GUARD: Gmail values are single-line, but upstream is
+        // never trusted blindly.
         if h.value.contains('\r') || h.value.contains('\n') {
             continue;
         }
@@ -1765,11 +1623,9 @@ mod tests {
 
     // ---- notification events at the ingest call site -----------------------
     //
-    // These drive the REAL pipeline (ingest_with_rules -> ingest_message ->
-    // triage::events -> append_event) through the real store, mirroring
-    // `SyncEngine::ingest_one` exactly. What they cannot exercise is the HTTP
-    // fetch above it, which is why the helper repeats the two lines of gating
-    // rather than the engine method being called directly.
+    // These drive the real pipeline through the real store; only the HTTP fetch
+    // above it is out of reach, which is why the helper repeats the engine's two
+    // lines of gating instead of calling `ingest_one` directly.
 
     /// Mirror of the engine's ingest emission site. Returns
     /// `(message_id, emitted_event_id)`.
@@ -1796,8 +1652,8 @@ mod tests {
         (id, emitted)
     }
 
-    /// An ops-alert EML dated `at` (rung 4: automated sender + alert language ->
-    /// Signal, importance 75, CONFIDENT).
+    /// An ops-alert EML dated `at`: automated sender + alert language, so it
+    /// lands Signal / importance 75 / CONFIDENT.
     fn alert_eml(at: DateTime<Utc>) -> String {
         format!(
             "From: Monitoring <alerts@monitoring.example>\r\n\
@@ -1852,9 +1708,9 @@ mod tests {
 
     #[test]
     fn stale_mail_is_silent_even_at_the_top_tier() {
-        // THE STORM GUARD. A past-due bill from a KNOWN biller is the loudest
-        // verdict the pipeline can produce — and if the mail is old, it is still
-        // silent. This is what makes `catch_up()`'s whole-window re-scan safe.
+        // THE STORM GUARD: a past-due bill from a KNOWN biller is the loudest
+        // verdict the pipeline can produce, and old mail is silent anyway. This
+        // is what makes `catch_up()`'s whole-window re-scan safe.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -1887,8 +1743,7 @@ mod tests {
         assert_eq!(ev, None, "old mail is silent no matter what the verdict says");
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
 
-        // Sanity: the verdict really was the loud one — the guard is what stopped
-        // it, not a mis-triage.
+        // Sanity: the guard stopped it, not a mis-triage.
         let updates = store.ranked_updates(acct, old - ChronoDuration::days(1), None).unwrap();
         let bill = updates.iter().find(|u| u.id == mid).expect("bill surfaced in the client");
         assert_eq!(bill.tier, Tier::PastDue);
@@ -1896,8 +1751,7 @@ mod tests {
 
     #[test]
     fn sealed_mail_never_emits_an_event() {
-        // SEAL INVARIANT, end to end: an OTP is the exact thing that must never
-        // land on a lock screen.
+        // SEAL INVARIANT end to end: an OTP must never reach a lock screen.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -1923,9 +1777,8 @@ mod tests {
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
 
-        // A SQUELCH rule against the alert sender: the user said in advance that
-        // this sender does not get to interrupt them, and that outranks the
-        // heuristic that would otherwise have surfaced it (proved above).
+        // A SQUELCH rule outranks the heuristic that would otherwise have
+        // surfaced this sender (proved above).
         store
             .set_sender_rule(acct, "*@monitoring.example", "not urgent", Disposition::Squelch)
             .unwrap();
@@ -1951,11 +1804,9 @@ mod tests {
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
     }
 
-    /// Mirror of the engine's STAGE-1 apply emission site, for a row the pass
-    /// ALREADY HOLDS: land the refined verdict via the real `stage1_apply`, and
-    /// only when the guarded UPDATE matched (the row was not sealed out from
-    /// under the pass) consult the rule list as it stands NOW and emit. Returns
-    /// the emitted event id, if any.
+    /// Mirror of the engine's STAGE-1 apply emission site for a row the pass
+    /// ALREADY HOLDS: apply via the real `stage1_apply`, and emit only when the
+    /// guarded UPDATE matched, consulting the rule list as it stands NOW.
     fn refine_row_and_notify(
         store: &SqliteStore,
         account_id: AccountId,
@@ -1978,7 +1829,7 @@ mod tests {
             deadline: None,
             category: None,
         };
-        // TOCTOU gate, exactly as the engine: a verdict that did not land
+        // TOCTOU gate, as the engine has it: a verdict that did not land
         // (`false` — sealed mid-pass) must not emit.
         if !store.stage1_apply(&applied).unwrap() {
             return None;
@@ -2001,8 +1852,8 @@ mod tests {
         events::event_for(&ctx, &cfg, now).and_then(|ev| store.append_event(&ev).unwrap())
     }
 
-    /// [`refine_row_and_notify`] for the common case where the queue read and
-    /// the apply are not racing anything: fetch the queued row by id first.
+    /// [`refine_row_and_notify`] when nothing is racing the queue read: fetch
+    /// the queued row by id first.
     fn refine_and_notify(
         store: &SqliteStore,
         account_id: AccountId,
@@ -2022,10 +1873,9 @@ mod tests {
 
     #[test]
     fn a_row_sealed_mid_pass_lands_no_verdict_and_emits_nothing() {
-        // TOCTOU: the Stage-1 pass SELECTs its queue, the user seals one of the
-        // held rows (an OTP they spotted), and only THEN does the pass apply its
-        // verdict. The guarded UPDATE matches nothing and reports so; emitting on
-        // a bare Ok would snapshot sender + one_line for a now-sealed message.
+        // TOCTOU: the pass SELECTs its queue, the user seals one of the held rows
+        // (an OTP they spotted), and only THEN does the pass apply. Emitting on a
+        // bare Ok would snapshot sender + one_line for a now-sealed message.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -2057,11 +1907,9 @@ mod tests {
     #[test]
     fn future_dated_backlog_mail_stays_silent_through_the_refine_pass() {
         // The `Date:` header is SENDER-CONTROLLED and ingest prefers it over
-        // Gmail's internalDate; future-dating is a standard inbox-sorting trick.
-        // Backfill is silent by origin, but the refine passes then grind the whole
-        // backlog `received_at DESC` — future-dated rows FIRST — and emit from
-        // their own call sites. With no upper edge on the freshness window, a
-        // fresh install would storm on months-old mail dated 2030.
+        // Gmail's internalDate. The refine passes grind the backlog
+        // `received_at DESC` — future-dated rows FIRST — so without an upper
+        // edge on the freshness window a fresh install storms on mail dated 2030.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -2090,11 +1938,10 @@ mod tests {
 
     #[test]
     fn squelching_a_sender_silences_rows_already_queued() {
-        // THE REACTIVE SQUELCH: the mail is already sitting in the Stage-1 queue
-        // when the user squelches the sender. Nothing on the queued row records
-        // that — the 'rule' marker is stamped at INGEST only — so the refine site
-        // has to read the rule list live, or the pass mid-grind pushes mail from a
-        // sender the user just silenced.
+        // THE REACTIVE SQUELCH: the mail is already in the Stage-1 queue when the
+        // user squelches the sender, and the 'rule' marker is stamped at INGEST
+        // only — so the refine site must read the rule list live or push mail
+        // from a sender the user just silenced.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -2320,13 +2167,11 @@ mod tests {
 
     #[test]
     fn past_due_bill_lands_past_due_tier() {
-        // Updated for bug #3: a CONFIDENT PastDue now requires a TRUSTED sender.
-        // We first seed the biller as a known contact (via a prior sent-path
-        // message), proving a legit past-due from a known biller still screams.
+        // A CONFIDENT PastDue requires a TRUSTED sender, so seed the biller as a
+        // known contact first: a legit past-due from a known biller still screams.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
-        // Seed billing@utilityco.com as a known contact by having the user send
-        // TO the biller (contacts are derived from Sent-mail recipients).
+        // Contacts are derived from Sent-mail recipients.
         let seed = "From: me@example.com\r\n\
                     To: Utility <billing@utilityco.com>\r\n\
                     Subject: account setup\r\n\
@@ -2352,8 +2197,7 @@ mod tests {
             .ranked_updates(acct, now - ChronoDuration::days(1), None)
             .unwrap();
         // The seed sent-message is excluded from ranked_updates; only the
-        // past-due bill surfaces. Assert it landed the top scream tier for a
-        // KNOWN sender.
+        // past-due bill surfaces, at the top tier for a KNOWN sender.
         let bill = updates
             .iter()
             .find(|u| u.one_line.contains("PAST DUE"))
@@ -2402,8 +2246,8 @@ mod tests {
     fn html_email_stores_sanitized_html_served_by_client_thread_view() {
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
-        // An HTML email carrying dangerous markup (script, onerror, javascript:
-        // href, form) plus benign table/img/style content.
+        // Dangerous markup (script, onerror, javascript: href, form) alongside
+        // benign table/img/style content.
         let eml = "From: News <news@substack.com>\r\n\
                    To: me@example.com\r\n\
                    Subject: Weekly\r\n\
@@ -2440,7 +2284,7 @@ mod tests {
         assert!(html.contains("style=\"color:red\""));
         assert!(html.contains("https://cdn.example.com/x.png"));
 
-        // The flattened text path is unaffected and still feeds triage/FTS.
+        // The flattened text path still feeds triage/FTS.
         assert!(msg.content.contains("Hello"));
         assert!(!msg.content.contains('<'));
     }
@@ -2472,7 +2316,7 @@ mod tests {
         let acct = store.ensure_account("me@example.com").unwrap();
         assert!(store.sync_state(acct, HISTORY_KEY).unwrap().is_none());
 
-        // A historyId larger than u32::MAX to prove the widened field holds it.
+        // A historyId larger than u32::MAX, to prove the field holds it.
         let big = (u32::MAX as u64) + 123_456;
         store
             .set_sync_state(

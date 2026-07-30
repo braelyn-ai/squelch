@@ -1,41 +1,19 @@
-//! The categorize-then-extract SPECIALIST-EXTRACTION framework.
+//! The categorize-then-extract SPECIALIST-EXTRACTION framework. A row whose LLM
+//! `category` has a registered extractor is queued for a second, structured pass
+//! that runs in the sync loop after the stages and writes to a specialist table.
+//! Each specialist module owns a static system prompt, a closed output schema, a
+//! parse struct, and a pure `apply_result`.
 //!
-//! ## Where this sits
+//! INJECTION BOUNDARY: the user message reuses the fenced TRUSTED-CONTEXT /
+//! UNTRUSTED-EMAIL structure, everything from the email landing strictly inside
+//! the fence. The trusted block carries an empty OWNER REFINEMENT slot so
+//! per-user text can be injected later without restructuring the prompt.
 //!
-//! The stage-1 (and, on escalation, stage-2) LLM assigns every non-sealed email a
-//! coarse `category` (see [`crate::triage::stage1_llm`]). A category with a
-//! REGISTERED EXTRACTOR queues the row for a second, structured pass that runs in
-//! the sync loop AFTER the stage passes ([`crate::sync`]): the extractor pulls the
-//! specific fields that category needs (the banking extractor pulls institution /
-//! amount / account tail, for instance) and writes them to a specialist table.
-//!
-//! One module per specialist lives under this one ([`banking`] first). Each owns:
-//!   * a static SYSTEM prompt const (cache-friendly — identical bytes every call),
-//!   * an output schema (`additionalProperties: false`, explicit `required`),
-//!   * a parse struct + a pure `apply_result` mapping onto a store-facing "applied"
-//!     value.
-//!
-//! ## The injection boundary (identical to the stages)
-//!
-//! The user message reuses the shared fenced TRUSTED-CONTEXT / UNTRUSTED-EMAIL
-//! structure. The trusted block carries an explicit, currently-empty OWNER
-//! REFINEMENT slot (`owner refinement: none`) so per-user refinement text can be
-//! injected there later WITHOUT restructuring the prompt. Everything from the
-//! email lands strictly inside the untrusted fence.
-//!
-//! ## Cost + budget (documented)
-//!
-//! Extractors run on the STAGE-1 (small) model and count against the SHARED
-//! Stage-1 GLOBAL daily cap (simplest — one cap to reason about). Each extractor
-//! bills its token usage to its OWN usage-ledger category (e.g. `extract_banking`)
-//! so per-specialist cost stays visible.
-//!
-//! ## Sealed guard (defense in depth)
-//!
-//! Sealed rows never run the LLM stages, so they carry `category = NULL` and are
-//! structurally absent from the extractor queue. [`extract_sealed_guard`] is the
-//! second layer: a REAL release-mode check that refuses to let any sealed row
-//! cross into an extractor call.
+//! Cost: extractors run on the STAGE-1 (small) model and count against the
+//! SHARED Stage-1 global daily cap, each billing its own usage-ledger category so
+//! per-specialist cost stays visible. Sealed rows carry a NULL category and are
+//! structurally absent from the queue; [`extract_sealed_guard`] is the second
+//! layer (see docs/SECURITY.md).
 
 pub mod banking;
 pub mod marketing;
@@ -44,22 +22,19 @@ use crate::error::{CoreError, Result};
 use crate::store::ExtractQueued;
 use crate::types::Sensitivity;
 
-/// The categories that currently have a registered specialist extractor. The
-/// sync pass hands this to [`Store::extract_queue`](crate::store::Store::extract_queue)
-/// as the routing set, and dispatches each returned row by its category. Growing
-/// the framework = adding a specialist module and extending this slice.
+/// The categories with a registered specialist extractor: the routing set the
+/// sync pass hands to
+/// [`Store::extract_queue`](crate::store::Store::extract_queue), then dispatches
+/// each returned row by. A new specialist module extends this slice.
 pub fn extractable_categories() -> Vec<&'static str> {
     let mut out = banking::CATEGORIES.to_vec();
     out.extend_from_slice(marketing::CATEGORIES);
     out
 }
 
-/// The SEALED GUARD for the extractor pass (defense in depth), mirroring
-/// [`crate::triage::stage1_sealed_guard`]. The extract queue already excludes
-/// sealed rows in SQL (`sensitivity='normal'`, and sealed rows carry a NULL
-/// category anyway); this is the second layer — a REAL release-mode check.
-/// Returns `Err(CoreError::InvalidInput)` on a sealed row (redacted: id + the
-/// invariant only).
+/// The SEALED GUARD for the extractor pass: a REAL release-mode check behind the
+/// queue's own SQL exclusion, returning `Err(CoreError::InvalidInput)` on a
+/// sealed row (redacted to the id plus the invariant). See docs/SECURITY.md.
 pub fn extract_sealed_guard(row: &ExtractQueued) -> Result<()> {
     if matches!(row.sensitivity, Sensitivity::Sealed) {
         return Err(CoreError::InvalidInput(format!(
@@ -74,18 +49,16 @@ pub fn extract_sealed_guard(row: &ExtractQueued) -> Result<()> {
 // Shared fenced user-message builder (TRUSTED CONTEXT / UNTRUSTED EMAIL).
 // ===========================================================================
 
-/// Context an extractor needs to build its user message. Borrowed from an
-/// [`ExtractQueued`] plus the body cap. `owner_refinement` is the (currently
-/// always-absent) per-user refinement slot: `None` renders as
-/// `owner refinement: none`.
+/// Context an extractor needs to build its user message: an [`ExtractQueued`]
+/// borrowed, plus the body cap.
 pub struct ExtractContext<'a> {
     pub from_addr: &'a str,
     pub from_name: Option<&'a str>,
     pub subject: &'a str,
     pub body: &'a str,
-    /// Per-user refinement text for this specialist. Currently always `None`; the
-    /// slot exists so future refinement can be added without restructuring the
-    /// prompt. TRUSTED (account-owner authority), rendered in the trusted block.
+    /// Per-user refinement for this specialist, currently always `None` (which
+    /// renders as `owner refinement: none`). TRUSTED — account-owner authority,
+    /// so it renders in the trusted block.
     pub owner_refinement: Option<&'a str>,
     pub max_body_chars: usize,
 }
@@ -100,11 +73,9 @@ fn truncate_body(body: &str, max: usize) -> (String, bool) {
     }
 }
 
-/// Build the extractor user message: the TRUSTED CONTEXT block (with the empty
-/// owner-refinement slot) first, then the UNTRUSTED EMAIL fenced block. Identical
-/// fence discipline to [`crate::triage::stage2::build_user_message`] — any
-/// instruction-like text in the body lands strictly inside the fence, after the
-/// trust rule, never in the trusted region.
+/// Build the extractor user message: the TRUSTED CONTEXT block first, then the
+/// fenced UNTRUSTED EMAIL block. Instruction-like text in the body lands strictly
+/// inside the fence and after the trust rule, never in the trusted region.
 pub fn build_extract_user_message(ctx: &ExtractContext) -> String {
     let (body, truncated) = truncate_body(ctx.body, ctx.max_body_chars);
     let mut out = String::with_capacity(body.len() + 512);
@@ -142,10 +113,9 @@ pub fn build_extract_user_message(ctx: &ExtractContext) -> String {
     out.push_str(ctx.subject);
     out.push('\n');
     out.push_str("body:\n");
-    // Neutralize fence impersonation: a body containing our own static markers
-    // ("-----END UNTRUSTED EMAIL-----", "=== TRUSTED CONTEXT ===") could fake a
-    // close-fence followed by a forged owner-refinement block. Quote any line
-    // that starts with a fence/heading marker so it stays visibly data.
+    // Neutralize fence impersonation: a body echoing our own markers could fake
+    // a close-fence followed by a forged owner-refinement block, so any line
+    // starting with a fence/heading marker is quoted to stay visibly data.
     let neutralized: String = body
         .lines()
         .map(|l| {
@@ -219,7 +189,7 @@ mod tests {
         };
         let msg = build_extract_user_message(&ctx);
         assert!(msg.contains("owner refinement: none"), "empty refinement slot present");
-        // The trusted slot sits ahead of the untrusted fence.
+        // The trusted slot has to sit ahead of the untrusted fence.
         let refinement = msg.find("owner refinement").unwrap();
         let fence = msg.find("BEGIN UNTRUSTED EMAIL").unwrap();
         assert!(refinement < fence);

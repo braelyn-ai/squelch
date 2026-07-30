@@ -1,57 +1,27 @@
-//! Receipt -> open-bill matching (the "your payment closed this bill" hook).
+//! Receipt -> open-bill matching: the pure merchant-identity, amount, and
+//! recency rules for auto-resolving an open bill when its payment lands. The
+//! store-side query and status transition live in [`crate::store::sqlite`].
 //!
-//! When the ingest pipeline lands a RECEIPT (a record of money already paid,
-//! see [`crate::triage::receipt`]), the store looks for an OPEN bill (a
-//! `deadlines` row whose triage status is not yet 'done') that the payment
-//! plausibly settles, and auto-resolves it. This module is the PURE decision
-//! logic for that hook: merchant-identity normalization and the amount /
-//! recency rules. The store-side query + status transition live in
-//! [`crate::store::sqlite`]; keeping the rules here makes them unit-testable
-//! without a database.
-//!
-//! ## Bias: precision over recall (documented invariant)
-//!
-//! A FALSE auto-close HIDES AN UNPAID BILL — the exact thing squelch exists to
-//! prevent (a missed match merely leaves a paid bill on screen until the user
-//! dismisses it). Every rule here is therefore conservative:
-//!
-//!   * MERCHANT identity must match structurally — same registrable email
-//!     domain, or the same normalized display name. No substring or fuzzy
-//!     matching.
-//!   * FREEMAIL domains (gmail.com, yahoo.com, …) never establish merchant
-//!     identity on their own: two strangers on gmail share a domain. For those,
-//!     only the FULL from-address (same sender) matches.
-//!   * When BOTH sides carry an amount, they must agree to within
-//!     [`AMOUNT_TOLERANCE_USD`] (a couple of cents of rounding), else NO match.
-//!   * A receipt with NO amount can never close a bill that HAS one — the one
-//!     number we could verify is missing, so we refuse.
-//!   * Only when the BILL has no parsed amount is a merchant-only match
-//!     acceptable, and then only inside the tighter
-//!     [`MERCHANT_ONLY_WINDOW_DAYS`] recency window.
-//!
-//! SECURITY: receipts and deadlines are both structurally sealed-free (their
-//! detectors never run on sealed mail), so nothing here can ever touch sealed
-//! content. This is internal ingest logic — no agent-door (MCP) surface changes.
+//! INVARIANT — precision over recall, because a false auto-close hides an unpaid
+//! bill: merchant identity must match structurally (never fuzzy or substring),
+//! both amounts must agree when both are present, and a receipt with no amount
+//! never closes a bill that has one.
 
-/// Max |receipt - bill| in USD for two parsed amounts to count as "the same
-/// payment". Covers float noise and cent-level rounding between a statement and
-/// its confirmation; anything larger is a different transaction.
+/// Max |receipt - bill| in USD for two parsed amounts to be "the same payment":
+/// float noise and cent-level rounding only; anything larger is a different
+/// transaction.
 pub const AMOUNT_TOLERANCE_USD: f64 = 0.02;
 
-/// Recency window for an AMOUNT-VERIFIED match: the bill's message must have
-/// arrived no more than this many days before the receipt. Billing cycles are
-/// monthly; 60 days covers a cycle plus a late payment without reaching back to
-/// stale history.
+/// Recency window for an AMOUNT-VERIFIED match. Billing cycles are monthly; 60
+/// days covers a cycle plus a late payment without reaching into stale history.
 pub const AMOUNT_MATCH_WINDOW_DAYS: i64 = 60;
 
-/// Recency window for a MERCHANT-ONLY match (bill has no parsed amount). With
-/// no amount to corroborate, the window is tighter: the receipt must follow the
-/// bill within a month.
+/// Recency window for a MERCHANT-ONLY match (bill has no parsed amount).
+/// Tighter, because no amount corroborates it.
 pub const MERCHANT_ONLY_WINDOW_DAYS: i64 = 30;
 
-/// Freemail / consumer-mailbox domains that never establish MERCHANT identity
-/// by domain alone: two unrelated senders on gmail share `gmail.com`. For these
-/// only full from-address equality (the same sender) matches.
+/// Freemail domains that never establish MERCHANT identity by domain alone (two
+/// strangers share `gmail.com`); for these only full from-address equality does.
 const FREEMAIL_DOMAINS: &[&str] = &[
     "gmail.com",
     "googlemail.com",
@@ -66,28 +36,22 @@ const FREEMAIL_DOMAINS: &[&str] = &[
     "protonmail.com",
 ];
 
-/// Two-label suffixes that are PUBLIC (registry) suffixes, not registrable
-/// domains: `billing.foo.co.uk` and `bar.co.uk` must NOT match on "co.uk".
-/// Small pragmatic list (v0 is US-mail-heavy); a full public-suffix list is
-/// overkill here.
+/// Two-label PUBLIC (registry) suffixes, not registrable domains: `bar.co.uk`
+/// and `baz.co.uk` must NOT match on "co.uk". Pragmatic list, not the full PSL.
 const PUBLIC_TWO_LABEL_SUFFIXES: &[&str] = &[
     "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp",
     "com.br", "co.in",
 ];
 
 /// Trailing corporate-suffix tokens dropped during name normalization, so
-/// "Comcast Inc." and "Comcast" read as the same merchant. Only TRAILING tokens
-/// are dropped ("Co" inside a name is kept).
+/// "Comcast Inc." and "Comcast" are one merchant. Only TRAILING tokens go.
 const CORP_SUFFIX_TOKENS: &[&str] = &[
     "inc", "llc", "llp", "ltd", "co", "corp", "corporation", "company", "gmbh", "sa", "plc",
 ];
 
 /// Normalize a merchant DISPLAY NAME to a comparison key: lowercase, split on
-/// every non-alphanumeric character (so "PG&E" -> ["pg","e"]), drop trailing
-/// corporate-suffix tokens, and re-join with nothing between. Examples:
-/// "PG&E" -> "pge", "PGE" -> "pge", "Bay Wheels" -> "baywheels",
-/// "Comcast, Inc." -> "comcast". Returns an empty string for a name with no
-/// alphanumeric content (callers treat empty as "no name").
+/// every non-alphanumeric char, drop trailing corporate-suffix tokens, re-join
+/// with nothing between ("PG&E" and "PGE" both -> "pge"). Empty = "no name".
 pub fn normalize_merchant(name: &str) -> String {
     let lower = name.to_lowercase();
     let mut tokens: Vec<&str> = lower
@@ -105,9 +69,8 @@ pub fn normalize_merchant(name: &str) -> String {
 }
 
 /// The registrable-ish domain of an email address, lowercased: the last two
-/// labels, or three when the last two are a known public suffix (`co.uk`, …).
-/// `billing@sub.pge.com` -> `pge.com`. Returns `None` when there is no `@` or
-/// the domain has fewer than two labels (nothing trustworthy to compare).
+/// labels, or three when the last two are a known public suffix. `None` when
+/// there is no `@` or too few labels to compare.
 fn registrable_domain(addr: &str) -> Option<String> {
     let domain = addr.rsplit('@').next().filter(|d| *d != addr)?.to_lowercase();
     let labels: Vec<&str> = domain.split('.').filter(|l| !l.is_empty()).collect();
@@ -125,22 +88,14 @@ fn registrable_domain(addr: &str) -> Option<String> {
     }
 }
 
-/// Minimum length of a normalized name for a NAME-ONLY match. One- or
-/// two-letter keys ("GE" vs a stray "ge") are too collision-prone to establish
-/// identity by themselves.
+/// Minimum normalized-name length for a NAME-ONLY match; shorter keys ("GE")
+/// are too collision-prone to establish identity alone.
 const MIN_NAME_KEY_LEN: usize = 3;
 
-/// Do a receipt and a bill plausibly come from the SAME MERCHANT?
-///
-/// Matches when EITHER:
-///   * both from-addresses share a registrable domain — except on a freemail
-///     domain, where only the identical full address (same human sender)
-///     counts; OR
-///   * both display names normalize (case / punctuation / corporate suffixes
-///     stripped) to the same non-trivial key ("PG&E" == "PGE").
-///
-/// Deliberately NO substring or fuzzy matching — precision over recall (a false
-/// merchant match risks hiding an unpaid bill).
+/// Do a receipt and a bill plausibly come from the SAME MERCHANT? Either a
+/// shared registrable domain (on freemail, only the identical full address), or
+/// both display names normalizing to the same non-trivial key. No substring or
+/// fuzzy matching — a false merchant match risks hiding an unpaid bill.
 pub fn merchant_matches(
     receipt_addr: &str,
     receipt_name: Option<&str>,
@@ -174,16 +129,11 @@ pub fn amount_matches(receipt: f64, bill: f64) -> bool {
     (receipt - bill).abs() <= AMOUNT_TOLERANCE_USD + f64::EPSILON
 }
 
-/// The amount rule + which recency window applies, given the two optional
-/// amounts. Returns the applicable window in days, or `None` when the amounts
-/// forbid a close:
-///
-///   * both parsed: must agree within tolerance -> the wide
-///     [`AMOUNT_MATCH_WINDOW_DAYS`]; disagree -> no close.
-///   * bill parsed, receipt not: NO close — the one verifiable number is
-///     missing, and hiding an unpaid bill is worse than a missed match.
-///   * bill has no parsed amount: merchant identity + recency must carry the
-///     match alone -> the tight [`MERCHANT_ONLY_WINDOW_DAYS`].
+/// The amount rule plus the recency window it implies, or `None` when the
+/// amounts forbid a close: both parsed and agreeing -> the wide window; both
+/// parsed and disagreeing -> refuse; receipt missing an amount the bill has ->
+/// refuse (the one verifiable number is absent); bill with no parsed amount ->
+/// merchant identity carries it alone, inside the tight window.
 pub fn amounts_permit_close(receipt: Option<f64>, bill: Option<f64>) -> Option<i64> {
     match (receipt, bill) {
         (Some(r), Some(b)) => amount_matches(r, b).then_some(AMOUNT_MATCH_WINDOW_DAYS),

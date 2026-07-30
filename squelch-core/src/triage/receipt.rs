@@ -1,90 +1,46 @@
-//! Receipt / purchase-record detection for the ingest pipeline.
+//! Receipt / purchase-record detection: pure classification of mail recording
+//! money ALREADY paid ("payment received", "your receipt", "order confirmation",
+//! "you were charged"), plus a best-effort total ([`ReceiptInfo`]). A receipt is
+//! a RECORD — noise-tier for the ranked inbox, but its own client category.
+//! Never run for sealed mail (see docs/SECURITY.md).
 //!
-//! This is a PURE detection/extraction module in the same spirit as
-//! [`crate::triage::shipment`] and [`crate::triage::deadline`]: given a message's
-//! surfaces (from-address, subject, body) it decides whether the message is a
-//! RECEIPT — a record of money that has ALREADY been paid (past-tense: "payment
-//! received", "your receipt", "order confirmation", "you were charged") — and, if
-//! so, extracts a best-effort total ([`ReceiptInfo`]).
-//!
-//! A receipt is a RECORD, not an obligation and not a signal. It is noise-tier for
-//! the ranked inbox, but it deserves its own desktop category (the "Receipts" zone)
-//! rather than being mis-grabbed by the Newsletters heuristic (the live Bay Wheels
-//! bug this module fixes). The ingest pipeline runs this classifier side by side
-//! with the shipment/deadline classifiers for non-sealed mail.
-//!
-//! ## Precedence / independence (documented invariants)
-//!
-//!   * A receipt and a SHIPMENT can COEXIST. An order-confirmation that carries a
-//!     total AND a tracking number is BOTH a receipt (the record of what you paid)
-//!     and a shipment (the package to track). Receipt detection is INDEPENDENT of
-//!     shipment detection — neither suppresses the other; the ingest pipeline emits
-//!     both when both fire.
-//!   * A receipt is NEVER a BILL (obligation). The two are mutually exclusive by
-//!     phrasing: [`crate::triage::deadline::detect_bill`] already EXCLUDES
-//!     past-transaction phrasing (it suppresses the bill classification when
-//!     receipt-shaped language fires without a genuine payment-obligation phrase),
-//!     so a "payment received" receipt never lands as a bill on rung 1. This module
-//!     is the mirror: it classifies exactly those past-transaction records. We
-//!     additionally verify (see [`detect_receipt`]) that a genuine
-//!     payment-OBLIGATION email — "amount due", "payment due", "past due" — is NOT
-//!     classified as a receipt, so the two classifiers never double-claim a
-//!     message.
-//!
-//! ## Exclusions (return `None`)
-//!
-//!   * REFUNDS / inbound money: a refund is money flowing TO the user, not a
-//!     purchase — it is not a receipt. Reuses the deadline module's inbound-money
-//!     phrasing.
-//!   * Pure marketing / newsletters with no transaction phrasing: nothing to
-//!     record.
-//!   * Bills / future obligations: kept separate (see above).
-//!
-//! SECURITY: this is NEVER run for sealed (auth/2FA) mail — the caller gates on
-//! `sensitivity='normal'` exactly like the shipment/deadline paths, so a sealed
-//! OTP can never become a receipt. No bodies/keys are logged.
+//! Invariants: a receipt and a SHIPMENT can COEXIST — detection is independent,
+//! neither suppresses the other. A receipt is NEVER a bill: obligation phrasing
+//! excludes here and [`crate::triage::deadline::detect_bill`] excludes receipt
+//! phrasing, so the two classifiers never double-claim a message. Refunds /
+//! inbound money and pure marketing return `None`.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// A detected receipt. Mirrors the shape persisted in the `receipts` table minus
-/// the DB identity/timestamp/sender columns (those are supplied by the ingest
-/// pipeline from the message).
+/// A detected receipt: the `receipts` table shape minus the DB
+/// identity/timestamp/sender columns, which ingest supplies from the message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReceiptInfo {
-    /// The extracted total, or `None` when no amount parses. A receipt with no
-    /// parseable total is STILL a receipt (it must still leave Newsletters) — the
-    /// amount is best-effort, not a gate.
+    /// The extracted total. Best-effort, not a gate: a receipt with no parseable
+    /// total is STILL a receipt.
     pub amount: Option<f64>,
-    /// Currency code for `amount` (always "USD" in v0, mirroring the deadline
-    /// currency parser). `None` when `amount` is `None`.
+    /// Currency code for `amount` (always "USD" in v0); `None` when `amount` is.
     pub currency: Option<String>,
 }
 
 struct ReceiptDetector {
-    /// Past-transaction / purchase-record phrasing. Any of these classifies the
-    /// message as a receipt (subject to the exclusions below). This is the same
-    /// family the deadline module uses to SUPPRESS the bill classification; here
-    /// it POSITIVELY classifies. Bay-Wheels-style ride/service receipts are
-    /// covered by "receipt for" / "your receipt" / "thank you for your ride".
+    /// Past-transaction / purchase-record phrasing; any one classifies the
+    /// message as a receipt, subject to the exclusions below.
     receipt_phrases: Vec<Regex>,
-    /// Currency amount patterns (reused shape from the deadline module).
+    /// Currency amount patterns.
     amount: Vec<Regex>,
-    /// "total|paid|charged|amount|order total|grand total <amount>" — an amount
-    /// ADJACENT to a total-word is preferred over the largest amount in the body.
-    /// Captures the amount in group 1.
+    /// An amount ADJACENT to a total-word, preferred over the largest amount in
+    /// the body. Captures the amount in group 1.
     total_adjacent: Vec<Regex>,
-    /// REFUND / inbound-money phrasing (reused semantics from the deadline
-    /// module): a refund is money flowing TO the user, not a purchase — exclude.
+    /// REFUND / inbound-money phrasing: money flowing TO the user, not a
+    /// purchase — exclude.
     inbound_money: Vec<Regex>,
-    /// Genuine payment-OBLIGATION phrasing: the user still OWES money. If any of
-    /// these fire, the message is a BILL/deadline, not a receipt — exclude, so the
-    /// receipt and bill classifiers never double-claim a message.
+    /// Genuine payment-OBLIGATION phrasing (the user still OWES): a BILL, not a
+    /// receipt — exclude, so the two classifiers never double-claim a message.
     obligation: Vec<Regex>,
 }
 
-/// Compile a case-insensitive static regex (panics on a bad pattern — these are
-/// all compile-time-constant patterns).
 fn rx(p: &str) -> Regex {
     Regex::new(&format!("(?i){p}")).expect("static receipt regex must compile")
 }
@@ -111,8 +67,7 @@ fn detector() -> &'static ReceiptDetector {
             rx(r"\bpayment posted\b"),
             rx(r"\bsuccessfully paid\b"),
             rx(r"\byour (payment|order|purchase) has been\b"),
-            // Bay-Wheels-style ride/service receipts: "receipt for your ride",
-            // "your trip receipt", "thanks for riding".
+            // Ride/service receipts.
             rx(r"\b(ride|trip) receipt\b"),
             rx(r"\breceipt for your (ride|trip)\b"),
             rx(r"\bthanks for (riding|your ride)\b"),
@@ -160,15 +115,13 @@ fn detector() -> &'static ReceiptDetector {
     })
 }
 
-/// Does the text carry REFUND / inbound-money phrasing? A refund is money flowing
-/// TO the user, not a purchase — never a receipt.
+/// Money flowing TO the user (a refund) is never a receipt.
 fn has_inbound_money(text: &str) -> bool {
     detector().inbound_money.iter().any(|re| re.is_match(text))
 }
 
-/// Does the text carry a genuine payment-OBLIGATION phrase (the user still owes)?
-/// Such mail is a BILL/deadline, not a receipt — so the two classifiers never
-/// double-claim a message.
+/// A genuine payment-OBLIGATION phrase (the user still owes) makes this a BILL,
+/// not a receipt.
 fn has_obligation(text: &str) -> bool {
     detector().obligation.iter().any(|re| re.is_match(text))
 }
@@ -178,10 +131,9 @@ fn parse_amount(raw: &str) -> Option<f64> {
     raw.replace(',', "").parse::<f64>().ok()
 }
 
-/// Extract the receipt TOTAL. Prefers a value adjacent to a total-word
-/// (total|paid|charged|amount|order total|grand total); else the LARGEST currency
-/// amount in the text (the total is almost always the largest line on a receipt).
-/// Returns `(amount, "USD")` or `None` when nothing parses.
+/// Extract the receipt TOTAL: an amount adjacent to a total-word if there is
+/// one, else the LARGEST currency amount (the total is almost always the largest
+/// line on a receipt). `None` when nothing parses.
 fn extract_total(text: &str) -> Option<(f64, String)> {
     let d = detector();
     // 1. Prefer an amount adjacent to a total-word.
@@ -207,34 +159,26 @@ fn extract_total(text: &str) -> Option<(f64, String)> {
     best.map(|v| (v, "USD".to_string()))
 }
 
-/// Detect a receipt from a message's surfaces. Returns `None` when the message is
-/// not a purchase record, is a refund/inbound-money notice, or is a bill/obligation.
+/// Detect a receipt from a message's surfaces. `None` when the message is not a
+/// purchase record, is a refund, or is a bill. Classification is driven by
+/// past-transaction phrasing, so a receipt with no parseable total still counts.
 ///
-/// A receipt WITHOUT a parseable total is STILL a receipt (`amount: None`) — the
-/// classification is driven by past-transaction phrasing, not by the amount.
-///
-/// SECURITY: callers MUST NOT invoke this for sealed mail. It reads only the
-/// provided text and never logs.
+/// SECURITY: callers MUST NOT invoke this for sealed mail (docs/SECURITY.md).
 pub fn detect_receipt(from_addr: &str, subject: &str, body: &str) -> Option<ReceiptInfo> {
     let d = detector();
     let hay = format!("{from_addr}\n{subject}\n{body}");
 
-    // 0. REFUND / INBOUND-MONEY EXCLUSION. A refund is money flowing TO the user —
-    //    not a purchase receipt. Suppress entirely. (Mirrors the deadline module's
-    //    inbound-money exclusion.)
+    // 0. Refund / inbound money: flowing TO the user, so not a purchase.
     if has_inbound_money(&hay) {
         return None;
     }
 
-    // 0b. OBLIGATION EXCLUSION. A genuine "amount due" / "payment due" / "past due"
-    //     is a BILL, handled by detect_bill — never a receipt. This keeps the two
-    //     classifiers from double-claiming a message (a receipt is never a bill).
+    // 0b. A genuine obligation is a BILL (detect_bill's job), never a receipt.
     if has_obligation(&hay) {
         return None;
     }
 
-    // 1. Is there past-transaction / purchase-record phrasing at all? Without one,
-    //    a stray amount or a marketing blast is not a receipt.
+    // 1. Without past-transaction phrasing, a stray amount is not a receipt.
     if !d.receipt_phrases.iter().any(|re| re.is_match(&hay)) {
         return None;
     }
@@ -256,8 +200,7 @@ mod tests {
 
     #[test]
     fn bay_wheels_ride_receipt_is_a_receipt_with_amount() {
-        // The live bug: a Bay Wheels ride receipt. It must classify as a receipt
-        // (so it leaves Newsletters) and pull its total.
+        // A ride receipt must classify and pull its total.
         let r = detect_receipt(
             "no-reply@baywheels.com",
             "Your Bay Wheels ride receipt",
@@ -305,8 +248,7 @@ mod tests {
 
     #[test]
     fn receipt_with_no_amount_is_still_a_receipt() {
-        // No parseable total anywhere — STILL a receipt (amount None), so it must
-        // still leave Newsletters.
+        // No parseable total anywhere — still a receipt, with amount None.
         let r = detect_receipt(
             "no-reply@service.com",
             "Your receipt",
@@ -343,8 +285,7 @@ mod tests {
 
     #[test]
     fn bill_payment_due_is_not_a_receipt() {
-        // A genuine bill (payment due) is an OBLIGATION handled by detect_bill —
-        // it stays a bill and must NOT be double-claimed as a receipt.
+        // An obligation stays a bill; the two classifiers never double-claim.
         let r = detect_receipt(
             "billing@pge.com",
             "Your PG&E statement",
@@ -366,8 +307,8 @@ mod tests {
 
     #[test]
     fn otp_shaped_email_is_not_a_receipt() {
-        // Belt (the ingest pipeline never calls this for sealed mail) + suspenders:
-        // an OTP carries no receipt phrasing, so it is not a receipt regardless.
+        // Ingest never calls this for sealed mail; an OTP also carries no receipt
+        // phrasing, so it cannot classify either way.
         let r = detect_receipt(
             "noreply@bank.com",
             "Your verification code",
@@ -380,10 +321,8 @@ mod tests {
 
     #[test]
     fn order_confirmation_with_tracking_is_still_a_receipt() {
-        // An order confirmation with a total AND a tracking number is BOTH a
-        // receipt and a shipment. Receipt detection is independent of shipment
-        // detection — this fires as a receipt (the shipment classifier fires
-        // separately in ingest).
+        // A total AND a tracking number is both; the shipment classifier fires
+        // separately in ingest.
         let r = detect_receipt(
             "auto@amazon.com",
             "Your Amazon.com order confirmation",

@@ -89,7 +89,6 @@ fn handle_rule_edit(app: &mut App, key: KeyEvent) {
         }
         _ => match ed.field {
             RuleField::Disposition => {
-                // Space or arrows cycle the disposition.
                 if matches!(
                     key.code,
                     KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right

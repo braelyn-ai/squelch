@@ -1,71 +1,47 @@
-//! Shipment / package-tracking detection for the ingest pipeline.
+//! Shipment / package-tracking detection: pure extraction of carrier, tracking
+//! number, best-effort item name, coarse status, and a carrier tracking URL
+//! ([`ShipmentInfo`]). Independent of the Stage-1 tier — shipping mail is
+//! noise-tier for the ranked inbox but still feeds the shipments tracker. Never
+//! run for sealed mail (see docs/SECURITY.md).
 //!
-//! This is a PURE detection/extraction module in the same spirit as
-//! [`crate::triage::deadline`]: given a message's surfaces (from-address,
-//! subject, body) it decides whether the message is a shipping/delivery
-//! notification and, if so, extracts a [`ShipmentInfo`] — carrier, tracking
-//! number, best-effort item name, coarse status, and a carrier tracking URL.
-//!
-//! It is INDEPENDENT of the Stage-1 triage tier: shipping mail is noise-tier for
-//! the ranked inbox (a "your order shipped" email is not a bill and not a
-//! signal), but the same email still feeds the shipments tracker so the desktop
-//! "In Transit" zone can list every package currently en route. The ingest
-//! pipeline runs both classifiers side by side for non-sealed mail.
-//!
-//! SECURITY: this is NEVER run for sealed (auth/2FA) mail — the caller gates on
-//! `sensitivity='normal'` exactly like every other non-sealed-only path, so a
-//! sealed OTP can never become a shipment. There is nothing to leak here (no
-//! bodies/keys are logged), and by construction the `shipments` table only ever
-//! holds rows produced from non-sealed mail.
-//!
-//! ## Carrier disambiguation
-//!
-//! The hard part is that USPS / FedEx / DHL tracking numbers are all bare
-//! digit-runs and overlap heavily. We resolve carrier in two passes:
-//!   1. an EXPLICIT carrier-name mention in the sender/subject/body (e.g. "UPS",
-//!      "USPS", "fedex.com", "DHL") is the strongest signal — prefer it;
-//!   2. otherwise fall back to the tracking-number SHAPE (UPS `1Z…` and Amazon
-//!      `TBA…` are unambiguous prefixes; USPS/FedEx/DHL fall to length
-//!      heuristics).
-//!
-//! If a number is found but the carrier is genuinely ambiguous, we keep the
-//! number and store `carrier="unknown"` (no tracking URL) rather than guess.
+//! Carrier resolution takes two passes, because USPS / FedEx / DHL numbers are
+//! all overlapping bare digit-runs: an EXPLICIT carrier-name mention in the
+//! surfaces wins, else the number's SHAPE decides (UPS `1Z…` and Amazon `TBA…`
+//! are unambiguous prefixes; the rest fall to length heuristics). A genuinely
+//! ambiguous number is kept as `carrier="unknown"` with no URL, never guessed.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// A detected shipment. Mirrors the shape persisted in the `shipments` table
-/// minus the DB identity/timestamp columns.
+/// A detected shipment: the `shipments` table shape minus the DB
+/// identity/timestamp columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShipmentInfo {
     /// Lower-case carrier slug: "ups", "usps", "fedex", "dhl", "amazon", or
-    /// "unknown" (a number we could not attribute to a carrier).
+    /// "unknown" (a number we could not attribute).
     pub carrier: String,
-    /// The extracted tracking number. Always present — a shipment with no
-    /// tracking number is not emitted (we can't dedupe/track it).
+    /// Always present — a shipment with no tracking number is never emitted,
+    /// since it could not be deduped or tracked.
     pub tracking_number: String,
-    /// Best-effort product/item phrase pulled from the subject; empty when
-    /// nothing meaningful survives the boilerplate strip.
+    /// Best-effort item phrase; empty when nothing survives the strip.
     pub item_name: String,
     /// Coarse lifecycle status.
     pub status: ShipmentStatus,
-    /// Carrier tracking URL with the number substituted, or `None` when the
-    /// carrier has no public tracking URL (Amazon) or is unknown.
+    /// Tracking URL with the number substituted; `None` for a carrier with no
+    /// public tracking URL (Amazon) or an unknown one.
     pub tracking_url: Option<String>,
 }
 
-/// Coarse shipment lifecycle. Ranked (except [`ShipmentStatus::Exception`],
-/// which is a flag) so the ingest state machine never regresses a delivered
-/// package back to shipped. See [`ShipmentStatus::rank`].
+/// Coarse shipment lifecycle, ranked so the ingest state machine never regresses
+/// a delivered package back to shipped (see [`ShipmentStatus::rank`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShipmentStatus {
     Ordered,
     Shipped,
     OutForDelivery,
     Delivered,
-    /// A delivery problem (delay / failed delivery / exception). Treated as a
-    /// FLAG rather than a point on the ordered<shipped<... ladder: it can apply
-    /// at any stage, so it does not have a monotonic rank.
+    /// A delivery problem. A FLAG, not a point on the ladder — it can apply at
+    /// any stage, so it carries no monotonic rank.
     Exception,
 }
 
@@ -91,10 +67,8 @@ impl ShipmentStatus {
         }
     }
 
-    /// Progress rank for the no-regress state machine. `ordered < shipped <
-    /// out_for_delivery < delivered`. `Exception` returns `None` — it is a flag,
-    /// not a monotonic stage, so it never forces a regress and is never regressed
-    /// away by a later stage update.
+    /// Progress rank for the no-regress state machine: `ordered < shipped <
+    /// out_for_delivery < delivered`. `Exception` has none — it is a flag.
     pub fn rank(self) -> Option<u8> {
         match self {
             ShipmentStatus::Ordered => Some(0),
@@ -105,13 +79,9 @@ impl ShipmentStatus {
         }
     }
 
-    /// Merge an incoming status onto an existing one WITHOUT ever regressing a
-    /// delivered package. Rules:
-    ///   * a delivered shipment stays delivered (a later "shipped" email is a
-    ///     stale/duplicate notification, not a real regress);
-    ///   * an incoming Exception is preserved (a delivery problem is worth
-    ///     surfacing) UNLESS the shipment is already delivered;
-    ///   * otherwise the HIGHER rank wins.
+    /// Merge an incoming status onto an existing one, never regressing:
+    /// delivered is terminal (a later "shipped" email is a stale duplicate); an
+    /// incoming Exception is kept unless already delivered; else higher rank wins.
     pub fn merge(existing: ShipmentStatus, incoming: ShipmentStatus) -> ShipmentStatus {
         // Delivered is terminal — never walk it back.
         if existing == ShipmentStatus::Delivered {
@@ -141,48 +111,35 @@ impl ShipmentStatus {
 }
 
 struct Detector {
-    /// Carrier tracking-number patterns, MOST-SPECIFIC FIRST. Each entry is
-    /// `(carrier_slug, regex, requires_signal)`. UPS `1Z…` and Amazon `TBA…` are
-    /// unambiguous prefixes (`requires_signal=false`) and come first; the bare
-    /// digit-runs (USPS/FedEx/DHL) follow with `requires_signal=true` — a lone
-    /// digit-run with NO real carrier signal (carrier name in the surfaces, or a
-    /// carrier tracking-URL/word) must NOT be classified as that carrier.
+    /// `(carrier_slug, regex, requires_signal)`, MOST-SPECIFIC FIRST. The
+    /// unambiguous prefixes (UPS `1Z…`, Amazon `TBA…`) come first and need no
+    /// signal; the bare digit-runs follow with `requires_signal=true`, since a
+    /// lone digit-run with no carrier signal must NOT become that carrier.
     numbers: Vec<(&'static str, Regex, bool)>,
-    /// Explicit carrier-name mentions (sender/subject/body). Used to disambiguate
-    /// the digit-run carriers and to attribute an otherwise-ambiguous number.
+    /// Explicit carrier-name mentions, used to disambiguate the digit-run
+    /// carriers and to attribute an otherwise-ambiguous number.
     carrier_names: Vec<(&'static str, Regex)>,
     /// Boilerplate phrases stripped from the subject to recover the item name.
     boilerplate: Vec<Regex>,
-    /// Status keyword sets, checked in the order that resolves priority
-    /// (out_for_delivery / delivered / exception before the weaker shipped /
-    /// ordered). Each entry is `(status, regex)`.
+    /// `(status, regex)` in priority order — out_for_delivery / delivered /
+    /// exception are checked before the weaker shipped / ordered.
     status: Vec<(ShipmentStatus, Regex)>,
-    /// Generic "is this even a shipping email" signal — a delivery/tracking
-    /// signal that must be present for detection to fire when only an ambiguous
-    /// bare-digit number is found (guards against random long digit-runs like
-    /// order totals or phone numbers being mistaken for tracking numbers).
+    /// "Is this even a shipping email" signal, required before an ambiguous
+    /// bare-digit number counts — otherwise an order total or phone number
+    /// reads as a tracking number.
     shipping_signal: Vec<Regex>,
-    /// OUTBOUND/RETURN phrasing: a return going FROM the user TO the seller, or a
-    /// return-label/refund notice. These are NOT inbound deliveries — money/goods
-    /// flow away from the user — so they must never become a tracked shipment.
-    /// Same spirit as the deadline module's inbound-money/receipt exclusions.
+    /// OUTBOUND/RETURN phrasing (a return to the seller, a return label, a
+    /// refund). Goods flow away from the user, so it is never a tracked shipment.
     return_signal: Vec<Regex>,
-    /// GENUINE INBOUND-DELIVERY phrasing: "your package/order shipped / delivered
-    /// / out for delivery / on its way / arriving". Used to document the return
-    /// precedence: even when inbound-delivery language ALSO appears, a return
-    /// notice still excludes (a return that mentions the original shipment is a
-    /// return). This set exists for clarity/testing, not to override the return
-    /// exclusion — it is consulted only by the precedence test.
+    /// GENUINE INBOUND-DELIVERY phrasing. Consulted only by the precedence test
+    /// proving that a return notice excludes even when this also fires.
     #[cfg_attr(not(test), allow(dead_code))]
     inbound_delivery_signal: Vec<Regex>,
-    /// "From <SELLER/ITEM>", "Your order of <X>", "<X> is on its way", product/
-    /// merchant phrases pulled from the BODY when the subject strips to a generic
-    /// leftover ("Package", "Your order", "") — best-effort, regex-only.
+    /// Product/merchant phrases pulled from the BODY when the subject strips to
+    /// a generic leftover ("Package", "Your order", ""). Best-effort, regex-only.
     body_item: Vec<Regex>,
 }
 
-/// Compile a case-insensitive static regex (panics on a bad pattern — these are
-/// all compile-time-constant patterns).
 fn rx(p: &str) -> Regex {
     Regex::new(&format!("(?i){p}")).expect("static shipment regex must compile")
 }
@@ -193,27 +150,22 @@ fn detector() -> &'static Detector {
         numbers: vec![
             // UPS: 1Z + 16 alnum. Unambiguous prefix — trusted without a signal.
             ("ups", rx(r"\b1Z[0-9A-Z]{16}\b"), false),
-            // Amazon logistics: TBA + >=9 digits. Unambiguous prefix. No public
-            // tracking URL -> we link to nothing / the order page.
+            // Amazon logistics: TBA + >=9 digits. Unambiguous prefix.
             ("amazon", rx(r"\bTBA\d{9,}\b"), false),
-            // USPS: 9[234] then 18-24 more digits (20-22 total common), OR a bare
-            // 20-22 digit run. Most-specific USPS shape first. The distinctive
-            // 9[234]-prefixed impb form is trusted; the bare 20-22 digit run is
-            // ambiguous and REQUIRES a carrier signal.
+            // USPS: the distinctive 9[234]-prefixed impb form is trusted; a bare
+            // 20-22 digit run is ambiguous and needs a carrier signal.
             ("usps", rx(r"\b9[234]\d{18,24}\b"), false),
             ("usps", rx(r"\b\d{20,22}\b"), true),
-            // FedEx: 12, 15, or 20 digits — all bare digit-runs, REQUIRE a signal.
+            // FedEx: 12, 15, or 20 digits — all bare runs, all need a signal.
             ("fedex", rx(r"\b\d{20}\b"), true),
             ("fedex", rx(r"\b\d{15}\b"), true),
             ("fedex", rx(r"\b\d{12}\b"), true),
-            // DHL: 10-11 digits — bare digit-run, REQUIRES a signal (this is the
-            // exact false-positive class: a bare 10-digit eBay order number with
-            // no DHL signal must NOT read as a DHL shipment).
+            // DHL: 10-11 digits, the loosest shape — a bare 10-digit order
+            // number with no DHL signal must not read as a DHL shipment.
             ("dhl", rx(r"\b\d{10,11}\b"), true),
         ],
         carrier_names: vec![
             ("ups", rx(r"\bUPS\b|\bups\.com\b")),
-            // USPS: the acronym, "postal service", or usps.com.
             ("usps", rx(r"\bUSPS\b|\bu\.s\.p\.s\b|usps\.com|postal service")),
             ("fedex", rx(r"\bfedex\b|fedex\.com")),
             ("dhl", rx(r"\bDHL\b|dhl\.com")),
@@ -241,9 +193,8 @@ fn detector() -> &'static Detector {
             rx(r"\btracking (info(rmation)?|number|update|details?)\b"),
             rx(r"\btracking\b"),
             rx(r"\border confirmation\b"),
-            // A trailing/standalone update|notification|confirmation|alert word
-            // left behind after the phrase strips above (e.g. "tracking number
-            // update" -> "update").
+            // A standalone word left behind by the strips above ("tracking
+            // number update" -> "update").
             rx(r"\b(update|notification|confirmation|alert|info(rmation)?)\b"),
             rx(r"\border\s*#?\s*[\w-]+"),
             rx(r"#\s*[\w-]+"),
@@ -253,16 +204,12 @@ fn detector() -> &'static Detector {
             rx(r"\bfor\b"),
         ],
         status: vec![
-            // Exception FIRST: a delivery problem should win over any weaker
-            // "shipped"/"on its way" text that lingers in the same email.
+            // Exception FIRST: a delivery problem wins over any weaker
+            // "shipped"/"on its way" text lingering in the same email.
             (ShipmentStatus::Exception, rx(r"\bdelay(ed|s)?\b|\bexception\b|\bfailed delivery\b|\bdelivery (failed|attempt|problem|issue)\b|\bcould not be delivered\b|\bundeliverable\b")),
-            // Out for delivery / arriving today.
             (ShipmentStatus::OutForDelivery, rx(r"\bout for delivery\b|\barriving today\b|\bwill be delivered today\b")),
-            // Delivered.
             (ShipmentStatus::Delivered, rx(r"\b(was|has been|is)?\s*delivered\b|\bdelivery complete\b")),
-            // Shipped / on its way.
             (ShipmentStatus::Shipped, rx(r"\bshipped\b|\bhas shipped\b|\bon its way\b|\bon the way\b|\bshipment (is )?on\b|\bin transit\b")),
-            // Ordered / order confirmed.
             (ShipmentStatus::Ordered, rx(r"\border confirmed\b|\border placed\b|\border received\b|\bthank you for your order\b|\bwe('| ha)ve received your order\b")),
         ],
         shipping_signal: vec![
@@ -292,13 +239,11 @@ fn detector() -> &'static Detector {
             rx(r"\barriving today\b"),
         ],
         body_item: vec![
-            // "From <SELLER/ITEM>" (UPS/USPS delivered-notice style: "From DOUBLE
-            // TAKE MIRROR"). Capture the trailing phrase up to a line/sentence end.
+            // "From <SELLER>", the UPS/USPS delivered-notice style.
             rx(r"\bfrom\s+([A-Za-z0-9][A-Za-z0-9 &'.,\-]{2,60})"),
-            // "Your order of <X>" / "Your order for <X>".
+            // "Your order of/for <X>".
             rx(r"\byour order (?:of|for)\s+([A-Za-z0-9][A-Za-z0-9 &'.,\-]{2,60})"),
-            // "<X> is on its way / has shipped / has been delivered" — capture the
-            // product/merchant phrase that PRECEDES the shipping verb.
+            // The phrase PRECEDING a shipping verb: "<X> is on its way".
             rx(r"\b([A-Za-z0-9][A-Za-z0-9 &'.,\-]{2,60}?)\s+(?:is on its way|has shipped|have shipped|has been delivered|was delivered)\b"),
             // "shipment of <X>" / "order of <X>".
             rx(r"\b(?:shipment|order) of\s+([A-Za-z0-9][A-Za-z0-9 &'.,\-]{2,60})"),
@@ -319,17 +264,15 @@ fn tracking_url(carrier: &str, number: &str) -> Option<String> {
         "dhl" => Some(format!(
             "https://www.dhl.com/us-en/home/tracking.html?tracking-id={enc}"
         )),
-        // Amazon has no public tracking URL keyed by the TBA number; the user
-        // tracks via their order page. Unknown carriers get nothing.
+        // Amazon has no public URL keyed by the TBA number (the user tracks via
+        // their order page); unknown carriers get nothing.
         _ => None,
     }
 }
 
-/// Is there a REAL carrier signal in the surfaces — ANY carrier name mention, or
-/// a carrier tracking URL/word ("united parcel", a `*.com` carrier domain, a
-/// carrier tracking-URL fragment)? Required before an ambiguous bare-digit number
-/// is classified as a shipment: a lone digit-run with no carrier signal is almost
-/// certainly an order number, phone number, or amount — not a tracking number.
+/// Is there a REAL carrier signal — a carrier-name mention, or a carrier
+/// tracking URL/word? Required before an ambiguous bare-digit number counts: a
+/// lone digit-run with no carrier signal is almost certainly an order number.
 fn has_carrier_signal(mentioned: &[&'static str], hay: &str) -> bool {
     if !mentioned.is_empty() {
         return true;
@@ -341,21 +284,15 @@ fn has_carrier_signal(mentioned: &[&'static str], hay: &str) -> bool {
     .is_match(hay)
 }
 
-/// Does the text carry OUTBOUND/RETURN phrasing (a return going FROM the user TO
-/// the seller, a return-label/refund notice)? Such mail is never an inbound
-/// delivery. PRECEDENCE: this wins even when inbound-delivery language also
-/// appears — a return notice that mentions the original shipment is still a
-/// return. Same spirit as the deadline module's inbound-money/receipt exclusions.
+/// Does the text carry OUTBOUND/RETURN phrasing? PRECEDENCE: this wins even when
+/// inbound-delivery language also appears — a return notice that mentions the
+/// original shipment is still a return.
 fn is_return_or_outbound(hay: &str) -> bool {
     detector().return_signal.iter().any(|re| re.is_match(hay))
 }
 
-/// Does the text carry GENUINE INBOUND-DELIVERY phrasing ("your package shipped /
-/// delivered / out for delivery / arriving")? Advisory only: a true inbound
-/// delivery is NOT excluded, but this NEVER overrides the return exclusion — see
-/// the precedence documented on [`is_return_or_outbound`]. Exposed for the
-/// precedence test that proves a return notice mentioning the original shipment
-/// still excludes.
+/// Does the text carry GENUINE INBOUND-DELIVERY phrasing? Advisory only, and it
+/// never overrides the return exclusion — see [`is_return_or_outbound`].
 #[cfg(test)]
 fn has_inbound_delivery_signal(hay: &str) -> bool {
     detector()
@@ -364,10 +301,8 @@ fn has_inbound_delivery_signal(hay: &str) -> bool {
         .any(|re| re.is_match(hay))
 }
 
-/// Best-effort item name pulled from the BODY when the subject stripped to an
-/// empty/generic leftover. Looks for "From <SELLER>", "Your order of <X>", "<X>
-/// is on its way", "shipment of <X>", caps length, strips tracking numbers/urls
-/// and carrier names. Returns empty when nothing meaningful is found.
+/// Best-effort item name from the BODY, for when the subject stripped to an
+/// empty or generic leftover. Empty when nothing meaningful is found.
 fn extract_item_name_from_body(body: &str) -> String {
     let d = detector();
     for re in &d.body_item {
@@ -375,8 +310,8 @@ fn extract_item_name_from_body(body: &str) -> String {
             && let Some(m) = cap.get(1)
         {
             let raw = m.as_str();
-            // Cut at a sentence/line terminator so we don't slurp a whole
-            // paragraph after the phrase.
+            // Cut at a sentence/line terminator, so a whole paragraph after the
+            // phrase is not slurped in.
             let raw = raw
                 .split(['.', '\n', '\r', '!', '?', ';'])
                 .next()
@@ -407,8 +342,8 @@ fn clean_item_phrase(s: &str) -> String {
     trimmed.chars().take(60).collect::<String>().trim().to_string()
 }
 
-/// Is `s` a generic placeholder that is no better than the desktop's
-/// "Package via {carrier}" fallback?
+/// Is `s` a generic placeholder ("Package", "Your order", …) rather than a real
+/// item? Such a leftover is no better than the client's own fallback label.
 fn is_generic_item(s: &str) -> bool {
     let l = s.trim().to_lowercase();
     matches!(
@@ -428,9 +363,8 @@ fn mentioned_carriers(hay: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Extract the status from the surfaces, defaulting to [`ShipmentStatus::Shipped`]
-/// when a shipping email carries no explicit status keyword (a bare "tracking
-/// number: X" notification means the thing is in transit).
+/// The status from the surfaces, defaulting to [`ShipmentStatus::Shipped`]: a
+/// shipping email with no status keyword ("tracking number: X") is in transit.
 fn extract_status(hay: &str) -> ShipmentStatus {
     for (status, re) in &detector().status {
         if re.is_match(hay) {
@@ -441,24 +375,21 @@ fn extract_status(hay: &str) -> ShipmentStatus {
 }
 
 /// Best-effort item name from the subject: strip shipping boilerplate and
-/// leftover punctuation, collapse whitespace. Returns an empty string when
-/// nothing meaningful survives.
+/// leftover punctuation. Empty when nothing meaningful survives.
 pub fn extract_item_name(subject: &str) -> String {
     let mut s = subject.to_string();
     for re in &detector().boilerplate {
         s = re.replace_all(&s, " ").to_string();
     }
-    // Drop carrier names from the residual so "UPS" etc. don't masquerade as the
-    // item.
+    // So "UPS" and friends can't masquerade as the item.
     for (_, re) in &detector().carrier_names {
         s = re.replace_all(&s, " ").to_string();
     }
-    // Strip stray punctuation/separators left behind by the removals.
+    // Strip stray separators left behind by the removals.
     let cleaned: String = s
         .chars()
         .map(|c| if "|:–—-•·".contains(c) { ' ' } else { c })
         .collect();
-    // Collapse whitespace and trim leftover separators.
     let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = joined.trim_matches(|c: char| c == ',' || c == '.' || c.is_whitespace());
     // A one-or-two-char residue ("s", "of") is noise, not an item.
@@ -469,53 +400,42 @@ pub fn extract_item_name(subject: &str) -> String {
     }
 }
 
-/// Attribute a bare tracking-number match to a carrier, disambiguating the
-/// overlapping digit-run carriers (USPS/FedEx/DHL) with any explicit carrier
-/// mention. `shape_carrier` is the carrier the number's SHAPE suggested.
+/// Attribute a tracking-number match to a carrier, disambiguating the
+/// overlapping digit-run carriers with any explicit carrier mention.
+/// `shape_carrier` is what the number's SHAPE suggested.
 fn attribute_carrier(shape_carrier: &str, mentioned: &[&'static str]) -> String {
-    // Unambiguous prefixes (UPS 1Z, Amazon TBA) trust their shape outright —
-    // unless a DIFFERENT explicit carrier is mentioned AND the shape is a bare
-    // digit-run carrier. UPS/Amazon prefixes are distinctive enough to keep.
+    // The UPS/Amazon prefixes are distinctive enough to trust outright.
     if shape_carrier == "ups" || shape_carrier == "amazon" {
         return shape_carrier.to_string();
     }
-    // Digit-run carriers: an explicit mention wins if it is itself a digit-run
-    // carrier (usps/fedex/dhl) — that is the disambiguation. If the only mention
-    // is a prefix carrier (ups/amazon) but the number is a digit-run, keep the
-    // shape guess (the mention likely refers to something else).
+    // For a digit-run number, only a mention of another DIGIT-RUN carrier
+    // disambiguates; a ups/amazon mention alongside one likely refers to
+    // something else, so the shape guess stands.
     for m in mentioned {
         if matches!(*m, "usps" | "fedex" | "dhl") {
             return (*m).to_string();
         }
     }
-    // No disambiguating mention: fall back to the shape's length heuristic guess.
     shape_carrier.to_string()
 }
 
-/// Detect a shipment from a message's surfaces. Returns `None` when the message
-/// is not a shipping notification or carries no tracking number.
+/// Detect a shipment from a message's surfaces. `None` when the message is not a
+/// shipping notification or carries no tracking number.
 ///
-/// SECURITY: callers MUST NOT invoke this for sealed mail. It reads only the
-/// provided text and never logs.
+/// SECURITY: callers MUST NOT invoke this for sealed mail (docs/SECURITY.md).
 pub fn detect_shipment(from_addr: &str, subject: &str, body: &str) -> Option<ShipmentInfo> {
     let d = detector();
     let hay = format!("{from_addr}\n{subject}\n{body}");
 
-    // 0. OUTBOUND/RETURN EXCLUSION. A return (going FROM the user TO the seller),
-    //    a return-label/refund notice, or "seller received item" is NOT an inbound
-    //    delivery — nothing to track for the user's In-Transit zone. Suppress
-    //    entirely. PRECEDENCE: this wins even when inbound-delivery language ALSO
-    //    appears (a return notice that references the original shipment is still a
-    //    return). Same spirit as deadline.rs's inbound-money/receipt exclusions.
-    //    (This is what stops the eBay "Return 5322397648: Seller received item"
-    //    false positive — both a bare-digit number AND "seller received item".)
+    // 0. Outbound/return exclusion: nothing inbound to track. PRECEDENCE — this
+    //    wins even when inbound-delivery language ALSO appears, since a return
+    //    notice that references the original shipment is still a return.
     if is_return_or_outbound(&hay) {
         return None;
     }
 
-    // Is there any shipping/tracking/delivery signal at all? Without one, a long
-    // digit-run is almost certainly an order total, an amount, or a phone number
-    // — not a tracking number. This guards recall/precision both.
+    // Without any shipping signal, a long digit-run is almost certainly an order
+    // total, an amount, or a phone number rather than a tracking number.
     let has_signal = d.shipping_signal.iter().any(|re| re.is_match(&hay));
     if !has_signal {
         return None;
@@ -523,32 +443,24 @@ pub fn detect_shipment(from_addr: &str, subject: &str, body: &str) -> Option<Shi
 
     let mentioned = mentioned_carriers(&hay);
 
-    // Find the first tracking number by most-specific-first shape. The first
-    // match wins its number; carrier is then disambiguated.
+    // First match by most-specific-first shape wins its number; the carrier is
+    // then disambiguated.
     for (shape_carrier, re, requires_signal) in &d.numbers {
         if let Some(m) = re.find(&hay) {
-            // CARRIER SIGNAL GATE: for the ambiguous bare-digit carriers
-            // (DHL/FedEx/USPS-bare), a real carrier signal (name mention or a
-            // carrier tracking-URL/word) MUST be present. A lone digit-run with no
-            // carrier signal is not a shipment — skip this shape and try the next
-            // (there is no other shape for a plain 10-digit number, so we fall
-            // through to `None`). UPS 1Z / Amazon TBA prefixes are unambiguous and
-            // skip this gate.
+            // CARRIER SIGNAL GATE: the ambiguous bare-digit shapes need a real
+            // carrier signal, so skip to the next shape without one. There is no
+            // other shape for a plain 10-digit number, so that falls to `None`.
             if *requires_signal && !has_carrier_signal(&mentioned, &hay) {
                 continue;
             }
             let number = m.as_str().to_string();
             let carrier = attribute_carrier(shape_carrier, &mentioned);
             let status = extract_status(&hay);
-            // Item name: subject first; if it strips to empty/generic, recover a
-            // real product/merchant phrase from the body (BUG 2).
             let mut item_name = extract_item_name(subject);
             if is_generic_item(&item_name) {
-                // Subject stripped to empty/generic ("Package", "Your order", …):
-                // try to recover a real product/merchant phrase from the body. If
-                // the body yields nothing, blank the generic leftover so the
-                // desktop uses its own "Package via {carrier}" fallback rather than
-                // storing a bare "Package".
+                // The subject stripped to a generic leftover: recover a real
+                // phrase from the body, and store nothing if there is none, so
+                // the client shows its own fallback rather than a bare "Package".
                 item_name = extract_item_name_from_body(body);
             }
             let tracking_url = tracking_url(&carrier, &number);
@@ -662,11 +574,8 @@ mod tests {
 
     #[test]
     fn ambiguous_digit_run_without_carrier_signal_is_not_a_shipment() {
-        // UPDATED for BUG 1's carrier-signal gate: a bare 12-digit number with a
-        // shipping signal but NO carrier name/URL is no longer classified as a
-        // FedEx shipment — a lone digit-run with no real carrier signal is too
-        // ambiguous (order number / amount / phone). Precision over a guessed
-        // carrier.
+        // A bare 12-digit number with a shipping signal but no carrier name/URL
+        // is too ambiguous to name a carrier: precision over a guess.
         let s = detect_shipment(
             "orders@shop.example",
             "Your shipment is on its way",
@@ -791,10 +700,8 @@ mod tests {
 
     #[test]
     fn otp_shaped_email_is_not_a_shipment() {
-        // An OTP body carries a long digit-run (the code) but NO shipping signal,
-        // so it must never be mistaken for a tracking number. (Belt: the ingest
-        // pipeline never even calls this for sealed mail; suspenders: no signal
-        // => no shipment regardless.)
+        // Ingest never calls this for sealed mail, and an OTP's long digit-run
+        // carries no shipping signal, so it cannot classify either way.
         let s = detect_shipment(
             "noreply@bank.com",
             "Your verification code",
@@ -821,16 +728,13 @@ mod tests {
         assert!(s.is_none(), "receipt must not be a shipment: {s:?}");
     }
 
-    // ---- full extraction end-to-end --------------------------------------
-
-    // ---- BUG 1: return / outbound exclusion ------------------------------
+    // ---- return / outbound exclusion -------------------------------------
 
     #[test]
     fn ebay_return_seller_received_is_not_a_shipment() {
-        // The exact live false positive: an eBay RETURN ("Seller received item")
-        // carrying a bare 10-digit return number that loosely matched DHL's
-        // \d{10,11}. Two failures fixed: no DHL signal (carrier-signal gate) AND
-        // return language (outbound exclusion). Must produce NO shipment.
+        // A return carrying a bare 10-digit number that loosely matches DHL's
+        // \d{10,11}: excluded twice over, by the carrier-signal gate and by the
+        // return language.
         let s = detect_shipment(
             "ebay@ebay.com",
             "Return 5322397648: Seller received item",
@@ -857,9 +761,7 @@ mod tests {
 
     #[test]
     fn return_precedence_wins_over_inbound_delivery_language() {
-        // PRECEDENCE: even when genuine inbound-delivery language ("your package
-        // ... delivered") ALSO appears, a return notice still excludes — a return
-        // that references the original shipment is still a return.
+        // A return that references the original shipment is still a return.
         let subject = "Your return received";
         let body = "We have received your return. Your package was delivered on July 1. Tracking 1Z999AA10123456784.";
         let hay = format!("x@y.com\n{subject}\n{body}");
@@ -871,12 +773,12 @@ mod tests {
         );
     }
 
-    // ---- BUG 1: carrier-signal required for bare digit-runs --------------
+    // ---- carrier signal required for bare digit-runs ---------------------
 
     #[test]
     fn bare_digit_run_without_carrier_signal_is_not_a_shipment() {
-        // A shipping signal ("package") plus a bare 10-digit number but NO carrier
-        // name / URL: not enough to name a carrier or a shipment.
+        // A shipping signal ("package") plus a bare 10-digit number but no
+        // carrier name/URL: not enough to name a carrier or a shipment.
         let s = detect_shipment(
             "orders@shop.example",
             "Your package update",
@@ -887,8 +789,7 @@ mod tests {
 
     #[test]
     fn dhl_bare_digit_with_signal_is_a_shipment() {
-        // Same shape as above but WITH a real DHL signal (name + domain): the
-        // genuine inbound DHL delivery is detected.
+        // Same shape, but with a real DHL signal (name + domain).
         let s = detect_shipment(
             "noreply@dhl.com",
             "Your DHL package is out for delivery",
@@ -900,12 +801,12 @@ mod tests {
         assert_eq!(s.status, ShipmentStatus::OutForDelivery);
     }
 
-    // ---- BUG 2: item name recovered from body ----------------------------
+    // ---- item name recovered from the body -------------------------------
 
     #[test]
     fn ups_delivered_pulls_item_name_from_body_from_seller() {
-        // Subject strips to the generic "Package"; the body's "From DOUBLE TAKE
-        // MIRROR" supplies a real merchant/product phrase.
+        // The subject strips to the generic "Package"; the body's "From DOUBLE
+        // TAKE MIRROR" supplies a real merchant phrase.
         let s = detect_shipment(
             "mcinfo@ups.com",
             "Your UPS Package was delivered",
@@ -919,8 +820,8 @@ mod tests {
 
     #[test]
     fn body_item_falls_back_to_empty_when_nothing_useful() {
-        // Generic subject, no product/merchant phrase in the body: item stays
-        // empty (the desktop falls back to "Package via {carrier}").
+        // Generic subject, nothing usable in the body: item stays empty and the
+        // client supplies its own fallback label.
         let s = detect_shipment(
             "ship@ups.com",
             "Your package has shipped",

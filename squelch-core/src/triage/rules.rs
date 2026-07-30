@@ -1,21 +1,16 @@
-//! Sender-rule matching and pattern batteries for Stage-1 triage.
-//!
-//! Two responsibilities:
-//!   1. [`glob_match`]: `*`-wildcard matching of a sender rule's `match_pattern`
-//!      against a `from` address (the sync engine's local rules).
-//!   2. Static regex batteries for the alert / noise / sales rungs of the
-//!      Stage-1 ladder. Kept here so [`super::stage1`] reads as a clean ladder.
+//! Sender-rule matching and pattern batteries for Stage-1 triage: [`glob_match`]
+//! over a rule's `match_pattern`, plus the static regex batteries for the alert /
+//! noise / sales rungs of the Stage-1 ladder.
 
 use crate::types::SenderRule;
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Glob match with `*` wildcards (case-insensitive). `*` matches any run of
-/// characters including empty. No other metacharacters are special, so a
-/// pattern like `*@newsletter.com` or `billing@*.acme.com` works as expected.
+/// Glob match with `*` wildcards (case-insensitive); `*` matches any run
+/// including empty, and no other metacharacter is special.
 ///
-/// This is deliberately a hand-rolled matcher rather than translating to regex:
-/// user-authored patterns must never be able to inject regex metacharacters.
+/// Hand-rolled rather than translated to regex: user-authored patterns must
+/// never be able to inject regex metacharacters.
 pub fn glob_match(pattern: &str, candidate: &str) -> bool {
     let pat: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let cand: Vec<char> = candidate.to_ascii_lowercase().chars().collect();

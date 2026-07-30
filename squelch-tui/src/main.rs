@@ -1,17 +1,8 @@
-//! squelch-tui: a deliberately minimal local debug/setup viewer.
-//!
-//! This is NOT the product surface — it's a local operator's window into the
-//! store. It opens the real SQLite store (the same db the sync daemon and MCP
-//! server use), live-refreshes on a tick, and is the ONLY place sealed messages
-//! are ever shown (via the local-only `Store::sealed_messages`), and even here
-//! their bodies stay hidden until the operator explicitly reveals them.
-//!
-//! It is READ-ONLY toward mail; the single write it performs is
-//! `Store::set_sender_rule` (the "squelch profile" editor, `t` key).
-//!
-//! Keys: j/k move, Enter drill into thread detail, t edit sender rule,
-//! T list all rules, +/- adjust the in-session squelch threshold, g refresh,
-//! s toggle below-line items, r reveal sealed subjects, q quit.
+//! squelch-tui: a local debug/setup viewer over the real store (the same
+//! SQLite db the sync daemon and MCP server use), live-refreshed on a tick.
+//! Read-only toward mail; the single write is `Store::set_sender_rule`.
+//! The only surface that shows sealed messages at all — local-only
+//! `Store::sealed_messages`, metadata hidden until the operator reveals it.
 
 mod app;
 mod input;
@@ -36,23 +27,20 @@ use squelch_core::types::AccountId;
 
 use crate::app::App;
 
-/// Starting in-session squelch threshold (min importance). Shown as
-/// `[squelch: 50]` in the header. TODO(persist): read from config.
+/// Starting in-session squelch threshold. TODO(persist): read from config.
 const DEFAULT_MIN_IMPORTANCE: u8 = 50;
 
 /// Live-refresh cadence.
 const TICK: StdDuration = StdDuration::from_secs(2);
 
-/// The account this viewer operates on: canonical `SQUELCH_ACCOUNT_EMAIL` >
-/// legacy `SQUELCH_ACCOUNT` (deprecated) > default. Shares core config's
-/// resolver so every binary points at the same account.
+/// Account this viewer operates on. Goes through core config's resolver so
+/// every binary points at the same account.
 fn account_email() -> String {
     squelch_core::config::resolve_account_email("me@localhost")
 }
 
-/// Resolve the SQLite path via core config's single source of truth: canonical
-/// `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecated) > shared XDG default, so
-/// the TUI, MCP server, and daemon all open the same db.
+/// SQLite path from core config, so the TUI, MCP server, and daemon all open
+/// the same db.
 fn db_path() -> PathBuf {
     squelch_core::config::resolve_db_path()
 }
@@ -61,7 +49,6 @@ fn main() -> Result<()> {
     let demo = std::env::args().any(|a| a == "--demo");
 
     let store = if demo {
-        // Demo mode: self-contained in-memory store seeded with fake rows.
         let store = SqliteStore::open_in_memory()?;
         let account = store.ensure_account(&account_email())?;
         seed_fake_data(&store, account)?;
@@ -84,7 +71,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     while !app.quit {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // Poll for input up to the remaining tick budget; refresh on timeout.
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
@@ -93,9 +79,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             input::handle_key(app, key);
         }
         if last_tick.elapsed() >= TICK {
-            // Live refresh: pick up whatever the sync daemon has written. Only
-            // refresh the underlying list while sitting in the list view so we
-            // don't yank data out from under an open modal.
+            // List view only: refreshing under an open modal yanks its data out.
             if matches!(app.mode, app::Mode::List) {
                 let _ = app.refresh();
             }
@@ -104,10 +88,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Small shared helper
-// ---------------------------------------------------------------------------
 
 /// Truncate to a display width, appending an ellipsis when cut.
 pub fn truncate(mut s: String, width: usize) -> String {
@@ -120,10 +100,6 @@ pub fn truncate(mut s: String, width: usize) -> String {
     }
     s
 }
-
-// ---------------------------------------------------------------------------
-// Terminal setup / teardown
-// ---------------------------------------------------------------------------
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
@@ -141,12 +117,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Demo seeding (only reachable behind --demo)
-// ---------------------------------------------------------------------------
-
-/// Seeds a handful of fake rows across every tier plus sealed messages so the
-/// viewer renders something during setup/debug. Only called under `--demo`.
+/// Seeds fake rows across every tier plus sealed messages so `--demo` renders
+/// something without a real store.
 fn seed_fake_data(store: &SqliteStore, account: AccountId) -> Result<()> {
     use squelch_core::types::{NewMessage, SealedKind, Sensitivity, Tier};
 

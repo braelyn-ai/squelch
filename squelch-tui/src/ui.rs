@@ -152,11 +152,9 @@ fn render_row(
         Row::Sealed(s) => {
             let kind = s.sealed_kind.as_deref().unwrap_or("sealed");
             let body = if reveal_sealed {
-                // Even revealed, the store hands the TUI metadata only
-                // (sealed_messages is metadata-only), so we show the subject as
-                // the most sensitive thing available and mark it revealed.
-                // TODO(core): a local-only sealed body accessor would let us
-                //   surface the actual code/body here.
+                // `sealed_messages` hands the TUI metadata only, so the subject
+                // is the most sensitive thing revealable here.
+                // TODO(core): a local-only sealed body accessor.
                 format!("REVEALED subject: {}", s.subject)
             } else {
                 "•••••• (press r to reveal)".to_string()

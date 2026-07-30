@@ -1,31 +1,11 @@
 //! The notification-emission decision: is THIS triage verdict worth waking the
-//! user for, and if so, what does the durable `events` row look like?
+//! user for, and what does the durable `events` row look like?
 //!
-//! Deliberately PURE and store-free. The sync engine owns the call sites (it is
-//! the only layer that knows which sync path it is on), the store owns the
-//! append; this module owns nothing but the judgment, so the whole policy is
-//! unit-testable without a database or a Gmail account.
-//!
-//! ## The rules
-//!
-//! A verdict is worthy iff ALL of:
-//!   * sensitivity is `Normal` — sealed mail is NEVER notified. It would be at
-//!     most a contentless ping, and an OTP surfacing on a lock screen would undo
-//!     the entire seal design, so v1 skips it outright. This check is redundant
-//!     (sealed rows are noise-tier/importance-0 and never see Stage-1) and is
-//!     here anyway: a seal invariant should hold for two independent reasons.
-//!   * it is not the user's own Sent mail.
-//!   * no `Squelch`/`Filtered` sender rule decided it — a rule is the user
-//!     telling us in advance that this sender does not get to interrupt them.
-//!     (`Filtered` is included on the conservative side: its `want_text` is
-//!     evaluated by Stage-2 for the CLIENT surfaces, but a sender the user
-//!     bothered to filter should not push to their phone.)
-//!   * AND it is urgent-tier, or carries a deadline, or scores at/above
-//!     `notify.min_importance`.
-//!   * AND the mail is FRESH (see [`is_fresh`]).
-//!
-//! The kind precedence is `urgent` > `deadline` > `surfaced`, matching the order
-//! of the three disjuncts above.
+//! Pure and store-free — the sync engine owns the call sites, the store owns the
+//! append — so the whole policy is unit-testable without a database. Kind
+//! precedence is `urgent` > `deadline` > `surfaced`; sealed mail is never
+//! notified, since even a contentless ping on a lock screen would undo the seal
+//! (see docs/SECURITY.md).
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
@@ -42,8 +22,8 @@ pub struct EventContext<'a> {
     pub account_id: AccountId,
     pub message_id: i64,
     pub thread_id: &'a str,
-    /// The sender as the client lists render it — `from_addr`, matching
-    /// [`crate::types::Update::sender`].
+    /// `from_addr`, as the client lists render it (matches
+    /// [`crate::types::Update::sender`]).
     pub sender: &'a str,
     pub one_line: &'a str,
     pub received_at: DateTime<Utc>,
@@ -57,23 +37,15 @@ pub struct EventContext<'a> {
     pub deadline: Option<&'a DeadlineHit>,
 }
 
-/// How far AHEAD of our clock a message may be dated and still count as fresh.
-/// Only a tolerance for a wrong sender clock or a mislabeled timezone — never a
-/// licence to notify. One hour is roomy enough for the broken-MUA cases and far
-/// too narrow to guess a future sync's processing time within.
+/// How far AHEAD of our clock a message may be dated and still count as fresh:
+/// tolerance for a wrong sender clock only, never a licence to notify.
 const MAX_FUTURE_SKEW_SECS: i64 = 3600;
 
-/// Whether `received_at` is inside the configured freshness window relative to
-/// `now`. THE STORM GUARD — see [`NotifyConfig::freshness_window_secs`].
-///
-/// BOUNDED ON BOTH SIDES, because `received_at` is SENDER-CONTROLLED: ingest
-/// prefers the RFC822 `Date:` header over Gmail's `internalDate`, and dating
-/// mail in the future is a standing spam trick for winning inbox sort order.
-/// An unbounded upper edge would mean months-old mail dated 2030 counts as
-/// "fresh" forever — so the backlog grind on a fresh install (Stage-1/Stage-2
-/// walk the queues `received_at DESC`, i.e. future-dated rows FIRST) and
-/// `catch_up()`'s whole-window re-scan would push it, defeating the "never on
-/// initial backfill" guarantee this window exists to provide.
+/// Whether `received_at` is inside the configured freshness window — THE STORM
+/// GUARD (see [`NotifyConfig::freshness_window_secs`]). Bounded on BOTH sides
+/// because `received_at` is SENDER-CONTROLLED (ingest prefers the RFC822 `Date:`
+/// header): with no ceiling, future-dated mail stays "fresh" forever and the
+/// backlog grind — which walks the queues `received_at DESC` — storms.
 pub fn is_fresh(received_at: DateTime<Utc>, cfg: &NotifyConfig, now: DateTime<Utc>) -> bool {
     let floor = now - ChronoDuration::seconds(cfg.freshness_window_secs as i64);
     let ceiling = now + ChronoDuration::seconds(MAX_FUTURE_SKEW_SECS);
@@ -87,7 +59,7 @@ pub fn worthy_kind(
     cfg: &NotifyConfig,
     now: DateTime<Utc>,
 ) -> Option<EventKind> {
-    // SEAL INVARIANT (belt and braces — see the module header).
+    // SEAL INVARIANT, defense in depth: sealed rows never get here anyway.
     if ctx.sensitivity != Sensitivity::Normal {
         return None;
     }
@@ -117,8 +89,8 @@ pub fn worthy_kind(
     None
 }
 
-/// [`worthy_kind`] plus the denormalized snapshot the `events` row stores. This
-/// is what the sync engine hands to [`crate::store::Store::append_event`].
+/// [`worthy_kind`] plus the denormalized snapshot the `events` row stores — what
+/// the sync engine hands to [`crate::store::Store::append_event`].
 pub fn event_for(
     ctx: &EventContext<'_>,
     cfg: &NotifyConfig,
@@ -138,18 +110,12 @@ pub fn event_for(
     })
 }
 
-/// Gather the [`EventContext`] for an INGEST-path verdict (the heuristic seed,
-/// in the same tick that wrote the message row).
+/// Gather the [`EventContext`] for an INGEST-path verdict, resolving
+/// `matched_rule`'s id against `rules` (the batch's rule list).
 ///
-/// `rules` is the account's rule list as loaded for the ingest batch; it is what
-/// resolves `matched_rule`'s id back to a disposition.
-///
-/// NOTE the caller's other obligation: only a CONFIDENT seed may emit. A
-/// non-confident seed is a guess, and guessing is not grounds for waking anyone
-/// — those rows wait for Stage-1/Stage-2 to refine them and emit from those call
-/// sites instead (under the same freshness window). Confidence is not folded in
-/// here because it is a property of the INGEST path only: a refined verdict is
-/// final whatever the seed thought.
+/// CALLER OBLIGATION: only a CONFIDENT seed may emit — a guess is not grounds
+/// for waking anyone. Non-confident rows wait for Stage-1/Stage-2 to refine them
+/// and emit from those sites instead, under the same freshness window.
 pub fn ingest_context<'a>(
     triaged: &'a TriagedMessage,
     message_id: i64,
@@ -175,15 +141,11 @@ pub fn ingest_context<'a>(
     }
 }
 
-/// The rule disposition for a REFINE-site context (Stage-1 / Stage-2 apply):
-/// the sender's rule as the list stands NOW, not as it stood at ingest.
-///
-/// Refine sites cannot read the rule off the triage row. A rule that existed at
-/// ingest stamps `stage1_model_used='rule'` and keeps the row out of the queues
-/// entirely; a rule the user adds AFTERWARDS — the reactive squelch, which is
-/// the common case — leaves no mark on rows already queued. Without this
-/// lookup, squelching a sender would not stop the pass that is mid-grind from
-/// pushing their still-fresh mail.
+/// The sender's rule as the list stands NOW, for the REFINE sites (Stage-1 /
+/// Stage-2 apply). They cannot read it off the triage row: a rule the user adds
+/// AFTER ingest — the reactive squelch, the common case — leaves no mark on rows
+/// already queued, so without this lookup a mid-grind pass would keep pushing
+/// that sender's still-fresh mail.
 pub fn current_rule(from_addr: &str, rules: &[SenderRule]) -> Option<Disposition> {
     crate::triage::rules::match_sender_rule(from_addr, rules).map(|r| r.disposition)
 }
@@ -295,11 +257,7 @@ mod tests {
         c.received_at = now - ChronoDuration::seconds(cfg.freshness_window_secs as i64);
         assert_eq!(worthy_kind(&c, &cfg, now), Some(EventKind::Surfaced));
 
-        // FUTURE-DATED: the `Date:` header is sender-controlled, and dating mail
-        // in the future is a standard spam trick. It must not buy freshness —
-        // otherwise months-old mail dated 2030 notifies forever, and the backlog
-        // grind (which walks `received_at DESC`, so future dates come FIRST)
-        // storms on a fresh install.
+        // FUTURE-DATED: a sender-controlled `Date:` must not buy freshness.
         for ahead in [ChronoDuration::days(365 * 4), ChronoDuration::hours(2)] {
             let mut c = ctx(now);
             c.received_at = now + ahead;
@@ -353,13 +311,10 @@ mod tests {
         assert_eq!(worthy_kind(&c, &cfg, now), None);
     }
 
-    /// A FILTERED rule suppresses on its DISPOSITION alone — `want_text` plays
-    /// no part. The distinction matters because the store maps an empty
-    /// `want_text` to `None` on the Stage-2 queue row: an emit site inferring
-    /// the rule from `rule_want_text` presence (as the Stage-2 site once did)
-    /// would let an empty-want_text Filtered rule push. Rule creation now
-    /// rejects that shape too, but rows written before the validation can still
-    /// carry it, so the emit-site suppression must not depend on it.
+    /// A FILTERED rule suppresses on its DISPOSITION alone, never on
+    /// `want_text` — which the store maps to `None` when empty, so an emit site
+    /// inferring the rule from `rule_want_text` presence would let a row with an
+    /// empty want_text push.
     #[test]
     fn filtered_rule_with_empty_want_text_still_silences() {
         let rules = vec![SenderRule {
@@ -384,10 +339,9 @@ mod tests {
         assert_eq!(worthy_kind(&c, &cfg, now), None, "filtered stays silent, want_text or not");
     }
 
-    /// SEAL INVARIANT: a sealed message can NEVER produce an event — not with a
-    /// past-due tier, not with a deadline, not at importance 100. No path
-    /// constructs those values for sealed mail; this proves the decision would
-    /// refuse them even if one did.
+    /// SEAL INVARIANT: a sealed message can NEVER produce an event, whatever its
+    /// tier, deadline, or score. No path constructs those values for sealed
+    /// mail; this proves the decision would refuse them even if one did.
     #[test]
     fn sealed_can_never_produce_an_event() {
         let now = Utc::now();

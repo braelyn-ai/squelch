@@ -1,39 +1,16 @@
-//! The MARKETING specialist extractor.
+//! The MARKETING specialist extractor: pulls the handful of fields that make a
+//! promo worth keeping — brand, a one-line offer, the discount, a promo code,
+//! and an expiry — which the store write upserts into a `marketing` row.
 //!
-//! Runs on rows the LLM categorized `marketing` (a promotional or bulk send —
-//! a sale, offer, newsletter, product announcement or event promo). It pulls the
-//! handful of fields that make a promo worth keeping around — brand, the offer
-//! in one line, the discount, a promo code, and when it expires — and the store
-//! write ([`crate::store::Store::marketing_apply`]) upserts a `marketing` row.
+//! NO URL FIELD, deliberately. Asking a model to emit a URL derived from
+//! untrusted email content, which the client then renders as clickable, is a
+//! prompt-injection lever — the result would carry squelch's endorsement. The
+//! email's real links are already extracted client-side from the sanitized html
+//! and re-guarded to http(s), so nothing is lost by refusing to invent one.
 //!
-//! ## Why this exists
-//!
-//! Marketing used to be inferred CLIENT-SIDE by pattern-matching Stage-1's
-//! `reason` prose, which is documented as "a short internal justification" — text
-//! written for another purpose that nothing promised to keep stable. That
-//! heuristic both over-matched (any recurring robot sender qualified) and could
-//! silently stop matching. Classifying it server-side and projecting the useful
-//! fields here replaces a guess with a record.
-//!
-//! ## NO URL FIELD, deliberately
-//!
-//! The obvious sixth field is the CTA link, and it is omitted on purpose. Asking
-//! a model to emit a URL derived from untrusted email content, which the client
-//! then renders as clickable, is a prompt-injection lever: a hostile email could
-//! steer that one field and we would present the result as if squelch had
-//! endorsed it. The email's real links are already extracted from the SANITIZED
-//! html client-side and re-guarded to http(s) before the shell ever sees them
-//! (see EmailFrame), so nothing is lost by refusing to invent this one.
-//!
-//! ## Does NOT auto-resolve
-//!
-//! Unlike the banking records, a marketing row leaves the triage row's attention
-//! lifecycle alone. Marketing is noise-tier already, so it is not cluttering the
-//! attention bands, and auto-resolving it would remove it from the flat Emails
-//! inbox — the surface whose entire promise is that it hides nothing.
-//!
-//! Cost: runs on the STAGE-1 (small) model, billed to [`LEDGER_CATEGORY`], and
-//! counts against the SHARED Stage-1 global daily cap like every other extractor.
+//! Does NOT auto-resolve, unlike the banking records. Marketing is noise-tier
+//! already, so it clutters no attention band, and resolving it would drop it out
+//! of the flat inbox — the surface whose promise is that it hides nothing.
 
 use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::{ExtractQueued, MarketingApplied};
@@ -49,7 +26,7 @@ pub const CATEGORIES: &[&str] = &["marketing"];
 pub const LEDGER_CATEGORY: &str = "extract_marketing";
 
 // ===========================================================================
-// System prompt (static — SAME BYTES every call for prompt caching).
+// System prompt — static, so every call sends the SAME BYTES (prompt caching).
 // ===========================================================================
 
 pub const SYSTEM_PROMPT: &str = "\
@@ -120,8 +97,8 @@ pub struct MarketingOutput {
 }
 
 // ===========================================================================
-// Post-validation. Every field here is UNTRUSTED model text derived from email
-// content, so each one is bounded and shape-checked before it can be stored.
+// Post-validation. Every field is UNTRUSTED model text derived from email
+// content, so each is bounded and shape-checked before it can be stored.
 // ===========================================================================
 
 /// Char-safe truncation to `max` chars.
@@ -140,12 +117,9 @@ fn clean_opt(s: Option<&str>, max: usize) -> Option<String> {
 }
 
 /// Reduce a model-emitted promo code to a SAFE short token, or `None`.
-///
 /// Deliberately strict, because this is the field a hostile email would most
-/// want to steer: codes are short, alphanumeric (dashes allowed), and never
-/// sentences. Anything with whitespace, punctuation beyond a dash, or an
-/// implausible length is dropped rather than stored. Normalized to uppercase,
-/// which is how every promo code in the wild is presented anyway.
+/// want to steer: real codes are short, alphanumeric (dashes allowed), and never
+/// sentences, so anything else is dropped rather than stored.
 pub fn sanitize_code(raw: Option<&str>) -> Option<String> {
     let t = raw?.trim();
     if t.is_empty() {
@@ -159,18 +133,17 @@ pub fn sanitize_code(raw: Option<&str>) -> Option<String> {
     if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
-    // A pure-digit run of 6+ is far more likely an order/tracking id than a
-    // coupon; refuse it rather than showing the reader a number to "use".
+    // A pure-digit run of 6+ is far more likely an order or tracking id than a
+    // coupon; refuse rather than showing the reader a number to "use".
     if t.chars().all(|c| c.is_ascii_digit()) && n >= 6 {
         return None;
     }
     Some(t.to_ascii_uppercase())
 }
 
-/// Accept an expiry only when it parses as a date AND is plausible relative to
-/// when the mail arrived: not before it, and not more than a year after. A promo
-/// that "expires" in 2031 is a model error, and one that expired before the
-/// email was sent is worse than useless.
+/// Accept an expiry only when it parses AND is plausible relative to arrival:
+/// not before it, and not more than a year after. A promo "expiring" five years
+/// out is a model error; one already expired on arrival is worse than useless.
 pub fn sanitize_expiry(raw: Option<&str>, received_at: DateTime<Utc>) -> Option<String> {
     let t = raw?.trim();
     if t.is_empty() {
@@ -257,8 +230,8 @@ fn finalize_output(text: &str, usage: Option<Usage>) -> ExtractOutcome {
 // ===========================================================================
 
 /// Map parsed output onto a [`MarketingApplied`]. Pure. Every text field is
-/// bounded; `code` and `expires_at` are shape-validated (see above).
-/// `auto_resolve` is intentionally absent — see the module header.
+/// bounded, `code` and `expires_at` are shape-validated, and `auto_resolve` is
+/// intentionally absent (see the module header).
 pub fn apply_result(q: &ExtractQueued, out: &MarketingOutput, model: &str) -> MarketingApplied {
     MarketingApplied {
         message_id: q.message_id,
@@ -289,7 +262,7 @@ mod tests {
         for k in ["brand", "offer", "discount", "code", "expires_at"] {
             assert!(req.iter().any(|v| v == k), "missing required {k}");
         }
-        // The CTA-url field is deliberately absent; see the module header.
+        // The CTA-url field is deliberately absent — see the module header.
         assert!(s["properties"].get("url").is_none());
         assert!(s["properties"].get("link").is_none());
     }

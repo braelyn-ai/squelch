@@ -4,8 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
-    /// Thread/message not found. Sealed threads MUST surface as this over MCP
-    /// so they are indistinguishable from nonexistent ones.
+    /// Thread/message not found. Sealed threads MUST surface as this over MCP so
+    /// they are indistinguishable from nonexistent ones — see docs/SECURITY.md.
     #[error("not found")]
     NotFound,
 
