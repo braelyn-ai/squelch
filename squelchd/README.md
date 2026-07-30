@@ -6,13 +6,13 @@ The daemon. One process that hosts everything: the Gmail sync loop and a single 
 
 ```sh
 squelchd auth              # one-time OAuth consent (gmail.readonly), token -> keyring
-squelchd auth --write      # separate write credential (gmail.modify + gmail.send)
+squelchd auth --write      # BOTH credentials: write (gmail.modify + gmail.send), then read
 squelchd auth --headless   # headless box: prints consent URL, binds loopback :8847
 squelchd run               # sync loop only, no HTTP (back-compat)
 squelchd serve [--bind A]  # the unified daemon: sync + both doors on one port
 ```
 
-`auth` mints the read credential the sync engine uses. `auth --write` mints a distinct credential stored in a separate slot, reachable only by the human door's action handlers — sync and triage never touch it. On a headless host, forward the consent port with `ssh -L 8847:127.0.0.1:8847 <host>` and open the printed URL locally.
+`auth` mints the read credential the sync engine uses. `auth --write` runs two consent flows back to back — the write credential first, then the read one — so the two never drift apart after a renewal. They stay two tokens in two separate slots: the write one is reachable only by the human door's action handlers, and sync and triage never touch it. On a headless host, forward the consent port with `ssh -L 8847:127.0.0.1:8847 <host>` and open the printed URLs locally; both flows reuse that one port.
 
 ## Configuration
 

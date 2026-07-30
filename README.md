@@ -55,7 +55,7 @@ cargo run --bin squelchd -- auth     # one-time browser consent, token lands in 
 cargo run --bin squelchd -- serve    # sync + both doors on one port
 ```
 
-On a headless box use `squelchd auth --headless` and forward the port: `ssh -L 8847:127.0.0.1:8847 yourbox`. Grant write scopes later with `squelchd auth --write` (only needed for archive/send actions).
+On a headless box use `squelchd auth --headless` and forward the port: `ssh -L 8847:127.0.0.1:8847 yourbox`. Grant write scopes later with `squelchd auth --write` (only needed for archive/send actions) — that runs two consent flows, minting the write credential and re-minting the read one, so the two slots stay in sync.
 
 ### 4. Connect an agent
 

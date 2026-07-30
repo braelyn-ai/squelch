@@ -41,16 +41,20 @@ enum Command {
     /// Authorize a Gmail account and store tokens in the configured backend
     /// (OS keyring, or a mode-0600 JSON file on headless hosts).
     ///
-    /// Plain `auth` mints the READ credential (gmail.readonly) used by the sync
-    /// daemon. `auth --write` mints the separate WRITE credential
-    /// (gmail.modify + gmail.send) used only by human-door action endpoints; it
-    /// is stored in a distinct slot and never touched by sync/triage.
+    /// Plain `auth` mints ONLY the READ credential (gmail.readonly) used by the
+    /// sync daemon. `auth --write` mints BOTH, as two back-to-back consent
+    /// flows: first the WRITE credential (gmail.modify + gmail.send) used only
+    /// by human-door action endpoints, then the READ credential. They remain two
+    /// tokens in two distinct slots — sync/triage never touch the write one.
+    /// Renewing them together is the point: renewing write alone left the sync
+    /// daemon failing on a stale read token.
     ///
     /// HEADLESS: on a box with no browser/keyring, run
     /// `squelchd auth [--write] --headless [--port N]`. It prints the consent
     /// URL and binds a FIXED loopback port (default 8847). Forward it from your
     /// laptop with `ssh -L 8847:127.0.0.1:8847 <host>`, then open the URL in
-    /// your local browser to complete consent.
+    /// your local browser to complete consent. With `--write` the two flows run
+    /// sequentially on that same port, so one tunnel covers both.
     Auth(AuthArgs),
     /// Run the sync loop ONLY (back-compat). No HTTP doors are served.
     Run,
@@ -70,8 +74,10 @@ struct ServeArgs {
 
 #[derive(Args)]
 struct AuthArgs {
-    /// Mint the WRITE credential (gmail.modify + gmail.send) instead of the
-    /// default read-only credential. Stored in a separate slot.
+    /// Mint the WRITE credential (gmail.modify + gmail.send) AND re-mint the
+    /// read-only credential, as two consent flows into two separate slots, so
+    /// the pair cannot drift. Without this flag only the read-only credential
+    /// is minted.
     #[arg(long)]
     write: bool,
 
@@ -189,20 +195,83 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the OAuth consent flow and persist tokens for the configured account.
+/// Uppercase tag for the progress banners; `{kind:?}` reads too quietly when
+/// two consent flows run back to back.
+fn scope_word(scopes: AuthScopes) -> &'static str {
+    match scopes {
+        AuthScopes::Read => "READ",
+        AuthScopes::Write => "WRITE",
+    }
+}
+
+/// Which credentials one `auth` invocation mints, in order. `--write` also
+/// re-mints READ: renewing the action credential alone left the sync daemon
+/// failing on a stale read token, and two slots that drift are worse than one
+/// extra consent screen. Still two scope sets, two flows, two slots — the
+/// two-door split is never collapsed into a single merged token.
+fn auth_plan(args: &AuthArgs) -> Vec<AuthScopes> {
+    if args.write {
+        vec![AuthScopes::Write, AuthScopes::Read]
+    } else {
+        vec![AuthScopes::Read]
+    }
+}
+
+/// Run the OAuth consent flow(s) and persist tokens for the configured account.
 fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreError> {
     let client = config.oauth_client()?;
     let email = config.require_account_email()?;
-
-    let scopes = if args.write {
-        AuthScopes::Write
-    } else {
-        AuthScopes::Read
-    };
-    let kind = scopes.kind();
     let backend = config.credential_backend;
     let creds_path = config.resolve_credentials_path();
 
+    let plan = auth_plan(args);
+    let total = plan.len();
+    if total > 1 {
+        eprintln!(
+            "squelchd: --write renews BOTH credentials so they cannot drift apart; \
+             {total} separate Google consent screens are coming, one per credential."
+        );
+        if args.headless {
+            eprintln!(
+                "squelchd: both flows reuse loopback port {}, so a single SSH tunnel covers both.",
+                args.port
+            );
+        }
+    }
+
+    for (i, scopes) in plan.iter().copied().enumerate() {
+        let step = i + 1;
+        eprintln!(
+            "\nsquelchd: minting {} credential ({step}/{total})...",
+            scope_word(scopes)
+        );
+        // Strictly sequential: each flow's loopback listener is dropped before
+        // the next one binds, so headless can reuse the one fixed port.
+        if let Err(e) = mint_credential(&client, &email, backend, &creds_path, scopes, args) {
+            if step > 1 {
+                eprintln!(
+                    "squelchd: the credential(s) minted earlier in this run ARE stored; \
+                     re-run `squelchd auth` to finish the {} credential.",
+                    scope_word(scopes)
+                );
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One consent flow, persisted into that kind's own slot. Each call mints a
+/// distinct token; scopes from different kinds never share a slot.
+fn mint_credential(
+    client: &OAuthClientConfig,
+    email: &str,
+    backend: CredentialBackend,
+    creds_path: &std::path::Path,
+    scopes: AuthScopes,
+    args: &AuthArgs,
+) -> Result<(), squelch_core::CoreError> {
+    let kind = scopes.kind();
     println!(
         "Authorizing Gmail account: {email} [{}] via {:?} backend",
         scopes.label(),
@@ -214,11 +283,11 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
         headless: args.headless,
         port: args.port,
     };
-    let token = run_auth_flow(&client, &opts)?;
-    store_token_backend(backend, &creds_path, &email, kind, &token)?;
+    let token = run_auth_flow(client, &opts)?;
+    store_token_backend(backend, creds_path, email, kind, &token)?;
 
     // Confirm persistence without ever printing the token material.
-    let _ = load_token_backend(backend, &creds_path, &email, kind)?;
+    let _ = load_token_backend(backend, creds_path, email, kind)?;
     match backend {
         CredentialBackend::Keyring => {
             println!("\nStored {kind:?} credentials for {email} in the OS keyring (service \"squelch\").");
@@ -485,6 +554,65 @@ fn cmd_serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `auth` parses: flags default off, and `--write`/`--headless --port` stick.
+    #[test]
+    fn auth_subcommand_parses() {
+        let cli = Cli::parse_from(["squelchd", "auth"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(!args.write);
+                assert!(!args.headless);
+                assert_eq!(args.port, DEFAULT_HEADLESS_PORT);
+            }
+            _ => panic!("expected auth subcommand"),
+        }
+
+        let cli = Cli::parse_from(["squelchd", "auth", "--write", "--headless", "--port", "9100"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(args.write);
+                assert!(args.headless);
+                assert_eq!(args.port, 9100);
+            }
+            _ => panic!("expected auth subcommand"),
+        }
+    }
+
+    /// Plain `auth` mints READ only; `--write` mints WRITE then READ. Two plan
+    /// entries means two consent flows into two slots — the two-door split must
+    /// survive as separate kinds with non-overlapping scopes.
+    #[test]
+    fn auth_plan_write_mints_both_credentials() {
+        use squelch_core::credentials::CredentialKind;
+
+        let read_only = auth_plan(&AuthArgs {
+            write: false,
+            headless: false,
+            port: DEFAULT_HEADLESS_PORT,
+        });
+        assert_eq!(read_only, vec![AuthScopes::Read]);
+
+        let both = auth_plan(&AuthArgs {
+            write: true,
+            headless: true,
+            port: DEFAULT_HEADLESS_PORT,
+        });
+        assert_eq!(both, vec![AuthScopes::Write, AuthScopes::Read]);
+        assert_eq!(both[0].kind(), CredentialKind::Write);
+        assert_eq!(both[1].kind(), CredentialKind::Read);
+        assert_ne!(
+            CredentialKind::Write.slot_key("you@x.com"),
+            CredentialKind::Read.slot_key("you@x.com"),
+            "the two credentials must land in separate storage slots"
+        );
+
+        let (write_scopes, read_scopes) = (both[0].scopes(), both[1].scopes());
+        assert!(
+            write_scopes.iter().all(|s| !read_scopes.contains(s)),
+            "write and read scope sets must not be merged into one consent"
+        );
+    }
 
     /// `serve` parses, with and without an explicit `--bind`.
     #[test]
