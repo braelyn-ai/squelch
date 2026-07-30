@@ -1,19 +1,8 @@
-// USAGE — server-side triage spend plus the client-side assistant tally.
-//
-//   TRIAGE    — GET /client/usage. The triage pipeline reports its stages as
-//               separate ledger categories (stage-1 runs on every email,
-//               stage-2 on escalations); each renders as its own section with a
-//               compact daily breakdown and an inline bar per day. The view
-//               loops over whatever categories arrive, falling back to the flat
-//               single-category shape older servers send.
-//   ASSISTANT — the BYOK ⌘K assistant's spend, tracked on this machine (its
-//               calls go straight from here to your own provider key; the
-//               server never sees them).
-//
-// Every number is monospaced-digit so the columns line up rather than jittering
-// as they update.
-//
-// Ported from squelch-desktop/src/views/UsageView.tsx.
+// USAGE — server-side triage spend (GET /client/usage) plus the client-side BYOK
+// assistant tally. The triage pipeline reports its stages as separate ledger
+// categories; this view loops over whatever arrives and falls back to the flat
+// single-category shape older servers send. Assistant calls go straight from
+// here to the reader's own provider key — the server never sees them.
 
 import SwiftUI
 
@@ -24,8 +13,8 @@ struct UsageView: View {
     @State private var loading = true
     @State private var assistant = AssistantUsage()
 
-    /// A category resolved for rendering: the wire map's KEY promoted to `id`
-    /// plus a derived display label (the wire carries no label).
+    /// A category resolved for rendering: the wire map's KEY promoted to `id`,
+    /// plus a display label derived here (the wire carries none).
     private struct ResolvedCategory: Identifiable {
         var id: String
         var label: String
@@ -54,9 +43,8 @@ struct UsageView: View {
         }
     }
 
-    /// Prefer the per-stage `categories` breakdown — an OBJECT MAP keyed by id,
-    /// so we enumerate it and promote each key — and fall back to the flat
-    /// single-category shape older servers send.
+    /// The per-stage `categories` breakdown — an OBJECT MAP keyed by id, so each
+    /// key is enumerated and promoted — else the flat legacy shape.
     private var categories: [ResolvedCategory] {
         guard let usage else { return [] }
         if let map = usage.categories, !map.isEmpty {
@@ -100,8 +88,7 @@ struct UsageView: View {
             }
         }
         .task { await load() }
-        // Esc leaves, same as Settings and the RoutedHost pages. Usage had the
-        // identical gap: a full routed page with no way out but the rail.
+        // Esc leaves — a full routed page needs an exit other than the rail.
         .keyContext(.modal)
         .keyBindings(.modal, [
             KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
@@ -109,7 +96,6 @@ struct UsageView: View {
     }
 
     private func load() async {
-        // Last 30 days of daily rows.
         do {
             usage = try await APIClient.shared.getUsage(days: 30)
         } catch {

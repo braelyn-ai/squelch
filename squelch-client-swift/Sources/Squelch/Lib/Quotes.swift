@@ -1,18 +1,10 @@
 // Quoted reply-history detection, for auto-collapsing the tail of a message.
 //
-// Server-side sanitization (ammonia, defaults) strips class/id attributes, so
-// the client never sees Gmail's `.gmail_quote` or Outlook's `#divRplyFwdMsg`
-// markers. Detection therefore keys off what DOES survive: <blockquote>
-// structure in html bodies, and ">"-prefixed lines / "On … wrote:" attribution
-// lines in plain text.
-//
-// The bias is deliberately conservative: a wrongly-collapsed reply hides real
-// content behind a click, so anything ambiguous (inline quotes with substantial
-// text after them, messages that are ALL quote) is left fully expanded.
-//
-// Ported from squelch-desktop/src/lib/quotes.ts. The HTML side (findQuoteNodes)
-// runs inside the WKWebView as injected JS — see EmailWebView's collapse script,
-// which mirrors this heuristic exactly.
+// Sanitization strips class/id, so Gmail's `.gmail_quote` and Outlook's
+// `#divRplyFwdMsg` never arrive; detection keys off <blockquote> structure and
+// ">"-prefixed or "On … wrote:" lines. Conservative — anything ambiguous stays
+// expanded. The html side is injected JS in EmailWebView's collapse script, and
+// the two heuristics must stay in step.
 
 import Foundation
 
@@ -33,11 +25,10 @@ enum Quotes {
         var quoted: String?
     }
 
-    /// Split a PLAIN-TEXT body into the visible reply and its trailing quoted
-    /// history. Returns `quoted: nil` unless the tail is genuinely history: at
-    /// least two quoted lines, and almost nothing that is neither quote,
-    /// attribution, nor blank. A message that STARTS quoted is left alone:
-    /// collapsing it would blank the whole card.
+    /// Split a plain-text body into the visible reply and its trailing quoted
+    /// history. `quoted: nil` unless the tail is genuinely history: ≥ 2 quoted
+    /// lines and almost no stray non-quote text. A message that STARTS quoted is
+    /// left alone — collapsing it would blank the whole card.
     static func splitText(_ content: String) -> TextSplit {
         let lines = content.components(separatedBy: "\n")
         var start = -1

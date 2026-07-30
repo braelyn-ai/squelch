@@ -1,29 +1,18 @@
-// The "ask your inbox" agent loop. Runs entirely on this machine with the
-// user's OWN key: build a /v1/messages body, fire it through LLMProxy, and walk
-// the standard tool-use loop (search_mail / get_thread) until the model answers.
-// Non-streaming — each turn is a short complete message we inspect for
-// stop_reason; inbox answers are a paragraph, so there is nothing to stream.
-//
-// SECURITY POSTURE (mirrors the Tauri shell's `llm_complete` exactly): the key
-// is read ONLY inside LLMProxy, from the keychain, at call time. It is never a
-// parameter here, never a return value, never in an error, and never reachable
-// from the view layer. This file cannot obtain it even if it wanted to —
-// `AssistantKeyStore.read()` is fileprivate to Keychain.swift.
-//
-// The tools are thin wrappers over the existing human-door reads, so the
-// assistant gets exactly the same sealed-absent, summary-first view the rest of
-// the app does. Sealed (auth/2FA) messages are structurally absent from both
-// routes, which is why the system prompt can promise it plainly.
-//
-// Ported from squelch-desktop/src/api/assistant/*.
+// The "ask your inbox" agent loop, run on this machine with the user's OWN key:
+// build a /v1/messages body, fire it through LLMProxy, walk the tool-use loop
+// (search_mail / get_thread) until the model answers. Non-streaming — each turn
+// is one short complete message. The key is read only inside LLMProxy, at call
+// time: never a parameter, return value, or error here. Both tools are
+// human-door reads, so sealed mail is structurally absent from the assistant
+// (see docs/SECURITY.md §4) — which is why the system prompt can promise it.
 
 import Foundation
 
 // MARK: - wire shapes
 
-/// Minimal Anthropic /v1/messages shapes — just the fields the loop reads. We
-/// hand-roll these rather than pull an SDK because the HTTP call itself is made
-/// by LLMProxy; this only builds the body and walks the response blocks.
+/// Minimal Anthropic /v1/messages shapes — just the fields the loop reads.
+/// Hand-rolled rather than an SDK because LLMProxy makes the HTTP call; this
+/// only builds the body and walks the response blocks.
 private enum Wire {
     struct ToolDef: Encodable {
         var name: String
@@ -253,8 +242,8 @@ enum Assistant {
                 required: ["thread_id"])),
     ]
 
-    /// Ask a question and return a cited answer. Throws on a missing key, the
-    /// wrong provider, a provider error, a refusal, or hitting the step limit.
+    /// Ask a question and return a cited answer. Throws on a missing key, a
+    /// wrong-provider key, a provider error, a refusal, or the step limit.
     static func ask(_ question: String) async throws -> AssistantAnswer {
         let status = await AssistantKeyStore.statusAsync()
         guard status.present else {
@@ -271,7 +260,7 @@ enum Assistant {
             .init(role: "user", content: .text(question.trimmed))
         ]
 
-        // Threads surfaced by search vs. actually opened via get_thread. We cite
+        // Threads surfaced by search vs. actually opened via get_thread: cite
         // the opened ones when the model drilled in, else the top hits it saw.
         var cites: [String: ToolCitation] = [:]
         var citeOrder: [String] = []
@@ -383,7 +372,6 @@ enum Assistant {
                 let limit = min(input["limit"]?.intValue ?? 8, 20)
                 let page = try await APIClient.shared.search(query, limit: limit, mode: .hybrid)
                 let rows = page.items.map { hit -> [String: Any] in
-                    // Remember every hit as a candidate citation.
                     cite(
                         ToolCitation(
                             threadId: hit.thread_id,
@@ -435,9 +423,9 @@ enum Assistant {
 // MARK: - local usage ledger
 
 /// Client-side token tally for the BYOK assistant. Its calls go straight from
-/// this machine to the user's provider with their own key — the squelch server
-/// never sees them, so this usage is tracked locally and feeds the Usage page's
-/// "Assistant" slot. Entirely separate from server-side triage usage.
+/// this machine to the user's provider, so the squelch server never sees them
+/// and the tally is local only — entirely separate from server-side triage
+/// usage.
 struct AssistantUsage: Sendable, Equatable {
     /// Completed asks (not per-turn API calls).
     var asks = 0

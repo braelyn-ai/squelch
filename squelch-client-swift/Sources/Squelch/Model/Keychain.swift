@@ -1,28 +1,15 @@
 // OS keychain storage for the human-door connection settings and the BYOK
-// assistant key. Ported from squelch-desktop/src-tauri/src/lib.rs — SAME
-// service name and SAME account slots, so an existing squelch-desktop install's
-// credentials are picked up by this client with no re-entry.
-//
-// SECURITY: the API token is written ONLY to the OS keychain. It is never
-// written to disk by us, never placed in a log line, and never returned in an
-// error message.
-//
-// The assistant key is the strictest slot: `AssistantKeyStore` can report
-// whether a key exists and which provider it routes to, and it can make a
-// completion call — `read()` stays fileprivate so the request path (`LLMProxy`)
-// is the only thing that handles the secret, which is why that type lives in
-// this file. That mirrors the Rust shell, where the key lived only inside
-// `llm_complete`.
-//
-// The ONE exception is `revealAsync()`: Settings shows the stored key behind a
-// Show / Edit affordance, and both need the plaintext. It is an explicit,
-// human-initiated disclosure to the person who typed the key in the first
-// place — not a general read. Nothing else may call it.
+// assistant key. The service name and account slots are fixed — changing one
+// orphans an existing install's credentials. The API token is written only to
+// the keychain: never to disk, a log line, or an error message. The assistant
+// key is stricter — `read()` is fileprivate so `LLMProxy` (which lives in this
+// file for that reason) is its only consumer, and `revealAsync()` is the one
+// deliberate hole, for Settings' human-initiated Show / Edit.
 
 import Foundation
 import Security
 
-/// Keyring service name shared by every stored field (matches the Tauri shell).
+/// Keyring service name shared by every stored field.
 private let keychainService = "squelch-desktop"
 /// Keyring "account" (username) slots within the service.
 private let accountURL = "server_url"
@@ -111,13 +98,10 @@ struct ConnectionSettings: Sendable, Equatable {
 }
 
 enum SettingsStore {
-    /// Load stored settings. Returns nil until BOTH fields have been saved
-    /// (the first-run Connect gate relies on this).
-    ///
-    /// ALWAYS call this off the main actor (see `loadAsync`). A keychain read
-    /// can put up the system's "allow access?" panel and block until the human
-    /// answers — on the main thread that is a frozen, unpaintable app, which is
-    /// exactly the impression you do not want to make on first launch.
+    /// Load stored settings; nil until BOTH fields are saved (the first-run
+    /// Connect gate relies on that). ALWAYS call off the main actor (see
+    /// `loadAsync`): a keychain read can raise the system's "allow access?"
+    /// panel and block until the human answers, freezing the UI.
     static func load() throws -> ConnectionSettings? {
         let url = try Keychain.read(account: accountURL)
         let token = try Keychain.read(account: accountToken)
@@ -125,8 +109,8 @@ enum SettingsStore {
         return ConnectionSettings(serverURL: url, apiToken: token)
     }
 
-    /// The safe entry point: performs the (possibly prompting) read on a
-    /// background executor so the UI keeps painting and stays responsive.
+    /// The safe entry point: runs the (possibly prompting) read on a background
+    /// executor so the UI keeps painting.
     static func loadAsync() async -> Result<ConnectionSettings?, Error> {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -188,8 +172,8 @@ enum AssistantKeyStore {
     }
 
     /// The one function allowed to see the secret. `fileprivate` on purpose:
-    /// nothing outside this file — and specifically nothing in the view layer —
-    /// can obtain the key. `LLMProxy` lives in this file for that reason.
+    /// nothing outside this file — the view layer especially — can obtain the
+    /// key.
     fileprivate static func read() -> String? {
         guard let k = try? Keychain.read(account: accountAssistantKey), !k.isEmpty else {
             return nil
@@ -202,7 +186,7 @@ enum AssistantKeyStore {
         return AssistantKeyStatus(present: true, provider: provider(forKey: k))
     }
 
-    /// Off-main-actor status read — same prompt-blocking reasoning as
+    /// Off-main-actor status read — same prompt-blocking reason as
     /// `SettingsStore.loadAsync`. Still never yields the key itself.
     static func statusAsync() async -> AssistantKeyStatus {
         await withCheckedContinuation { continuation in
@@ -212,8 +196,8 @@ enum AssistantKeyStore {
         }
     }
 
-    /// Hand the stored key to the Settings UI so it can be shown or edited.
-    /// The deliberate hole in the rule above — see this file's header. Off the
+    /// Hand the stored key to Settings' Show / Edit affordance — the one
+    /// deliberate hole in the rule above, and nothing else may call it. Off the
     /// main actor for the same prompt-blocking reason as `statusAsync`.
     static func revealAsync() async -> String? {
         await withCheckedContinuation { continuation in
@@ -258,10 +242,9 @@ enum LLMError: Error, LocalizedError {
     }
 }
 
-/// Makes assistant completion calls. Reads the key from the keychain, routes by
-/// its real prefix (never trusting a caller-supplied provider), injects the auth
-/// header, POSTs, and hands back the raw response. The key never leaves this
-/// type — it is not a parameter, not a return value, and not in any error.
+/// Makes assistant completion calls. Routes by the key's real prefix, never a
+/// caller-supplied provider. The key never leaves this type — not a parameter,
+/// not a return value, not in any error.
 enum LLMProxy {
     private static let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral

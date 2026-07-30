@@ -1,10 +1,6 @@
-// TWO VOICES.
-//
-// SF (the system stack) is the interface voice — this is a mac app and it
-// should read like one. Newsreader, the bundled editorial serif, is the BRAND
-// voice and appears in exactly one place: the sitrep hero headline. Spreading
-// a display serif across an interface turns it into wallpaper; keeping it to
-// one line per screen is what makes it land.
+// Two voices: SF for the interface, and Newsreader — the bundled editorial
+// serif — for the brand, in exactly one place, the sitrep hero headline.
+// Spread further, a display serif becomes wallpaper.
 //
 // Numbers are always monospaced-digit so columns of amounts, importances and
 // token counts line up rather than jittering as they update.
@@ -17,9 +13,9 @@ enum Typo {
     /// the resource is missing, which keeps the editorial voice either way.
     static let serifFamily = "Newsreader"
 
-    /// Register the bundled fonts. ATSApplicationFontsPath in Info.plist covers
-    /// the normal case; this is the belt-and-suspenders path for a bundle whose
-    /// resources landed somewhere unexpected.
+    /// Register the bundled fonts. `ATSApplicationFontsPath` in Info.plist
+    /// covers the normal case; this is the fallback when the resources landed
+    /// somewhere unexpected in the bundle.
     static func registerBundledFonts() {
         guard NSFont(name: serifFamily, size: 12) == nil else { return }
         for name in ["newsreader-var", "newsreader-italic-var"] {
@@ -30,7 +26,7 @@ enum Typo {
         }
     }
 
-    /// THE editorial headline. Newsreader when available, New York otherwise.
+    /// The editorial headline. Newsreader when available, New York otherwise.
     static func hero(_ size: CGFloat = 40) -> Font {
         if NSFont(name: serifFamily, size: size) != nil {
             return .custom(serifFamily, size: size).weight(.medium)
@@ -72,7 +68,7 @@ enum Typo {
 
 // MARK: - kbd chip
 
-/// The `<kbd>` affordance the whole app uses to teach its keymap in place.
+/// The key-hint chip the whole app uses to teach its keymap in place.
 struct Kbd: View {
     let label: String
     init(_ label: String) { self.label = label }

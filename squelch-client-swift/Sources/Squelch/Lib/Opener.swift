@@ -1,12 +1,9 @@
-// Open an external URL in the user's real system browser, and clipboard writes.
+// Open an external URL in the system browser, plus clipboard and save-panel
+// helpers.
 //
-// SECURITY: only http/https URLs are ever opened. Anything else (mailto:, tel:,
-// javascript:, data:, file:, custom schemes) is ignored — we never hand an
-// arbitrary scheme to the OS. A failure log carries at most the HOST, never the
-// path/query: unsubscribe links are mail-derived and routinely carry
-// per-recipient tokens.
-//
-// Ported from squelch-desktop/src/lib/{opener,clipboard,download}.ts.
+// Only http/https is ever handed to the OS; every other scheme is ignored. A
+// failure log carries at most the HOST — mail-derived links routinely carry
+// per-recipient tokens. See docs/SECURITY.md §2.
 
 import AppKit
 import Foundation
@@ -30,8 +27,7 @@ enum Opener {
     static func open(_ url: String?) {
         guard let url, !url.isEmpty, isHTTP(url), let parsed = URL(string: url) else { return }
         if !NSWorkspace.shared.open(parsed) {
-            // Never swallow silently: a dead button is not diagnosable. Log a
-            // STATIC message plus at most the host.
+            // A dead button must be diagnosable: static text plus the host only.
             NSLog("openExternal: failed to open external URL (host: %@)", safeHost(url))
         }
     }

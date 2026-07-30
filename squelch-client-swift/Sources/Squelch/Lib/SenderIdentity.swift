@@ -1,13 +1,9 @@
 // Sender avatars + display names — deterministic and initials-based by default.
 //
-// PRIVACY MODEL: human correspondents are NEVER resolved over the network — no
-// Gravatar, no favicon fetch — because the human correspondent graph must never
-// leak off-device. The ONLY exception is ROBOT senders (no-reply@,
-// notifications@, billing@, …), whose local-parts identify a service, not a
-// person. For those we fetch the DOMAIN's favicon once (verdict cached), which
-// leaks nothing about who a human talks to.
-//
-// Ported from squelch-desktop/src/lib/avatar.ts.
+// PRIVACY: human correspondents are NEVER resolved over the network (no
+// Gravatar, no favicon) — the human correspondent graph must not leave the
+// device. The only exception is ROBOT/BRAND senders, whose local-parts identify
+// a service rather than a person; those fetch the domain's favicon once.
 
 import Foundation
 
@@ -20,14 +16,11 @@ enum SenderID {
         var addr: String
     }
 
-    /// Extract a display name and address from a sender string:
-    /// "Sarah Chen <sarah@acme.com>" -> ("Sarah Chen", "sarah@acme.com")
+    /// "Sarah Chen <sarah@acme.com>" -> ("Sarah Chen", "sarah@acme.com").
     ///
-    /// PLAIN STRING SCANNING, NOT REGEX, and deliberately so. Every row asks for
-    /// a display name, initials, a palette slot and a robot/brand verdict, and
-    /// each of those parses the sender — so a 500-row list was running thousands
-    /// of Swift `Regex` matches per frame, which is what made scrolling crawl.
-    /// This does the same job by walking the string once.
+    /// Plain string scanning, not regex, deliberately: a row parses its sender
+    /// several times over (name, initials, slot, robot verdict), so a long list
+    /// ran thousands of `Regex` matches per frame and scrolling crawled.
     static func parse(_ sender: String) -> Parsed {
         let s = sender.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -58,20 +51,16 @@ enum SenderID {
             }
         }
 
-        // A BARE ADDRESS HAS NO DISPLAY NAME. This used to return the address in
-        // `name` as well, which is a landmine for every caller that treats a
-        // non-empty `name` as a real one: `initials` did, and rendered the
-        // DOMAIN's letters ("bboynton97@gmail.com" -> "BC", the C of ".com").
-        // The desktop's regex yields "" here, so this is also the faithful port.
+        // A bare address has no display name: callers treat a non-empty `name`
+        // as a real one, and `initials` would render the domain's letters
+        // ("bboynton97@gmail.com" -> "BC", the C of ".com").
         if s.contains("@") { return Parsed(name: "", addr: s) }
         return Parsed(name: s, addr: s)
     }
 
-    /// Everything a row needs about a sender, resolved once and memoized.
-    ///
-    /// Rows are re-evaluated constantly (hover, selection, poll), and the
-    /// derivation is pure, so caching by the raw sender string turns a
-    /// per-frame cost into a one-time one.
+    /// Everything a row needs about a sender. Rows re-evaluate constantly
+    /// (hover, selection, poll) and the derivation is pure, so `SenderCache`
+    /// memoizes this by raw sender string.
     struct Resolved: Sendable {
         var displayName: String
         var initials: String
@@ -92,18 +81,11 @@ enum SenderID {
         parse(sender).addr.lowercased()
     }
 
-    /// Up to two initials from a display name; fallback to the local-part.
-    /// Up to two initials for a sender.
-    ///
-    /// THE SOURCE IS NEVER THE FULL ADDRESS. It used to be, and the domain leaked
-    /// into the result: "bboynton97@gmail.com" split to ["bboynton97@gmail","com"]
-    /// and rendered "BC" — that second letter is the C of ".com". Almost every
-    /// bare address produced a "?C" monogram, which is why a column of avatars
-    /// read RC, IC, BC, MC, SC.
-    ///
-    /// Order: a real display name, then the resolved brand/robot label (so a row
-    /// labelled "Corpnet" shows CO rather than the IC of "info@corpnet.com"), then
-    /// the local-part alone.
+    /// Up to two initials for a sender. THE SOURCE IS NEVER THE FULL ADDRESS —
+    /// the domain leaks in otherwise ("bboynton97@gmail.com" -> "BC"). Order: a
+    /// real display name, then the brand/robot label (so a row labelled
+    /// "Corpnet" shows CO, not the IC of "info@corpnet.com"), then the
+    /// local-part alone.
     static func initials(_ sender: String) -> String {
         let p = parse(sender)
         let local = (p.addr.split(separator: "@").first.map(String.init) ?? "")
@@ -150,7 +132,6 @@ enum SenderID {
         "alert", "alerts", "update", "updates", "news", "newsletter", "marketing", "mailer",
         "billing", "receipt", "receipts", "order", "orders", "team", "hello", "info", "support",
         "account", "accounts", "security", "admin", "service", "contact", "help", "feedback",
-        // Parity with the desktop's ROBOT_LOCAL, which had drifted ahead.
         "mail", "email", "invoice", "invoices", "statement", "statements", "confirmation",
         "confirmations", "tracking", "delivery", "digest", "bulletin",
     ]
@@ -164,18 +145,10 @@ enum SenderID {
     ]
 
     /// Unambiguous automation markers, matched against the local-part with its
-    /// separators SQUASHED.
-    ///
-    /// `robotLocals` above must match the WHOLE local-part, which real senders
-    /// very often fail: "no.reply.alerts@chase.com", "no_reply@discord.com",
-    /// "billing-noreply@stripe.com" and "no-reply-aws@amazon.com" are all
-    /// obviously machines, and all fell through to initials.
-    ///
-    /// Deliberately narrow: only markers no human is ever behind. The
-    /// human-capable words in `robotLocals` (hello, info, support, team, contact)
-    /// stay WHOLE-local-part matches only — segment-matching those would classify
-    /// "jane.support@acme.com" as a robot and fetch a favicon for a domain a HUMAN
-    /// corresponds with, which is exactly the leak the privacy model forbids.
+    /// separators SQUASHED ("no.reply.alerts", "billing-noreply"), which
+    /// `robotLocals`' whole-local-part match misses. Narrow on purpose:
+    /// segment-matching robotLocals' human-capable words (hello, info, support)
+    /// would favicon-fetch a domain a HUMAN corresponds with.
     private static let robotMarkers = [
         "noreply", "donotreply", "mailerdaemon", "automailer", "automated", "autoconfirm",
     ]
@@ -265,19 +238,12 @@ enum SenderID {
 
 // MARK: - favicon verdict cache
 
-/// Per-domain verdict. "ok" = the image loaded; "failed" = error / blank / tiny.
-/// Persisted in UserDefaults, mirroring the desktop client's localStorage map.
+/// Per-domain verdict, persisted in UserDefaults. "ok" = the image loaded;
+/// "failed" = error / blank / tiny.
 ///
-/// A FAILURE IS NOT PERMANENT. It used to be: one fetch returns one
-/// undifferentiated failure, so being offline for a moment, a rate-limit, a DNS
-/// blip and "this domain has no icon" all looked identical — and every one was
-/// recorded forever, no expiry, no retry. A live cache held 50 domains marked
-/// failed, github.com, paypal.com, google.com, ebay.com, venmo.com and
-/// schwab.com among them, every one of which serves a valid icon when re-tested.
-///
-/// Failures now carry the time they happened and are retried after
-/// `failedRetry`. A domain that genuinely has no icon costs one request a week;
-/// a domain that failed transiently heals itself.
+/// A FAILURE IS NOT PERMANENT: one fetch cannot tell "this domain has no icon"
+/// from an offline moment or a rate-limit, so failures carry their timestamp
+/// and are retried after `failedRetry`.
 @MainActor
 final class FaviconCache {
     static let shared = FaviconCache()
@@ -305,12 +271,8 @@ final class FaviconCache {
             {
                 mem[domain] = .failed(at: Date(timeIntervalSince1970: t))
             }
-            // A LEGACY bare "failed" (written before failures expired) is
-            // deliberately NOT loaded: it carries no timestamp, so there is no
-            // honest way to age it, and the odds are high it was a transient
-            // failure recorded as permanent. Dropping it retries the domain once
-            // and then re-records it properly. This is what un-poisons an
-            // existing install.
+            // A bare "failed" carries no timestamp, so there is no honest way
+            // to age it: drop it, retry the domain once, re-record it properly.
         }
     }
 
@@ -351,9 +313,9 @@ final class FaviconCache {
 }
 
 
-/// The memo table for `SenderID.resolve`. Isolated to the main actor because
-/// that is the only place rows render; `SenderID` itself stays nonisolated so
-/// pure helpers (Newsletters derivation) can still run off it.
+/// The memo table for `SenderID.resolve`. Main-actor isolated because that is
+/// the only place rows render; `SenderID` itself stays nonisolated so pure
+/// helpers can run off the main actor.
 @MainActor
 enum SenderCache {
     private static var cache: [String: SenderID.Resolved] = [:]

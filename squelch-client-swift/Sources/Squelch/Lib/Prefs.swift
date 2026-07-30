@@ -1,11 +1,6 @@
-// Local UI preferences — UserDefaults-backed, app-wide, reactive.
-//
-// Same persistence model as the desktop client's localStorage prefs: per-device
-// view preferences, not account state. Views read through @Observable so a
-// change in Settings re-renders every open consumer (e.g. the email frames)
-// immediately.
-//
-// Ported from squelch-desktop/src/lib/{prefs,identity}.ts + state/theme.ts.
+// Local UI preferences — UserDefaults-backed, app-wide, reactive. Per-device
+// view state, not account state. Views read through @Observable, so a change in
+// Settings re-renders every open consumer (e.g. the email frames) immediately.
 
 import Foundation
 import SwiftUI
@@ -25,9 +20,7 @@ enum SettingsSection: String, CaseIterable, Sendable {
     }
 }
 
-/// Two palettes selected explicitly; `system` follows the OS. The desktop
-/// client had only light/dark — `system` is the native-app addition, and it is
-/// the default because a mac app that ignores the system appearance is wrong.
+/// Two palettes selected explicitly; `system` follows the OS and is the default.
 enum ThemeChoice: String, CaseIterable, Sendable {
     case system, light, dark
 
@@ -136,8 +129,8 @@ final class Prefs {
         }
     }
 
-    /// The human's display name — used only for the Sitrep greeting. Stored
-    /// client-side; there is no such field on the human door, and it's cosmetic.
+    /// The human's display name, for the Sitrep greeting only. Client-side —
+    /// the human door has no such field.
     private var _userName: String
     var userName: String {
         get { _userName }

@@ -1,9 +1,7 @@
 // One dense update row: importance meter · avatar · sender · one_line ·
 // relative time · matched-rule hint · deadline chip. Mouse click selects AND
-// opens the thread (gmail semantics). Action affordances stay keyboard-first —
-// the [r][e][d] verb hint shows only on the selected row.
-//
-// Ported from squelch-desktop/src/components/UpdateRow.tsx.
+// opens the thread (gmail semantics); action affordances stay keyboard-first,
+// with the [r][e][d] verb hint only on the selected row.
 
 import SwiftUI
 
@@ -21,9 +19,8 @@ struct UpdateRow: View {
 
     @State private var hovering = false
 
-    /// The aging BADGE only earns its place once an item is genuinely aging
-    /// (> 48h). Under that a STILL OPEN row shows the plain relative time like
-    /// any other band — no shouty badge on fresh items.
+    /// The aging BADGE only earns its place past 48h; under that a STILL OPEN
+    /// row shows the plain relative time like any other band.
     private var showAgeBadge: Bool {
         aging && Fmt.isAging(update.surfaced_at ?? update.resolved_at)
     }
@@ -128,10 +125,8 @@ struct UpdateRow: View {
     }
 }
 
-/// The header sun/moon theme toggle. Mirrors the `\` keybinding; both route
-/// through the same Prefs so every mount stays in sync automatically (the
-/// desktop client needed a hand-rolled pub/sub for this — @Observable is the
-/// native equivalent).
+/// The header sun/moon theme toggle. Mirrors the `\` keybinding, both routed
+/// through the same Prefs so every mount stays in sync.
 struct ThemeToggle: View {
     @Environment(Prefs.self) private var prefs
 

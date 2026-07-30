@@ -1,10 +1,5 @@
 // App entry point. Opens ONE window whose background is the native AppKit
 // backdrop — that is the layer every `.glassEffect` in the app refracts.
-//
-// The menu bar carries the ⌘-chords that macOS expects to find there (⌘K, ⌘[,
-// ⌘]), so they show up in Help > Search and read as native. They ALSO exist in
-// the key registry, because the registry is where the app's layering semantics
-// live; the menu items simply call the same handlers.
 
 import AppKit
 import SwiftUI
@@ -41,16 +36,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        // Before launch finishes: a notification tapped while Squelch was not
-        // running is delivered the moment a delegate exists, and a center
-        // without one drops it.
+        // Install before launch finishes: a notification tapped while Squelch
+        // was not running is delivered the moment a delegate exists, and a
+        // center without one drops it.
         Notifier.shared.install()
     }
 
-    // FALSE, because the app is a notifier now. Closing the window means "get
-    // out of my way", not "quit" — terminating on last-window-close would drop
-    // the event stream, and the notification the window was closed to wait for
-    // would never arrive. ⌘Q and the app menu still quit.
+    // FALSE, because the app is a notifier: terminating on last-window-close
+    // would drop the event stream, so the notification the window was closed to
+    // wait for would never arrive. ⌘Q and the app menu still quit.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     /// Dock click with nothing on screen: put the window back.
@@ -63,8 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 /// Native menu equivalents for the app's global chords. These duplicate
-/// registry bindings on purpose: the registry owns dispatch semantics, the menu
-/// owns discoverability.
+/// registry bindings on purpose: the registry owns dispatch semantics (its
+/// layering and input guard), the menu owns discoverability.
 struct SquelchCommands: Commands {
     let store: AppStore
     let prefs: Prefs
@@ -72,9 +66,8 @@ struct SquelchCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {}
 
-        // ⌘, is THE macOS settings shortcut and belongs in the app menu where
-        // every mac user already looks for it. Settings is a routed view here
-        // rather than a separate window, so this routes instead of opening one.
+        // Settings is a routed view rather than a separate window, so the
+        // standard ⌘, routes instead of opening one.
         CommandGroup(replacing: .appSettings) {
             Button("Settings…") { store.setView(.settings) }
                 .keyboardShortcut(",", modifiers: .command)
@@ -115,11 +108,9 @@ struct SquelchCommands: Commands {
         }
 
         CommandGroup(after: .toolbar) {
-            // Deliberately NO keyboardShortcut: `\` is bound in the key registry
-            // instead. A menu shortcut with no modifier fires even while a text
-            // field has focus, which would make it impossible to type a
-            // backslash anywhere in the app. The registry's input guard is the
-            // whole reason that dispatch layer exists.
+            // Deliberately NO keyboardShortcut: a menu shortcut with no
+            // modifier fires even while a text field has focus, so `\` is bound
+            // in the key registry instead, behind its input guard.
             Button(prefs.theme == .dark ? "Light Appearance" : "Dark Appearance") {
                 prefs.flipTheme()
             }

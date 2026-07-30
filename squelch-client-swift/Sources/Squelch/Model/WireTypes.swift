@@ -1,19 +1,16 @@
-// Swift mirrors of the squelch-core / squelch-api JSON contracts served under
-// /client/*. Field names and enum string values match the Rust serde output
-// EXACTLY (serde rename_all = "snake_case"). Do not "improve" these.
-//
-// Ported 1:1 from squelch-desktop/src/api/types.ts. Every enum decodes
-// leniently (an unknown wire value becomes `.unknown` rather than throwing) so
-// a newer daemon can add a variant without bricking an older client.
+// Swift mirrors of the squelch-core / squelch-api JSON contracts under
+// /client/*. THESE SHAPES ARE A WIRE CONTRACT: field names and enum string
+// values match the Rust serde output exactly (rename_all = "snake_case"), so do
+// not "improve" them. Every enum decodes leniently (an unknown wire value falls
+// back) so a newer daemon can add a variant without bricking an older client.
 
 import Foundation
 
 // MARK: - lenient enum helper
 
-/// A String-backed enum that never fails to decode: unrecognised wire values
-/// fall into the type's `unknownFallback`. The desktop client got this for free
-/// (TS unions are erased at runtime); Swift needs it spelled out or one new
-/// server-side tier value would fail the whole page decode.
+/// A String-backed enum that never fails to decode: an unrecognised wire value
+/// becomes `unknownFallback`. Without this, one new server-side tier value
+/// would fail the whole page decode.
 protocol LenientRawEnum: RawRepresentable, Codable, Sendable, Hashable
 where RawValue == String {
     static var unknownFallback: Self { get }
@@ -53,7 +50,7 @@ enum Disposition: String, LenientRawEnum, CaseIterable {
     static var unknownFallback: Disposition { .squelch }
 
     /// User-facing label. "squelch" is the product name, not a UI verb — the
-    /// chip reads "mute" while the wire value is unchanged.
+    /// chip reads "mute" while the wire value stays `squelch`.
     var label: String {
         switch self {
         case .surface: "surface"
@@ -87,17 +84,15 @@ enum EventKind: String, LenientRawEnum {
     case deadline
     /// Importance landed at or above the notify threshold.
     case surfaced
-    /// A kind this build has never heard of is still worth a banner — it only
-    /// loses the urgent styling.
+    /// An unheard-of kind still earns a banner; it only loses urgent styling.
     static var unknownFallback: EventKind { .surfaced }
 }
 
 /// core::types::Event — one row of the durable notification log, delivered as
-/// SSE frames on GET /client/events.
-///
-/// Every field is a snapshot taken at emission time, deliberately: a client
-/// renders the whole notification from this row alone, with no second round
-/// trip to spend. SEALED MAIL CAN NEVER APPEAR HERE (enforced server-side).
+/// SSE frames on GET /client/events. Every field is a snapshot taken at
+/// emission time, so a client renders the whole notification from this row with
+/// no second round trip. SEALED MAIL CAN NEVER APPEAR HERE (enforced
+/// server-side; see docs/SECURITY.md §4).
 struct Event: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var kind: EventKind
@@ -122,9 +117,8 @@ struct FieldReasons: Codable, Sendable, Hashable {
     var tier: String?
 }
 
-/// core::types::AttentionUpdate. Rust `#[serde(flatten)]`s `Update` into this
-/// struct, so on the wire it is ONE flat object (Update fields + the three
-/// lifecycle fields). `surfaced_at == nil` => NEW.
+/// core::types::AttentionUpdate. Rust `#[serde(flatten)]`s `Update` in, so the
+/// wire shape is ONE flat object. `surfaced_at == nil` => NEW.
 struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var thread_id: String
@@ -171,7 +165,7 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable {
     var attachmentList: [Attachment] { attachments ?? [] }
 
     /// "Name <addr>" when a display name exists, else the bare address — the
-    /// string senderDisplayName() expects.
+    /// shape `SenderID.parse` expects.
     var senderString: String {
         if let n = from_name, !n.isEmpty { return "\(n) <\(from_addr)>" }
         return from_addr
@@ -617,7 +611,7 @@ struct TriageFeedback: Codable, Sendable, Identifiable, Hashable {
     var note: String?
 }
 
-/// store::MarketingOffer (GET /client/marketing). Deliberately carries NO url:
+/// store::MarketingOffer (GET /client/marketing). Deliberately carries NO url —
 /// a model-emitted, email-derived link rendered as clickable is a
 /// prompt-injection lever.
 struct MarketingOffer: Codable, Sendable, Hashable {

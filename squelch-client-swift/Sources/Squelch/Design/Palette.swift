@@ -1,29 +1,15 @@
-// THE SQUELCH PALETTE — brand identity carried INTO the native material.
-//
-// The point of this rewrite is that the glass is real (AppKit's, sampled from
-// the actual window backdrop) — but real glass is not an excuse for a colorless
-// app. The web build went neutral and read as soulless. So:
-//
-//   * THE ACCENT IS SQUELCH BLUE (#2b7fd4). It marks state, never decoration:
-//     focus, selection, the active rail item, primary buttons, the auth ring.
-//     Glass surfaces that carry meaning get a *tinted* glass, not a grey one.
-//   * TIER SEMANTICS are fixed and never reused for chrome: coral = overdue,
-//     amber = deadline, green = signal/synced, periwinkle = auth/sealed.
-//   * TYPE is two-voice. SF for the interface (it is a mac app), and the
-//     Newsreader serif for exactly one thing — the sitrep hero headline. That
-//     single editorial moment is the brand's voice; spreading it further would
-//     make it wallpaper.
-//
-// Every color is defined for BOTH appearances. On glass, ink has to be darker
-// in light mode and lighter in dark mode than it would be on an opaque fill,
-// because the material lets the backdrop's luminance through.
+// The squelch palette. Every color is defined for BOTH appearances: on glass,
+// ink has to be darker in light mode and lighter in dark than it would be on an
+// opaque fill, because the material lets the backdrop's luminance through.
+// The accent marks state, never decoration. Tier colors are fixed and never
+// reused for chrome: coral overdue, amber deadline, green signal, lock auth.
 
 import SwiftUI
 
 enum Palette {
     // MARK: - the accent
 
-    /// THE squelch blue. Saturated on purpose.
+    /// The squelch blue. Saturated on purpose.
     static let accent = Color(
         light: Color(hex: 0x2B7FD4), dark: Color(hex: 0x4E9BEA))
     /// Deeper blue for amounts, links and pressed states.
@@ -34,8 +20,8 @@ enum Palette {
         light: Color(hex: 0x2B7FD4).opacity(0.14),
         dark: Color(hex: 0x4E9BEA).opacity(0.20))
 
-    /// The glass tint the app's own chrome uses. Deliberately subtle — a tint
-    /// this saturated at a high alpha stops being glass and becomes a blue box.
+    /// The glass tint the app's own chrome uses. Alpha stays low: a tint this
+    /// saturated stops being glass and becomes a blue box.
     static let glassTint = Color(hex: 0x2B7FD4).opacity(0.10)
     /// A stronger tint for surfaces that must read as "squelch's own".
     static let glassTintStrong = Color(hex: 0x2B7FD4).opacity(0.18)
@@ -82,7 +68,7 @@ enum Palette {
     // MARK: - lines
 
     /// A hairline INSIDE a glass pane — ink-side, so it reads on the pane's own
-    /// tint rather than dissolving into the specular edge.
+    /// tint instead of dissolving into the specular edge.
     static let hairline = Color(
         light: Color(hex: 0x1E3246).opacity(0.12), dark: Color(hex: 0xFFFFFF).opacity(0.10))
     static let hairlineStrong = Color(
@@ -90,8 +76,8 @@ enum Palette {
 
     // MARK: - reading surface
 
-    /// Long-form mail is a reading PAGE, not a glass panel — body copy must
-    /// never sit on a busy photo. The thread viewer's message cards stay solid.
+    /// Long-form mail is a reading PAGE, not a glass panel: body copy must never
+    /// sit on a busy wallpaper, so message cards stay solid.
     static let readerBackground = Color(
         light: Color(hex: 0xF7FAFD), dark: Color(hex: 0x131A24))
 
@@ -100,8 +86,7 @@ enum Palette {
 
     // MARK: - avatar palette
 
-    /// Ten theme-aware pairs, deterministic by sender address. Blue-leaning so
-    /// avatars belong to the same family as the accent instead of confetti.
+    /// Ten theme-aware pairs, picked deterministically by sender address.
     static let avatarPalette: [(bg: Color, fg: Color)] = [
         (Color(light: 0xD8E6F8, dark: 0x24384F), Color(light: 0x1C4E82, dark: 0xA9CBF0)),
         (Color(light: 0xDCE9E1, dark: 0x22392E), Color(light: 0x246148, dark: 0x9AD3B6)),
@@ -133,8 +118,7 @@ extension Color {
             opacity: 1)
     }
 
-    /// A dynamic color that resolves per appearance — the Swift equivalent of
-    /// the CSS `:root[data-theme]` pairs.
+    /// A dynamic color that resolves per appearance.
     init(light: Color, dark: Color) {
         self.init(
             nsColor: NSColor(name: nil) { appearance in

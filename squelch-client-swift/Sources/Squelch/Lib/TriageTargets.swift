@@ -1,26 +1,11 @@
 // Correction targets for the triage-fix palette (`v`), and the prefix matcher
 // that turns what you type into one of them.
 //
-// The values here MIRROR the pipeline exactly — TriageAxis::allowed in
-// squelch-core/src/types.rs is the server-side gate, and it rejects anything
-// else with a 400. That is deliberate: the whole point of the feedback dataset
-// is "the model said X, the human said Y", and Y has to be a label the model
-// could itself have produced or the pair means nothing.
-//
-// TYPING. You should be able to hit v, type "bill", and hit Enter. The aliases
-// below are what make that work. Matches are RANKED rather than resolved to a
-// single answer, because some words genuinely are ambiguous — "bill" fits both
-// an invoice you owe and an autopay notice — and silently guessing between them
-// would write a wrong label into the training set.
-//
-// BANDS ARE NOT LABELS. The sitrep's top section, "For your eyes", is a QUERY
-// over tiers — the server defines it as `tier IN ('past_due','deadline') AND
-// status != 'done'` (squelch-core/src/store/sqlite.rs) — so there is no "fye"
-// value to send and inventing one would 400 at the door above. The words people
-// reach for reach the tiers that CONSTITUTE the band instead, and `lands` puts
-// the mapping on the row so it is visible rather than folklore.
-//
-// Ported from squelch-desktop/src/lib/triageTargets.ts.
+// Every `value` must exist in TriageAxis::allowed (squelch-core/src/types.rs) —
+// the server 400s anything else, and a feedback pair only means something if the
+// human's label is one the model could itself have produced. BANDS ARE NOT
+// LABELS: "For your eyes" is a server query over tiers, so band words map onto
+// the tiers that constitute it (see `lands`) rather than a value that would 400.
 
 import Foundation
 
@@ -32,17 +17,15 @@ enum TriageAxis: String, Sendable, Hashable {
     var chipLabel: String { self == .sensitivity ? "auth" : rawValue }
 }
 
-/// What a correction does to the row's CURRENT band membership, by the server's
-/// own predicates. The palette applies exactly this and no more: modeling a move
-/// the server does not make would flicker, because the forced refresh a beat
-/// later puts back whatever was removed wrongly.
+/// What a correction does to the row's current band membership, by the server's
+/// own predicates. The palette applies exactly this and no more — modelling a
+/// move the server does not make flickers when the forced refresh undoes it.
 enum CorrectionExit: Sendable {
-    /// Nothing moves. A category is not a band — `/client/updates` buckets on
-    /// tier, status and surfaced_at only, so correcting the category leaves the
-    /// row exactly where it sits.
+    /// Nothing moves: `/client/updates` buckets on tier, status and surfaced_at
+    /// only, so a category is not a band.
     case stays
-    /// Leaves For-your-eyes and nothing else: `new` and `open` are defined by
-    /// surfaced_at/status, which a tier correction does not touch.
+    /// Leaves For-your-eyes only — `new`/`open` are defined by surfaced_at and
+    /// status, which a tier correction does not touch.
     case standing
     /// Leaves every band — the base predicate excludes `sensitivity = 'sealed'`.
     case allBands
@@ -58,18 +41,16 @@ struct TriageTarget: Identifiable, Hashable, Sendable {
     var hint: String
     /// Extra words that should match this target.
     var aliases: [String]
-    /// Words that should SURFACE this target without naming it. Ranked BELOW
-    /// aliases on purpose: "important" names `signal`, so Enter must keep
-    /// writing `signal` — but the tiers that actually land in For-your-eyes have
-    /// to appear under it, or the band is unreachable by the only word anyone
-    /// types for it.
+    /// Words that SURFACE this target without naming it. Ranked below aliases on
+    /// purpose: "important" names `signal`, so Enter must keep writing `signal`
+    /// while the band's real tiers still appear under it.
     var nudges: [String] = []
 
     var id: String { "\(axis.rawValue):\(value)" }
 
-    /// Which sitrep surface this value PUTS the mail on, where that is a server
-    /// predicate rather than a heuristic. nil = this value does not place mail,
-    /// and the row says nothing rather than implying a move.
+    /// Which sitrep surface this value PUTS the mail on, by server predicate
+    /// rather than heuristic. nil = it places nothing, and the row stays silent
+    /// rather than implying a move.
     var lands: String? {
         switch (axis, value) {
         // standing = tier IN ('past_due','deadline') AND status != 'done'
@@ -122,10 +103,10 @@ enum TriageTargets {
             aliases: ["general", "none", "other", "plain"]),
 
         // --- auth: the sealed axis -------------------------------------------
-        // Auth is NOT a category — it is `triage.sensitivity`, and it is the
-        // axis with real consequences. Sealed mail is structurally absent from
-        // the agent door, so moving a message here RESTRICTS what any agent can
-        // ever see of it, and moving it out EXPOSES it.
+        // Not a category but `triage.sensitivity`, and the axis with real
+        // consequences: sealed mail is structurally absent from the agent door,
+        // so moving mail in RESTRICTS what an agent can see and moving it out
+        // EXPOSES it. See docs/SECURITY.md §4.
         TriageTarget(
             axis: .sensitivity, value: "sealed", label: "Auth",
             hint: "a code, reset or sign-in alert; hides it from agents",
@@ -139,18 +120,16 @@ enum TriageTargets {
             aliases: ["notauth", "unseal", "unsealed", "normal", "notsealed"]),
 
         // --- tiers: how much it should DEMAND of you -------------------------
-        // TIER IS WHAT PLACES MAIL: past_due and deadline ARE the For-your-eyes
-        // band, the other two are everything else. So the band words live on
-        // those two and on NEITHER of the others — aliasing "for your eyes" onto
-        // `signal` would read as helpful while writing a value that is
+        // Tier is what places mail: past_due and deadline ARE the For-your-eyes
+        // band, so the band words live on those two and on neither of the
+        // others — aliasing "for your eyes" onto `signal` would write a value
         // definitionally not in that band.
         TriageTarget(
             axis: .tier, value: "past_due", label: "Past due",
             hint: "a deadline that has already passed",
             aliases: ["pastdue", "past", "overdue", "late"],
-            // Below Deadline for the band words: both land in For-your-eyes,
-            // but "past due" additionally asserts the date has PASSED, which is
-            // the more falsifiable of the two claims.
+            // Ranks below Deadline for the band words: both land in
+            // For-your-eyes, but "past due" also asserts the date has PASSED.
             nudges: ["foryoureyes", "fye", "eyes", "important"]),
         TriageTarget(
             axis: .tier, value: "deadline", label: "Deadline",
@@ -160,18 +139,16 @@ enum TriageTargets {
         TriageTarget(
             axis: .tier, value: "signal", label: "Signal",
             hint: "worth your attention, no deadline",
-            // "important" STAYS the name of this tier — plenty of important mail
+            // "important" stays the name of THIS tier: plenty of important mail
             // has no date, and demoting it would make Enter write a deadline
-            // claim onto mail that has none. The two band tiers merely rank
-            // under it, which is the palette showing the ambiguity it has.
+            // claim onto mail that has none.
             aliases: ["signal", "important", "attention"]),
         TriageTarget(
             axis: .tier, value: "noise", label: "Noise",
             hint: "should not have surfaced at all",
-            // The marketing words deliberately do NOT live here: "this is
-            // marketing" is a statement about what the mail IS; "this is noise"
-            // is about whether it should have surfaced. Conflating them would
-            // teach the dataset that every promo is unwanted.
+            // The marketing words deliberately do NOT live here: conflating
+            // "this IS marketing" with "this should not have surfaced" teaches
+            // the dataset that every promo is unwanted.
             aliases: ["noise", "junk", "ignore", "spam", "quiet"]),
     ]
 
@@ -181,13 +158,8 @@ enum TriageTargets {
     }
 
     /// Rank a target against what the user typed. Higher = better; 0 hides it.
-    ///
-    /// The ordering is deliberately boring: an exact hit beats a prefix, a
-    /// prefix beats a mid-word substring, and a match on the real value beats a
-    /// match on a convenience alias, which beats a nudge. Anything cleverer
-    /// would make it harder to predict which label you are about to write, and
-    /// writing the wrong label is the one failure mode this feature cannot
-    /// afford.
+    /// Deliberately boring — exact beats prefix beats substring, and value beats
+    /// alias beats nudge — so which label Enter writes stays predictable.
     static func score(_ target: TriageTarget, query: String) -> Int {
         let q = norm(query)
         if q.isEmpty { return 1 }  // empty query: everything, in declaration order
@@ -208,8 +180,8 @@ enum TriageTargets {
         }
         if best > 0 { return best }
 
-        // A nudge ranks under every alias so it can only ever ADD an option
-        // below the one the typed word actually names — never replace it.
+        // A nudge ranks under every alias, so it can only ADD an option below
+        // the one the typed word names — never replace it.
         for nudge in target.nudges {
             let n = norm(nudge)
             if n == q || n.hasPrefix(q) { return 30 }

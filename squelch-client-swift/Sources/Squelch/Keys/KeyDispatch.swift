@@ -1,31 +1,25 @@
-// Single keymap registry. ALL keybindings in the app flow through here so they
-// live in one system and can't collide silently. Views register a set of
-// bindings scoped to a KeyContext; the active context is a STACK (last pushed
-// wins) so a modal transparently captures keys until it pops.
-//
-// Ported 1:1 from squelch-desktop/src/keys/{dispatchCore,useKeys}.ts — the
+// The app's single keymap registry: views register bindings scoped to a
+// KeyContext, and the active context is a STACK (last pushed wins). The
 // layering semantics are load-bearing:
 //
 //   * The active context composes with "global", so 1..5 view nav and ⌘K keep
 //     firing from inside a modal.
-//   * Registration order matters: the LAST registered set in a context wins,
-//     which is how a nested overlay's Escape beats the surface underneath.
-//   * Two passes — an EXACT (case-sensitive) match always beats a case-folded
-//     one, so "A" (audit) and "a" (browse) coexist while a shifted letter with
-//     no exact-case binding still falls back to its lowercase sibling.
-//   * meta (⌘) is matched EXACTLY, like shift: a meta binding fires only with
-//     ⌘ held, and a plain binding never fires while ⌘ is held. That is what
-//     keeps ⌘[ / ⌘] from colliding with bare "[" / "]".
-//   * A binding whose handler returns false DECLINES the key and dispatch
-//     continues to the next candidate (the newsletter zone's `e` uses this to
-//     defer to the For-your-eyes handler when nothing is hovered).
+//   * The LAST registered set in a context wins, which is how a nested
+//     overlay's Escape beats the surface underneath.
+//   * Two passes: an EXACT (case-sensitive) match beats a case-folded one, so
+//     "A" (audit) and "a" (browse) coexist while a shifted letter with no
+//     exact-case binding still falls back to its lowercase sibling.
+//   * meta (⌘) is matched EXACTLY both ways, which keeps ⌘[ / ⌘] from
+//     colliding with bare "[" / "]".
+//   * A handler returning false DECLINES the key and dispatch continues to the
+//     next candidate.
 
 import AppKit
 import SwiftUI
 
-/// Which layer is receiving keys. "sitrep" is the dashboard's own minimal
-/// context; "thread" is the fullscreen viewer's layer ABOVE "modal" so a thread
-/// opened from a search panel gates that panel's keys until the viewer closes.
+/// Which layer is receiving keys. "thread" (the fullscreen viewer) sits ABOVE
+/// "modal", so a thread opened from a search panel gates that panel's keys
+/// until the viewer closes.
 enum KeyContext: String, Sendable, Hashable {
     case list
     case sitrep
@@ -39,8 +33,7 @@ enum KeyContext: String, Sendable, Hashable {
 struct KeyBinding: Identifiable {
     /// The base key: a character ("j"), or a named key ("Escape", "ArrowDown",
     /// "Enter", "Space", "Tab"). Modifiers are expressed by the flags below,
-    /// never baked into this string — except "shift+" on NAMED keys, matching
-    /// the desktop client's normalize().
+    /// never baked into this string — except "shift+" on NAMED keys.
     var key: String
     var description: String
     /// Require the ⌘ modifier. Matched exactly (see file header).
@@ -104,7 +97,6 @@ final class KeyRegistry {
     /// an array so a re-render can swap in closures that capture fresh state
     /// WITHOUT re-registering — re-registering would move the set to the top of
     /// the order and let a stale surface steal keys from an overlay above it.
-    /// This is the Swift stand-in for React's `useKeys(ctx, bindings, [deps])`.
     @MainActor
     final class BindingsBox {
         var bindings: [KeyBinding]
@@ -140,7 +132,7 @@ final class KeyRegistry {
     }
 
     func popContext(_ token: UUID) {
-        // Never pop the base "list" entry (index 0), mirroring `idx > 0`.
+        // Never pop the base "list" entry at index 0.
         if let idx = contextStack.lastIndex(where: { $0.token == token }), idx > 0 {
             contextStack.remove(at: idx)
         }
@@ -190,14 +182,9 @@ final class KeyRegistry {
                     for b in set.box.bindings {
                         guard b.meta == metaHeld else { continue }
                         guard matcher(b.key, eventStr) else { continue }
-                        // Escape is NEVER input-suppressed. "Esc closes this" is
-                        // the app's universal contract — panels even render an
-                        // `Esc close` hint — so a surface that happens to focus a
-                        // text field must not become a trap. It was left to each
-                        // binding to opt in, which 10 of 15 Escapes did and 5
-                        // (search panel, help, auth code, process mode, the two
-                        // back-to-sitreps) did not: with the search field focused
-                        // there was NO way out of the panel.
+                        // Escape is NEVER input-suppressed: "Esc closes this" is
+                        // the app's universal contract, so a surface that
+                        // focuses a text field must not become a trap.
                         if editing && !b.allowInInput && b.key != "Escape" { continue }
                         if b.handler() {
                             return DispatchOutcome(
@@ -210,9 +197,9 @@ final class KeyRegistry {
         return .unhandled
     }
 
-    /// Build the normalized key string. NOTE: meta (⌘) is intentionally NOT
-    /// baked in — it is matched separately via each binding's `meta` flag, so a
-    /// bare-key binding never fires under ⌘ and a meta chord fires only under ⌘.
+    /// Build the normalized key string. meta (⌘) is intentionally NOT baked in:
+    /// it is matched separately via each binding's `meta` flag, so a bare-key
+    /// binding never fires under ⌘ and a meta chord fires only under ⌘.
     static func normalize(_ e: KeyEventLike) -> String {
         var parts: [String] = []
         if e.control { parts.append("ctrl") }
@@ -220,7 +207,7 @@ final class KeyRegistry {
         var k = e.key
         if k == " " { k = "Space" }
         // Shift is only expressed for NAMED keys; for letters the case of `key`
-        // already carries it (matching the browser's KeyboardEvent.key).
+        // already carries it.
         if e.shift && k.count > 1 { parts.append("shift") }
         parts.append(k)
         return parts.joined(separator: "+")
@@ -229,8 +216,8 @@ final class KeyRegistry {
 
 // MARK: - NSEvent bridge
 
-/// Translate an AppKit key event into the browser-style key names the ported
-/// bindings are written against.
+/// Translate an AppKit key event into the browser-style key names bindings are
+/// written against.
 enum KeyNames {
     static func name(for event: NSEvent) -> String? {
         // Named keys first, by key code — `characters` for these is a private
@@ -252,16 +239,15 @@ enum KeyNames {
         case 121: return "PageDown"
         default: break
         }
-        // Printable characters keep their case (that IS the shift signal for
-        // letters, matching KeyboardEvent.key). Use charactersIgnoringModifiers
-        // so an Option chord still reports the base glyph, then re-apply shift
-        // casing from the event's own characters when available.
+        // Printable characters keep their case — that IS the shift signal for
+        // letters. `charactersIgnoringModifiers` so an Option chord still
+        // reports the base glyph, then shift casing is re-applied.
         guard let raw = event.charactersIgnoringModifiers, !raw.isEmpty else { return nil }
         if raw.count == 1, let ch = raw.first, ch.isLetter {
             return event.modifierFlags.contains(.shift) ? raw.uppercased() : raw.lowercased()
         }
         // For non-letters, `characters` reflects the shifted glyph ("?" for
-        // shift+/), which is exactly what the bindings expect.
+        // shift+/), which is what the bindings are written against.
         if let chars = event.characters, !chars.isEmpty, chars.count == 1 { return chars }
         return raw
     }
@@ -279,8 +265,7 @@ enum KeyNames {
 }
 
 /// Installs the ONE global key monitor. Sits at the app level (SquelchApp) so
-/// there is exactly one listener, exactly like the desktop client's single
-/// window keydown handler.
+/// there is exactly one listener.
 @MainActor
 final class KeyMonitor {
     static let shared = KeyMonitor()
@@ -292,11 +277,11 @@ final class KeyMonitor {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard let like = KeyNames.eventLike(event) else { return event }
-            // Typing into a text field suppresses single-letter bindings
-            // automatically unless the binding opts in — the "input" guard.
+            // The input guard: typing into a text field suppresses single-letter
+            // bindings unless the binding opts in.
             let editing = Self.isEditing(event.window)
             let outcome = KeyRegistry.shared.dispatch(like, editing: editing)
-            // Consuming the event is the equivalent of preventDefault().
+            // Returning nil consumes the event.
             return outcome.handled ? nil : event
         }
     }
@@ -319,8 +304,8 @@ private struct KeyBindingsModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         // Swap in the freshest closures on EVERY body evaluation — they capture
-        // the view's current state, and the box is a plain (non-observable)
-        // reference so writing to it cannot re-enter the render.
+        // the view's current state, and the box is a plain non-observable
+        // reference, so writing to it cannot re-enter the render.
         box.bindings = bindings
         return
             content
@@ -336,9 +321,8 @@ private struct KeyBindingsModifier: ViewModifier {
 
 /// Pushes a KeyContext while the view is mounted, so its bindings capture keys
 /// above the layer beneath. CRITICAL: attach this only to CONDITIONALLY-MOUNTED
-/// views (modals, panels, the thread viewer). An always-mounted push would pin
-/// the context on the stack forever and permanently gate out the list keymap —
-/// exactly the bug the desktop client's SideViews header warns about.
+/// views (modals, panels, the thread viewer). An always-mounted push pins the
+/// context on the stack forever and permanently gates out the list keymap.
 private struct KeyContextModifier: ViewModifier {
     let context: KeyContext
     @State private var token: UUID?

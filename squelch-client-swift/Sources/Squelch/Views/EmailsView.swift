@@ -1,20 +1,8 @@
-// EMAILS VIEW — the traditional flat inbox. The "I just want a normal email
-// view" escape hatch: ALL updates (every tier, noise included), sorted by order
-// received (newest first), one dense list. The abstracted bands live on the
-// Sitrep; this surface hides nothing.
-//
-// Keyboard-first: j/k traverse rows; Enter drills into a thread; r/e/d dispatch
-// through Actions. e/d optimistically drop the row here (the action layer only
-// removes it from the sitrep bands; this list is its own fetch). Owns the
-// "list" KeyContext.
-//
-// SELECTION MODEL (owner call, 2026-07-24): there is NO persistent selection.
-// The row highlight renders only while the KEYBOARD is driving; any mouse hover
-// hides it and re-anchors the cursor to the hovered row so arrows continue from
-// there. Action keys require kbActive OR a live hover — with nothing
-// highlighted they must be inert, or you get invisible row-0 casualties.
-//
-// Ported from squelch-desktop/src/views/EmailsView.tsx.
+// EMAILS VIEW — the traditional flat inbox: ALL updates, every tier, newest
+// first, one dense list that hides nothing. Owns the "list" KeyContext; e/d drop
+// the row optimistically here because the action layer only removes it from the
+// sitrep bands. No persistent selection — the highlight renders only while the
+// keyboard drives, and action keys are inert without kbActive or a live hover.
 
 import SwiftUI
 
@@ -24,9 +12,9 @@ struct EmailsView: View {
 
     /// One generous page — the read model is local, this is cheap.
     private static let fetchLimit = 500
-    /// How many rows get their thread warmed ahead of any click. Deliberately a
-    /// bounded prefix: warming all 500 would stampede the daemon for mail
-    /// nobody scrolls to. Hover warming picks up anything past it.
+    /// How many rows get their thread warmed ahead of any click — a bounded
+    /// prefix, because warming all 500 would stampede the daemon for mail nobody
+    /// scrolls to. Hover warming picks up anything past it.
     private static let warmRows = 40
 
     @State private var items: [AttentionUpdate]?
@@ -37,13 +25,9 @@ struct EmailsView: View {
     /// True only while the cursor is actually over a row.
     @State private var hovering = false
 
-    /// The local snapshot MINUS anything resolved since it was fetched.
-    ///
-    /// `items` is this view's own copy and only reloads on `store.lastRefresh`
-    /// — the 10s poll — so mail finished from the reader used to sit here,
-    /// visibly undone, until the next tick. Filtering against the store's
-    /// resolved set closes that window without giving up the local list (which
-    /// is what makes this page's ordering and paging its own).
+    /// The local snapshot MINUS anything resolved since it was fetched: `items`
+    /// only reloads on the 10s `store.lastRefresh` poll, so without this filter
+    /// mail finished from the reader sits here visibly undone until the next tick.
     private var rows: [AttentionUpdate] {
         (items ?? []).filter { !store.resolvedIds.contains($0.id) }
     }
@@ -70,9 +54,9 @@ struct EmailsView: View {
                                     selected: kbActive && i == index,
                                     glassNamespace: listGlass,
                                     onHover: {
-                                        // A hover must NOT follow-scroll: hovering a
-                                        // row near the viewport edge would jump the
-                                        // list under the cursor.
+                                        // A hover must NOT follow-scroll: a row near
+                                        // the viewport edge would jump the list out
+                                        // from under the cursor.
                                         hovering = true
                                         kbActive = false
                                         index = i
@@ -98,11 +82,9 @@ struct EmailsView: View {
         }
         .keyBindings(.list, bindings)
         .task(id: store.lastRefresh) { await load() }
-        // INSTANT-OPEN warmer: pull the thread for the row the cursor (or the
-        // keyboard selection) actually rests on. Debounced, so sweeping the
-        // mouse down a 500-row list fires one request for the row you stop on
-        // rather than one per row you pass over. The bounded head-warm above
-        // covers the first screenfuls; this covers everything past them.
+        // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
+        // a 500-row list fires one request for the row you stop on rather than
+        // one per row you pass. Covers everything past the bounded head-warm.
         .task(id: selected?.id) {
             guard let u = selected else { return }
             try? await Task.sleep(for: .milliseconds(120))
@@ -178,9 +160,8 @@ struct EmailsView: View {
             .help("keyboard shortcuts (?)")
             ThemeToggle()
         }
-        // Same metrics as the sitrep masthead, not just the same fonts: the rail
-        // icon beside it is aligned to that wordmark's line, so a header that
-        // sat 3pt higher here would break the alignment on every page but one.
+        // These metrics must match the sitrep masthead's: the rail icon beside
+        // this header is aligned to that wordmark's line.
         .padding(.horizontal, 24)
         .padding(.top, 16)
         .padding(.bottom, 12)
@@ -198,8 +179,8 @@ struct EmailsView: View {
             KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) },
             KeyBinding("Enter", "drill in") {
                 guard actionable, let u = selected else { return }
-                // Hand the ordered rows to the viewer as its queue so "done +
-                // next" (e/d) can advance in place.
+                // The ordered rows become the viewer's queue, so "done + next"
+                // (e/d) can advance in place.
                 store.openThread(u.thread_id, queue: rows)
             },
             KeyBinding("v", "fix triage") {
@@ -213,7 +194,6 @@ struct EmailsView: View {
                 guard actionable, let u = selected else { return }
                 Actions.reply(u)
             },
-            // e = done everywhere (sitrep parity — owner call, 2026-07-23).
             KeyBinding("e", "done") { resolveSelected() },
             KeyBinding("d", "done") { resolveSelected() },
             KeyBinding("a", "browse all") { store.openSide(.browse) },
@@ -221,8 +201,7 @@ struct EmailsView: View {
             KeyBinding("A", "audit log") { store.setView(.audit) },
             KeyBinding("g", "auth messages") { store.setView(.auth) },
             KeyBinding("u", "undo") { Task { await store.fireUndo() } },
-            // `\` (theme) and `?` (help) live in the GLOBAL context — see
-            // MainShell.globalBindings — so they work from every surface.
+            // `\` (theme) and `?` (help) are global bindings, not listed here.
         ]
     }
 
@@ -239,9 +218,9 @@ struct EmailsView: View {
 
     // MARK: - data
 
-    /// Epoch for "order received". surfaced_at approximates arrival; items the
-    /// triage loop hasn't surfaced yet are the newest mail, so they sort to the
-    /// top. Ties (and the nil bucket) break on id, which is ingest order.
+    /// Epoch for "order received": surfaced_at approximates arrival, and items
+    /// the triage loop hasn't surfaced yet are the newest mail, so they sort to
+    /// the top. Ties (and the nil bucket) break on id, which is ingest order.
     private static func receivedTS(_ u: AttentionUpdate) -> Double {
         guard let s = u.surfaced_at else { return .greatestFiniteMagnitude }
         return Fmt.date(s)?.timeIntervalSince1970 ?? 0
@@ -251,9 +230,8 @@ struct EmailsView: View {
         do {
             let page = try await APIClient.shared.getUpdates(
                 UpdatesParams(limit: Self.fetchLimit))
-            // Done/archived mail leaves the inbox (gmail semantics). This also
-            // keeps auto-resolved receipts out — they're records on the sitrep
-            // rail, not inbox rows.
+            // Done/archived mail leaves the inbox (gmail semantics), which also
+            // keeps auto-resolved receipts out — they're rail records, not rows.
             let next =
                 page.items
                 .filter { $0.status != .done }
@@ -266,8 +244,8 @@ struct EmailsView: View {
             // re-runs this and an identical assignment would re-render 500 rows.
             if next != items { items = next }
             error = nil
-            // PRE-OPEN WARM: pull the head rows' threads before any click, so an
-            // open renders from cache.
+            // Pull the head rows' threads before any click, so an open renders
+            // from cache.
             ThreadPrefetch.shared.warm(
                 (items ?? []).prefix(Self.warmRows).map(\.thread_id), immediate: 5)
         } catch {

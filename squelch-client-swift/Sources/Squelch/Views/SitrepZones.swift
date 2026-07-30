@@ -1,15 +1,8 @@
-// THE SITREP RIGHT RAIL + the newsletters zone.
-//
-// Calendar / Shipments / Banking / Receipts are RECORDS, not actions. Unlike
-// the left column's zones (which hide when empty) the rail always shows its
-// cards with an empty state, because a column that appears and disappears as
-// mail arrives is a column you stop trusting to be there.
-//
+// THE SITREP RIGHT RAIL + the newsletters zone. Calendar / Shipments / Banking
+// / Receipts are RECORDS, not actions: they always render, empty state and all,
+// because a column that comes and goes as mail arrives is one you stop trusting.
 // These records are auto-resolved out of the attention bands at ingest, so this
 // rail is their ONLY surface — clicking a row opens the underlying email.
-//
-// Ported from squelch-desktop/src/views/SitrepView.tsx (zones) and
-// src/lib/newsletters.ts.
 
 import SwiftUI
 
@@ -63,9 +56,8 @@ struct CalendarZone: View {
         kind == .cancellation ? Palette.danger : Palette.inkFaint
     }
 
-    /// thread_id shipped after the calendar wire type — a daemon that predates it
-    /// sends rows without one. Fall back to the emails-page jump so the click
-    /// always does SOMETHING.
+    /// An older daemon sends calendar rows with no thread_id; fall back to the
+    /// emails-page jump so the click always does SOMETHING.
     private func open(_ c: CalendarUpdate) {
         if let tid = c.thread_id, !tid.isEmpty {
             store.openThread(tid)
@@ -74,7 +66,6 @@ struct CalendarZone: View {
         }
     }
 
-    /// Compact when-column: time if the event is today, short date otherwise.
     private func when(_ c: CalendarUpdate) -> String {
         guard c.starts_at != nil else { return "" }
         return Fmt.isToday(c.starts_at) ? Fmt.timeOfDay(c.starts_at) : Fmt.shortDate(c.starts_at)
@@ -83,9 +74,8 @@ struct CalendarZone: View {
 
 // MARK: - shipments
 
-/// Fetches with includeDelivered=true then keeps a shipment when it's still
-/// active OR it was delivered TODAY. Yesterday's-and-older deliveries drop out.
-/// View-only by design: no j/k, but each card's Track button is real.
+/// Still-active shipments plus anything delivered TODAY; older deliveries drop
+/// out. View-only: no j/k, but each card's Track button is real.
 struct ShipmentsZone: View {
     @Environment(AppStore.self) private var store
     private var shipments: [Shipment] { store.zones.shipments }
@@ -118,8 +108,7 @@ private struct ShipmentCard: View {
         return trimmed.isEmpty ? "Package via \(shipment.carrier.label)" : trimmed
     }
 
-    /// Status → tone. out_for_delivery is the loud one (it's arriving today),
-    /// exception is an error, delivered fades back into the record.
+    /// Status → tone: out_for_delivery is the loud one, delivered fades back.
     private var tone: Color {
         switch shipment.status {
         case .outForDelivery: Palette.warn
@@ -172,8 +161,8 @@ private struct ShipmentCard: View {
     }
 }
 
-/// Carrier favicon, falling back to a neutral package glyph for amazon/unknown
-/// (no clean single domain) or a failed fetch.
+/// Carrier favicon, falling back to a package glyph for amazon/unknown (no clean
+/// single domain) or a failed fetch.
 private struct CarrierBadge: View {
     let carrier: Carrier
     @State private var image: NSImage?
@@ -206,9 +195,9 @@ private struct CarrierBadge: View {
 
 // MARK: - banking
 
-/// Statements & transaction alerts — the latest few, dense record rows:
-/// institution + kind tag + masked account hint, amount right-aligned (a
-/// statement's amount is the TOTAL balance the extractor pulled).
+/// Statements & transaction alerts, latest first: institution + kind tag +
+/// masked account hint, amount right-aligned (a statement's amount is the TOTAL
+/// balance the extractor pulled).
 struct BankingZone: View {
     @Environment(AppStore.self) private var store
     private var records: [BankingRecord] { store.zones.banking }
@@ -260,9 +249,8 @@ struct BankingZone: View {
         return r.account_hint.map { "\(base) \($0)" } ?? base
     }
 
-    /// thread_id shipped after the banking wire type — a daemon that predates it
-    /// sends rows without one. Fall back to the emails-page jump so the click
-    /// always does SOMETHING.
+    /// An older daemon sends banking rows with no thread_id; fall back to the
+    /// emails-page jump so the click always does SOMETHING.
     private func open(_ r: BankingRecord) {
         if let tid = r.thread_id, !tid.isEmpty {
             store.openThread(tid)
@@ -274,9 +262,8 @@ struct BankingZone: View {
 
 // MARK: - receipts
 
-/// Records of money already paid — the clean merchant name (left) and the total
-/// (right). Only TODAY's receipts show: a fresh daily digest, like a paper
-/// receipt you'd glance at and file.
+/// Money already paid: merchant (left), total (right). Only TODAY's receipts
+/// show — a fresh daily digest rather than a growing ledger.
 struct ReceiptsZone: View {
     @Environment(AppStore.self) private var store
     private var receipts: [Receipt] { store.zones.receipts }
@@ -332,19 +319,13 @@ struct ReceiptsZone: View {
 
 // MARK: - newsletters
 
-/// THE RULE-ONBOARDING SURFACE. Surfaces recurring marketing senders and, when
-/// a rule already governs one, shows that rule as an editable chip. Clicking a
-/// card OPENS the latest email of that sender (with the sender's whole window
-/// as the viewer's h/l queue); `e` while hovering marks that window done.
+/// THE RULE-ONBOARDING SURFACE: recurring marketing senders, each governing rule
+/// shown as an editable chip. Clicking opens that sender's latest email with
+/// their whole window as the viewer's h/l queue; `e` while hovering marks it done.
 ///
-/// THE FETCH LIVES IN SitrepView, NOT HERE, and that is load-bearing.
-/// SwiftUI gives `EmptyView` no lifetime: `.task`/`.onAppear` on a view that
-/// resolves to nothing NEVER FIRE. This zone hides itself while empty, so when
-/// it owned its own `.task` the loop closed on itself — empty because it never
-/// fetched, never fetched because it was empty. It was invisible for its entire
-/// existence. The React original had no such trap: hooks run before the
-/// `return null`. Any zone that can hide itself must be fed from a parent that
-/// cannot.
+/// THE FETCH LIVES IN SitrepView, NOT HERE: SwiftUI gives `EmptyView` no
+/// lifetime, so `.task`/`.onAppear` on a view that resolves to nothing never
+/// fire. Any zone that can hide itself must be fed by a parent that cannot.
 struct NewslettersZone: View {
     @Environment(AppStore.self) private var store
     @Binding var newsletters: [Newsletter]
@@ -359,8 +340,8 @@ struct NewslettersZone: View {
     private static let gap: CGFloat = 10
 
     var body: some View {
-        // ALWAYS on the board, empty or not (owner call, 2026-07-28). A zone
-        // that vanishes reads as a missing feature, not as "nothing this week".
+        // Always on the board, empty or not: a zone that vanishes reads as a
+        // missing feature, not as "nothing this week".
         ZoneCard(
             symbol: "envelope.open", title: "Newsletters", count: newsletters.count,
             subtitle: "recurring noise · choose what you want"
@@ -373,11 +354,9 @@ struct NewslettersZone: View {
         }
     }
 
-    /// NON-LAZY on purpose — see AdaptiveGrid. A LazyVGrid destroys and rebuilds
-    /// cards as they cross the viewport, and each rebuild costs a hero lookup
-    /// and a fresh `.task`, which is what made scrolling past this zone stutter.
-    /// A week of recurring senders is a bounded list; holding all of it is
-    /// cheaper than rebuilding the visible part over and over.
+    /// NON-LAZY on purpose: a LazyVGrid rebuilds cards as they cross the
+    /// viewport, and each rebuild costs a hero lookup and a fresh `.task`. A
+    /// week of recurring senders is bounded, so holding all of it is cheaper.
     private var grid: some View {
         AdaptiveGrid(minimum: Self.cardMinimum, spacing: Self.gap) { cards }
     }
@@ -403,8 +382,8 @@ struct NewslettersZone: View {
     }
 }
 
-/// Fetch + derive for the newsletters zone. Free-standing so the ALWAYS-mounted
-/// SitrepView can own it; see the note on NewslettersZone.
+/// Fetch + derive for the newsletters zone. Free-standing so the always-mounted
+/// SitrepView can own it.
 enum NewsletterFeed {
     /// Pull a generous window of noise-tier updates and filter to the last 7
     /// days client-side (the wire model carries no received_at).
@@ -415,9 +394,8 @@ enum NewsletterFeed {
             async let updates = APIClient.shared.getUpdates(
                 UpdatesParams(tier: .noise, limit: fetchLimit))
             async let rules = APIClient.shared.listRules()
-            // Best-effort: an older daemon has no /client/marketing, in which
-            // case the zone falls back to the legacy heuristic rather than
-            // rendering empty.
+            // Best-effort: an older daemon has no /client/marketing, and the
+            // zone falls back to the legacy heuristic rather than rendering empty.
             let marketing = (try? await APIClient.shared.getMarketing()) ?? []
             let (page, rl) = try await (updates, rules)
             return Newsletters.derive(
@@ -445,10 +423,8 @@ private struct NewsletterCard: View {
 
     var body: some View {
         Button(action: onOpen) {
-            // Hero LEFT as a square thumb, text right — the card reads as a row
-            // at a glance instead of a banner you have to scan vertically, and
-            // a fixed square keeps every card in the grid the same height
-            // whether or not its sender ships art.
+            // Hero left as a FIXED square, text right: every card in the grid
+            // keeps the same height whether or not its sender ships art.
             HStack(alignment: .top, spacing: 9) {
                 NewsletterHero(threadId: newsletter.latestThreadId)
                 VStack(alignment: .leading, spacing: 6) {
@@ -519,10 +495,9 @@ private struct NewsletterCard: View {
     }
 }
 
-/// Hero thumbnail for a newsletter card: mined from the LATEST email's
-/// sanitized html via the shared thread cache. Renders nothing until (and
-/// unless) a hero resolves, and is gated on the remote-images pref — with
-/// images "on demand" NO network fetch happens for unopened mail.
+/// Hero thumbnail mined from the latest email's sanitized html via the shared
+/// thread cache. Gated on the remote-images pref: with images "on demand" NO
+/// network fetch happens for unopened mail (see docs/SECURITY.md §3).
 private struct NewsletterHero: View {
     let threadId: String
     @State private var resolved: HeroCache.Hero?
@@ -530,54 +505,44 @@ private struct NewsletterHero: View {
     /// Side of the square thumb.
     private static let side: CGFloat = 54
 
-    /// TUNABLE. The widest a hero is allowed to be DRAWN, as a width:height
-    /// ratio. Art wider than this is cropped to exactly this ratio instead of
-    /// letterboxed whole: a 728x90 masthead fitted into the square becomes a
-    /// strip a few points tall — technically present, unreadable in practice —
-    /// and the ends of a masthead are the part nobody misses.
+    /// TUNABLE width:height cap on how wide a hero may be DRAWN. Wider art is
+    /// cropped to exactly this ratio rather than letterboxed whole: a 728x90
+    /// masthead fitted into the square becomes an unreadable few-point strip.
     private static let maxAspect: CGFloat = 7
 
-    /// Falling back to the cache INSIDE the read is what keeps a recycled card
-    /// from flashing empty: `@State` is gone the moment LazyVGrid drops the
-    /// card, but the resolved hero is not, so it repaints from the cache on the
-    /// very first frame instead of waiting for `.task` to hand back what we
-    /// already had.
+    /// Falling back to the cache INSIDE the read keeps a recycled card from
+    /// flashing empty: `@State` is gone the moment the card is dropped, the
+    /// cached hero is not, so it repaints on the very first frame.
     private var hero: HeroCache.Hero? { resolved ?? HeroCache.shared.cached(threadId) }
 
     var body: some View {
         content
             .task(id: threadId) {
-                // Already answered — `hero` is drawing that answer. Resolving
-                // again would suspend, publish the same value and cost a second
-                // body pass. The guard is INSIDE the task, not around it: a card
-                // whose hero is not cached yet is the only reason this fetch
-                // exists, and a conditional modifier would change identity as
-                // the verdict lands.
+                // Already answered — `hero` is drawing that answer, and resolving
+                // again costs a second body pass. The guard is INSIDE the task,
+                // not around it: a conditional modifier would change this view's
+                // identity as the verdict lands.
                 guard !HeroCache.shared.isResolved(threadId) else { return }
                 resolved = await HeroCache.shared.resolve(threadId)
             }
     }
 
-    /// The no-hero branch is a REAL zero-size leaf, not an implicit EmptyView.
-    /// SwiftUI gives EmptyView no lifetime, so `.task` on a view that resolves
-    /// to nothing never fires — and this view starts with no image, which meant
-    /// the fetch that would produce one never ran and no card ever showed art.
-    /// Identical to the trap that kept the zones themselves invisible; see the
-    /// note on NewslettersZone.
+    /// The no-hero branch is a REAL zero-size leaf, not an implicit EmptyView:
+    /// `.task` on a view that resolves to nothing never fires, and this view
+    /// starts with no image, so the fetch that produces one would never run.
     @ViewBuilder
     private var content: some View {
         if let hero {
             art(hero)
                 .frame(width: Self.side, height: Self.side)
-                // The REST OF THE SQUARE, in the art's own dominant colour —
-                // see ImageFill. Falls back to the neutral well when sampling
-                // failed, which must stay distinguishable from a white sample.
+                // The rest of the square, in the art's own dominant colour, or
+                // the neutral well when sampling failed — which must stay
+                // distinguishable from a white sample.
                 .background(hero.fill ?? Palette.canvas.opacity(0.7))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
-            // No art: the text takes the full width rather than sitting beside
-            // an empty box. Zero in BOTH axes — a zero-height-only placeholder
-            // would still collect the HStack's spacing and indent the text.
+            // Zero in BOTH axes: a zero-height-only placeholder would still
+            // collect the HStack's spacing and indent the text.
             Color.clear.frame(width: 0, height: 0)
         }
     }
@@ -587,11 +552,9 @@ private struct NewsletterHero: View {
     @ViewBuilder
     private func art(_ hero: HeroCache.Hero) -> some View {
         if ultraWide(hero.image) {
-            // Past `maxAspect` letterboxing stops paying: the strip it leaves
-            // is too short to read the wordmark off. Draw the art at the capped
-            // ratio and let the ENDS crop instead — `.fill` into a frame this
-            // shape overflows on the long axis, and `.clipped` takes the middle
-            // of that overflow, which is where the mark lives.
+            // Past `maxAspect`, draw at the capped ratio and let the ENDS crop:
+            // `.fill` overflows on the long axis and `.clipped` keeps the middle,
+            // which is where the wordmark lives.
             Image(nsImage: hero.image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
@@ -609,12 +572,9 @@ private struct NewsletterHero: View {
         image.size.height > 0 && image.size.width > image.size.height * Self.maxAspect
     }
 
-    /// Fit by shape, and it matters MORE in a square than it did in the old
-    /// full-width banner: tall/square heroes crop to fill (photos survive a
-    /// crop), WIDE art letterboxes. Filling the square with a wordmark would
-    /// leave a meaningless slice of two letters.
-    ///
-    /// Only reached for art within `maxAspect`; see `art` for the rest.
+    /// Fit by shape: tall/square heroes crop to fill (photos survive a crop),
+    /// WIDE art letterboxes — filling a square with a wordmark would leave a
+    /// meaningless slice of two letters. Only reached for art within `maxAspect`.
     private func fit(_ image: NSImage) -> ContentMode {
         image.size.width > image.size.height * 1.2 ? .fit : .fill
     }
@@ -622,17 +582,11 @@ private struct NewsletterHero: View {
 
 // MARK: - adaptive grid
 
-/// A NON-LAZY `LazyVGrid(columns: [.adaptive(minimum:spacing:)], spacing:)`.
-///
-/// Same geometry, deliberately without the laziness: as many equal-width
-/// columns as fit at `minimum` or wider, each row as tall as its tallest card,
-/// shorter cards centred in it — that is what `GridItem`'s default `.center`
-/// alignment does, and the newsletter cards differ in height (0/1/2 summary
-/// lines, rule chip or none), so getting it wrong is visible.
-///
-/// A `Layout` sees every subview on every pass, so nothing is created or
-/// destroyed by scrolling. That is the whole point; see the note at the call
-/// site.
+/// `LazyVGrid(columns: [.adaptive(minimum:spacing:)])` geometry WITHOUT the
+/// laziness: as many equal-width columns as fit at `minimum`, each row as tall as
+/// its tallest card with shorter cards centred (matching `GridItem`'s default
+/// `.center`). A `Layout` sees every subview on every pass, so nothing is created
+/// or destroyed by scrolling — that is the whole point.
 struct AdaptiveGrid: Layout {
     /// Narrowest a column may be. Columns then stretch to divide the width
     /// evenly, matching `.adaptive`'s default unbounded maximum.
@@ -673,12 +627,10 @@ struct AdaptiveGrid: Layout {
         var height: CGFloat
     }
 
-    /// Column count is the most that fit at `minimum` with a gutter between
-    /// each; the leftover is then split evenly so the row reaches both edges.
-    ///
-    /// A nil or infinite proposal is one of SwiftUI's sizing probes, not a real
-    /// width — answer it with a single column at `minimum` rather than feeding
-    /// infinity into the column arithmetic, which traps on the `Int` conversion.
+    /// Column count is the most that fit at `minimum` with a gutter between each;
+    /// leftover is split evenly. A nil or infinite proposal is a SwiftUI sizing
+    /// probe, not a width — answer it with one column at `minimum`, because
+    /// feeding infinity into the column arithmetic traps on the `Int` conversion.
     private func metrics(width proposed: CGFloat?, subviews: Subviews) -> Metrics {
         let width = (proposed?.isFinite == true) ? max(0, proposed!) : minimum
         let columns = max(1, Int((width + spacing) / (minimum + spacing)))
@@ -702,8 +654,7 @@ struct AdaptiveGrid: Layout {
 
 // MARK: - shared bits
 
-/// The rail's empty state. Present rather than hidden: a column that vanishes
-/// when it has nothing is a column you stop trusting to be there.
+/// The rail's empty state — present rather than hidden.
 struct EmptyNote: View {
     let text: String
     init(_ text: String) { self.text = text }
@@ -717,8 +668,7 @@ struct EmptyNote: View {
     }
 }
 
-/// A record row: no chrome at rest, a soft wash on hover. Records are for
-/// reading; the affordance appears only when you reach for it.
+/// A record row: no chrome at rest, a soft wash on hover.
 struct RecordRowStyle: ButtonStyle {
     @State private var hovering = false
 

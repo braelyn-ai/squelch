@@ -1,17 +1,10 @@
-// macOS notification delivery for the event feed: one banner per event, tapping
-// one opens that thread.
+// macOS notification delivery for the event feed: one banner per event, a tap
+// opens that thread.
 //
-// The Event row is a DENORMALIZED SNAPSHOT (sender, one-line, tier, deadline),
-// so the whole banner renders from the frame alone — no round trip on the path
-// between "mail arrived" and "the human sees it". `copy(for:)` is that mapping
-// and is a pure function of the event, kept separate from the posting so its
-// edge cases (empty summary, unknown kind, a one-liner with newlines in it) can
-// be read straight through.
-//
-// PERMISSION, on a dev machine: an ad-hoc signature's identity is a hash of the
-// build, so every recompile looks like a different app to the notification
-// database and the grant resets. That is a signing artifact, not a bug here —
-// see build.sh's note on why local builds are ad-hoc.
+// The Event row is a denormalized snapshot, so a banner renders from the frame
+// alone with no round trip. `copy(for:)` is that mapping, kept pure and separate
+// from posting. On a dev machine the grant resets every recompile: an ad-hoc
+// signature's identity is a hash of the build.
 
 import AppKit
 import UserNotifications
@@ -20,9 +13,8 @@ import UserNotifications
 final class Notifier {
     static let shared = Notifier()
 
-    /// userInfo keys. The thread id is the whole point of the payload: it is
-    /// what a tap routes on. `nonisolated` because the delegate reads the
-    /// payload on whatever queue the system delivered it to.
+    /// userInfo keys — a tap routes on the thread id. `nonisolated` because the
+    /// delegate reads the payload on whatever queue the system delivers it to.
     nonisolated static let threadKey = "squelch.thread_id"
     nonisolated static let eventKey = "squelch.event_id"
 
@@ -35,15 +27,14 @@ final class Notifier {
     private init() {}
 
     /// Install the delegate. Call from applicationDidFinishLaunching: a
-    /// notification tapped while Squelch was not running is delivered as soon
-    /// as the delegate exists, and a center without one drops it.
+    /// notification tapped while Squelch was not running is delivered as soon as
+    /// the delegate exists, and a center without one drops it.
     func install() {
         UNUserNotificationCenter.current().delegate = delegate
     }
 
-    /// Ask for the alert/sound grant, once per launch. A denial is not an error
-    /// worth surfacing — `post` below simply becomes a no-op, which is exactly
-    /// what "no thanks" should mean.
+    /// Ask for the alert/sound grant, once per launch. A denial is not worth
+    /// surfacing — `post` simply becomes a no-op.
     func requestAuthorizationIfNeeded() async {
         guard !asked else { return }
         asked = true
@@ -63,46 +54,41 @@ final class Notifier {
     }
 
     static func copy(for event: Event, now: Date = Date()) -> Copy {
-        // "Sarah Chen <sarah@acme.com>" is not a notification title. The app's
-        // own sender parser is the one place that knows how to shorten one.
+        // "Sarah Chen <sarah@acme.com>" is not a notification title.
         let sender = flatten(SenderID.displayName(event.sender), max: 64)
         let summary = flatten(event.one_line, max: 240)
         let due = Fmt.deadlineChip(event.deadline, now: now)?.text ?? ""
 
         let subtitle: String
         switch event.kind {
-        // Urgent is the standing band: past-due or deadline tier. When there is
-        // a real date, SAY the date — "2d PAST DUE" is the entire reason the
-        // banner is worth interrupting for. Otherwise a plain nudge.
+        // Urgent is the standing band. When there is a real date, SAY it —
+        // "2d PAST DUE" is why the banner is worth interrupting for.
         case .urgent: subtitle = due.isEmpty ? "needs attention" : due
         case .deadline: subtitle = due
-        // The ordinary above-the-line case gets no second line. A subtitle on
-        // every notification is a subtitle that means nothing.
+        // No second line for the ordinary case: a subtitle on every
+        // notification is a subtitle that means nothing.
         case .surfaced: subtitle = ""
         }
 
         return Copy(
             title: sender.isEmpty ? "Squelch" : sender,
             subtitle: subtitle,
-            // An empty one_line means triage stored no summary. Say something
+            // An empty one_line means triage stored no summary; say something
             // true rather than posting a blank banner.
             body: summary.isEmpty ? "New mail worth your attention." : summary,
-            // Coalescing key: three events on one thread stack into ONE group
-            // in Notification Center instead of three separate piles. Falls
-            // back to something unique so an empty thread id cannot glue
+            // Coalescing key: events on one thread stack into ONE group. The
+            // fallback must be unique, or an empty thread id would glue
             // unrelated mail together.
             threadIdentifier: event.thread_id.isEmpty
                 ? "squelch.event.\(event.id)" : event.thread_id,
-            // Sound is reserved for the two kinds that are actually time-bound.
-            // A chime for every surfaced email is how a notification stream
-            // gets muted wholesale.
+            // Sound only for the time-bound kinds — a chime per surfaced email
+            // is how a notification stream gets muted wholesale.
             sound: event.kind != .surfaced)
     }
 
-    /// Collapse to one line and cap the length. Notification text is drawn in a
-    /// small fixed box: an embedded newline eats one of the few lines available
-    /// and a 4KB model-written summary is truncated by the system anyway, in
-    /// the middle of a word and without an ellipsis to say so.
+    /// Collapse to one line and cap the length: notification text is a small
+    /// fixed box, and the system's own truncation lands mid-word with no
+    /// ellipsis to say so.
     private static func flatten(_ s: String, max: Int) -> String {
         let flat = s.split(whereSeparator: { $0.isNewline || $0 == "\t" })
             .joined(separator: " ")
@@ -125,7 +111,7 @@ final class Notifier {
 
         // The event id as the REQUEST id makes a re-delivered frame (a replay
         // overlapping the live seam after a reconnect) replace its own banner
-        // instead of stacking a second identical one.
+        // rather than stack a second copy.
         let request = UNNotificationRequest(
             identifier: "squelch.event.\(event.id)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
@@ -134,23 +120,18 @@ final class Notifier {
     // MARK: - delegate behaviour
 
     /// What to do with a notification that arrives while the app is running.
-    ///
-    /// Frontmost app WITH its window up => NO banner. The human is looking at
-    /// Squelch; sliding a card over the sitrep to tell them about a row already
-    /// on that sitrep is the app talking over itself. It still lands in
-    /// Notification Center, so nothing is lost if they were looking at another
-    /// view. The window check matters under residency: "active with zero
-    /// visible windows" (closed the window, app lingers) is a common state, and
-    /// there the banner is the only voice the app has.
+    /// Frontmost WITH a visible window => no banner, only the list: the human is
+    /// already looking at the sitrep the row is on. The window check matters —
+    /// "active with zero visible windows" is a common state under residency, and
+    /// there the banner is the app's only voice.
     nonisolated static func presentation(
         appActive: Bool, windowVisible: Bool
     ) -> UNNotificationPresentationOptions {
         (appActive && windowVisible) ? [.list] : [.banner, .sound, .list]
     }
 
-    /// A tap: front the app, put the window back if it was closed, open the
-    /// thread. Setting `threadId` is all it takes — RootView gates the reader
-    /// on it (see AppStore.openThread).
+    /// A tap: front the app, restore the window if it was closed, open the
+    /// thread.
     func handleTap(threadId: String?) {
         NSApp.activate(ignoringOtherApps: true)
         MainWindow.show()
@@ -159,13 +140,12 @@ final class Notifier {
     }
 }
 
-/// The center's delegate. Retained by `Notifier.shared`; see the note there on
-/// why that matters.
+/// The center's delegate, retained by `Notifier.shared`.
 ///
 /// Deliberately NOT main-actor isolated: these callbacks are protocol
-/// requirements with no isolation of their own, so the class stays nonisolated
-/// and each method hops to the main actor carrying a plain `String?` —
-/// `[AnyHashable: Any]` is not Sendable and must be read on this side.
+/// requirements with no isolation of their own, so each method hops to the main
+/// actor carrying a plain `String?` — `[AnyHashable: Any]` is not Sendable and
+/// must be read on this side.
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, willPresent notification: UNNotification

@@ -1,15 +1,9 @@
-// NEWSLETTERS derivation for the Sitrep dashboard zone. The newsletters zone is
-// the rule-onboarding surface: it surfaces recurring noise-tier senders and — if
-// no rule governs them yet — invites the human to define one.
+// The Sitrep's newsletters zone — recurring noise-tier senders, and the
+// rule-onboarding CTA when no rule governs them yet.
 //
-// QUALIFICATION. Preferred: the pipeline classified at least one of this
-// sender's messages as `marketing` (GET /client/marketing). That is a real
-// classification, not an inference. Legacy fallback (only while NOTHING has
-// been categorized yet): a newsletter-shaped `reason` string, or a recurring
-// robot/brand sender. That fallback stays ONLY as a migration bridge and
-// disappears the moment real data exists.
-//
-// Ported from squelch-desktop/src/lib/newsletters.ts.
+// Qualification prefers a real `marketing` classification (GET
+// /client/marketing). The reason-string / recurring-robot fallback is a
+// migration bridge: it applies ONLY while nothing has been categorized yet.
 
 import Foundation
 
@@ -27,8 +21,8 @@ struct Newsletter: Identifiable, Hashable, Sendable {
     var latest: Double
     /// The latest message's thread — clicking the card opens this email.
     var latestThreadId: String
-    /// The window's aggregated updates, NEWEST FIRST — the viewer's horizontal
-    /// queue (h/l between this sender's emails) and the bulk-done target.
+    /// The window's updates, NEWEST FIRST — the viewer's horizontal queue (h/l
+    /// between this sender's emails) and the bulk-done target.
     var items: [AttentionUpdate]
     /// The rule governing this sender, if any (drives the chip).
     var rule: SenderRule?
@@ -62,8 +56,8 @@ enum Newsletters {
         return d.timeIntervalSince1970
     }
 
-    /// Glob match for a rule's match_pattern ("*@acme.com", "billing@acme.com")
-    /// against a bare address. `*` matches any run; case-insensitive.
+    /// Glob match for a rule's match_pattern ("*@acme.com") against a bare
+    /// address. `*` matches any run; case-insensitive.
     static func ruleMatches(pattern: String, address: String) -> Bool {
         let pat = pattern.trimmingCharacters(in: .whitespaces).lowercased()
         guard !pat.isEmpty else { return false }
@@ -126,10 +120,9 @@ enum Newsletters {
         var order: [String] = []
 
         for u in updates {
-            // EXCLUDE RECEIPTS. The server AUTO-RESOLVES receipt-classified mail
-            // to status='done' at ingest. A done row is a settled record, not
-            // recurring noise to onboard a rule for — so it must never surface
-            // as a "newsletter".
+            // Excludes receipts: the server auto-resolves receipt-classified
+            // mail to status='done' at ingest, and a settled record is not
+            // recurring noise to onboard a rule for.
             if u.status == .done { continue }
             if dateOf(u) < cutoff { continue }
             let address = SenderID.address(u.sender)
@@ -193,9 +186,8 @@ enum Newsletters {
         return "*@\(domain)"
     }
 
-    /// Strip redundant genre labels from a newsletter summary — "Promotional
-    /// email from X:", "Event promotion for …", "Newsletter: …". The section
-    /// already says what these are. Conservative: only recognized leading label
+    /// Strip redundant genre labels ("Promotional email from X:", "Newsletter:
+    /// …") — the section already says what these are. Only recognized leading
     /// shapes are removed; anything else passes through unchanged.
     static func cleanSummary(_ summary: String) -> String {
         var out = summary.trimmingCharacters(in: .whitespaces)

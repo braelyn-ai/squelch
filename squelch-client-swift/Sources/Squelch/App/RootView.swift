@@ -1,18 +1,10 @@
 // App shell. Boots settings from the keychain, shows Connect until connected,
-// then mounts the rail + the routed main view + the side-panel/overlay surfaces.
+// then stacks, bottom to top: rail + routed main view, side panels, the
+// fullscreen thread viewer, the action layer (toasts, compose, palettes).
 //
-// LAYERING (bottom to top), matching the desktop client's z-model exactly:
-//   0. rail + routed main view
-//   1. side panels (browse / search)
-//   2. the fullscreen thread viewer
-//   3. the action layer — toasts, compose, palettes, the code modal
-//
-// The global 1..5 / ⌘[ / ⌘] / ⌘K bindings are registered HERE in the "global"
-// context, so they compose with whatever context is active (list / sitrep /
-// modal / thread) rather than being gated by it — nav must always work, even
-// from inside a modal panel.
-//
-// Ported from squelch-desktop/src/App.tsx.
+// The global 1..5 / ⌘[ / ⌘] / ⌘K bindings register HERE in the "global"
+// context, so they compose with whatever context is active rather than being
+// gated by it — nav must work even from inside a modal panel.
 
 import SwiftUI
 
@@ -32,7 +24,7 @@ struct RootView: View {
         }
         .task {
             // Pay WebKit's process-launch cost at boot rather than on the first
-            // email the reader opens. See EmailWebView.warmProcess.
+            // email the reader opens.
             EmailWebView.warmProcess()
             await store.loadSettings()
         }
@@ -70,17 +62,17 @@ struct MainShell: View {
 
         ZStack(alignment: .topLeading) {
             // EVERYTHING A MODAL SITS ON TOP OF, blurred as one layer while a
-            // modal is up. Blurring the content is what keeps the app VISIBLE
-            // behind ⌘K — layout and colour survive a defocus, where a material
-            // scrim just paints over them.
+            // modal is up. Blurring is what keeps the app visible behind ⌘K:
+            // layout and colour survive a defocus, a material scrim paints
+            // over them.
             ZStack(alignment: .topLeading) {
             HStack(spacing: 0) {
                 SidebarRail(namespace: shellGlass)
                 VStack(spacing: 0) {
                     ConnectionBanner()
-                    // Daemon down with nothing ever loaded: there is no data to
-                    // show, so showing empty bands would LIE. Settings stays
-                    // reachable so the token/URL can be fixed.
+                    // Daemon down with nothing ever loaded: empty bands would
+                    // read as an empty inbox. Settings stays reachable so the
+                    // token/URL can be fixed.
                     if store.daemonDown && store.activeView != .settings {
                         DaemonDownPane()
                     } else {
@@ -98,16 +90,14 @@ struct MainShell: View {
             }
 
             // Email viewer — above the side panels, below the action layer so
-            // compose/undo/palette stay on top. It fills the window EXCEPT for
-            // an open side panel's strip: opening a hit from search must leave
-            // the results you're working through visible beside the email, not
-            // swallow them. Esc closes the reader, a second Esc the panel.
+            // compose/undo/palette stay on top. It fills the window EXCEPT an
+            // open side panel's strip: opening a hit from search must leave the
+            // results visible beside the email. Esc closes the reader, a second
+            // Esc the panel.
             if let threadId = store.threadId {
                 HStack(spacing: 0) {
-                    // THE RAIL STAYS. Reading an email is not leaving the app,
-                    // so the nav you navigate BY should not disappear underneath
-                    // it — the reader insets past the rail instead of covering
-                    // it, and 1..5 stay clickable while you read.
+                    // THE RAIL STAYS: the reader insets past it instead of
+                    // covering it, so 1..5 stay clickable while you read.
                     Color.clear
                         .frame(width: SidebarRail.railWidth)
                         .allowsHitTesting(false)
@@ -121,10 +111,9 @@ struct MainShell: View {
                             .allowsHitTesting(false)
                     }
                 }
-                // NO TRANSITION. Opening an email is a jump, not a dissolve —
-                // a crossfade means every open and close spends a fifth of a
-                // second showing you two surfaces at once, which reads as lag
-                // rather than polish on a surface you enter and leave constantly.
+                // NO TRANSITION. Opening an email is a jump, not a dissolve: a
+                // crossfade shows two surfaces at once on a surface the reader
+                // enters and leaves constantly, which reads as lag.
                 .zIndex(20)
             }
             }
@@ -137,7 +126,7 @@ struct MainShell: View {
         }
         .animation(.easeOut(duration: 0.18), value: store.modalOverlayOpen)
         .animation(.smooth(duration: 0.22), value: store.sideView)
-        // threadId is deliberately NOT animated — see the reader's zIndex block.
+        // threadId is deliberately NOT animated — opening a thread is a jump.
         .keyBindings(.global, globalBindings)
         .onChange(of: store.sitrep.sealed) { _, sealed in
             AuthArrival.shared.observe(sealed: sealed)
@@ -157,10 +146,10 @@ struct MainShell: View {
         }
     }
 
-    /// 1..5 view nav + ⌘[ back / ⌘] forward + ⌘K ask bar. Digits are otherwise
-    /// unbound; the ⌘ chords use the `meta` flag so a bare "[" / "]" never
-    /// triggers them. allowInInput keeps history nav and ⌘K working even with a
-    /// search/compose field focused (they are chords, not typed characters).
+    /// 1..5 view nav + ⌘[ back / ⌘] forward + ⌘K ask bar. The ⌘ chords use the
+    /// `meta` flag so a bare "[" / "]" never triggers them; `allowInInput` keeps
+    /// them working with a search/compose field focused, since a chord is not a
+    /// typed character.
     private var globalBindings: [KeyBinding] {
         var bindings: [KeyBinding] = MainView.mainViews.enumerated().map { index, view in
             KeyBinding("\(index + 1)", "go to \(view.rawValue)") { store.setView(view) }
@@ -173,15 +162,10 @@ struct MainShell: View {
             KeyBinding("k", "ask your inbox", meta: true, allowInInput: true) {
                 store.askBarOpen = true
             })
-        // The help overlay files these under "App", so they belong in the
-        // GLOBAL context rather than only in the inbox list — pressing `?` on
-        // the sitrep should open help, not nothing. Neither collides with any
-        // other binding, and both stay input-guarded (no allowInInput), so
-        // typing "?" into search still types a question mark.
-        // `/` was registered ONLY in the Emails list, so it did nothing on the
-        // surface the app actually LANDS on. Search is a global affordance —
-        // ⌘F already opens it from anywhere — and it stays input-guarded, so
-        // typing "/" into a field still types a slash.
+        // Global, not list-only: `/`, `\` and `?` must work on every surface,
+        // including the sitrep the app lands on. All three stay input-guarded
+        // (no allowInInput), so typing them into a field still types the
+        // character.
         bindings.append(
             KeyBinding("/", "search") { store.openSearch() })
         bindings.append(
@@ -192,14 +176,13 @@ struct MainShell: View {
     }
 }
 
-/// ROUTED VIEW HOST — Auth / Rules / Audit, promoted from side panels to full
-/// main views behind the rail.
+/// Host for the full main views behind the rail: Auth / Rules / Audit.
 ///
 /// These inner views register their list-style keys into the "modal" KeyContext
-/// and never push a context themselves, so this host pushes it while mounted —
-/// exactly like SidePanel does. Only one routed view is mounted at a time, so
-/// there is never a competing "list" set active. The global 1..5 keys keep
-/// firing here because "global" composes with "modal".
+/// and never push a context themselves, so this host pushes it while mounted.
+/// Only one routed view is mounted at a time, so there is never a competing
+/// "list" set active; the global 1..5 keys still fire because "global"
+/// composes with "modal".
 struct RoutedHost<Content: View>: View {
     @Environment(AppStore.self) private var store
     let view: MainView
@@ -216,8 +199,8 @@ struct RoutedHost<Content: View>: View {
     var body: some View {
         Group {
             if view == .auth {
-                // Auth owns its entire surface — its own header band and a
-                // two-column body — so it opts out of the shared chrome.
+                // Auth owns its entire surface (own header band, two-column
+                // body), so it opts out of the shared chrome.
                 content
             } else {
                 VStack(alignment: .leading, spacing: 0) {
@@ -227,9 +210,9 @@ struct RoutedHost<Content: View>: View {
             }
         }
         .keyContext(.modal)
-        // Esc = back to the sitrep (the home surface). Overlays these views open
-        // push their OWN contexts above this one, so their Esc wins while
-        // they're up and this fires only from the bare list.
+        // Esc = back to the sitrep. Overlays these views open push their OWN
+        // contexts above this one, so their Esc wins while they're up and this
+        // fires only from the bare list.
         .keyBindings(.modal, [
             KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
         ])

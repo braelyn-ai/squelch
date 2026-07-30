@@ -1,38 +1,8 @@
-// SITREP VIEW — the fully-abstracted dashboard. THE DEFAULT SURFACE ON LAUNCH.
-//
-// ZERO individual email rows: this is the situation report, not the mailbox.
-//   a. FOR YOUR EYES — the top-10 standing items, ranked by a configurable
-//      blend of urgency (time) + severity (importance). Rows: avatar + sender,
-//      one-line + amount + due date. A quiet "{n} more" expands the full ranked
-//      list in place. Actions: done (d/e), open (Enter), fix triage (v).
-//   b. ATTENTION — aggregate only: "N new since <relative last check>" +
-//      deduped sender chips. Click → Emails.
-//   c. NEWSLETTERS — the rule-onboarding surface.
-//   d. STATUS STRIP — last sync, today's triage cost, rules count.
-//   right rail: CALENDAR · SHIPMENTS · BANKING · RECEIPTS.
-//
-// Minimal keymap in its own "sitrep" KeyContext: j/k move between the VISIBLE
-// ranked rows, d/e mark done, Enter opens fullscreen, v corrects a wrong
-// verdict. The global 1..5 nav works here too.
-//
-// SELECTION MODEL — the same one the inbox uses (owner call, 2026-07-24). There
-// is NO persistent selection: the tinted focus glass renders only while the
-// KEYBOARD is driving, and any mouse hover hides it, paints a cheap wash on the
-// hovered row, and re-anchors the cursor so j/k continue from there. Action keys
-// need kbActive OR a live hover, or nothing is highlighted and `e` quietly
-// resolves row 0.
-//
-// This is also why hover does NOT drag the glass: `selectionGlass` is a
-// conditional modifier, so flipping a row between its two branches re-creates
-// that row's whole subtree (state lost, `.task` re-run). Doing that twice per
-// row you cross made a mouse sweep visibly lag the cursor.
-//
-// GLASS: the whole dashboard is one GlassEffectContainer. That is what makes
-// adjacent zones read as a single sheet of material that parts around them
-// rather than four separate panes — and it is precisely the behavior CSS
-// cannot produce, because backdrop-filter has no notion of neighbors.
-//
-// Ported from squelch-desktop/src/views/SitrepView.tsx.
+// SITREP VIEW — the abstracted dashboard and default surface on launch: ranked
+// standing items, an attention aggregate, newsletters, a status strip and the
+// records rail. Owns the "sitrep" KeyContext. No persistent selection — the
+// focus glass renders only while the keyboard drives, and hover must NOT drag it:
+// `selectionGlass` is conditional, so flipping branches re-creates the subtree.
 
 import SwiftUI
 
@@ -44,11 +14,9 @@ struct SitrepView: View {
     @Environment(Prefs.self) private var prefs
     @Namespace private var zoneGlass
 
-    // For-your-eyes cursor (j/k), over the VISIBLE rows only — the keyboard
-    // never reaches collapsed-away rows.
+    // Cursor over the VISIBLE rows only — collapsed-away rows are unreachable.
     @State private var eyesIndex = 0
-    /// True only while the KEYBOARD is driving the cursor — see the selection
-    /// model note in the header.
+    /// True only while the keyboard is driving the cursor.
     @State private var eyesKbActive = false
     /// True only while the cursor is actually over a row.
     @State private var eyesHovering = false
@@ -57,9 +25,8 @@ struct SitrepView: View {
     /// window done, deferring to the For-your-eyes handler when nothing hovers.
     @State private var hoveredNewsletter: String?
 
-    /// Zone data lives in the STORE, not here — see SitrepZoneCache. Held in
-    /// `@State` it was thrown away every time you navigated off the dashboard,
-    /// so coming back showed empty cards until five round-trips landed.
+    /// Zone data lives in the STORE, not in `@State`: `@State` is discarded on
+    /// navigate-away, so a revisit would show empty cards until refetch.
     private var rulesCount: Int? { store.zones.rulesCount }
 
     private var ranked: [AttentionUpdate] {
@@ -75,12 +42,10 @@ struct SitrepView: View {
 
         return VStack(spacing: 0) {
             masthead
-            // ONE scroll surface for the dashboard. The GlassEffectContainers
-            // live INSIDE, one per column: a container sizes itself to what it
-            // is offered, so wrapping the entire scrollable body in one gave
-            // the ScrollView a content height it could not scroll. Per-column
-            // containers are also where merging actually reads — glass merging
-            // across a whole scrolling page is not a thing anyone can perceive.
+            // GlassEffectContainers live INSIDE this scroll view, one per
+            // column: a container sizes itself to what it is offered, so
+            // wrapping the whole scrollable body in one leaves the ScrollView
+            // with a content height it cannot scroll.
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 18) {
                     DashHero(standing: store.sitrep.standing)
@@ -114,15 +79,12 @@ struct SitrepView: View {
         }
         .keyContext(.sitrep)
         .keyBindings(.sitrep, bindings)
-        // Renders from whatever the store already holds, then refreshes
-        // underneath — the rows on screen are never cleared first, so a revisit
-        // paints instantly and updates in place. Hero art is warmed by the same
-        // pass (see AppStore.refreshZones).
+        // Refreshes underneath what is already on screen — rows are never
+        // cleared first, so a revisit paints instantly and updates in place.
         .task { await store.refreshZones() }
-        // PRELOAD every For-your-eyes email so opening one is instant. The
-        // visible top-10 warm immediately; the collapsed remainder trickles so a
-        // long list never stampedes the daemon. Prefetch dedupes in-flight and
-        // fresh entries, so re-runs on re-rank or the 10s poll are near-free.
+        // Warm the visible top-10 immediately and trickle the collapsed
+        // remainder, so a long list never stampedes the daemon. Prefetch dedupes
+        // in-flight and fresh entries, so re-runs are near-free.
         .onChange(of: ranked.map(\.thread_id)) { _, ids in
             ThreadPrefetch.shared.warm(ids, immediate: eyesVisible, spacing: .milliseconds(150))
         }
@@ -222,9 +184,8 @@ struct SitrepView: View {
                     .padding(.top, 6)
                 }
             }
-            // Leaving the zone entirely ends the hover; moving BETWEEN rows keeps
-            // it (the phase stays .active), so a sweep never flickers actionable
-            // off and on.
+            // Only leaving the zone ends the hover; moving BETWEEN rows keeps the
+            // phase .active, so a sweep never flickers actionable off and on.
             .onContinuousHover { phase in
                 if case .ended = phase { eyesHovering = false }
             }
@@ -279,9 +240,8 @@ struct SitrepView: View {
                 guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
                 Task { await Actions.done(u) }
             },
-            // `e` first tries the hovered newsletter card (bulk-resolve that
-            // sender's window); with nothing hovered it DECLINES and the
-            // for-your-eyes done handler below runs instead.
+            // `e` first tries the hovered newsletter card; with nothing hovered
+            // it DECLINES so the for-your-eyes done handler runs instead.
             KeyBinding(declining: "e", "mark done") {
                 if let addr = hoveredNewsletter,
                     let nl = store.zones.newsletters.first(where: { $0.address == addr })
@@ -297,10 +257,6 @@ struct SitrepView: View {
                 guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
                 store.openThread(u.thread_id)
             },
-            // `v` used to be a second way to open the email, which Enter already
-            // does. Repurposed for the triage-fix palette: this is the surface
-            // where a wrong verdict is most visible, so it is where correcting
-            // it should be cheapest.
             KeyBinding("v", "fix triage") {
                 guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
                 store.openTriageFix(
@@ -325,8 +281,8 @@ struct SitrepView: View {
             for item in nl.items {
                 try await APIClient.shared.setStatus(item.id, .done)
                 // Unpin as each one lands, not at the end: a throw partway
-                // through still leaves the resolved ones correctly released.
-                // No undo on this path, so nothing re-pins.
+                // through still leaves the resolved ones released. No undo on
+                // this path, so nothing re-pins.
                 await ImageStore.shared.release(messageId: item.id)
             }
             store.pushToast(
@@ -338,11 +294,9 @@ struct SitrepView: View {
 
 }
 
-/// The masthead's freshness stamp, isolated in its own view ON PURPOSE.
-///
-/// `lastRefresh` changes on every 10s poll. Read inline in the dashboard's body
-/// it would invalidate the ENTIRE sitrep — hero, zones, rows, rails — six times
-/// a minute. Scoped here, a poll re-renders one line of text.
+/// The masthead's freshness stamp, isolated ON PURPOSE: `lastRefresh` changes on
+/// every 10s poll, so read inline in the dashboard body it would invalidate the
+/// entire sitrep. Scoped here, a poll re-renders one line of text.
 private struct SyncLabel: View {
     @Environment(AppStore.self) private var store
 
@@ -361,10 +315,9 @@ private struct SyncLabel: View {
 
 // MARK: - DASH HERO
 
-/// The editorial centerpiece: a tiny greeting label with the human's name, and
-/// a big Newsreader-serif headline stating what needs them today. This is the
-/// ONE place the display serif appears — keeping it to a single line per screen
-/// is what makes it read as voice rather than decoration.
+/// A greeting label plus one serif headline stating what needs the reader today.
+/// The ONE place the display serif appears — held to a single line per screen so
+/// it reads as voice rather than decoration.
 private struct DashHero: View {
     @Environment(Prefs.self) private var prefs
     let standing: [AttentionUpdate]
@@ -373,9 +326,8 @@ private struct DashHero: View {
         "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
     ]
 
-    /// Spell small counts ("Two obligations…") — a numeral in a display serif
-    /// headline reads like a dashboard metric, which is the opposite of the
-    /// intent.
+    /// Spell small counts — a numeral in a display serif headline reads like a
+    /// dashboard metric, which is the opposite of the intent.
     private static func spell(_ n: Int) -> String {
         (0..<smallWords.count).contains(n) ? smallWords[n] : String(n)
     }
@@ -428,22 +380,20 @@ private struct ObligationRow: View {
     let onHover: () -> Void
     let onOpen: () -> Void
 
-    /// Drives the cheap hover wash. Kept LOCAL on purpose: it is the row's own
-    /// feedback, so it never depends on the dashboard re-rendering.
+    /// Drives the hover wash. LOCAL on purpose: the row's own feedback never
+    /// depends on the dashboard re-rendering.
     @State private var hovering = false
 
-    /// Best-effort money amount pulled from an update's one_line ("$142.00").
-    /// Scanned by hand rather than by regex, and memoized: this is evaluated for
-    /// every visible row on every render, and Swift `Regex` is far too slow to
-    /// sit in that path.
+    /// Best-effort money amount from an update's one_line ("$142.00"). Hand-
+    /// scanned and memoized rather than regex: this runs for every visible row
+    /// on every render, and Swift `Regex` is far too slow for that path.
     private var amount: String? { MoneyScan.amount(in: update.one_line) }
 
     var body: some View {
         let chip = Fmt.deadlineChip(update.deadline)
         let overdue = chip?.overdue ?? false
 
-        // Click anywhere on the row opens the email; done is keyboard-only
-        // (e/d), same as the inbox — no per-row checkmark button.
+        // Click anywhere on the row opens the email; done is keyboard-only (e/d).
         Button(action: onOpen) {
             HStack(spacing: 9) {
                 Avatar(sender: update.sender, size: 22)
@@ -490,10 +440,9 @@ private struct ObligationRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // The KEYBOARD-focused row is glass, tinted by urgency — overdue items
-        // carry the danger tint IN the material rather than as a flat wash on top
-        // of it. A hovered row gets the wash instead: same branch as a plain row,
-        // so sweeping the mouse only recolors a fill.
+        // The KEYBOARD-focused row is glass tinted by urgency; a hovered row gets
+        // a wash on the SAME branch as a plain row, so a mouse sweep only
+        // recolors a fill instead of rebuilding the row.
         .selectionGlass(
             focused, hovering: hovering, tint: overdue ? Palette.danger : Palette.accent,
             id: "eyes-selection", in: glassNamespace)
@@ -517,7 +466,7 @@ private struct ObligationRow: View {
 private struct SenderChips: View {
     let items: [AttentionUpdate]
 
-    /// Dedupe by sender, keep first occurrence; cap so the zone stays glanceable.
+    /// Dedupe by sender, keeping the first occurrence.
     private var chips: [AttentionUpdate] {
         var seen = Set<String>()
         var out: [AttentionUpdate] = []
@@ -544,9 +493,8 @@ private struct SenderChips: View {
                 }
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
-                // A plain capsule, NOT glass: this row can hold a dozen chips,
-                // and a dozen live glass passes costs real frames while reading
-                // no better than a tinted pill at this size.
+                // A plain capsule, NOT glass: a dozen live glass passes costs
+                // real frames and reads no better than a tinted pill this size.
                 .background(Capsule().fill(Palette.hairline.opacity(0.7)))
                 .help(u.sender)
             }
@@ -621,10 +569,7 @@ private struct StatusStrip: View {
         .padding(.top, 2)
     }
 
-    /// "synced 4m ago" / "synced just now". The desktop build concatenated
-    /// unconditionally and produced the nonsense "synced now ago" whenever the
-    /// age token was "now"; the masthead already phrased it correctly, so this
-    /// matches the masthead rather than reproducing the typo.
+    /// "synced 4m ago" / "synced just now" — never the nonsense "synced now ago".
     private var syncedLabel: String {
         let iso = store.lastRefresh.map { ISO8601DateFormatter().string(from: $0) }
         let age = Fmt.relAge(iso ?? store.sitrep.stats?.last_surfaced_at)
@@ -634,7 +579,7 @@ private struct StatusStrip: View {
 
 // MARK: - dev re-triage button
 
-/// DEV-MODE re-triage. Renders nothing unless the developerMode pref is on.
+/// DEV-MODE re-triage: renders nothing unless the developerMode pref is on.
 /// Fires POST /client/retriage for the trailing 7 days and toasts the count.
 struct RetriageButton: View {
     @Environment(AppStore.self) private var store
@@ -667,9 +612,8 @@ struct RetriageButton: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
             }
-            // Text-only, like every other action in the masthead: an outlined
-            // pill for a DEV control put the loudest shape on the page around
-            // the one button most readers never use.
+            // Text-only: an outlined pill would put the loudest shape on the
+            // page around a dev control most readers never use.
             .buttonStyle(.textAction)
             .disabled(busy)
             .help(
@@ -682,8 +626,7 @@ struct RetriageButton: View {
 // MARK: - small helpers
 
 extension Array {
-    /// Bounds-checked read — the ported code indexes cursors constantly and a
-    /// clamped-but-stale index must never trap.
+    /// Bounds-checked read: a clamped-but-stale cursor index must never trap.
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
     }

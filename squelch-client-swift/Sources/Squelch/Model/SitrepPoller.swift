@@ -1,12 +1,8 @@
-// Polling that keeps the sitrep read model fresh: fetches the three bands +
-// stats + sealed metadata every 10s and on window focus. Writes results into
-// the store; views just read store.sitrep.
+// Keeps the sitrep read model fresh: the three bands + stats + sealed metadata,
+// every 10s and on window focus, written into the store for views to read.
 //
-// Each band is fetched with its own server-side `band` filter so the buckets
-// match the server's definitions exactly. Sealed is metadata-only (never
-// bodies here).
-//
-// Ported from squelch-desktop/src/state/useSitrep.ts.
+// Each band carries its own server-side `band` filter so the buckets match the
+// server's definitions exactly. Sealed is metadata-only — never bodies.
 
 import AppKit
 import Foundation
@@ -18,11 +14,10 @@ final class SitrepPoller {
     private static let pollInterval: Duration = .seconds(10)
     private static let pageLimit = 200
 
-    /// The in-flight pull, shared by the interval poller AND every manual
-    /// caller, so a poke never races an overlapping scheduled pull. Held as the
-    /// TASK rather than a flag so an overlapping caller can JOIN it: a caller
-    /// that skips has no idea whether the answer on screen is older than what it
-    /// asked about.
+    /// The in-flight pull, shared by the interval poller and every manual
+    /// caller. Held as the TASK rather than a flag so an overlapping caller can
+    /// JOIN it — a caller that merely skips cannot know whether what is on
+    /// screen predates what it asked about.
     private var inFlight: Task<Void, Never>?
     private var task: Task<Void, Never>?
     private var focusObserver: NSObjectProtocol?
@@ -54,9 +49,9 @@ final class SitrepPoller {
         focusObserver = nil
     }
 
-    /// Fetch the sitrep read model once and write it into the store. Joins a
-    /// pull already in flight rather than stacking a second one; no-ops if the
-    /// door isn't connected.
+    /// Fetch the read model once and write it into the store. Joins a pull
+    /// already in flight rather than stacking a second; no-ops when the door is
+    /// not connected.
     func pull() async {
         if let inFlight {
             await inFlight.value
@@ -69,15 +64,12 @@ final class SitrepPoller {
         if inFlight == task { inFlight = nil }
     }
 
-    /// Re-read every surface a triage correction can move mail BETWEEN, NOW. The
-    /// bands are otherwise up to a poll behind and the zones up to a TTL behind,
-    /// which is minutes — long enough that the mail looks like it never moved.
+    /// Re-read every surface a triage correction can move mail between, NOW —
+    /// bands are otherwise a poll behind and zones a TTL behind, long enough
+    /// that the mail looks like it never moved.
     ///
-    /// JOIN THEN PULL, rather than pull: a poll already running may have read
-    /// the daemon before the correction committed, so its rows are allowed to be
-    /// stale and cannot be the ones we settle on. The two halves then run
-    /// together, and `pull`'s own trailing zone refresh joins the forced pass
-    /// below instead of costing a second round of five requests.
+    /// JOIN THEN PULL: a poll already running may have read the daemon before
+    /// the correction committed, so its rows cannot be the ones we settle on.
     func refreshAfterCorrection() async {
         if let inFlight { await inFlight.value }
         async let bands: Void = pull()
@@ -99,15 +91,14 @@ final class SitrepPoller {
             let (s, f, o, st, sl) = try await (standing, fresh, open, stats, sealed)
             let next = SitrepData(
                 standing: s.items, new: f.items, open: o.items, stats: st, sealed: sl)
-            // ASSIGN ONLY ON CHANGE. @Observable notifies on assignment, not on
+            // ASSIGN ONLY ON CHANGE: @Observable notifies on assignment, not on
             // value difference, so writing an identical read model every 10s
-            // invalidated every view reading it and re-laid out the whole
-            // dashboard — for nothing. Most polls return identical data.
+            // re-lays out the whole dashboard for nothing.
             if next != store.sitrep { store.sitrep = next }
             if store.refreshError != nil { store.refreshError = nil }
             store.lastRefresh = Date()
             // The bands half of the launch image warm's input; refreshZones
-            // below supplies the other half.
+            // below supplies the rest.
             ImageWarmer.shared.noteSitrepLanded()
 
             // Keep a valid selection: if nothing selected, land on the first row.
@@ -115,15 +106,13 @@ final class SitrepPoller {
                 store.selectedId = first
             }
 
-            // Keep the dashboard's ZONES warm from here too, not just from the
-            // view. The bands above are only half the sitrep; if the zones only
-            // loaded when SitrepView mounted, the FIRST visit of a session still
-            // paid for five round-trips. Its own TTL makes this a no-op most
-            // polls (see AppStore.refreshZones), so the cost is one date compare.
+            // Zones warm from here, not just from SitrepView's mount, or the
+            // first visit of a session still pays five round-trips. Its own TTL
+            // makes this a date compare on most polls.
             await store.refreshZones()
         } catch {
             // Keep the kind so the UI can say "daemon unreachable" vs "token
-            // rejected" instead of one undifferentiated failure.
+            // rejected" rather than one undifferentiated failure.
             if let api = error as? APIError {
                 store.refreshError = RefreshError(message: api.message, kind: api.kind)
             } else {
@@ -132,11 +121,10 @@ final class SitrepPoller {
         }
     }
 
-    /// MANUAL refresh: poke the daemon to poll Gmail NOW, then re-pull the read
-    /// model so freshly-ingested mail shows without waiting out the ~45s server
-    /// poll or the 10s client poll. The server poke is fire-and-forget, so we
-    /// pull once right after the rows are likely landed and once more a beat
-    /// later to catch a slower Gmail round trip.
+    /// Manual refresh: poke the daemon to poll Gmail now, then re-pull so fresh
+    /// mail shows without waiting out the ~45s server or 10s client poll. The
+    /// poke is fire-and-forget, hence two pulls — one when rows have likely
+    /// landed, one a beat later for a slower Gmail round trip.
     func triggerMailRefresh() async {
         guard store.connStatus == .connected else { return }
         // Poke failure is non-fatal — pullSitrep surfaces its own error.

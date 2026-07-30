@@ -1,15 +1,9 @@
-// RANKING — the pure scorer for the Sitrep "For your eyes" zone.
+// The pure scorer for the Sitrep "For your eyes" zone — a configurable blend of
+// urgency (how soon it's due) and severity (how important it is):
 //
-// A standing item is scored by a configurable blend of URGENCY (how soon it's
-// due) and SEVERITY (how important it is):
-//
-//   urgency(u)  = 1.0                      if overdue (deadline in the past)
-//               = 1 / (1 + daysUntilDue/7) if it has a future deadline
-//               = 0                        if it has no deadline
-//   severity(u) = importance / 100         (clamped to 0..1)
-//   score       = w * urgency + (1 - w) * severity     // w = rankWeight
-//
-// Ported from squelch-desktop/src/lib/ranking.ts.
+//   urgency  = 1 if overdue | 1 / (1 + daysUntilDue/7) | 0 with no deadline
+//   severity = importance / 100, clamped to 0..1
+//   score    = w * urgency + (1 - w) * severity,  w = rankWeight
 
 import Foundation
 
@@ -22,8 +16,8 @@ private func clamp01(_ n: Double) -> Double {
 }
 
 enum Ranking {
-    /// Urgency in 0..1. Overdue pins to 1.0; a future deadline decays with
-    /// distance (half-life-ish at a week); no/invalid deadline is 0.
+    /// Urgency in 0..1: overdue pins to 1, a future deadline decays with
+    /// distance (half-life-ish at a week), no/invalid deadline is 0.
     static func urgency(_ item: AttentionUpdate, now: Date = Date()) -> Double {
         guard let t = Fmt.date(item.deadline) else { return 0 }
         if t <= now { return 1 }
@@ -44,8 +38,8 @@ enum Ranking {
         return w * urgency(item, now: now) + (1 - w) * severity(item)
     }
 
-    /// A NEW array sorted by descending score. Stable: equal scores keep their
-    /// original relative order so a re-render never reshuffles ties.
+    /// Sorted by descending score. STABLE — equal scores keep their original
+    /// order, so a re-render never reshuffles ties.
     static func rank(
         _ items: [AttentionUpdate], weight: Double = defaultRankWeight, now: Date = Date()
     ) -> [AttentionUpdate] {
