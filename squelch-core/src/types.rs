@@ -472,6 +472,69 @@ pub struct AuditEntry {
     pub target_subject: Option<String>,
 }
 
+/// Why a notification-worthy event was emitted. Precedence when classifying a
+/// verdict is `Urgent` > `Deadline` > `Surfaced` (see
+/// [`crate::triage::events::worthy_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// Tier is `past_due`/`deadline` — the standing band, immune to thresholds.
+    Urgent,
+    /// A deadline was detected on a message that is not itself urgent-tier.
+    Deadline,
+    /// Importance landed at or above the notify threshold (above the line).
+    Surfaced,
+}
+
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::Urgent => "urgent",
+            EventKind::Deadline => "deadline",
+            EventKind::Surfaced => "surfaced",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<EventKind> {
+        match s {
+            "urgent" => Some(EventKind::Urgent),
+            "deadline" => Some(EventKind::Deadline),
+            "surfaced" => Some(EventKind::Surfaced),
+            _ => None,
+        }
+    }
+}
+
+/// One durable notification event: the monotonic `events` log the delivery
+/// adapters read (SSE for the resident Mac app, the APNs pusher for iOS).
+///
+/// Every field is a DENORMALIZED SNAPSHOT taken at emission time, on purpose: a
+/// client must be able to render the whole notification from this row alone
+/// (the iOS Notification Service Extension fetches exactly one of these by id
+/// after an opaque push, and has no second round-trip to spend).
+///
+/// SEALED MAIL CAN NEVER BE REPRESENTED HERE. The emission decision
+/// ([`crate::triage::events::worthy_kind`]) requires `Sensitivity::Normal`, and
+/// sealed rows are structurally noise-tier/importance-0 with no Stage-1 pass, so
+/// there are two independent reasons no sealed message ever reaches this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    /// Monotonic id — also the per-channel cursor clients page with (`after`).
+    pub id: i64,
+    pub kind: EventKind,
+    pub message_id: i64,
+    pub thread_id: String,
+    pub tier: Tier,
+    pub importance: u8,
+    pub sender: String,
+    pub one_line: String,
+    /// The snapshotted deadline as stored RFC3339 text, or `None`. Passed
+    /// through verbatim — it is display copy for a notification, never something
+    /// the delivery path computes with.
+    pub deadline: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Per-tier / sealed / sync summary counts. Human-door-facing (squelch-api).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreStats {

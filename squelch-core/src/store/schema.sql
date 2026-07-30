@@ -556,3 +556,48 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_account_ts ON audit_log(account_id, ts);
+
+-- NOTIFICATION EVENT LOG. The single source of truth for "something worth
+-- interrupting the user happened", written by the SYNC ENGINE at each triage
+-- verdict (never by the store write methods themselves — only the engine knows
+-- which path it is on, and only the engine knows the mail is fresh). Read by
+-- per-platform delivery adapters, each tracking its OWN monotonic cursor:
+-- `GET /client/events` SSE for the resident macOS app, an APNs pusher for iOS.
+-- Per-channel cursors, deliberately NOT a global 'delivered' flag — a
+-- single-consumer assumption is what would make the second client a refactor.
+--
+-- Every column besides the ids is a DENORMALIZED SNAPSHOT at emission time so a
+-- client can render the notification from this row alone (the iOS Notification
+-- Service Extension fetches exactly one row by id after an opaque push and has
+-- no second round-trip to spend). Nothing here is recomputed on read.
+--
+-- ONE EVENT PER MESSAGE, EVER: UNIQUE(message_id) plus INSERT OR IGNORE at the
+-- writer. That is what makes re-ingest (history overlap, catch-up re-scan of the
+-- whole backfill window) and the Stage-1/Stage-2 refine passes idempotent — a
+-- message that already notified can never notify twice, whatever later verdicts
+-- say. The storm guard proper is the freshness window in the emission decision
+-- (see `triage::events`); this key is the belt to its suspenders.
+--
+-- SECURITY: sealed mail is never represented here. The emission decision
+-- requires sensitivity='normal', and sealed rows are structurally
+-- noise-tier/importance-0 with no Stage-1 pass — two independent reasons. An OTP
+-- on a lock screen would undo the entire seal design, so this is load-bearing.
+-- A human sealing a message AFTER it notified is the third: `correct_triage`
+-- DELETEs the row, because a snapshot taken pre-seal would otherwise be replayed
+-- to every client cursor forever.
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY,   -- monotonic; the clients' cursor
+    account_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL UNIQUE,
+    thread_id   TEXT NOT NULL,
+    kind        TEXT NOT NULL,         -- urgent | deadline | surfaced
+    tier        TEXT NOT NULL,
+    importance  INTEGER NOT NULL,
+    sender      TEXT NOT NULL,
+    one_line    TEXT NOT NULL,
+    deadline    TEXT,                  -- RFC3339 snapshot, or NULL
+    created_at  TEXT NOT NULL
+);
+
+-- The read pattern is exactly "rows after my cursor, for my account".
+CREATE INDEX IF NOT EXISTS idx_events_account_id ON events(account_id, id);

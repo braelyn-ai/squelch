@@ -14,15 +14,16 @@ use crate::error::{CoreError, Result};
 use crate::store::{
     TriageDebug,
     AttachmentBytes, BankingApplied, ExtractQueued, MarketingApplied, MarketingOffer,
-    MessageUnsub, MissingVector, NewAuditEntry,
+    MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
     SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity, ShredCandidate,
-    StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, Update, UnsubscribeRecord,
+    Event, EventKind, NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity,
+    ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, Update,
+    UnsubscribeRecord,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -74,6 +75,17 @@ pub struct SqliteStore {
     /// the model has finished downloading. `RwLock` keeps concurrent readers
     /// (every search) cheap; the single background write is rare.
     embedder: RwLock<Option<std::sync::Arc<dyn crate::embed::Embedder>>>,
+    /// In-process wake signal for newly-appended `events` rows: every successful
+    /// [`Store::append_event`] best-effort sends the new id here. `None` until a
+    /// consumer attaches one via [`SqliteStore::attach_event_notifier`] — the
+    /// same runtime-attach shape as `embedder`, for the same reason (the store is
+    /// already behind an `Arc` by the time the SSE endpoint exists).
+    ///
+    /// THE PAYLOAD IS ONLY A HINT. The `events` TABLE is the source of truth: a
+    /// reader wakes on any id and then re-reads every row past its own cursor, so
+    /// a lagged, dropped, or entirely missed broadcast message costs nothing but
+    /// latency. That is why send errors here are ignored.
+    event_tx: RwLock<Option<tokio::sync::broadcast::Sender<i64>>>,
 }
 
 impl SqliteStore {
@@ -101,6 +113,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Mutex::new(conn),
             embedder: RwLock::new(None),
+            event_tx: RwLock::new(None),
         })
     }
 
@@ -148,6 +161,32 @@ impl SqliteStore {
             .read()
             .ok()
             .and_then(|g| g.clone())
+    }
+
+    /// Attach (or replace) the in-process broadcast every successful
+    /// [`Store::append_event`] pokes with the new event id, while the store may
+    /// ALREADY be shared behind an `Arc` (`&self`, not `self`) — the same
+    /// runtime-attach hook as [`SqliteStore::attach_embedder`], for the same
+    /// reason: the SSE endpoint is wired up after the store exists. Returns the
+    /// previous sender, if any.
+    ///
+    /// Attaching one is OPTIONAL and changes no persisted behavior: the `events`
+    /// table is the source of truth and readers re-read past their own cursor on
+    /// every wake, so a consumer that never attaches simply polls instead.
+    pub fn attach_event_notifier(
+        &self,
+        tx: tokio::sync::broadcast::Sender<i64>,
+    ) -> Result<Option<tokio::sync::broadcast::Sender<i64>>> {
+        let mut guard = self
+            .event_tx
+            .write()
+            .map_err(|_| CoreError::Other(anyhow::anyhow!("event notifier lock poisoned")))?;
+        Ok(guard.replace(tx))
+    }
+
+    /// The attached event notifier, if any. Cheap clone of the sender.
+    pub fn event_notifier(&self) -> Option<tokio::sync::broadcast::Sender<i64>> {
+        self.event_tx.read().ok().and_then(|g| g.clone())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -1273,6 +1312,64 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| CoreError::InvalidInput(format!("bad datetime {s:?}: {e}")))
 }
 
+/// Validate a sender-rule write (shared by set/set-audited/update). A FILTERED
+/// rule with an empty `want_text` is a contradiction: "filter everything from
+/// this sender except <nothing>". Stage-2 would have no instruction to evaluate
+/// (`stage2_queue` maps empty `want_text` to `None`), so the rule silently
+/// degrades to a no-instruction row while still reading as a rule in the UI.
+/// Reject it at write time instead — every door (client, agent) lands here.
+fn validate_sender_rule(want_text: &str, disposition: Disposition) -> Result<()> {
+    if disposition == Disposition::Filtered && want_text.trim().is_empty() {
+        return Err(CoreError::InvalidInput(
+            "a filtered rule requires a non-empty want_text (what SHOULD get through)".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ---- `events` row mapping (shared by events_after / event_by_id) -----------
+
+/// One raw `events` row, columns in SELECT order. Split from [`finish_event`]
+/// because the rusqlite mapper cannot fail with a [`CoreError`]: the mapper
+/// pulls the primitives, the parse of the two text timestamps happens after.
+type EventRow = (i64, i64, String, String, String, i64, String, String, Option<String>, String);
+
+fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+    ))
+}
+
+/// Turn a raw [`EventRow`] into an [`Event`]. An unparseable `kind`/`tier` falls
+/// back to the least-alarming value rather than erroring — a stored row is
+/// already a fact, and refusing to serve it would silently stall a client's
+/// cursor at the bad row forever.
+fn finish_event(row: EventRow) -> Result<Event> {
+    let (id, message_id, thread_id, kind, tier, importance, sender, one_line, deadline, created_at) =
+        row;
+    Ok(Event {
+        id,
+        kind: EventKind::parse(&kind).unwrap_or(EventKind::Surfaced),
+        message_id,
+        thread_id,
+        tier: Tier::parse(&tier).unwrap_or(Tier::Noise),
+        importance: importance.clamp(0, 255) as u8,
+        sender,
+        one_line,
+        deadline,
+        created_at: parse_dt(&created_at)?,
+    })
+}
+
 // ---- LLM usage ledger helpers (shared by the stage-1 and stage-2 categories) --
 
 /// Bump the `stage2_usage` ledger for `(account, day, category)`: +1 call and add
@@ -2213,6 +2310,7 @@ impl Store for SqliteStore {
         want_text: &str,
         disposition: Disposition,
     ) -> Result<i64> {
+        validate_sender_rule(want_text, disposition)?;
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO sender_rules(account_id, match_pattern, want_text, disposition, updated_at)
@@ -2244,6 +2342,7 @@ impl Store for SqliteStore {
         disposition: Disposition,
         audit: &NewAuditEntry,
     ) -> Result<i64> {
+        validate_sender_rule(want_text, disposition)?;
         // FAIL-CLOSED: the rule write and its audit row share ONE transaction. If
         // the audit INSERT errors, `?` bails before commit and the tx is rolled
         // back on drop — so the agent-door rule write never lands untraced.
@@ -2292,6 +2391,7 @@ impl Store for SqliteStore {
         want_text: &str,
         disposition: Disposition,
     ) -> Result<bool> {
+        validate_sender_rule(want_text, disposition)?;
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE sender_rules SET
@@ -3033,6 +3133,95 @@ impl Store for SqliteStore {
         Ok(conn.last_insert_rowid())
     }
 
+    fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>> {
+        let inserted = {
+            let conn = self.lock()?;
+            // INSERT OR IGNORE on UNIQUE(message_id): one event per message ever.
+            // A no-op insert reports 0 changed rows, which is how a re-ingest or a
+            // second (refined) verdict for the same message stays silent.
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO events(account_id, message_id, thread_id, kind, tier,
+                     importance, sender, one_line, deadline, created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    ev.account_id,
+                    ev.message_id,
+                    ev.thread_id,
+                    ev.kind.as_str(),
+                    ev.tier.as_str(),
+                    ev.importance as i64,
+                    ev.sender,
+                    ev.one_line,
+                    ev.deadline,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            conn.last_insert_rowid()
+        };
+        // Poke the in-process broadcast AFTER dropping the connection lock. The
+        // payload is only a hint (readers re-read past their own cursor), so a
+        // send error — which here means nobody is listening — is not a failure.
+        if let Some(tx) = self.event_notifier() {
+            let _ = tx.send(inserted);
+        }
+        Ok(Some(inserted))
+    }
+
+    fn events_after(
+        &self,
+        account_id: AccountId,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
+                    deadline, created_at
+             FROM events
+             WHERE account_id = ?1 AND id > ?2
+             ORDER BY id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, after_id, limit as i64], map_event)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(finish_event(row?)?);
+        }
+        Ok(out)
+    }
+
+    fn event_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<Event>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
+                        deadline, created_at
+                 FROM events
+                 WHERE account_id = ?1 AND id = ?2",
+                params![account_id, id],
+                map_event,
+            )
+            .optional()?;
+        match row {
+            Some(r) => Ok(Some(finish_event(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn latest_event_id(&self, account_id: AccountId) -> Result<i64> {
+        let conn = self.lock()?;
+        // COALESCE, so an account with no events reports the 0 cursor.
+        let id: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE account_id = ?1",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
     fn triage_debug(
         &self,
         account_id: AccountId,
@@ -3325,6 +3514,19 @@ impl Store for SqliteStore {
             )?;
             tx.execute(
                 "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            // And the NOTIFICATION EVENT, if this message already emitted one.
+            // An `events` row is a denormalized snapshot — sender + one_line,
+            // captured pre-seal — that every client cursor replays forever,
+            // including an iOS notification-service extension putting it on a
+            // lock screen. Sealing must retract that: the seal invariant says
+            // sealed content never reaches a notification surface, and it is not
+            // upheld by refusing to emit ONE event if the row already emitted is
+            // served indefinitely. No path re-emits it either — `worthy_kind`
+            // refuses non-normal sensitivity and the row is now human-stamped.
+            tx.execute(
+                "DELETE FROM events WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
         }
@@ -3713,7 +3915,7 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    fn stage1_apply(&self, applied: &Stage1Applied) -> Result<()> {
+    fn stage1_apply(&self, applied: &Stage1Applied) -> Result<bool> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
@@ -3725,7 +3927,7 @@ impl Store for SqliteStore {
         // Overwrite the heuristic seed values, stamp stage1_model_used (leaving
         // the Stage-1 queue), and set the escalation flag. `model_used` (the
         // Stage-2 marker) is left untouched. Guarded by sensitivity='normal'.
-        tx.execute(
+        let n = tx.execute(
             "UPDATE triage SET
                  importance = ?3,
                  tier = ?4,
@@ -3751,30 +3953,36 @@ impl Store for SqliteStore {
                 applied.category,
             ],
         )?;
-        // (Re)write the deadlines row idempotently.
-        tx.execute(
-            "DELETE FROM deadlines WHERE message_id=?1",
-            params![applied.message_id],
-        )?;
-        if let Some(d) = &applied.deadline {
+        // TOCTOU: the row can be sealed BY HAND between the queue SELECT and this
+        // apply. When the guard matched nothing, the verdict did NOT land — skip
+        // the deadlines rewrite too (a sealed message must not grow a fresh
+        // deadline row) and report `false` so the caller emits no event.
+        if n > 0 {
+            // (Re)write the deadlines row idempotently.
             tx.execute(
-                "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
-                     due_at, past_due, source)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    applied.account_id,
-                    applied.message_id,
-                    d.kind,
-                    d.amount,
-                    d.currency,
-                    d.due_at.to_rfc3339(),
-                    d.past_due as i64,
-                    d.source,
-                ],
+                "DELETE FROM deadlines WHERE message_id=?1",
+                params![applied.message_id],
             )?;
+            if let Some(d) = &applied.deadline {
+                tx.execute(
+                    "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
+                         due_at, past_due, source)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        applied.account_id,
+                        applied.message_id,
+                        d.kind,
+                        d.amount,
+                        d.currency,
+                        d.due_at.to_rfc3339(),
+                        d.past_due as i64,
+                        d.source,
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
-        Ok(())
+        Ok(n > 0)
     }
 
     fn stage1_mark_processed(
@@ -3929,7 +4137,7 @@ impl Store for SqliteStore {
         Ok(n.max(0) as u32)
     }
 
-    fn stage2_apply(&self, applied: &Stage2Applied) -> Result<()> {
+    fn stage2_apply(&self, applied: &Stage2Applied) -> Result<bool> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         // Overwrite triage fields and stamp model_used. Guarded by
@@ -3944,7 +4152,7 @@ impl Store for SqliteStore {
         } else {
             serde_json::to_string(&applied.field_reasons).ok()
         };
-        tx.execute(
+        let n = tx.execute(
             "UPDATE triage SET
                  importance = ?3,
                  tier = ?4,
@@ -3968,30 +4176,35 @@ impl Store for SqliteStore {
                 applied.category,
             ],
         )?;
-        // (Re)write the deadlines row idempotently.
-        tx.execute(
-            "DELETE FROM deadlines WHERE message_id=?1",
-            params![applied.message_id],
-        )?;
-        if let Some(d) = &applied.deadline {
+        // TOCTOU: same as `stage1_apply` — a row sealed by hand mid-pass makes
+        // the guard match nothing. No verdict landed, no deadline row, `false`
+        // back to the caller so no notification event is emitted.
+        if n > 0 {
+            // (Re)write the deadlines row idempotently.
             tx.execute(
-                "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
-                     due_at, past_due, source)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    applied.account_id,
-                    applied.message_id,
-                    d.kind,
-                    d.amount,
-                    d.currency,
-                    d.due_at.to_rfc3339(),
-                    d.past_due as i64,
-                    d.source,
-                ],
+                "DELETE FROM deadlines WHERE message_id=?1",
+                params![applied.message_id],
             )?;
+            if let Some(d) = &applied.deadline {
+                tx.execute(
+                    "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
+                         due_at, past_due, source)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        applied.account_id,
+                        applied.message_id,
+                        d.kind,
+                        d.amount,
+                        d.currency,
+                        d.due_at.to_rfc3339(),
+                        d.past_due as i64,
+                        d.source,
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
-        Ok(())
+        Ok(n > 0)
     }
 
     fn stage2_mark_processed(
@@ -5056,6 +5269,43 @@ mod tests {
         let sealed = store.sealed_messages(acct).unwrap();
         assert_eq!(sealed.len(), 1);
         assert_eq!(sealed[0].id, id);
+    }
+
+    #[test]
+    fn sealing_by_hand_retracts_the_notification_event() {
+        // A message can notify FIRST and be sealed by hand after. The `events` row
+        // is a denormalized pre-seal snapshot (sender + one_line) that every
+        // client cursor replays forever — and an iOS notification-service
+        // extension renders exactly that row on a lock screen. So sealing has to
+        // retract it; refusing to emit a SECOND event is not the same thing.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let t0 = Utc::now();
+        let id = store
+            .ingest_message(&inbound_triaged(acct, "g1", "t1", "noreply@bank.com", t0, false))
+            .unwrap();
+        let other = store
+            .ingest_message(&inbound_triaged(acct, "g2", "t2", "alice@x.com", t0, false))
+            .unwrap();
+        let sealed_ev = store.append_event(&new_event(acct, id)).unwrap().unwrap();
+        let keep = store.append_event(&new_event(acct, other)).unwrap().unwrap();
+
+        store
+            .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store.event_by_id(acct, sealed_ev).unwrap().is_none(),
+            "the sealed message's snapshot must not survive the seal"
+        );
+        let left = store.events_after(acct, 0, 100).unwrap();
+        assert_eq!(
+            left.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![keep],
+            "and only THAT message's event is retracted"
+        );
+        assert_eq!(store.sealed_messages(acct).unwrap().len(), 1, "it WAS sealed");
     }
 
     #[test]
@@ -7269,7 +7519,7 @@ mod tests {
             }),
             category: Some("invoice".into()),
         };
-        store.stage2_apply(&applied).unwrap();
+        assert!(store.stage2_apply(&applied).unwrap(), "the guard matched the normal row");
 
         // Row left the queue (model_used stamped).
         assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
@@ -7288,6 +7538,7 @@ mod tests {
 
     #[test]
     fn stage2_apply_never_touches_sealed_row() {
+        use crate::triage::DeadlineHit;
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let id = seed_triage_row(&store, acct, "g-sealed", "t1", Sensitivity::Sealed);
@@ -7300,11 +7551,23 @@ mod tests {
             reason: "should not apply".into(),
             field_reasons: crate::types::FieldReasons::default(),
             model_used: "m".into(),
-            deadline: None,
+            deadline: Some(DeadlineHit {
+                kind: "invoice".into(),
+                amount: None,
+                currency: None,
+                due_at: Utc::now() + chrono::Duration::days(3),
+                past_due: false,
+                source: "stage2".into(),
+            }),
             category: Some("general".into()),
         };
-        store.stage2_apply(&applied).unwrap();
-        // The sealed row's triage must be unchanged (guarded by sensitivity).
+        // TOCTOU report: the guard matched nothing, and the caller must know —
+        // a bare Ok here is what would let a message sealed mid-pass emit a
+        // notification event anyway.
+        assert!(!store.stage2_apply(&applied).unwrap(), "sealed row: apply reports false");
+        // The sealed row's triage must be unchanged (guarded by sensitivity),
+        // and the verdict's deadline must NOT have been written either.
+        assert!(store.deadlines(acct, Some(365)).unwrap().is_empty(), "no deadline row");
         let conn = store.lock().unwrap();
         let (imp, model): (i64, Option<String>) = conn
             .query_row(
@@ -7315,6 +7578,53 @@ mod tests {
             .unwrap();
         assert_eq!(imp, 40, "sealed row importance unchanged");
         assert!(model.is_none(), "sealed row model_used untouched");
+    }
+
+    #[test]
+    fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
+        use crate::triage::DeadlineHit;
+        // TOCTOU: the Stage-1 pass SELECTs its queue, then a human seals one of
+        // the rows before the pass gets around to applying its verdict. The
+        // guarded UPDATE matches nothing; the apply must say so, or the engine
+        // would emit a notification event for a now-sealed message.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let id = seed_triage_row(&store, acct, "g-race", "t1", Sensitivity::Normal);
+        let applied = Stage1Applied {
+            message_id: id,
+            account_id: acct,
+            importance: 90,
+            tier: Tier::PastDue,
+            one_line: "loud verdict".into(),
+            reason: "stage-1".into(),
+            field_reasons: crate::types::FieldReasons::default(),
+            stage1_model_used: "claude-haiku-4-5".into(),
+            needs_stage2: false,
+            deadline: Some(DeadlineHit {
+                kind: "bill".into(),
+                amount: Some(10.0),
+                currency: Some("USD".into()),
+                due_at: Utc::now() - chrono::Duration::days(1),
+                past_due: true,
+                source: "stage1".into(),
+            }),
+            category: None,
+        };
+
+        // Sealed between queue and apply.
+        store
+            .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+            .unwrap()
+            .unwrap();
+
+        assert!(!store.stage1_apply(&applied).unwrap(), "sealed mid-pass: apply reports false");
+        assert!(store.deadlines(acct, Some(365)).unwrap().is_empty(), "no deadline row");
+
+        // Control: the same apply on a live row reports true.
+        let live = seed_triage_row(&store, acct, "g-live", "t2", Sensitivity::Normal);
+        let mut ok = applied.clone();
+        ok.message_id = live;
+        assert!(store.stage1_apply(&ok).unwrap(), "normal row: apply reports true");
     }
 
     #[test]
@@ -7341,6 +7651,57 @@ mod tests {
         assert_eq!(log[0].actor, "agent");
         assert_eq!(log[0].action, "rule.set");
         assert_eq!(log[0].target.as_deref(), Some("*@spam.com"));
+    }
+
+    #[test]
+    fn filtered_rules_reject_an_empty_want_text_on_every_write_path() {
+        // A Filtered rule's want_text IS the rule ("filter everything except
+        // <this>"). Empty, it degrades silently: `stage2_queue` maps it to None
+        // and Stage-2 gets no instruction, while the UI still shows a rule. So
+        // all three write paths reject it up front (`InvalidInput`).
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let audit = NewAuditEntry {
+            actor: "agent".into(),
+            action: "rule.set".into(),
+            target: Some("*@vendor.com".into()),
+            detail: None,
+        };
+
+        for want in ["", "   ", "\t\n"] {
+            let e = store
+                .set_sender_rule(acct, "*@vendor.com", want, Disposition::Filtered)
+                .unwrap_err();
+            assert!(matches!(e, CoreError::InvalidInput(_)), "set: {want:?}");
+            let e = store
+                .set_sender_rule_audited(acct, "*@vendor.com", want, Disposition::Filtered, &audit)
+                .unwrap_err();
+            assert!(matches!(e, CoreError::InvalidInput(_)), "set_audited: {want:?}");
+        }
+        // Nothing landed — no rule, and (fail-closed) no orphan audit row either.
+        assert!(store.list_sender_rules(acct).unwrap().is_empty());
+        assert!(store.list_audit(acct, 10).unwrap().is_empty());
+
+        // The other dispositions don't require want_text; empty stays legal.
+        let id = store
+            .set_sender_rule(acct, "*@vendor.com", "", Disposition::Squelch)
+            .unwrap();
+        // ...but an UPDATE cannot smuggle the empty-want Filtered shape in.
+        let e = store
+            .update_sender_rule(acct, id, "*@vendor.com", " ", Disposition::Filtered)
+            .unwrap_err();
+        assert!(matches!(e, CoreError::InvalidInput(_)), "update path validates too");
+        assert_eq!(store.list_sender_rules(acct).unwrap()[0].disposition, Disposition::Squelch);
+
+        // With a real want_text, Filtered writes fine on both mutating paths.
+        assert!(
+            store
+                .update_sender_rule(acct, id, "*@vendor.com", "only invoices", Disposition::Filtered)
+                .unwrap()
+        );
+        store
+            .set_sender_rule(acct, "*@other.com", "only receipts", Disposition::Filtered)
+            .unwrap();
     }
 
     #[test]
@@ -7429,6 +7790,162 @@ mod tests {
         assert!(res.is_err(), "audit failure must fail the whole call");
         // The rule write must have been rolled back.
         assert_eq!(store.list_sender_rules(acct).unwrap().len(), 0);
+    }
+
+    // ---- NOTIFICATION EVENTS ---------------------------------------------
+
+    /// A worthy `NewEvent` for `message_id`, distinct per id so ordering and
+    /// snapshotting are visible in assertions.
+    fn new_event(acct: AccountId, message_id: i64) -> NewEvent {
+        NewEvent {
+            account_id: acct,
+            message_id,
+            thread_id: format!("t{message_id}"),
+            kind: EventKind::Surfaced,
+            tier: Tier::Signal,
+            importance: 70,
+            sender: "alice@example.com".to_string(),
+            one_line: format!("line {message_id}"),
+            deadline: None,
+        }
+    }
+
+    #[test]
+    fn append_event_is_once_per_message_ever() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let first = store.append_event(&new_event(acct, 1)).unwrap();
+        assert_eq!(first, Some(1), "first append inserts and returns the new id");
+
+        // A SECOND append for the same message — a re-ingest, or a Stage-2 verdict
+        // landing on a row that already notified at ingest — is a silent no-op.
+        let mut again = new_event(acct, 1);
+        again.kind = EventKind::Urgent;
+        again.one_line = "a louder verdict".into();
+        assert_eq!(store.append_event(&again).unwrap(), None, "dedup on message_id");
+
+        let all = store.events_after(acct, 0, 100).unwrap();
+        assert_eq!(all.len(), 1, "still exactly one row");
+        assert_eq!(all[0].kind, EventKind::Surfaced, "the FIRST verdict is the one kept");
+        assert_eq!(all[0].one_line, "line 1");
+    }
+
+    #[test]
+    fn events_after_pages_in_id_order_and_scopes_by_account() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let other = store.ensure_account("other@example.com").unwrap();
+
+        let mut ids = Vec::new();
+        for m in 1..=5 {
+            ids.push(store.append_event(&new_event(acct, m)).unwrap().unwrap());
+        }
+        // Another account's event must never appear in this account's replay.
+        store.append_event(&new_event(other, 99)).unwrap().unwrap();
+
+        // From the zero cursor: everything, oldest first.
+        let all = store.events_after(acct, 0, 100).unwrap();
+        assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), ids);
+        assert_eq!(all.iter().map(|e| e.message_id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+
+        // Limit truncates from the FRONT (the oldest unseen), so a client that
+        // pages never skips a row.
+        let page = store.events_after(acct, 0, 2).unwrap();
+        assert_eq!(page.iter().map(|e| e.id).collect::<Vec<_>>(), ids[..2].to_vec());
+
+        // Resuming from a cursor is exclusive of the cursor itself.
+        let rest = store.events_after(acct, ids[2], 100).unwrap();
+        assert_eq!(rest.iter().map(|e| e.id).collect::<Vec<_>>(), ids[3..].to_vec());
+
+        // Caught up.
+        assert!(store.events_after(acct, *ids.last().unwrap(), 100).unwrap().is_empty());
+        // Account scoping.
+        assert_eq!(store.events_after(other, 0, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn event_by_id_round_trips_the_snapshot_and_scopes_by_account() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let other = store.ensure_account("other@example.com").unwrap();
+
+        let due = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+        let mut ev = new_event(acct, 42);
+        ev.kind = EventKind::Urgent;
+        ev.tier = Tier::PastDue;
+        ev.importance = 95;
+        ev.deadline = Some(due.to_rfc3339());
+        let id = store.append_event(&ev).unwrap().unwrap();
+
+        // Every field a client renders from comes back verbatim — the row alone
+        // is enough to build the notification (the iOS NSE has no second call).
+        let got = store.event_by_id(acct, id).unwrap().expect("event");
+        assert_eq!(got.id, id);
+        assert_eq!(got.kind, EventKind::Urgent);
+        assert_eq!(got.message_id, 42);
+        assert_eq!(got.thread_id, "t42");
+        assert_eq!(got.tier, Tier::PastDue);
+        assert_eq!(got.importance, 95);
+        assert_eq!(got.sender, "alice@example.com");
+        assert_eq!(got.one_line, "line 42");
+        assert_eq!(got.deadline.as_deref(), Some(due.to_rfc3339().as_str()));
+
+        // Unknown id, and another account's id, are both indistinguishable misses.
+        assert!(store.event_by_id(acct, id + 1).unwrap().is_none());
+        assert!(store.event_by_id(other, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_event_id_is_zero_until_something_happens() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let other = store.ensure_account("other@example.com").unwrap();
+
+        assert_eq!(store.latest_event_id(acct).unwrap(), 0, "empty => the 0 cursor");
+
+        let a = store.append_event(&new_event(acct, 1)).unwrap().unwrap();
+        let b = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
+        assert_eq!(store.latest_event_id(acct).unwrap(), b);
+        assert!(b > a, "ids are monotonic");
+        // A deduped append does not move the cursor.
+        assert_eq!(store.append_event(&new_event(acct, 2)).unwrap(), None);
+        assert_eq!(store.latest_event_id(acct).unwrap(), b);
+        // Per-account, so a busy second account cannot skip this one's replay.
+        assert_eq!(store.latest_event_id(other).unwrap(), 0);
+    }
+
+    #[test]
+    fn append_event_pokes_the_attached_notifier_only_on_a_real_insert() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        // No notifier attached: appending must still work (a consumer that never
+        // attaches simply polls the table instead).
+        store.append_event(&new_event(acct, 1)).unwrap().unwrap();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        assert!(store.attach_event_notifier(tx).unwrap().is_none());
+
+        let id = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), id, "the new id is broadcast on insert");
+
+        // A deduped append broadcasts nothing — no phantom wake for a no-op.
+        assert_eq!(store.append_event(&new_event(acct, 2)).unwrap(), None);
+        assert!(rx.try_recv().is_err(), "no broadcast for a deduped append");
+    }
+
+    #[test]
+    fn append_event_survives_having_no_receivers() {
+        // The broadcast payload is only a hint; the table is the source of truth.
+        // A sender with every receiver dropped errors on send, and that must be
+        // invisible to the caller.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel::<i64>(8);
+        drop(rx);
+        store.attach_event_notifier(tx).unwrap();
+        assert_eq!(store.append_event(&new_event(acct, 1)).unwrap(), Some(1));
     }
 
     // ---- SEMANTIC RECALL (v1) --------------------------------------------

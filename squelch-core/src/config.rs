@@ -214,6 +214,41 @@ impl Default for SyncConfig {
     }
 }
 
+/// Notification-event tunables. The sync engine writes a row to the `events`
+/// table at each triage verdict that is worth interrupting the user for; these
+/// two numbers are the whole emission policy that is not structural.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Importance at or above which a message earns an event on the strength of
+    /// its score alone (past_due/deadline tiers and detected deadlines bypass it
+    /// entirely, exactly as they bypass the squelch line). Default 50 — the same
+    /// number the TUI starts its in-session squelch line at, so "notified" and
+    /// "above the line" mean the same thing. Env:
+    /// `SQUELCH_NOTIFY_MIN_IMPORTANCE`.
+    pub min_importance: u8,
+    /// THE STORM GUARD. Mail received longer than this many seconds ago can
+    /// never produce an event, whatever its verdict says. Without it, the
+    /// Stage-1/Stage-2 passes chewing through a fresh install's backfilled
+    /// backlog — or `catch_up()` re-scanning the whole backfill window after an
+    /// expired history cursor — would fire hundreds of notifications at once.
+    /// This is what implements "never on initial backfill" ROBUSTLY, across
+    /// restarts and re-syncs, rather than by trusting a code path to know which
+    /// pass it is on. Mail dated in the FUTURE is out of the window too (a
+    /// sender-controlled `Date:` header must not be able to buy freshness — see
+    /// [`crate::triage::events::is_fresh`]). Default 900 (15 minutes).
+    pub freshness_window_secs: u64,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            min_importance: 50,
+            freshness_window_secs: 900,
+        }
+    }
+}
+
 /// The default embedding-weights cache dir: `~/.local/share/squelch/models`
 /// (a sibling of the sqlite db under the XDG data dir). Falls back to a
 /// CWD-relative `squelch-models` only when `HOME` is unset.
@@ -638,6 +673,8 @@ pub struct Config {
     pub sync: SyncConfig,
     /// On-box semantic-recall (v1) tunables (embedding model, dims, cache dir).
     pub embed: EmbedConfig,
+    /// Notification-event emission policy (threshold + the freshness storm guard).
+    pub notify: NotifyConfig,
 }
 
 impl Default for Config {
@@ -657,6 +694,7 @@ impl Default for Config {
             stage2: Stage2Config::default(),
             sync: SyncConfig::default(),
             embed: EmbedConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -754,6 +792,11 @@ impl Config {
             && let Ok(n) = v.parse::<u8>()
         {
             self.squelch_level = n;
+        }
+        if let Ok(v) = std::env::var("SQUELCH_NOTIFY_MIN_IMPORTANCE")
+            && let Ok(n) = v.parse::<u8>()
+        {
+            self.notify.min_importance = n;
         }
         if let Ok(v) = std::env::var("SQUELCH_CRED_BACKEND")
             && let Some(b) = CredentialBackend::from_str_lenient(&v)
@@ -1577,6 +1620,40 @@ backfill_days = 90
             std::env::remove_var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK");
             std::env::remove_var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK");
         }
+    }
+
+    #[test]
+    fn notify_defaults_match_the_squelch_line_and_env_overrides_the_threshold() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // The default threshold IS the TUI's starting squelch line (50), so
+        // "notified" and "above the line" mean the same thing to a user.
+        let c = Config::default();
+        assert_eq!(c.notify.min_importance, 50);
+        assert_eq!(c.notify.freshness_window_secs, 900);
+
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("SQUELCH_NOTIFY_MIN_IMPORTANCE", "85") }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.notify.min_importance, 85);
+        // Unrelated: the generic SQUELCH_MIN_IMPORTANCE knob is the READ default,
+        // not the notify threshold; they must not alias.
+        assert_eq!(c.default_min_importance, 0);
+        unsafe { std::env::remove_var("SQUELCH_NOTIFY_MIN_IMPORTANCE") }
+    }
+
+    #[test]
+    fn notify_section_round_trips_through_toml() {
+        let cfg: Config =
+            toml::from_str("[notify]\nmin_importance = 30\nfreshness_window_secs = 60\n").unwrap();
+        assert_eq!(cfg.notify.min_importance, 30);
+        assert_eq!(cfg.notify.freshness_window_secs, 60);
+        // A partial section keeps the other field's default (#[serde(default)]).
+        let cfg: Config = toml::from_str("[notify]\nmin_importance = 30\n").unwrap();
+        assert_eq!(cfg.notify.freshness_window_secs, 900);
+        // A config that predates the feature has no [notify] table at all.
+        let cfg: Config = toml::from_str("squelch_level = 1\n").unwrap();
+        assert_eq!(cfg.notify.min_importance, 50);
     }
 
     #[test]

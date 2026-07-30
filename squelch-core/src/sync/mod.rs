@@ -38,6 +38,7 @@ use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules};
+use crate::triage::events;
 use crate::triage::extract::{self, banking, marketing};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
@@ -73,6 +74,22 @@ const SENDER_BUDGET_PREFIX: &str = "sender:";
 /// `__global__` sentinel so the two stages' daily counts never collide. No real
 /// Gmail thread id can match (they are hex).
 const STAGE1_GLOBAL_BUDGET_KEY: &str = "__stage1_global__";
+
+/// Which sync path an ingest batch is running on. It decides ONE thing: whether
+/// a notification-worthy verdict may append an `events` row.
+///
+/// The INITIAL BACKFILL never notifies — a fresh install must not fire a hundred
+/// pushes for a month of already-read mail. Every incremental path may, and the
+/// freshness window plus the one-event-per-message key are what make that safe
+/// even for `catch_up()`, which re-scans the ENTIRE backfill window whenever the
+/// history cursor expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestOrigin {
+    /// First-run backfill. Structurally silent.
+    Backfill,
+    /// A history walk or a catch-up re-scan: mail that may be genuinely new.
+    Incremental,
+}
 
 /// Model id stamped on a row skipped for being older than `stage2_max_age_days`:
 /// it is marked processed WITHOUT a model call so it neither consumes budget nor
@@ -444,7 +461,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // INBOX bodies.
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let inbox_ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
-        let n = self.fetch_raw_and_ingest(&inbox_ids, /* is_sent */ false).await?;
+        // Backfill NEVER notifies (see `IngestOrigin`).
+        let n = self
+            .fetch_raw_and_ingest(&inbox_ids, /* is_sent */ false, IngestOrigin::Backfill)
+            .await?;
         eprintln!("squelch: backfilled {n} INBOX messages");
 
         // SENT bodies (format=raw). Fetching full bodies (not just headers) is
@@ -457,7 +477,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // it is embeddable for recall.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
         let seeded = self
-            .fetch_raw_and_ingest(&sent_ids, /* is_sent */ true)
+            .fetch_raw_and_ingest(&sent_ids, /* is_sent */ true, IngestOrigin::Backfill)
             .await?;
         eprintln!("squelch: backfilled {seeded} SENT messages (bodies for recall + contacts)");
 
@@ -575,7 +595,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         new_ids.dedup();
 
         if !new_ids.is_empty() {
-            let n = self.fetch_raw_and_ingest(&new_ids, false).await?;
+            let n = self
+                .fetch_raw_and_ingest(&new_ids, false, IngestOrigin::Incremental)
+                .await?;
             eprintln!("squelch: ingested {n} new INBOX messages");
         }
         self.store_history_cursor(cursor)?;
@@ -588,7 +610,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     async fn catch_up(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
-        let n = self.fetch_raw_and_ingest(&ids, false).await?;
+        // INCREMENTAL: a catch-up can carry genuinely new mail, so it is allowed
+        // to notify — but it re-scans the WHOLE backfill window, so what keeps it
+        // from storming is the freshness window in `triage::events` plus the
+        // one-event-per-message key, not this flag.
+        let n = self
+            .fetch_raw_and_ingest(&ids, false, IngestOrigin::Incremental)
+            .await?;
         if n > 0 {
             eprintln!("squelch: catch-up ingested {n} INBOX messages");
         }
@@ -625,7 +653,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// Fetch each id `format=raw`, base64url-decode to RFC822, and run through
     /// the (unchanged) ingest pipeline. Sequential — rate limits are a non-issue
     /// at this volume. Returns the count ingested.
-    async fn fetch_raw_and_ingest(&self, ids: &[String], is_sent: bool) -> Result<usize> {
+    async fn fetch_raw_and_ingest(
+        &self,
+        ids: &[String],
+        is_sent: bool,
+        origin: IngestOrigin,
+    ) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -657,7 +690,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 is_sent,
                 account_addr: self.account_email.clone(),
             };
-            if let Some((id, text)) = self.ingest_one(&fetched, &rules, now)? {
+            if let Some((id, text)) = self.ingest_one(&fetched, &rules, now, origin)? {
                 self.embed_and_store(id, text).await;
             }
             count += 1;
@@ -677,6 +710,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         fetched: &RawFetched,
         rules: &[SenderRule],
         now: DateTime<Utc>,
+        origin: IngestOrigin,
     ) -> Result<Option<(i64, String)>> {
         let triaged = ingest_with_rules(
             fetched,
@@ -686,6 +720,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             |addr| self.store.is_known_contact(self.account_id, addr).unwrap_or(false),
         );
         let id = self.store.ingest_message(&triaged)?;
+        // NOTIFICATION EVENT (heuristic verdict). Only on an incremental path, and
+        // only for a CONFIDENT seed — a guess is not grounds for waking anyone, so
+        // non-confident rows wait for the Stage-1/Stage-2 apply sites. Worthiness
+        // and the freshness storm guard are decided in `triage::events`.
+        //
+        // ACCEPTED v1 TRADEOFF (fast notify vs accuracy): a confident seed is
+        // still refined by Stage-1 later, which may DOWNGRADE it — but by then
+        // the push has fired and the events row keeps the seed's snapshot
+        // (UNIQUE(message_id): no second, corrected event). Notifying now beats
+        // sitting on mail that looks urgent until an LLM pass gets around to it.
+        if origin == IngestOrigin::Incremental && triaged.confident {
+            self.emit_event(&events::ingest_context(&triaged, id, rules), now);
+        }
         // STRUCTURAL EXCLUSION: sealed mail is never embedded.
         if triaged.sensitivity != Sensitivity::Normal {
             return Ok(None);
@@ -696,6 +743,49 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             self.config.embed.max_chars,
         );
         Ok(Some((id, text)))
+    }
+
+    /// Append the `events` row for a verdict that just landed, if it earns one.
+    ///
+    /// The single emission point for all three verdict sites (ingest heuristic,
+    /// Stage-1 apply, Stage-2 apply). The DECISION lives in [`events::event_for`]
+    /// — pure, config-driven, and the owner of both the seal invariant and the
+    /// freshness storm guard; this method is only the plumbing.
+    ///
+    /// BEST-EFFORT BY DESIGN: a notification is never worth failing triage over,
+    /// so a store error is logged (redacted — ids only) and swallowed. Dedup lives
+    /// in the store (`UNIQUE(message_id)`), so calling this for a message that
+    /// already notified is a silent no-op — which is exactly what makes the refine
+    /// passes and `catch_up()`'s window re-scan safe to hook.
+    /// The sender's CURRENT rule disposition, for the refine emission sites —
+    /// see [`events::current_rule`] for why a queued row cannot answer this
+    /// itself. One small SELECT per refined row, alongside an LLM call.
+    ///
+    /// A store error reads as "no rule", which is the pre-existing behavior of
+    /// these sites; the surrounding pass has already logged any real store
+    /// trouble by the time we get here.
+    fn current_rule(&self, from_addr: &str) -> Option<crate::types::Disposition> {
+        let rules = self.store.list_sender_rules(self.account_id).ok()?;
+        events::current_rule(from_addr, &rules)
+    }
+
+    fn emit_event(&self, ctx: &events::EventContext<'_>, now: DateTime<Utc>) {
+        let Some(ev) = events::event_for(ctx, &self.config.notify, now) else {
+            return;
+        };
+        match self.store.append_event(&ev) {
+            Ok(Some(id)) => eprintln!(
+                "squelch: notification event {id} ({}) for message {}",
+                ev.kind.as_str(),
+                ev.message_id
+            ),
+            // Already notified once; one event per message, ever.
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "squelch: append_event failed ({e}); no notification for message {}",
+                ev.message_id
+            ),
+        }
     }
 
     /// Embed `text` off the async runtime (CPU work) and write the vector for
@@ -953,10 +1043,45 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         }
                     }
                     let applied = stage1_llm::apply_result(row, &out, &cfg.model, Utc::now());
-                    if let Err(e) = self.store.stage1_apply(&applied) {
-                        eprintln!("squelch: stage-1 apply failed ({e}); row stays queued");
-                    } else {
-                        refined += 1;
+                    match self.store.stage1_apply(&applied) {
+                        Err(e) => {
+                            eprintln!("squelch: stage-1 apply failed ({e}); row stays queued");
+                        }
+                        // TOCTOU: the row was sealed by hand while this pass held
+                        // it — the guarded UPDATE matched nothing, so no verdict
+                        // landed and there is nothing to notify for. (The seal
+                        // invariant would otherwise leak: emitting on a bare Ok
+                        // would snapshot sender+one_line for a now-sealed row.)
+                        Ok(false) => {}
+                        Ok(true) => {
+                            refined += 1;
+                            // NOTIFICATION EVENT: the refined verdict is final, so
+                            // it emits regardless of what the heuristic seed
+                            // thought. The freshness window is what stops this pass
+                            // from storming through a fresh install's backlog.
+                            self.emit_event(
+                                &events::EventContext {
+                                    account_id: self.account_id,
+                                    message_id: row.message_id,
+                                    thread_id: &row.thread_id,
+                                    sender: &row.from_addr,
+                                    one_line: &applied.one_line,
+                                    received_at: row.received_at,
+                                    sensitivity: row.sensitivity,
+                                    // The Stage-1 queue selects `m.is_sent = 0`.
+                                    is_sent: false,
+                                    // The queue excludes rows a rule decided AT
+                                    // INGEST (stage1_model_used='rule'), but says
+                                    // nothing about a rule added since — so read
+                                    // the rule list as it stands now.
+                                    rule: self.current_rule(&row.from_addr),
+                                    tier: applied.tier,
+                                    importance: applied.importance,
+                                    deadline: applied.deadline.as_ref(),
+                                },
+                                Utc::now(),
+                            );
+                        }
                     }
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -1406,10 +1531,42 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         }
                     }
                     let applied = stage2::apply_result(row, &out, &cfg.model, Utc::now());
-                    if let Err(e) = self.store.stage2_apply(&applied) {
-                        eprintln!("squelch: stage-2 apply failed ({e}); row stays queued");
-                    } else {
-                        processed += 1;
+                    match self.store.stage2_apply(&applied) {
+                        Err(e) => {
+                            eprintln!("squelch: stage-2 apply failed ({e}); row stays queued");
+                        }
+                        // TOCTOU: sealed by hand mid-pass; no verdict landed, so
+                        // nothing to notify for (same as the Stage-1 site).
+                        Ok(false) => {}
+                        Ok(true) => {
+                            processed += 1;
+                            // NOTIFICATION EVENT: same discipline as the Stage-1
+                            // site.
+                            self.emit_event(
+                                &events::EventContext {
+                                    account_id: self.account_id,
+                                    message_id: row.message_id,
+                                    thread_id: &row.thread_id,
+                                    sender: &row.from_addr,
+                                    one_line: &applied.one_line,
+                                    received_at: row.received_at,
+                                    sensitivity: row.sensitivity,
+                                    // The Stage-2 queue selects `m.is_sent = 0`.
+                                    is_sent: false,
+                                    // Read NOW, not at ingest: `rule_want_text`
+                                    // only reflects the Filtered rule that was in
+                                    // force when the row was queued (Squelch/
+                                    // Surface decide confidently and never reach
+                                    // this queue), so a sender squelched since
+                                    // then would still push.
+                                    rule: self.current_rule(&row.from_addr),
+                                    tier: applied.tier,
+                                    importance: applied.importance,
+                                    deadline: applied.deadline.as_ref(),
+                                },
+                                Utc::now(),
+                            );
+                        }
                     }
                 }
                 Ok(ClassifyOutcome::Refused) => {
@@ -1576,7 +1733,7 @@ mod tests {
     use super::*;
     use crate::config::Stage1Config;
     use crate::store::SqliteStore;
-    use crate::types::Tier;
+    use crate::types::{Disposition, Tier, TriageAxis};
 
     /// Build a RawFetched from an RFC822 string, as the transport layer would.
     /// The account's own address is fixed to `me@example.com` in these fixtures.
@@ -1604,6 +1761,366 @@ mod tests {
             store.is_known_contact(account_id, addr).unwrap_or(false)
         });
         store.ingest_message(&triaged).unwrap()
+    }
+
+    // ---- notification events at the ingest call site -----------------------
+    //
+    // These drive the REAL pipeline (ingest_with_rules -> ingest_message ->
+    // triage::events -> append_event) through the real store, mirroring
+    // `SyncEngine::ingest_one` exactly. What they cannot exercise is the HTTP
+    // fetch above it, which is why the helper repeats the two lines of gating
+    // rather than the engine method being called directly.
+
+    /// Mirror of the engine's ingest emission site. Returns
+    /// `(message_id, emitted_event_id)`.
+    fn ingest_and_notify(
+        store: &SqliteStore,
+        account_id: AccountId,
+        f: &RawFetched,
+        now: DateTime<Utc>,
+        origin: IngestOrigin,
+    ) -> (i64, Option<i64>) {
+        let cfg = crate::config::NotifyConfig::default();
+        let rules = store.list_sender_rules(account_id).unwrap();
+        let triaged = ingest_with_rules(f, &Stage1Config::default(), now, &rules, |addr| {
+            store.is_known_contact(account_id, addr).unwrap_or(false)
+        });
+        let id = store.ingest_message(&triaged).unwrap();
+        let mut emitted = None;
+        if origin == IngestOrigin::Incremental && triaged.confident {
+            let ctx = events::ingest_context(&triaged, id, &rules);
+            if let Some(ev) = events::event_for(&ctx, &cfg, now) {
+                emitted = store.append_event(&ev).unwrap();
+            }
+        }
+        (id, emitted)
+    }
+
+    /// An ops-alert EML dated `at` (rung 4: automated sender + alert language ->
+    /// Signal, importance 75, CONFIDENT).
+    fn alert_eml(at: DateTime<Utc>) -> String {
+        format!(
+            "From: Monitoring <alerts@monitoring.example>\r\n\
+             To: me@example.com\r\n\
+             Subject: Incident: checkout api is down\r\n\
+             Date: {}\r\n\
+             \r\n\
+             A high-severity incident was opened for the checkout service.\r\n",
+            at.to_rfc2822()
+        )
+    }
+
+    #[test]
+    fn fresh_worthy_ingest_emits_exactly_one_event() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eml = alert_eml(now);
+        let f = fixture(acct, "g-alert", &eml, false);
+
+        let (mid, ev_id) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
+        let ev_id = ev_id.expect("a fresh confident alert above the line must notify");
+
+        let ev = store.event_by_id(acct, ev_id).unwrap().expect("event row");
+        assert_eq!(ev.message_id, mid);
+        assert_eq!(ev.kind, crate::types::EventKind::Surfaced);
+        assert_eq!(ev.tier, Tier::Signal);
+        assert_eq!(ev.sender, "alerts@monitoring.example");
+        assert_eq!(store.latest_event_id(acct).unwrap(), ev_id);
+
+        // RE-INGEST (history overlap / catch-up re-scan) must stay silent.
+        let (mid2, again) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert_eq!(mid2, mid, "same message row");
+        assert_eq!(again, None, "one event per message, ever");
+        assert_eq!(store.events_after(acct, 0, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backfill_never_emits() {
+        // A fresh install backfills a month of already-read mail. Not one push.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eml = alert_eml(now);
+        let f = fixture(acct, "g-alert", &eml, false);
+
+        let (_, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+        assert_eq!(ev, None, "backfill is structurally silent");
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        assert_eq!(store.latest_event_id(acct).unwrap(), 0);
+    }
+
+    #[test]
+    fn stale_mail_is_silent_even_at_the_top_tier() {
+        // THE STORM GUARD. A past-due bill from a KNOWN biller is the loudest
+        // verdict the pipeline can produce — and if the mail is old, it is still
+        // silent. This is what makes `catch_up()`'s whole-window re-scan safe.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let old = now - ChronoDuration::days(3);
+
+        // Seed the biller as a known contact so the bill lands CONFIDENT PastDue.
+        let seed = format!(
+            "From: me@example.com\r\n\
+             To: Utility <billing@utilityco.example>\r\n\
+             Subject: account setup\r\n\
+             Date: {}\r\n\
+             \r\n\
+             hello\r\n",
+            old.to_rfc2822()
+        );
+        let sf = fixture(acct, "g-seed", &seed, /* is_sent */ true);
+        ingest_and_notify(&store, acct, &sf, now, IngestOrigin::Incremental);
+
+        let eml = format!(
+            "From: Utility <billing@utilityco.example>\r\n\
+             To: me@example.com\r\n\
+             Subject: PAST DUE: Your electric bill\r\n\
+             Date: {}\r\n\
+             \r\n\
+             Amount due $84.20. This payment is overdue.\r\n",
+            old.to_rfc2822()
+        );
+        let f = fixture(acct, "g-pastdue", &eml, false);
+        let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert_eq!(ev, None, "old mail is silent no matter what the verdict says");
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+
+        // Sanity: the verdict really was the loud one — the guard is what stopped
+        // it, not a mis-triage.
+        let updates = store.ranked_updates(acct, old - ChronoDuration::days(1), None).unwrap();
+        let bill = updates.iter().find(|u| u.id == mid).expect("bill surfaced in the client");
+        assert_eq!(bill.tier, Tier::PastDue);
+    }
+
+    #[test]
+    fn sealed_mail_never_emits_an_event() {
+        // SEAL INVARIANT, end to end: an OTP is the exact thing that must never
+        // land on a lock screen.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eml = format!(
+            "From: Bank <noreply@bank.example>\r\n\
+             To: me@example.com\r\n\
+             Subject: Your verification code\r\n\
+             Date: {}\r\n\
+             \r\n\
+             Your one-time passcode is 483920. Enter this code to continue.\r\n",
+            now.to_rfc2822()
+        );
+        let f = fixture(acct, "g-otp", &eml, false);
+        let (_, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert_eq!(ev, None, "sealed mail must never notify");
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        assert_eq!(store.sealed_messages(acct).unwrap().len(), 1, "it WAS sealed");
+    }
+
+    #[test]
+    fn squelched_sender_and_noise_are_both_silent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        // A SQUELCH rule against the alert sender: the user said in advance that
+        // this sender does not get to interrupt them, and that outranks the
+        // heuristic that would otherwise have surfaced it (proved above).
+        store
+            .set_sender_rule(acct, "*@monitoring.example", "not urgent", Disposition::Squelch)
+            .unwrap();
+        let eml = alert_eml(now);
+        let f = fixture(acct, "g-alert", &eml, false);
+        let (_, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert_eq!(ev, None, "a squelch-ruled sender is silent");
+
+        // Plain below-the-line noise: fresh, confident, and simply not important.
+        let news = format!(
+            "From: News <hello@newsletter.example>\r\n\
+             To: me@example.com\r\n\
+             Subject: This week in widgets\r\n\
+             Date: {}\r\n\
+             \r\n\
+             Lots of widget news. Click here to unsubscribe from these emails.\r\n",
+            now.to_rfc2822()
+        );
+        let nf = fixture(acct, "g-news", &news, false);
+        let (_, ev) = ingest_and_notify(&store, acct, &nf, now, IngestOrigin::Incremental);
+        assert_eq!(ev, None, "noise below the line is silent");
+
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+    }
+
+    /// Mirror of the engine's STAGE-1 apply emission site, for a row the pass
+    /// ALREADY HOLDS: land the refined verdict via the real `stage1_apply`, and
+    /// only when the guarded UPDATE matched (the row was not sealed out from
+    /// under the pass) consult the rule list as it stands NOW and emit. Returns
+    /// the emitted event id, if any.
+    fn refine_row_and_notify(
+        store: &SqliteStore,
+        account_id: AccountId,
+        row: &crate::store::Stage1Queued,
+        tier: Tier,
+        importance: u8,
+        now: DateTime<Utc>,
+    ) -> Option<i64> {
+        let cfg = crate::config::NotifyConfig::default();
+        let applied = crate::store::Stage1Applied {
+            message_id: row.message_id,
+            account_id,
+            importance,
+            tier,
+            one_line: "refined one-liner".into(),
+            reason: "stage-1".into(),
+            field_reasons: crate::types::FieldReasons::default(),
+            stage1_model_used: "claude-haiku-4-5".into(),
+            needs_stage2: false,
+            deadline: None,
+            category: None,
+        };
+        // TOCTOU gate, exactly as the engine: a verdict that did not land
+        // (`false` — sealed mid-pass) must not emit.
+        if !store.stage1_apply(&applied).unwrap() {
+            return None;
+        }
+        let rules = store.list_sender_rules(account_id).unwrap();
+        let ctx = events::EventContext {
+            account_id,
+            message_id: row.message_id,
+            thread_id: &row.thread_id,
+            sender: &row.from_addr,
+            one_line: "refined one-liner",
+            received_at: row.received_at,
+            sensitivity: row.sensitivity,
+            is_sent: false,
+            rule: events::current_rule(&row.from_addr, &rules),
+            tier,
+            importance,
+            deadline: None,
+        };
+        events::event_for(&ctx, &cfg, now).and_then(|ev| store.append_event(&ev).unwrap())
+    }
+
+    /// [`refine_row_and_notify`] for the common case where the queue read and
+    /// the apply are not racing anything: fetch the queued row by id first.
+    fn refine_and_notify(
+        store: &SqliteStore,
+        account_id: AccountId,
+        message_id: i64,
+        tier: Tier,
+        importance: u8,
+        now: DateTime<Utc>,
+    ) -> Option<i64> {
+        let row = store
+            .stage1_queue(account_id, 100)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.message_id == message_id)
+            .expect("the row is queued for the stage-1 refine pass");
+        refine_row_and_notify(store, account_id, &row, tier, importance, now)
+    }
+
+    #[test]
+    fn a_row_sealed_mid_pass_lands_no_verdict_and_emits_nothing() {
+        // TOCTOU: the Stage-1 pass SELECTs its queue, the user seals one of the
+        // held rows (an OTP they spotted), and only THEN does the pass apply its
+        // verdict. The guarded UPDATE matches nothing and reports so; emitting on
+        // a bare Ok would snapshot sender + one_line for a now-sealed message.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let f = fixture(acct, "g-alert", &alert_eml(now), false);
+        let (mid, _) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+
+        // The pass is already holding the queued row...
+        let row = store
+            .stage1_queue(acct, 100)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.message_id == mid)
+            .expect("queued");
+        // ...when the seal lands.
+        store
+            .correct_triage(acct, mid, TriageAxis::Sensitivity, "sealed", None, now)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            refine_row_and_notify(&store, acct, &row, Tier::PastDue, 100, now),
+            None,
+            "a verdict that did not land must not notify"
+        );
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn future_dated_backlog_mail_stays_silent_through_the_refine_pass() {
+        // The `Date:` header is SENDER-CONTROLLED and ingest prefers it over
+        // Gmail's internalDate; future-dating is a standard inbox-sorting trick.
+        // Backfill is silent by origin, but the refine passes then grind the whole
+        // backlog `received_at DESC` — future-dated rows FIRST — and emit from
+        // their own call sites. With no upper edge on the freshness window, a
+        // fresh install would storm on months-old mail dated 2030.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let eml = alert_eml(now + ChronoDuration::days(365 * 4));
+        let f = fixture(acct, "g-liar", &eml, false);
+        let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+        assert_eq!(ev, None, "backfill is silent by origin");
+
+        // Sanity: the lying header really is what the row carries.
+        let row = store
+            .stage1_queue(acct, 100)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.message_id == mid)
+            .expect("queued");
+        assert!(row.received_at > now + ChronoDuration::days(1000), "the Date: header won");
+
+        assert_eq!(
+            refine_and_notify(&store, acct, mid, Tier::PastDue, 100, now),
+            None,
+            "future-dated mail is outside the freshness window, loud verdict or not"
+        );
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn squelching_a_sender_silences_rows_already_queued() {
+        // THE REACTIVE SQUELCH: the mail is already sitting in the Stage-1 queue
+        // when the user squelches the sender. Nothing on the queued row records
+        // that — the 'rule' marker is stamped at INGEST only — so the refine site
+        // has to read the rule list live, or the pass mid-grind pushes mail from a
+        // sender the user just silenced.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let f = fixture(acct, "g-alert", &alert_eml(now), false);
+        let (mid, _) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+
+        store
+            .set_sender_rule(acct, "*@monitoring.example", "not urgent", Disposition::Squelch)
+            .unwrap();
+        assert_eq!(
+            refine_and_notify(&store, acct, mid, Tier::PastDue, 100, now),
+            None,
+            "a sender squelched AFTER the row was queued must not push"
+        );
+
+        // Control: the same verdict from an unruled sender does notify, so the
+        // silence above is the rule and not the harness.
+        let free = alert_eml(now).replace("alerts@monitoring.example", "alerts@other.example");
+        let ff = fixture(acct, "g-other", &free, false);
+        let (mid2, _) = ingest_and_notify(&store, acct, &ff, now, IngestOrigin::Backfill);
+        assert!(
+            refine_and_notify(&store, acct, mid2, Tier::PastDue, 100, now).is_some(),
+            "unruled sender, same verdict: notifies"
+        );
+        assert_eq!(store.events_after(acct, 0, 100).unwrap().len(), 1);
     }
 
     // ---- budget-notice log redaction (PII safety) -------------------------

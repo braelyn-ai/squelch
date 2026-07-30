@@ -14,9 +14,9 @@ use crate::error::Result;
 use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
-    CalendarUpdate, Deadline, Disposition, FieldReasons, NewMessage, Receipt, SealedKind, SearchHit,
-    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis,
-    TriageFeedback, Update, UnsubscribeRecord,
+    CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, Receipt,
+    SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier,
+    TriageAxis, TriageFeedback, Update, UnsubscribeRecord,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -213,6 +213,26 @@ pub struct NewAuditEntry {
     pub action: String,
     pub target: Option<String>,
     pub detail: Option<String>,
+}
+
+/// A notification-worthy event to append to the `events` log.
+///
+/// Produced ONLY by [`crate::triage::events`] (the pure emission decision) and
+/// passed to [`Store::append_event`]. Every field besides the ids is a
+/// denormalized snapshot of the verdict at emission time — see the `events`
+/// block in schema.sql for why. Sealed mail can never produce one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewEvent {
+    pub account_id: AccountId,
+    pub message_id: i64,
+    pub thread_id: String,
+    pub kind: EventKind,
+    pub tier: Tier,
+    pub importance: u8,
+    pub sender: String,
+    pub one_line: String,
+    /// RFC3339 deadline snapshot, or `None`.
+    pub deadline: Option<String>,
 }
 
 /// One non-confident triage row queued for the Stage-2 LLM pass, plus the
@@ -693,6 +713,12 @@ pub trait Store: Send + Sync {
     fn list_banking(&self, account_id: AccountId) -> Result<Vec<Banking>>;
 
     /// Upsert a sender rule. Returns the rule id.
+    ///
+    /// Rejects (`InvalidInput`) a `Filtered` rule whose `want_text` is empty or
+    /// whitespace: the want text IS a filtered rule's instruction, and without
+    /// one the rule silently degrades (Stage-2 receives nothing to evaluate).
+    /// The same validation applies to [`Store::set_sender_rule_audited`] and
+    /// [`Store::update_sender_rule`].
     fn set_sender_rule(
         &self,
         account_id: AccountId,
@@ -823,6 +849,38 @@ pub trait Store: Send + Sync {
 
     /// Append a row to the human-door audit log. Returns the new row id.
     fn append_audit(&self, account_id: AccountId, entry: &NewAuditEntry) -> Result<i64>;
+
+    // ---------------------------------------------------------------------
+    // NOTIFICATION EVENTS. The durable, monotonic log the delivery adapters
+    // read (SSE today, an APNs pusher later). WRITTEN ONLY BY THE SYNC ENGINE
+    // via `triage::events` — never from a store write method, because only the
+    // engine knows which sync path it is on and whether the mail is fresh.
+    // Every reader carries its OWN cursor; there is deliberately no global
+    // 'delivered' flag. See the `events` block in schema.sql.
+    // ---------------------------------------------------------------------
+
+    /// Append one event, at most once per message ever (INSERT OR IGNORE on the
+    /// `UNIQUE(message_id)` key). Returns the new id, or `None` when the message
+    /// already has an event — which is what makes re-ingest and the Stage-1/
+    /// Stage-2 refine passes idempotent.
+    ///
+    /// On a real insert the implementation ALSO pokes the in-process broadcast
+    /// (see [`SqliteStore::attach_event_notifier`]) so an SSE reader wakes
+    /// without polling. That send is best-effort: no receivers is normal.
+    fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>>;
+
+    /// Events with `id > after_id`, oldest first, capped at `limit`. The replay
+    /// query behind `GET /client/events?after=<cursor>`.
+    fn events_after(&self, account_id: AccountId, after_id: i64, limit: usize) -> Result<Vec<Event>>;
+
+    /// One event by id, scoped to the account. `None` for an unknown id — this
+    /// is what the iOS Notification Service Extension calls after an opaque
+    /// push, so it must never be more informative than that.
+    fn event_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<Event>>;
+
+    /// The newest event id for the account, or `0` when there are none — the
+    /// starting cursor for a client that has never connected.
+    fn latest_event_id(&self, account_id: AccountId) -> Result<i64>;
 
     // ---------------------------------------------------------------------
     // UNSUBSCRIBE (human door). All four are `/client/*`-only. Sealed mail is
@@ -986,7 +1044,12 @@ pub trait Store: Send + Sync {
     /// `stage1_model_used` (leaving the Stage-1 queue), set `needs_stage2`, and
     /// (re)write the message's `deadlines` row. Guarded by `sensitivity='normal'`.
     /// Does NOT touch `model_used` (the Stage-2 marker).
-    fn stage1_apply(&self, applied: &Stage1Applied) -> Result<()>;
+    ///
+    /// Returns whether the guarded UPDATE matched a row. `false` means the row
+    /// was sealed BY HAND between the queue SELECT and this apply (TOCTOU):
+    /// nothing was written — not even the deadline — and the caller must treat
+    /// the verdict as NOT landed (in particular: no notification event).
+    fn stage1_apply(&self, applied: &Stage1Applied) -> Result<bool>;
 
     /// Mark a Stage-1-queued row PROCESSED without changing its heuristic seed
     /// values — stamp `stage1_model_used` only, PRESERVING the `needs_stage2`
@@ -1061,7 +1124,11 @@ pub trait Store: Send + Sync {
     /// the row processed so it leaves the queue), and (re)write the message's
     /// `deadlines` row when the model extracted a deadline. Never touches sealed
     /// rows (guarded by `sensitivity='normal'` in the UPDATE).
-    fn stage2_apply(&self, applied: &Stage2Applied) -> Result<()>;
+    ///
+    /// Returns whether the guarded UPDATE matched a row — `false` is the
+    /// sealed-mid-pass TOCTOU case, exactly as on [`Store::stage1_apply`]:
+    /// nothing was written and the caller must not emit for it.
+    fn stage2_apply(&self, applied: &Stage2Applied) -> Result<bool>;
 
     /// Mark a queued row PROCESSED without changing its Stage-1 values — stamp
     /// `model_used` only. Used when the model refused (keep Stage-1 output) or a
