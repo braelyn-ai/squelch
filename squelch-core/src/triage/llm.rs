@@ -1,7 +1,8 @@
 //! Shared provider plumbing for both triage stages (Anthropic Messages API +
 //! OpenAI Chat Completions): wire types, retry policy, truncation-retry,
-//! refusal/permanent-failure classification, and [`classify_llm`]. Each stage
-//! owns only its system prompt, fenced user message, schema, and verdict parse.
+//! refusal/permanent-failure classification, [`classify_llm`], and the shared
+//! [`LlmOutcome`]/[`classify_into`] verdict shape. Each stage owns only its
+//! system prompt, fenced user message, schema, and verdict validation.
 //! REDACTION: never log email bodies, subjects, the API key, or raw bodies.
 
 use crate::config::Stage2Provider;
@@ -41,12 +42,15 @@ pub struct LlmRequest<'a> {
     pub schema: serde_json::Value,
 }
 
-/// The outcome of a single [`classify_llm`] call.
+/// The outcome of a single LLM call, generic over the verdict `T`. Every stage
+/// and extractor shares this one shape: [`classify_llm`] yields
+/// `LlmOutcome<String>` (the raw JSON verdict text) and [`classify_into`] turns
+/// that into the caller's own parsed type, so the Refused/Failed halves are
+/// never re-declared per stage.
 #[derive(Debug)]
-pub enum LlmOutcome {
-    /// The model's raw JSON verdict text + usage; the caller parses it into its
-    /// own stage verdict struct.
-    Json(String, Option<Usage>),
+pub enum LlmOutcome<T> {
+    /// The model's verdict + usage.
+    Ok(T, Option<Usage>),
     /// The model declined (`stop_reason == "refusal"` / OpenAI `refusal` field).
     Refused,
     /// A permanent (non-retryable, e.g. 400/401/truncation/parse) failure.
@@ -88,12 +92,69 @@ pub async fn classify_llm(
     api_key: &str,
     provider: Stage2Provider,
     req: &LlmRequest<'_>,
-) -> std::result::Result<LlmOutcome, ClassifyError> {
+) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
     match provider {
         Stage2Provider::Anthropic => classify_anthropic(http, url, api_key, req).await,
         Stage2Provider::OpenAI => classify_openai(http, url, api_key, req).await,
     }
 }
+
+/// [`classify_llm`] plus the verdict parse: deserialize the raw text into `T`,
+/// then hand it to `finish` for the caller's own validation/repackaging (its
+/// `Err` is a redacted failure kind). Refusals and permanent failures pass
+/// through untouched, and a malformed verdict becomes `Failed("json_parse")` —
+/// the shape every stage and extractor shares.
+pub async fn classify_into<T, U>(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    provider: Stage2Provider,
+    req: &LlmRequest<'_>,
+    finish: impl FnOnce(T) -> std::result::Result<U, String>,
+) -> std::result::Result<LlmOutcome<U>, ClassifyError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let raw = classify_llm(http, url, api_key, provider, req).await?;
+    Ok(match raw {
+        LlmOutcome::Ok(text, usage) => match serde_json::from_str::<T>(&text) {
+            Ok(parsed) => match finish(parsed) {
+                Ok(value) => LlmOutcome::Ok(value, usage),
+                Err(kind) => LlmOutcome::Failed(kind),
+            },
+            Err(_) => LlmOutcome::Failed("json_parse".into()),
+        },
+        LlmOutcome::Refused => LlmOutcome::Refused,
+        LlmOutcome::Failed(kind) => LlmOutcome::Failed(kind),
+    })
+}
+
+/// Emit a stage's/extractor's production `classify`: the delegation to its own
+/// `classify_at` at the provider's production endpoint. Identical for all four
+/// call sites, so it is written once. Leading doc attributes are forwarded.
+macro_rules! classify_entrypoint {
+    ($(#[$attr:meta])* $cfg:ty, $input:ty, $outcome:ty $(,)?) => {
+        $(#[$attr])*
+        pub async fn classify(
+            http: &reqwest::Client,
+            api_key: &str,
+            cfg: &$cfg,
+            provider: $crate::config::Stage2Provider,
+            input: &$input,
+        ) -> std::result::Result<$outcome, $crate::triage::llm::ClassifyError> {
+            classify_at(
+                http,
+                $crate::triage::llm::provider_url(provider),
+                api_key,
+                cfg,
+                provider,
+                input,
+            )
+            .await
+        }
+    };
+}
+pub(crate) use classify_entrypoint;
 
 // ===========================================================================
 // Anthropic Messages API wire types.
@@ -249,7 +310,7 @@ async fn classify_anthropic(
     url: &str,
     api_key: &str,
     req: &LlmRequest<'_>,
-) -> std::result::Result<LlmOutcome, ClassifyError> {
+) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
     let mut max_tokens = MAX_TOKENS;
     let mut allow_token_retry = true;
 
@@ -308,7 +369,7 @@ async fn classify_anthropic(
             Some(t) => t.to_string(),
             None => return Ok(LlmOutcome::Failed("no_text_block".into())),
         };
-        return Ok(LlmOutcome::Json(text, parsed.usage));
+        return Ok(LlmOutcome::Ok(text, parsed.usage));
     }
 }
 
@@ -317,7 +378,7 @@ async fn classify_openai(
     url: &str,
     api_key: &str,
     req: &LlmRequest<'_>,
-) -> std::result::Result<LlmOutcome, ClassifyError> {
+) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
     let mut max_completion_tokens = MAX_TOKENS;
     let mut allow_token_retry = true;
 
@@ -385,7 +446,7 @@ async fn classify_openai(
             Some(t) => t,
             None => return Ok(LlmOutcome::Failed("no_text_block".into())),
         };
-        return Ok(LlmOutcome::Json(
+        return Ok(LlmOutcome::Ok(
             text,
             parsed.usage.map(OpenAiUsage::into_usage),
         ));

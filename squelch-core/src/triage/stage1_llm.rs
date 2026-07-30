@@ -6,10 +6,10 @@
 
 use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::{Stage1Applied, Stage1Queued};
-use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, Usage};
+use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, classify_entrypoint};
 use crate::triage::stage2::{
-    DeadlineInput, RowContext, build_user_message, derive_deadline_and_tier, truncate_field_reason,
-    truncate_one_line, truncate_reason,
+    DeadlineInput, RowContext, build_user_message, check_importance, derive_deadline_and_tier,
+    truncate_field_reason, truncate_one_line, truncate_reason,
 };
 use crate::types::FieldReasons;
 use chrono::{DateTime, Utc};
@@ -247,18 +247,12 @@ pub fn normalize_category(raw: &str) -> String {
 // classify() — delegates transport to [`crate::triage::llm`].
 // ===========================================================================
 
-/// The outcome of a single Stage-1 [`classify`] call.
-#[derive(Debug)]
-pub enum ClassifyOutcome {
-    /// Parsed, schema-valid output (importance range validated) + usage. The
-    /// output is boxed so this large variant doesn't bloat the whole enum.
-    Ok(Box<Stage1Output>, Option<Usage>),
-    /// The model declined. Keep the heuristic seed values; the caller stamps
-    /// `heuristic-only`.
-    Refused,
-    /// A permanent (non-retryable) failure. Keep the heuristic seed values.
-    Failed(String),
-}
+/// The outcome of a single Stage-1 [`classify`] call: parsed, schema-valid
+/// output (importance range validated) + usage, or a refusal / permanent
+/// failure, both of which keep the heuristic seed values (the caller stamps
+/// `heuristic-only`). The output is boxed so the large variant doesn't bloat the
+/// enum.
+pub type ClassifyOutcome = LlmOutcome<Box<Stage1Output>>;
 
 /// Build a fenced [`RowContext`] for a queued Stage-1 row. Stage-1 rows never
 /// carry a Filtered-rule `want_text` (those skip straight to Stage-2).
@@ -273,16 +267,12 @@ fn row_context<'a>(q: &'a Stage1Queued, max_body_chars: usize) -> RowContext<'a>
     }
 }
 
-/// Classify one email against the configured provider using the Stage-1 model.
-pub async fn classify(
-    http: &reqwest::Client,
-    api_key: &str,
-    cfg: &Stage1Config,
-    provider: Stage2Provider,
-    q: &Stage1Queued,
-) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    classify_at(http, llm::provider_url(provider), api_key, cfg, provider, q).await
-}
+classify_entrypoint!(
+    /// Classify one email against the configured provider using the Stage-1 model.
+    Stage1Config,
+    Stage1Queued,
+    ClassifyOutcome,
+);
 
 /// [`classify`] against an explicit endpoint URL (tests point this at a mock).
 pub async fn classify_at(
@@ -301,25 +291,10 @@ pub async fn classify_at(
         user: &user,
         schema: output_schema(),
     };
-    match llm::classify_llm(http, url, api_key, provider, &req).await? {
-        LlmOutcome::Json(text, usage) => finalize_output(&text, usage),
-        LlmOutcome::Refused => Ok(ClassifyOutcome::Refused),
-        LlmOutcome::Failed(kind) => Ok(ClassifyOutcome::Failed(kind)),
-    }
-}
-
-fn finalize_output(
-    text: &str,
-    usage: Option<Usage>,
-) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    let out: Stage1Output = match serde_json::from_str(text) {
-        Ok(o) => o,
-        Err(_) => return Ok(ClassifyOutcome::Failed("json_parse".into())),
-    };
-    if !(0..=100).contains(&out.importance) {
-        return Ok(ClassifyOutcome::Failed("importance_out_of_range".into()));
-    }
-    Ok(ClassifyOutcome::Ok(Box::new(out), usage))
+    llm::classify_into(http, url, api_key, provider, &req, |out: Stage1Output| {
+        check_importance(out.importance).map(|()| Box::new(out))
+    })
+    .await
 }
 
 // ===========================================================================

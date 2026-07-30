@@ -13,7 +13,7 @@
 use crate::config::{Stage2Config, Stage2Provider};
 use crate::store::{Stage2Applied, Stage2Queued};
 use crate::triage::DeadlineHit;
-use crate::triage::llm::{self, LlmOutcome, LlmRequest};
+use crate::triage::llm::{self, LlmOutcome, LlmRequest, classify_entrypoint};
 use crate::triage::text::{truncate_chars, truncate_flagged};
 use crate::types::{FieldReasons, Tier};
 use chrono::{DateTime, Utc};
@@ -277,32 +277,22 @@ pub struct Stage2Output {
 // classify() — delegates transport to [`crate::triage::llm`].
 // ===========================================================================
 
-/// The outcome of a single [`classify`] call.
-#[derive(Debug)]
-pub enum ClassifyOutcome {
-    /// Parsed, schema-valid output (importance range validated) + usage.
-    Ok(Stage2Output, Option<Usage>),
-    /// The model declined (`stop_reason == "refusal"`). Keep Stage-1 values,
-    /// mark the row processed. Redacted — no body logged.
-    Refused,
-    /// A permanent (non-retryable, e.g. 400/401) failure. Mark the row failed
-    /// (processed) so it does not loop. Carries a redacted error type only.
-    Failed(String),
-}
+/// The outcome of a single [`classify`] call: parsed, schema-valid output
+/// (importance range validated) + usage; a refusal, which keeps Stage-1 values
+/// and marks the row processed; or a permanent (non-retryable, e.g. 400/401)
+/// failure carrying a redacted error type, which marks the row processed so it
+/// cannot loop.
+pub type ClassifyOutcome = LlmOutcome<Stage2Output>;
 
-/// Classify one email against the configured Stage-2 provider, parsing the
-/// verdict into a [`Stage2Output`]. Both providers consume the IDENTICAL
-/// prompt/schema. Never logs the request/response body or the API key; a hard
-/// failure returns a redacted [`ClassifyError`].
-pub async fn classify(
-    http: &reqwest::Client,
-    api_key: &str,
-    cfg: &Stage2Config,
-    provider: Stage2Provider,
-    ctx: &RowContext<'_>,
-) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    classify_at(http, llm::provider_url(provider), api_key, cfg, provider, ctx).await
-}
+classify_entrypoint!(
+    /// Classify one email against the configured Stage-2 provider, parsing the
+    /// verdict into a [`Stage2Output`]. Both providers consume the IDENTICAL
+    /// prompt/schema. Never logs the request/response body or the API key; a hard
+    /// failure returns a redacted [`ClassifyError`].
+    Stage2Config,
+    RowContext<'_>,
+    ClassifyOutcome,
+);
 
 /// [`classify`] against an explicit endpoint URL (tests point this at a mock).
 pub async fn classify_at(
@@ -320,27 +310,21 @@ pub async fn classify_at(
         user: &user,
         schema: output_schema(),
     };
-    match llm::classify_llm(http, url, api_key, provider, &req).await? {
-        LlmOutcome::Json(text, usage) => finalize_output(&text, usage),
-        LlmOutcome::Refused => Ok(ClassifyOutcome::Refused),
-        LlmOutcome::Failed(kind) => Ok(ClassifyOutcome::Failed(kind)),
-    }
+    llm::classify_into(http, url, api_key, provider, &req, |out: Stage2Output| {
+        check_importance(out.importance).map(|()| out)
+    })
+    .await
 }
 
-/// Parse the verdict text, validate the importance range, package the outcome.
-fn finalize_output(
-    text: &str,
-    usage: Option<Usage>,
-) -> std::result::Result<ClassifyOutcome, ClassifyError> {
-    let out: Stage2Output = match serde_json::from_str(text) {
-        Ok(o) => o,
-        Err(_) => return Ok(ClassifyOutcome::Failed("json_parse".into())),
-    };
-    // Client-side range validation (schema can't express min/max).
-    if !(0..=100).contains(&out.importance) {
-        return Ok(ClassifyOutcome::Failed("importance_out_of_range".into()));
+/// The client-side `importance` range check BOTH LLM stages apply after parse:
+/// structured output cannot express a numeric min/max, so 0-100 is enforced
+/// here. `Err` carries the redacted failure kind.
+pub(crate) fn check_importance(importance: i64) -> std::result::Result<(), String> {
+    if (0..=100).contains(&importance) {
+        Ok(())
+    } else {
+        Err("importance_out_of_range".to_string())
     }
-    Ok(ClassifyOutcome::Ok(out, usage))
 }
 
 // ===========================================================================

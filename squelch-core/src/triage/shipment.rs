@@ -11,6 +11,7 @@
 //! ambiguous number is kept as `carrier="unknown"` with no URL, never guessed.
 
 use crate::triage::text::rx;
+use crate::types::str_enum;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -33,41 +34,22 @@ pub struct ShipmentInfo {
     pub tracking_url: Option<String>,
 }
 
-/// Coarse shipment lifecycle, ranked so the ingest state machine never regresses
-/// a delivered package back to shipped (see [`ShipmentStatus::rank`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShipmentStatus {
-    Ordered,
-    Shipped,
-    OutForDelivery,
-    Delivered,
-    /// A delivery problem. A FLAG, not a point on the ladder — it can apply at
-    /// any stage, so it carries no monotonic rank.
-    Exception,
+str_enum! {
+    /// Coarse shipment lifecycle, ranked so the ingest state machine never regresses
+    /// a delivered package back to shipped (see [`ShipmentStatus::rank`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ShipmentStatus {
+        Ordered => "ordered",
+        Shipped => "shipped",
+        OutForDelivery => "out_for_delivery",
+        Delivered => "delivered",
+        /// A delivery problem. A FLAG, not a point on the ladder — it can apply at
+        /// any stage, so it carries no monotonic rank.
+        Exception => "exception",
+    }
 }
 
 impl ShipmentStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ShipmentStatus::Ordered => "ordered",
-            ShipmentStatus::Shipped => "shipped",
-            ShipmentStatus::OutForDelivery => "out_for_delivery",
-            ShipmentStatus::Delivered => "delivered",
-            ShipmentStatus::Exception => "exception",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<ShipmentStatus> {
-        match s {
-            "ordered" => Some(ShipmentStatus::Ordered),
-            "shipped" => Some(ShipmentStatus::Shipped),
-            "out_for_delivery" => Some(ShipmentStatus::OutForDelivery),
-            "delivered" => Some(ShipmentStatus::Delivered),
-            "exception" => Some(ShipmentStatus::Exception),
-            _ => None,
-        }
-    }
-
     /// Progress rank for the no-regress state machine: `ordered < shipped <
     /// out_for_delivery < delivered`. `Exception` has none — it is a flag.
     pub fn rank(self) -> Option<u8> {

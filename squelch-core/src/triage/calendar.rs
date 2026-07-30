@@ -12,46 +12,28 @@
 //! subject template. A newsletter that merely mentions "calendar" must not match.
 
 use crate::triage::text::rx;
+use crate::types::str_enum;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// What kind of calendar update this message is. [`as_str`] is a WIRE CONTRACT:
-/// it serializes into `calendar_updates.kind` AND the /client/calendar shape —
-/// "invite" | "update" | "cancellation" | "response".
-///
-/// [`as_str`]: CalendarKind::as_str
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CalendarKind {
-    /// A new invitation ("Invitation: …").
-    Invite,
-    /// A change to an existing event ("Updated invitation: …", "Updated: …").
-    Update,
-    /// The event was canceled ("Canceled event: …", "Canceled: …").
-    Cancellation,
-    /// An attendee's RSVP ("Accepted: …", "Declined: …", "Tentatively
-    /// accepted: …", "New time proposed: …").
-    Response,
-}
-
-impl CalendarKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            CalendarKind::Invite => "invite",
-            CalendarKind::Update => "update",
-            CalendarKind::Cancellation => "cancellation",
-            CalendarKind::Response => "response",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<CalendarKind> {
-        match s {
-            "invite" => Some(CalendarKind::Invite),
-            "update" => Some(CalendarKind::Update),
-            "cancellation" => Some(CalendarKind::Cancellation),
-            "response" => Some(CalendarKind::Response),
-            _ => None,
-        }
+str_enum! {
+    /// What kind of calendar update this message is. [`as_str`] is a WIRE CONTRACT:
+    /// it serializes into `calendar_updates.kind` AND the /client/calendar shape —
+    /// "invite" | "update" | "cancellation" | "response".
+    ///
+    /// [`as_str`]: CalendarKind::as_str
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CalendarKind {
+        /// A new invitation ("Invitation: …").
+        Invite => "invite",
+        /// A change to an existing event ("Updated invitation: …", "Updated: …").
+        Update => "update",
+        /// The event was canceled ("Canceled event: …", "Canceled: …").
+        Cancellation => "cancellation",
+        /// An attendee's RSVP ("Accepted: …", "Declined: …", "Tentatively
+        /// accepted: …", "New time proposed: …").
+        Response => "response",
     }
 }
 

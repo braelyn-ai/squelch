@@ -15,7 +15,7 @@
 use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::{BankingApplied, ExtractQueued};
 use crate::triage::extract::{ExtractContext, build_extract_user_message};
-use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, Usage};
+use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, classify_entrypoint};
 use crate::triage::stage1_llm::RECORD_CATEGORIES;
 use crate::triage::text::{truncate_chars, truncate_trimmed};
 use serde::{Deserialize, Serialize};
@@ -128,16 +128,10 @@ pub fn kind_for_category(category: &str) -> &'static str {
 // classify() — delegates transport to [`crate::triage::llm`].
 // ===========================================================================
 
-/// The outcome of a single banking [`classify`] call.
-#[derive(Debug)]
-pub enum ExtractOutcome {
-    /// Parsed, schema-valid output + usage.
-    Ok(BankingOutput, Option<Usage>),
-    /// The model declined; the caller marks the row processed so it cannot loop.
-    Refused,
-    /// A permanent (non-retryable) failure. The caller marks the row processed.
-    Failed(String),
-}
+/// The outcome of a single banking [`classify`] call: parsed, schema-valid
+/// output + usage, or a refusal / permanent (non-retryable) failure — on either
+/// of which the caller marks the row processed so it cannot loop.
+pub type ExtractOutcome = LlmOutcome<BankingOutput>;
 
 fn context<'a>(q: &'a ExtractQueued, max_body_chars: usize) -> ExtractContext<'a> {
     ExtractContext {
@@ -150,17 +144,13 @@ fn context<'a>(q: &'a ExtractQueued, max_body_chars: usize) -> ExtractContext<'a
     }
 }
 
-/// Extract one banking row against the configured provider, on the Stage-1
-/// (small) model.
-pub async fn classify(
-    http: &reqwest::Client,
-    api_key: &str,
-    cfg: &Stage1Config,
-    provider: Stage2Provider,
-    q: &ExtractQueued,
-) -> std::result::Result<ExtractOutcome, ClassifyError> {
-    classify_at(http, llm::provider_url(provider), api_key, cfg, provider, q).await
-}
+classify_entrypoint!(
+    /// Extract one banking row against the configured provider, on the Stage-1
+    /// (small) model.
+    Stage1Config,
+    ExtractQueued,
+    ExtractOutcome,
+);
 
 /// [`classify`] against an explicit endpoint URL (tests point this at a mock).
 pub async fn classify_at(
@@ -179,18 +169,9 @@ pub async fn classify_at(
         user: &user,
         schema: output_schema(),
     };
-    match llm::classify_llm(http, url, api_key, provider, &req).await? {
-        LlmOutcome::Json(text, usage) => Ok(finalize_output(&text, usage)),
-        LlmOutcome::Refused => Ok(ExtractOutcome::Refused),
-        LlmOutcome::Failed(kind) => Ok(ExtractOutcome::Failed(kind)),
-    }
-}
-
-fn finalize_output(text: &str, usage: Option<Usage>) -> ExtractOutcome {
-    match serde_json::from_str::<BankingOutput>(text) {
-        Ok(o) => ExtractOutcome::Ok(o, usage),
-        Err(_) => ExtractOutcome::Failed("json_parse".into()),
-    }
+    // No post-parse validation here: `account_hint` and the text fields are
+    // sanitized in [`apply_result`], so the parsed record IS the outcome.
+    llm::classify_into(http, url, api_key, provider, &req, Ok::<BankingOutput, _>).await
 }
 
 // ===========================================================================
