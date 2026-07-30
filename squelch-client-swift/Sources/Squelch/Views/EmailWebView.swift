@@ -55,7 +55,7 @@ import WebKit
 struct EmailWebView: View {
     let html: String
     /// Stable id (message id) for the height memory.
-    var cacheKey: String?
+    let cacheKey: String?
     /// Image srcs already shown by a CHRONOLOGICALLY EARLIER message in this
     /// thread; each is dropped from this one.
     ///
@@ -63,7 +63,7 @@ struct EmailWebView: View {
     /// against ITSELF, which is what collapses the stack of signature copies a
     /// quoted history drags along behind it. Only cross-message suppression
     /// needs a thread to supply this.
-    var seenEarlier: Set<String> = []
+    let seenEarlier: Set<String>
 
     @Environment(Prefs.self) private var prefs
     @Environment(AppStore.self) private var store
@@ -74,15 +74,32 @@ struct EmailWebView: View {
     @State private var quotedHidden = true
     @State private var measured = false
 
-    /// The tracker-strip + link-extraction pass, computed ONCE per html string.
+    /// The tracker-strip + dedupe + link-extraction pass for THIS body.
     ///
-    /// These were computed as `var`s off `html` on every body evaluation, which
-    /// meant a full regex scan of every message body in the thread on every
-    /// single scroll frame — enough to make the whole viewer feel locked up.
-    /// `Prepared` is cached by content so scrolling costs nothing.
-    @State private var prepared: Prepared = .empty
+    /// Warmed at PREFETCH time (ThreadPrefetch fills PreparedBodies off the
+    /// main actor as soon as a thread lands in the cache) and read back in
+    /// `init`, so the ordinary open hands the frame a finished document on its
+    /// first evaluation. Two separate costs are being removed, not one: the
+    /// scans, which are a full regex walk of the body, and the runloop beat a
+    /// `.task` needs before it can deliver anything — and the Coordinator
+    /// refuses to load a placeholder, so that beat WAS the blank frame.
+    ///
+    /// The `.task` below is the cold path (opened before the warmer finished,
+    /// or evicted), not the normal one.
+    @State private var prepared: Prepared
 
-    struct Prepared: Equatable {
+    /// Explicit because `prepared` is seeded from the warm cache here, in the
+    /// initializer — the earliest point that exists. `@State` cannot be
+    /// assigned from `body`, and every later hook is a frame too late.
+    init(html: String, cacheKey: String? = nil, seenEarlier: Set<String> = []) {
+        self.html = html
+        self.cacheKey = cacheKey
+        self.seenEarlier = seenEarlier
+        _prepared = State(
+            initialValue: PreparedBodies.shared.get(Prepared.cacheKey(html, seenEarlier)) ?? .empty)
+    }
+
+    struct Prepared: Equatable, Sendable {
         var sourceHash: Int
         var html: String
         var blocked: Int
@@ -208,11 +225,26 @@ struct EmailWebView: View {
                 height = remembered
             }
         }
-        // Prepare once per content change, never per render.
+        // COLD PATH ONLY — `init` already seeded `prepared` from the warmer,
+        // so this runs for a body opened before its thread finished warming
+        // (or one whose entry has since been evicted). Off the main actor,
+        // because the scans are exactly as expensive here as they are there,
+        // and the result goes back into the cache so the next open is warm.
         .task(id: preparedKey) {
-            if prepared.sourceHash != preparedKey {
-                prepared = Prepared.make(from: html, seenEarlier: seenEarlier)
+            guard prepared.sourceHash != preparedKey else { return }
+            let key = preparedKey
+            if let warm = PreparedBodies.shared.get(key) {
+                prepared = warm
+                return
             }
+            let source = html
+            let seen = seenEarlier
+            let made = await Task.detached(priority: .userInitiated) {
+                Prepared.make(from: source, seenEarlier: seen)
+            }.value
+            PreparedBodies.shared.set(key, made)
+            guard !Task.isCancelled else { return }
+            prepared = made
         }
         // SAFETY NET: the view is sized purely from what the measuring script
         // reports, so if that never arrives (a pathological document, a load

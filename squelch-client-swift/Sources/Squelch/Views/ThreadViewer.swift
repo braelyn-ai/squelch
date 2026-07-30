@@ -40,7 +40,7 @@ struct ThreadViewer: View {
     @State private var debugInfo: TriageDebug?
     /// messageId -> image srcs an earlier message in this thread already showed.
     /// Rebuilt with the thread and thrown away with it — nothing crosses
-    /// threads. See `repeatedImages(in:)`.
+    /// threads. See `ThreadPrefetch.repeatedImages(in:)`.
     @State private var repeatedImages: [Int: Set<String>] = [:]
 
     enum ConfirmMode: Equatable { case ask, noLink }
@@ -323,34 +323,15 @@ struct ThreadViewer: View {
     /// The repeated-image pass in particular must not be a computed property:
     /// it strips and scans every message body, and the surrounding view
     /// re-evaluates on every scroll frame — the same trap EmailWebView's
-    /// `Prepared` cache exists to close.
+    /// `Prepared` cache exists to close. The prefetch warmer normally has it
+    /// computed already (off the main actor, alongside the prepared bodies);
+    /// only a thread that opened ahead of its warmer pays for it here.
     private func adopt(_ view: ClientThreadView) {
         thread = view
-        repeatedImages = Self.repeatedImages(in: view)
+        repeatedImages =
+            ThreadPrefetch.shared.cachedRepeatedImages(threadId)
+            ?? ThreadPrefetch.repeatedImages(in: view)
         index = 0  // newest renders first — land on it
-    }
-
-    /// messageId -> image srcs already shown by an earlier message.
-    ///
-    /// "EARLIER" MEANS CHRONOLOGICALLY EARLIER, so this walks `view.messages`
-    /// (server order, oldest first) and NOT the newest-first order the reader
-    /// sees. Walking the display order instead would keep the newest copy of a
-    /// signature and suppress the original — hiding the image in the message
-    /// that actually introduced it.
-    ///
-    /// Scans TRACKER-STRIPPED html for the same reason the strip runs first in
-    /// EmailWebView: a tracking pixel is removed from every message anyway, so
-    /// letting one register as a "first occurrence" here could suppress a real
-    /// image that shares its src and leave the thread showing none at all.
-    private static func repeatedImages(in view: ClientThreadView) -> [Int: Set<String>] {
-        var seen = Set<String>()
-        var out: [Int: Set<String>] = [:]
-        for message in view.messages {
-            out[message.id] = seen
-            guard let html = message.html, !html.isEmpty else { continue }
-            seen.formUnion(ImageRepeats.sources(Trackers.strip(html).html))
-        }
-        return out
     }
 
     /// Best-effort: a failed lookup just leaves the hint in its default state.
