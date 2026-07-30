@@ -1,25 +1,8 @@
-//! Installed-app (Desktop) OAuth 2.0 for Gmail.
-//!
-//! The flow, end to end:
-//! 1. Build the Google consent URL with PKCE and the requested scopes,
-//!    targeting a loopback redirect on a `127.0.0.1` port (ephemeral by
-//!    default, fixed in headless mode).
-//! 2. Print the URL and (unless headless) best-effort open the browser.
-//! 3. Block on a one-shot loopback HTTP listener for Google's redirect, pull
-//!    the `code`, and verify the `state` matches our CSRF token.
-//! 4. Exchange the code (+ PKCE verifier) for access + refresh tokens.
-//!
-//! TWO-DOOR: [`AuthScopes::Read`] requests only [`GMAIL_READONLY_SCOPE`] (sync +
-//! triage). [`AuthScopes::Write`] requests [`WRITE_SCOPES`] (`gmail.modify` +
-//! `gmail.send`) for the human-door action credential. Which one is minted is an
-//! explicit caller choice; they never overlap.
-//!
-//! HEADLESS: with [`AuthFlowOptions::headless`] the browser is NOT auto-opened
-//! and the loopback listener binds a FIXED port ([`DEFAULT_HEADLESS_PORT`]) so a
-//! remote box can complete consent over an SSH tunnel:
-//! `ssh -L 8847:127.0.0.1:8847 baddiebox`, then open the printed URL locally.
-//!
-//! SECURITY: we never log the code, tokens, or the client secret.
+//! Installed-app (Desktop) OAuth 2.0 for Gmail: PKCE consent URL -> loopback
+//! redirect on `127.0.0.1` -> code exchange, with `state` verified as a CSRF token.
+//! TWO-DOOR: one token per call, never both scope sets — [`AuthScopes::Read`] mints
+//! [`GMAIL_READONLY_SCOPE`], [`AuthScopes::Write`] mints [`WRITE_SCOPES`] for
+//! human-door actions. The code, tokens, and client secret are never logged.
 
 use crate::config::{GMAIL_READONLY_SCOPE, OAuthClientConfig, WRITE_SCOPES};
 use crate::credentials::{CredentialKind, StoredToken};
@@ -80,8 +63,7 @@ pub struct AuthFlowOptions {
     pub scopes: AuthScopes,
     /// Headless: don't auto-open a browser; bind a fixed, SSH-forwardable port.
     pub headless: bool,
-    /// Fixed loopback port for headless mode. Defaults to
-    /// [`DEFAULT_HEADLESS_PORT`]. Ignored (ephemeral port) when not headless.
+    /// Fixed loopback port for headless mode; ignored (ephemeral) otherwise.
     pub port: u16,
 }
 
@@ -99,17 +81,16 @@ fn map_oauth_err<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> CoreError + '
     move |e| CoreError::Credential(format!("{ctx}: {e}"))
 }
 
-/// Back-compat: run the interactive read-only flow with an ephemeral port and a
-/// browser auto-open. Equivalent to `run_auth_flow(client, &AuthFlowOptions::default())`.
+/// Run the interactive read-only flow with the defaults: ephemeral port, browser
+/// auto-open.
 pub fn run_installed_app_flow(client: &OAuthClientConfig) -> Result<StoredToken> {
     run_auth_flow(client, &AuthFlowOptions::default())
 }
 
-/// Run the full interactive authorization flow with explicit options and return
-/// the resulting token. Blocks the current thread while waiting for the browser
-/// redirect.
+/// Run the interactive authorization flow and return the token. BLOCKS the calling
+/// thread until the browser redirect arrives.
 pub fn run_auth_flow(client: &OAuthClientConfig, opts: &AuthFlowOptions) -> Result<StoredToken> {
-    // Headless -> a FIXED port that can be SSH-forwarded; otherwise ephemeral.
+    // Headless -> a FIXED port so it can be SSH-forwarded; otherwise ephemeral.
     let bind_addr = if opts.headless {
         format!("127.0.0.1:{}", opts.port)
     } else {
@@ -197,8 +178,7 @@ pub fn run_auth_flow(client: &OAuthClientConfig, opts: &AuthFlowOptions) -> Resu
 /// Block on the loopback listener for a single redirect request, validate the
 /// CSRF `state`, and return the authorization `code`.
 fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    // Loop so we can skip stray/empty pokes (e.g. favicon probes) and only act
-    // on the first request that actually carries OAuth params.
+    // Loop so stray pokes (favicon probes) don't consume the one-shot listener.
     loop {
         let (mut stream, _) = listener
             .accept()
@@ -270,8 +250,7 @@ fn parse_redirect_query(path: &str) -> (Option<String>, Option<String>) {
     (code, state)
 }
 
-/// Minimal percent-decoder (also turns '+' into space) — enough for OAuth
-/// redirect params, no external dep needed.
+/// Minimal percent-decoder (also '+' -> space); enough for OAuth redirect params.
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

@@ -1,11 +1,8 @@
-//! Stage-1 sealed-message detector.
-//!
-//! Auth-related mail (2FA codes, password resets, magic links, login alerts,
-//! verification) must be sealed BEFORE anything else looks at it. The detector
-//! biases toward over-sealing: recall over precision. A false positive just
-//! hides a benign email from the agent (the TUI still shows it); a false
-//! negative leaks a security-sensitive code to an LLM/agent. We prefer the
-//! former.
+//! Stage-1 sealed-message detector: auth mail (2FA codes, password resets, magic
+//! links, login alerts, verification) must be detected BEFORE any other pass reads
+//! the body. Biases to recall over precision — a false seal only hides benign mail
+//! from the agent, a false negative leaks a code to an LLM/agent.
+//! See docs/SECURITY.md §4.
 
 use crate::types::SealedKind;
 use regex::Regex;
@@ -24,28 +21,22 @@ struct Detector {
     magic_link: Vec<Regex>,
     login_alert: Vec<Regex>,
     verification: Vec<Regex>,
-    /// Sender-shape corroborators: security@/donotreply@/etc. at a financial-ish
-    /// domain. Used to seal weaker login-ish phrasing when the sender looks like
-    /// a bank/security notifier (bug #4).
+    /// Sender-shape corroborators: security@/donotreply@ at a financial-ish
+    /// domain, used to seal weaker login-ish phrasing.
     security_sender: Vec<Regex>,
     financial_domain: Vec<Regex>,
-    /// Weaker login-ish phrasing that only seals when corroborated by a
-    /// security-shaped sender.
+    /// Weaker login-ish phrasing; seals only with a security-shaped sender.
     login_soft: Vec<Regex>,
-    /// Concrete, reader-addressed OTP codes (digits or "your code is"). These
-    /// seal even when the email otherwise looks like marketing — a genuine code
-    /// leak is the highest-stakes miss.
+    /// Concrete, reader-addressed OTP codes. These seal even past the marketing
+    /// guard — a genuine code leak is the highest-stakes miss.
     otp_code: Vec<Regex>,
-    /// Marketing / newsletter markers (unsubscribe, "view in browser", …). An
-    /// auth-as-a-service vendor (WorkOS, Auth0, Clerk, …) sends newsletters that
-    /// talk about 2FA/SSO/magic-links as PRODUCTS; those must NOT be sealed.
-    /// When these fire, topical auth mentions are ignored (a real 2FA/reset
-    /// email is transactional, never a marketing blast).
+    /// Marketing / newsletter markers. When these fire, topical auth mentions are
+    /// ignored: an auth vendor's newsletter discusses 2FA/SSO/magic-links as
+    /// PRODUCTS, and a real auth email is transactional, never a blast.
     marketing: Vec<Regex>,
 }
 
 fn rx(p: &str) -> Regex {
-    // All patterns are authored case-insensitive.
     Regex::new(&format!("(?i){p}")).expect("static seal regex must compile")
 }
 
@@ -87,7 +78,6 @@ fn detector() -> &'static Detector {
             rx(r"\bwas this you\b"),
             rx(r"\bsomeone (just )?(signed|logged) in\b"),
             rx(r"\bsign[-\s]?in (attempt|detected)\b"),
-            // bug #4: Schwab-style "Confirming your recent login".
             rx(r"\bconfirming your (recent )?login\b"),
             rx(r"\bsigned in (to|from)\b"),
             rx(r"\blogin (from|detected|alert)\b"),
@@ -104,18 +94,15 @@ fn detector() -> &'static Detector {
             rx(r"^(security|secure|donotreply|do[-_.]?not[-_.]?reply|no[-_.]?reply|alerts?|account|notify|notifications?)@"),
         ],
         financial_domain: vec![
-            // Bank/broker-ish domains and mail-subdomains thereof.
             rx(r"@(mail\.)?(schwab|chase|wellsfargo|bankofamerica|bofa|citi|capitalone|amex|americanexpress|fidelity|vanguard|paypal|venmo|ally|discover|usbank|pnc|tdbank)\."),
             rx(r"@[^@]*(bank|creditunion|financial|fcu)\."),
         ],
         login_soft: vec![
-            // Weaker phrasing that seals only with a security-shaped sender.
             rx(r"\blog(ged)?[-\s]?in\b"),
             rx(r"\bsign(ed)?[-\s]?in\b"),
             rx(r"\baccount (access|activity)\b"),
         ],
         otp_code: vec![
-            // Reader-addressed codes — a newsletter never says these TO you.
             rx(r"\bcode[:\s]+\d{4,8}\b"),
             rx(r"\b\d{4,8}\s+is your\b"),
             rx(r"\byour code is\b"),
@@ -145,16 +132,14 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
     let d = detector();
     let hay = [input.subject, input.body];
 
-    // A concrete, reader-addressed OTP code always seals — even if the email
-    // otherwise looks like marketing. This is the highest-stakes leak.
+    // A concrete reader-addressed code always seals — it wins over the marketing
+    // guard below, because a leaked code is the highest-stakes miss.
     if any_match(&d.otp_code, &hay) {
         return Some(SealedKind::Otp);
     }
 
-    // Marketing / newsletter blast: an auth-as-a-service vendor's newsletter
-    // talks about 2FA / SSO / magic-links as PRODUCT features. Those topical
-    // mentions must NOT seal it (a genuine auth email is transactional, never a
-    // marketing blast). The concrete-code check above still wins over this.
+    // Auth-vendor newsletters discuss 2FA / SSO / magic-links as PRODUCTS; those
+    // topical mentions must NOT seal.
     if any_match(&d.marketing, &hay) {
         return None;
     }
@@ -174,9 +159,8 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
     if any_match(&d.verification, &hay) {
         return Some(SealedKind::Verification);
     }
-    // bug #4 corroborator: weaker login-ish phrasing seals when the sender looks
-    // like a security/no-reply notifier at a financial-ish domain. Biased to
-    // over-seal: a bank telling you about account access is auth-adjacent.
+    // Weak login-ish phrasing seals when the sender is a security/no-reply
+    // notifier at a financial-ish domain — biased to over-seal.
     let sender_is_security = d
         .security_sender
         .iter()
@@ -271,8 +255,7 @@ mod tests {
 
     #[test]
     fn bug4_schwab_login_confirmation_seals() {
-        // Confirmed against real mail: this LOGIN ALERT scored noise/40
-        // fallthrough and was NOT sealed. It must be Sealed(LoginAlert).
+        // A bank's login-confirmation notice must seal as LoginAlert.
         let got = detect_sealed(&inp_from(
             "donotreply@mail.schwab.com",
             "Confirming your recent login",
@@ -316,8 +299,7 @@ mod tests {
             )),
             Some(SealedKind::LoginAlert),
         );
-        // Same weak phrasing from a random marketing sender => NOT sealed
-        // (no strong phrasing, no security/financial sender shape).
+        // Same weak phrasing from a marketing sender => NOT sealed.
         assert_eq!(
             detect_sealed(&inp_from(
                 "hello@randomshop.com",
@@ -330,8 +312,7 @@ mod tests {
 
     #[test]
     fn marketing_signin_offer_does_not_seal() {
-        // Negative fixture: pure marketing that mentions "sign in to view your
-        // offer" from a non-financial marketing sender should not seal.
+        // Marketing that mentions signing in, from a non-financial sender.
         assert_eq!(
             detect_sealed(&inp_from(
                 "deals@shopmail.com",
@@ -344,9 +325,8 @@ mod tests {
 
     #[test]
     fn auth_vendor_newsletter_does_not_seal() {
-        // WorkOS et al. sell auth; their newsletters talk about 2FA / SSO /
-        // magic links as PRODUCTS. With marketing markers present, topical auth
-        // mentions must NOT seal.
+        // Auth vendors' newsletters discuss 2FA / SSO / magic links as PRODUCTS:
+        // with marketing markers present, topical auth mentions must NOT seal.
         let cases = [
             (
                 "marketing@workos.com",
@@ -375,8 +355,7 @@ mod tests {
 
     #[test]
     fn real_code_seals_even_with_marketing_footer() {
-        // A genuine OTP with a footer must still seal — the concrete-code check
-        // wins over the marketing guard.
+        // The concrete-code check wins over the marketing guard.
         assert_eq!(
             detect_sealed(&inp_from(
                 "noreply@service.com",

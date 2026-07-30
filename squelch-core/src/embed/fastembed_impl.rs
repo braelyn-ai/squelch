@@ -1,7 +1,6 @@
-//! Production [`Embedder`]: fastembed (ONNX Runtime, CPU) with weights cached on
-//! disk. First construction with a not-yet-cached model triggers a one-time
-//! download to `settings.cache_dir` (we log a single redacted notice); every
-//! later run loads locally with no network.
+//! Production [`Embedder`]: fastembed (ONNX Runtime, CPU), weights cached on disk.
+//! A not-yet-cached model triggers a one-time download to `settings.cache_dir`;
+//! every later run loads locally with no network.
 
 use std::sync::Mutex;
 
@@ -10,19 +9,17 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use super::{EmbedSettings, Embedder};
 use crate::error::{CoreError, Result};
 
-/// fastembed-backed embedder. `TextEmbedding::embed` takes `&mut self`, so the
-/// model sits behind a `Mutex`; embedding is CPU work run under
-/// `spawn_blocking`, so the brief lock contention is a non-issue.
+/// fastembed-backed embedder. `TextEmbedding::embed` takes `&mut self`, hence the
+/// `Mutex`; embedding runs under `spawn_blocking`, so contention is a non-issue.
 pub struct FastEmbedder {
     model: Mutex<TextEmbedding>,
     dims: usize,
 }
 
 impl FastEmbedder {
-    /// Construct from resolved [`EmbedSettings`]. Downloads weights on first use
-    /// (logs one notice). Fails if the model name is unknown or the reported
-    /// dimension disagrees with `settings.dims` (a config/schema mismatch that
-    /// would silently corrupt the vec0 table otherwise).
+    /// Construct from resolved [`EmbedSettings`], downloading weights on first use.
+    /// Errors on an unknown model name, or a reported dimension that disagrees with
+    /// `settings.dims` — such a mismatch would silently corrupt the vec0 table.
     pub fn new(settings: &EmbedSettings) -> Result<Self> {
         let (model, dim) = resolve_model(&settings.model_name)?;
         if dim != settings.dims {
@@ -32,9 +29,7 @@ impl FastEmbedder {
             )));
         }
 
-        // One-line first-download notice. fastembed itself prints a progress bar
-        // when show_download_progress is on; we add a stable, greppable line so
-        // operators know weights are being fetched to the data dir on first run.
+        // A stable, greppable line so operators know weights are being fetched.
         let already_cached = model_appears_cached(&settings.cache_dir);
         if !already_cached {
             eprintln!(
@@ -85,10 +80,8 @@ impl Embedder for FastEmbedder {
 }
 
 /// Map a config model-name string to a fastembed [`EmbeddingModel`] + its
-/// dimension. Accepts either the canonical fastembed `model_code`
-/// (e.g. "Qdrant/bge-small-en-v1.5") or a friendly short alias
-/// ("bge-small-en-v1.5", "BGESmallENV15"). Default lives in
-/// [`crate::config::EmbedConfig`], not here.
+/// dimension. Accepts the canonical fastembed `model_code`
+/// ("Qdrant/bge-small-en-v1.5") or a short alias ("bge-small-en-v1.5").
 fn resolve_model(name: &str) -> Result<(EmbeddingModel, usize)> {
     let want = name.trim().to_lowercase();
     // Friendly aliases -> the fastembed model_code substring to match on.
@@ -107,15 +100,14 @@ fn resolve_model(name: &str) -> Result<(EmbeddingModel, usize)> {
     )))
 }
 
-/// Best-effort check for whether the model cache dir already holds weights, so
-/// the first-download notice fires only on an actual download. If we can't tell,
-/// assume not cached (worst case: an extra notice line).
+/// Best-effort check for weights already in the cache dir, so the first-download
+/// notice fires only on a real download. Unknowable -> assume not cached (worst
+/// case: one extra notice line).
 fn model_appears_cached(cache_dir: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return false;
     };
-    // fastembed lays weights out under per-model subdirs; any non-empty subdir
-    // means something was already fetched here.
+    // fastembed lays weights out in per-model subdirs; any non-empty one counts.
     for entry in entries.flatten() {
         if entry.path().is_dir()
             && std::fs::read_dir(entry.path())

@@ -1,14 +1,8 @@
-//! On-box semantic embeddings for v1 recall ("what did I say I'd send X").
+//! On-box semantic embeddings for recall ("what did I say I'd send X").
 //!
-//! SECURITY INVARIANT: sealed (auth/2FA) content is NEVER embedded. The store's
-//! embed-at-write path is gated on `sensitivity == Normal`, so sealed text is
-//! structurally absent from the vector space — there is nothing to filter later.
-//! This module holds no such gate itself (it just turns text into vectors); the
-//! gate lives at every call site in the store.
-//!
-//! The [`Embedder`] trait is the seam: production uses [`FastEmbedder`] (ONNX,
-//! CPU-only, weights cached under the data dir); tests use a tiny deterministic
-//! stub so the SQL/gating can be unit-tested without a model download.
+//! SECURITY INVARIANT: sealed (auth/2FA) content is NEVER embedded. The gate is
+//! the store's embed-at-write path (`sensitivity == Normal`), not this module —
+//! sealed text is structurally absent from the vector space. See docs/SECURITY.md.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -20,17 +14,13 @@ mod fastembed_impl;
 pub use fastembed_impl::FastEmbedder;
 
 /// Turns text into a fixed-dimension embedding vector. CPU-bound; callers run it
-/// off the async poll loop (`spawn_blocking`) so ingest never stalls on it.
-///
-/// The dimension MUST match the vec0 table's `float[N]` declaration (see
-/// `store/schema.sql`, `message_vecs`). [`Embedder::dims`] exposes it so the
-/// store can assert at open time.
+/// under `spawn_blocking` so ingest never stalls on it. `dims()` MUST match the
+/// vec0 `message_vecs` `float[N]` declaration in `store/schema.sql`.
 pub trait Embedder: Send + Sync {
     /// Embed a single piece of text into a `dims()`-length `f32` vector.
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
 
-    /// Embed a batch. Default fans out to [`Embedder::embed`]; the fastembed impl
-    /// overrides this to use a single batched ONNX pass (the backfill hot path).
+    /// Embed a batch; the default fans out to [`Embedder::embed`].
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
@@ -40,7 +30,6 @@ pub trait Embedder: Send + Sync {
 }
 
 /// Resolved embedding config: which model, how wide, and where weights cache.
-/// Built from [`crate::config::EmbedConfig`] plus the data dir.
 #[derive(Debug, Clone)]
 pub struct EmbedSettings {
     /// fastembed model identifier string (e.g. "bge-small-en-v1.5").
@@ -51,10 +40,9 @@ pub struct EmbedSettings {
     pub cache_dir: PathBuf,
 }
 
-/// Flatten a message into the text we embed: subject then body, joined by a
-/// blank line, truncated to `max_chars` characters (on a char boundary). This is
-/// the single canonical shaping used at BOTH ingest and query embed time so the
-/// vector space is consistent.
+/// Flatten a message into embed text: subject, blank line, body, truncated to
+/// `max_chars` on a char boundary. MUST be the identical shaping at ingest and at
+/// query time, or the vector space is inconsistent.
 pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String {
     let mut s = String::with_capacity(subject.len() + body.len() + 2);
     s.push_str(subject.trim());
@@ -76,14 +64,12 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Default number of characters of `subject + body` fed to the embedder.
 pub const DEFAULT_EMBED_MAX_CHARS: usize = 2000;
 
-/// A deterministic, download-free [`Embedder`] for tests. Produces a stable
-/// vector from a bag-of-words hash so "planted relevant doc ranks above decoy"
-/// is reproducible offline. NOT for production (no semantics beyond token
-/// overlap).
+/// Deterministic, download-free [`Embedder`] for tests: a bag-of-words hash, so
+/// "planted doc ranks above decoy" is reproducible offline. Not for production —
+/// no semantics beyond token overlap.
 #[derive(Debug)]
 pub struct StubEmbedder {
     dims: usize,
-    // Kept for API symmetry / potential future locking parity with real impls.
     _guard: Mutex<()>,
 }
 
@@ -101,8 +87,8 @@ impl Embedder for StubEmbedder {
         if self.dims == 0 {
             return Err(CoreError::Other(anyhow::anyhow!("stub embedder dims=0")));
         }
-        // Hash each lowercased token into a bucket and L2-normalize. Documents
-        // sharing tokens end up close; unrelated ones do not.
+        // Hash lowercased tokens into buckets, then L2-normalize: docs sharing
+        // tokens end up close, unrelated ones do not.
         let mut v = vec![0.0f32; self.dims];
         for tok in text
             .to_lowercase()

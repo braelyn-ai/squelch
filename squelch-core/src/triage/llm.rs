@@ -1,22 +1,8 @@
-//! Shared LLM provider plumbing for BOTH triage stages.
-//!
-//! Stage-1 (small model, runs on every non-sealed, non-rule-decided email) and
-//! Stage-2 (more capable escalation model) both talk to the SAME two providers
-//! (Anthropic Messages API + OpenAI Chat Completions) with the SAME retry
-//! discipline, the SAME structured-output request shape, and the SAME
-//! injection-fenced prompt structure. This module owns that provider call so
-//! neither stage forks the transport.
-//!
-//! What lives here: the wire request/response types, the retry policy, the
-//! truncation-retry, the refusal/permanent-failure classification, and the
-//! [`classify_llm`] entry point that returns the model's raw JSON verdict text
-//! plus token usage. What lives in each stage: the (static, cache-friendly)
-//! system prompt, the fenced user message, the output schema, and the parse +
-//! apply of that stage's own verdict struct.
-//!
-//! REDACTION: this module NEVER logs email bodies, subjects, the API key, or raw
-//! request/response bodies. Callers log counts, the model id, redacted error
-//! types, and token-usage numbers (which are fine to log).
+//! Shared provider plumbing for both triage stages (Anthropic Messages API +
+//! OpenAI Chat Completions): wire types, retry policy, truncation-retry,
+//! refusal/permanent-failure classification, and [`classify_llm`]. Each stage
+//! owns only its system prompt, fenced user message, schema, and verdict parse.
+//! REDACTION: never log email bodies, subjects, the API key, or raw bodies.
 
 use crate::config::Stage2Provider;
 use serde::{Deserialize, Serialize};
@@ -44,11 +30,10 @@ pub fn provider_url(provider: Stage2Provider) -> &'static str {
     }
 }
 
-/// A single LLM classification request, shared by both stages. `system` is the
-/// stage's STATIC system prompt (identical bytes every call so haiku prompt
-/// caching can apply); `user` is the stage's fenced TRUSTED/UNTRUSTED message;
-/// `schema` is the stage's structured-output JSON schema. `model` is written
-/// verbatim into the request.
+/// A single LLM classification request, shared by both stages. `system` must be
+/// the stage's STATIC prompt (identical bytes every call, so prompt caching can
+/// apply); `user` is the stage's fenced TRUSTED/UNTRUSTED message. `model` is
+/// written verbatim into the request.
 pub struct LlmRequest<'a> {
     pub model: &'a str,
     pub system: &'a str,
@@ -59,8 +44,8 @@ pub struct LlmRequest<'a> {
 /// The outcome of a single [`classify_llm`] call.
 #[derive(Debug)]
 pub enum LlmOutcome {
-    /// The model's raw JSON verdict text (schema-valid per the provider) + usage.
-    /// The caller parses this into its own stage verdict struct.
+    /// The model's raw JSON verdict text + usage; the caller parses it into its
+    /// own stage verdict struct.
     Json(String, Option<Usage>),
     /// The model declined (`stop_reason == "refusal"` / OpenAI `refusal` field).
     Refused,
@@ -76,7 +61,7 @@ pub struct ClassifyError {
     /// A short, redacted description (status code / error type only).
     pub kind: String,
     /// Whether this was a retryable class that exhausted its budget (vs. a hard
-    /// transport error). Informational for logging.
+    /// transport error). Informational only.
     pub retryable: bool,
 }
 
@@ -91,13 +76,12 @@ impl std::fmt::Display for ClassifyError {
 }
 
 /// Classify one email against the configured provider, returning the model's raw
-/// JSON verdict text (the caller parses + validates it). Both providers consume
+/// JSON verdict text for the caller to parse and validate. Both providers consume
 /// the IDENTICAL system prompt, fenced user message, and output schema.
 ///
-/// Retry policy (shared): 429 (honor `retry-after`) and 529/5xx are retryable
-/// with exponential backoff (cap 60s, max 3 tries); 400/401 are permanent. A
-/// truncation is retried once at a higher token budget; a refusal yields
-/// [`LlmOutcome::Refused`].
+/// Retry policy: 429 (honors `retry-after`) and 529/5xx retry with exponential
+/// backoff (60s cap, 3 tries); 400/401 are permanent; a truncation retries once
+/// at a higher token budget.
 pub async fn classify_llm(
     http: &reqwest::Client,
     url: &str,
@@ -408,7 +392,7 @@ async fn classify_openai(
     }
 }
 
-/// Internal: the two success shapes from [`send_with_retry`].
+/// The two success shapes from [`send_with_retry`].
 enum SendOk<T> {
     Body(T),
     /// A permanent (400/401) failure with a redacted kind string.
@@ -428,7 +412,7 @@ struct ApiErrorInner {
     kind: Option<String>,
 }
 
-/// POST the request, applying the SHARED retry policy for retryable statuses.
+/// POST the request, applying the retry policy for retryable statuses.
 async fn send_with_retry<T, F>(build: F) -> std::result::Result<SendOk<T>, ClassifyError>
 where
     T: serde::de::DeserializeOwned,

@@ -1,36 +1,8 @@
-//! Triage pipeline.
-//!
-//! Stage 1 has two sub-stages that run at INGEST, in this order:
-//!   1. [`seal`] detector (implemented elsewhere) — seals auth mail before
-//!      anything else can see it. Sealed mail never reaches [`stage1`].
-//!   2. [`stage1`] — the rules engine in this module. A deterministic,
-//!      LLM-free classifier that assigns every non-sealed message a [`Tier`],
-//!      an importance score, and a one-liner. Where it is *not confident*, it
-//!      marks the message for a later Stage-2 LLM pass.
-//!
-//! Stage 2: LLM ranking (stub in v0; ALWAYS skipped for sealed content). The
-//! only messages that should reach Stage-2 are the ones [`stage1`] returns with
-//! `confident == false`.
-//!
-//! ## The Stage-1 ladder (priority order — first match wins)
-//!
-//! 1. **BILL / PAYMENT** — highest recall priority. Missing a bill is the
-//!    user's #1 fear, so bills are checked first and bypass every threshold by
-//!    landing in [`Tier::PastDue`] / [`Tier::Deadline`]. `confident = true`.
-//! 2. **SENDER RULES** — the user's own local rules (glob on the from-address):
-//!    - `Squelch` -> [`Tier::Noise`], confident.
-//!    - `Surface` -> [`Tier::Signal`], confident.
-//!    - `Filtered` -> [`Tier::Noise`], **not confident** — the rule's
-//!      `want_text` is a natural-language filter we can't evaluate without the
-//!      LLM, so it queues for Stage-2 (see TODO below).
-//! 3. **KNOWN CONTACT** — sender appears in the user's Sent mail -> Signal,
-//!    confident.
-//! 4. **ALERT** — ops/monitoring language from an automated sender -> Signal,
-//!    confident.
-//! 5. **NOISE** — unsubscribe/list shapes, receipts, cold-sales -> Noise,
-//!    confident.
-//! 6. **FALL-THROUGH** — unknown sender, no pattern -> the ambiguous middle:
-//!    Noise-ish importance but **not confident**, so Stage-2 gets a look.
+//! Triage pipeline. The [`seal`] detector runs first at ingest, so sealed auth
+//! mail never reaches [`stage1`] — the deterministic, LLM-free classifier here
+//! that gives every non-sealed message a [`Tier`], importance, and one-liner.
+//! Its rungs are first-match-wins and bills are checked first by design.
+//! `confident == false` is the only thing that queues a row for Stage-2.
 
 pub mod calendar;
 pub mod deadline;
@@ -59,9 +31,7 @@ use crate::types::{
 use chrono::{DateTime, Utc};
 
 /// Result of the Stage-1 rules engine for a single (non-sealed) message.
-///
-/// `confident == false` is the signal to the sync engine that this message
-/// should be enqueued for the Stage-2 LLM pass. Everything else is final.
+/// `confident == false` enqueues the row for the Stage-2 LLM pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stage1Result {
     pub tier: Tier,
@@ -73,14 +43,13 @@ pub struct Stage1Result {
     pub matched_rule: Option<i64>,
     /// `true` => final; `false` => queue for Stage-2 LLM triage.
     pub confident: bool,
-    /// Per-property justifications for THIS row's importance / deadline / tier,
-    /// stated as the fact of the branch that produced them. Deterministic —
-    /// derived from the actual rung taken, never generic copy. Threaded to the
-    /// store and served HUMAN-DOOR ONLY (see [`crate::types::FieldReasons`]).
+    /// Per-property justifications for this row's importance / deadline / tier,
+    /// derived from the rung actually taken. Served HUMAN-DOOR ONLY (see
+    /// [`crate::types::FieldReasons`]).
     pub field_reasons: FieldReasons,
 }
 
-/// Legacy triage outcome kept for the store/upsert path. Prefer [`Stage1Result`].
+/// Triage outcome for the store/upsert path. Prefer [`Stage1Result`].
 #[derive(Debug, Clone)]
 pub struct TriageResult {
     pub importance: u8,
@@ -92,15 +61,9 @@ pub struct TriageResult {
     pub matched_rule: Option<i64>,
 }
 
-/// Run the Stage-1 rules engine over a stored-message view.
-///
-/// This is the entry point the sync engine calls, in the same transaction that
-/// stores the (already non-sealed) message. The signature is deliberately free
-/// of IMAP/store types: it takes the core [`NewMessage`] view, a
-/// `is_known_contact` flag the caller derives from Sent-mail contacts, and the
-/// account's [`SenderRule`]s.
-///
-/// Uses the default [`Stage1Config`]. Call [`stage1_with_config`] to override.
+/// Run the Stage-1 rules engine over a stored-message view with the default
+/// [`Stage1Config`]. Called by the sync engine in the same transaction that
+/// stores the (already non-sealed) message.
 pub fn stage1(msg: &NewMessage, is_known_contact: bool, rules: &[SenderRule]) -> Stage1Result {
     stage1_with_config(msg, is_known_contact, rules, &Stage1Config::default(), Utc::now())
 }
@@ -118,42 +81,31 @@ pub fn stage1_with_config(
     let body = msg.body.as_str();
     let from = msg.from_addr.as_str();
 
-    // Resolve the matched sender rule ONCE, up front. Rung 2 still owns the
-    // rule's disposition-driven tiering below; here we only need it to decide
-    // bill-trust in rung 1 (bills are evaluated first). Matching is pure — this
-    // reorder changes no behavior for the non-bill rungs.
+    // Resolved up front because rung 1 (bills, evaluated first) needs it for
+    // bill-trust; rung 2 below still owns the rule's disposition tiering.
     let matched_rule = rules::match_sender_rule(from, rules);
 
     // ---- Rung 1: BILL / PAYMENT (highest recall) ------------------------
     if let Some(hit) = deadline::detect_bill(subject, body, now) {
-        // Sender trust gates the scream. A bill from a TRUSTED sender keeps full
-        // confidence and its natural PastDue/Deadline tier. Trust has two
-        // sources:
-        //   * a KNOWN CONTACT (the sender appears in the user's Sent mail), or
-        //   * an explicit SURFACE sender rule — the user ruled this sender, which
-        //     is a direct statement of trust in their own vendor.
-        // A bill from an UNKNOWN, unruled sender must NOT be allowed to land
-        // CONFIDENT PastDue — that is exactly the scam vector in bug #3 (a
-        // stranger screaming "past due" for $2.4M). We cap it at Deadline, mark
-        // it not-confident (queue for Stage-2), and use a moderate importance.
+        // Sender trust gates the scream: a KNOWN CONTACT, or an explicit SURFACE
+        // rule (the user vouching for their own vendor), keeps full confidence
+        // and the natural PastDue/Deadline tier. A bill from an UNKNOWN, unruled
+        // sender must NEVER land CONFIDENT PastDue — that is the scam vector (a
+        // stranger screaming "past due" for $2.4M): cap at Deadline, mark
+        // not-confident, moderate importance.
         let surface_ruled = matched_rule
             .is_some_and(|r| r.disposition == Disposition::Surface);
         let trusted = is_known_contact || surface_ruled;
 
-        // Sanity dampeners. These NEVER raise a tier; they only shave confidence.
-        // A SURFACE-ruled sender is an EXPLICIT user trust statement: the user
-        // knows their vendor sends big, urgent invoices, so the absurd-amount and
-        // scammy-phrasing dampeners are bypassed for them. Known-contact trust
-        // does NOT bypass the dampeners (a known biller with a $2.4M "past due" is
-        // still suspicious); only the explicit rule does.
+        // Sanity dampeners never raise a tier, only shave confidence. An explicit
+        // SURFACE rule bypasses them (the user knows this vendor sends big, urgent
+        // invoices); mere known-contact trust does not.
         let absurd_amount = hit
             .amount
             .is_some_and(|a| a > cfg.bill_absurd_amount_threshold);
         let scammy = deadline::has_scammy_phrasing(subject, body);
         let dampened = (absurd_amount || scammy) && !surface_ruled;
 
-        // Tier: trusted senders keep their natural tier. Untrusted senders are
-        // capped at Deadline (never PastDue). Dampeners also cap at Deadline.
         let natural_tier = if hit.past_due {
             Tier::PastDue
         } else {
@@ -165,7 +117,6 @@ pub fn stage1_with_config(
             Tier::Deadline
         };
 
-        // Confidence: trusted + no dampener => final. Anything else => Stage-2.
         let confident = trusted && !dampened;
 
         let importance = if trusted {
@@ -188,7 +139,6 @@ pub fn stage1_with_config(
             "bill/payment signal (kind={}, source={}, past_due={})",
             hit.kind, hit.source, hit.past_due
         );
-        // Name the trust source that applied (or that it was absent).
         if surface_ruled {
             if let Some(r) = matched_rule {
                 reason.push_str(&format!(
@@ -208,7 +158,6 @@ pub fn stage1_with_config(
             reason.push_str("; screamy/scam phrasing dampener");
         }
 
-        // Per-property reasons, each derived from the branch's actual facts.
         let importance_reason = if trusted {
             let src = if surface_ruled {
                 "surface rule"
@@ -226,9 +175,8 @@ pub fn stage1_with_config(
             hit.due_at.format("%Y-%m-%d"),
             hit.past_due
         );
-        // "capped" wording only when a cap actually BIT (the bill was past due
-        // and would have surfaced past_due absent the trust/dampening rule) — a
-        // future-dated bill's natural tier is already deadline, no cap occurred.
+        // Say "capped" only when a cap actually BIT: a future-dated bill's natural
+        // tier is already deadline, so nothing was capped.
         let tier_reason = if tier == Tier::PastDue {
             "overdue bill from trusted sender -> past_due".to_string()
         } else if !trusted {
@@ -268,7 +216,6 @@ pub fn stage1_with_config(
     }
 
     // ---- Rung 2: SENDER RULES (user's own local rules) ------------------
-    // Reuse the rule resolved up front for rung 1's bill-trust decision.
     if let Some(rule) = matched_rule {
         return match rule.disposition {
             Disposition::Squelch => Stage1Result {
@@ -305,14 +252,13 @@ pub fn stage1_with_config(
                     tier: Some(format!("surface rule #{} -> signal", rule.id)),
                 },
             },
-            // Filtered: the rule's `want_text` is a natural-language predicate we
-            // cannot evaluate without the LLM. Park it in Noise but mark it
-            // NOT confident so Stage-2 picks it up.
+            // Filtered: `want_text` is a natural-language predicate we cannot
+            // evaluate without the LLM. Park in Noise, NOT confident, so Stage-2
+            // picks it up.
             //
-            // TODO(stage2): when the Stage-2 pass runs for a Filtered-rule match,
-            // inject `rule.want_text` as a TRUSTED user instruction (it is the
-            // user's own rule, not attacker-controlled email content) and let the
-            // LLM decide surface-vs-squelch against it.
+            // TODO(stage2): inject `rule.want_text` as a TRUSTED user instruction
+            // (the user's own rule, not attacker-controlled email content) and let
+            // the LLM decide surface-vs-squelch against it.
             Disposition::Filtered => Stage1Result {
                 tier: Tier::Noise,
                 importance: cfg.rule_filtered_importance,
@@ -394,7 +340,6 @@ pub fn stage1_with_config(
     }
 
     // ---- Rung 6: FALL-THROUGH (the ambiguous middle) --------------------
-    // Unknown sender, nothing matched. Not confident: Stage-2 gets a look.
     Stage1Result {
         tier: Tier::Noise,
         importance: cfg.fallthrough_importance,
@@ -444,8 +389,8 @@ fn short_subject(subject: &str) -> String {
     }
 }
 
-/// Back-compat glob-based sender-rule match. Prefer
-/// [`rules::match_sender_rule`]. Returns the first matching rule + disposition.
+/// The first sender rule matching `from_addr`, plus its disposition. Prefer
+/// [`rules::match_sender_rule`].
 pub fn apply_sender_rules<'a>(
     from_addr: &str,
     rules: &'a [SenderRule],
@@ -453,19 +398,12 @@ pub fn apply_sender_rules<'a>(
     rules::match_sender_rule(from_addr, rules).map(|r| (r, r.disposition))
 }
 
-/// The SEALED GUARD for Stage-2 (defense in depth).
-///
-/// The Stage-2 queue predicate already excludes sealed rows in SQL, but that is
-/// one layer. This is the second: a REAL runtime check (compiled into release,
-/// unlike the old `debug_assert!`) that refuses to let any sealed row cross into
-/// the LLM path. Returns `Err(CoreError::InvalidInput)` if a sealed row is ever
-/// handed to Stage-2 — a bug in the caller, surfaced loudly rather than
-/// silently leaking auth content to the model.
-///
-/// Call this on every queued row immediately before building the API request.
+/// Sealed rows must never reach the Stage-2 LLM path — a real release-mode check
+/// behind the queue predicate's SQL exclusion. Call it on every queued row right
+/// before building the API request; the error is redacted to the message id.
+/// See docs/SECURITY.md.
 pub fn stage2_sealed_guard(row: &Stage2Queued) -> crate::error::Result<()> {
     if matches!(row.sensitivity, Sensitivity::Sealed) {
-        // Redacted: no subject/body/sender — just the invariant and the id.
         return Err(CoreError::InvalidInput(format!(
             "stage-2 sealed guard: message {} is sealed and must never reach the LLM",
             row.message_id
@@ -474,13 +412,9 @@ pub fn stage2_sealed_guard(row: &Stage2Queued) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// The SEALED GUARD for Stage-1 (defense in depth), mirroring
-/// [`stage2_sealed_guard`]. The Stage-1 queue predicate already excludes sealed
-/// rows in SQL (`sensitivity='normal'`); this is the second layer — a REAL
-/// release-mode check that refuses to let any sealed row cross into the Stage-1
-/// LLM path. Call it on every queued row immediately before building the API
-/// request. Returns `Err(CoreError::InvalidInput)` on a sealed row (redacted: no
-/// subject/body/sender — just the invariant and the id).
+/// Sealed rows must never reach the Stage-1 LLM path — a real release-mode check
+/// behind the queue predicate's `sensitivity='normal'` exclusion. Call it on every
+/// queued row right before building the API request. See docs/SECURITY.md.
 pub fn stage1_sealed_guard(row: &Stage1Queued) -> crate::error::Result<()> {
     if matches!(row.sensitivity, Sensitivity::Sealed) {
         return Err(CoreError::InvalidInput(format!(
@@ -491,13 +425,8 @@ pub fn stage1_sealed_guard(row: &Stage1Queued) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Back-compat guard entry kept for callers that only have a [`Sensitivity`].
-/// Replaces the old `debug_assert!`-only stub with a REAL release-mode check:
-/// returns an error for sealed input instead of compiling the assertion out.
-///
-/// The per-row orchestration now lives in [`stage2`] (prompt build, `classify`,
-/// `apply_result`) and is driven by the sync loop; this remains the minimal
-/// invariant gate.
+/// Sealed-guard entry for callers that only have a [`Sensitivity`]: a real
+/// release-mode check that errors on sealed input. See docs/SECURITY.md.
 pub fn stage2_llm_triage(sensitivity: Sensitivity) -> crate::error::Result<()> {
     if matches!(sensitivity, Sensitivity::Sealed) {
         return Err(CoreError::InvalidInput(
@@ -553,8 +482,7 @@ mod tests {
 
     #[test]
     fn past_due_bill() {
-        // Updated for bug #3: a confident PastDue now requires a TRUSTED sender
-        // (known contact). Same email from a known biller still screams.
+        // A confident PastDue requires a trusted (known-contact) sender.
         let m = msg(
             "billing@utilityco.com",
             "PAST DUE: Your electric bill",
@@ -572,7 +500,7 @@ mod tests {
 
     #[test]
     fn dated_future_bill_is_deadline() {
-        // Known sender => confident. (Bug #3: unknown senders now defer.)
+        // Known sender => confident; unknown senders defer.
         let m = msg(
             "invoices@acme.com",
             "Invoice #4402 from Acme",
@@ -588,8 +516,7 @@ mod tests {
 
     #[test]
     fn bill_wins_over_sender_rule() {
-        // Even a squelch rule must not suppress a bill. Known sender so it keeps
-        // its full PastDue tier (bug #3 caps only UNKNOWN senders).
+        // A squelch rule must not suppress a bill; the known sender keeps PastDue.
         let m = msg(
             "billing@acme.com",
             "Your invoice is ready",
@@ -601,12 +528,11 @@ mod tests {
         assert_eq!(r.matched_rule, None);
     }
 
-    // ---- Bug #3: sender-trust-gated bills -------------------------------
+    // ---- Sender-trust-gated bills ---------------------------------------
 
     #[test]
     fn pge_style_past_due_from_known_sender_still_screams() {
-        // The user's real fear: a legit past-due from a known biller MUST still
-        // land CONFIDENT PastDue at the top of the scream tier.
+        // A legit past-due from a known biller must land CONFIDENT PastDue.
         let m = msg(
             "customerservice@pge.com",
             "Your PG&E bill is past due",
@@ -624,9 +550,8 @@ mod tests {
 
     #[test]
     fn scam_past_due_from_unknown_sender_is_not_confident_past_due() {
-        // Bug #3 (confirmed against real mail): a scam "past due" from an unknown
-        // sender parsed $2,470,000 and landed CONFIDENT PastDue at the top of
-        // the scream tier. It must now be Deadline AT MOST, NOT confident.
+        // A scam "past due" from an unknown sender must be Deadline at most and
+        // NOT confident, however large the parsed amount.
         let m = msg(
             "info@sfmail.corpnet.com",
             "You're Past Due — Penalties Are Adding Up",
@@ -661,10 +586,8 @@ mod tests {
 
     #[test]
     fn corpnet_past_due_with_surface_rule_is_confident_pastdue_dampeners_bypassed() {
-        // A Surface rule is an explicit user statement of trust in their vendor.
-        // The real corpnet-style fixture: large amount + "penalties are adding up"
-        // + a Surface rule => CONFIDENT PastDue, BOTH dampeners bypassed. The user
-        // ruled the sender; they know this vendor sends big, urgent invoices.
+        // Large amount + scam phrasing + a Surface rule => CONFIDENT PastDue with
+        // BOTH dampeners bypassed: the user vouched for this vendor.
         let m = msg(
             "info@sfmail.corpnet.com",
             "You're Past Due — Penalties Are Adding Up",
@@ -686,8 +609,8 @@ mod tests {
 
     #[test]
     fn corpnet_past_due_without_rule_is_still_dampened_regression() {
-        // Same email, no Surface rule, unknown sender: the bug #3 protections
-        // still hold — capped at Deadline, not confident, both dampeners fire.
+        // Same email, no Surface rule, unknown sender: capped at Deadline, not
+        // confident, both dampeners fire.
         let m = msg(
             "info@sfmail.corpnet.com",
             "You're Past Due — Penalties Are Adding Up",
@@ -706,9 +629,8 @@ mod tests {
 
     #[test]
     fn squelch_ruled_sender_bill_unchanged() {
-        // A Squelch rule does NOT confer bill-trust: the sender is not explicitly
-        // trusted, so an unknown-sender past-due stays capped at Deadline and
-        // deferred (the squelch rule still can't suppress a bill — rung 1 wins).
+        // A Squelch rule confers no bill-trust, so an unknown-sender past-due stays
+        // capped and deferred; rung 1 still wins over the squelch rule.
         let m = msg(
             "info@sfmail.corpnet.com",
             "You're Past Due — Penalties Are Adding Up",
@@ -723,8 +645,8 @@ mod tests {
 
     #[test]
     fn surface_rule_trust_on_clean_past_due_names_source() {
-        // A clean past-due (no dampeners) from an unknown sender WITH a Surface
-        // rule: confident PastDue, reason names the surface-rule trust source.
+        // Clean past-due from an unknown sender WITH a Surface rule: confident
+        // PastDue, and the reason names the trust source.
         let m = msg(
             "billing@myvendor.example",
             "Invoice past due",
@@ -740,8 +662,7 @@ mod tests {
 
     #[test]
     fn absurd_amount_dampens_even_known_sender() {
-        // Sanity dampener applies regardless of sender: an absurd amount caps a
-        // known-sender bill at Deadline and defers it, even though it's "trusted".
+        // An absurd amount caps and defers even a trusted known-sender bill.
         let m = msg(
             "billing@utilityco.com",
             "PAST DUE",
@@ -777,8 +698,7 @@ mod tests {
 
     #[test]
     fn minga_style_filtered_newsletter_defers_to_stage2() {
-        // Filtered rule: user wants only "school closure" items from this
-        // newsletter, which we can't evaluate without the LLM.
+        // Filtered rule: the want_text can't be evaluated without the LLM.
         let m = msg(
             "newsletter@minga.school",
             "This week at Minga: bake sale, spirit week, and more",
@@ -846,8 +766,6 @@ mod tests {
             "can you look?",
         );
         let r = run(&m, false, &[]);
-        // Not an automated sender => not the alert rung. Unknown human => falls
-        // through to the ambiguous middle.
         assert_eq!(r.tier, Tier::Noise);
         assert!(!r.confident);
     }
@@ -915,7 +833,7 @@ mod tests {
 
     #[test]
     fn default_public_signature_compiles() {
-        // Exercise the 3-arg public entry point (uses default config + now()).
+        // Exercise the 3-arg public entry point (default config + now()).
         let m = msg("alice@friends.com", "hi", "hello");
         let _ = stage1(&m, true, &[]);
     }
@@ -950,8 +868,7 @@ mod tests {
 
     #[test]
     fn field_reasons_for_deadline_hit_branch() {
-        // Known sender past-due bill: importance/deadline/tier reasons all present
-        // and describe the STORED values.
+        // Known-sender past-due bill: all three reasons describe the STORED values.
         let m = msg(
             "billing@utilityco.com",
             "PAST DUE: Your electric bill",
@@ -971,8 +888,8 @@ mod tests {
 
     #[test]
     fn field_reasons_for_untrusted_bill_states_the_cap() {
-        // Unknown-sender bill: tier reason must describe the WINNING value
-        // (capped at deadline), never the discarded past_due it might have looked like.
+        // The tier reason must describe the WINNING value (capped at deadline),
+        // never the discarded past_due.
         let m = msg(
             "billing@unknown-vendor.example",
             "Invoice past due",
@@ -1055,8 +972,7 @@ mod tests {
 
     #[test]
     fn llm_triage_guard_errors_on_sealed_in_release_semantics() {
-        // The old stub used debug_assert! (compiled out in release). This must be
-        // a REAL error return regardless of build profile.
+        // Must be a REAL error return regardless of build profile.
         assert!(stage2_llm_triage(Sensitivity::Sealed).is_err());
         assert!(stage2_llm_triage(Sensitivity::Normal).is_ok());
     }

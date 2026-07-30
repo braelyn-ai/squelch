@@ -1,24 +1,16 @@
-//! Bill / payment / deadline extraction for Stage-1 triage.
+//! Bill / payment / deadline extraction for Stage-1 triage: `kind`, an optional
+//! currency amount, and an absolute due date.
 //!
-//! This is the highest-recall rung of the Stage-1 ladder: the user's #1 fear is
-//! a missed bill, so we bias toward *detecting* a deadline. False positives cost
-//! the user a slightly-too-prominent email; false negatives cost them a late fee.
-//!
-//! We extract three things from a candidate bill:
-//!   1. the `kind` (invoice / statement / autopay / payment-due / …),
-//!   2. an optional currency amount (`$42.10`, `1,299.00 USD`),
-//!   3. a due date — absolute dates in several common formats.
-//!
-//! Relative dates ("due Friday", "due next week") are intentionally *out of
-//! scope* for v0: absolute dates are what actually matter for bills, and cheap
-//! relative parsing is error-prone. See the TODO in [`extract_due_at`].
+//! Highest-recall rung of the Stage-1 ladder — bias toward DETECTING a deadline: a
+//! false positive costs a too-prominent email, a false negative costs a late fee.
+//! Relative dates ("due Friday") are out of scope; see the TODO in [`extract_due_at`].
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// A detected bill/deadline. Mirrors the shape persisted as
-/// [`crate::types::Deadline`] minus the DB identity columns.
+/// A detected bill/deadline: [`crate::types::Deadline`] minus the DB identity
+/// columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeadlineHit {
     /// Coarse classification: "invoice", "statement", "autopay", "payment_due",
@@ -28,14 +20,13 @@ pub struct DeadlineHit {
     pub currency: Option<String>,
     pub due_at: DateTime<Utc>,
     pub past_due: bool,
-    /// Which surface produced the hit, e.g. "subject", "body", or
-    /// "body:due-on-receipt". Handy for debugging recall.
+    /// Which surface produced the hit, e.g. "subject", "body:due-on-receipt".
     pub source: String,
 }
 
 struct BillDetector {
-    /// Strong "this is a bill" signals. If any fire, we treat the message as a
-    /// bill even absent an amount or a parseable date.
+    /// Strong "this is a bill" signals — any match classifies, even with no
+    /// amount and no parseable date.
     signals: Vec<(Regex, &'static str)>,
     /// Explicit "already overdue" language.
     overdue: Vec<Regex>,
@@ -45,29 +36,22 @@ struct BillDetector {
     due_phrase: Vec<Regex>,
     /// "due on receipt" / "due upon receipt" — treated as due *now*.
     due_on_receipt: Regex,
-    /// Screamy / scammy phrasing that legit billers rarely use. A corroborating
-    /// signal for the Stage-1 confidence dampener (bug #3), NOT for tier.
+    /// Screamy / scammy phrasing: a Stage-1 confidence dampener, NEVER a tier
+    /// signal.
     scammy: Vec<Regex>,
-    /// INBOUND-MONEY phrasing: refund / return / reimbursement / credit-to-you /
-    /// cash-back / payout / "you will receive". When any of these fire (and no
-    /// genuine payment-obligation signal does), the message is money flowing TO
-    /// the user, not a bill — it must NOT produce a bill tier or past_due.
+    /// INBOUND-MONEY phrasing (refund / reimbursement / credit-to-you / payout).
+    /// Money flowing TO the user is never a bill: absent a genuine
+    /// payment-obligation signal, it must not produce a bill tier or past_due.
     inbound_money: Vec<Regex>,
-    /// PAST-TRANSACTION phrasing: receipts / payment confirmations / order
-    /// confirmations. Past/completed-tense language ("payment received", "thank
-    /// you for your payment", "order confirmation") means the money has ALREADY
-    /// moved — the message is a RECORD, not a deadline. When any of these fire
-    /// (and no genuine payment-obligation signal does), the bill classification
-    /// is suppressed so a receipt with a stray amount/date drops to the rung-5
-    /// receipt-noise rung instead of screaming as a bill.
+    /// PAST-TRANSACTION phrasing (receipts, payment/order confirmations): the
+    /// money ALREADY moved, so the message is a RECORD, not a deadline. Absent a
+    /// genuine payment-obligation signal, the bill classification is suppressed.
     past_transaction: Vec<Regex>,
 }
 
 /// Sanity bounds on a resolved due date, relative to the message's `received_at`.
-/// A date more than [`MAX_DAYS_PAST`] before the message, or more than
-/// [`MAX_DAYS_FUTURE`] after it, is treated as a PARSE FAILURE (absurd dates are
-/// parser bugs, not two-year-late bills). See bug: eBay "July 13th" mis-yeared to
-/// ~2 years past and shown as "104 weeks after due date".
+/// A date outside them is treated as a PARSE FAILURE — an absurd date is a parser
+/// bug, never a real two-year-late bill.
 const MAX_DAYS_PAST: i64 = 365;
 const MAX_DAYS_FUTURE: i64 = 365 * 3;
 
@@ -88,8 +72,8 @@ fn detector() -> &'static BillDetector {
             (rx(r"\bamount due\b"), "payment_due"),
             (rx(r"\bpayment due\b"), "payment_due"),
             (rx(r"\bpayment (is )?(now )?due\b"), "payment_due"),
-            // "(next )payment of $54.99 is due ...": an amount sits between
-            // "payment" and "due", so the contiguous pattern above misses it.
+            // "payment of $54.99 is due": an amount sits between the two words,
+            // so the contiguous pattern above misses it.
             (rx(r"\bpayment\b.{0,40}?\bis (now )?due\b"), "payment_due"),
             (rx(r"\bbill(ing)? (is )?due\b"), "payment_due"),
             (rx(r"\byour bill\b"), "bill"),
@@ -109,16 +93,13 @@ fn detector() -> &'static BillDetector {
             rx(r"\b(?:USD|usd)\s?([0-9][0-9,]*(?:\.[0-9]{2})?)"),
         ],
         due_phrase: vec![
-            // ORDER MATTERS — year-bearing "Month D, YYYY" patterns come FIRST so
-            // the day/year comma ("January 5, 2026") is captured whole instead of
-            // being truncated to "January 5" by the generic terminator below.
-            // (The regex crate has no look-around, so we can't special-case the
-            // comma inside one pattern — we try the explicit shapes first.)
+            // ORDER MATTERS: year-bearing "Month D, YYYY" shapes come FIRST so the
+            // day/year comma is captured whole instead of truncated to "January 5"
+            // by the generic terminator below (the regex crate has no look-around).
             rx(r"\b(?:payment\s+)?due(?:\s+date)?[:\s]+(?:on\s+|by\s+)?([A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,\s*\d{4})"),
             rx(r"\bby\s+([A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,\s*\d{4})"),
-            // Generic fallback: any date-ish fragment up to a terminator (covers
-            // ISO/numeric, "Month D YYYY" without a comma, and bare year-less
-            // "Month D" which the year-less resolver then anchors to received_at).
+            // Generic fallback: any date-ish fragment up to a terminator (ISO,
+            // numeric, "Month D YYYY", and year-less "Month D").
             rx(r"\b(?:payment\s+)?due(?:\s+date)?[:\s]+(?:on\s+|by\s+)?([A-Za-z0-9\-/ ]{4,30}?)(?:[.,;)\n]|$)"),
             rx(r"\bby\s+([A-Za-z0-9\-/ ]{4,30}?)(?:[.,;)\n]|$)"),
         ],
@@ -130,7 +111,7 @@ fn detector() -> &'static BillDetector {
             rx(r"\bavoid (further |additional )?(penalt|prosecution|legal|suspension|arrest)"),
             rx(r"\bimmediate (action|payment) (is )?required\b"),
             rx(r"\byour account (will|may) be (suspended|terminated|closed)\b"),
-            // Excessive urgency punctuation: "!!!", "!!", "NOW!!" etc.
+            // Excessive urgency punctuation.
             rx(r"!{2,}"),
         ],
         inbound_money: vec![
@@ -147,10 +128,8 @@ fn detector() -> &'static BillDetector {
             rx(r"\bmoney back\b"),
         ],
         past_transaction: vec![
-            // STATEMENT-AVAILABILITY: "your June statement is available" is a
-            // record notice, not an obligation (the PayPal-statement-in-FYE
-            // bug). Same precedence as the rest of this list: explicit
-            // payment-obligation phrasing still wins.
+            // "your June statement is available" is a record notice, not an
+            // obligation; explicit payment-obligation phrasing still wins.
             rx(r"\bstatement is (now )?(available|ready)\b"),
             rx(r"\b(view|access) your (account |monthly )?statement\b"),
             rx(r"\b(account|monthly|billing) statement\b"),
@@ -172,8 +151,8 @@ fn detector() -> &'static BillDetector {
     })
 }
 
-/// Does the text carry screamy/scammy phrasing (a bug #3 confidence dampener)?
-/// Purely advisory — it never raises a tier, only shaves confidence.
+/// Does the text carry screamy/scammy phrasing? Advisory only: it never raises a
+/// tier, only shaves confidence.
 pub fn has_scammy_phrasing(subject: &str, body: &str) -> bool {
     let d = detector();
     d.scammy
@@ -181,30 +160,23 @@ pub fn has_scammy_phrasing(subject: &str, body: &str) -> bool {
         .any(|re| re.is_match(subject) || re.is_match(body))
 }
 
-/// Does the text carry INBOUND-MONEY phrasing (refund / return / reimbursement /
-/// credit-to-you / cash-back / payout / "you will receive")? Money flowing TO the
-/// user is never a bill. Advisory to [`detect_bill`], which suppresses the bill
-/// classification when this fires WITHOUT a genuine payment-obligation signal.
+/// Does the text carry INBOUND-MONEY phrasing (refund / reimbursement /
+/// credit-to-you / payout)? Money flowing TO the user is never a bill:
+/// [`detect_bill`] suppresses unless a payment-obligation signal also fires.
 fn has_inbound_money_phrasing(text: &str) -> bool {
     detector().inbound_money.iter().any(|re| re.is_match(text))
 }
 
-/// Does the text carry PAST-TRANSACTION phrasing (a receipt / payment
-/// confirmation / order confirmation)? Past/completed-tense money language means
-/// the money has ALREADY moved: the message is a RECORD, not a deadline. Advisory
-/// to [`detect_bill`], which suppresses the bill classification when this fires
-/// WITHOUT a genuine payment-obligation signal — so receipts drop to the rung-5
-/// receipt-noise rung instead of screaming as a bill. Receipts are records, not
-/// deadlines.
+/// Does the text carry PAST-TRANSACTION phrasing (receipt / payment or order
+/// confirmation)? The money ALREADY moved, so the message is a RECORD, not a
+/// deadline: [`detect_bill`] suppresses unless an obligation signal also fires.
 fn has_past_transaction_phrasing(text: &str) -> bool {
     detector().past_transaction.iter().any(|re| re.is_match(text))
 }
 
-/// Genuine payment-OBLIGATION phrasing: the user owes money. Used to break the
-/// tie when BOTH a bill-obligation phrase AND refund phrasing appear — we prefer
-/// the BILL reading (conservative for the user's missed-bill fear). Anchored on
-/// obligation-shaped wording so a bare "credit" (e.g. "store credit") does not
-/// count, but "credit card payment due" / "amount due" / "past due" do.
+/// Genuine payment-OBLIGATION phrasing: the user owes money. Breaks the tie when
+/// obligation AND refund/receipt phrasing both appear — the BILL reading wins.
+/// Anchored so a bare "store credit" does not count but "amount due" does.
 fn has_payment_obligation_phrasing(text: &str) -> bool {
     static OBLIGATION: OnceLock<Vec<Regex>> = OnceLock::new();
     let res = OBLIGATION.get_or_init(|| {
@@ -221,26 +193,20 @@ fn has_payment_obligation_phrasing(text: &str) -> bool {
             rx(r"\bplease (pay|remit)\b"),
             rx(r"\bpay(ment)? (your|this|the) (bill|invoice|balance)\b"),
             rx(r"\bpay by\b"),
-            // "(next )payment of $54.99 is due ...": obligation phrasing where an
-            // amount sits between "payment" and "due", so the contiguous
-            // "payment due" patterns above miss it.
+            // "payment of $54.99 is due": an amount sits between the two words.
             rx(r"\bpayment\b.{0,40}?\bis (now )?due\b"),
         ]
     });
     res.iter().any(|re| re.is_match(text))
 }
 
-/// Parse a single absolute date fragment into a `NaiveDate`. Tries a battery of
-/// common human/machine formats. Returns `None` for anything it can't confidently
-/// read (including relative dates like "Friday").
+/// Parse a single absolute date fragment into a `NaiveDate`, trying a battery of
+/// common formats. Returns `None` for anything it can't confidently read
+/// (including relative dates like "Friday").
 ///
-/// `received_at` anchors year-less dates: a date written without a year ("July
-/// 13", "January 3") is resolved to its NEAREST OCCURRENCE relative to the
-/// message's receipt, NOT to wall-clock now (so backfill is deterministic and a
-/// message received in 2024 does not get today's year). See
-/// [`resolve_yearless_date`]. This was the root cause of the eBay "104 weeks
-/// after due date" bug: the old code slapped `Utc::now().year()` on the fragment
-/// and never consulted `received_at` or rolled the year forward.
+/// `received_at` anchors year-less dates to their NEAREST OCCURRENCE relative to
+/// receipt, never to wall-clock now, so backfill is deterministic. See
+/// [`resolve_yearless_date`].
 fn parse_date_fragment(frag: &str, received_at: DateTime<Utc>) -> Option<NaiveDate> {
     let s = frag.trim().trim_end_matches(['.', ',']);
     if s.is_empty() {
@@ -271,13 +237,11 @@ fn parse_date_fragment(frag: &str, received_at: DateTime<Utc>) -> Option<NaiveDa
         }
     }
 
-    // Year-LESS month-name formats: parse the month/day against a placeholder
-    // year, then resolve the real year to the nearest occurrence relative to
-    // `received_at`.
+    // Year-LESS month-name formats: parse against a placeholder year, then resolve
+    // the real year relative to `received_at`.
     const NO_YEAR: &[&str] = &["%B %d", "%b %d", "%d %B", "%d %b"];
     for fmt in NO_YEAR {
-        // Use a leap year (2000) as the placeholder so "Feb 29" still parses; the
-        // year is discarded by `resolve_yearless_date`.
+        // Leap-year placeholder so "Feb 29" parses; the year is discarded below.
         let candidate = format!("{cleaned} 2000");
         let yfmt = format!("{fmt} %Y");
         if let Ok(d) = NaiveDate::parse_from_str(&candidate, &yfmt) {
@@ -288,18 +252,10 @@ fn parse_date_fragment(frag: &str, received_at: DateTime<Utc>) -> Option<NaiveDa
     None
 }
 
-/// Resolve a year-less (month, day) to a full `NaiveDate` using the NEAREST
-/// OCCURRENCE relative to the message's `received_at`:
-///   1. take the occurrence in the SAME year as `received_at`;
-///   2. if that lands MORE THAN 14 DAYS BEFORE `received_at`, roll forward one
-///      year (a bill/deadline written without a year is forward-looking; a
-///      recently-passed date — within 14 days — stays in the receipt year so a
-///      genuinely just-missed bill still reads as past-due by days).
-///
-/// Examples (all deterministic in `received_at`, never wall-clock now):
-///   * "July 13"  received 2026-07-09 => 2026-07-13 (future, this year).
-///   * "July 1"   received 2026-07-09 => 2026-07-01 (past by 8 days, kept).
-///   * "January 3" received 2026-12-28 => 2027-01-03 (rolled forward).
+/// Resolve a year-less (month, day) to the NEAREST OCCURRENCE relative to
+/// `received_at`: the same-year date, rolled forward one year when it lands MORE
+/// THAN 14 DAYS BEFORE receipt (a year-less deadline is forward-looking, but a
+/// just-missed bill must still read as past-due by days). Never wall-clock now.
 fn resolve_yearless_date(
     month: u32,
     day: u32,
@@ -308,7 +264,6 @@ fn resolve_yearless_date(
     let recv = received_at.date_naive();
     let same_year = NaiveDate::from_ymd_opt(recv.year(), month, day)?;
     if (recv - same_year).num_days() > 14 {
-        // More than two weeks before receipt: roll forward a year.
         NaiveDate::from_ymd_opt(recv.year() + 1, month, day)
     } else {
         Some(same_year)
@@ -322,10 +277,8 @@ fn end_of_day_utc(d: NaiveDate) -> DateTime<Utc> {
     Utc.from_utc_datetime(&ndt)
 }
 
-/// Is this date within the sane window around `received_at`? A date more than
-/// [`MAX_DAYS_PAST`] before, or more than [`MAX_DAYS_FUTURE`] after, the message
-/// is treated as a parse failure (an absurd date is a parser bug, never a real
-/// two-year-late bill).
+/// Is this date within [`MAX_DAYS_PAST`]/[`MAX_DAYS_FUTURE`] of `received_at`?
+/// Outside that window a date is a parse failure, not a real bill.
 fn date_is_sane(due: DateTime<Utc>, received_at: DateTime<Utc>) -> bool {
     let days = (due - received_at).num_days();
     (-MAX_DAYS_PAST..=MAX_DAYS_FUTURE).contains(&days)

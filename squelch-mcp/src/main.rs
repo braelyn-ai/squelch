@@ -1,9 +1,6 @@
-//! squelch-mcp: MCP server exposing squelch's 6 read-mostly tools.
-//!
-//! Transport is chosen HERE and only here. Tool logic lives in [`server`] and
-//! is transport-agnostic. Default (no args) is stdio, exactly as before; passing
-//! `--http [addr]` (or setting `SQUELCH_MCP_HTTP`) serves the MCP Streamable HTTP
-//! transport instead. The endpoint is mounted at `/mcp`.
+//! squelch-mcp binary. Transport is chosen here and only here: stdio by
+//! default, or the MCP Streamable HTTP transport at `/mcp` when given
+//! `--http [addr]` / `SQUELCH_MCP_HTTP`. Tool logic lives in [`server`].
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,56 +13,43 @@ use squelch_mcp::server::SquelchServer;
 use squelch_mcp::{MCP_PATH, streamable_http_service};
 use tokio_util::sync::CancellationToken;
 
-/// Default bind address for HTTP mode. Loopback ONLY: a reverse proxy
-/// (e.g. `tailscale serve`) is expected to front this listener. We never
-/// default to a non-loopback interface.
+/// Default bind address for HTTP mode. Loopback only — never default to a
+/// non-loopback interface; a reverse proxy is expected to front this listener.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8848";
 
-/// Path the Streamable HTTP transport is mounted at. Clients connect to
-/// `http://<addr>/mcp`. Sourced from the lib so the bin and `squelchd serve`
-/// agree.
+/// Where the Streamable HTTP transport is mounted; sourced from the lib.
 const HTTP_MCP_PATH: &str = MCP_PATH;
 
 /// How the server talks to clients. Selected once, in `main`.
 enum Transport {
-    /// stdio: the default, unchanged behavior.
+    /// stdio (the default).
     Stdio,
     /// Streamable HTTP bound to `addr` (loopback by default).
     Http(SocketAddr),
 }
 
-/// Resolve the SQLite path via core config's single source of truth: canonical
-/// `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` (deprecated) > the shared XDG default.
+/// Resolve the SQLite path: `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` > XDG default.
 fn db_path() -> PathBuf {
     squelch_core::config::resolve_db_path()
 }
 
-/// The account this server operates on. Canonical `SQUELCH_ACCOUNT_EMAIL` >
-/// legacy `SQUELCH_ACCOUNT` (deprecated) > default. Multi-account selection is
-/// future work; the schema already carries `account_id` everywhere.
+/// The account this server operates on: `SQUELCH_ACCOUNT_EMAIL` > legacy
+/// `SQUELCH_ACCOUNT` > default. Multi-account selection is future work.
 fn account_email() -> String {
     squelch_core::config::resolve_account_email("me@localhost")
 }
 
-/// Build the server object. Split out so the smoke test can construct it without
-/// binding a transport.
+/// Build the server object, so tests can construct it without binding a transport.
 fn build_server() -> anyhow::Result<SquelchServer> {
     let store = Arc::new(SqliteStore::open(db_path())?);
     SquelchServer::new(store, &account_email())
 }
 
-/// Decide the transport from CLI args and env, without touching tool logic.
-///
-/// Rules:
-/// - No `--http` flag and no `SQUELCH_MCP_HTTP` env => stdio (default, unchanged).
-/// - `--http` (optionally followed by an address) => HTTP. An explicit address
-///   wins over the env var, which wins over the loopback default.
-/// - `SQUELCH_MCP_HTTP` set (to an address or empty) => HTTP, unless overridden
-///   by an explicit `--http <addr>`.
-///
-/// The bind address always defaults to loopback; we never silently widen it.
+/// Decide the transport from CLI args and env: `--http [addr]` or
+/// `SQUELCH_MCP_HTTP` selects HTTP, otherwise stdio. An explicit `--http <addr>`
+/// wins over the env var, which wins over the loopback default — the bind
+/// address is never silently widened past loopback.
 fn select_transport() -> anyhow::Result<Transport> {
-    // Skip argv[0].
     let mut args = std::env::args().skip(1);
     let mut http_flag = false;
     let mut flag_addr: Option<String> = None;
@@ -74,8 +58,7 @@ fn select_transport() -> anyhow::Result<Transport> {
         match arg.as_str() {
             "--http" => {
                 http_flag = true;
-                // Optional inline address: `--http 127.0.0.1:9000`. Peek the
-                // next arg; only consume it if it isn't another flag.
+                // Optional inline address: `--http 127.0.0.1:9000`.
                 if let Some(next) = args.next() {
                     if next.starts_with('-') {
                         return Err(anyhow::anyhow!(
@@ -110,7 +93,6 @@ fn select_transport() -> anyhow::Result<Transport> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Transport selection lives ONLY here. Tool code is untouched either way.
     match select_transport()? {
         Transport::Stdio => {
             let server = build_server()?;
@@ -123,27 +105,21 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Serve the MCP Streamable HTTP transport on `addr` until ctrl-c.
-///
-/// rmcp exposes the transport as a tower `Service`; axum hosts it at `/mcp`.
-/// A fresh [`SquelchServer`] is handed to each session via the service factory
-/// (it is cheap to clone — it only wraps an `Arc<SqliteStore>`).
 async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
     let store = Arc::new(SqliteStore::open(db_path())?);
 
     let shutdown = CancellationToken::new();
-    // Construction errors surface before we bind. The service is built through
-    // the shared lib fn so the agent door is identical to `squelchd serve`.
+    // Construction errors surface before we bind.
     let service = streamable_http_service(store, &account_email(), shutdown.child_token())?;
 
     let router = axum::Router::new().nest_service(HTTP_MCP_PATH, service);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr().unwrap_or(addr);
 
-    // Single startup line on stderr. No tokens or message content are ever logged.
+    // No tokens or message content are ever logged.
     eprintln!("squelch-mcp: serving MCP Streamable HTTP on http://{bound}{HTTP_MCP_PATH}");
 
-    // Graceful shutdown: on ctrl-c, cancel the token (terminates active MCP
-    // sessions) and stop accepting connections.
+    // On ctrl-c, cancel the token: that terminates active MCP sessions.
     let shutdown_signal = {
         let shutdown = shutdown.clone();
         async move {
@@ -163,8 +139,7 @@ async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Smoke test: the server object constructs and exposes exactly the 7 tools
-    /// over an in-memory store, without binding any transport.
+    /// Smoke test: the server constructs and exposes exactly 7 tools, no transport.
     #[test]
     fn constructs_server_with_seven_tools() {
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));

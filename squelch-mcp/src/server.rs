@@ -1,14 +1,9 @@
-//! Transport-agnostic MCP server for squelch.
+//! Transport-agnostic MCP server: the [`SquelchServer`] handler and its tools.
 //!
-//! This module knows nothing about stdio vs SSE vs streamable-http. It defines
-//! the [`SquelchServer`] handler and its 7 tools. `main.rs` picks the transport
-//! and calls `.serve(...)`.
-//!
-//! SECURITY: sealed (auth-related) messages are excluded structurally by the
-//! SQL layer in `squelch-core`. This layer RE-CHECKS the invariant as defense
-//! in depth: every value is scrubbed against [`SquelchServer::assert_unsealed`]
-//! before it is serialized, and `get_thread` collapses any sealed/unknown thread
-//! to the exact same `resource_not_found` error so the two are indistinguishable.
+//! Sealed (auth-related) mail is excluded structurally in SQL by `squelch-core`;
+//! this layer re-checks as defense in depth, and `get_thread` collapses a sealed
+//! and an unknown thread into one indistinguishable `resource_not_found`.
+//! See docs/SECURITY.md.
 
 use std::sync::Arc;
 
@@ -25,17 +20,14 @@ use squelch_core::error::CoreError;
 use squelch_core::store::{NewAuditEntry, SqliteStore, Store};
 use squelch_core::types::{AccountId, Disposition, ThreadView, Update};
 
-/// The squelch MCP server. Holds the store and the active account.
-///
-/// v0 is single-account: the account is resolved once at construction. The
-/// multi-tenant schema (every row carries `account_id`) is already in place, so
-/// per-request account selection can be layered on later without schema changes.
+/// The squelch MCP server. Single-account: the account is resolved once at
+/// construction, though every row already carries `account_id`.
 #[derive(Clone)]
 pub struct SquelchServer {
     store: Arc<SqliteStore>,
     account_id: AccountId,
-    // Read by the macro-generated `ServerHandler` (call_tool/list_tools), not by
-    // hand-written code, so dead-code analysis can't see the use.
+    // Read only by the macro-generated `ServerHandler`, so dead-code analysis
+    // can't see the use.
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -67,8 +59,7 @@ pub struct SearchMailParams {
     pub k: Option<u8>,
 }
 
-/// One `search_mail` result: a SUMMARY ONLY (no body). To read the full thread,
-/// pass `thread_id` to `get_thread`.
+/// One `search_mail` result: a SUMMARY ONLY, never a body.
 #[derive(Debug, serde::Serialize)]
 pub struct SearchMailHit {
     /// Sender address (with display name when known).
@@ -98,8 +89,7 @@ pub struct GetShipmentsParams {
     pub include_delivered: Option<bool>,
 }
 
-/// One `get_shipments` result: a tracked package. No message body / no sealed
-/// content — shipments are extracted from non-sealed shipping mail only.
+/// One `get_shipments` result. Shipments are only ever built from non-sealed mail.
 #[derive(Debug, serde::Serialize)]
 pub struct ShipmentHit {
     pub item_name: String,
@@ -121,9 +111,8 @@ pub struct SetSenderRuleParams {
     pub disposition: String,
 }
 
-/// Truncate `s` to at most `max` characters (not bytes — safe on UTF-8),
-/// appending a single ellipsis when it was cut. Used to keep audit `detail`
-/// bounded and readable for the human review UI.
+/// Truncate `s` to at most `max` characters (not bytes), appending a single
+/// ellipsis when it was cut. Keeps audit `detail` bounded.
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut it = s.char_indices();
     match it.nth(max) {
@@ -158,12 +147,9 @@ impl SquelchServer {
         }
     }
 
-    /// Defense-in-depth guard. The `Update`/`Deadline`/`ThreadView` types carry
-    /// no sensitivity field by design (sealed rows are dropped in SQL), so there
-    /// is nothing to inspect on the value itself. This helper exists as the
-    /// single choke point where any future sealed-bearing type MUST be checked,
-    /// and it re-queries the store's local-only sealed set to guarantee that no
-    /// thread we are about to surface overlaps a sealed thread.
+    /// Defense-in-depth guard, and the single choke point for it: re-queries the
+    /// store's local-only sealed set to guarantee no thread we are about to
+    /// surface overlaps a sealed thread.
     fn thread_is_sealed(&self, thread_id: &str) -> Result<bool, ErrorData> {
         let sealed = self
             .store
@@ -178,7 +164,6 @@ impl SquelchServer {
         self.tool_router.list_all().len()
     }
 
-    /// Serialize a value into a structured tool result.
     fn ok_json<T: serde::Serialize>(value: T) -> Result<CallToolResult, ErrorData> {
         let block = ContentBlock::json(value)?;
         Ok(CallToolResult::success(vec![block]))
@@ -204,8 +189,7 @@ impl SquelchServer {
             .ranked_updates(self.account_id, params.since, params.min_importance)
             .map_err(Self::map_err)?;
 
-        // Defense in depth: drop any update whose thread overlaps a sealed
-        // thread, even though the SQL layer should already have excluded it.
+        // Defense in depth: drop any update whose thread overlaps a sealed thread.
         let mut safe = Vec::with_capacity(updates.len());
         for u in updates {
             if !self.thread_is_sealed(&u.thread_id)? {
@@ -213,13 +197,9 @@ impl SquelchServer {
             }
         }
 
-        // SEEN-LEDGER: the agent door also stamps. Once the serialization set is
-        // fixed, mark those rows surfaced (surfaced_at=now if NULL, new->open) so
-        // the ledger answers "did ANYONE see this" across both doors. Sealed rows
-        // can't be here (SQL + defense-in-depth), and mark_surfaced re-guards
-        // sensitivity, so nothing sealed is ever stamped. The RESPONSE SHAPE IS
-        // UNCHANGED — the agent doesn't bucket, so we serialize `Update` as before
-        // and stamp as a side effect.
+        // SEEN-LEDGER: the agent door stamps too (surfaced_at=now if NULL,
+        // new->open), so the ledger answers "did ANYONE see this" across both
+        // doors. mark_surfaced re-guards sensitivity, so sealed is never stamped.
         let ids: Vec<i64> = safe.iter().map(|u| u.id).collect();
         self.store
             .mark_surfaced(self.account_id, &ids)
@@ -228,16 +208,9 @@ impl SquelchServer {
         Self::ok_json(safe)
     }
 
-    /// Full sanitized thread view. A sealed thread returns the SAME error as a
-    /// nonexistent one, so its existence cannot be inferred.
-    ///
-    /// FORGIVENESS: `id` may be a thread id (the `thread_id` field on every
-    /// `get_inbox_updates` / `search_mail` result) OR a single message id. When
-    /// the thread lookup misses, `id` is retried as a message id and, on a hit,
-    /// that message's thread is returned. The SEALED indistinguishable-404 holds
-    /// through BOTH paths: a sealed message id resolves to `None` in SQL, so it
-    /// yields the same not-found error as a nonexistent id and never leaks that a
-    /// sealed message (or its thread) exists.
+    /// Full sanitized thread view. `id` may be a thread id or a single message
+    /// id. A sealed id and a nonexistent one return the same `resource_not_found`
+    /// through BOTH paths, so a sealed message's existence cannot be inferred.
     #[tool(
         name = "get_thread",
         description = "Fetch a sanitized thread. `id` is EITHER a thread id (the \
@@ -250,8 +223,7 @@ impl SquelchServer {
         &self,
         Parameters(params): Parameters<GetThreadParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Re-check BEFORE hitting the (already-safe) store path so the two
-        // rejection reasons are indistinguishable.
+        // Re-check before the store path so the two rejections are indistinguishable.
         if self.thread_is_sealed(&params.id)? {
             return Err(ErrorData::resource_not_found("not found", None));
         }
@@ -260,9 +232,9 @@ impl SquelchServer {
         match self.store.thread_view(self.account_id, &params.id) {
             Ok(view) => Self::ok_json(view),
             Err(CoreError::NotFound) => {
-                // PATH 2 (forgiveness): retry `id` as a MESSAGE id -> its thread.
-                // `thread_id_for_message` excludes sealed rows in SQL, so a sealed
-                // (or nonexistent) message id yields None -> the identical 404.
+                // PATH 2: retry `id` as a MESSAGE id. `thread_id_for_message`
+                // excludes sealed rows in SQL, so a sealed or nonexistent message
+                // id both yield None -> the identical 404.
                 let message_id: i64 = match params.id.parse() {
                     Ok(n) => n,
                     // Not numeric => can't be a message id; keep the same 404.
@@ -275,9 +247,8 @@ impl SquelchServer {
                 let Some(thread_id) = thread_id else {
                     return Err(ErrorData::resource_not_found("not found", None));
                 };
-                // Re-run the FULL sealed guard on the resolved thread: the
-                // message itself was unsealed, but a sibling in its thread may be
-                // sealed, which seals the whole thread (indistinguishable 404).
+                // Re-guard the resolved thread: an unsealed message may have a
+                // sealed sibling, which seals the whole thread.
                 if self.thread_is_sealed(&thread_id)? {
                     return Err(ErrorData::resource_not_found("not found", None));
                 }
@@ -309,9 +280,8 @@ impl SquelchServer {
         Self::ok_json(deadlines)
     }
 
-    /// Packages currently in transit (and, optionally, delivered ones). Extracted
-    /// from non-sealed shipping/delivery mail; sealed content can never appear
-    /// here (shipments are never built from sealed mail).
+    /// Packages in transit (and, optionally, delivered ones). Never built from
+    /// sealed mail, so sealed content can't appear here.
     #[tool(
         name = "get_shipments",
         description = "Tracked packages/shipments. Returns en-route packages by \
@@ -325,9 +295,7 @@ impl SquelchServer {
         Parameters(params): Parameters<GetShipmentsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let include_delivered = params.include_delivered.unwrap_or(false);
-        // The shipments table holds no sealed rows by construction (detection
-        // never runs on sealed mail), so — unlike thread/update surfaces — there
-        // is no sealed row to filter here.
+        // No sealed row to filter: detection never runs on sealed mail.
         let shipments = self
             .store
             .list_shipments(self.account_id, include_delivered)

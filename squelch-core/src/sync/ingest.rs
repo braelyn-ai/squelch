@@ -1,15 +1,10 @@
 //! The ingest pipeline: raw RFC822 bytes -> parsed -> flattened text ->
 //! seal-first triage -> a [`TriagedMessage`] ready for an atomic store write.
 //!
-//! SECURITY (ordering is an invariant):
-//!   1. parse + flatten to text (HTML crudely stripped),
-//!   2. seal detection FIRST ([`triage::seal`]) — sealed mail is classified
-//!      `sensitivity='sealed'`, importance 0, and NEVER runs Stage-1 or reaches
-//!      any LLM,
-//!   3. only for non-sealed mail: `is_known_contact` + sender rules -> Stage-1.
-//!
-//! This module is deliberately free of any network/IMAP types so it can be unit
-//! tested against fixture RFC822 bytes with no connection.
+//! ORDERING IS A SECURITY INVARIANT: parse/flatten, then seal detection FIRST
+//! (sealed mail is `sensitivity='sealed'`, importance 0, and never runs Stage-1 or
+//! reaches any LLM), and only then, for non-sealed mail, contacts/rules -> Stage-1.
+//! Network-free by design so it is testable against fixture bytes.
 
 use crate::config::Stage1Config;
 use crate::store::TriagedMessage;
@@ -24,10 +19,8 @@ use chrono::{DateTime, Utc};
 use mail_parser::{Address, MessageParser, MimeHeaders};
 
 /// The raw identity/metadata the transport supplies alongside the RFC822 body.
-/// The Gmail REST engine fills `gmail_msg_id` from the native `message.id` and
-/// `gmail_thread_id` from the native `message.threadId`; when both are absent
-/// (e.g. a synthetic metadata-only Sent ingest) the pipeline falls back to a
-/// header-derived thread key (see [`fallback_thread_id`]).
+/// When the native Gmail ids are absent the pipeline falls back to a header-derived
+/// thread key (see [`fallback_thread_id`]).
 #[derive(Debug, Clone)]
 pub struct RawFetched {
     pub account_id: AccountId,
@@ -42,25 +35,21 @@ pub struct RawFetched {
     pub internal_date: Option<DateTime<Utc>>,
     /// Whether this came from the Sent mailbox (seeds the contacts table).
     pub is_sent: bool,
-    /// The account's own email address, used to guard the contacts table so the
-    /// user's own address can NEVER become a contact (Sent mail's From header is
-    /// the user; contacts must be derived from To/Cc recipients instead).
-    /// Lower-cased comparison; may be empty when unknown (then only the From
-    /// address is excluded, since on Sent mail From == the account).
+    /// The account's own email, compared lower-cased so the user's own address can
+    /// NEVER become a contact (contacts come from Sent mail's To/Cc, not From). May
+    /// be empty when unknown — then only From is excluded, which on Sent mail is
+    /// the account anyway.
     pub account_addr: String,
 }
 
-/// Crudely flatten HTML to text: drop tags, decode a handful of common
-/// entities, collapse whitespace. mail-parser already gives us a text part when
-/// one exists; this is the HTML-only fallback so we never feed raw markup to
-/// triage.
+/// Crudely flatten HTML to text: drop tags, decode common entities, collapse
+/// whitespace. The HTML-only fallback, so raw markup never reaches triage.
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut tag_buf = String::new();
-    // Inside a <style>/<script> block: their TEXT content is code, not prose —
-    // without this, HTML-only mail flattened to a wall of CSS (visible in the
-    // sealed reveal panel and fed to the triage models as "body").
+    // Inside a <style>/<script> block: that TEXT is code, not prose, and must not
+    // land in the body fed to the triage models.
     let mut skip_block: Option<&'static str> = None;
     for c in html.chars() {
         match c {
@@ -100,7 +89,6 @@ pub fn html_to_text(html: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'");
-    // Collapse runs of whitespace.
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -114,9 +102,8 @@ fn first_addr(addr: &Address) -> (String, Option<String>) {
     }
 }
 
-/// Collect every non-empty email address from an [`Address`] header (handles
-/// both flat address lists and grouped lists). Used to derive contacts from the
-/// To/Cc recipients of Sent mail.
+/// Collect every non-empty email address from an [`Address`] header (flat or
+/// grouped lists). Used to derive contacts from Sent mail's To/Cc recipients.
 fn collect_addrs(addr: &Address, out: &mut Vec<String>) {
     for a in addr.iter() {
         if let Some(email) = a.address()
@@ -127,19 +114,11 @@ fn collect_addrs(addr: &Address, out: &mut Vec<String>) {
     }
 }
 
-/// Heuristic: does `addr` look like a machine/robot address rather than a real
-/// person? Used ONLY to filter recipient contact seeding, so Gmail's
-/// mailto-unsubscribe traffic (real emails sent to unsubscribe/leave/optout
-/// robots) never becomes a "person I know" contact and pollutes triage.
-///
-/// Kept deliberately simple — obvious rules over cleverness. It combines:
-///   * local-part prefixes/patterns (unsub, leave-, optout, bounce, noreply…),
-///   * domain first-label hints (unsub., leave., bounce., optout.…),
-///   * token-like locals (long hex/UUID blobs, or multiple +-separated
-///     UUID-ish segments) that no human picks as an address.
-///
-/// A real local part like `rentbikes.net` must pass (short, has vowels, not a
-/// hex blob), and so must ordinary `first@domain.com` addresses.
+/// Heuristic: does `addr` look like a machine/robot address rather than a person?
+/// Used ONLY to filter recipient contact seeding, so mailto-unsubscribe traffic
+/// never becomes a "person I know" and pollutes triage. Combines local-part
+/// prefixes, domain first-label hints, and token-like locals (hex/UUID blobs).
+/// Ordinary addresses — including a dotted local like `rentbikes.net` — must pass.
 pub fn is_robot_address(addr: &str) -> bool {
     let addr = addr.trim().to_ascii_lowercase();
     let (local, domain) = match addr.split_once('@') {
@@ -148,7 +127,7 @@ pub fn is_robot_address(addr: &str) -> bool {
         _ => return false,
     };
 
-    // --- Domain first-label hints (e.g. leave.mcmap.chase.com, unsub.beehiiv.com)
+    // Domain first-label hints (e.g. leave.mcmap.chase.com, unsub.beehiiv.com).
     let first_label = domain.split('.').next().unwrap_or("");
     const DOMAIN_ROBOT_LABELS: &[&str] =
         &["unsub", "unsubscribe", "leave", "bounce", "optout", "opt-out"];
@@ -156,9 +135,8 @@ pub fn is_robot_address(addr: &str) -> bool {
         return true;
     }
 
-    // --- Local-part prefixes/patterns.
-    // The + is the plus-address boundary; segment on it so a prefix on ANY
-    // +-segment (e.g. "unsubscribe-mc.us22_...") is caught.
+    // Segment on the plus-address boundary so a prefix on ANY +-segment
+    // (e.g. "unsubscribe-mc.us22_...") is caught.
     const LOCAL_ROBOT_PREFIXES: &[&str] = &[
         "unsubscribe",
         "unsub",
@@ -185,23 +163,21 @@ pub fn is_robot_address(addr: &str) -> bool {
         }
     }
 
-    // --- Token-like locals: opaque machine blobs no human would choose.
-    // Multiple +-separated UUID-ish segments (beehiiv style).
+    // Token-like locals: opaque machine blobs no human would choose. First,
+    // multiple +-separated UUID-ish segments (beehiiv style).
     let uuidish_segments = plus_segments.iter().filter(|s| looks_uuidish(s)).count();
     if uuidish_segments >= 1 && plus_segments.len() >= 2 {
         return true;
     }
-    // A single segment that is itself a UUID or a long hex/token blob.
     for seg in &plus_segments {
         if looks_uuidish(seg) || is_hex_blob(seg) {
             return true;
         }
     }
 
-    // A long opaque alnum run (>=25 chars) with a machine-token character mix:
-    // digits present AND a low vowel ratio. Break the local on the usual
-    // separators and inspect each run so a real dotted name (rentbikes.net)
-    // never trips it — its runs are short and vowel-rich.
+    // Break the local on the usual separators and inspect each run, so a real
+    // dotted name (rentbikes.net) never trips it — its runs are short and
+    // vowel-rich.
     for run in local.split(['.', '-', '_', '=']) {
         if is_token_blob(run) {
             return true;
@@ -211,9 +187,8 @@ pub fn is_robot_address(addr: &str) -> bool {
     false
 }
 
-/// A long random-looking machine token: >=25 alphanumeric chars, containing at
-/// least one digit, with a low vowel ratio (<20%). Human words — even long ones
-/// — carry far more vowels; random ids skimp on them and pepper in digits.
+/// A long random-looking machine token: >=25 alphanumeric chars, at least one
+/// digit, vowel ratio below 20%. Human words carry far more vowels even when long.
 fn is_token_blob(s: &str) -> bool {
     if s.len() < 25 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return false;
@@ -223,7 +198,6 @@ fn is_token_blob(s: &str) -> bool {
         return false;
     }
     let vowels = s.bytes().filter(|b| b"aeiou".contains(b)).count();
-    // Low vowel density is the tell of a random token.
     vowels * 5 < s.len()
 }
 
@@ -240,28 +214,19 @@ fn looks_uuidish(s: &str) -> bool {
         .all(|(g, &n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// A long opaque hex/token blob: >=20 chars drawn only from [0-9a-f-] (and not a
-/// human-readable dotted name). Real names like `rentbikes.net` contain letters
-/// outside a-f and stay well under the threshold, so they pass.
+/// A long opaque hex/token blob: >=20 chars drawn only from `[0-9a-f-]`. Real
+/// names contain letters outside a-f and stay under the threshold, so they pass.
 fn is_hex_blob(s: &str) -> bool {
     if s.len() < 20 {
         return false;
     }
-    // Only hex digits and hyphens — a machine token, not a word.
     s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
-/// Extract the unsubscribe intent from a parsed message:
-///   * the raw `List-Unsubscribe` header value (comma-separated `<mailto:…>` /
-///     `<https:…>` entries), trimmed — `None` when absent or blank;
-///   * whether RFC 8058 one-click is advertised: a `List-Unsubscribe-Post`
-///     header whose value contains `List-Unsubscribe=One-Click`
-///     (case-insensitive). One-click is only meaningful alongside a
-///     `List-Unsubscribe` header, so the flag is forced `false` when the latter
-///     is absent.
-///
-/// Header selection/parsing is left to the human-door endpoint; here we only
-/// capture the raw material so triage/FTS/MCP are never affected.
+/// Capture unsubscribe intent: the raw trimmed `List-Unsubscribe` value, plus
+/// whether RFC 8058 one-click is advertised (`List-Unsubscribe-Post` containing
+/// `List-Unsubscribe=One-Click`). One-click is forced `false` without a
+/// `List-Unsubscribe` header. Only raw material — parsing is the endpoint's job.
 pub fn extract_unsub_headers(msg: &mail_parser::Message) -> (Option<String>, bool) {
     let list_unsub = msg
         .header_raw("List-Unsubscribe")
@@ -276,11 +241,10 @@ pub fn extract_unsub_headers(msg: &mail_parser::Message) -> (Option<String>, boo
     (list_unsub, one_click)
 }
 
-/// Derive a stable thread key from headers when X-GM-THRID is unavailable.
-/// Uses the root References id, else In-Reply-To, else this message's own
-/// Message-ID. This keeps a reply chain grouped without Gmail's THRID.
+/// Derive a stable thread key from headers when the Gmail thread id is absent:
+/// the root References id, else In-Reply-To, else this message's own Message-ID.
 pub fn fallback_thread_id(msg: &mail_parser::Message) -> Option<String> {
-    // References: first id is the thread root.
+    // The first References id is the thread root.
     if let Some(first) = msg.references().as_text_list().and_then(|l| l.iter().next()) {
         return Some(first.to_string());
     }
@@ -290,8 +254,8 @@ pub fn fallback_thread_id(msg: &mail_parser::Message) -> Option<String> {
     msg.message_id().map(|s| s.to_string())
 }
 
-/// A tiny FNV-1a hash, hex-encoded. Used as a last-resort stable id when even a
-/// Message-ID is missing (so two distinct such messages don't collide on "").
+/// A tiny FNV-1a hash, hex-encoded: the last-resort stable id when even a
+/// Message-ID is missing, so two such messages don't collide on "".
 pub fn stable_hash(input: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in input.as_bytes() {

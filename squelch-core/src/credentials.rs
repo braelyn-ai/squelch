@@ -1,23 +1,8 @@
-//! Credential storage.
-//!
-//! [`OAuthToken`] is the in-memory token the rest of the system consumes.
-//! [`StoredToken`] is the JSON-serialized shape persisted to a backend (access
-//! token + optional refresh token + absolute expiry).
-//!
-//! TWO-DOOR MODEL: each account has up to two *separate* credentials keyed by
-//! [`CredentialKind`]:
-//!   - [`CredentialKind::Read`]  — `gmail.readonly`; the sync daemon + triage
-//!     use ONLY this. Stored in the plain-email slot for back-compat.
-//!   - [`CredentialKind::Write`] — `gmail.modify` + `gmail.send`; loaded ONLY by
-//!     human-door action endpoints. Stored in a `#write`-suffixed slot.
-//!
-//! A store is constructed *bound to one kind*; a Read-bound store can never
-//! return the write token and vice versa.
-//!
-//! Both backends ([`KeyringCredentialStore`], [`FileCredentialStore`]) share the
-//! same refresh logic via [`refresh_stored_token`] — no duplication.
-//!
-//! SECURITY: tokens are never logged. On unix the file backend is mode 0600.
+//! Credential storage: [`OAuthToken`] in memory, [`StoredToken`] as the JSON blob
+//! persisted to a backend. TWO-DOOR: each account has up to two slots keyed by
+//! [`CredentialKind`] — Read (`gmail.readonly`, sync + triage) and Write
+//! (`gmail.modify` + `gmail.send`, human-door actions). A store is bound to ONE
+//! kind and can never return the other's token. Tokens are never logged.
 
 use crate::config::OAuthClientConfig;
 use crate::error::{CoreError, Result};
@@ -44,9 +29,8 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
-    /// Storage-slot suffix. Read is empty for back-compat with pre-two-door
-    /// tokens already sitting in the plain-email keyring slot; Write is
-    /// disambiguated by suffix.
+    /// Storage-slot suffix. Read's MUST stay empty — already-issued tokens live in
+    /// the plain-email slot, and suffixing it orphans them.
     pub fn slot_suffix(self) -> &'static str {
         match self {
             CredentialKind::Read => "",
@@ -68,9 +52,8 @@ pub struct OAuthToken {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-/// Abstracts where OAuth tokens live (keyring, file, env). A store is bound to a
-/// single account and a single [`CredentialKind`]; `token` returns only that
-/// kind's token.
+/// Abstracts where OAuth tokens live (keyring, file, env). Bound to one account and
+/// one [`CredentialKind`]; `token` returns only that kind's token.
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     /// Return a *currently valid* access token, refreshing if necessary.
@@ -136,19 +119,16 @@ impl StoredToken {
     }
 }
 
-/// Refresh a token grace window: refresh if within 60s of expiry.
+/// Refresh grace window: refresh when within 60s of expiry.
 const REFRESH_SKEW_SECS: i64 = 60;
 
 // ---------------------------------------------------------------------------
-// Shared refresh logic (used by both keyring and file backends).
+// Shared refresh logic.
 // ---------------------------------------------------------------------------
 
-/// Exchange a refresh token for a fresh access token via Google's token
-/// endpoint. Pure network op — persistence is the caller's job. Shared by every
-/// backend so refresh behavior can't drift between them.
-///
-/// Google typically omits a new refresh token on refresh, so we preserve the
-/// caller's `refresh_token` when the response doesn't carry one.
+/// Exchange a refresh token for a fresh access token at Google's token endpoint.
+/// Pure network op — persistence is the caller's job. Google usually omits a new
+/// refresh token on refresh, so the caller's is carried forward when absent.
 pub fn refresh_stored_token(
     client: &OAuthClientConfig,
     refresh_token: &str,
@@ -189,11 +169,9 @@ pub fn refresh_stored_token(
     ))
 }
 
-/// The credential-error message for a failed refresh exchange. `invalid_grant`
-/// means the REFRESH token itself is dead (not a transient failure), so no
-/// amount of backoff will recover — tell the operator how to fix it, including
-/// the usual root cause: Google expires refresh tokens after 7 days while the
-/// OAuth consent screen is in "Testing" status.
+/// The credential-error message for a failed refresh exchange. `invalid_grant` means
+/// the REFRESH token itself is dead, not a transient failure — no backoff recovers
+/// it, so the message names the fix instead.
 fn refresh_error_message(err: &str) -> String {
     if err.contains("invalid_grant") {
         format!(
@@ -208,9 +186,8 @@ fn refresh_error_message(err: &str) -> String {
     }
 }
 
-/// Given a stored token, return a currently-valid [`OAuthToken`], refreshing via
-/// `refresh_stored_token` if within the skew window. `persist` re-saves the
-/// refreshed blob into whatever backend the caller owns. Shared by all backends.
+/// Return a currently-valid [`OAuthToken`] from `stored`, refreshing when inside the
+/// skew window. `persist` re-saves the refreshed blob into the caller's backend.
 fn validate_or_refresh(
     stored: StoredToken,
     client: &OAuthClientConfig,
@@ -235,7 +212,7 @@ fn validate_or_refresh(
 // ---------------------------------------------------------------------------
 
 /// Persist a token into the OS keyring at `(service = "squelch", slot)` where
-/// `slot` = email + kind suffix. Used by the auth flow.
+/// `slot` = email + kind suffix.
 pub fn store_token(account_email: &str, kind: CredentialKind, token: &StoredToken) -> Result<()> {
     let slot = kind.slot_key(account_email);
     let entry = keyring::Entry::new(KEYRING_SERVICE, &slot)
@@ -270,7 +247,7 @@ pub struct KeyringCredentialStore {
 }
 
 impl KeyringCredentialStore {
-    /// Construct a Read-bound store (the sync engine's back-compat entry point).
+    /// Construct a Read-bound store.
     pub fn new(account_id: AccountId, account_email: String, client: OAuthClientConfig) -> Self {
         Self::new_with_kind(account_id, account_email, CredentialKind::Read, client)
     }
@@ -376,8 +353,7 @@ impl CredentialsFile {
         write_private(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, path)
             .map_err(|e| CoreError::Credential(format!("finalizing credentials file: {e}")))?;
-        // Ensure the final path also carries 0600 (rename preserves tmp's mode,
-        // but be explicit in case the dest pre-existed with looser bits).
+        // Be explicit about 0600: the destination may have pre-existed looser.
         set_private_mode(path)?;
         Ok(())
     }
@@ -460,7 +436,7 @@ pub struct FileCredentialStore {
 }
 
 impl FileCredentialStore {
-    /// Construct a Read-bound file store (sync-engine back-compat entry point).
+    /// Construct a Read-bound file store.
     pub fn new(
         account_id: AccountId,
         account_email: String,
@@ -546,8 +522,7 @@ impl CredentialStore for FileCredentialStore {
 
 use crate::config::CredentialBackend;
 
-/// Persist a freshly-minted token into whichever backend is configured. The
-/// auth subcommand calls this so it stays backend-agnostic.
+/// Persist a freshly-minted token into whichever backend is configured.
 pub fn store_token_backend(
     backend: CredentialBackend,
     credentials_path: &Path,
@@ -563,8 +538,7 @@ pub fn store_token_backend(
     }
 }
 
-/// Load a raw stored token from whichever backend is configured (used by the
-/// auth subcommand to confirm persistence).
+/// Load a raw stored token from whichever backend is configured.
 pub fn load_token_backend(
     backend: CredentialBackend,
     credentials_path: &Path,
@@ -577,8 +551,7 @@ pub fn load_token_backend(
     }
 }
 
-/// Build a Read-bound [`CredentialStore`] trait object for the configured
-/// backend. The sync engine consumes this; its call sites never change.
+/// Build a Read-bound [`CredentialStore`] trait object for the configured backend.
 pub fn read_store_for_backend(
     backend: CredentialBackend,
     account_id: AccountId,
