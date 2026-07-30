@@ -37,7 +37,16 @@ struct EmailsView: View {
     /// True only while the cursor is actually over a row.
     @State private var hovering = false
 
-    private var rows: [AttentionUpdate] { items ?? [] }
+    /// The local snapshot MINUS anything resolved since it was fetched.
+    ///
+    /// `items` is this view's own copy and only reloads on `store.lastRefresh`
+    /// — the 10s poll — so mail finished from the reader used to sit here,
+    /// visibly undone, until the next tick. Filtering against the store's
+    /// resolved set closes that window without giving up the local list (which
+    /// is what makes this page's ordering and paging its own).
+    private var rows: [AttentionUpdate] {
+        (items ?? []).filter { !store.resolvedIds.contains($0.id) }
+    }
     private var selected: AttentionUpdate? { rows[safe: index] }
     /// Action keys are inert unless something is actually highlighted.
     private var actionable: Bool { kbActive || hovering }

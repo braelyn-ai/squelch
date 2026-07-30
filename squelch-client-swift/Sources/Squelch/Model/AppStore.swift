@@ -696,11 +696,23 @@ final class AppStore {
 
     // MARK: - band mutation (optimistic)
 
+    /// Ids resolved during this session, so a list that keeps its OWN copy of
+    /// the rows can drop them the moment it is looked at again.
+    ///
+    /// The bands live in `sitrep` and update in place, but EmailsView holds a
+    /// local `items` snapshot and only reloads on `lastRefresh` — the 10s poll.
+    /// Resolving from the reader therefore left the row sitting on the mail page
+    /// for up to a full poll after the mail was gone, which reads as the action
+    /// not having worked. This is the shared record of "already done" that any
+    /// such list can filter against; the poll still supplies the truth.
+    private(set) var resolvedIds: Set<Int> = []
+
     /// Optimistically pull a message id out of whatever band holds it and keep
     /// the selection valid (advance to the next row, else the previous).
     /// Returns a `restore` thunk that re-inserts the removed rows on failure.
     func removeFromBands(_ messageId: Int) -> () -> Void {
         let prev = sitrep
+        resolvedIds.insert(messageId)
         // Compute the next selection BEFORE mutating, using the flat order.
         let orderBefore = orderedIds
         let posBefore = orderBefore.firstIndex(of: messageId) ?? 0
@@ -724,6 +736,33 @@ final class AppStore {
             self.sitrep.new = prev.new
             self.sitrep.open = prev.open
             self.selectedId = messageId
+            // An undone resolve must be undone EVERYWHERE, or the row returns
+            // to the bands while the mail page keeps filtering it out.
+            self.resolvedIds.remove(messageId)
         }
+    }
+
+    /// Record a resolve that did NOT go through the bands — the reader can
+    /// finish a thread it was not opened from a queue with, and that mail may
+    /// still be sitting in a list somewhere behind it.
+    func noteResolved(_ messageId: Int) {
+        resolvedIds.insert(messageId)
+        sitrep.standing.removeAll { $0.id == messageId }
+        sitrep.new.removeAll { $0.id == messageId }
+        sitrep.open.removeAll { $0.id == messageId }
+    }
+
+    /// Optimistically pull a message out of the STANDING band ONLY — the one a
+    /// tier correction actually empties.
+    ///
+    /// For-your-eyes is tier-defined server-side (`tier IN
+    /// ('past_due','deadline') AND status != 'done'`); `new` and `open` are
+    /// defined by surfaced_at and status, which a tier correction leaves
+    /// untouched. A fresh deadline email sits in standing AND new, so pulling it
+    /// from all three would blank it out of Attention for the half second before
+    /// the refresh puts it back. No restore thunk: the write has already
+    /// succeeded by the time this runs.
+    func removeFromStanding(_ messageId: Int) {
+        sitrep.standing.removeAll { $0.id == messageId }
     }
 }
