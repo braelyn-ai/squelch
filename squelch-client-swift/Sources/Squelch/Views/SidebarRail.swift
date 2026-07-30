@@ -36,8 +36,9 @@ struct SidebarRail: View {
     /// Height of the strip the traffic lights live in, left unpainted by the
     /// rail's material below. Measured from the TRUE window top (the material
     /// ignores the top safe area): the dots bottom out ~20pt down, so this
-    /// stops just under them.
-    static let titleBarHeight: CGFloat = 22
+    /// stops just under them, with a little air so the dots don't sit tight
+    /// against the material's edge.
+    static let titleBarHeight: CGFloat = 28
 
     var body: some View {
         railStack

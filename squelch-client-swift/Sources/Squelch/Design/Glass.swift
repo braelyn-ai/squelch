@@ -353,8 +353,46 @@ struct WindowConfigurator: NSViewRepresentable {
             window.titleVisibility = .hidden
             window.styleMask.insert(.fullSizeContentView)
             window.isMovableByWindowBackground = true
+            Self.hideTitlebarDecoration(in: window)
         }
         return view
+    }
+
+    /// Hide the glass chip macOS 26 paints behind the traffic lights
+    /// (`_NSTitlebarDecorationView`). It samples the backdrop and re-tints it,
+    /// so the title strip reads as a different colour than the page it sits on.
+    /// `titlebarAppearsTransparent` hides the titlebar *background* view but
+    /// not this one, and no public API reaches it, hence the class-name walk.
+    ///
+    /// AppKit builds the decoration lazily — it does not exist yet when the
+    /// window is configured — and can rebuild it on later transitions, so one
+    /// walk is not enough: a few post-launch retries catch the initial build,
+    /// and key/main/occlusion observers catch rebuilds for the window's life.
+    static func hideTitlebarDecoration(in window: NSWindow) {
+        func walk(_ view: NSView) {
+            if String(describing: type(of: view)).contains("TitlebarDecoration") {
+                view.isHidden = true
+            }
+            view.subviews.forEach(walk)
+        }
+        func hide() {
+            if let frameView = window.contentView?.superview { walk(frameView) }
+        }
+        hide()
+        for delay in [0.25, 0.75, 2.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { hide() }
+        }
+        for name in [
+            NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+            NSWindow.didBecomeMainNotification, NSWindow.didResignMainNotification,
+            NSWindow.didChangeOcclusionStateNotification,
+        ] {
+            NotificationCenter.default.addObserver(
+                forName: name, object: window, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { hide() }
+            }
+        }
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
