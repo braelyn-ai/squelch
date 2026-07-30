@@ -173,10 +173,16 @@ struct EmailWebView: View {
                 onLink: { Opener.open($0) }
             )
             .frame(height: displayHeight)
-            // PAINT-HOLD: an unmeasured frame keeps its placeholder space but
-            // stays invisible until the first measurement lands, so the reader
-            // never sees a half-laid-out document snap to size.
-            .opacity(measured || rememberedHeight != nil ? 1 : 0)
+            // PAINT-HOLD: the frame keeps its (placeholder or remembered) space
+            // but stays invisible until the first measurement lands, so the
+            // reader never sees a half-laid-out document snap to size. This is
+            // THE anti-incremental-paint mechanism — WebKit's own
+            // `suppressesIncrementalRendering` is deliberately NOT used, because
+            // it refuses to paint until every subresource (each remote image)
+            // has finished downloading, which held fully-parsed mail hostage to
+            // the slowest CDN. The measurement fires at document end, before
+            // images: one coherent text+layout paint, images settle into it.
+            .opacity(measured ? 1 : 0)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             if hasQuoted {
@@ -214,8 +220,11 @@ struct EmailWebView: View {
         // no way to read the rest. After a beat, fall back to a tall box.
         .task(id: prepared.sourceHash) {
             try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled, !measured, height == 0 else { return }
-            height = Self.unmeasuredFallbackHeight
+            guard !Task.isCancelled, !measured else { return }
+            // A remembered height is still a good size; only a never-measured
+            // first open needs the tall fallback. Either way the frame must
+            // become VISIBLE — opacity is gated on `measured` alone now.
+            if height == 0 { height = Self.unmeasuredFallbackHeight }
             measured = true
         }
     }
@@ -342,7 +351,6 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         // LAYER 5: no cookie jar, no persistent storage, nothing survives close.
         config.websiteDataStore = Self.sharedDataStore
-        config.suppressesIncrementalRendering = true
 
         let controller = WKUserContentController()
         controller.add(context.coordinator, name: "squelch")
