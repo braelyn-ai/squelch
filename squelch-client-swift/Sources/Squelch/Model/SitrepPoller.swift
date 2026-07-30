@@ -18,9 +18,12 @@ final class SitrepPoller {
     private static let pollInterval: Duration = .seconds(10)
     private static let pageLimit = 200
 
-    /// In-flight guard shared by the interval poller AND the manual refresh
-    /// button, so a user poke never races an overlapping scheduled pull.
-    private var inFlight = false
+    /// The in-flight pull, shared by the interval poller AND every manual
+    /// caller, so a poke never races an overlapping scheduled pull. Held as the
+    /// TASK rather than a flag so an overlapping caller can JOIN it: a caller
+    /// that skips has no idea whether the answer on screen is older than what it
+    /// asked about.
+    private var inFlight: Task<Void, Never>?
     private var task: Task<Void, Never>?
     private var focusObserver: NSObjectProtocol?
 
@@ -51,13 +54,38 @@ final class SitrepPoller {
         focusObserver = nil
     }
 
-    /// Fetch the sitrep read model once and write it into the store. No-ops if
-    /// a pull is already in flight or the door isn't connected.
+    /// Fetch the sitrep read model once and write it into the store. Joins a
+    /// pull already in flight rather than stacking a second one; no-ops if the
+    /// door isn't connected.
     func pull() async {
-        guard !inFlight, store.connStatus == .connected else { return }
-        inFlight = true
-        defer { inFlight = false }
+        if let inFlight {
+            await inFlight.value
+            return
+        }
+        guard store.connStatus == .connected else { return }
+        let task = Task { await self.performPull() }
+        inFlight = task
+        await task.value
+        if inFlight == task { inFlight = nil }
+    }
 
+    /// Re-read every surface a triage correction can move mail BETWEEN, NOW. The
+    /// bands are otherwise up to a poll behind and the zones up to a TTL behind,
+    /// which is minutes — long enough that the mail looks like it never moved.
+    ///
+    /// JOIN THEN PULL, rather than pull: a poll already running may have read
+    /// the daemon before the correction committed, so its rows are allowed to be
+    /// stale and cannot be the ones we settle on. The two halves then run
+    /// together, and `pull`'s own trailing zone refresh joins the forced pass
+    /// below instead of costing a second round of five requests.
+    func refreshAfterCorrection() async {
+        if let inFlight { await inFlight.value }
+        async let bands: Void = pull()
+        async let zones: Void = store.refreshZones(force: true)
+        _ = await (bands, zones)
+    }
+
+    private func performPull() async {
         do {
             async let standing = APIClient.shared.getUpdates(
                 UpdatesParams(band: .standing, limit: Self.pageLimit))
@@ -78,6 +106,9 @@ final class SitrepPoller {
             if next != store.sitrep { store.sitrep = next }
             if store.refreshError != nil { store.refreshError = nil }
             store.lastRefresh = Date()
+            // The bands half of the launch image warm's input; refreshZones
+            // below supplies the other half.
+            ImageWarmer.shared.noteSitrepLanded()
 
             // Keep a valid selection: if nothing selected, land on the first row.
             if store.selectedId == nil, let first = store.orderedIds.first {

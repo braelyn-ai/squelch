@@ -109,7 +109,7 @@ struct TriageFixPalette: View {
     }
 
     private var input: some View {
-        TextField("where should this have gone? (bill, noise, statement…)", text: $query)
+        TextField("where should this have gone? (important, bill, noise…)", text: $query)
             .textFieldStyle(.plain)
             .font(.system(size: 15))
             .foregroundStyle(Palette.ink)
@@ -197,18 +197,42 @@ struct TriageFixPalette: View {
         ]
     }
 
+    /// A correction that SUCCEEDS has to be visible by the time the list is back
+    /// on screen, in both directions: the row leaves the band the server no
+    /// longer puts it in, and it ARRIVES in its new home with the server's own
+    /// row rather than a guess at one — a zone row is a different shape than a
+    /// band row, so there is nothing here to synthesize it from.
+    ///
+    /// So: optimistic removal for exactly the moves the server's predicates make
+    /// (TriageTarget.exit), then a forced re-read of the bands AND the zones,
+    /// which renders underneath what is already on screen. A correction that
+    /// FAILS moves nothing and keeps the palette up to try again.
     private func apply(_ hit: TriageTarget) async {
         guard !busy else { return }
         busy = true
         do {
             try await APIClient.shared.correctTriage(
                 messageId: target.messageId, dimension: hit.axis, toValue: hit.value)
-            store.pushToast("moved to \(hit.label) · recorded", .success)
-            onClose()
         } catch {
             store.pushToast(errText(error, "could not record the correction"), .error)
             busy = false
+            return
         }
+        switch hit.exit {
+        case .stays: break
+        case .standing: store.removeFromStanding(target.messageId)
+        case .allBands: _ = store.removeFromBands(target.messageId)
+        }
+        // Never promises a move the pipeline does not make: a category is not a
+        // band, so "moved to Marketing" would be a claim the list then visibly
+        // contradicts.
+        store.pushToast(
+            hit.lands.map { "\(hit.label) → \($0) · recorded" } ?? "\(hit.label) · recorded",
+            .success)
+        onClose()
+        // Runs on past the palette on purpose — the Task that called us belongs
+        // to the key binding, not to this view, so dismissing does not cancel it.
+        await SitrepPoller.shared.refreshAfterCorrection()
     }
 }
 
@@ -241,6 +265,18 @@ private struct TargetRow: View {
                     .foregroundStyle(Palette.inkFaint)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                // WHERE IT LANDS, for the values whose destination is a server
+                // predicate. "For your eyes" is a band over tiers, not a label
+                // anyone can pick, so seeing which tiers constitute it is the
+                // only way to aim at it on purpose. Shown on the row rather than
+                // written in a hint because the mapping is the thing people get
+                // wrong, and it truncates last.
+                if let lands = target.lands {
+                    Text("→ \(lands)")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.accent.opacity(0.85))
+                        .fixedSize()
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)

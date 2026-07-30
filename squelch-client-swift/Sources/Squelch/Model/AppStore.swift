@@ -538,14 +538,22 @@ final class AppStore {
         // own `.task` the moment the sitrep mounts — so on a cold load every one
         // of them would sail past the TTL check and fire its own copy of all
         // five requests.
+        //
+        // A FORCED caller does not get to stop there. It forces because it just
+        // changed the data, and a pass already in flight may have read the
+        // daemon BEFORE that change landed — joining it would answer with rows
+        // the caller already knows are stale.
         if let running = zoneRefresh {
             await running.value
-            return
+            if !force { return }
         }
         let refresh = Task { await performZoneRefresh() }
         zoneRefresh = refresh
         await refresh.value
-        zoneRefresh = nil
+        // Only clear our OWN marker: a forced caller can have replaced it while
+        // we were suspended, and nil-ing that one would let the next joiner
+        // start a redundant third pass.
+        if zoneRefresh == refresh { zoneRefresh = nil }
     }
 
     /// In-flight zone refresh, so concurrent callers share one pass.
