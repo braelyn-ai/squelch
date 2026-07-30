@@ -60,13 +60,38 @@ enum Trackers {
 
     // MARK: - attribute reading
 
+    /// The three quoting shapes one attribute name can arrive in.
+    private struct AttrPatterns {
+        let quoted: Regex<AnyRegexOutput>?
+        let single: Regex<AnyRegexOutput>?
+        let bare: Regex<AnyRegexOutput>?
+
+        init(_ name: String) {
+            quoted = try? Regex("(?i)\\b\(name)\\s*=\\s*\"([^\"]*)\"")
+            single = try? Regex("(?i)\\b\(name)\\s*=\\s*'([^']*)'")
+            bare = try? Regex("(?i)\\b\(name)\\s*=\\s*([^\\s>]+)")
+        }
+    }
+
+    /// Compiled once per attribute NAME, matching the idiom the rest of the
+    /// pipeline uses (ImageProxy's patterns). `attrValue` is hit ~6× per `<img>`
+    /// and `strip` runs over every body of every thread, so building three
+    /// regexes out of an interpolated pattern PER CALL was pure overhead. Only
+    /// these names are ever asked for; anything else still compiles on demand,
+    /// so nothing about the matching changes.
+    nonisolated(unsafe) private static let attrPatterns: [String: AttrPatterns] =
+        Dictionary(
+            uniqueKeysWithValues: ["src", "style", "width", "height"].map { ($0, AttrPatterns($0)) }
+        )
+
     /// Read one attribute's value from a raw `<img …>` tag string.
     static func attrValue(_ tag: String, _ name: String) -> String? {
-        guard let quoted = try? Regex("(?i)\\b\(name)\\s*=\\s*\"([^\"]*)\"") else { return nil }
+        let patterns = attrPatterns[name] ?? attrPatterns[name.lowercased()] ?? AttrPatterns(name)
+        guard let quoted = patterns.quoted else { return nil }
         if let m = tag.firstMatch(of: quoted), let r = m[1].range { return String(tag[r]) }
-        guard let single = try? Regex("(?i)\\b\(name)\\s*=\\s*'([^']*)'") else { return nil }
+        guard let single = patterns.single else { return nil }
         if let m = tag.firstMatch(of: single), let r = m[1].range { return String(tag[r]) }
-        guard let bare = try? Regex("(?i)\\b\(name)\\s*=\\s*([^\\s>]+)") else { return nil }
+        guard let bare = patterns.bare else { return nil }
         if let m = tag.firstMatch(of: bare), let r = m[1].range { return String(tag[r]) }
         return nil
     }
@@ -81,9 +106,19 @@ enum Trackers {
         return Double(m.1)
     }
 
+    /// Compiled once per property name, for the same reason as `attrPatterns`.
+    nonisolated(unsafe) private static let stylePatterns: [String: Regex<AnyRegexOutput>] =
+        Dictionary(
+            uniqueKeysWithValues: ["width", "height", "display", "visibility"].compactMap { prop in
+                (try? Regex("(?i)(?:^|;)\\s*\(prop)\\s*:\\s*([^;]+)")).map { (prop, $0) }
+            })
+
     /// Read a property value out of an inline style string (best-effort).
     private static func styleProp(_ style: String, _ prop: String) -> String? {
-        guard let re = try? Regex("(?i)(?:^|;)\\s*\(prop)\\s*:\\s*([^;]+)") else { return nil }
+        let cached = stylePatterns[prop] ?? stylePatterns[prop.lowercased()]
+        guard let re = cached ?? (try? Regex("(?i)(?:^|;)\\s*\(prop)\\s*:\\s*([^;]+)")) else {
+            return nil
+        }
         guard let m = style.firstMatch(of: re), let r = m[1].range else { return nil }
         return String(style[r]).trimmingCharacters(in: .whitespaces)
     }

@@ -34,10 +34,17 @@ enum ImageRepeats {
     }
 
     /// The key an image is deduped by. Trimmed (leading/trailing space in an
-    /// attribute is meaningless) but otherwise verbatim: URL paths are
-    /// case-sensitive, so folding case here would merge two distinct images.
+    /// attribute is meaningless) and entity-DECODED, through the same decoder
+    /// ImageProxy applies before it proxies a src: the attribute value is
+    /// HTML-escaped in the sanitized document, so `?a=1&amp;b=2` and `?a=1&b=2`
+    /// name ONE image and one fetch, and keying on the raw text would show it
+    /// twice. Otherwise verbatim: URL paths are case-sensitive, so folding case
+    /// here would merge two distinct images.
+    ///
+    /// Key material only — the html this pass emits is still byte-for-byte the
+    /// html it was handed, minus whole `<img>` tags.
     static func key(_ src: String) -> String {
-        src.trimmingCharacters(in: .whitespacesAndNewlines)
+        ImageProxy.unescapeEntities(src.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// Every dedupable `<img src>` in document order.

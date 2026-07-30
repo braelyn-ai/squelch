@@ -1,5 +1,5 @@
 // AUTH CODE MODAL — the payoff of the 2FA "present, don't read" flow. When an
-// otp/login_code/verification message arrives we auto-reveal (audited) and
+// otp/verification message arrives we auto-reveal (audited) and
 // extract the code; this presents it BIG so the human copies it and moves on
 // without ever reading the email.
 //

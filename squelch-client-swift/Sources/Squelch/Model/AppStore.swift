@@ -313,7 +313,7 @@ final class AppStore {
 
     // MARK: 2FA
     var authRings: [AuthRing] = []
-    /// Newest-first queue of code-modal entries (only otp/login_code/verification).
+    /// Newest-first queue of code-modal entries (only otp/verification).
     var authQueue: [AuthCodeEntry] = []
 
     private init() {}

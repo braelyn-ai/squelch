@@ -305,7 +305,12 @@ enum ImageProxy {
 
     /// The five entities an HTML serializer can put in an attribute value, in
     /// ONE pass so `&amp;lt;` decodes to `&lt;` and not to `<`.
-    private static func unescapeEntities(_ text: String) -> String {
+    ///
+    /// Internal rather than private because this decode defines what url a
+    /// reference actually FETCHES, so any pass that needs to identify a
+    /// reference has to agree with it — ImageRepeats keys its dedupe on this,
+    /// which is the only way `?a=1&amp;b=2` and `?a=1&b=2` land on one image.
+    static func unescapeEntities(_ text: String) -> String {
         guard text.contains("&") else { return text }
         var out = ""
         var rest = Substring(text)

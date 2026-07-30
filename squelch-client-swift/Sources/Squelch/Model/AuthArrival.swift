@@ -3,8 +3,8 @@
 // The app already polls sealed metadata (SitrepPoller, 10s). This watches that
 // list and fires a one-shot flow the first time a genuinely-new auth message
 // appears: a countdown ring on the auth rail, and — for code kinds (otp /
-// login_code / verification) — an auto-reveal (server-side audited) plus
-// client-side code extraction that pops a modal. Password resets and sign-in
+// verification) — an auto-reveal (server-side audited) plus client-side code
+// extraction that pops a modal. Password resets, sign-in links, and sign-in
 // alerts get the ring but no modal.
 //
 // A message counts as a fresh arrival when it is NOT in the persisted seen-set

@@ -13,8 +13,13 @@ import SwiftUI
 // MARK: - code extraction
 
 enum AuthCode {
-    /// Kinds that warrant the code modal. Others (resets/alerts) get the ring only.
-    static let codeKinds: Set<String> = ["otp", "login_code", "verification"]
+    /// Kinds that warrant the code modal. Others (resets/alerts/links) get the
+    /// ring only.
+    ///
+    /// These are wire values from `SealedKind` (squelch-core/src/types.rs) — the
+    /// server only ever sends otp, password_reset, magic_link, login_alert,
+    /// verification. Anything not in that enum is dead weight here.
+    static let codeKinds: Set<String> = ["otp", "verification"]
 
     /// True if this sealed kind should pop the code modal (vs. ring-only).
     static func isCodeKind(_ kind: String?) -> Bool {

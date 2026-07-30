@@ -180,10 +180,20 @@ final class HeroCache {
 final class HeroBytes {
     static let shared = HeroBytes()
 
+    /// Ephemeral, and every knob that could leak the reader is off — the same
+    /// lockdown as `ImageStore`, because this fetches the same kind of thing:
+    /// a URL an email chose. `urlCache` is nil because HeroCache holds the only
+    /// copy worth keeping (the downsampled thumbnail); a URL cache underneath
+    /// would keep the full-size art as well, on disk, keyed by a mail-supplied
+    /// URL.
     private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 10
+        let cfg = URLSessionConfiguration.ephemeral
         cfg.httpShouldSetCookies = false
+        cfg.httpCookieAcceptPolicy = .never
+        cfg.httpCookieStorage = nil
+        cfg.urlCache = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.timeoutIntervalForRequest = 10
         return URLSession(configuration: cfg)
     }()
 
