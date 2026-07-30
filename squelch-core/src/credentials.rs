@@ -175,7 +175,7 @@ pub fn refresh_stored_token(
     let resp = oauth
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request(&http)
-        .map_err(|e| CoreError::Credential(format!("refresh failed: {e}")))?;
+        .map_err(|e| CoreError::Credential(refresh_error_message(&e.to_string())))?;
 
     let new_refresh = resp
         .refresh_token()
@@ -187,6 +187,25 @@ pub fn refresh_stored_token(
         new_refresh,
         resp.expires_in(),
     ))
+}
+
+/// The credential-error message for a failed refresh exchange. `invalid_grant`
+/// means the REFRESH token itself is dead (not a transient failure), so no
+/// amount of backoff will recover — tell the operator how to fix it, including
+/// the usual root cause: Google expires refresh tokens after 7 days while the
+/// OAuth consent screen is in "Testing" status.
+fn refresh_error_message(err: &str) -> String {
+    if err.contains("invalid_grant") {
+        format!(
+            "refresh failed: {err} — Google has expired or revoked the refresh \
+             token; re-authorize with `squelchd auth` (add --write for the write \
+             credential). If this recurs every ~7 days, publish the OAuth consent \
+             screen from \"Testing\" to \"In production\" in Google Cloud Console: \
+             testing-status apps get 7-day refresh tokens"
+        )
+    } else {
+        format!("refresh failed: {err}")
+    }
 }
 
 /// Given a stored token, return a currently-valid [`OAuthToken`], refreshing via
@@ -611,6 +630,18 @@ mod tests {
             client_id: "id".into(),
             client_secret: "secret".into(),
         }
+    }
+
+    #[test]
+    fn invalid_grant_refresh_error_names_the_fix() {
+        let msg = refresh_error_message(
+            "Server returned error response: invalid_grant: Token has been expired or revoked.",
+        );
+        assert!(msg.contains("squelchd auth"));
+        assert!(msg.contains("In production"));
+
+        let transient = refresh_error_message("connection reset by peer");
+        assert_eq!(transient, "refresh failed: connection reset by peer");
     }
 
     #[test]
