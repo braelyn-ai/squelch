@@ -5,119 +5,110 @@ use serde::{Deserialize, Serialize};
 
 pub type AccountId = i64;
 
-/// MCP-visible triage tier. There is deliberately NO `Sealed` variant here:
-/// sealed messages are excluded structurally, never surfaced as a tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tier {
-    PastDue,
-    Deadline,
-    Signal,
-    Noise,
+/// Declares a C-like enum together with its string mapping, so the enum, its
+/// `as_str`, and its `parse` all come from ONE variant→literal table and can
+/// never drift out of step.
+///
+/// Attributes and doc comments pass through verbatim onto the enum and each
+/// variant, so derives and `#[serde(rename_all = …)]` keep producing exactly the
+/// wire shape they did hand-written — these enums cross the doors, so the
+/// serialized bytes are a contract.
+///
+/// `parse` returns `Option<Self>`. A trailing `fallback = Variant;` clause makes
+/// it infallible instead, returning `Self` with every unrecognized string mapped
+/// to that variant.
+macro_rules! str_enum {
+    // Internal: the `parse` half, infallible form (a `fallback` was declared).
+    (@parse $name:ident { $($variant:ident => $lit:literal),+ } fallback = $fallback:ident;) => {
+        /// Infallible: an unrecognized string parses to the fallback variant.
+        pub fn parse(s: &str) -> $name {
+            match s {
+                $($lit => $name::$variant,)+
+                _ => $name::$fallback,
+            }
+        }
+    };
+    // Internal: the `parse` half, fallible form (no `fallback` declared).
+    (@parse $name:ident { $($variant:ident => $lit:literal),+ }) => {
+        pub fn parse(s: &str) -> Option<$name> {
+            match s {
+                $($lit => Some($name::$variant),)+
+                _ => None,
+            }
+        }
+    };
+
+    (
+        $(#[$emeta:meta])*
+        $vis:vis enum $name:ident {
+            $($(#[$vmeta:meta])* $variant:ident => $lit:literal),+ $(,)?
+        }
+        $($fallback:tt)*
+    ) => {
+        $(#[$emeta])*
+        $vis enum $name {
+            $($(#[$vmeta])* $variant,)+
+        }
+
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $($name::$variant => $lit,)+
+                }
+            }
+
+            $crate::types::str_enum!(@parse $name { $($variant => $lit),+ } $($fallback)*);
+        }
+    };
 }
 
-impl Tier {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Tier::PastDue => "past_due",
-            Tier::Deadline => "deadline",
-            Tier::Signal => "signal",
-            Tier::Noise => "noise",
-        }
-    }
+// Sibling modules reach the macro by path, so definition order never matters.
+pub(crate) use str_enum;
 
-    pub fn parse(s: &str) -> Option<Tier> {
-        match s {
-            "past_due" => Some(Tier::PastDue),
-            "deadline" => Some(Tier::Deadline),
-            "signal" => Some(Tier::Signal),
-            "noise" => Some(Tier::Noise),
-            _ => None,
-        }
-    }
-}
-
-/// Internal-only classification. NEVER crosses the MCP boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sensitivity {
-    Normal,
-    Sealed,
-}
-
-impl Sensitivity {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Sensitivity::Normal => "normal",
-            Sensitivity::Sealed => "sealed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Sensitivity {
-        match s {
-            "sealed" => Sensitivity::Sealed,
-            _ => Sensitivity::Normal,
-        }
-    }
-}
-
-/// The kind of auth-related content that caused a message to be sealed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealedKind {
-    Otp,
-    PasswordReset,
-    MagicLink,
-    LoginAlert,
-    Verification,
-}
-
-impl SealedKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SealedKind::Otp => "otp",
-            SealedKind::PasswordReset => "password_reset",
-            SealedKind::MagicLink => "magic_link",
-            SealedKind::LoginAlert => "login_alert",
-            SealedKind::Verification => "verification",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<SealedKind> {
-        match s {
-            "otp" => Some(SealedKind::Otp),
-            "password_reset" => Some(SealedKind::PasswordReset),
-            "magic_link" => Some(SealedKind::MagicLink),
-            "login_alert" => Some(SealedKind::LoginAlert),
-            "verification" => Some(SealedKind::Verification),
-            _ => None,
-        }
+str_enum! {
+    /// MCP-visible triage tier. There is deliberately NO `Sealed` variant here:
+    /// sealed messages are excluded structurally, never surfaced as a tier.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Tier {
+        PastDue => "past_due",
+        Deadline => "deadline",
+        Signal => "signal",
+        Noise => "noise",
     }
 }
 
-/// What squelch decides to do with a message at the surfacing layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Disposition {
-    Surface,
-    Squelch,
-    Filtered,
+str_enum! {
+    /// Internal-only classification. NEVER crosses the MCP boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Sensitivity {
+        Normal => "normal",
+        Sealed => "sealed",
+    }
+    // Anything that is not explicitly sealed is normal — parse never fails.
+    fallback = Normal;
 }
 
-impl Disposition {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Disposition::Surface => "surface",
-            Disposition::Squelch => "squelch",
-            Disposition::Filtered => "filtered",
-        }
+str_enum! {
+    /// The kind of auth-related content that caused a message to be sealed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SealedKind {
+        Otp => "otp",
+        PasswordReset => "password_reset",
+        MagicLink => "magic_link",
+        LoginAlert => "login_alert",
+        Verification => "verification",
     }
+}
 
-    pub fn parse(s: &str) -> Option<Disposition> {
-        match s {
-            "surface" => Some(Disposition::Surface),
-            "squelch" => Some(Disposition::Squelch),
-            "filtered" => Some(Disposition::Filtered),
-            _ => None,
-        }
+str_enum! {
+    /// What squelch decides to do with a message at the surfacing layer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Disposition {
+        Surface => "surface",
+        Squelch => "squelch",
+        Filtered => "filtered",
     }
 }
 
@@ -167,33 +158,16 @@ pub struct Update {
     pub has_attachments: Option<bool>,
 }
 
-/// The attention-lifecycle status of a triage row (sitrep seen-ledger).
-/// `new` = never surfaced through any door; `open` = surfaced, still needs
-/// attention; `done` = resolved (acted on or explicitly dismissed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttentionStatus {
-    New,
-    Open,
-    Done,
-}
-
-impl AttentionStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AttentionStatus::New => "new",
-            AttentionStatus::Open => "open",
-            AttentionStatus::Done => "done",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<AttentionStatus> {
-        match s {
-            "new" => Some(AttentionStatus::New),
-            "open" => Some(AttentionStatus::Open),
-            "done" => Some(AttentionStatus::Done),
-            _ => None,
-        }
+str_enum! {
+    /// The attention-lifecycle status of a triage row (sitrep seen-ledger).
+    /// `new` = never surfaced through any door; `open` = surfaced, still needs
+    /// attention; `done` = resolved (acted on or explicitly dismissed).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AttentionStatus {
+        New => "new",
+        Open => "open",
+        Done => "done",
     }
 }
 
@@ -420,36 +394,19 @@ pub struct AuditEntry {
     pub target_subject: Option<String>,
 }
 
-/// Why a notification-worthy event was emitted. Precedence when classifying a
-/// verdict is `Urgent` > `Deadline` > `Surfaced` (see
-/// [`crate::triage::events::worthy_kind`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventKind {
-    /// Tier is `past_due`/`deadline` — the standing band, immune to thresholds.
-    Urgent,
-    /// A deadline was detected on a message that is not itself urgent-tier.
-    Deadline,
-    /// Importance landed at or above the notify threshold (above the line).
-    Surfaced,
-}
-
-impl EventKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EventKind::Urgent => "urgent",
-            EventKind::Deadline => "deadline",
-            EventKind::Surfaced => "surfaced",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<EventKind> {
-        match s {
-            "urgent" => Some(EventKind::Urgent),
-            "deadline" => Some(EventKind::Deadline),
-            "surfaced" => Some(EventKind::Surfaced),
-            _ => None,
-        }
+str_enum! {
+    /// Why a notification-worthy event was emitted. Precedence when classifying a
+    /// verdict is `Urgent` > `Deadline` > `Surfaced` (see
+    /// [`crate::triage::events::worthy_kind`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum EventKind {
+        /// Tier is `past_due`/`deadline` — the standing band, immune to thresholds.
+        Urgent => "urgent",
+        /// A deadline was detected on a message that is not itself urgent-tier.
+        Deadline => "deadline",
+        /// Importance landed at or above the notify threshold (above the line).
+        Surfaced => "surfaced",
     }
 }
 
@@ -570,39 +527,24 @@ pub struct UnsubscribeRecord {
     pub resolution: Option<String>,
 }
 
-/// Which axis of a triage verdict a human overruled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TriageAxis {
-    /// `triage.tier` — past_due | deadline | signal | noise.
-    Tier,
-    /// `triage.category` — general | marketing | invoice | autopay_bill |
-    /// banking_statement | transaction_alert.
-    Category,
-    /// `triage.sensitivity` — normal | sealed. Corrections matter in BOTH
-    /// directions: under-sealing let a code into the normal inbox, over-sealing
-    /// locked ordinary mail away.
-    Sensitivity,
+str_enum! {
+    /// Which axis of a triage verdict a human overruled.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum TriageAxis {
+        /// `triage.tier` — past_due | deadline | signal | noise.
+        Tier => "tier",
+        /// `triage.category` — general | marketing | invoice | autopay_bill |
+        /// banking_statement | transaction_alert.
+        Category => "category",
+        /// `triage.sensitivity` — normal | sealed. Corrections matter in BOTH
+        /// directions: under-sealing let a code into the normal inbox, over-sealing
+        /// locked ordinary mail away.
+        Sensitivity => "sensitivity",
+    }
 }
 
 impl TriageAxis {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TriageAxis::Tier => "tier",
-            TriageAxis::Category => "category",
-            TriageAxis::Sensitivity => "sensitivity",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<TriageAxis> {
-        match s {
-            "tier" => Some(TriageAxis::Tier),
-            "category" => Some(TriageAxis::Category),
-            "sensitivity" => Some(TriageAxis::Sensitivity),
-            _ => None,
-        }
-    }
-
     /// The values this axis accepts. Corrections are validated against it so a
     /// typo can never write a label the pipeline would not itself produce.
     pub fn allowed(&self) -> &'static [&'static str] {
