@@ -2,6 +2,7 @@
 //! over a rule's `match_pattern`, plus the static regex batteries for the alert /
 //! noise / sales rungs of the Stage-1 ladder.
 
+use crate::triage::text::{any, rx};
 use crate::types::SenderRule;
 use regex::Regex;
 use std::sync::OnceLock;
@@ -68,10 +69,6 @@ struct Patterns {
     sales: Vec<Regex>,
 }
 
-fn rx(p: &str) -> Regex {
-    Regex::new(&format!("(?i){p}")).expect("static rules regex must compile")
-}
-
 fn patterns() -> &'static Patterns {
     static P: OnceLock<Patterns> = OnceLock::new();
     P.get_or_init(|| Patterns {
@@ -130,10 +127,6 @@ fn patterns() -> &'static Patterns {
             rx(r"\bdon'?t miss\b"),
         ],
     })
-}
-
-fn any(res: &[Regex], hay: &[&str]) -> bool {
-    res.iter().any(|re| hay.iter().any(|h| re.is_match(h)))
 }
 
 /// Does this look like it came from an automated/no-reply sender?

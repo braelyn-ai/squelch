@@ -16,6 +16,7 @@ pub mod seal;
 pub mod shipment;
 pub mod stage1_llm;
 pub mod stage2;
+pub(crate) mod text;
 
 pub use calendar::{CalendarInfo, CalendarKind, detect_calendar};
 pub use deadline::DeadlineHit;

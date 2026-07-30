@@ -16,6 +16,7 @@ use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::{ExtractQueued, MarketingApplied};
 use crate::triage::extract::{ExtractContext, build_extract_user_message};
 use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, Usage};
+use crate::triage::text::truncate_trimmed;
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -101,18 +102,8 @@ pub struct MarketingOutput {
 // content, so each is bounded and shape-checked before it can be stored.
 // ===========================================================================
 
-/// Char-safe truncation to `max` chars.
-fn truncate(s: &str, max: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= max {
-        t.to_string()
-    } else {
-        t.chars().take(max).collect()
-    }
-}
-
 fn clean_opt(s: Option<&str>, max: usize) -> Option<String> {
-    let t = truncate(s?, max);
+    let t = truncate_trimmed(s?, max);
     if t.is_empty() { None } else { Some(t) }
 }
 

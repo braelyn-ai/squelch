@@ -16,10 +16,13 @@ use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::{BankingApplied, ExtractQueued};
 use crate::triage::extract::{ExtractContext, build_extract_user_message};
 use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, Usage};
+use crate::triage::stage1_llm::RECORD_CATEGORIES;
+use crate::triage::text::{truncate_chars, truncate_trimmed};
 use serde::{Deserialize, Serialize};
 
-/// The categories this extractor handles. All are RECORDS (they auto-resolve).
-pub const CATEGORIES: &[&str] = &["banking_statement", "transaction_alert", "autopay_bill"];
+/// The categories this extractor handles: exactly the RECORD categories, which
+/// is why every row it writes auto-resolves.
+pub const CATEGORIES: &[&str] = RECORD_CATEGORIES;
 
 /// The usage-ledger category this extractor bills its token usage to.
 pub const LEDGER_CATEGORY: &str = "extract_banking";
@@ -218,12 +221,7 @@ pub fn apply_result(q: &ExtractQueued, out: &BankingOutput, model: &str) -> Bank
 /// full card number into the one text field that isn't `account_hint`.
 fn truncate_institution(name: &str) -> String {
     const MAX: usize = 80;
-    let redacted = redact_digit_runs(name.trim());
-    if redacted.chars().count() > MAX {
-        redacted.chars().take(MAX).collect()
-    } else {
-        redacted
-    }
+    truncate_chars(&redact_digit_runs(name.trim()), MAX)
 }
 
 /// Replace any run of more than 4 digits (counting digits across the common
@@ -269,12 +267,7 @@ fn redact_digit_runs(s: &str) -> String {
 /// 3 chars, so the cap is generous.
 fn truncate_currency(cur: &str) -> String {
     const MAX: usize = 8;
-    let c = cur.trim();
-    if c.chars().count() > MAX {
-        c.chars().take(MAX).collect()
-    } else {
-        c.to_string()
-    }
+    truncate_trimmed(cur, MAX)
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@
 //! notifier sender, or invite machinery in the body), or the full relayed-RSVP
 //! subject template. A newsletter that merely mentions "calendar" must not match.
 
+use crate::triage::text::rx;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
@@ -112,10 +113,6 @@ struct CalendarDetector {
     /// Standalone 4-digit year trailing a date-RANGE clause ("Aug 5–10, 2026"),
     /// where the range tail puts it out of `month_day`'s inline year group.
     year: Regex,
-}
-
-fn rx(p: &str) -> Regex {
-    Regex::new(&format!("(?i){p}")).expect("static calendar regex must compile")
 }
 
 fn detector() -> &'static CalendarDetector {

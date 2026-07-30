@@ -5,6 +5,7 @@
 //! false positive costs a too-prominent email, a false negative costs a late fee.
 //! Relative dates ("due Friday") are out of scope; see the TODO in [`extract_due_at`].
 
+use crate::triage::text::rx;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
@@ -54,10 +55,6 @@ struct BillDetector {
 /// bug, never a real two-year-late bill.
 const MAX_DAYS_PAST: i64 = 365;
 const MAX_DAYS_FUTURE: i64 = 365 * 3;
-
-fn rx(p: &str) -> Regex {
-    Regex::new(&format!("(?i){p}")).expect("static bill regex must compile")
-}
 
 fn detector() -> &'static BillDetector {
     static D: OnceLock<BillDetector> = OnceLock::new();

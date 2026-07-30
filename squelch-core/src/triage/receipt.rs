@@ -10,6 +10,7 @@
 //! phrasing, so the two classifiers never double-claim a message. Refunds /
 //! inbound money and pure marketing return `None`.
 
+use crate::triage::text::rx;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -39,10 +40,6 @@ struct ReceiptDetector {
     /// Genuine payment-OBLIGATION phrasing (the user still OWES): a BILL, not a
     /// receipt — exclude, so the two classifiers never double-claim a message.
     obligation: Vec<Regex>,
-}
-
-fn rx(p: &str) -> Regex {
-    Regex::new(&format!("(?i){p}")).expect("static receipt regex must compile")
 }
 
 fn detector() -> &'static ReceiptDetector {

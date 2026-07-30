@@ -14,6 +14,7 @@ use crate::config::{Stage2Config, Stage2Provider};
 use crate::store::{Stage2Applied, Stage2Queued};
 use crate::triage::DeadlineHit;
 use crate::triage::llm::{self, LlmOutcome, LlmRequest};
+use crate::triage::text::{truncate_chars, truncate_flagged};
 use crate::types::{FieldReasons, Tier};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -151,22 +152,11 @@ impl<'a> RowContext<'a> {
     }
 }
 
-/// Truncate `body` to at most `max` chars (char-boundary safe), returning the
-/// text and whether truncation occurred.
-fn truncate_body(body: &str, max: usize) -> (String, bool) {
-    if body.chars().count() <= max {
-        (body.to_string(), false)
-    } else {
-        let s: String = body.chars().take(max).collect();
-        (s, true)
-    }
-}
-
 /// Build the user message: the TRUSTED CONTEXT block, then the fenced UNTRUSTED
 /// EMAIL block. Instruction-like text in the body lands strictly inside the
 /// fence and after the trust rule, never in the trusted region.
 pub fn build_user_message(ctx: &RowContext) -> String {
-    let (body, truncated) = truncate_body(ctx.body, ctx.max_body_chars);
+    let (body, truncated) = truncate_flagged(ctx.body, ctx.max_body_chars);
 
     let mut out = String::with_capacity(body.len() + 512);
 
@@ -594,11 +584,7 @@ pub(crate) fn tier_from_importance(importance: u8) -> Tier {
 /// Keep the model's `reason` compact for storage and logs.
 pub(crate) fn truncate_reason(reason: &str) -> String {
     const MAX: usize = 200;
-    if reason.chars().count() > MAX {
-        reason.chars().take(MAX).collect()
-    } else {
-        reason.to_string()
-    }
+    truncate_chars(reason, MAX)
 }
 
 /// Hard cap for a stored per-property reason. These carry UNTRUSTED model text
@@ -606,33 +592,21 @@ pub(crate) fn truncate_reason(reason: &str) -> String {
 /// row; 300 chars keeps a full sentence while staying small.
 pub(crate) fn truncate_field_reason(reason: &str) -> String {
     const MAX: usize = 300;
-    if reason.chars().count() > MAX {
-        reason.chars().take(MAX).collect()
-    } else {
-        reason.to_string()
-    }
+    truncate_chars(reason, MAX)
 }
 
 /// Hard cap for the stored `one_line` (untrusted model text), applied at BOTH
 /// stages' apply sites.
 pub(crate) fn truncate_one_line(one_line: &str) -> String {
     const MAX: usize = 160;
-    if one_line.chars().count() > MAX {
-        one_line.chars().take(MAX).collect()
-    } else {
-        one_line.to_string()
-    }
+    truncate_chars(one_line, MAX)
 }
 
 /// Hard cap for the stored deadline `kind` label (untrusted model text), applied
 /// at the shared derive site so both stages get it.
 pub(crate) fn truncate_deadline_kind(kind: &str) -> String {
     const MAX: usize = 40;
-    if kind.chars().count() > MAX {
-        kind.chars().take(MAX).collect()
-    } else {
-        kind.to_string()
-    }
+    truncate_chars(kind, MAX)
 }
 
 #[cfg(test)]

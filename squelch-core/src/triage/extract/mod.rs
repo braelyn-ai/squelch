@@ -20,6 +20,7 @@ pub mod marketing;
 
 use crate::error::{CoreError, Result};
 use crate::store::ExtractQueued;
+use crate::triage::text::truncate_flagged;
 use crate::types::Sensitivity;
 
 /// The categories with a registered specialist extractor: the routing set the
@@ -63,21 +64,11 @@ pub struct ExtractContext<'a> {
     pub max_body_chars: usize,
 }
 
-/// Truncate `body` to at most `max` chars (char-boundary safe), returning the
-/// text and whether truncation occurred.
-fn truncate_body(body: &str, max: usize) -> (String, bool) {
-    if body.chars().count() <= max {
-        (body.to_string(), false)
-    } else {
-        (body.chars().take(max).collect(), true)
-    }
-}
-
 /// Build the extractor user message: the TRUSTED CONTEXT block first, then the
 /// fenced UNTRUSTED EMAIL block. Instruction-like text in the body lands strictly
 /// inside the fence and after the trust rule, never in the trusted region.
 pub fn build_extract_user_message(ctx: &ExtractContext) -> String {
-    let (body, truncated) = truncate_body(ctx.body, ctx.max_body_chars);
+    let (body, truncated) = truncate_flagged(ctx.body, ctx.max_body_chars);
     let mut out = String::with_capacity(body.len() + 512);
 
     // ---- TRUSTED CONTEXT (account-owner authority) ----------------------

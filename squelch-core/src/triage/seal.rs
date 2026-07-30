@@ -4,6 +4,7 @@
 //! from the agent, a false negative leaks a code to an LLM/agent.
 //! See docs/SECURITY.md §4.
 
+use crate::triage::text::{any, rx};
 use crate::types::SealedKind;
 use regex::Regex;
 use std::sync::OnceLock;
@@ -34,10 +35,6 @@ struct Detector {
     /// ignored: an auth vendor's newsletter discusses 2FA/SSO/magic-links as
     /// PRODUCTS, and a real auth email is transactional, never a blast.
     marketing: Vec<Regex>,
-}
-
-fn rx(p: &str) -> Regex {
-    Regex::new(&format!("(?i){p}")).expect("static seal regex must compile")
 }
 
 fn detector() -> &'static Detector {
@@ -120,12 +117,6 @@ fn detector() -> &'static Detector {
     })
 }
 
-fn any_match(regexes: &[Regex], haystacks: &[&str]) -> bool {
-    regexes
-        .iter()
-        .any(|re| haystacks.iter().any(|h| re.is_match(h)))
-}
-
 /// Returns `Some(kind)` if the message should be sealed. Ordering encodes
 /// priority when multiple signals fire (OTP is the most sensitive).
 pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
@@ -134,29 +125,29 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
 
     // A concrete reader-addressed code always seals — it wins over the marketing
     // guard below, because a leaked code is the highest-stakes miss.
-    if any_match(&d.otp_code, &hay) {
+    if any(&d.otp_code, &hay) {
         return Some(SealedKind::Otp);
     }
 
     // Auth-vendor newsletters discuss 2FA / SSO / magic-links as PRODUCTS; those
     // topical mentions must NOT seal.
-    if any_match(&d.marketing, &hay) {
+    if any(&d.marketing, &hay) {
         return None;
     }
 
-    if any_match(&d.otp, &hay) {
+    if any(&d.otp, &hay) {
         return Some(SealedKind::Otp);
     }
-    if any_match(&d.password_reset, &hay) {
+    if any(&d.password_reset, &hay) {
         return Some(SealedKind::PasswordReset);
     }
-    if any_match(&d.magic_link, &hay) {
+    if any(&d.magic_link, &hay) {
         return Some(SealedKind::MagicLink);
     }
-    if any_match(&d.login_alert, &hay) {
+    if any(&d.login_alert, &hay) {
         return Some(SealedKind::LoginAlert);
     }
-    if any_match(&d.verification, &hay) {
+    if any(&d.verification, &hay) {
         return Some(SealedKind::Verification);
     }
     // Weak login-ish phrasing seals when the sender is a security/no-reply
@@ -169,7 +160,7 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
         .financial_domain
         .iter()
         .any(|re| re.is_match(input.from_addr));
-    if sender_is_security && sender_is_financial && any_match(&d.login_soft, &hay) {
+    if sender_is_security && sender_is_financial && any(&d.login_soft, &hay) {
         return Some(SealedKind::LoginAlert);
     }
     None

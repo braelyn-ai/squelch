@@ -10,6 +10,7 @@
 //! are unambiguous prefixes; the rest fall to length heuristics). A genuinely
 //! ambiguous number is kept as `carrier="unknown"` with no URL, never guessed.
 
+use crate::triage::text::rx;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -138,10 +139,6 @@ struct Detector {
     /// Product/merchant phrases pulled from the BODY when the subject strips to
     /// a generic leftover ("Package", "Your order", ""). Best-effort, regex-only.
     body_item: Vec<Regex>,
-}
-
-fn rx(p: &str) -> Regex {
-    Regex::new(&format!("(?i){p}")).expect("static shipment regex must compile")
 }
 
 fn detector() -> &'static Detector {
