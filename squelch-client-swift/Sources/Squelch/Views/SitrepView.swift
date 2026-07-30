@@ -9,36 +9,71 @@ import SwiftUI
 /// How many ranked standing items show before the quiet "{n} more" expander.
 private let eyesVisible = 10
 
+/// The sitrep's hover + keyboard cursor, in an `@Observable` box rather than
+/// `SitrepView`'s `@State`.
+///
+/// WHY IT IS NOT `@State`: a pointer resting anywhere over the page fires hover
+/// enter/exit CONTINUOUSLY while a scroll drags rows under it, and a `@State`
+/// write at the top of the tree re-renders the whole dashboard for every one of
+/// them — re-ranking the standing list, rebuilding every row, re-measuring every
+/// newsletter card. Held here, a write only invalidates views that actually READ
+/// that field, and the keymap reads all of it at KEY-PRESS time rather than at
+/// render time, so most of these writes reach no observer at all.
+@MainActor
+@Observable
+final class SitrepCursor {
+    /// Index into the VISIBLE rows only — collapsed-away rows are unreachable.
+    var index = 0
+    /// True only while the keyboard is driving; the focus glass renders on this.
+    var kbActive = false
+    /// True only while the pointer is over a row.
+    var hovering = false
+    /// Whether "for your eyes" is showing past the first `eyesVisible`.
+    var expanded = false
+    /// Hovered newsletter address — `e` marks that sender's whole window done,
+    /// deferring to the For-your-eyes handler when nothing hovers.
+    var newsletter: String?
+
+    /// Point the cursor at a row the POINTER is over. EVERY WRITE IS GUARDED:
+    /// `@Observable` notifies on assignment, not on change, so an unguarded
+    /// `kbActive = false` here would invalidate every row on every mouse-move —
+    /// which is exactly the cost this whole type exists to avoid.
+    func hover(_ index: Int) {
+        if !hovering { hovering = true }
+        if kbActive { kbActive = false }
+        if self.index != index { self.index = index }
+    }
+}
+
 struct SitrepView: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
     @Namespace private var zoneGlass
 
-    // Cursor over the VISIBLE rows only — collapsed-away rows are unreachable.
-    @State private var eyesIndex = 0
-    /// True only while the keyboard is driving the cursor.
-    @State private var eyesKbActive = false
-    /// True only while the cursor is actually over a row.
-    @State private var eyesHovering = false
-    @State private var eyesExpanded = false
-    /// Hovered newsletter address — `e` while hovering marks that sender's
-    /// window done, deferring to the For-your-eyes handler when nothing hovers.
-    @State private var hoveredNewsletter: String?
+    /// Hover + keyboard cursor. A reference, deliberately — see `SitrepCursor`.
+    @State private var cursor = SitrepCursor()
 
     /// Zone data lives in the STORE, not in `@State`: `@State` is discarded on
     /// navigate-away, so a revisit would show empty cards until refetch.
     private var rulesCount: Int? { store.zones.rulesCount }
 
-    private var ranked: [AttentionUpdate] {
-        Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+    /// The rows the cursor can reach, recomputed at KEY-PRESS time. The render
+    /// path does NOT come through here — `body` ranks once into a `let` and
+    /// passes the result down.
+    private var reachable: [AttentionUpdate] {
+        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        return cursor.expanded ? ranked : Array(ranked.prefix(eyesVisible))
     }
-    private var visibleEyes: [AttentionUpdate] {
-        eyesExpanded ? ranked : Array(ranked.prefix(eyesVisible))
-    }
-    private var eyesOverflow: Int { ranked.count - eyesVisible }
 
     var body: some View {
-        @Bindable var store = store
+        // ONE rank per render. This was a computed property read FOUR times a
+        // pass — twice through `visibleEyes`, and once more by each `onChange`,
+        // whose value expression is re-evaluated on every body evaluation — and
+        // every read re-sorted the entire standing list.
+        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        let visible = cursor.expanded ? ranked : Array(ranked.prefix(eyesVisible))
+        let overflow = ranked.count - eyesVisible
+        let threadIds = ranked.map(\.thread_id)
 
         return VStack(spacing: 0) {
             masthead
@@ -53,12 +88,12 @@ struct SitrepView: View {
 
                     HStack(alignment: .top, spacing: 18) {
                         VStack(spacing: 16) {
-                            if !store.sitrep.standing.isEmpty { forYourEyes }
+                            if !store.sitrep.standing.isEmpty {
+                                forYourEyes(visible: visible, overflow: overflow)
+                            }
                             if !store.sitrep.new.isEmpty { attentionZone }
                             NewslettersZone(
-                                newsletters: $store.zones.newsletters,
-                                hovered: $hoveredNewsletter,
-                                reload: { await store.refreshZones(force: true) })
+                                newsletters: store.zones.newsletters, cursor: cursor)
                             StatusStrip(rulesCount: rulesCount)
                         }
                         .frame(maxWidth: .infinity, alignment: .top)
@@ -85,15 +120,15 @@ struct SitrepView: View {
         // Warm the visible top-10 immediately and trickle the collapsed
         // remainder, so a long list never stampedes the daemon. Prefetch dedupes
         // in-flight and fresh entries, so re-runs are near-free.
-        .onChange(of: ranked.map(\.thread_id)) { _, ids in
+        .onChange(of: threadIds) { _, ids in
             ThreadPrefetch.shared.warm(ids, immediate: eyesVisible, spacing: .milliseconds(150))
         }
         .onAppear {
             ThreadPrefetch.shared.warm(
-                ranked.map(\.thread_id), immediate: eyesVisible, spacing: .milliseconds(150))
+                threadIds, immediate: eyesVisible, spacing: .milliseconds(150))
         }
-        .onChange(of: visibleEyes.count) { _, count in
-            eyesIndex = max(0, min(eyesIndex, max(0, count - 1)))
+        .onChange(of: visible.count) { _, count in
+            cursor.index = max(0, min(cursor.index, max(0, count - 1)))
         }
     }
 
@@ -148,32 +183,24 @@ struct SitrepView: View {
 
     // MARK: - (a) for your eyes
 
-    private var forYourEyes: some View {
+    private func forYourEyes(visible: [AttentionUpdate], overflow: Int) -> some View {
         ZoneCard(
             symbol: "eye", title: "For your eyes", count: store.sitrep.standing.count
         ) {
             GlassEffectContainer(spacing: 2) {
             VStack(spacing: 1) {
-                ForEach(Array(visibleEyes.enumerated()), id: \.element.id) { i, u in
+                ForEach(Array(visible.enumerated()), id: \.element.id) { i, u in
+                    // No closures passed down: a stored closure is never equal to
+                    // last render's, so handing rows their actions this way meant
+                    // SwiftUI could not skip a single one when the parent redrew.
                     ObligationRow(
-                        update: u,
-                        focused: eyesKbActive && i == eyesIndex,
-                        glassNamespace: zoneGlass,
-                        onHover: {
-                            eyesHovering = true
-                            eyesKbActive = false
-                            eyesIndex = i
-                        },
-                        onOpen: {
-                            eyesIndex = i
-                            store.openThread(u.thread_id)
-                        })
+                        update: u, index: i, cursor: cursor, glassNamespace: zoneGlass)
                 }
-                if eyesOverflow > 0 {
+                if overflow > 0 {
                     Button {
-                        withAnimation(.smooth(duration: 0.28)) { eyesExpanded.toggle() }
+                        withAnimation(.smooth(duration: 0.28)) { cursor.expanded.toggle() }
                     } label: {
-                        Text(eyesExpanded ? "show less" : "\(eyesOverflow) more")
+                        Text(cursor.expanded ? "show less" : "\(overflow) more")
                             .font(Typo.micro)
                             .foregroundStyle(Palette.inkFaint)
                             .padding(.horizontal, 11)
@@ -187,7 +214,7 @@ struct SitrepView: View {
             // Only leaving the zone ends the hover; moving BETWEEN rows keeps the
             // phase .active, so a sweep never flickers actionable off and on.
             .onContinuousHover { phase in
-                if case .ended = phase { eyesHovering = false }
+                if case .ended = phase, cursor.hovering { cursor.hovering = false }
             }
             }
         }
@@ -227,8 +254,9 @@ struct SitrepView: View {
     // MARK: - keymap
 
     /// Action keys are inert unless something is actually highlighted — either
-    /// the keyboard cursor or a live hover.
-    private var eyesActionable: Bool { eyesKbActive || eyesHovering }
+    /// the keyboard cursor or a live hover. Read from HANDLERS only, never from
+    /// `body`, which is what keeps these fields free to change on hover.
+    private var eyesActionable: Bool { cursor.kbActive || cursor.hovering }
 
     private var bindings: [KeyBinding] {
         [
@@ -237,28 +265,28 @@ struct SitrepView: View {
             KeyBinding("ArrowDown", "next item") { moveEyes(+1) },
             KeyBinding("ArrowUp", "prev item") { moveEyes(-1) },
             KeyBinding("d", "mark done") {
-                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 Task { await Actions.done(u) }
             },
             // `e` first tries the hovered newsletter card; with nothing hovered
             // it DECLINES so the for-your-eyes done handler runs instead.
             KeyBinding(declining: "e", "mark done") {
-                if let addr = hoveredNewsletter,
+                if let addr = cursor.newsletter,
                     let nl = store.zones.newsletters.first(where: { $0.address == addr })
                 {
                     Task { await markNewsletterDone(nl) }
                     return true
                 }
-                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return false }
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return false }
                 Task { await Actions.done(u) }
                 return true
             },
             KeyBinding("Enter", "open email") {
-                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 store.openThread(u.thread_id)
             },
             KeyBinding("v", "fix triage") {
-                guard eyesActionable, let u = visibleEyes[safe: eyesIndex] else { return }
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 store.openTriageFix(
                     TriageFixTarget(
                         messageId: u.id, sender: u.sender, subject: u.one_line,
@@ -270,8 +298,8 @@ struct SitrepView: View {
     /// j/k hand the cursor back to the keyboard, which is what makes the focus
     /// glass reappear.
     private func moveEyes(_ delta: Int) {
-        eyesKbActive = true
-        eyesIndex = max(0, min(visibleEyes.count - 1, eyesIndex + delta))
+        cursor.kbActive = true
+        cursor.index = max(0, min(reachable.count - 1, cursor.index + delta))
     }
 
     private func markNewsletterDone(_ nl: Newsletter) async {
@@ -374,15 +402,22 @@ private struct DashHero: View {
 // MARK: - obligation row
 
 private struct ObligationRow: View {
+    @Environment(AppStore.self) private var store
     let update: AttentionUpdate
-    let focused: Bool
+    let index: Int
+    let cursor: SitrepCursor
     let glassNamespace: Namespace.ID
-    let onHover: () -> Void
-    let onOpen: () -> Void
 
     /// Drives the hover wash. LOCAL on purpose: the row's own feedback never
     /// depends on the dashboard re-rendering.
     @State private var hovering = false
+
+    /// THE SHORT-CIRCUIT IS LOAD-BEARING. Observation records only the properties
+    /// a body actually TOUCHED, so with the keyboard idle this never reads
+    /// `cursor.index` — and the index write every hover event performs then has
+    /// no observer to invalidate. Collapsing this to a stored `focused` flag
+    /// passed from the parent is what used to make a scroll redraw the page.
+    private var focused: Bool { cursor.kbActive && cursor.index == index }
 
     /// Best-effort money amount from an update's one_line ("$142.00"). Hand-
     /// scanned and memoized rather than regex: this runs for every visible row
@@ -394,7 +429,10 @@ private struct ObligationRow: View {
         let overdue = chip?.overdue ?? false
 
         // Click anywhere on the row opens the email; done is keyboard-only (e/d).
-        Button(action: onOpen) {
+        Button {
+            cursor.index = index
+            store.openThread(update.thread_id)
+        } label: {
             HStack(spacing: 9) {
                 Avatar(sender: update.sender, size: 22)
                 Text(SenderCache.resolved(update.sender).displayName)
@@ -456,7 +494,7 @@ private struct ObligationRow: View {
         }
         .onHover { over in
             hovering = over
-            if over { onHover() }
+            if over { cursor.hover(index) }
         }
     }
 }

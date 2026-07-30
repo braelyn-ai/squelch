@@ -319,12 +319,15 @@ struct ReceiptsZone: View {
 /// THE FETCH LIVES IN SitrepView, NOT HERE: SwiftUI gives `EmptyView` no
 /// lifetime, so `.task`/`.onAppear` on a view that resolves to nothing never
 /// fire. Any zone that can hide itself must be fed by a parent that cannot.
+/// NOTHING HERE IS A CLOSURE OR A BINDING, deliberately: both compare unequal on
+/// every render, so a zone that took them could never be skipped when the
+/// dashboard redrew — and skipping it is what keeps a scroll from re-measuring
+/// every card. `[Newsletter]` is Equatable and the cursor is one stable
+/// reference, so SwiftUI can prove this subtree unchanged and leave it alone.
 struct NewslettersZone: View {
     @Environment(AppStore.self) private var store
-    @Binding var newsletters: [Newsletter]
-    @Binding var hovered: String?
-    /// Re-derive after a rule save, so the chip/CTA reflects it immediately.
-    let reload: () async -> Void
+    let newsletters: [Newsletter]
+    let cursor: SitrepCursor
 
     /// Narrowest a card may be drawn; the grid fits as many equal columns of at
     /// least this width as the zone allows.
@@ -356,22 +359,8 @@ struct NewslettersZone: View {
 
     @ViewBuilder private var cards: some View {
         ForEach(newsletters) { nl in
-            NewsletterCard(
-                newsletter: nl,
-                onOpen: {
-                    guard !nl.latestThreadId.isEmpty else { return }
-                    store.openThread(nl.latestThreadId, queue: nl.items)
-                },
-                onEdit: { edit(nl) },
-                onHover: { over in hovered = over ? nl.address : nil }
-            )
+            NewsletterCard(newsletter: nl, cursor: cursor)
         }
-    }
-
-    private func edit(_ nl: Newsletter) {
-        guard let rule = nl.rule else { return }
-        store.openRuleEditor(
-            RuleEditorRequest(rule: rule, onSaved: { Task { await reload() } }))
     }
 }
 
@@ -402,11 +391,9 @@ enum NewsletterFeed {
 }
 
 private struct NewsletterCard: View {
-    @Environment(Prefs.self) private var prefs
+    @Environment(AppStore.self) private var store
     let newsletter: Newsletter
-    let onOpen: () -> Void
-    let onEdit: () -> Void
-    let onHover: (Bool) -> Void
+    let cursor: SitrepCursor
 
     @State private var hovering = false
 
@@ -415,7 +402,7 @@ private struct NewsletterCard: View {
     }
 
     var body: some View {
-        Button(action: onOpen) {
+        Button(action: open) {
             // Hero left as a FIXED square, text right: every card in the grid
             // keeps the same height whether or not its sender ships art.
             HStack(alignment: .top, spacing: 9) {
@@ -442,7 +429,7 @@ private struct NewsletterCard: View {
                     }
                     if let rule = newsletter.rule {
                         // A ruled card keeps its chip as the EDIT affordance.
-                        ChromeChip(help: "edit this rule", action: onEdit) {
+                        ChromeChip(help: "edit this rule", action: edit) {
                             HStack(spacing: 5) {
                                 Text(rule.disposition.label)
                                     .font(Typo.micro)
@@ -479,8 +466,23 @@ private struct NewsletterCard: View {
         .buttonStyle(.plain)
         .onHover { over in
             hovering = over
-            onHover(over)
+            // Nothing READS this during a render — only the `e` handler, at
+            // key-press time — so this write is free even at scroll frequency.
+            cursor.newsletter = over ? newsletter.address : nil
         }
+    }
+
+    private func open() {
+        guard !newsletter.latestThreadId.isEmpty else { return }
+        store.openThread(newsletter.latestThreadId, queue: newsletter.items)
+    }
+
+    /// Re-derive after a save, so the chip/CTA reflects the new rule immediately.
+    private func edit() {
+        guard let rule = newsletter.rule else { return }
+        store.openRuleEditor(
+            RuleEditorRequest(
+                rule: rule, onSaved: { Task { await store.refreshZones(force: true) } }))
     }
 }
 
@@ -582,15 +584,40 @@ struct AdaptiveGrid: Layout {
     var minimum: CGFloat
     var spacing: CGFloat
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let metrics = metrics(width: proposal.width, subviews: subviews)
+    /// Column geometry, kept BETWEEN the sizing pass and the placement pass.
+    ///
+    /// Without this every layout measured every card TWICE — `sizeThatFits` and
+    /// `placeSubviews` each called `metrics`, which maps `sizeThatFits` over all
+    /// of them — and a card's height is a two-line text layout, not a constant.
+    /// Keyed on the width it was measured at, so a window resize invalidates it
+    /// and nothing else needs to.
+    struct Cache {
+        var measuredAt: CGFloat?
+        var measuredCount = 0
+        var metrics: Metrics?
+    }
+
+    func makeCache(subviews: Subviews) -> Cache { Cache() }
+
+    /// The subviews changed, so the heights we hold describe cards that are gone.
+    /// `metrics` ALSO re-checks the count on every read: this is the documented
+    /// invalidation hook, but a stale row height is a visibly broken grid, and
+    /// the count check costs nothing to carry.
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        cache.measuredAt = nil
+        cache.metrics = nil
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize
+    {
+        let metrics = metrics(width: proposal.width, subviews: subviews, cache: &cache)
         return CGSize(width: metrics.width, height: metrics.height)
     }
 
     func placeSubviews(
-        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache
     ) {
-        let metrics = metrics(width: bounds.width, subviews: subviews)
+        let metrics = metrics(width: bounds.width, subviews: subviews, cache: &cache)
         var y = bounds.minY
         var index = 0
         for rowHeight in metrics.rowHeights {
@@ -607,7 +634,7 @@ struct AdaptiveGrid: Layout {
         }
     }
 
-    private struct Metrics {
+    struct Metrics {
         var columns: Int
         var columnWidth: CGFloat
         var heights: [CGFloat]
@@ -616,12 +643,28 @@ struct AdaptiveGrid: Layout {
         var height: CGFloat
     }
 
+    /// Cached geometry for this width, measuring only on a miss.
+    private func metrics(width proposed: CGFloat?, subviews: Subviews, cache: inout Cache)
+        -> Metrics
+    {
+        let width = (proposed?.isFinite == true) ? max(0, proposed!) : minimum
+        if let hit = cache.metrics, cache.measuredAt == width,
+            cache.measuredCount == subviews.count
+        {
+            return hit
+        }
+        let measured = measure(width: width, subviews: subviews)
+        cache.measuredAt = width
+        cache.measuredCount = subviews.count
+        cache.metrics = measured
+        return measured
+    }
+
     /// Column count is the most that fit at `minimum` with a gutter between each;
     /// leftover is split evenly. A nil or infinite proposal is a SwiftUI sizing
     /// probe, not a width — answer it with one column at `minimum`, because
     /// feeding infinity into the column arithmetic traps on the `Int` conversion.
-    private func metrics(width proposed: CGFloat?, subviews: Subviews) -> Metrics {
-        let width = (proposed?.isFinite == true) ? max(0, proposed!) : minimum
+    private func measure(width: CGFloat, subviews: Subviews) -> Metrics {
         let columns = max(1, Int((width + spacing) / (minimum + spacing)))
         let columnWidth = max(0, (width - spacing * CGFloat(columns - 1)) / CGFloat(columns))
         let heights = subviews.map {
