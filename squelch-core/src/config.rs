@@ -249,6 +249,37 @@ impl Default for NotifyConfig {
     }
 }
 
+/// APNs PUSHER config: where the blind relay lives and how to authenticate to
+/// it. See [`crate::push`] for the task itself.
+///
+/// `relay_url` IS THE FEATURE FLAG. Absent (the default), the daemon never spawns
+/// the pusher and never opens a socket toward anyone — iOS push is strictly
+/// opt-in, and a squelch install that has not been told about a relay is
+/// structurally incapable of talking to one.
+///
+/// PRIVACY: the relay is BLIND on purpose. Nothing here configures content,
+/// because no content is ever sent — the push carries an event id and a collapse
+/// id and nothing else. `topic`/`environment` are pass-throughs for operators
+/// running a relay with more than one bundle id or a sandbox build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PusherConfig {
+    /// Base URL of the squelch relay (e.g. `https://relay.example.com`). The
+    /// pusher POSTs to `{relay_url}/v1/push`. Env: `SQUELCH_RELAY_URL`.
+    /// `None` => the pusher task is not spawned at all.
+    pub relay_url: Option<String>,
+    /// Bearer presented to the relay; it is the value the relay itself validates
+    /// as `SQUELCH_RELAY_AUTH_TOKEN`. Env: `SQUELCH_RELAY_TOKEN`. Prefer the env
+    /// var over config.toml — this is secret material, and it is NEVER logged.
+    pub relay_token: Option<String>,
+    /// Optional `apns-topic` (bundle id) override, forwarded verbatim. Must be in
+    /// the relay's own allowlist. Env: `SQUELCH_RELAY_TOPIC`.
+    pub topic: Option<String>,
+    /// Optional APNs environment override (`production` | `sandbox`), forwarded
+    /// verbatim; the relay validates it. Env: `SQUELCH_RELAY_APNS_ENV`.
+    pub environment: Option<String>,
+}
+
 /// The default embedding-weights cache dir: `~/.local/share/squelch/models`
 /// (a sibling of the sqlite db under the XDG data dir). Falls back to a
 /// CWD-relative `squelch-models` only when `HOME` is unset.
@@ -675,6 +706,9 @@ pub struct Config {
     pub embed: EmbedConfig,
     /// Notification-event emission policy (threshold + the freshness storm guard).
     pub notify: NotifyConfig,
+    /// APNs pusher: the blind relay's URL + bearer. Absent `relay_url` means the
+    /// task is never spawned.
+    pub pusher: PusherConfig,
 }
 
 impl Default for Config {
@@ -695,6 +729,7 @@ impl Default for Config {
             sync: SyncConfig::default(),
             embed: EmbedConfig::default(),
             notify: NotifyConfig::default(),
+            pusher: PusherConfig::default(),
         }
     }
 }
@@ -798,6 +833,24 @@ impl Config {
         {
             self.notify.min_importance = n;
         }
+        // ---- APNs pusher (blind relay) -------------------------------------
+        // `relay_url` is the on/off switch for the whole feature, so it is read
+        // exactly like every other override and nothing derives from its absence
+        // beyond "do not spawn the task". The TOKEN is never echoed anywhere.
+        for (name, slot) in [
+            ("SQUELCH_RELAY_URL", &mut self.pusher.relay_url),
+            ("SQUELCH_RELAY_TOKEN", &mut self.pusher.relay_token),
+            ("SQUELCH_RELAY_TOPIC", &mut self.pusher.topic),
+            ("SQUELCH_RELAY_APNS_ENV", &mut self.pusher.environment),
+        ] {
+            if let Ok(v) = std::env::var(name) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    *slot = Some(v.to_string());
+                }
+            }
+        }
+
         if let Ok(v) = std::env::var("SQUELCH_CRED_BACKEND")
             && let Some(b) = CredentialBackend::from_str_lenient(&v)
         {
@@ -1640,6 +1693,44 @@ backfill_days = 90
         // not the notify threshold; they must not alias.
         assert_eq!(c.default_min_importance, 0);
         unsafe { std::env::remove_var("SQUELCH_NOTIFY_MIN_IMPORTANCE") }
+    }
+
+    /// The pusher is OFF unless an operator names a relay. `relay_url` is the
+    /// whole feature flag, and env beats config exactly like everywhere else.
+    #[test]
+    fn pusher_is_absent_by_default_and_env_names_the_relay() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let c = Config::default();
+        assert_eq!(c.pusher, PusherConfig::default());
+        assert!(c.pusher.relay_url.is_none(), "no relay => no pusher task");
+
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_RELAY_URL", "https://relay.example.com");
+            std::env::set_var("SQUELCH_RELAY_TOKEN", "s3cret");
+            std::env::set_var("SQUELCH_RELAY_TOPIC", "dev.squelch.ios");
+            std::env::set_var("SQUELCH_RELAY_APNS_ENV", "sandbox");
+        }
+        let mut c: Config = toml::from_str("[pusher]\nrelay_url = \"http://from-file\"\n").unwrap();
+        assert_eq!(c.pusher.relay_url.as_deref(), Some("http://from-file"));
+        c.apply_env_overrides();
+        assert_eq!(c.pusher.relay_url.as_deref(), Some("https://relay.example.com"));
+        assert_eq!(c.pusher.relay_token.as_deref(), Some("s3cret"));
+        assert_eq!(c.pusher.topic.as_deref(), Some("dev.squelch.ios"));
+        assert_eq!(c.pusher.environment.as_deref(), Some("sandbox"));
+
+        // A blank env var is "unset", not "set to empty" — otherwise an exported
+        // but empty SQUELCH_RELAY_URL would silently disable a configured relay.
+        unsafe {
+            std::env::set_var("SQUELCH_RELAY_URL", "   ");
+            std::env::remove_var("SQUELCH_RELAY_TOKEN");
+            std::env::remove_var("SQUELCH_RELAY_TOPIC");
+            std::env::remove_var("SQUELCH_RELAY_APNS_ENV");
+        }
+        let mut c: Config = toml::from_str("[pusher]\nrelay_url = \"http://from-file\"\n").unwrap();
+        c.apply_env_overrides();
+        assert_eq!(c.pusher.relay_url.as_deref(), Some("http://from-file"));
+        unsafe { std::env::remove_var("SQUELCH_RELAY_URL") }
     }
 
     #[test]

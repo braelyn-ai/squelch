@@ -1300,7 +1300,7 @@ const CONFIRM_HINT: &str =
 /// Append an audit row for an action, best-effort. Audit failures must not mask
 /// the action's own outcome, so a failed insert is swallowed (it cannot leak
 /// anything and the action result is what the caller cares about).
-async fn audit_action(
+pub(crate) async fn audit_action(
     state: &ApiState,
     action: &'static str,
     target: Option<String>,

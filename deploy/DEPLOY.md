@@ -119,9 +119,18 @@ fallbacks and log a one-line deprecation note to stderr — migrate off them.
 | `SQUELCH_CRED_BACKEND` | no | `keyring` (macOS) / `file` (Linux) | `keyring` or `file`. |
 | `SQUELCH_CREDENTIALS_PATH` | no | `~/.config/squelch/credentials.json` | Used only by the `file` backend. |
 | `SQUELCH_CLIENT_ID` / `SQUELCH_CLIENT_SECRET` | yes (OAuth) | — | Your GCP "Desktop app" OAuth client. |
+| `SQUELCH_RELAY_URL` | no | — | Base URL of your `squelch-relay`. Setting it is what SPAWNS the APNs pusher; unset, the daemon never talks to any relay. |
+| `SQUELCH_RELAY_TOKEN` | with a relay | — | Bearer the pusher presents to the relay — the value the relay validates as its own `SQUELCH_RELAY_AUTH_TOKEN`. Never logged. |
+| `SQUELCH_RELAY_TOPIC` | no | relay's default | `apns-topic` (bundle id) override, forwarded verbatim; must be in the relay's allowlist. |
+| `SQUELCH_RELAY_APNS_ENV` | no | relay's default | `production` or `sandbox`, forwarded verbatim. Set it for TestFlight/dev builds. |
 
 The DNS-rebinding allow-list is read once when the agent door is constructed, so
 both `squelchd serve` and the standalone `squelch-mcp --http` honor it identically.
+
+The relay variables are the iOS push path and are entirely optional: the relay
+never sees mail content — only an event id and a collapse id — and with
+`SQUELCH_RELAY_URL` unset, `squelchd serve` logs one line saying the pusher is
+disabled and spawns nothing.
 
 ---
 

@@ -9,6 +9,7 @@ pub mod config;
 pub mod credentials;
 pub mod embed;
 pub mod error;
+pub mod push;
 pub mod store;
 pub mod sync;
 pub mod triage;

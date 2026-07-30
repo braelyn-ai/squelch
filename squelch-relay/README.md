@@ -1,7 +1,11 @@
 # squelch-relay
 
-**Status: v1 implemented. Not deployed anywhere yet — nothing calls it until the
-daemon grows a pusher task and the iOS app exists.**
+**Status: v1 implemented, and the daemon now has a caller.** `squelchd` ships an
+APNs pusher (`squelch_core::push`) that registers devices on the human door and
+POSTs `/v1/push` for each new event; it is off unless `SQUELCH_RELAY_URL` is set.
+Deployment is a root `Dockerfile` + `railway.toml` (Railway), so the service can
+go up whenever the iOS app needs it. Still nothing in production, and the iOS app
+does not exist yet.
 
 A tiny, blind APNs relay. It exists so that a future squelch iOS app can receive
 push notifications without any user's mail content — or any user's daemon — ever
@@ -172,17 +176,19 @@ need no setup. It is not an Apple credential and never was.
 
 ## Daemon and client integration (lives in the main repo, not here)
 
-Planned, in dependency order:
+In dependency order. **Steps 1-4 are done**; step 4's iOS half (the app, the NSE,
+and the shared rendering package) is what remains.
 
-1. `events` table + triage emission rules + in-process broadcast
+1. **Done.** `events` table + triage emission rules + in-process broadcast
    (`squelch-core`). Emission rules decided up front: never on initial
    backfill; sealed mail is at most a contentless event (probably skipped in
    v1 — an OTP on a lock screen would undo the seal design); deterministically
    squelched senders are silent.
-2. `GET /client/events` SSE with replay cursor, and `GET /client/events/{id}`
+2. **Done.** `GET /client/events` SSE with replay cursor, and
+   `GET /client/events/{id}`
    (id-addressable from day one — the iOS NSE fetches by id; trivial now, a
    retrofit later).
-3. macOS Swift client consumes SSE (`URLSession.bytes` on the existing
+3. **Done.** macOS Swift client consumes SSE (`URLSession.bytes` on the existing
    `APIClient` plumbing, reconnect with the persisted last-seen id), renders
    through `UNUserNotificationCenter`, notification click focuses the app and
    deep-links to the thread. Residency: last-window-closed does not terminate,
@@ -190,10 +196,19 @@ Planned, in dependency order:
    real bundle (`dev.squelch.client`) so notification authorization just works;
    note that re-signing ad-hoc can reset the user's notification permission
    grant.
-4. iOS era: `POST /client/devices` registration on the human door (device
-   token, human door, bearer-authed), a pusher task in squelchd reading the
-   events table and POSTing to this relay, dropping tokens on 410. NSE +
-   shared-package rendering as described above.
+4. iOS era. **Daemon half done:** `POST /client/devices` +
+   `POST /client/devices/unregister` on the human door (bearer-authed, idempotent
+   — iOS re-registers every launch; the token rides in the body, never in a URL
+   path, because a path segment is what every access log keeps), and the pusher
+   task in squelchd reading the
+   `events` table past its own `sync_state` cursor and POSTing one `/v1/push`
+   per event, oldest first, dropping tokens on `410`. The cursor advances only
+   after a 200, so a relay outage delays pushes and never skips them; a cold
+   start joins at the head rather than replaying history; with no devices
+   registered the cursor advances without any request at all. Configured
+   entirely by `SQUELCH_RELAY_URL` / `SQUELCH_RELAY_TOKEN` (+ optional
+   `SQUELCH_RELAY_TOPIC` / `SQUELCH_RELAY_APNS_ENV`) — no relay URL, no task.
+   **Remaining:** the iOS app itself, the NSE, and the shared rendering package.
 
 **Per-channel cursors, not a global "delivered" flag** — the Mac's SSE consumer
 and each phone track their own `after=<id>` independently. A single-consumer
@@ -208,6 +223,10 @@ against it, and it links against nothing of the daemon's — no `squelch-core`,
 no store, no mail types. Stateless, so any small VPS or fly.io-class host works;
 scale is a rounding error. TLS terminated by the host. The `.p8` key is the
 only secret.
+
+Concretely: the repo root carries a `Dockerfile` and `railway.toml` that build
+and run only this crate, so `railway up` is the whole deploy. Nothing is
+deployed yet.
 
 ## Open questions
 

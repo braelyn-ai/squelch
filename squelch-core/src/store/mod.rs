@@ -235,6 +235,26 @@ pub struct NewEvent {
     pub deadline: Option<String>,
 }
 
+/// One registered APNs device: a token the user's own phone handed to their own
+/// daemon, plus when it was first seen and last re-registered.
+///
+/// PRIVACY: `token` is user-owned capability material. It is written by the
+/// human door, read by the pusher, and NEVER logged (see [`Store::list_devices`])
+/// nor exposed on the agent door.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub token: String,
+    /// Free-form platform tag; `ios` today, so the row survives a macOS-over-APNs
+    /// experiment without a schema change.
+    pub platform: String,
+    pub created_at: DateTime<Utc>,
+    /// Refreshed on every re-registration — iOS hands the app its token on every
+    /// launch, so this is the liveness signal, not `created_at`.
+    pub last_registered_at: DateTime<Utc>,
+}
+
 /// One non-confident triage row queued for the Stage-2 LLM pass, plus the
 /// message context and the matched Filtered-rule's `want_text` (when a rule
 /// fired). Produced by [`Store::stage2_queue`].
@@ -881,6 +901,33 @@ pub trait Store: Send + Sync {
     /// The newest event id for the account, or `0` when there are none — the
     /// starting cursor for a client that has never connected.
     fn latest_event_id(&self, account_id: AccountId) -> Result<i64>;
+
+    // ---------------------------------------------------------------------
+    // REGISTERED PUSH DEVICES. Written by the human door
+    // (`POST/DELETE /client/devices`), read by the APNs pusher, invisible to
+    // the agent door. See the `devices` block in schema.sql.
+    // ---------------------------------------------------------------------
+
+    /// Register a device token, or refresh an already-known one. IDEMPOTENT by
+    /// construction (UPSERT on the `UNIQUE(token)` key): iOS hands the app its
+    /// token on every launch, so a re-register must update
+    /// `last_registered_at` rather than fork a second row. Returns the resulting
+    /// row.
+    ///
+    /// A token already registered to ANOTHER account is refused with
+    /// [`CoreError::InvalidInput`] and nothing is written: re-registration must
+    /// never be able to silently repoint an existing device's pushes at a
+    /// different account.
+    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device>;
+
+    /// Every registered device for the account, oldest first (stable order, so a
+    /// push fan-out and its response array line up reproducibly).
+    fn list_devices(&self, account_id: AccountId) -> Result<Vec<Device>>;
+
+    /// Drop one device by token, scoped to the account. Returns whether a row was
+    /// removed. Two callers: the human door's DELETE, and the pusher when the
+    /// relay reports APNs `410 Unregistered` for that token.
+    fn delete_device_by_token(&self, account_id: AccountId, token: &str) -> Result<bool>;
 
     // ---------------------------------------------------------------------
     // UNSUBSCRIBE (human door). All four are `/client/*`-only. Sealed mail is

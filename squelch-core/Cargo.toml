@@ -29,3 +29,10 @@ sha2 = "0.10"
 fastembed = { workspace = true }
 sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }
+
+[dev-dependencies]
+# The APNs pusher's tests bind a MOCK RELAY on an ephemeral loopback port and
+# assert on the exact bytes that leave the daemon — "the relay is blind" is only
+# a real guarantee if it is checked on the wire, not on a struct. Same axum 0.8
+# line the rest of the workspace pins.
+axum = { version = "0.8" }

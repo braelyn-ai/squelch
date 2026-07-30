@@ -14,7 +14,7 @@ use crate::error::{CoreError, Result};
 use crate::store::{
     TriageDebug,
     AttachmentBytes, BankingApplied, ExtractQueued, MarketingApplied, MarketingOffer,
-    MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
+    Device, MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
     SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
@@ -1367,6 +1367,29 @@ fn finish_event(row: EventRow) -> Result<Event> {
         one_line,
         deadline,
         created_at: parse_dt(&created_at)?,
+    })
+}
+
+// ---- `devices` row mapping -------------------------------------------------
+
+/// One raw `devices` row, columns in SELECT order. Split from [`finish_device`]
+/// for the same reason [`EventRow`] is: the rusqlite mapper cannot fail with a
+/// [`CoreError`], so the timestamp parse happens after it.
+type DeviceRow = (i64, i64, String, String, String, String);
+
+fn map_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+}
+
+fn finish_device(row: DeviceRow) -> Result<Device> {
+    let (id, account_id, token, platform, created_at, last_registered_at) = row;
+    Ok(Device {
+        id,
+        account_id,
+        token,
+        platform,
+        created_at: parse_dt(&created_at)?,
+        last_registered_at: parse_dt(&last_registered_at)?,
     })
 }
 
@@ -3222,6 +3245,71 @@ impl Store for SqliteStore {
         Ok(id)
     }
 
+    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device> {
+        let conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        // UPSERT on UNIQUE(token). `created_at` is deliberately NOT touched on
+        // conflict — first sight is a fact worth keeping.
+        //
+        // THE CONFLICT UPDATE IS ACCOUNT-SCOPED, and that WHERE is the security
+        // property. Adopting `excluded.account_id` would mean anyone who can
+        // register a device could re-register a token ALREADY OWNED by another
+        // account and silently move it — every subsequent push for that physical
+        // phone would then be aimed by whoever rebound it. Single-account
+        // daemons make that theoretical today; the store is the wrong layer to
+        // leave it true in.
+        //
+        // A cross-account collision therefore updates NOTHING (0 rows changed),
+        // and 0-rows is reported rather than swallowed: a silent no-op that
+        // returned the other account's row would be worse than the rebind.
+        let changed = conn.execute(
+            "INSERT INTO devices(account_id, token, platform, created_at, last_registered_at)
+             VALUES(?1,?2,?3,?4,?4)
+             ON CONFLICT(token) DO UPDATE SET
+                 platform=excluded.platform,
+                 last_registered_at=excluded.last_registered_at
+             WHERE devices.account_id = excluded.account_id",
+            params![account_id, token, platform, now],
+        )?;
+        if changed == 0 {
+            // States the RULE, never the token — this string reaches the human
+            // door as a 400 body.
+            return Err(CoreError::InvalidInput(
+                "device token is already registered to another account".to_string(),
+            ));
+        }
+        let row = conn.query_row(
+            "SELECT id, account_id, token, platform, created_at, last_registered_at
+             FROM devices WHERE token = ?1",
+            params![token],
+            map_device,
+        )?;
+        finish_device(row)
+    }
+
+    fn list_devices(&self, account_id: AccountId) -> Result<Vec<Device>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, token, platform, created_at, last_registered_at
+             FROM devices WHERE account_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id], map_device)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(finish_device(row?)?);
+        }
+        Ok(out)
+    }
+
+    fn delete_device_by_token(&self, account_id: AccountId, token: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "DELETE FROM devices WHERE account_id = ?1 AND token = ?2",
+            params![account_id, token],
+        )?;
+        Ok(n > 0)
+    }
+
     fn triage_debug(
         &self,
         account_id: AccountId,
@@ -3525,8 +3613,23 @@ impl Store for SqliteStore {
             // upheld by refusing to emit ONE event if the row already emitted is
             // served indefinitely. No path re-emits it either — `worthy_kind`
             // refuses non-normal sensitivity and the row is now human-stamped.
+            //
+            // REDACT, NEVER DELETE. `events.id` is `INTEGER PRIMARY KEY` with no
+            // AUTOINCREMENT, so it IS the rowid and SQLite hands the largest
+            // free one to the next insert: deleting the newest event would let
+            // the next `append_event` REUSE that id. Every consumer of this log
+            // holds a durable cursor (the pusher's `apns_push_cursor` row, each
+            // client's `after=<id>`), and a cursor already past the reused id
+            // skips that event permanently — a lost notification, forever, for
+            // an unrelated message. So the row STAYS and only its content goes:
+            // id/message_id/thread_id/kind/tier/importance/created_at are
+            // structure, and the seal requirement is that CONTENT is gone. The
+            // notification itself already fired pre-seal (nothing can unring
+            // that), and a replaying client renders its generic fallback for an
+            // empty sender/one_line.
             tx.execute(
-                "DELETE FROM events WHERE account_id = ?1 AND message_id = ?2",
+                "UPDATE events SET sender = '', one_line = '', deadline = NULL
+                 WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
         }
@@ -5278,6 +5381,12 @@ mod tests {
         // client cursor replays forever — and an iOS notification-service
         // extension renders exactly that row on a lock screen. So sealing has to
         // retract it; refusing to emit a SECOND event is not the same thing.
+        //
+        // Retraction is REDACTION, not deletion: `events.id` is the rowid, so
+        // deleting the newest row would free that id for the next append, and
+        // every durable cursor past it (`apns_push_cursor`, a client's `after=`)
+        // would silently skip the reused event forever. The row therefore stays,
+        // keyed and ordered exactly as before, with its CONTENT emptied.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let t0 = Utc::now();
@@ -5287,24 +5396,61 @@ mod tests {
         let other = store
             .ingest_message(&inbound_triaged(acct, "g2", "t2", "alice@x.com", t0, false))
             .unwrap();
-        let sealed_ev = store.append_event(&new_event(acct, id)).unwrap().unwrap();
+        let sealed_ev = store
+            .append_event(&NewEvent {
+                deadline: Some("2026-08-01T17:00:00Z".to_string()),
+                ..new_event(acct, id)
+            })
+            .unwrap()
+            .unwrap();
         let keep = store.append_event(&new_event(acct, other)).unwrap().unwrap();
+        let before = store.event_by_id(acct, sealed_ev).unwrap().unwrap();
+        assert!(!before.sender.is_empty() && !before.one_line.is_empty());
+        assert!(before.deadline.is_some());
+        let keep_before = store.event_by_id(acct, keep).unwrap().unwrap();
 
         store
             .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
             .unwrap()
             .unwrap();
 
-        assert!(
-            store.event_by_id(acct, sealed_ev).unwrap().is_none(),
-            "the sealed message's snapshot must not survive the seal"
-        );
+        // The row SURVIVES — the id must never be recyclable...
+        let after = store
+            .event_by_id(acct, sealed_ev)
+            .unwrap()
+            .expect("the id must stay taken; a freed rowid is a skipped notification later");
+        // ...carrying nothing about the mail any more.
+        assert_eq!(after.sender, "", "sealed content must not survive the seal");
+        assert_eq!(after.one_line, "");
+        assert_eq!(after.deadline, None);
+        // Structure is untouched: the row is still addressable and orderable.
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.message_id, before.message_id);
+        assert_eq!(after.thread_id, before.thread_id);
+        assert_eq!(after.created_at, before.created_at);
+
+        // Replay sees both rows, in order, and only the sealed one is blanked.
         let left = store.events_after(acct, 0, 100).unwrap();
         assert_eq!(
             left.iter().map(|e| e.id).collect::<Vec<_>>(),
-            vec![keep],
-            "and only THAT message's event is retracted"
+            vec![sealed_ev, keep],
+            "redaction must not renumber or drop the log"
         );
+        assert_eq!(left[0].one_line, "");
+        assert_eq!(
+            (left[1].sender.as_str(), left[1].one_line.as_str()),
+            (keep_before.sender.as_str(), keep_before.one_line.as_str()),
+            "and only THAT message's event is redacted"
+        );
+
+        // The next append gets a FRESH id rather than the sealed row's — which is
+        // the whole reason this is an UPDATE.
+        let third = store
+            .ingest_message(&inbound_triaged(acct, "g3", "t3", "bob@x.com", t0, false))
+            .unwrap();
+        let next = store.append_event(&new_event(acct, third)).unwrap().unwrap();
+        assert!(next > keep, "ids must keep moving forward, got {next}");
+
         assert_eq!(store.sealed_messages(acct).unwrap().len(), 1, "it WAS sealed");
     }
 
@@ -7946,6 +8092,101 @@ mod tests {
         drop(rx);
         store.attach_event_notifier(tx).unwrap();
         assert_eq!(store.append_event(&new_event(acct, 1)).unwrap(), Some(1));
+    }
+
+    // ---- REGISTERED PUSH DEVICES -----------------------------------------
+
+    const TOK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+    const TOK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2";
+
+    /// Registration is IDEMPOTENT: iOS re-registers on every launch, so a second
+    /// call must refresh the same row rather than fork a new one.
+    #[test]
+    fn upsert_device_is_idempotent_and_refreshes_liveness() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+
+        let first = store.upsert_device(acct, TOK_A, "ios").unwrap();
+        assert_eq!(first.token, TOK_A);
+        assert_eq!(first.platform, "ios");
+        assert_eq!(first.account_id, acct);
+
+        // Same token again: same row id, `created_at` preserved (first sight is a
+        // fact), `last_registered_at` moved forward.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let again = store.upsert_device(acct, TOK_A, "ios").unwrap();
+        assert_eq!(again.id, first.id, "a re-register must not fork a row");
+        assert_eq!(again.created_at, first.created_at);
+        assert!(again.last_registered_at >= first.last_registered_at);
+        assert_eq!(store.list_devices(acct).unwrap().len(), 1);
+
+        // A distinct token is a distinct device.
+        store.upsert_device(acct, TOK_B, "ios").unwrap();
+        let all = store.list_devices(acct).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, first.id, "listed oldest-first");
+    }
+
+    /// Devices are account-scoped on read, and a token that already belongs to
+    /// another account CANNOT be taken over by re-registering it: the conflict
+    /// update is scoped to the owning account, so the collision is an error and
+    /// the original row is untouched. Otherwise a bearer for account B could
+    /// silently repoint account A's phone at itself.
+    #[test]
+    fn a_cross_account_token_collision_is_refused_not_rebound() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let other = store.ensure_account("other@example.com").unwrap();
+
+        let a = store.upsert_device(acct, TOK_A, "ios").unwrap();
+        assert!(store.list_devices(other).unwrap().is_empty());
+
+        let err = store
+            .upsert_device(other, TOK_A, "macos")
+            .expect_err("another account must not be able to adopt this token");
+        assert!(
+            matches!(err, CoreError::InvalidInput(ref m) if !m.contains(TOK_A)),
+            "expected InvalidInput that does not echo the token, got {err:?}"
+        );
+
+        // A's row is exactly as it was: same id, same account, same platform.
+        let still = store.list_devices(acct).unwrap();
+        assert_eq!(still.len(), 1);
+        assert_eq!(still[0].id, a.id);
+        assert_eq!(still[0].account_id, acct);
+        assert_eq!(still[0].platform, "ios");
+        assert_eq!(still[0].last_registered_at, a.last_registered_at);
+        // And B gained nothing at all.
+        assert!(store.list_devices(other).unwrap().is_empty());
+
+        // The owner can still re-register it, of course.
+        let refreshed = store.upsert_device(acct, TOK_A, "ios").unwrap();
+        assert_eq!(refreshed.id, a.id);
+    }
+
+    /// Delete-by-token is the shape both the human door's DELETE and the pusher's
+    /// APNs-410 cleanup use: scoped, boolean, and idempotent.
+    #[test]
+    fn delete_device_by_token_is_scoped_and_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let other = store.ensure_account("other@example.com").unwrap();
+        store.upsert_device(acct, TOK_A, "ios").unwrap();
+        store.upsert_device(acct, TOK_B, "ios").unwrap();
+
+        // Another account cannot delete this account's device.
+        assert!(!store.delete_device_by_token(other, TOK_A).unwrap());
+        assert_eq!(store.list_devices(acct).unwrap().len(), 2);
+
+        assert!(store.delete_device_by_token(acct, TOK_A).unwrap());
+        let left = store.list_devices(acct).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].token, TOK_B);
+
+        // A second delete is a no-op, not an error.
+        assert!(!store.delete_device_by_token(acct, TOK_A).unwrap());
+        // An unknown token likewise.
+        assert!(!store.delete_device_by_token(acct, "ffff0000ffff0000").unwrap());
     }
 
     // ---- SEMANTIC RECALL (v1) --------------------------------------------

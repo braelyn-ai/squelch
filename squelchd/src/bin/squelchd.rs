@@ -417,6 +417,33 @@ fn cmd_serve(
     let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
     store.attach_event_notifier(event_tx.clone())?;
 
+    // The APNs pusher is the SECOND reader of that same log (SSE is the first),
+    // carrying its own persisted cursor. `None` unless a relay is configured —
+    // absence of `SQUELCH_RELAY_URL` is the whole feature flag, so a daemon that
+    // was never told about a relay never constructs a client aimed at one.
+    // A relay that IS configured but whose client cannot be built is a
+    // misconfiguration, not "the feature is off": say so loudly and keep serving
+    // mail, rather than printing the disabled line at an operator who set
+    // SQUELCH_RELAY_URL and would then go hunting for a typo that isn't there.
+    let pusher = match squelch_core::push::Pusher::from_config(
+        store.clone() as Arc<dyn squelch_core::store::Store>,
+        account_id,
+        &config,
+    ) {
+        Ok(pusher) => pusher,
+        Err(e) => {
+            eprintln!(
+                "squelchd: APNs pusher NOT started: a relay is configured but its HTTP client could not be built: {e}"
+            );
+            None
+        }
+    };
+    // Subscribe BEFORE the sender is handed to the human door, so nothing
+    // appended during startup can be missed. (It would only cost latency — the
+    // table is the truth and the pusher re-reads past its own cursor — but a
+    // receiver that exists is free.)
+    let pusher_wake = event_tx.subscribe();
+
     // The human door refuses to build without SQUELCH_API_TOKEN. Attaching the
     // WRITE-bound credential store here enables the action endpoints — the sync
     // engine below gets a separate Read-bound store and never sees this one.
@@ -453,6 +480,28 @@ fn cmd_serve(
         // waits for open connections, so without this one resident client would
         // hold the daemon open forever.
         let api_state = api_state.with_shutdown(shutdown_rx.clone());
+
+        // The APNs pusher: the events log's second delivery adapter, reading past
+        // its OWN cursor and POSTing opaque pings to the blind relay. Spawned
+        // ONLY when a relay is configured; same shutdown watch as the sync loop,
+        // and awaited on the way out so it stops gracefully.
+        let pusher_handle = match pusher {
+            Some(pusher) => {
+                eprintln!("squelchd: APNs pusher enabled (relay configured)");
+                let shutdown_rx = shutdown_rx.clone();
+                Some(tokio::spawn(
+                    async move { pusher.run(pusher_wake, shutdown_rx).await },
+                ))
+            }
+            None => {
+                // One quiet line. The absence of SQUELCH_RELAY_URL is the normal
+                // case (iOS push is opt-in), so this is a detail, not a warning.
+                eprintln!(
+                    "squelchd: APNs pusher disabled (no SQUELCH_RELAY_URL / [pusher] relay_url)"
+                );
+                None
+            }
+        };
 
         // The sync loop. No embedder override: it resolves the embedder from the
         // shared store each tick, so it picks up the background-attached one.
@@ -557,6 +606,13 @@ fn cmd_serve(
             Ok(Ok(())) => {}
             Ok(Err(e)) => eprintln!("squelchd: sync ended with error: {e}"),
             Err(e) => eprintln!("squelchd: sync task join error: {e}"),
+        }
+        if let Some(handle) = pusher_handle {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("squelchd: APNs pusher ended with error: {e}"),
+                Err(e) => eprintln!("squelchd: APNs pusher task join error: {e}"),
+            }
         }
 
         serve_result.map_err(|e| other_err(format!("http serve: {e}")))

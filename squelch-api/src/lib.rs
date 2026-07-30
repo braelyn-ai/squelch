@@ -18,9 +18,13 @@
 //! - `/client/events` streams the notification log and `/client/events/{id}`
 //!   serves one row of it. Sealed mail can never be represented there (enforced
 //!   at emission in squelch-core), and the agent door has no access to either.
+//! - `/client/devices` registers an APNs device token for the daemon's pusher
+//!   task. Tokens are user-owned capability material: never logged, never echoed
+//!   back in a response, never visible on the agent door.
 //! - No secrets, tokens, or message bodies are ever logged.
 
 mod auth;
+mod devices;
 mod error;
 mod events;
 pub mod guard;
@@ -113,6 +117,17 @@ pub fn router(state: ApiState) -> Router {
         // door only — the agent door gains no access to the event log.
         .route("/client/events", get(events::events_stream))
         .route("/client/events/{id}", get(events::get_event))
+        // Push-device registration: the phone hands ITS OWN daemon an APNs
+        // token, which the pusher task fans event ids out to via the blind
+        // relay. Human door only — the agent door never learns a device exists.
+        .route("/client/devices", post(devices::register_device))
+        // Unregister is a POST carrying the token in the BODY, deliberately not
+        // `DELETE /client/devices/{token}`: a device token is capability
+        // material, and a URL path is the most-logged part of a request.
+        .route(
+            "/client/devices/unregister",
+            post(devices::unregister_device),
+        )
         // Actions: the only write capability. Require the opt-in write
         // credential; 403 without one.
         .route("/client/actions/archive", post(handlers::action_archive))

@@ -16,8 +16,10 @@
 //!
 //! SECURITY: sealed mail can never appear here. That is enforced upstream (the
 //! emission decision requires `sensitivity='normal'`, and sealing a message
-//! retracts its event row), so this module has no sealed-handling of its own —
-//! there is nothing to handle.
+//! REDACTS its event row — sender/one_line blanked, the row itself kept so its
+//! id can never be reused under a client's cursor), so this module has no
+//! sealed-handling of its own. A redacted row streams as an ordinary event with
+//! empty content, which clients render with their generic fallback.
 
 use std::convert::Infallible;
 use std::sync::Arc;

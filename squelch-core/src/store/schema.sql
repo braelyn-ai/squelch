@@ -583,8 +583,11 @@ CREATE INDEX IF NOT EXISTS idx_audit_account_ts ON audit_log(account_id, ts);
 -- noise-tier/importance-0 with no Stage-1 pass — two independent reasons. An OTP
 -- on a lock screen would undo the entire seal design, so this is load-bearing.
 -- A human sealing a message AFTER it notified is the third: `correct_triage`
--- DELETEs the row, because a snapshot taken pre-seal would otherwise be replayed
--- to every client cursor forever.
+-- REDACTS the row (sender/one_line/deadline blanked, everything structural
+-- kept), because a snapshot taken pre-seal would otherwise be replayed to every
+-- client cursor forever. It does NOT delete: `id` is the rowid, and deleting the
+-- newest row would let the next insert reuse that id, which every durable cursor
+-- (`apns_push_cursor`, each client's `after=`) would then skip forever.
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,   -- monotonic; the clients' cursor
     account_id  INTEGER NOT NULL,
@@ -601,3 +604,38 @@ CREATE TABLE IF NOT EXISTS events (
 
 -- The read pattern is exactly "rows after my cursor, for my account".
 CREATE INDEX IF NOT EXISTS idx_events_account_id ON events(account_id, id);
+
+-- REGISTERED PUSH DEVICES. One row per APNs device token the user's phone has
+-- handed to THEIR OWN daemon over the human door (`POST /client/devices`). The
+-- daemon's pusher task fans an event id out to every row here via the blind
+-- relay; nothing else reads this table.
+--
+-- `token` is UNIQUE and re-registration is an UPSERT, because iOS hands the app
+-- its token on EVERY launch: registration has to be idempotent or a chatty app
+-- would grow one row per cold start. `last_registered_at` is the liveness
+-- signal that distinguishes "same device, still here" from a stale row.
+--
+-- Rows die exactly two ways: the human door's DELETE, and APNs answering `410
+-- Unregistered` for that token — the relay passes that status back verbatim
+-- precisely so this daemon, and not shared infrastructure, owns the cleanup.
+-- The relay is stateless and remembers no token.
+--
+-- PRIVACY: a device token is a capability, not a secret Apple protects, but it
+-- is still the user's. It is never logged (the pusher logs row ids, or an
+-- 8-char prefix at most) and never crosses the agent door.
+CREATE TABLE IF NOT EXISTS devices (
+    id                 INTEGER PRIMARY KEY,
+    account_id         INTEGER NOT NULL,
+    -- Hex APNs device token. UNIQUE across accounts: one physical device is one
+    -- row. Re-registering a token that belongs to ANOTHER account is REFUSED,
+    -- not rebound — the upsert's conflict update carries
+    -- `WHERE devices.account_id = excluded.account_id`, so registration can
+    -- never silently repoint an existing device's pushes.
+    token              TEXT NOT NULL UNIQUE,
+    platform           TEXT NOT NULL DEFAULT 'ios',
+    created_at         TEXT NOT NULL,
+    last_registered_at TEXT NOT NULL
+);
+
+-- The pusher's read is exactly "every token for my account".
+CREATE INDEX IF NOT EXISTS idx_devices_account ON devices(account_id);
