@@ -165,6 +165,27 @@ pub struct ParentHeaders {
     pub references: Option<String>,
 }
 
+/// What `messages.send` echoed back about the message it created. Parsed
+/// leniently — both fields `None` on a `{}` response — because the send has
+/// ALREADY succeeded by the time this is built: a missing id costs us the local
+/// echo, never the request.
+#[derive(Debug, Default, Clone)]
+pub struct SentRef {
+    pub id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+/// One `format=raw` message as Gmail returns it: the base64url RFC822 body plus
+/// the ids/date it carries alongside. Decoding is the caller's job (core owns
+/// `decode_raw_b64url`).
+#[derive(Debug, Clone)]
+pub struct FetchedRaw {
+    pub raw_b64: String,
+    pub thread_id: Option<String>,
+    /// Milliseconds since epoch as a decimal string (Gmail's `internalDate`).
+    pub internal_date: Option<String>,
+}
+
 /// Executes Gmail write ops with a WRITE-bound credential store. The token is
 /// fetched per call and never retained.
 pub struct GmailWriteClient {
@@ -236,6 +257,30 @@ impl GmailWriteClient {
         }
     }
 
+    /// GET a JSON body with the write bearer token (gmail.modify grants read).
+    /// Never logs the token or the response.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, WriteError> {
+        let token = self.write_token().await?;
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| WriteError::Transport(format!("gmail request failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Never echo the upstream body (it may carry request context).
+            return Err(WriteError::Api {
+                status: status.as_u16(),
+                message: "request rejected".into(),
+            });
+        }
+        resp.json::<T>()
+            .await
+            .map_err(|e| WriteError::Transport(format!("gmail json decode: {e}")))
+    }
+
     /// `messages.modify`: add/remove labels on a Gmail message.
     pub async fn modify(
         &self,
@@ -270,25 +315,7 @@ impl GmailWriteClient {
              ?format=metadata&metadataHeaders=Message-ID&metadataHeaders=References",
             self.base
         );
-        let token = self.write_token().await?;
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| WriteError::Transport(format!("gmail request failed: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(WriteError::Api {
-                status: status.as_u16(),
-                message: "request rejected".into(),
-            });
-        }
-        let meta: GmailMessage = resp
-            .json()
-            .await
-            .map_err(|e| WriteError::Transport(format!("gmail json decode: {e}")))?;
+        let meta: GmailMessage = self.get_json(&url).await?;
         let mut out = ParentHeaders::default();
         if let Some(p) = meta.payload {
             for h in p.headers {
@@ -302,11 +329,29 @@ impl GmailWriteClient {
         Ok(out)
     }
 
-    /// `messages.send`: send a raw RFC822 message, optionally threaded.
-    pub async fn send(&self, raw: &[u8], thread_id: Option<&str>) -> Result<(), WriteError> {
+    /// `messages.send`: send a raw RFC822 message, optionally threaded. Returns
+    /// what Gmail echoed about the created message (see [`SentRef`]).
+    pub async fn send(&self, raw: &[u8], thread_id: Option<&str>) -> Result<SentRef, WriteError> {
         let url = format!("{}/messages/send", self.base);
         let body = send_body(raw, thread_id);
-        self.post_json(&url, &body).await.map(|_| ())
+        let v = self.post_json(&url, &body).await?;
+        Ok(SentRef {
+            id: v["id"].as_str().map(str::to_string),
+            thread_id: v["threadId"].as_str().map(str::to_string),
+        })
+    }
+
+    /// Read one message `format=raw` with the WRITE token. Used to echo a
+    /// just-sent message into the local store; the read credential never sees
+    /// Sent mail between polls.
+    pub async fn fetch_raw(&self, gmail_msg_id: &str) -> Result<FetchedRaw, WriteError> {
+        let url = format!("{}/messages/{gmail_msg_id}?format=raw", self.base);
+        let msg: GmailMessage = self.get_json(&url).await?;
+        Ok(FetchedRaw {
+            raw_b64: msg.raw.unwrap_or_default(),
+            thread_id: msg.thread_id,
+            internal_date: msg.internal_date,
+        })
     }
 }
 
@@ -494,16 +539,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_posts_raw_and_threadid() {
-        let (base, handle) = mock_once(200, "{\"id\":\"x\"}").await;
+    async fn send_posts_raw_and_threadid_and_returns_ids() {
+        let (base, handle) =
+            mock_once(200, "{\"id\":\"sent-1\",\"threadId\":\"thread-9\"}").await;
         let c = client(base);
         let raw = b"To: a@b.com\r\nSubject: hi\r\n\r\nbody";
-        c.send(raw, Some("thread-9")).await.unwrap();
+        let sent = c.send(raw, Some("thread-9")).await.unwrap();
+        assert_eq!(sent.id.as_deref(), Some("sent-1"));
+        assert_eq!(sent.thread_id.as_deref(), Some("thread-9"));
         let req = handle.await.unwrap();
         assert!(req.contains("/messages/send"), "send path");
         assert!(req.contains("\"threadId\":\"thread-9\""));
         let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
         assert!(req.contains(&expected), "raw base64url payload present");
+    }
+
+    #[tokio::test]
+    async fn send_tolerates_an_idless_response() {
+        // The send SUCCEEDED; an echo-less body must not become an error.
+        let (base, handle) = mock_once(200, "{}").await;
+        let c = client(base);
+        let sent = c.send(b"To: a@b.com\r\n\r\nx", None).await.unwrap();
+        handle.await.unwrap();
+        assert!(sent.id.is_none());
+        assert!(sent.thread_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_raw_gets_format_raw_with_the_write_token() {
+        let (base, handle) = mock_once(
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"t9\",\"internalDate\":\"1783591200000\",\
+             \"raw\":\"VG86IGFAYi5jb20\"}",
+        )
+        .await;
+        let c = client(base);
+        let got = c.fetch_raw("sent-1").await.unwrap();
+        let req = handle.await.unwrap();
+        assert!(req.starts_with("GET "), "raw fetch is a GET");
+        assert!(req.contains("/messages/sent-1?format=raw"));
+        assert!(
+            req.contains("authorization: Bearer WRITE-TOKEN")
+                || req.contains("Authorization: Bearer WRITE-TOKEN")
+        );
+        assert_eq!(got.raw_b64, "VG86IGFAYi5jb20");
+        assert_eq!(got.thread_id.as_deref(), Some("t9"));
+        assert_eq!(got.internal_date.as_deref(), Some("1783591200000"));
     }
 
     #[tokio::test]

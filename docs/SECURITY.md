@@ -179,3 +179,26 @@ audit row. False positives are acceptable precisely because it is overridable.
 **Do not break.** `GuardMatch::kind()` is the only thing that may leave the process —
 never return, log, or audit the matched substring. Keep the override audited; an
 un-audited bypass is not a bypass we can reason about.
+
+**Post-send echo (audit contract).** After a successful send,
+`handlers::echo_sent` fetches the sent message back (`format=raw`, write token) and
+ingests it locally so the thread shows the reply immediately. It is strictly
+best-effort — the mail has already left, so nothing here may fail the request — and
+audits under its own action `send.echo`, alongside the `send` row's own outcomes
+(`rejected:confirm`, `rejected:empty_body`, `blocked:guard`, `guard_override:<kinds>`,
+`rejected:no_write_credential`, `failed:target`, `rejected:no_recipient`,
+`rejected:compose`, `failed:gmail`, `ok`):
+
+| `send.echo` detail | meaning |
+| --- | --- |
+| `skipped:no_id` | Gmail's send response carried no message id; nothing to fetch back. |
+| `failed:fetch` | the read-back GET or its base64url decode failed. |
+| `failed:ingest` | the local store write failed. |
+| `ok:<local id>` | echoed; `<local id>` is the local `messages.id`. |
+
+The echoed row goes through the SAME seal-first ingest as any other message
+(`sync::ingest::ingest_sent`, `is_sent: true`), so it runs no LLM and — because
+seal detection precedes the `is_sent` branch — a reply quoting an OTP lands
+`sealed`, exactly as backfilled SENT mail does. Keep the echo's failures audited
+and swallowed; keep it out of core's write surface (the fetch lives in
+`squelch-api/src/gmail_write.rs`, core takes bytes).

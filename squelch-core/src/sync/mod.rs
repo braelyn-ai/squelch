@@ -1576,8 +1576,9 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Gmail `internalDate` is milliseconds-since-epoch as a decimal string.
-fn parse_internal_date(s: Option<&str>) -> Option<DateTime<Utc>> {
+/// Gmail `internalDate` is milliseconds-since-epoch as a decimal string. `pub`
+/// so squelch-api's send-echo parses it from one definition.
+pub fn parse_internal_date(s: Option<&str>) -> Option<DateTime<Utc>> {
     let ms: i64 = s?.trim().parse().ok()?;
     DateTime::from_timestamp_millis(ms)
 }

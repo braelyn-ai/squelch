@@ -821,6 +821,34 @@ async fn mock_gmail(n: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) 
     (format!("http://{addr}"), handle)
 }
 
+/// [`mock_gmail`]'s scripted sibling: serve one `(status, body)` per entry, in
+/// order. The send path's calls differ in what they must return (ids, then a raw
+/// message), and the echo's failure mode is a status, so both are scripted.
+async fn mock_gmail_seq(
+    responses: Vec<(u16, String)>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let mut reqs = Vec::new();
+        for (status, body) in responses {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let m = sock.read(&mut buf).await.unwrap();
+            reqs.push(String::from_utf8_lossy(&buf[..m]).to_string());
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        }
+        reqs
+    });
+    (format!("http://{addr}"), handle)
+}
+
 /// The default harness plus a write credential pointed at a mock Gmail `base`.
 fn app_with_writes(base: String, seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
     let (state, store, acct) = common::state_with(seed);
@@ -941,9 +969,184 @@ async fn reply_send_success_threads_and_audits_ok() {
     // Threaded onto the parent's Gmail thread.
     assert!(reqs[1].contains("\"threadId\":\"thread-77\""));
 
+    // `mock_gmail` answers `{}`, so there is no sent id to echo back.
     let audit = store.list_audit(acct, 10).unwrap();
-    assert_eq!(audit[0].action, "send");
-    assert_eq!(audit[0].detail.as_deref(), Some("ok"));
+    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+}
+
+/// The RFC822 Gmail hands back for the echoed reply, base64url-encoded the way
+/// `format=raw` returns it.
+fn sent_reply_raw_b64() -> String {
+    use base64::Engine as _;
+    let eml = "From: Me <me@example.com>\r\n\
+               To: Alice <alice@example.com>\r\n\
+               Subject: Re: Lunch?\r\n\
+               Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+               Content-Type: text/plain; charset=\"UTF-8\"\r\n\
+               \r\n\
+               yes, noon works\r\n";
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+}
+
+#[tokio::test]
+async fn reply_send_echoes_the_sent_message_into_the_thread() {
+    // Three Gmail calls: parent headers, the send, then the echo's raw read-back.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{}".to_string()),
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-77\"}".to_string()),
+        (
+            200,
+            format!(
+                "{{\"id\":\"sent-1\",\"threadId\":\"thread-77\",\
+                   \"internalDate\":\"1783591200000\",\"raw\":\"{}\"}}",
+                sent_reply_raw_b64()
+            ),
+        ),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        let m = store
+            .upsert_message(&msg(acct, "gmail-parent", "thread-77", "Lunch?", "want lunch?"))
+            .unwrap();
+        store
+            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+    });
+    let message_id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": message_id,
+                "body": "yes, noon works",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "sent");
+    assert_eq!(json["thread_id"], "thread-77");
+    let echo_id = json["echo_message_id"].as_i64().expect("echoed local id");
+
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert!(reqs[2].starts_with("GET "), "the echo reads the sent message back");
+    assert!(reqs[2].contains("/messages/sent-1?format=raw"));
+
+    // The thread view carries the reply immediately, no Sent poll needed.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/thread/thread-77"))
+        .await
+        .unwrap();
+    let thread = body_json(resp).await;
+    let msgs = thread["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "parent + echoed reply");
+    assert!(
+        msgs.iter().any(|m| m["id"].as_i64() == Some(echo_id)
+            && m["content"].as_str().unwrap().contains("noon works")),
+        "the echoed reply is in the thread"
+    );
+
+    // ...and creates no attention noise: sent mail never reaches /client/updates.
+    let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    let updates = body_json(resp).await;
+    assert!(
+        updates["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|u| u["id"].as_i64() != Some(echo_id)),
+        "the echo is not an update"
+    );
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some(&*format!("ok:{echo_id}"))),
+        "the echo audits its local id"
+    );
+}
+
+#[tokio::test]
+async fn send_with_no_echoed_id_skips_the_echo_and_still_succeeds() {
+    // Cold send whose response carries no id: nothing to fetch back, so exactly
+    // one Gmail call and a null echo id.
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "sent");
+    assert!(json["echo_message_id"].is_null());
+    assert!(json["thread_id"].is_null(), "no parent and no echoed thread");
+    assert_eq!(handle.await.unwrap().len(), 1);
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some("skipped:no_id"))
+    );
+}
+
+#[tokio::test]
+async fn echo_fetch_failure_never_fails_the_send() {
+    // The mail is away; a 500 on the read-back costs the local echo, nothing else.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (500, "{\"error\":\"backendError\"}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a failed echo is not a failed send");
+    let json = body_json(resp).await;
+    assert!(json["echo_message_id"].is_null());
+    // A cold send still reports the thread Gmail created, so the client can open it.
+    assert_eq!(json["thread_id"], "thread-new");
+    assert_eq!(handle.await.unwrap().len(), 2);
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some("failed:fetch"))
+    );
 }
 
 // --- sitrep: seen-ledger + bands + resolution over HTTP ---------------------
@@ -2471,11 +2674,16 @@ async fn successful_send_discards_the_draft_it_consumed() {
         Some(0),
         "the send consumed the draft"
     );
-    // The send itself is still audited; the draft cleanup is not.
+    // The send itself is still audited; the draft cleanup is not. `mock_gmail`
+    // answers `{}`, so the echo has no id to fetch back and audits the skip.
     let audit = store.list_audit(acct, 10).unwrap();
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0].action, "send");
-    assert_eq!(audit[0].detail.as_deref(), Some("ok"));
+    assert_eq!(audit.len(), 2);
+    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some("skipped:no_id"))
+    );
 }
 
 #[tokio::test]

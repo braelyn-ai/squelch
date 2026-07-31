@@ -19,13 +19,15 @@ use squelch_core::CoreError;
 use squelch_core::store::{
     ActionMessageRef, Draft, NewAuditEntry, SitrepBand, SqliteStore, Store,
 };
+use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::types::{
     AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
 };
 
 use crate::error::ApiError;
 use crate::gmail_write::{
-    GmailWriteClient, ReplyParts, WriteError, build_references, build_reply_rfc822, reply_subject,
+    GmailWriteClient, ReplyParts, SentRef, WriteError, build_references, build_reply_rfc822,
+    reply_subject,
 };
 use crate::guard;
 use crate::state::ApiState;
@@ -1517,6 +1519,80 @@ pub struct SendBody {
     draft_id: Option<i64>,
 }
 
+/// ECHO the just-sent message into the local store so the thread view shows the
+/// reply without waiting for the next Sent poll: fetch it back `format=raw` on
+/// the write token, decode, ingest with `is_sent: true`.
+///
+/// STRICTLY BEST-EFFORT — the send has already succeeded, so every failure path
+/// returns `None` after auditing; none of them may fail the request. Logs carry
+/// IDS ONLY, never message content. Returns the local message id on success.
+///
+/// AUDIT (contract, docs/SECURITY.md §5): action `send.echo`, detail
+/// `skipped:no_id` | `failed:fetch` | `failed:ingest` | `ok:<local id>`.
+async fn echo_sent(
+    state: &ApiState,
+    client: &GmailWriteClient,
+    target: Option<String>,
+    sent: &SentRef,
+) -> Option<i64> {
+    let gmail_msg_id = match sent.id.as_deref() {
+        Some(id) => id.to_string(),
+        // Gmail echoed no id: nothing to fetch back.
+        None => {
+            audit_action(state, "send.echo", target, "skipped:no_id").await;
+            return None;
+        }
+    };
+
+    let fetched = match client.fetch_raw(&gmail_msg_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("squelch-api: echo of sent message {gmail_msg_id} failed to fetch: {e}");
+            audit_action(state, "send.echo", target, "failed:fetch").await;
+            return None;
+        }
+    };
+    let raw = match decode_raw_b64url(&fetched.raw_b64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("squelch-api: echo of sent message {gmail_msg_id} failed to decode: {e}");
+            audit_action(state, "send.echo", target, "failed:fetch").await;
+            return None;
+        }
+    };
+
+    let thread_id = fetched.thread_id.clone().or_else(|| sent.thread_id.clone());
+    let internal_date = parse_internal_date(fetched.internal_date.as_deref());
+    // Kept back for the log line; the closure takes ownership of the id itself.
+    let log_id = gmail_msg_id.clone();
+    let ingested = store_call(state, move |store, account_id| {
+        let account_addr = store.account_email(account_id)?;
+        squelch_core::sync::ingest::ingest_sent(
+            store,
+            account_id,
+            &account_addr,
+            &gmail_msg_id,
+            thread_id,
+            raw,
+            internal_date,
+            Utc::now(),
+        )
+    })
+    .await;
+
+    match ingested {
+        Ok(local_id) => {
+            audit_action(state, "send.echo", target, &format!("ok:{local_id}")).await;
+            Some(local_id)
+        }
+        Err(_) => {
+            eprintln!("squelch-api: echo of sent message {log_id} failed to ingest");
+            audit_action(state, "send.echo", target, "failed:ingest").await;
+            None
+        }
+    }
+}
+
 /// Discard the draft a successful send consumed. Best-effort and IDS ONLY in the
 /// log line: the mail has already left, so a failed cleanup must not surface as
 /// a send failure. A `false` result is a stale id, not an error.
@@ -1644,7 +1720,7 @@ pub async fn action_send(
     };
 
     match client.send(&raw, thread_id.as_deref()).await {
-        Ok(()) => {
+        Ok(sent) => {
             // A cold send has no target row to resolve.
             if let Some(id) = body.reply_to_message_id {
                 resolve_done(&state, id).await;
@@ -1652,8 +1728,18 @@ pub async fn action_send(
             if let Some(draft_id) = body.draft_id {
                 discard_sent_draft(&state, draft_id).await;
             }
-            audit_action(&state, "send", target, "ok").await;
-            Ok(Json(json!({ "status": "sent" })))
+            audit_action(&state, "send", target.clone(), "ok").await;
+            // The mail is away; everything below is bookkeeping that cannot fail
+            // the request.
+            let echo_message_id = echo_sent(&state, &client, target, &sent).await;
+            // A cold send falls back to the thread Gmail just created, so the
+            // client can open it.
+            let thread = thread_id.or(sent.thread_id);
+            Ok(Json(json!({
+                "status": "sent",
+                "echo_message_id": echo_message_id,
+                "thread_id": thread,
+            })))
         }
         Err(e) => {
             audit_action(&state, "send", target, "failed:gmail").await;

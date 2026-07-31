@@ -7,7 +7,7 @@
 //! Network-free by design so it is testable against fixture bytes.
 
 use crate::config::Stage1Config;
-use crate::store::TriagedMessage;
+use crate::store::{SqliteStore, Store, TriagedMessage};
 use crate::sync::html::sanitize_email_html;
 use crate::triage::calendar;
 use crate::triage::receipt;
@@ -645,6 +645,46 @@ pub fn ingest_with_rules(
     triaged
 }
 
+/// Ingest ONE message the account just sent, from its raw RFC822 bytes.
+///
+/// Pure bytes-in: the caller (squelch-api's send path, which alone holds write
+/// credentials) does the Gmail fetch and hands the decoded bytes over, so core
+/// stays Gmail-WRITE-free. Runs the same seal-first pipeline as the sync engine
+/// with `is_sent: true`, so no LLM is ever called and the row lands neutral
+/// (tier=noise, importance=0); the attention/search queries filter `is_sent=0`,
+/// so an echoed message creates no attention noise. Idempotent: the store's
+/// `UNIQUE(account_id, gmail_msg_id)` upsert makes a re-ingest of the same Gmail
+/// id a no-op update, returning the existing local id.
+///
+/// ACCEPTED QUIRK: seal detection runs BEFORE the `is_sent` branch (that ordering
+/// is the security invariant), so a reply that quotes an OTP lands `sealed` — the
+/// user's own outbound copy then hides behind the reveal gate. Consistent with how
+/// backfill already treats SENT mail; not worth weakening the ordering for.
+pub fn ingest_sent(
+    store: &SqliteStore,
+    account_id: AccountId,
+    account_addr: &str,
+    gmail_msg_id: &str,
+    gmail_thread_id: Option<String>,
+    raw: Vec<u8>,
+    internal_date: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<i64> {
+    let fetched = RawFetched {
+        account_id,
+        gmail_msg_id: gmail_msg_id.to_string(),
+        gmail_thread_id,
+        raw,
+        internal_date,
+        is_sent: true,
+        account_addr: account_addr.to_string(),
+    };
+    // Both arguments are unreachable on the sent path: Stage-1 (which cfg tunes)
+    // and the contact lookup only run for non-sealed RECEIVED mail.
+    let triaged = ingest(&fetched, &Stage1Config::default(), now, |_| false);
+    store.ingest_message(&triaged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,6 +1240,59 @@ mod tests {
         assert_eq!(t.sensitivity, Sensitivity::Sealed);
         assert_eq!(t.attachments.len(), 1, "sealed mail's attachment is still extracted for storage");
         assert_eq!(t.attachments[0].filename, "statement.pdf");
+    }
+
+    #[test]
+    fn ingest_sent_commits_a_neutral_row_and_is_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Alice <alice@friends.com>\r\n\
+                   Subject: Re: Lunch?\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   yes, noon works\r\n";
+        let now = Utc::now();
+        let id = ingest_sent(
+            &store,
+            acct,
+            "me@example.com",
+            "sent-1",
+            Some("thread-77".to_string()),
+            eml.as_bytes().to_vec(),
+            Some(now),
+            now,
+        )
+        .unwrap();
+
+        // Visible in the thread, neutral, and never a source of attention noise.
+        let view = store.thread_view_with_html(acct, "thread-77").unwrap();
+        assert_eq!(view.messages.len(), 1);
+        assert!(view.messages[0].content.contains("noon works"));
+        let updates = store
+            .attention_updates(acct, now - chrono::Duration::days(1), None, None, None)
+            .unwrap();
+        assert!(updates.is_empty(), "sent mail never enters the attention bands");
+        // Recipients still seed contacts.
+        assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
+
+        // Re-ingesting the same Gmail id upserts onto the same local row.
+        let again = ingest_sent(
+            &store,
+            acct,
+            "me@example.com",
+            "sent-1",
+            Some("thread-77".to_string()),
+            eml.as_bytes().to_vec(),
+            Some(now),
+            now,
+        )
+        .unwrap();
+        assert_eq!(again, id, "idempotent on the UNIQUE(account, gmail id) upsert");
+        assert_eq!(
+            store.thread_view_with_html(acct, "thread-77").unwrap().messages.len(),
+            1
+        );
     }
 
     #[test]
