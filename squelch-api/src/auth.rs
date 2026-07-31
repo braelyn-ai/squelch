@@ -3,6 +3,9 @@
 //! state refuses to build otherwise), comparison is CONSTANT TIME so a timing
 //! side channel cannot leak it prefix-by-prefix, and a missing/bad header is a
 //! bare 401 that never echoes or logs the token.
+//!
+//! The compare and the header parse are shared with the relay in
+//! [`squelch_httpauth`] — one copy, one test suite, one place a fix lands.
 
 use axum::{
     body::Body,
@@ -11,29 +14,9 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use subtle::ConstantTimeEq;
+use squelch_httpauth::{ct_eq, parse_bearer};
 
 use crate::state::ApiState;
-
-/// Constant-time byte equality. Length is branched on first (it is not secret);
-/// `ConstantTimeEq` is only defined for equal-length slices.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
-}
-
-/// Extract a `Bearer` token from an `Authorization` header value.
-fn parse_bearer(value: &str) -> Option<&str> {
-    let rest = value.strip_prefix("Bearer ").or_else(|| {
-        // The scheme is case-insensitive.
-        let (scheme, rest) = value.split_once(' ')?;
-        scheme.eq_ignore_ascii_case("bearer").then_some(rest)
-    })?;
-    let token = rest.trim();
-    (!token.is_empty()).then_some(token)
-}
 
 /// Middleware: require a valid bearer token or return 401.
 pub async fn require_bearer(
@@ -55,25 +38,62 @@ pub async fn require_bearer(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode, header},
+        middleware,
+        routing::get,
+    };
+    use squelch_core::store::SqliteStore;
+    use tower::ServiceExt;
+
     use super::*;
 
-    #[test]
-    fn parses_bearer_variants() {
-        assert_eq!(parse_bearer("Bearer abc"), Some("abc"));
-        assert_eq!(parse_bearer("bearer abc"), Some("abc"));
-        assert_eq!(parse_bearer("BEARER abc"), Some("abc"));
-        assert_eq!(parse_bearer("Bearer  spaced "), Some("spaced"));
-        assert_eq!(parse_bearer("Basic abc"), None);
-        assert_eq!(parse_bearer("Bearer "), None);
-        assert_eq!(parse_bearer(""), None);
+    const TOKEN: &str = "test-secret-token";
+
+    /// One bare route behind the layer: this proves the WIRING (401 vs pass
+    /// through), not the compare — that is tested once in `squelch_httpauth`.
+    fn app() -> Router {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let state = ApiState::new(store, acct, TOKEN).unwrap();
+        Router::new()
+            .route("/gated", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer,
+            ))
+            .with_state(state)
     }
 
-    #[test]
-    fn ct_eq_matches_only_equal() {
-        assert!(ct_eq(b"secret", b"secret"));
-        assert!(!ct_eq(b"secret", b"secreu"));
-        assert!(!ct_eq(b"secret", b"secre"));
-        assert!(!ct_eq(b"", b"x"));
-        assert!(ct_eq(b"", b""));
+    #[tokio::test]
+    async fn gates_on_the_bearer_token() {
+        for (name, header_value) in [
+            ("no header", None),
+            ("wrong token", Some("Bearer nope")),
+            ("wrong scheme", Some("Basic test-secret-token")),
+            ("empty token", Some("Bearer ")),
+        ] {
+            let mut req = Request::builder().uri("/gated");
+            if let Some(h) = header_value {
+                req = req.header(header::AUTHORIZATION, h);
+            }
+            let resp = app()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{name}");
+        }
+
+        let req = Request::builder()
+            .uri("/gated")
+            .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

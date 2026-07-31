@@ -30,8 +30,10 @@ futures = { workspace = true }
 # `aws_lc_rs`) keeps the tree pure-Rust, matching why the workspace forces
 # rustls everywhere: no openssl/C toolchain on the headless Linux box.
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
-# Constant-time bearer comparison, exactly as squelch-api/src/auth.rs does it.
-subtle = "2"
+# Constant-time bearer compare + `Authorization` parse, shared byte-for-byte
+# with squelch-api. A leaf crate whose only dep is `subtle`: the relay must stay
+# blind, so it links this and NOT squelch-core.
+squelch-httpauth = { path = "../squelch-httpauth" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

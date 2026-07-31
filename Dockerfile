@@ -10,6 +10,7 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY squelch-core ./squelch-core
+COPY squelch-httpauth ./squelch-httpauth
 COPY squelch-mcp ./squelch-mcp
 COPY squelch-tui ./squelch-tui
 COPY squelch-api ./squelch-api

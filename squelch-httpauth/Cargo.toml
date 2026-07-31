@@ -1,0 +1,15 @@
+[package]
+name = "squelch-httpauth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_httpauth"
+path = "src/lib.rs"
+
+[dependencies]
+# The ONLY dependency, deliberately. squelch-relay links this crate and runs on
+# shared public infrastructure; it must stay blind (no store, no mail, no
+# credentials), which is why the shared compare does not live in squelch-core.
+subtle = "2"

@@ -14,6 +14,9 @@ path = "src/bin/squelch-api.rs"
 
 [dependencies]
 squelch-core = { path = "../squelch-core" }
+# Constant-time bearer compare + `Authorization` parse, shared byte-for-byte
+# with squelch-relay so a fix to either lands in one place.
+squelch-httpauth = { path = "../squelch-httpauth" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -31,8 +34,6 @@ tokio-stream = "0.1"
 # CORS is a browser courtesy, not the security boundary — bearer auth is.
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = "0.7"
-# Constant-time bearer-token comparison. Already in the workspace lock graph.
-subtle = "2"
 # Gmail write ops: HTTP client (rustls, no native-tls) mirroring the read
 # engine, base64url for send payloads, regex for the outbound secret guard.
 reqwest = { workspace = true }

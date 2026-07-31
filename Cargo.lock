@@ -3673,7 +3673,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squelch-core",
- "subtle",
+ "squelch-httpauth",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3714,6 +3714,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "squelch-httpauth"
+version = "0.1.0"
+dependencies = [
+ "subtle",
+]
+
+[[package]]
 name = "squelch-mcp"
 version = "0.1.0"
 dependencies = [
@@ -3740,7 +3747,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "subtle",
+ "squelch-httpauth",
  "thiserror 2.0.18",
  "tokio",
  "tower",
