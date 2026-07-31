@@ -80,11 +80,12 @@ enum Actions {
     }
 
     /// Reply: open the compose/review ceremony prefilled from the update.
+    /// Subject stays EMPTY — `u.one_line` is the LLM's summary, not the real
+    /// subject, and the daemon derives `Re: <parent subject>` when the send body
+    /// omits `subject` entirely. Typing one here overrides that derivation.
     static func reply(_ u: AttentionUpdate) {
-        let subject =
-            u.one_line.lowercased().hasPrefix("re:") ? u.one_line : "Re: \(u.one_line)"
         store.openCompose(
-            ComposeState(replyToMessageId: u.id, to: u.sender, subject: subject, body: ""))
+            ComposeState(replyToMessageId: u.id, to: u.sender, subject: "", body: ""))
     }
 
     /// Tune a sender: open the rule editor prefilled with *@domain.

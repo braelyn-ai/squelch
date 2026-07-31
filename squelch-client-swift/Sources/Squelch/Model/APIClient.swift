@@ -357,17 +357,18 @@ actor APIClient {
 
     /// Send. Two-phase by design: call without `overrideGuard` for the verdict
     /// (a guarded body yields a 422 with `.guardKinds`), then with it after
-    /// explicit consent.
+    /// explicit consent. A nil `subject` on a reply is omitted from the JSON, so
+    /// the daemon derives `Re: <parent subject>`; pass "" only to mean it.
     @discardableResult
     func actionSend(
         body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
-        overrideGuard: Bool = false
+        overrideGuard: Bool = false, draftId: Int? = nil
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
             body: SendBody(
                 reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body,
-                confirm: true, override_guard: overrideGuard))
+                confirm: true, override_guard: overrideGuard, draft_id: draftId))
     }
 
     // MARK: - refresh / retriage

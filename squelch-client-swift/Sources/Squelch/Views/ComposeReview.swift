@@ -86,7 +86,10 @@ struct ComposeReview: View {
                     .focused($focusedField, equals: .to)
             }
             Field(label: "subject") {
-                TextField("", text: bind(\.subject))
+                // Left blank on a reply the daemon titles from the parent; the
+                // placeholder says so, because an empty field otherwise reads as
+                // an unset required value.
+                TextField(subjectPlaceholder, text: bind(\.subject))
                     .textFieldStyle(.plain)
                     .focused($focusedField, equals: .subject)
             }
@@ -109,10 +112,24 @@ struct ComposeReview: View {
         }
     }
 
+    /// Stands in for an empty subject on a reply, in both panes: the daemon titles
+    /// it `Re: <parent subject>`, and the real parent subject is not in reach here
+    /// (the update carries an LLM summary, not the header).
+    private static let derivedSubject = "Re: (derived from thread)"
+
+    private var isReply: Bool { compose?.replyToMessageId != nil }
+
+    private var subjectPlaceholder: String {
+        isReply ? Self.derivedSubject : "subject"
+    }
+
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             reviewRow("to", compose.to.isEmpty ? "(none)" : compose.to)
-            reviewRow("subject", compose.subject.isEmpty ? "(none)" : compose.subject)
+            reviewRow(
+                "subject",
+                compose.subject.isEmpty
+                    ? (isReply ? Self.derivedSubject : "(none)") : compose.subject)
 
             ScrollView {
                 Text(compose.body)
@@ -276,8 +293,14 @@ struct ComposeReview: View {
             try await APIClient.shared.actionSend(
                 body: compose.body, replyToMessageId: compose.replyToMessageId,
                 to: compose.to.isEmpty ? nil : compose.to,
+                // nil, never "": the daemon reads Some("") as an explicit blank
+                // subject and would send the reply untitled.
                 subject: compose.subject.isEmpty ? nil : compose.subject,
                 overrideGuard: override)
+            // The daemon resolved the replied-to update; without this the row
+            // sits in its band until the next poll, reading as a no-op. No undo
+            // pairs with it — a send is the one irreversible action.
+            if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
             store.pushToast("sent", .success)
             store.closeCompose()
         } catch let apiError as APIError where apiError.kind == .guardBlocked {

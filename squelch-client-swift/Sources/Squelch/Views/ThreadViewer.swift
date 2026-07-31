@@ -137,7 +137,7 @@ struct ThreadViewer: View {
 
             Button { openSenderRule() } label: {
                 HStack(spacing: 4) {
-                    Kbd("r")
+                    Kbd("t")
                     Text("new rule").font(Typo.micro)
                 }
             }
@@ -283,12 +283,11 @@ struct ThreadViewer: View {
             KeyBinding("e", "done + next") { Task { await doneAndNext() } },
             KeyBinding("d", "done + next") { Task { await doneAndNext() } },
             KeyBinding("u", "unsubscribe") { confirmMode = .ask },
-            // `r` rather than `k`: k is this context's newer-message step. The
-            // list surfaces spell the same verb `t` (tune), which is taken here
-            // by nothing — but `t` on a row acts on the SELECTED row, and in the
-            // reader the sender is the thread's, so a distinct key keeps the two
-            // from reading as the same command with different targets.
-            KeyBinding("r", "new sender rule") { openSenderRule() },
+            // `t` = tune sender rule, same as on a list row: one verb, one key
+            // everywhere. The target differs (the thread's sender rather than the
+            // selected row's) but that is the only sender in view here. This
+            // frees `r` for reply.
+            KeyBinding("t", "new sender rule") { openSenderRule() },
         ]
     }
 

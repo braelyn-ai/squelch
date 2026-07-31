@@ -588,10 +588,14 @@ struct LabelBody: Codable, Sendable {
 struct SendBody: Codable, Sendable {
     var reply_to_message_id: Int?
     var to: String?
+    /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
+    /// only when the field is absent — `Some("")` is an explicit empty subject.
     var subject: String?
     var body: String
     var confirm: Bool
     var override_guard: Bool?
+    /// Server-side draft to delete once the send succeeds.
+    var draft_id: Int?
 }
 
 struct StatusResult: Codable, Sendable {
@@ -599,7 +603,13 @@ struct StatusResult: Codable, Sendable {
     var message_id: Int?
 }
 
-struct SendResult: Codable, Sendable { var status: String }
+struct SendResult: Codable, Sendable {
+    var status: String
+    /// The sent copy as it landed in the local store, and its thread — both null
+    /// when the send succeeded but the echo has not been ingested yet.
+    var echo_message_id: Int?
+    var thread_id: String?
+}
 struct RefreshResult: Codable, Sendable { var triggered: Bool }
 struct RetriageResult: Codable, Sendable { var reset: Int }
 struct UnsubResolutionResult: Codable, Sendable {
