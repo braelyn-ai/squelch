@@ -15,8 +15,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use squelch_core::store::{ActionMessageRef, NewAuditEntry, SitrepBand, Store};
-use squelch_core::types::{AttentionStatus, Disposition, ShredStats, Tier, TriageAxis};
+use squelch_core::CoreError;
+use squelch_core::store::{ActionMessageRef, NewAuditEntry, SitrepBand, SqliteStore, Store};
+use squelch_core::types::{
+    AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
+};
 
 use crate::error::ApiError;
 use crate::gmail_write::{
@@ -37,76 +40,20 @@ const AUDIT_ACTOR: &str = "human";
 // --- pagination cursor ------------------------------------------------------
 
 /// An opaque token round-tripping a row offset (`off:<n>`, base64url). Not
-/// security-sensitive; it is a scroll position.
+/// security-sensitive; it is a scroll position. Unpadded base64url, the same
+/// alphabet and padding discipline the Gmail write path uses.
 mod cursor {
-    use super::base64_lite::{decode, encode};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     pub fn encode_offset(offset: u32) -> String {
-        encode(format!("off:{offset}").as_bytes())
+        URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
     }
 
     pub fn decode_offset(s: &str) -> Option<u32> {
-        let bytes = decode(s)?;
+        let bytes = URL_SAFE_NO_PAD.decode(s).ok()?;
         let text = String::from_utf8(bytes).ok()?;
         text.strip_prefix("off:")?.parse().ok()
-    }
-}
-
-/// A dependency-free base64url codec, so opaque-ifying an integer offset needs
-/// no extra crate.
-mod base64_lite {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-    pub fn encode(input: &[u8]) -> String {
-        let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-        for chunk in input.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-            let n = (b0 << 16) | (b1 << 8) | b2;
-            out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-            out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-            if chunk.len() > 1 {
-                out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
-            }
-            if chunk.len() > 2 {
-                out.push(ALPHABET[(n & 63) as usize] as char);
-            }
-        }
-        out
-    }
-
-    pub fn decode(input: &str) -> Option<Vec<u8>> {
-        fn val(c: u8) -> Option<u32> {
-            match c {
-                b'A'..=b'Z' => Some((c - b'A') as u32),
-                b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-                b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-                b'-' => Some(62),
-                b'_' => Some(63),
-                _ => None,
-            }
-        }
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-        for chunk in bytes.chunks(4) {
-            if chunk.len() < 2 {
-                return None;
-            }
-            let mut n = 0u32;
-            for (i, &c) in chunk.iter().enumerate() {
-                n |= val(c)? << (18 - 6 * i);
-            }
-            out.push((n >> 16) as u8);
-            if chunk.len() > 2 {
-                out.push((n >> 8) as u8);
-            }
-            if chunk.len() > 3 {
-                out.push(n as u8);
-            }
-        }
-        Some(out)
     }
 }
 
@@ -146,6 +93,30 @@ where
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?
         .map_err(ApiError::from)
+}
+
+/// Run a store call for the ACTIVE ACCOUNT off the async runtime: the preamble
+/// every handler shares (clone the `Arc`, copy the account id, hop to a blocking
+/// thread). The account id is threaded in rather than captured, so no call site
+/// can accidentally query a different account.
+pub(crate) async fn store_call<T, F>(state: &ApiState, f: F) -> Result<T, ApiError>
+where
+    F: FnOnce(&SqliteStore, AccountId) -> Result<T, CoreError> + Send + 'static,
+    T: Send + 'static,
+{
+    let store = state.store.clone();
+    let account_id = state.account_id;
+    blocking(move || f(&store, account_id)).await
+}
+
+/// [`store_call`] for the common read shape: whatever the store returns IS the
+/// JSON response body.
+pub(crate) async fn query<T, F>(state: &ApiState, f: F) -> Result<Json<T>, ApiError>
+where
+    F: FnOnce(&SqliteStore, AccountId) -> Result<T, CoreError> + Send + 'static,
+    T: Send + 'static,
+{
+    Ok(Json(store_call(state, f).await?))
 }
 
 // --- GET /client/updates ----------------------------------------------------
@@ -193,9 +164,7 @@ pub async fn get_updates(
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
     let min_importance = q.min_importance;
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let items = blocking(move || {
+    let items = store_call(&state, move |store, account_id| {
         // attention_updates excludes sealed rows in SQL. status/band filter
         // server-side; tier and pagination apply over the ranked slice here.
         let mut all =
@@ -242,10 +211,10 @@ pub async fn set_update_status(
     let status = AttentionStatus::parse(&body.status)
         .ok_or_else(|| ApiError::bad_request("status must be one of: new, open, done"))?;
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let updated =
-        blocking(move || store.set_attention_status(account_id, message_id, status)).await?;
+    let updated = store_call(&state, move |store, account_id| {
+        store.set_attention_status(account_id, message_id, status)
+    })
+    .await?;
     if !updated {
         // Missing OR sealed => NotFound, keeping the two indistinguishable.
         return Err(ApiError::not_found());
@@ -302,10 +271,11 @@ pub async fn retriage(
     let days = body.days.unwrap_or(7).clamp(1, 90);
     let target = body.message_id.map(|id| id.to_string());
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let msg_id = body.message_id;
-    let reset = blocking(move || store.retriage_reset(account_id, msg_id, days)).await?;
+    let reset = store_call(&state, move |store, account_id| {
+        store.retriage_reset(account_id, msg_id, days)
+    })
+    .await?;
 
     audit_action(
         &state,
@@ -330,11 +300,11 @@ pub async fn triage_debug(
     State(state): State<ApiState>,
     Path(message_id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let dbg = blocking(move || store.triage_debug(account_id, message_id))
-        .await?
-        .ok_or(ApiError::not_found())?;
+    let dbg = store_call(&state, move |store, account_id| {
+        store.triage_debug(account_id, message_id)
+    })
+    .await?
+    .ok_or(ApiError::not_found())?;
     Ok(Json(dbg))
 }
 
@@ -344,12 +314,12 @@ pub async fn get_thread(
     State(state): State<ApiState>,
     Path(thread_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     // Sealed and nonexistent threads are the SAME NotFound. Each message carries
     // its server-sanitized `html`, null for plain-text-only mail.
-    let view = blocking(move || store.thread_view_with_html(account_id, &thread_id)).await?;
-    Ok(Json(view))
+    query(&state, move |store, account_id| {
+        store.thread_view_with_html(account_id, &thread_id)
+    })
+    .await
 }
 
 // --- GET /client/attachments/{id} -------------------------------------------
@@ -405,10 +375,11 @@ pub async fn get_attachment(
     State(state): State<ApiState>,
     Path(attachment_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     // `None` => unknown id OR sealed parent (indistinguishable): 404.
-    let found = blocking(move || store.attachment_bytes(account_id, attachment_id)).await?;
+    let found = store_call(&state, move |store, account_id| {
+        store.attachment_bytes(account_id, attachment_id)
+    })
+    .await?;
     let (filename, mime, data) = found.ok_or_else(ApiError::not_found)?;
     // Metadata exists but the bytes were never stored (over the ingest cap): 410.
     let bytes =
@@ -528,11 +499,9 @@ pub async fn search(
         other => other,
     };
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
     // Keyword paginates in SQL; semantic/hybrid rank a top-k window and offset
     // the fused slice. EVERY leg excludes sealed rows in SQL.
-    let items = blocking(move || match effective {
+    let items = store_call(&state, move |store, account_id| match effective {
         SearchMode::Keyword => store.search(account_id, &term, limit, offset),
         SearchMode::Semantic => {
             let k = (limit + offset) as usize;
@@ -570,12 +539,12 @@ pub async fn get_shipments(
     State(state): State<ApiState>,
     Query(q): Query<ShipmentsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     // The shipments table holds no sealed rows by construction: detection never
     // runs on sealed mail, so there is no sealed filtering to apply.
-    let items = blocking(move || store.list_shipments(account_id, q.include_delivered)).await?;
-    Ok(Json(items))
+    query(&state, move |store, account_id| {
+        store.list_shipments(account_id, q.include_delivered)
+    })
+    .await
 }
 
 // --- GET /client/receipts ---------------------------------------------------
@@ -593,12 +562,12 @@ pub async fn get_receipts(
     State(state): State<ApiState>,
     Query(q): Query<ReceiptsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let days = q.days.unwrap_or(DEFAULT_RECEIPTS_DAYS);
     // Newest-first. Structurally sealed-free, like shipments.
-    let items = blocking(move || store.list_receipts(account_id, days)).await?;
-    Ok(Json(items))
+    query(&state, move |store, account_id| {
+        store.list_receipts(account_id, days)
+    })
+    .await
 }
 
 // --- GET /client/banking -----------------------------------------------------
@@ -610,10 +579,7 @@ pub async fn get_receipts(
 pub async fn get_banking(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let items = blocking(move || store.list_banking(account_id)).await?;
-    Ok(Json(items))
+    query(&state, |store, account_id| store.list_banking(account_id)).await
 }
 
 // --- GET /client/marketing ---------------------------------------------------
@@ -637,10 +603,10 @@ pub async fn get_marketing(
     Query(q): Query<MarketingQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let days = q.days.unwrap_or(DEFAULT_MARKETING_DAYS).clamp(1, MAX_MARKETING_DAYS);
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let items = blocking(move || store.marketing_offers(account_id, days, MARKETING_LIMIT)).await?;
-    Ok(Json(items))
+    query(&state, move |store, account_id| {
+        store.marketing_offers(account_id, days, MARKETING_LIMIT)
+    })
+    .await
 }
 
 // --- GET /client/calendar ----------------------------------------------------
@@ -665,14 +631,14 @@ pub async fn get_calendar(
     State(state): State<ApiState>,
     Query(q): Query<CalendarQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let hours = q
         .hours
         .unwrap_or(DEFAULT_CALENDAR_HOURS)
         .clamp(MIN_CALENDAR_HOURS, MAX_CALENDAR_HOURS);
-    let items = blocking(move || store.list_calendar_updates(account_id, hours)).await?;
-    Ok(Json(items))
+    query(&state, move |store, account_id| {
+        store.list_calendar_updates(account_id, hours)
+    })
+    .await
 }
 
 // --- GET/POST/DELETE /client/rules ------------------------------------------
@@ -680,10 +646,10 @@ pub async fn get_calendar(
 pub async fn list_rules(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let rules = blocking(move || store.list_sender_rules(account_id)).await?;
-    Ok(Json(rules))
+    query(&state, |store, account_id| {
+        store.list_sender_rules(account_id)
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -703,10 +669,8 @@ pub async fn create_rule(
     let disposition = Disposition::parse(&body.disposition)
         .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let pattern = body.match_pattern.clone();
-    let id = blocking(move || {
+    let id = store_call(&state, move |store, account_id| {
         store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
@@ -726,10 +690,8 @@ pub async fn update_rule(
     let disposition = Disposition::parse(&body.disposition)
         .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let pattern = body.match_pattern.clone();
-    let updated = blocking(move || {
+    let updated = store_call(&state, move |store, account_id| {
         store.update_sender_rule(account_id, id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
@@ -746,9 +708,10 @@ pub async fn delete_rule(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let deleted = blocking(move || store.delete_sender_rule(account_id, id)).await?;
+    let deleted = store_call(&state, move |store, account_id| {
+        store.delete_sender_rule(account_id, id)
+    })
+    .await?;
     if deleted {
         // target is the rule id — the pattern is gone post-delete.
         audit_action(&state, "rule.delete", Some(id.to_string()), "ok").await;
@@ -774,9 +737,10 @@ struct SealedMeta {
 pub async fn list_sealed(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let sealed = blocking(move || store.sealed_messages(account_id)).await?;
+    let sealed = store_call(&state, |store, account_id| {
+        store.sealed_messages(account_id)
+    })
+    .await?;
     let items: Vec<SealedMeta> = sealed
         .into_iter()
         .map(|m| SealedMeta {
@@ -813,10 +777,7 @@ pub async fn reveal_sealed(
     State(state): State<ApiState>,
     Path(message_id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-
-    let sealed = blocking(move || {
+    let sealed = store_call(&state, move |store, account_id| {
         // Audit BEFORE returning the body, recording only the message id so the
         // log itself never leaks a secret.
         store.append_audit(
@@ -865,10 +826,10 @@ pub async fn get_audit(
     Query(q): Query<AuditQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let rows = blocking(move || store.list_audit(account_id, limit)).await?;
-    Ok(Json(rows))
+    query(&state, move |store, account_id| {
+        store.list_audit(account_id, limit)
+    })
+    .await
 }
 
 // --- GET /client/stats -------------------------------------------------------
@@ -876,11 +837,9 @@ pub async fn get_audit(
 pub async fn get_stats(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     // UTC day key for today's Stage-2 usage row.
     let day = Utc::now().format("%Y-%m-%d").to_string();
-    let (stats, usage) = blocking(move || {
+    let (stats, usage) = store_call(&state, move |store, account_id| {
         let stats = store.stats(account_id)?;
         let usage = store.stage2_usage_today(account_id, &day)?;
         Ok((stats, usage))
@@ -942,9 +901,7 @@ pub async fn get_usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let days = q.days.unwrap_or(DEFAULT_USAGE_DAYS).clamp(1, MAX_USAGE_DAYS);
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let (s2_rows, s1_rows) = blocking(move || {
+    let (s2_rows, s1_rows) = store_call(&state, move |store, account_id| {
         let s2 = store.list_usage(account_id, days)?;
         let s1 = store.list_usage_stage1(account_id, days)?;
         Ok((s2, s1))
@@ -1042,13 +999,11 @@ fn cap_source_str(
 /// trailing-14d averages, prices. Shared by GET and POST, which returns this
 /// fresh shape after persisting.
 async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let now = Utc::now();
     let since = now - chrono::Duration::days(TRIAGE_CONFIG_TRAILING_DAYS);
     let since_day = since.format("%Y-%m-%d").to_string();
 
-    let (overrides, inbound, usage, s1_usage) = blocking(move || {
+    let (overrides, inbound, usage, s1_usage) = store_call(state, move |store, account_id| {
         let overrides = store.stage2_cap_overrides(account_id)?;
         let inbound = store.count_inbound_since(account_id, since)?;
         let usage = store.stage2_usage_since(account_id, &since_day)?;
@@ -1177,10 +1132,8 @@ pub async fn set_triage_config(
     }
 
     if !updates.is_empty() {
-        let store = state.store.clone();
-        let account_id = state.account_id;
         let to_write = updates.clone();
-        blocking(move || {
+        store_call(&state, move |store, account_id| {
             for (key, value) in &to_write {
                 store.set_app_setting(account_id, key, &value.to_string())?;
             }
@@ -1233,24 +1186,23 @@ pub(crate) async fn audit_action(
     target: Option<String>,
     outcome: &str,
 ) {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let entry = NewAuditEntry {
         actor: ACTION_ACTOR.to_string(),
         action: action.to_string(),
         target,
         detail: Some(outcome.to_string()),
     };
-    let _ = tokio::task::spawn_blocking(move || store.append_audit(account_id, &entry)).await;
+    let _ = store_call(state, move |store, account_id| {
+        store.append_audit(account_id, &entry)
+    })
+    .await;
 }
 
 /// RESOLUTION: mark a triage row `done` after a successful action. Best-effort,
 /// so bookkeeping cannot mask the action's success; sealed rows are guarded in
 /// the store, so this can never touch sealed mail.
 async fn resolve_done(state: &ApiState, message_id: i64) {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = store_call(state, move |store, account_id| {
         store.set_attention_status(account_id, message_id, AttentionStatus::Done)
     })
     .await;
@@ -1291,12 +1243,83 @@ async fn resolve_target(
     state: &ApiState,
     message_id: i64,
 ) -> Result<ActionMessageRef, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    tokio::task::spawn_blocking(move || store.action_message_ref(account_id, message_id))
-        .await
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?
-        .map_err(ApiError::from)
+    store_call(state, move |store, account_id| {
+        store.action_message_ref(account_id, message_id)
+    })
+    .await
+}
+
+/// Whether a successful action resolves the target's attention row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnSuccess {
+    /// RESOLUTION: mark the target row done — the action handled the message.
+    ResolveDone,
+    /// Leave the attention row where it is (labeling is not handling).
+    LeaveOpen,
+}
+
+/// The ladder every message-scoped action walks: confirm gate -> the caller's own
+/// rejection -> write client -> non-sealed target -> the Gmail call.
+///
+/// AUDIT STRINGS ARE A CONTRACT. Every exit appends a row under `action` with the
+/// detail clients assert on — "rejected:confirm", the caller's `reject` detail,
+/// "rejected:no_write_credential", "failed:target", "failed:gmail", "ok" — in that
+/// order, so no action can quietly stop auditing an early return. `reject` is the
+/// action's own pre-flight failure as (audit detail, response error), checked
+/// immediately after the confirm gate.
+async fn guarded_action<F, Fut>(
+    state: &ApiState,
+    action: &'static str,
+    message_id: i64,
+    confirm: bool,
+    reject: Option<(&'static str, ApiError)>,
+    on_success: OnSuccess,
+    call: F,
+) -> Result<(), ApiError>
+where
+    F: FnOnce(GmailWriteClient, ActionMessageRef) -> Fut,
+    Fut: std::future::Future<Output = Result<(), WriteError>>,
+{
+    let target = Some(message_id.to_string());
+
+    if !confirm {
+        audit_action(state, action, target, "rejected:confirm").await;
+        return Err(ApiError::bad_request(CONFIRM_HINT));
+    }
+    if let Some((detail, err)) = reject {
+        audit_action(state, action, target, detail).await;
+        return Err(err);
+    }
+
+    let client = match write_client(state) {
+        Ok(c) => c,
+        Err(e) => {
+            audit_action(state, action, target, "rejected:no_write_credential").await;
+            return Err(e);
+        }
+    };
+
+    let msg = match resolve_target(state, message_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            audit_action(state, action, target, "failed:target").await;
+            return Err(e);
+        }
+    };
+
+    match call(client, msg).await {
+        Ok(()) => {
+            if on_success == OnSuccess::ResolveDone {
+                resolve_done(state, message_id).await;
+            }
+            audit_action(state, action, target, "ok").await;
+            Ok(())
+        }
+        Err(e) => {
+            audit_action(state, action, target, "failed:gmail").await;
+            Err(write_error(&e))
+        }
+    }
 }
 
 // --- POST /client/actions/archive -------------------------------------------
@@ -1312,41 +1335,18 @@ pub async fn action_archive(
     State(state): State<ApiState>,
     Json(body): Json<ArchiveBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let target = Some(body.message_id.to_string());
-
-    if !body.confirm {
-        audit_action(&state, "archive", target, "rejected:confirm").await;
-        return Err(ApiError::bad_request(CONFIRM_HINT));
-    }
-
-    let client = match write_client(&state) {
-        Ok(c) => c,
-        Err(e) => {
-            audit_action(&state, "archive", target, "rejected:no_write_credential").await;
-            return Err(e);
-        }
-    };
-
-    let msg = match resolve_target(&state, body.message_id).await {
-        Ok(m) => m,
-        Err(e) => {
-            audit_action(&state, "archive", target, "failed:target").await;
-            return Err(e);
-        }
-    };
-
-    match client.archive(&msg.gmail_msg_id).await {
-        Ok(()) => {
-            // RESOLUTION: a successful archive auto-resolves the target row.
-            resolve_done(&state, body.message_id).await;
-            audit_action(&state, "archive", target, "ok").await;
-            Ok(Json(json!({ "status": "archived", "message_id": body.message_id })))
-        }
-        Err(e) => {
-            audit_action(&state, "archive", target, "failed:gmail").await;
-            Err(write_error(&e))
-        }
-    }
+    guarded_action(
+        &state,
+        "archive",
+        body.message_id,
+        body.confirm,
+        None,
+        // A successful archive auto-resolves the target row.
+        OnSuccess::ResolveDone,
+        |client, msg| async move { client.archive(&msg.gmail_msg_id).await },
+    )
+    .await?;
+    Ok(Json(json!({ "status": "archived", "message_id": body.message_id })))
 }
 
 // --- POST /client/actions/label ---------------------------------------------
@@ -1366,43 +1366,29 @@ pub async fn action_label(
     State(state): State<ApiState>,
     Json(body): Json<LabelBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let target = Some(body.message_id.to_string());
+    let message_id = body.message_id;
+    // Checked after the confirm gate, exactly where the hand-written ladder had it.
+    let empty = (body.add.is_empty() && body.remove.is_empty()).then(|| {
+        (
+            "rejected:empty",
+            ApiError::bad_request("label requires a non-empty add or remove list"),
+        )
+    });
 
-    if !body.confirm {
-        audit_action(&state, "label", target, "rejected:confirm").await;
-        return Err(ApiError::bad_request(CONFIRM_HINT));
-    }
-    if body.add.is_empty() && body.remove.is_empty() {
-        audit_action(&state, "label", target, "rejected:empty").await;
-        return Err(ApiError::bad_request("label requires a non-empty add or remove list"));
-    }
-
-    let client = match write_client(&state) {
-        Ok(c) => c,
-        Err(e) => {
-            audit_action(&state, "label", target, "rejected:no_write_credential").await;
-            return Err(e);
-        }
-    };
-
-    let msg = match resolve_target(&state, body.message_id).await {
-        Ok(m) => m,
-        Err(e) => {
-            audit_action(&state, "label", target, "failed:target").await;
-            return Err(e);
-        }
-    };
-
-    match client.modify(&msg.gmail_msg_id, &body.add, &body.remove).await {
-        Ok(()) => {
-            audit_action(&state, "label", target, "ok").await;
-            Ok(Json(json!({ "status": "labeled", "message_id": body.message_id })))
-        }
-        Err(e) => {
-            audit_action(&state, "label", target, "failed:gmail").await;
-            Err(write_error(&e))
-        }
-    }
+    guarded_action(
+        &state,
+        "label",
+        message_id,
+        body.confirm,
+        empty,
+        // Labeling a message is not handling it; the attention row stands.
+        OnSuccess::LeaveOpen,
+        |client, msg| async move {
+            client.modify(&msg.gmail_msg_id, &body.add, &body.remove).await
+        },
+    )
+    .await?;
+    Ok(Json(json!({ "status": "labeled", "message_id": message_id })))
 }
 
 // --- POST /client/actions/send ----------------------------------------------
@@ -1568,10 +1554,8 @@ async fn record_unsub(
     method: &'static str,
     source_message_id: i64,
 ) -> Result<(), ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let sender = sender.to_string();
-    blocking(move || {
+    store_call(state, move |store, account_id| {
         store.upsert_unsubscribe(account_id, &sender, method, Some(source_message_id), Utc::now())
     })
     .await
@@ -1590,11 +1574,11 @@ pub async fn unsubscribe(
     let target = Some(message_id.to_string());
 
     // `None` => missing OR sealed, indistinguishable, both 404.
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let fields = blocking(move || store.message_unsub_fields(account_id, message_id))
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let fields = store_call(&state, move |store, account_id| {
+        store.message_unsub_fields(account_id, message_id)
+    })
+    .await?
+    .ok_or_else(ApiError::not_found)?;
 
     let sender = fields.from_addr.trim().to_ascii_lowercase();
     let plan = crate::unsubscribe::classify_unsubscribe(fields.list_unsubscribe.as_deref());
@@ -1668,12 +1652,10 @@ pub async fn post_triage_feedback(
         return Err(ApiError::bad_request("note is too long"));
     }
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let message_id = body.message_id;
     let to = to_value.clone();
     let n = note.clone();
-    let recorded = blocking(move || {
+    let recorded = store_call(&state, move |store, account_id| {
         store.correct_triage(account_id, message_id, axis, &to, n.as_deref(), Utc::now())
     })
     .await?
@@ -1709,10 +1691,10 @@ pub async fn get_triage_feedback(
         .limit
         .unwrap_or(FEEDBACK_DEFAULT_LIMIT)
         .clamp(1, FEEDBACK_MAX_LIMIT);
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let items = blocking(move || store.list_triage_feedback(account_id, limit)).await?;
-    Ok(Json(items))
+    query(&state, move |store, account_id| {
+        store.list_triage_feedback(account_id, limit)
+    })
+    .await
 }
 
 // --- AUTH-MAIL SHREDDER (retention) -----------------------------------------
@@ -1754,9 +1736,7 @@ fn parse_shred_policy(enabled: Option<String>, days: Option<String>) -> (bool, i
 
 /// Read the account's retention policy off the store.
 async fn shred_policy(state: &ApiState) -> Result<(bool, i64), ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    blocking(move || {
+    store_call(state, |store, account_id| {
         let enabled = store.get_app_setting(account_id, SHRED_ENABLED_KEY)?;
         let days = store.get_app_setting(account_id, SHRED_AFTER_DAYS_KEY)?;
         Ok(parse_shred_policy(enabled, days))
@@ -1766,13 +1746,11 @@ async fn shred_policy(state: &ApiState) -> Result<(bool, i64), ApiError> {
 
 /// Assemble the Auth page's shredder panel state.
 async fn shred_stats(state: &ApiState) -> Result<ShredStats, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let now = Utc::now();
     let recent_since = now - chrono::Duration::days(SHRED_RECENT_DAYS);
 
     let (enabled, after_days, pending, shredded_recent, shredded_total, last_shredded_at) =
-        blocking(move || {
+        store_call(state, move |store, account_id| {
             let enabled = store.get_app_setting(account_id, SHRED_ENABLED_KEY)?;
             let days = store.get_app_setting(account_id, SHRED_AFTER_DAYS_KEY)?;
             let (enabled, after_days) = parse_shred_policy(enabled, days);
@@ -1810,10 +1788,10 @@ pub async fn run_shred_pass(state: &ApiState) -> Result<u32, ApiError> {
     };
 
     let cutoff = Utc::now() - chrono::Duration::days(after_days);
-    let store = state.store.clone();
-    let account_id = state.account_id;
-    let candidates = blocking(move || store.shred_candidates(account_id, cutoff, SHRED_BATCH))
-        .await?;
+    let candidates = store_call(state, move |store, account_id| {
+        store.shred_candidates(account_id, cutoff, SHRED_BATCH)
+    })
+    .await?;
 
     let mut shredded = 0u32;
     for candidate in candidates {
@@ -1829,10 +1807,11 @@ pub async fn run_shred_pass(state: &ApiState) -> Result<u32, ApiError> {
             continue;
         }
         // Ledger AFTER Gmail confirms, so the count can never overstate.
-        let store = state.store.clone();
         let c = candidate.clone();
-        let recorded =
-            blocking(move || store.record_shred(account_id, &c, Utc::now())).await;
+        let recorded = store_call(state, move |store, account_id| {
+            store.record_shred(account_id, &c, Utc::now())
+        })
+        .await;
         if recorded.is_err() {
             // The mail IS trashed and only the bookkeeping failed: say so in the
             // audit trail rather than silently under-counting.
@@ -1879,16 +1858,18 @@ pub async fn set_shredder(
                 "after_days must be between {SHRED_MIN_DAYS} and {SHRED_MAX_DAYS}"
             )));
         }
-        let store = state.store.clone();
-        let account_id = state.account_id;
         let v = days.to_string();
-        blocking(move || store.set_app_setting(account_id, SHRED_AFTER_DAYS_KEY, &v)).await?;
+        store_call(&state, move |store, account_id| {
+            store.set_app_setting(account_id, SHRED_AFTER_DAYS_KEY, &v)
+        })
+        .await?;
     }
     if let Some(enabled) = body.enabled {
-        let store = state.store.clone();
-        let account_id = state.account_id;
         let v = if enabled { "1" } else { "0" }.to_string();
-        blocking(move || store.set_app_setting(account_id, SHRED_ENABLED_KEY, &v)).await?;
+        store_call(&state, move |store, account_id| {
+            store.set_app_setting(account_id, SHRED_ENABLED_KEY, &v)
+        })
+        .await?;
         // Turning automatic deletion on or off is a policy change worth a row.
         audit_action(
             &state,
@@ -1913,11 +1894,11 @@ pub async fn run_shredder(State(state): State<ApiState>) -> Result<impl IntoResp
 pub async fn list_unsubscribes(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let store = state.store.clone();
-    let account_id = state.account_id;
     // Newest requested_at first.
-    let items = blocking(move || store.list_unsubscribes(account_id)).await?;
-    Ok(Json(items))
+    query(&state, |store, account_id| {
+        store.list_unsubscribes(account_id)
+    })
+    .await
 }
 
 // --- POST /client/unsubscribes/resolution -----------------------------------
@@ -1945,11 +1926,12 @@ pub async fn unsubscribe_resolution(
         return Err(ApiError::bad_request("sender must not be empty"));
     }
 
-    let store = state.store.clone();
-    let account_id = state.account_id;
     let s = sender.clone();
     let r = resolution.clone();
-    let updated = blocking(move || store.set_unsubscribe_resolution(account_id, &s, &r)).await?;
+    let updated = store_call(&state, move |store, account_id| {
+        store.set_unsubscribe_resolution(account_id, &s, &r)
+    })
+    .await?;
     if !updated {
         return Err(ApiError::not_found());
     }
@@ -2016,6 +1998,31 @@ mod shred_policy_tests {
                 !parse_shred_policy(Some(raw.into()), Some("30".into())).0,
                 "{raw:?} must not read as enabled"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn offset_tokens_are_unpadded_base64url() {
+        // Frozen shape: unpadded base64url of `off:<n>`. Changing the codec
+        // would invalidate every cursor a client is holding.
+        assert_eq!(cursor::encode_offset(50), "b2ZmOjUw");
+        assert_eq!(cursor::encode_offset(2), "b2ZmOjI");
+        for off in [0u32, 1, 2, 50, 500, 12345, u32::MAX] {
+            assert_eq!(cursor::decode_offset(&cursor::encode_offset(off)), Some(off));
+        }
+    }
+
+    #[test]
+    fn malformed_tokens_decode_to_none() {
+        // Bad alphabet, padding (we emit none), a dangling 1-char chunk, and
+        // valid base64 that is not an offset token.
+        for bad in ["@@notbase64@@", "b2ZmOjIy=", "b2ZmOjIyM", "", "b", "aGk"] {
+            assert_eq!(cursor::decode_offset(bad), None, "{bad:?}");
         }
     }
 }

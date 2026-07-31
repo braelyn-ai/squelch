@@ -5,18 +5,15 @@
 //! from a read path. Tokens, auth headers and bodies are NEVER logged.
 
 use base64::Engine as _;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use squelch_core::credentials::CredentialStore;
 use squelch_core::store::ActionMessageRef;
+// The Gmail endpoint, the INBOX label and the Gmail-API response shapes are
+// defined once in core sync; the write path reuses them rather than re-deriving
+// its own copy. Archiving == removing `LABEL_INBOX`.
+use squelch_core::sync::{GMAIL_API_BASE, GmailMessage, LABEL_INBOX};
 use squelch_core::types::AccountId;
-
-/// Gmail REST base for the authenticated user.
-const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
-
-/// The Gmail system label for the inbox. Archiving == removing this label.
-pub const LABEL_INBOX: &str = "INBOX";
 
 /// An error from a write operation: deliberately coarse and free of any
 /// token/body content.
@@ -168,25 +165,6 @@ pub struct ParentHeaders {
     pub references: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageMetadata {
-    #[serde(default)]
-    payload: Option<MetaPayload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MetaPayload {
-    #[serde(default)]
-    headers: Vec<MetaHeader>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MetaHeader {
-    name: String,
-    value: String,
-}
-
 /// Executes Gmail write ops with a WRITE-bound credential store. The token is
 /// fetched per call and never retained.
 pub struct GmailWriteClient {
@@ -307,7 +285,7 @@ impl GmailWriteClient {
                 message: "request rejected".into(),
             });
         }
-        let meta: MessageMetadata = resp
+        let meta: GmailMessage = resp
             .json()
             .await
             .map_err(|e| WriteError::Transport(format!("gmail json decode: {e}")))?;

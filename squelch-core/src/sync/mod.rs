@@ -27,11 +27,14 @@ use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
 use crate::types::{AccountId, SenderRule, Sensitivity};
 
-/// Gmail REST base for the authenticated user. Fixed; not user-tunable.
-const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+/// Gmail REST base for the authenticated user. Fixed; not user-tunable. `pub`
+/// so squelch-api's write path targets the same host from one definition.
+pub const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 
-/// The INBOX and SENT label ids (Gmail system labels).
-const LABEL_INBOX: &str = "INBOX";
+/// The INBOX system label. `pub` because the write path archives by removing
+/// exactly this label.
+pub const LABEL_INBOX: &str = "INBOX";
+/// The SENT system label.
 const LABEL_SENT: &str = "SENT";
 
 /// The single `sync_state` row key for the REST engine's historyId cursor.
@@ -144,6 +147,9 @@ pub fn advance_history_cursor(current: u64, observed: impl IntoIterator<Item = u
 }
 
 // ---- Gmail REST response shapes (only the fields we consume) ---------------
+// These model the GMAIL API's own JSON, never squelch's client-facing wire
+// contracts. squelch-api's write path deserializes the same Gmail resources, so
+// the shared ones are `pub` here and defined exactly once.
 
 #[derive(Debug, Deserialize)]
 struct MessageRef {
@@ -159,27 +165,41 @@ struct ListMessagesResp {
     next_page_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// A Gmail `users.messages.get` resource, across every format squelch asks for:
+/// `format=raw` fills `raw`, `format=metadata` fills `payload.headers`, and a
+/// field the requested format omits simply stays `None`/empty.
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawMessage {
+pub struct GmailMessage {
     #[serde(default)]
-    id: String,
+    pub id: String,
     #[serde(default)]
-    thread_id: Option<String>,
+    pub thread_id: Option<String>,
     /// base64url of the full RFC822 message (present with `format=raw`).
     #[serde(default)]
-    raw: Option<String>,
+    pub raw: Option<String>,
     /// Milliseconds since epoch as a decimal string (Gmail's `internalDate`).
     #[serde(default)]
-    internal_date: Option<String>,
+    pub internal_date: Option<String>,
+    /// MIME structure (present with `format=metadata`/`full`); squelch reads
+    /// only its headers.
+    #[serde(default)]
+    pub payload: Option<MessagePayload>,
 }
 
-/// A single Gmail metadata header. Test-only: the contacts-seeding tests build
-/// these to exercise header parsing via [`synthesize_rfc822_headers`].
-#[cfg(test)]
-struct MessageHeader {
-    name: String,
-    value: String,
+/// The `payload` object of a Gmail message; only `headers` is consumed.
+#[derive(Debug, Default, Deserialize)]
+pub struct MessagePayload {
+    #[serde(default)]
+    pub headers: Vec<MessageHeader>,
+}
+
+/// A single Gmail `payload.headers[]` entry. Also what the contacts-seeding
+/// tests build to exercise header parsing via `synthesize_rfc822_headers`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageHeader {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,7 +616,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         for id in ids {
             let url = format!("{GMAIL_API_BASE}/messages/{id}?format=raw");
-            let msg: RawMessage = self.get_json(&url).await?;
+            let msg: GmailMessage = self.get_json(&url).await?;
             let raw_b64 = match &msg.raw {
                 Some(r) => r,
                 None => continue, // nothing to ingest
