@@ -52,6 +52,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/client/rules", post(handlers::create_rule))
         .route("/client/rules/{id}", put(handlers::update_rule))
         .route("/client/rules/{id}", delete(handlers::delete_rule))
+        // Local drafts: served EXCLUSIVELY here. Unsent compositions stay on
+        // this machine — the agent door has no drafts route and never learns the
+        // table exists. PUT is keyed (one draft per reply target, one for new
+        // mail), so it edits in place instead of piling up rows.
+        .route(
+            "/client/drafts",
+            get(handlers::list_drafts).put(handlers::put_draft),
+        )
+        .route("/client/drafts/{id}", delete(handlers::delete_draft))
         .route("/client/sealed", get(handlers::list_sealed))
         .route(
             "/client/sealed/{message_id}/reveal",

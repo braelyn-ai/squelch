@@ -2257,3 +2257,313 @@ async fn triage_feedback_round_trip_records_and_audits() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// --- local drafts: human-door CRUD + send cleanup ---------------------------
+
+/// Seed one ordinary (non-sealed) message and return its local id.
+fn seed_draft_parent(store: &SqliteStore, acct: i64) -> i64 {
+    let m = store
+        .upsert_message(&msg(acct, "gmail-parent", "t-draft", "Lunch?", "want lunch?"))
+        .unwrap();
+    store
+        .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+        .unwrap();
+    m
+}
+
+/// PUT one draft and hand back its wire view.
+async fn put_draft(app: &axum::Router, body: Value) -> Value {
+    let resp = app.clone().oneshot(authed_json("PUT", "/client/drafts", body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// The current draft list as a JSON array.
+async fn list_drafts(app: &axum::Router) -> Value {
+    let resp = app.clone().oneshot(authed("GET", "/client/drafts")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn put_draft_creates_then_edits_the_same_key_in_place() {
+    let mut parent = 0;
+    let Harness { app, .. } = harness(|store, acct| parent = seed_draft_parent(store, acct));
+
+    let first = put_draft(
+        &app,
+        serde_json::json!({
+            "reply_to_message_id": parent,
+            "to": "alice@example.com",
+            "subject": "Re: Lunch?",
+            "body": "sure"
+        }),
+    )
+    .await;
+    assert_eq!(first["reply_to_message_id"], parent);
+    assert_eq!(first["to"], "alice@example.com");
+    assert_eq!(first["body"], "sure");
+
+    // Same key => the same composition, edited: one row, same id.
+    let second = put_draft(
+        &app,
+        serde_json::json!({
+            "reply_to_message_id": parent,
+            "to": "alice@example.com",
+            "subject": "Re: Lunch?",
+            "body": "sure, 1pm"
+        }),
+    )
+    .await;
+    assert_eq!(second["id"], first["id"], "an edit must not mint a new draft");
+    assert_eq!(second["body"], "sure, 1pm");
+    assert_eq!(second["created_at"], first["created_at"], "created_at survives an edit");
+
+    let all = list_drafts(&app).await;
+    assert_eq!(all.as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn put_draft_defaults_missing_text_fields_and_keys_new_mail_on_null() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let draft = put_draft(&app, serde_json::json!({ "to": "bob@example.com" })).await;
+    assert!(draft["reply_to_message_id"].is_null(), "no parent => the new-message slot");
+    assert_eq!(draft["subject"], "", "a missing text field stores empty, not 400");
+    assert_eq!(draft["body"], "");
+}
+
+#[tokio::test]
+async fn put_draft_on_sealed_or_unknown_parent_is_404_and_stores_nothing() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let s = store
+            .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
+            .unwrap();
+        store
+            .set_triage(
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+    let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
+
+    // Sealed and unknown parents are the SAME 404: a draft can never be keyed to
+    // sealed mail, and the endpoint is no existence oracle.
+    for parent in [sealed_id, 999_999] {
+        let resp = app
+            .clone()
+            .oneshot(authed_json(
+                "PUT",
+                "/client/drafts",
+                serde_json::json!({ "reply_to_message_id": parent, "body": "hi" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "parent {parent} must 404");
+    }
+    assert!(store.list_drafts(acct).unwrap().is_empty(), "a 404 stores no draft");
+    assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn drafts_list_carries_the_to_field_name_on_the_wire() {
+    let Harness { app, .. } = harness(|_, _| {});
+    put_draft(
+        &app,
+        serde_json::json!({ "to": "bob@example.com", "subject": "Hello", "body": "hi" }),
+    )
+    .await;
+
+    let all = list_drafts(&app).await;
+    assert_eq!(all.as_array().map(Vec::len), Some(1));
+    assert_eq!(all[0]["to"], "bob@example.com", "the column is to_addr; the wire says `to`");
+    assert!(all[0].get("to_addr").is_none(), "no store column name leaks");
+    assert!(all[0].get("account_id").is_none(), "no account id on the wire");
+    assert_eq!(all[0]["subject"], "Hello");
+    assert_eq!(all[0]["body"], "hi");
+    // RFC3339 timestamps, same as every other wire view.
+    assert!(all[0]["created_at"].as_str().unwrap().contains('T'));
+    assert!(all[0]["updated_at"].as_str().unwrap().contains('T'));
+}
+
+#[tokio::test]
+async fn delete_draft_then_deleting_it_again_is_404() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let draft = put_draft(&app, serde_json::json!({ "to": "bob@example.com", "body": "hi" })).await;
+    let id = draft["id"].as_i64().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed("DELETE", &format!("/client/drafts/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "deleted");
+    assert_eq!(json["id"], id);
+    assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(0));
+
+    let resp = app
+        .oneshot(authed("DELETE", &format!("/client/drafts/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a second delete has nothing to remove");
+}
+
+#[tokio::test]
+async fn draft_crud_writes_no_audit_rows() {
+    // The audit log is the ledger of reveals and Gmail writes. A draft never
+    // leaves the machine, so it must leave no trace there.
+    let Harness { app, store, acct } = harness(|_, _| {});
+    let draft = put_draft(&app, serde_json::json!({ "to": "bob@example.com", "body": "hi" })).await;
+    let id = draft["id"].as_i64().unwrap();
+    put_draft(&app, serde_json::json!({ "to": "bob@example.com", "body": "hi again" })).await;
+    let _ = list_drafts(&app).await;
+    app.oneshot(authed("DELETE", &format!("/client/drafts/{id}")))
+        .await
+        .unwrap();
+
+    assert!(store.list_audit(acct, 10).unwrap().is_empty(), "draft CRUD is not audited");
+}
+
+#[tokio::test]
+async fn successful_send_discards_the_draft_it_consumed() {
+    // Cold send: one Gmail call (no parent headers to fetch).
+    let (base, handle) = mock_gmail(1).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "subject": "Hi", "body": "see you Tuesday" }),
+    )
+    .await;
+    let draft_id = draft["id"].as_i64().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true,
+                "draft_id": draft_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].contains("/messages/send"));
+
+    assert_eq!(
+        list_drafts(&app).await.as_array().map(Vec::len),
+        Some(0),
+        "the send consumed the draft"
+    );
+    // The send itself is still audited; the draft cleanup is not.
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "send");
+    assert_eq!(audit[0].detail.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn send_with_an_unknown_draft_id_still_succeeds() {
+    // A stale draft id is bookkeeping, not a send failure.
+    let (base, handle) = mock_gmail(1).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see you Tuesday",
+                "confirm": true,
+                "draft_id": 4242
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(handle.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn guard_blocked_send_leaves_the_draft_intact() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let draft = put_draft(
+        &app,
+        serde_json::json!({
+            "to": "alice@example.com",
+            "body": "your verification code is 483920"
+        }),
+    )
+    .await;
+    let draft_id = draft["id"].as_i64().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "your verification code is 483920",
+                "confirm": true,
+                "draft_id": draft_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A blocked send is recoverable: the composition is exactly where it was.
+    let all = list_drafts(&app).await;
+    assert_eq!(all.as_array().map(Vec::len), Some(1));
+    assert_eq!(all[0]["id"], draft_id);
+    assert_eq!(all[0]["body"], "your verification code is 483920");
+}
+
+#[tokio::test]
+async fn draft_routes_require_bearer_auth() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let unauthed = [
+        Request::builder()
+            .uri("/client/drafts")
+            .body(Body::empty())
+            .unwrap(),
+        common::json_request(
+            "PUT",
+            "/client/drafts",
+            &serde_json::json!({ "to": "a@example.com" }),
+            false,
+        ),
+        Request::builder()
+            .method("DELETE")
+            .uri("/client/drafts/1")
+            .body(Body::empty())
+            .unwrap(),
+    ];
+    for req in unauthed {
+        let uri = req.uri().clone();
+        let method = req.method().clone();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must be behind auth"
+        );
+    }
+}

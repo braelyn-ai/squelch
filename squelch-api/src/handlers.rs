@@ -16,7 +16,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squelch_core::CoreError;
-use squelch_core::store::{ActionMessageRef, NewAuditEntry, SitrepBand, SqliteStore, Store};
+use squelch_core::store::{
+    ActionMessageRef, Draft, NewAuditEntry, SitrepBand, SqliteStore, Store,
+};
 use squelch_core::types::{
     AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
 };
@@ -721,6 +723,104 @@ pub async fn delete_rule(
     }
 }
 
+// --- GET/PUT/DELETE /client/drafts ------------------------------------------
+//
+// Drafts are LOCAL and human-door only: nothing here is synced to Gmail Drafts
+// and no draft ever leaves the machine. Hence NO AUDIT ROWS anywhere in this
+// section — the audit log is the ledger of reveals and Gmail writes, and a
+// composition that never left is neither.
+
+/// One draft on the wire. `to_addr` is spelled `to` here: the field name the
+/// composer sends and the send endpoint uses.
+#[derive(Debug, Serialize)]
+struct DraftView {
+    id: i64,
+    reply_to_message_id: Option<i64>,
+    to: String,
+    subject: String,
+    body: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<Draft> for DraftView {
+    fn from(d: Draft) -> Self {
+        Self {
+            id: d.id,
+            reply_to_message_id: d.reply_to_message_id,
+            to: d.to_addr,
+            subject: d.subject,
+            body: d.body,
+            created_at: d.created_at,
+            updated_at: d.updated_at,
+        }
+    }
+}
+
+pub async fn list_drafts(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let drafts = store_call(&state, |store, account_id| store.list_drafts(account_id)).await?;
+    let items: Vec<DraftView> = drafts.into_iter().map(DraftView::from).collect();
+    Ok(Json(items))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DraftBody {
+    /// The message being replied to; absent or null addresses the account's
+    /// single new-message draft.
+    #[serde(default)]
+    reply_to_message_id: Option<i64>,
+    /// Every text field is optional — a half-composed draft is the normal case,
+    /// so a missing (or null) field stores "" rather than 400ing.
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// `PUT /client/drafts` — save the draft for one key (reply target, or the
+/// new-message slot). Idempotent by key: a second PUT edits the same row.
+pub async fn put_draft(
+    State(state): State<ApiState>,
+    Json(body): Json<DraftBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    // A draft can never be keyed to sealed mail: the parent is resolved through
+    // the same lookup `send` uses, where sealed and unknown are one 404.
+    if let Some(parent) = body.reply_to_message_id {
+        resolve_target(&state, parent).await?;
+    }
+    let reply_to = body.reply_to_message_id;
+    let to = body.to.unwrap_or_default();
+    let subject = body.subject.unwrap_or_default();
+    let text = body.body.unwrap_or_default();
+
+    let draft = store_call(&state, move |store, account_id| {
+        store.upsert_draft(account_id, reply_to, &to, &subject, &text, Utc::now())
+    })
+    .await?;
+    Ok(Json(DraftView::from(draft)))
+}
+
+/// `DELETE /client/drafts/{id}` — discard one draft. Another account's id and an
+/// unknown id are the same 404.
+pub async fn delete_draft(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let deleted = store_call(&state, move |store, account_id| {
+        store.delete_draft(account_id, id)
+    })
+    .await?;
+    if deleted {
+        Ok(Json(json!({ "status": "deleted", "id": id })))
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
 // --- GET /client/sealed ------------------------------------------------------
 
 /// Sealed METADATA only. No bodies here, ever.
@@ -1410,6 +1510,25 @@ pub struct SendBody {
     /// Override the outbound secret guard (still audited).
     #[serde(default)]
     override_guard: bool,
+    /// The local draft this send consumes, discarded once the mail is away. Only
+    /// a successful send clears it — every rejection leaves the composition
+    /// recoverable.
+    #[serde(default)]
+    draft_id: Option<i64>,
+}
+
+/// Discard the draft a successful send consumed. Best-effort and IDS ONLY in the
+/// log line: the mail has already left, so a failed cleanup must not surface as
+/// a send failure. A `false` result is a stale id, not an error.
+async fn discard_sent_draft(state: &ApiState, draft_id: i64) {
+    if store_call(state, move |store, account_id| {
+        store.delete_draft(account_id, draft_id)
+    })
+    .await
+    .is_err()
+    {
+        eprintln!("squelch-api: draft {draft_id} outlived its send; discard failed");
+    }
 }
 
 pub async fn action_send(
@@ -1529,6 +1648,9 @@ pub async fn action_send(
             // A cold send has no target row to resolve.
             if let Some(id) = body.reply_to_message_id {
                 resolve_done(&state, id).await;
+            }
+            if let Some(draft_id) = body.draft_id {
+                discard_sent_draft(&state, draft_id).await;
             }
             audit_action(&state, "send", target, "ok").await;
             Ok(Json(json!({ "status": "sent" })))
