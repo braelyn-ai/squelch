@@ -41,8 +41,11 @@ SCORING (importance is an integer 0-100, aligned with these anchors):
 TIER: pick one of \"past_due\", \"deadline\", \"signal\", \"noise\" that best fits. \
 Use past_due/deadline only for a concrete bill, payment, or dated obligation; \
 signal for mail worth surfacing; noise otherwise. A row categorized \
-banking_statement, transaction_alert, or autopay_bill is a RECORD: its tier \
-must be noise, never past_due or deadline. The is_known_contact flag in \
+banking_statement or autopay_bill is a RECORD: its tier must be noise, never \
+past_due or deadline. A transaction_alert is usually a record too (tier noise), \
+EXCEPT when it reports a problem demanding action - a bounced or returned \
+payment, a failed or declined charge, an overdraft: that is an obligation, so \
+give it the attention tier it deserves. The is_known_contact flag in \
 the TRUSTED CONTEXT is a strong signal for a higher tier.
 
 DEADLINES: set has_deadline=true only for a concrete bill, payment, or dated \
@@ -102,7 +105,11 @@ worst possible mistake.
 though a statement carries a due date, it is a RECORD, not an obligation — never \
 treat it as an invoice.
 - transaction_alert = a bank/card ACTIVITY notice: \"you spent\", a charge, a \
-deposit, a withdrawal, or a low-balance warning.
+deposit, a withdrawal, or a low-balance warning. Routine activity is a record: \
+no deadline, tier noise. But an alert reporting a FAILURE - a bounced or \
+returned payment (e.g. ACH), a failed or declined charge, an overdraft - \
+demands action: keep the category transaction_alert AND set has_deadline=true \
+(deadline_iso only if a date is written in the email) so it is not buried.
 BANKING CATEGORIES require the sender to actually BE a financial institution \
 (a bank, card issuer, or payment service) writing about the USER'S OWN account. \
 Marketplace notifications, shipping quotes, order updates, and vendor mail are \
@@ -202,14 +209,20 @@ pub const CATEGORIES: &[&str] = &[
     "transaction_alert",
 ];
 
-/// The record-shaped categories: rows that live in the Banking rail, never the
-/// attention bands. See [`clamp_record_tier`].
+/// The record-shaped categories: rows the Banking rail files. Routing only —
+/// tier clamping uses the narrower [`SELF_HANDLING_CATEGORIES`].
 pub const RECORD_CATEGORIES: &[&str] = &["banking_statement", "transaction_alert", "autopay_bill"];
 
+/// The categories whose dates are NEVER obligations: a statement's due date is
+/// informational and an autopay bill pays itself. `transaction_alert` is
+/// deliberately absent — a bounced/failed-payment alert is both banking AND an
+/// obligation, so it may keep an attention tier. See [`clamp_record_tier`].
+pub const SELF_HANDLING_CATEGORIES: &[&str] = &["banking_statement", "autopay_bill"];
+
 /// STRUCTURAL CONSISTENCY: category wins over tier. The model decides the two
-/// independently, so for a record category force the tier to Noise, drop any
-/// deadline, and say why — a contradictory verdict (banking_statement + deadline)
-/// must never sit in the attention bands.
+/// independently, so for a self-handling category force the tier to Noise, drop
+/// any deadline, and say why — a contradictory verdict (banking_statement +
+/// deadline) must never sit in the attention bands.
 /// Returns the (possibly) clamped (tier, deadline, tier_reason).
 pub(crate) fn clamp_record_tier(
     category: &str,
@@ -218,7 +231,7 @@ pub(crate) fn clamp_record_tier(
     tier_reason: String,
     stage_label: &str,
 ) -> (crate::types::Tier, Option<crate::triage::DeadlineHit>, String) {
-    if RECORD_CATEGORIES.contains(&category)
+    if SELF_HANDLING_CATEGORIES.contains(&category)
         && matches!(tier, crate::types::Tier::PastDue | crate::types::Tier::Deadline)
     {
         (
@@ -493,6 +506,31 @@ mod tests {
         let tr = a.field_reasons.tier.as_deref().unwrap_or("");
         assert!(tr.contains("record"), "reason states the clamp: {tr}");
         assert_eq!(a.category.as_deref(), Some("banking_statement"));
+    }
+
+    #[test]
+    fn bounced_payment_alert_keeps_its_attention_tier() {
+        // THE MERCURY ACH-BOUNCE CASE: a transaction_alert reporting a failed
+        // payment is banking AND an obligation. It files under the Banking rail
+        // (category) while the tier keeps it in For-your-eyes — no clamp.
+        let mut o = out(92, true);
+        o.category = "transaction_alert".into();
+        o.has_deadline = true;
+        o.deadline_iso = None; // no concrete date stated -> deadline tier
+        let a = apply_result(&queued(true), &o, "m", now());
+        assert_eq!(a.tier, Tier::Deadline, "failure alerts reach FYE");
+        assert_eq!(a.category.as_deref(), Some("transaction_alert"));
+    }
+
+    #[test]
+    fn routine_transaction_alert_without_deadline_stays_noise() {
+        // A "you spent $12" alert claims no deadline, so the derived tier rests
+        // on importance alone; the record-shaped score keeps it out of FYE.
+        let mut o = out(30, true);
+        o.category = "transaction_alert".into();
+        let a = apply_result(&queued(true), &o, "m", now());
+        assert_eq!(a.tier, Tier::Noise);
+        assert_eq!(a.category.as_deref(), Some("transaction_alert"));
     }
 
     #[test]

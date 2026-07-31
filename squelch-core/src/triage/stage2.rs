@@ -102,7 +102,11 @@ worst possible mistake.
 though a statement carries a due date, it is a RECORD, not an obligation — never \
 treat it as an invoice.
 - transaction_alert = a bank/card ACTIVITY notice: \"you spent\", a charge, a \
-deposit, a withdrawal, or a low-balance warning.
+deposit, a withdrawal, or a low-balance warning. Routine activity is a record: \
+no deadline. But an alert reporting a FAILURE - a bounced or returned payment \
+(e.g. ACH), a failed or declined charge, an overdraft - demands action: keep \
+the category transaction_alert AND set has_deadline=true (deadline_iso only if \
+a date is written in the email) so it is not buried.
 BANKING CATEGORIES require the sender to actually BE a financial institution \
 (a bank, card issuer, or payment service) writing about the USER'S OWN account. \
 Marketplace notifications, shipping quotes, order updates, and vendor mail are \
