@@ -20,7 +20,7 @@ pub use error::ApiError;
 /// The auth-mail retention pass. Exported for the daemon's timer: it uses the
 /// WRITE credential, which the readonly-bound sync loop must never touch.
 pub use handlers::run_shred_pass;
-pub use state::{ApiState, StateError};
+pub use state::{ApiState, StateError, attach_event_channel};
 
 use axum::{
     Router,

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use squelch_core::config::{CredentialBackend, OAuthClientConfig, Stage2CapSources};
+use squelch_core::config::{Config, CredentialBackend, OAuthClientConfig, Stage2CapSources};
 use squelch_core::credentials::{
     CredentialKind, CredentialStore, FileCredentialStore, KeyringCredentialStore,
 };
@@ -71,6 +71,27 @@ pub struct ApiState {
     /// graceful shutdown waits for open connections, so without this one
     /// resident client would hold squelchd open forever.
     pub(crate) shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Capacity of the `GET /client/events` wake channel. THE PAYLOAD IS ONLY A HINT
+/// — every stream re-reads the `events` table past its own cursor — so this only
+/// bounds how far a slow reader falls behind before taking the harmless Lagged
+/// path.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Build the event wake channel and attach it to the store, returning the sender
+/// for [`ApiState::with_event_notifier`] and for any other reader that wants to
+/// `subscribe` (the APNs pusher does). One helper so every binary uses the same
+/// capacity and the same single attach point.
+///
+/// Subscribe BEFORE handing the sender to the human door, so nothing appended
+/// during startup is missed.
+pub fn attach_event_channel(
+    store: &SqliteStore,
+) -> Result<tokio::sync::broadcast::Sender<i64>, squelch_core::CoreError> {
+    let (tx, _) = tokio::sync::broadcast::channel::<i64>(EVENT_CHANNEL_CAPACITY);
+    store.attach_event_notifier(tx.clone())?;
+    Ok(tx)
 }
 
 /// Why [`ApiState`] could not be constructed.
@@ -286,6 +307,61 @@ impl ApiState {
         }
         let account_id = store.ensure_account(account_email)?;
         Self::new(store, account_id, token)
+    }
+
+    /// THE one way a binary turns a loaded [`Config`] into serving state:
+    /// [`ApiState::from_env`] plus every config-derived knob (Stage-2 prices,
+    /// model/provider labels, daily caps + their sources, the Stage-1 block) and
+    /// the write credential. Both bins call this, so a knob added here reaches
+    /// both instead of silently misconfiguring the one that was not updated.
+    ///
+    /// Action endpoints are enabled ONLY when OAuth client credentials are
+    /// configured; the store built here is bound to [`CredentialKind::Write`]
+    /// and the sync/triage read path never touches it. Without it, actions 403.
+    ///
+    /// Process-level plumbing stays with the caller: the manual-refresh
+    /// [`Notify`](tokio::sync::Notify), the event notifier, and the shutdown
+    /// watch are all shared with other tasks the caller owns.
+    pub fn from_config(
+        store: Arc<SqliteStore>,
+        account_email: &str,
+        cfg: &Config,
+        cap_sources: Stage2CapSources,
+    ) -> Result<Self, StateError> {
+        let state = Self::from_env(store, account_email)?
+            .with_stage2_prices(cfg.stage2.price_in_per_mtok, cfg.stage2.price_out_per_mtok)
+            .with_stage2_model(
+                cfg.stage2.model.clone(),
+                cfg.stage2.stage2_provider.map(|p| p.as_str().to_string()),
+            )
+            .with_stage2_caps(
+                cfg.stage2.thread_daily_cap,
+                cfg.stage2.sender_daily_cap,
+                cfg.stage2.global_daily_cap,
+                cap_sources,
+            )
+            .with_stage1_config(
+                cfg.stage1.model.clone(),
+                cfg.stage1.price_in_per_mtok,
+                cfg.stage1.price_out_per_mtok,
+                cfg.stage1.global_daily_cap,
+            );
+
+        Ok(match cfg.oauth_client() {
+            Ok(client) => state.with_write_credentials(
+                cfg.credential_backend,
+                account_email.to_string(),
+                cfg.resolve_credentials_path(),
+                client,
+            ),
+            Err(_) => {
+                eprintln!(
+                    "squelch-api: no OAuth client configured; action endpoints will return 403 \
+                     (set client_id/client_secret and run `squelchd auth --write`)"
+                );
+                state
+            }
+        })
     }
 
     /// The active account id (exposed for tests / embedders).

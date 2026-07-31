@@ -490,6 +490,30 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
+/// Overwrite `slot` from env var `name` when it is set, non-empty, and parses as
+/// `T`. EMPTY IS "UNSET": an exported-but-blank var must never clear a
+/// configured value. The value is used verbatim — no trimming — so a var whose
+/// whitespace matters keeps it.
+fn env_override<T: std::str::FromStr>(name: &str, slot: &mut T) {
+    if let Ok(v) = std::env::var(name)
+        && !v.is_empty()
+        && let Ok(parsed) = v.parse::<T>()
+    {
+        *slot = parsed;
+    }
+}
+
+/// [`env_override`] for an `Option<T>` slot: a usable value sets `Some`, and an
+/// unset/blank/unparseable var leaves whatever the config file supplied.
+fn env_override_opt<T: std::str::FromStr>(name: &str, slot: &mut Option<T>) {
+    if let Ok(v) = std::env::var(name)
+        && !v.is_empty()
+        && let Ok(parsed) = v.parse::<T>()
+    {
+        *slot = Some(parsed);
+    }
+}
+
 // ---- Stage-2 daily-cap runtime-override plumbing ---------------------------
 // Three layers, highest wins: an `app_settings` runtime override (applied
 // without a restart) > config/env > [`Stage2Config::default`]. These constants
@@ -700,47 +724,24 @@ impl Config {
     /// Env-var overrides (highest precedence). Env always wins over the file so
     /// operators can override without editing config.
     fn apply_env_overrides(&mut self) {
+        // The two legacy-alias vars keep their own helper: they accept a
+        // deprecated second name and note the deprecation on stderr.
         if let Some(p) = env_with_legacy(ENV_DB_PATH, ENV_DB_PATH_LEGACY) {
             self.db_path = PathBuf::from(p);
         }
-        if let Ok(v) = std::env::var("SQUELCH_MIN_IMPORTANCE")
-            && let Ok(n) = v.parse::<u8>()
-        {
-            self.default_min_importance = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_CLIENT_ID")
-            && !v.is_empty()
-        {
-            self.client_id = Some(v);
-        }
-        if let Ok(v) = std::env::var("SQUELCH_CLIENT_SECRET")
-            && !v.is_empty()
-        {
-            self.client_secret = Some(v);
-        }
+        env_override("SQUELCH_MIN_IMPORTANCE", &mut self.default_min_importance);
+        env_override_opt("SQUELCH_CLIENT_ID", &mut self.client_id);
+        env_override_opt("SQUELCH_CLIENT_SECRET", &mut self.client_secret);
         if let Some(v) = env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY) {
             self.account_email = Some(v);
         }
-        if let Ok(v) = std::env::var("SQUELCH_BACKFILL_DAYS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.sync.backfill_days = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_POLL_SECS")
-            && let Ok(n) = v.parse::<u64>()
-        {
-            self.sync.poll_secs = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_SQUELCH_LEVEL")
-            && let Ok(n) = v.parse::<u8>()
-        {
-            self.squelch_level = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_NOTIFY_MIN_IMPORTANCE")
-            && let Ok(n) = v.parse::<u8>()
-        {
-            self.notify.min_importance = n;
-        }
+        env_override("SQUELCH_BACKFILL_DAYS", &mut self.sync.backfill_days);
+        env_override("SQUELCH_POLL_SECS", &mut self.sync.poll_secs);
+        env_override("SQUELCH_SQUELCH_LEVEL", &mut self.squelch_level);
+        env_override(
+            "SQUELCH_NOTIFY_MIN_IMPORTANCE",
+            &mut self.notify.min_importance,
+        );
         // ---- APNs pusher (blind relay) -------------------------------------
         // The relay token is never echoed anywhere.
         for (name, slot) in [
@@ -757,11 +758,15 @@ impl Config {
             }
         }
 
+        // Lenient enum parse (trim + lowercase, unknown value keeps the current
+        // one), so not the strict `FromStr` helper.
         if let Ok(v) = std::env::var("SQUELCH_CRED_BACKEND")
             && let Some(b) = CredentialBackend::from_str_lenient(&v)
         {
             self.credential_backend = b;
         }
+        // `var_os`, not `var`: a credentials path may be non-UTF-8, and an empty
+        // value is honored as-is here rather than treated as unset.
         if let Some(p) = std::env::var_os("SQUELCH_CREDENTIALS_PATH") {
             self.credentials_path = Some(PathBuf::from(p));
         }
@@ -774,83 +779,59 @@ impl Config {
         {
             self.stage2.stage2_provider = Some(p);
         }
-        if let Ok(v) = std::env::var("SQUELCH_MODEL")
-            && !v.is_empty()
-        {
-            self.stage2.model = v;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_MAX_BODY_CHARS")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.stage2.max_body_chars = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_BATCH_PER_CYCLE")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.stage2.batch_per_cycle = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_THREAD_DAILY_CAP")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.stage2.thread_daily_cap = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_GLOBAL_DAILY_CAP")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.stage2.global_daily_cap = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_SENDER_DAILY_CAP")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.stage2.sender_daily_cap = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_MAX_AGE_DAYS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.stage2.max_age_days = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK")
-            && let Ok(n) = v.parse::<f64>()
-        {
-            self.stage2.price_in_per_mtok = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK")
-            && let Ok(n) = v.parse::<f64>()
-        {
-            self.stage2.price_out_per_mtok = n;
-        }
+        env_override("SQUELCH_MODEL", &mut self.stage2.model);
+        env_override(
+            "SQUELCH_STAGE2_MAX_BODY_CHARS",
+            &mut self.stage2.max_body_chars,
+        );
+        env_override(
+            "SQUELCH_STAGE2_BATCH_PER_CYCLE",
+            &mut self.stage2.batch_per_cycle,
+        );
+        env_override(
+            "SQUELCH_STAGE2_THREAD_DAILY_CAP",
+            &mut self.stage2.thread_daily_cap,
+        );
+        env_override(
+            "SQUELCH_STAGE2_GLOBAL_DAILY_CAP",
+            &mut self.stage2.global_daily_cap,
+        );
+        env_override(
+            "SQUELCH_STAGE2_SENDER_DAILY_CAP",
+            &mut self.stage2.sender_daily_cap,
+        );
+        env_override("SQUELCH_STAGE2_MAX_AGE_DAYS", &mut self.stage2.max_age_days);
+        env_override(
+            "SQUELCH_STAGE2_PRICE_IN_PER_MTOK",
+            &mut self.stage2.price_in_per_mtok,
+        );
+        env_override(
+            "SQUELCH_STAGE2_PRICE_OUT_PER_MTOK",
+            &mut self.stage2.price_out_per_mtok,
+        );
 
         // ---- Stage-1 LLM overrides -----------------------------------------
-        if let Ok(v) = std::env::var("SQUELCH_STAGE1_MODEL")
-            && !v.is_empty()
-        {
-            self.stage1.model = v;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE1_MAX_BODY_CHARS")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.stage1.max_body_chars = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE1_BATCH_PER_CYCLE")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.stage1.batch_per_cycle = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE1_GLOBAL_DAILY_CAP")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.stage1.global_daily_cap = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE1_PRICE_IN_PER_MTOK")
-            && let Ok(n) = v.parse::<f64>()
-        {
-            self.stage1.price_in_per_mtok = n;
-        }
-        if let Ok(v) = std::env::var("SQUELCH_STAGE1_PRICE_OUT_PER_MTOK")
-            && let Ok(n) = v.parse::<f64>()
-        {
-            self.stage1.price_out_per_mtok = n;
-        }
+        env_override("SQUELCH_STAGE1_MODEL", &mut self.stage1.model);
+        env_override(
+            "SQUELCH_STAGE1_MAX_BODY_CHARS",
+            &mut self.stage1.max_body_chars,
+        );
+        env_override(
+            "SQUELCH_STAGE1_BATCH_PER_CYCLE",
+            &mut self.stage1.batch_per_cycle,
+        );
+        env_override(
+            "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
+            &mut self.stage1.global_daily_cap,
+        );
+        env_override(
+            "SQUELCH_STAGE1_PRICE_IN_PER_MTOK",
+            &mut self.stage1.price_in_per_mtok,
+        );
+        env_override(
+            "SQUELCH_STAGE1_PRICE_OUT_PER_MTOK",
+            &mut self.stage1.price_out_per_mtok,
+        );
 
         // Range-guard the caps, matching POST /client/triage-config's
         // validation: a cap of 0 would silently block EVERY row each cycle
@@ -1567,6 +1548,45 @@ backfill_days = 90
             std::env::remove_var("SQUELCH_STAGE2_MAX_AGE_DAYS");
             std::env::remove_var("SQUELCH_STAGE2_PRICE_IN_PER_MTOK");
             std::env::remove_var("SQUELCH_STAGE2_PRICE_OUT_PER_MTOK");
+        }
+    }
+
+    /// An exported-but-blank var is "unset", never "set to empty": otherwise a
+    /// stray `SQUELCH_MODEL=` in a shell would wipe the configured model. Same
+    /// rule for an unparseable value — the config-file layer survives both.
+    #[test]
+    fn blank_or_unparseable_env_never_clobbers_a_configured_value() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_MODEL", "");
+            std::env::set_var("SQUELCH_STAGE1_MODEL", "");
+            std::env::set_var("SQUELCH_CLIENT_ID", "");
+            std::env::set_var("SQUELCH_STAGE2_BATCH_PER_CYCLE", "not-a-number");
+        }
+        let mut c = Config {
+            client_id: Some("file-id".to_string()),
+            stage2: Stage2Config {
+                model: "file-model".to_string(),
+                batch_per_cycle: 42,
+                ..Stage2Config::default()
+            },
+            stage1: Stage1Config {
+                model: "file-stage1-model".to_string(),
+                ..Stage1Config::default()
+            },
+            ..Config::default()
+        };
+        c.apply_env_overrides();
+        assert_eq!(c.stage2.model, "file-model");
+        assert_eq!(c.stage1.model, "file-stage1-model");
+        assert_eq!(c.client_id.as_deref(), Some("file-id"));
+        assert_eq!(c.stage2.batch_per_cycle, 42);
+        unsafe {
+            std::env::remove_var("SQUELCH_MODEL");
+            std::env::remove_var("SQUELCH_STAGE1_MODEL");
+            std::env::remove_var("SQUELCH_CLIENT_ID");
+            std::env::remove_var("SQUELCH_STAGE2_BATCH_PER_CYCLE");
         }
     }
 

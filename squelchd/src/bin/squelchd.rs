@@ -395,10 +395,7 @@ fn cmd_serve(
 
     // Wake channel: the store pokes it on every real `append_event`, and each
     // open `GET /client/events` stream re-reads the table past its own cursor.
-    // The payload is only a hint, so capacity just bounds how far a slow reader
-    // falls behind before taking the harmless Lagged path.
-    let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
-    store.attach_event_notifier(event_tx.clone())?;
+    let event_tx = squelch_api::attach_event_channel(&store)?;
 
     // The APNs pusher is the second reader of that log, with its own persisted
     // cursor. Absence of `SQUELCH_RELAY_URL` is the whole feature flag. A relay
@@ -421,31 +418,14 @@ fn cmd_serve(
     // appended during startup is missed.
     let pusher_wake = event_tx.subscribe();
 
-    // The human door refuses to build without SQUELCH_API_TOKEN. The WRITE-bound
-    // credential store attached here is what enables the action endpoints; the
-    // sync engine below gets a separate READ-bound store and never sees this one.
-    let api_state = squelch_api::ApiState::from_env(store.clone(), &email)
+    // The human door refuses to build without SQUELCH_API_TOKEN. The shared
+    // config->state wiring also attaches the WRITE-bound credential store that
+    // enables the action endpoints; the sync engine below gets a separate
+    // READ-bound store and never sees this one.
+    let api_state = squelch_api::ApiState::from_config(store.clone(), &email, &config, cap_sources)
         .map_err(|e| other_err(format!("{e}")))?
-        .with_write_credentials(backend, email.clone(), creds_path.clone(), client.clone())
         .with_refresh(refresh.clone())
-        .with_event_notifier(event_tx)
-        .with_stage2_prices(config.stage2.price_in_per_mtok, config.stage2.price_out_per_mtok)
-        .with_stage2_model(
-            config.stage2.model.clone(),
-            config.stage2.stage2_provider.map(|p| p.as_str().to_string()),
-        )
-        .with_stage2_caps(
-            config.stage2.thread_daily_cap,
-            config.stage2.sender_daily_cap,
-            config.stage2.global_daily_cap,
-            cap_sources,
-        )
-        .with_stage1_config(
-            config.stage1.model.clone(),
-            config.stage1.price_in_per_mtok,
-            config.stage1.price_out_per_mtok,
-            config.stage1.global_daily_cap,
-        );
+        .with_event_notifier(event_tx);
 
     let runtime = build_runtime()?;
     runtime.block_on(async move {

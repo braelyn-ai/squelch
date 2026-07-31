@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use squelch_api::{ApiState, router};
+use squelch_api::{ApiState, attach_event_channel, router};
 use squelch_core::config::Config;
 use squelch_core::store::SqliteStore;
 
@@ -34,57 +34,18 @@ fn bind_addr() -> anyhow::Result<SocketAddr> {
 async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SqliteStore::open(db_path())?);
     let email = account_email();
-    // Refuses to build (and thus serve) without SQUELCH_API_TOKEN.
-    let mut state = ApiState::from_env(store.clone(), &email)?;
-
-    // Action endpoints are enabled ONLY when OAuth client credentials are
-    // configured; the store built below is bound to CredentialKind::Write and
-    // the sync/triage read path never touches it. Without it, actions 403.
     let (cfg, cap_sources) = Config::load_with_cap_sources();
-    state = state.with_stage2_prices(
-        cfg.stage2.price_in_per_mtok,
-        cfg.stage2.price_out_per_mtok,
-    );
-    state = state.with_stage2_model(
-        cfg.stage2.model.clone(),
-        cfg.stage2.stage2_provider.map(|p| p.as_str().to_string()),
-    );
-    state = state.with_stage2_caps(
-        cfg.stage2.thread_daily_cap,
-        cfg.stage2.sender_daily_cap,
-        cfg.stage2.global_daily_cap,
-        cap_sources,
-    );
-    state = state.with_stage1_config(
-        cfg.stage1.model.clone(),
-        cfg.stage1.price_in_per_mtok,
-        cfg.stage1.price_out_per_mtok,
-        cfg.stage1.global_daily_cap,
-    );
-    match cfg.oauth_client() {
-        Ok(client) => {
-            state = state.with_write_credentials(
-                cfg.credential_backend,
-                email.clone(),
-                cfg.resolve_credentials_path(),
-                client,
-            );
-        }
-        Err(_) => {
-            eprintln!(
-                "squelch-api: no OAuth client configured; action endpoints will return 403 \
-                 (set client_id/client_secret and run `squelchd auth --write`)"
-            );
-        }
-    }
+    // The shared config->state wiring (prices, model labels, caps, Stage-1, and
+    // the write credential). Refuses to build (and thus serve) without
+    // SQUELCH_API_TOKEN.
+    let state = ApiState::from_config(store.clone(), &email, &cfg, cap_sources)?;
 
     // SSE plumbing. Nothing here appends events, but the shutdown signal is NOT
     // optional: an open `/client/events` stream would keep
     // `with_graceful_shutdown` waiting forever on Ctrl-C.
-    let (event_tx, _) = tokio::sync::broadcast::channel::<i64>(256);
-    store.attach_event_notifier(event_tx.clone())?;
+    let event_tx = attach_event_channel(&store)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
+    let state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
 
     let app = router(state);
 
