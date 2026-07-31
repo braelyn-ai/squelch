@@ -223,6 +223,28 @@ pub struct Device {
     pub last_registered_at: DateTime<Utc>,
 }
 
+/// One local draft: an unsent composition addressed either at a message being
+/// replied to, or at the account's single new-message slot
+/// (`reply_to_message_id: None`).
+///
+/// HUMAN-DOOR ONLY — produced by
+/// [`SqliteStore::upsert_draft`](sqlite::SqliteStore::upsert_draft) and friends
+/// for `/client/drafts`. Nothing here is synced to Gmail Drafts and no agent-door
+/// read reaches the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub id: i64,
+    pub account_id: AccountId,
+    /// The message this replies to; `None` is the new-message draft.
+    pub reply_to_message_id: Option<i64>,
+    pub to_addr: String,
+    pub subject: String,
+    pub body: String,
+    /// First save of this draft; an edit keeps it.
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// One non-confident triage row queued for the Stage-2 LLM pass, with message
 /// context and the matched Filtered-rule's `want_text`. Produced by
 /// [`Store::stage2_queue`], whose predicate (`model_used IS NULL AND

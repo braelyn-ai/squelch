@@ -10,6 +10,7 @@
 
 mod attention;
 mod audit;
+mod drafts;
 mod events;
 mod feedback;
 mod messages;
@@ -33,7 +34,7 @@ use crate::error::{CoreError, Result};
 use crate::store::{
     TriageDebug,
     AttachmentBytes, BankingApplied, ExtractQueued, MarketingApplied, MarketingOffer,
-    Device, MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
+    Device, Draft, MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
     SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
 };
@@ -206,6 +207,20 @@ impl SqliteStore {
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    /// The account's own email address. [`CoreError::NotFound`] for an unknown
+    /// id, like every other single-row getter here.
+    pub fn account_email(&self, account_id: AccountId) -> Result<String> {
+        let conn = self.lock()?;
+        let email: Option<String> = conn
+            .query_row(
+                "SELECT email FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        email.ok_or(CoreError::NotFound)
     }
 
     /// HUMAN-DOOR ACTION SUPPORT (squelch-api only): resolve a local message id

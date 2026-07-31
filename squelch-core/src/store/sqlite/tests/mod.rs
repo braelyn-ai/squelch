@@ -3,6 +3,7 @@
 mod support;
 mod attention;
 mod audit;
+mod drafts;
 mod events;
 mod feedback;
 mod messages;

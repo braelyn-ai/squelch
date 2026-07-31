@@ -535,3 +535,29 @@ CREATE TABLE IF NOT EXISTS devices (
 
 -- The pusher's read is exactly "every token for my account".
 CREATE INDEX IF NOT EXISTS idx_devices_account ON devices(account_id);
+
+-- LOCAL DRAFTS. One unsent composition per reply target, plus ONE new-message
+-- draft per account (`reply_to_message_id IS NULL`).
+--
+-- HUMAN-DOOR DATA ONLY: served exclusively by /client/drafts, never synced to
+-- Gmail Drafts, and never visible on /mcp — an unsent draft is the user's own
+-- thinking, not mail the agent door was handed (two-door invariant).
+--
+-- Uniqueness is two PARTIAL indexes rather than UNIQUE(account_id,
+-- reply_to_message_id), because SQLite treats NULLs as distinct in a UNIQUE:
+-- the new-message draft would otherwise be insertable without bound.
+CREATE TABLE IF NOT EXISTS drafts (
+    id                  INTEGER PRIMARY KEY,
+    account_id          INTEGER NOT NULL,
+    reply_to_message_id INTEGER,          -- NULL = the new-message draft
+    to_addr             TEXT NOT NULL DEFAULT '',
+    subject             TEXT NOT NULL DEFAULT '',
+    body                TEXT NOT NULL DEFAULT '',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_reply
+    ON drafts(account_id, reply_to_message_id) WHERE reply_to_message_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_new
+    ON drafts(account_id) WHERE reply_to_message_id IS NULL;
