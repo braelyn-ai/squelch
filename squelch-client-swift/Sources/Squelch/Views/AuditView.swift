@@ -108,7 +108,7 @@ struct AuditView: View {
     private static let actionVerbs: [String: String] = [
         "archive": "archived",
         "label": "relabeled a message",
-        "send": "sent a reply",
+        "send.echo": "filed the sent copy into the thread",
         "reveal_sealed": "revealed auth message",
         "reveal": "revealed auth message",
         "unsubscribe": "opened unsubscribe",
@@ -122,6 +122,11 @@ struct AuditView: View {
     ]
 
     static func actionVerb(_ e: AuditEntry) -> String {
+        if e.action == "send" {
+            // A reply audits with the parent message id as its target; a fresh
+            // message has no target, and calling it a reply misreports the ledger.
+            return (e.target ?? "").isEmpty ? "sent a message" : "sent a reply"
+        }
         if e.action == "set_status" {
             switch (e.detail ?? "").lowercased() {
             case "done": return "marked done"
