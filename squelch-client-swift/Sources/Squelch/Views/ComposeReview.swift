@@ -230,7 +230,14 @@ struct ComposeReview: View {
     private func bind(_ keyPath: WritableKeyPath<ComposeState, String>) -> Binding<String> {
         Binding(
             get: { store.compose?[keyPath: keyPath] ?? "" },
-            set: { value in patch { $0[keyPath: keyPath] = value } })
+            set: { value in
+                // Every field of this composer is bound through here, which is why
+                // the autosave hooks HERE and nowhere else: there is no way to edit
+                // the draft without arming a save.
+                guard store.compose?[keyPath: keyPath] != value else { return }
+                patch { $0[keyPath: keyPath] = value }
+                DraftSaver.shared.noteChange(.compose)
+            })
     }
 
     private func patch(_ mutate: (inout ComposeState) -> Void) {
@@ -267,6 +274,9 @@ struct ComposeReview: View {
             // pairs with it — a send is the one irreversible action.
             if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
             store.pushToast("sent", .success)
+            // The send already deleted the draft; without this the close below
+            // would flush it straight back and offer to restore mail that is gone.
+            DraftSaver.shared.noteSent(.compose)
             store.closeCompose()
         case .guardBlocked(let kinds):
             // Stay in review with the redacted verdict; the override must be an

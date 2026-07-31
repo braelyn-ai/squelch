@@ -617,6 +617,32 @@ struct UnsubResolutionResult: Codable, Sendable {
     var resolution: String
 }
 
+// MARK: - drafts
+
+/// One saved draft. LOCAL and human-door only: never a Gmail draft, never
+/// synced, never reachable from the agent door. `to` is the send endpoint's own
+/// spelling of the field, not the store's `to_addr`.
+struct DraftView: Codable, Sendable, Identifiable, Hashable {
+    var id: Int
+    /// The message this answers. nil = the account's single new-message draft.
+    var reply_to_message_id: Int?
+    var to: String
+    var subject: String
+    var body: String
+    var created_at: String
+    var updated_at: String
+}
+
+/// PUT /client/drafts — upsert keyed on `reply_to_message_id`. Every text field
+/// is optional server-side (a half-composed draft is the normal case), but the
+/// composer always knows all three, so all three go.
+struct DraftBody: Codable, Sendable {
+    var reply_to_message_id: Int?
+    var to: String
+    var subject: String
+    var body: String
+}
+
 // MARK: - triage debug / shredder / feedback / marketing
 
 struct TriageDebug: Codable, Sendable, Hashable {

@@ -48,6 +48,11 @@ struct ActionLayer: View {
                 if let u = store.selectedUpdate { Actions.tune(sender: u.sender) }
             },
             KeyBinding("p", "process mode") { store.processModeOpen = true },
+            // `c` = compose, registered per-SURFACE (here for the lists, and again
+            // in the sitrep and the reader) rather than globally: a global one would
+            // fire from inside a modal, where the letter belongs to whatever is
+            // being typed.
+            KeyBinding("c", "new message") { store.openComposeNew() },
         ])
         .task(id: store.lastRefresh) { await scanViolations() }
     }
@@ -222,6 +227,7 @@ struct ShortcutsOverlay: View {
                 (["j", "k"], "move selection"),
                 (["Enter"], "open thread"),
                 (["r"], "reply"),
+                (["c"], "new message"),
                 (["e", "d"], "mark done"),
                 (["v"], "fix a wrong triage verdict"),
                 (["t"], "tune sender rule"),
@@ -234,6 +240,7 @@ struct ShortcutsOverlay: View {
                 (["j", "k"], "older / newer message"),
                 (["h", "l"], "previous / next queued email"),
                 (["r"], "reply"),
+                (["c"], "new message"),
                 (["e", "d"], "done + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),

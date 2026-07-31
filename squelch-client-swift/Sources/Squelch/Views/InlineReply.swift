@@ -231,7 +231,13 @@ struct InlineReply: View {
     private func bind(_ keyPath: WritableKeyPath<ComposeState, String>) -> Binding<String> {
         Binding(
             get: { store.inlineReply?[keyPath: keyPath] ?? "" },
-            set: { value in patch { $0[keyPath: keyPath] = value } })
+            set: { value in
+                // The autosave's one hook for this composer — the body is the only
+                // field it has, and it is bound through here.
+                guard store.inlineReply?[keyPath: keyPath] != value else { return }
+                patch { $0[keyPath: keyPath] = value }
+                DraftSaver.shared.noteChange(.inlineReply)
+            })
     }
 
     private func patch(_ mutate: (inout ComposeState) -> Void) {
@@ -273,6 +279,9 @@ struct InlineReply: View {
             // ingest has not caught up and there is nothing to fetch — the poll
             // gets there.
             let echoed = result.echo_message_id != nil
+            // The send already deleted the draft; the close below must not flush it
+            // back and leave a reply that went out sitting there to be restored.
+            DraftSaver.shared.noteSent(.inlineReply)
             store.closeInlineReply()
             if echoed { onEchoed() }
         case .guardBlocked(let kinds):

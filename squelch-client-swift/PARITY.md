@@ -89,6 +89,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 | Attachment strip | **done** | Lazy thumbnails, **native PDFKit preview** (stronger than the web build's `<embed>` + blob URL), size/stored states |
 | Side panels (browse / search) | **done** | Conditional-mount so the modal context is never pinned |
 | Compose review ceremony | **done** | edit → review → guard verdict → explicit override |
+| Draft autosave + restore | **done** | Debounced `PUT /client/drafts` per composer slot, flushed on every exit, silent; `c` / ⌘N restores the new-message draft, `r` restores the reply's |
 | Triage-fix palette (`v`) | **done** | Ranked, ambiguity shown not guessed |
 | ⌘K ask-your-inbox bar | **done** | BYOK agent loop w/ citations |
 | 2FA code modal | **done** | Auto-reveal, 30s countdown, copy pauses the timer |
@@ -130,12 +131,16 @@ parts that are easy to get subtly wrong:
   an overlay above it).
 
 Full keymap: digits 1–5 view nav · ⌘[ / ⌘] history · ⌘K ask bar · ⌘, settings · j/k/arrows ·
-Enter open · r reply · e/d done · v fix triage · t tune · p process · a browse ·
+Enter open · r reply · c new message · e/d done · v fix triage · t tune · p process · a browse ·
 / search · u undo · T rules · A audit · g auth · `\` theme · `?` help · Esc
-close · thread viewer h/l queue nav, r reply (inline composer), u unsubscribe ·
-rules n/e/x · browse ± noise.
+close · thread viewer h/l queue nav, r reply (inline composer), c new message,
+u unsubscribe · rules n/e/x · browse ± noise.
 
-Menu-bar equivalents (⌘1–5, ⌘[, ⌘], ⌘K, ⌘F, ⌘R, ⌘Z, ⌘,) exist for discoverability;
+`c` is registered per-surface (list, sitrep, thread) rather than globally, so it
+cannot fire from inside a modal where the letter belongs to whatever is being
+typed; ⌘N reaches the composer from everywhere via the menu path.
+
+Menu-bar equivalents (⌘N, ⌘1–5, ⌘[, ⌘], ⌘K, ⌘F, ⌘R, ⌘Z, ⌘,) exist for discoverability;
 the registry remains the authority on dispatch semantics.
 
 ---

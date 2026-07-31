@@ -24,9 +24,11 @@ enum ComposeSubmit {
     /// `guardBlocked` verdict; never pass true on a first attempt, or the verdict
     /// never happens.
     ///
-    /// No `draftId` yet: `actionSend` can delete a server-side draft on success,
-    /// but `ComposeState` carries no draft id, so there is nothing to pass. When
-    /// it grows one, it is threaded through here and both composers get it.
+    /// `draftId` rides along so the daemon deletes the autosaved draft in the same
+    /// transaction as the send: one round-trip, no window in which the mail has
+    /// gone out and a draft of it is still restorable. nil means the composer never
+    /// autosaved (nothing typed since it opened, or the save never landed), and
+    /// then there is nothing to delete.
     static func fire(_ c: ComposeState, override: Bool) async -> SendOutcome {
         do {
             let result = try await APIClient.shared.actionSend(
@@ -37,7 +39,7 @@ enum ComposeSubmit {
                 // nil, never "": the daemon reads Some("") as an explicit blank
                 // subject and would send the reply untitled.
                 subject: c.subject.isEmpty ? nil : c.subject,
-                overrideGuard: override)
+                overrideGuard: override, draftId: c.draftId)
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
             return .guardBlocked(apiError.guardKinds ?? [])

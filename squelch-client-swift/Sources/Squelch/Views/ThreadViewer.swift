@@ -329,6 +329,11 @@ struct ThreadViewer: View {
             // selected row's) but that is the only sender in view here. This
             // frees `r` for reply.
             KeyBinding("t", "new sender rule") { openSenderRule() },
+            // A new message from the reader, in the modal composer over it. The two
+            // draft slots are independent, so this cannot disturb an inline reply
+            // open underneath — and with one open the body has focus, so `c` is
+            // input-suppressed and types a letter instead.
+            KeyBinding("c", "new message") { store.openComposeNew() },
         ]
     }
 

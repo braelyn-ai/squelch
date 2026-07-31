@@ -64,7 +64,12 @@ struct SquelchCommands: Commands {
     let prefs: Prefs
 
     var body: some Commands {
-        CommandGroup(replacing: .newItem) {}
+        // ⌘N composes from ANYWHERE, including the surfaces where the bare `c` is
+        // deliberately out of reach (inside a modal, or with a text field focused).
+        CommandGroup(replacing: .newItem) {
+            Button("New Message") { store.openComposeNew() }
+                .keyboardShortcut("n")
+        }
 
         // Settings is a routed view rather than a separate window, so the
         // standard ⌘, routes instead of opening one.

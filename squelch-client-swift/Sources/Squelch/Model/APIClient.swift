@@ -62,7 +62,7 @@ actor APIClient {
 
     // MARK: - request plumbing
 
-    private enum Method: String { case GET, POST, DELETE }
+    private enum Method: String { case GET, POST, PUT, DELETE }
 
     private func buildRequest(
         path: String,
@@ -159,6 +159,17 @@ actor APIClient {
         // pass an explicit empty struct where that matters.
         let req = try buildRequest(
             path: path, method: .POST, query: query, body: payload, timeout: Self.requestTimeout)
+        let (data, _) = try await perform(req)
+        return try decode(T.self, from: data)
+    }
+
+    private func put<T: Decodable>(
+        _ path: String, body: Encodable? = nil, as type: T.Type = T.self
+    ) async throws -> T {
+        var payload: Data? = nil
+        if let body { payload = try Self.encoder.encode(AnyEncodable(body)) }
+        let req = try buildRequest(
+            path: path, method: .PUT, query: [:], body: payload, timeout: Self.requestTimeout)
         let (data, _) = try await perform(req)
         return try decode(T.self, from: data)
     }
@@ -370,6 +381,30 @@ actor APIClient {
                 reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body,
                 confirm: true, override_guard: overrideGuard, draft_id: draftId))
     }
+
+    // MARK: - drafts
+
+    /// Every draft this account holds. At most one per reply target plus one
+    /// new-message draft, enforced server-side, and a draft whose parent has since
+    /// been sealed is already filtered out — so what comes back is exactly what
+    /// can be restored.
+    func listDrafts() async throws -> [DraftView] { try await get("/client/drafts") }
+
+    /// Upsert by KEY: `replyToMessageId` (nil = the new-message slot) names the
+    /// draft, so a second PUT edits the same row rather than making another. A
+    /// sealed or unknown parent is a 404 and stores nothing.
+    @discardableResult
+    func putDraft(replyToMessageId: Int?, to: String, subject: String, body: String) async throws
+        -> DraftView
+    {
+        try await put(
+            "/client/drafts",
+            body: DraftBody(
+                reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body))
+    }
+
+    /// Discard one draft. Another account's id and an unknown id are the same 404.
+    func deleteDraft(_ id: Int) async throws { try await deleteNoContent("/client/drafts/\(id)") }
 
     // MARK: - refresh / retriage
 

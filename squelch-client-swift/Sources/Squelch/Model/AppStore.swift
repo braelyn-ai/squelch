@@ -188,6 +188,10 @@ struct ComposeState: Sendable, Equatable {
     var to: String = ""
     var subject: String = ""
     var body: String = ""
+    /// The server-side draft this composer is autosaving into, once one exists.
+    /// Rides along to `send` so a successful send deletes the draft in the same
+    /// transaction — otherwise the next `c` would restore mail already gone.
+    var draftId: Int?
     /// "edit" = composing; "review" = guard verdict shown, second Enter fires.
     var phase: Phase = .edit
     /// Redacted guard kinds from a 422; empty means the guard passed (or hasn't
@@ -499,7 +503,10 @@ final class AppStore {
         self.threadQueue = queue
         // Both cleared unconditionally: moving to ANOTHER thread (h/l, done+next)
         // must not carry the previous one's draft or its pending reply request
-        // into a thread they do not belong to.
+        // into a thread they do not belong to. The draft is SAVED on the way out
+        // rather than dropped — the reply is keyed to the message it answers, so
+        // walking away from it and coming back restores it.
+        DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = replyTo
     }
@@ -507,6 +514,7 @@ final class AppStore {
     func closeThread() {
         threadId = nil
         threadQueue = []
+        DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
     }
@@ -703,8 +711,52 @@ final class AppStore {
         sideView = .search
     }
 
-    func openCompose(_ state: ComposeState) { compose = state }
-    func closeCompose() { compose = nil }
+    func openCompose(_ state: ComposeState) {
+        compose = state
+        DraftSaver.shared.noteOpened(.compose)
+    }
+
+    /// `c` / ⌘N — the new-message composer, RESTORED. The account holds at most
+    /// one new-message draft by construction, so there is one row to look for and
+    /// no picker to show.
+    ///
+    /// The modal opens BLANK and immediately, because the keypress has to feel
+    /// instant; the saved draft lands into it a round-trip later, and only if
+    /// nothing has been typed in the meantime (see `restoreNewMessage`).
+    func openComposeNew() {
+        // A composer already up is not something a repeated `c` — or the menu
+        // item behind ⌘N — gets to blank out. Same rule as the inline reply.
+        guard compose == nil else { return }
+        openCompose(ComposeState())
+        Task { await restoreNewMessage() }
+    }
+
+    /// Fill the just-opened new-message composer from its saved draft. Silent on
+    /// failure: a restore that cannot happen leaves a blank composer, which is
+    /// what the reader asked for anyway.
+    private func restoreNewMessage() async {
+        guard let rows = try? await APIClient.shared.listDrafts(),
+            let draft = rows.first(where: { $0.reply_to_message_id == nil })
+        else { return }
+        // Must still be THE blank composer we opened: closed, replaced by a
+        // reply, or typed into in the meantime all mean the draft has missed its
+        // window, and overwriting live keystrokes is worse than not restoring.
+        guard var next = compose, next.replyToMessageId == nil, next.draftId == nil,
+            next.to.isEmpty, next.subject.isEmpty, next.body.isEmpty
+        else { return }
+        next.to = draft.to
+        next.subject = draft.subject
+        next.body = draft.body
+        next.draftId = draft.id
+        compose = next
+    }
+
+    func closeCompose() {
+        // An unsent draft outlives its composer: the closing values go out as one
+        // fire-and-forget save. Before the slot is cleared — `flush` reads it.
+        DraftSaver.shared.flush(.compose, compose)
+        compose = nil
+    }
 
     /// Open the reader's inline reply on a specific message. Never resets a
     /// composer that is already open — a draft is not something a repeated `r`
@@ -712,9 +764,31 @@ final class AppStore {
     func openInlineReply(replyTo messageId: Int) {
         guard inlineReply == nil else { return }
         inlineReply = ComposeState(replyToMessageId: messageId)
+        DraftSaver.shared.noteOpened(.inlineReply)
+        // Both ways in (the reader's `r` and the list's hand-off) come through
+        // here, so the restore is wired once.
+        Task { await restoreReply(messageId) }
     }
 
-    func closeInlineReply() { inlineReply = nil }
+    /// Fill the just-opened inline composer from the draft keyed to this parent.
+    /// Body only: a reply carries nothing else — the daemon derives the recipient
+    /// and `Re: <subject>` from the parent.
+    private func restoreReply(_ messageId: Int) async {
+        guard let rows = try? await APIClient.shared.listDrafts(),
+            let draft = rows.first(where: { $0.reply_to_message_id == messageId })
+        else { return }
+        guard var next = inlineReply, next.replyToMessageId == messageId, next.draftId == nil,
+            next.body.isEmpty
+        else { return }
+        next.body = draft.body
+        next.draftId = draft.id
+        inlineReply = next
+    }
+
+    func closeInlineReply() {
+        DraftSaver.shared.flush(.inlineReply, inlineReply)
+        inlineReply = nil
+    }
 
     func openTriageFix(_ target: TriageFixTarget) { triageFix = target }
     func closeTriageFix() { triageFix = nil }
