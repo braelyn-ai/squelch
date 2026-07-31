@@ -15,12 +15,11 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use squelch_relay::{Config, Environment, RelayState, router};
+use squelch_relay::{Config, RelayState, router};
 use tokio::net::TcpListener;
 
-const KEY: &str = include_str!("fixture_test_key.p8");
-const TOPIC: &str = "dev.squelch.ios";
-const BETA_TOPIC: &str = "dev.squelch.ios.beta";
+mod common;
+use common::{BETA_TOPIC, TOPIC, config};
 
 /// A live token, a token APNs has retired, and one APNs calls malformed.
 const LIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
@@ -78,19 +77,6 @@ async fn spawn_mock() -> (String, Mock) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), mock)
-}
-
-fn config(apns_url_override: Option<String>, auth_token: Option<String>) -> Config {
-    Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        apns_key_pem: KEY.to_string(),
-        apns_key_id: "KEYID12345".into(),
-        apns_team_id: "TEAMID6789".into(),
-        apns_topics: vec![TOPIC.into(), BETA_TOPIC.into()],
-        apns_env: Environment::Production,
-        auth_token,
-        apns_url_override,
-    }
 }
 
 async fn spawn_relay(config: Config) -> String {

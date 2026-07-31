@@ -4,9 +4,8 @@
 
 use squelch_relay::{Config, Environment, RelayState};
 
-const KEY: &str = include_str!("fixture_test_key.p8");
-const TOPIC: &str = "dev.squelch.ios";
-const BETA_TOPIC: &str = "dev.squelch.ios.beta";
+mod common;
+use common::{BETA_TOPIC, KEY, TOPIC};
 
 /// The ONLY test that touches process-global environment: it sets, reads, and
 /// clears in one body so nothing else can observe a half-built config.

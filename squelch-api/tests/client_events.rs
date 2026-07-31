@@ -10,13 +10,14 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use squelch_api::{ApiState, router};
+use squelch_api::router;
 use squelch_core::store::{NewEvent, SqliteStore, Store};
 use squelch_core::types::{EventKind, Tier};
 use tokio::sync::{broadcast, watch};
 use tower::ServiceExt;
 
-const TOKEN: &str = "test-secret-token";
+mod common;
+use common::{authed, state_with};
 
 /// How long a read waits before the test calls the stream hung.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -56,30 +57,17 @@ fn event_for(account_id: i64, message_id: i64) -> NewEvent {
 /// The production wiring: one broadcast sender attached to BOTH the store and
 /// the state, plus the shutdown watch squelchd hands the human door.
 fn harness(seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let acct = store.ensure_account("me@example.com").unwrap();
-    seed(&store, acct);
+    let (state, store, acct) = state_with(seed);
     let (event_tx, _) = broadcast::channel::<i64>(256);
     store.attach_event_notifier(event_tx.clone()).unwrap();
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let state = ApiState::new(store.clone(), acct, TOKEN)
-        .unwrap()
-        .with_event_notifier(event_tx)
-        .with_shutdown(shutdown_rx);
+    let state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
     Harness {
         app: router(state),
         store,
         acct,
         shutdown,
     }
-}
-
-fn authed(uri: &str) -> Request<Body> {
-    Request::builder()
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-        .body(Body::empty())
-        .unwrap()
 }
 
 /// One parsed SSE frame.
@@ -180,7 +168,7 @@ impl Reader {
 
 /// Open the SSE stream and assert the response envelope.
 async fn open(h: &Harness, uri: &str) -> Reader {
-    let resp = h.app.clone().oneshot(authed(uri)).await.unwrap();
+    let resp = h.app.clone().oneshot(authed("GET", uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
     assert!(ct.starts_with("text/event-stream"), "content-type was {ct}");
@@ -234,7 +222,7 @@ async fn event_by_id_round_trips() {
     let resp = h
         .app
         .clone()
-        .oneshot(authed(&format!("/client/events/{id}")))
+        .oneshot(authed("GET", &format!("/client/events/{id}")))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -255,7 +243,7 @@ async fn event_by_id_round_trips() {
 #[tokio::test]
 async fn unknown_event_id_is_404() {
     let h = harness(|_, _| {});
-    let resp = h.app.clone().oneshot(authed("/client/events/999999")).await.unwrap();
+    let resp = h.app.clone().oneshot(authed("GET", "/client/events/999999")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -269,7 +257,7 @@ async fn another_accounts_event_is_404() {
     let resp = h
         .app
         .clone()
-        .oneshot(authed(&format!("/client/events/{theirs}")))
+        .oneshot(authed("GET", &format!("/client/events/{theirs}")))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -361,12 +349,10 @@ async fn replay_then_live_on_one_connection() {
 async fn live_works_off_a_store_attached_notifier_alone() {
     // Half-wired: the notifier is on the store but never reached the state, so
     // the handler falls back to the store's.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let acct = store.ensure_account("me@example.com").unwrap();
+    let (state, store, acct) = state_with(|_, _| {});
     let (event_tx, _) = broadcast::channel::<i64>(16);
     store.attach_event_notifier(event_tx).unwrap();
     let (shutdown, _shutdown_rx) = watch::channel(false);
-    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
     let h = Harness {
         app: router(state),
         store,
@@ -384,10 +370,7 @@ async fn live_works_off_a_store_attached_notifier_alone() {
 async fn no_notifier_at_all_still_replays_and_holds_the_connection() {
     // Nothing in the process can append events, so parking is correct — the
     // stream must NOT report end-of-stream the moment it opens.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let acct = store.ensure_account("me@example.com").unwrap();
-    let seeded = store.append_event(&event_for(acct, 1)).unwrap().unwrap();
-    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
+    let (state, store, acct) = state_with(|_, _| {});
     let (shutdown, _rx) = watch::channel(false);
     let h = Harness {
         app: router(state),
@@ -395,6 +378,8 @@ async fn no_notifier_at_all_still_replays_and_holds_the_connection() {
         acct,
         shutdown,
     };
+    // No notifier anywhere: this append can only be seen by the replay drain.
+    let seeded = h.emit(1);
 
     let mut r = open(&h, "/client/events?after=0").await;
     assert_eq!(r.next().await.json()["id"], seeded);

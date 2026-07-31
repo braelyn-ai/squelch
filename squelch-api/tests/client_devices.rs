@@ -4,46 +4,20 @@
 //! so a second POST lands on the same row) and not leaking capability material:
 //! no response echoes the token, and no token appears in a URL path.
 
-use std::sync::Arc;
-
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, Uri, header};
-use http_body_util::BodyExt;
+use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use squelch_api::{ApiState, router};
-use squelch_core::store::{SqliteStore, Store};
+use squelch_core::store::Store;
 use tower::ServiceExt;
 
-const TOKEN: &str = "test-secret-token";
+mod common;
+use common::{authed, body_json, harness, json_request};
+
 const DEV_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
 const DEV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2";
 
-struct Harness {
-    app: axum::Router,
-    store: Arc<SqliteStore>,
-    acct: i64,
-}
-
-fn harness() -> Harness {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let acct = store.ensure_account("me@example.com").unwrap();
-    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
-    Harness {
-        app: router(state),
-        store,
-        acct,
-    }
-}
-
 fn post(uri: &str, body: Value, bearer: bool) -> Request<Body> {
-    let mut b = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json");
-    if bearer {
-        b = b.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
-    }
-    b.body(Body::from(body.to_string())).unwrap()
+    json_request("POST", uri, &body, bearer)
 }
 
 /// Unregister: the token rides in the BODY. Moving it to a `{token}` path
@@ -56,16 +30,11 @@ fn unregister(token: &str, bearer: bool) -> Request<Body> {
     )
 }
 
-async fn body_json(resp: axum::response::Response) -> Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-}
-
 /// The bearer layer covers these routes like every other `/client/*` route —
 /// nothing is ever mounted outside it.
 #[tokio::test]
 async fn registration_requires_the_bearer() {
-    let h = harness();
+    let h = harness(|_, _| {});
 
     let resp = h
         .app
@@ -91,7 +60,7 @@ async fn registration_requires_the_bearer() {
 /// row WITHOUT echoing the token.
 #[tokio::test]
 async fn register_then_unregister_round_trips() {
-    let h = harness();
+    let h = harness(|_, _| {});
 
     let resp = h
         .app
@@ -152,7 +121,7 @@ async fn register_then_unregister_round_trips() {
 /// route.
 #[tokio::test]
 async fn the_token_travels_in_the_body_not_the_path() {
-    let h = harness();
+    let h = harness(|_, _| {});
     h.store.upsert_device(h.acct, DEV_A, "ios").unwrap();
 
     // The request line of the real call mentions no token at all.
@@ -167,13 +136,7 @@ async fn the_token_travels_in_the_body_not_the_path() {
 
     // A token in the path is a 405/404, never a working endpoint.
     h.store.upsert_device(h.acct, DEV_A, "ios").unwrap();
-    let uri: Uri = format!("/client/devices/{DEV_A}").parse().unwrap();
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-        .body(Body::empty())
-        .unwrap();
+    let req = authed("DELETE", &format!("/client/devices/{DEV_A}"));
     let resp = h.app.oneshot(req).await.unwrap();
     assert!(
         resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
@@ -191,7 +154,7 @@ async fn the_token_travels_in_the_body_not_the_path() {
 /// the one row — otherwise one device slowly becomes a hundred push targets.
 #[tokio::test]
 async fn re_registration_is_idempotent() {
-    let h = harness();
+    let h = harness(|_, _| {});
 
     let first = h
         .app
@@ -225,7 +188,7 @@ async fn re_registration_is_idempotent() {
 /// reject fails at registration instead of silently at push time.
 #[tokio::test]
 async fn a_token_the_relay_would_reject_is_refused_here() {
-    let h = harness();
+    let h = harness(|_, _| {});
 
     for bad in [
         json!({ "token": "abc" }),           // too short

@@ -10,58 +10,15 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use squelch_api::{ApiState, router};
 use squelch_core::store::{SqliteStore, Store};
-use squelch_core::types::{NewMessage, SealedKind, Sensitivity, Tier};
+use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
-const TOKEN: &str = "test-secret-token";
-
-fn msg(account_id: i64, gmail: &str, thread: &str, subject: &str, body: &str) -> NewMessage {
-    NewMessage {
-        account_id,
-        gmail_msg_id: gmail.to_string(),
-        thread_id: thread.to_string(),
-        from_addr: "alice@example.com".to_string(),
-        from_name: Some("Alice".to_string()),
-        subject: subject.to_string(),
-        received_at: chrono::Utc::now(),
-        snippet: subject.to_string(),
-        body: body.to_string(),
-        body_html: None,
-        is_sent: false,
-        list_unsubscribe: None,
-        list_unsub_one_click: false,
-    }
-}
-
-/// Build state + router over an in-memory store seeded by `seed`.
-fn app_with(seed: impl FnOnce(&SqliteStore, i64)) -> (axum::Router, Arc<SqliteStore>, i64) {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let acct = store.ensure_account("me@example.com").unwrap();
-    seed(&store, acct);
-    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
-    (router(state), store, acct)
-}
-
-fn authed(method: &str, uri: &str) -> Request<Body> {
-    Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
-async fn body_json(resp: axum::response::Response) -> Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    if bytes.is_empty() {
-        return Value::Null;
-    }
-    serde_json::from_slice(&bytes).unwrap()
-}
+mod common;
+use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg};
 
 #[tokio::test]
 async fn missing_token_is_401() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let req = Request::builder()
         .uri("/client/stats")
         .body(Body::empty())
@@ -72,7 +29,7 @@ async fn missing_token_is_401() {
 
 #[tokio::test]
 async fn wrong_token_is_401() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let req = Request::builder()
         .uri("/client/stats")
         .header(header::AUTHORIZATION, "Bearer nope")
@@ -84,7 +41,7 @@ async fn wrong_token_is_401() {
 
 #[tokio::test]
 async fn good_token_is_200() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -99,7 +56,7 @@ async fn state_refuses_empty_token() {
 
 #[tokio::test]
 async fn search_excludes_sealed() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         // Normal message mentioning "verification"...
         let n = store
             .upsert_message(&msg(acct, "g1", "t1", "Your account verification steps", "hello"))
@@ -142,7 +99,7 @@ async fn search_excludes_sealed() {
 #[tokio::test]
 async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
     use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         let mid = store.upsert_message(&msg(acct, "g1", "t1", "shipped", "b")).unwrap();
         // One en-route (shipped) and one delivered.
         store
@@ -201,7 +158,7 @@ async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
 #[tokio::test]
 async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::ReceiptInfo;
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let m1 = store.upsert_message(&msg(acct, "g1", "t1", "receipt a", "b")).unwrap();
         let m2 = store.upsert_message(&msg(acct, "g2", "t2", "receipt b", "b")).unwrap();
         // Older, then newer — expect newest-first ordering on read.
@@ -251,7 +208,7 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
 
 #[tokio::test]
 async fn retriage_route_exists_resets_and_audits() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
         store
             .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
@@ -299,7 +256,7 @@ async fn retriage_route_exists_resets_and_audits() {
 #[tokio::test]
 async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::store::BankingApplied;
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let m1 = store.upsert_message(&msg(acct, "g1", "t1", "statement", "b")).unwrap();
         let m2 = store.upsert_message(&msg(acct, "g2", "t2", "alert", "b")).unwrap();
         // Older statement, then newer alert -> expect newest-first ordering.
@@ -364,7 +321,7 @@ async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
 #[tokio::test]
 async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::{CalendarInfo, CalendarKind};
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let m1 = store.upsert_message(&msg(acct, "g1", "t1", "invite", "b")).unwrap();
         let m2 = store.upsert_message(&msg(acct, "g2", "t2", "cancel", "b")).unwrap();
         let m3 = store.upsert_message(&msg(acct, "g3", "t3", "old", "b")).unwrap();
@@ -480,7 +437,7 @@ async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
 /// A garbage `mode` value is a 400.
 #[tokio::test]
 async fn search_bad_mode_is_400() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let n = store
             .upsert_message(&msg(acct, "g1", "t1", "hello world", "body"))
             .unwrap();
@@ -499,7 +456,7 @@ async fn search_bad_mode_is_400() {
 /// the kind actually run — never erroring the caller.
 #[tokio::test]
 async fn search_semantic_without_vectors_falls_back_to_keyword() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let n = store
             .upsert_message(&msg(acct, "g1", "t1", "quarterly report attached", "body"))
             .unwrap();
@@ -579,7 +536,7 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
 
 #[tokio::test]
 async fn reveal_writes_audit_and_returns_body() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         let s = store
             .upsert_message(&msg(acct, "g1", "t1", "code", "your code is 987654"))
             .unwrap();
@@ -620,7 +577,7 @@ async fn reveal_writes_audit_and_returns_body() {
 
 #[tokio::test]
 async fn sealed_list_has_no_bodies() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let s = store
             .upsert_message(&msg(acct, "g1", "t1", "code", "secret body 111"))
             .unwrap();
@@ -650,7 +607,7 @@ async fn sealed_list_has_no_bodies() {
 
 #[tokio::test]
 async fn pagination_cursor_round_trip() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         // 3 normal signal messages so limit=2 yields a next_cursor.
         for i in 0..3 {
             let g = format!("g{i}");
@@ -685,7 +642,7 @@ async fn pagination_cursor_round_trip() {
 
 #[tokio::test]
 async fn bad_cursor_is_400() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let resp = app
         .oneshot(authed("GET", "/client/updates?cursor=@@notbase64@@"))
         .await
@@ -693,21 +650,10 @@ async fn bad_cursor_is_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// Build an authed POST with a JSON body.
-fn authed_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
-}
-
 #[tokio::test]
 async fn action_requires_confirm() {
     // The confirm gate fires before anything else.
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -727,7 +673,7 @@ async fn action_requires_confirm() {
 #[tokio::test]
 async fn action_without_write_credential_is_403() {
     // Confirmed, but no write credential configured => 403 with a hint.
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let m = store
             .upsert_message(&msg(acct, "g1", "t1", "hi", "body"))
             .unwrap();
@@ -750,7 +696,7 @@ async fn action_without_write_credential_is_403() {
 
 #[tokio::test]
 async fn send_outbound_guard_blocks_and_audits() {
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -781,7 +727,7 @@ async fn send_outbound_guard_blocks_and_audits() {
 async fn send_guard_override_passes_guard_then_403_no_creds() {
     // override_guard bypasses the guard, then the 403 gate stops it. Two audit
     // rows: the override note and the no-credential rejection.
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -810,7 +756,7 @@ async fn send_guard_override_passes_guard_then_403_no_creds() {
 async fn clean_send_passes_guard() {
     // A clean body clears the guard; the 403 for missing creds proves it did
     // not block.
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -875,23 +821,21 @@ async fn mock_gmail(n: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) 
     (format!("http://{addr}"), handle)
 }
 
-fn app_with_writes(
-    base: String,
-    seed: impl FnOnce(&SqliteStore, i64),
-) -> (axum::Router, Arc<SqliteStore>, i64) {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let acct = store.ensure_account("me@example.com").unwrap();
-    seed(&store, acct);
-    let state = ApiState::new(store.clone(), acct, TOKEN)
-        .unwrap()
-        .with_write_test_harness(Arc::new(StubCreds), base);
-    (router(state), store, acct)
+/// The default harness plus a write credential pointed at a mock Gmail `base`.
+fn app_with_writes(base: String, seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
+    let (state, store, acct) = common::state_with(seed);
+    let state = state.with_write_test_harness(Arc::new(StubCreds), base);
+    Harness {
+        app: router(state),
+        store,
+        acct,
+    }
 }
 
 #[tokio::test]
 async fn archive_success_audits_ok_and_hits_gmail() {
     let (base, handle) = mock_gmail(1).await;
-    let (app, store, acct) = app_with_writes(base, |store, acct| {
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let m = store
             .upsert_message(&msg(acct, "gmail-abc", "t1", "hi", "body"))
             .unwrap();
@@ -927,7 +871,7 @@ async fn action_on_sealed_message_is_404() {
     // A sealed message is invisible to actions: 404, and no Gmail call at all —
     // the write path can never touch sealed mail.
     let (base, handle) = mock_gmail(0).await;
-    let (app, store, acct) = app_with_writes(base, |store, acct| {
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let s = store
             .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
             .unwrap();
@@ -965,7 +909,7 @@ async fn action_on_sealed_message_is_404() {
 async fn reply_send_success_threads_and_audits_ok() {
     // Reply flow makes two Gmail calls: parent_headers GET, then send POST.
     let (base, handle) = mock_gmail(2).await;
-    let (app, store, acct) = app_with_writes(base, |store, acct| {
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let m = store
             .upsert_message(&msg(acct, "gmail-parent", "thread-77", "Lunch?", "want lunch?"))
             .unwrap();
@@ -1019,7 +963,7 @@ fn seed_one_signal(store: &SqliteStore, acct: i64, gmail: &str, thread: &str, su
 
 #[tokio::test]
 async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         seed_one_signal(store, acct, "g1", "t1", "hi");
     });
 
@@ -1061,7 +1005,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
 #[tokio::test]
 async fn updates_carry_field_reasons_object() {
     use squelch_core::types::FieldReasons;
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let id = seed_one_signal(store, acct, "g1", "t1", "hi");
         store
             .set_field_reasons(
@@ -1093,7 +1037,7 @@ async fn updates_carry_field_reasons_object() {
 async fn updates_without_reasons_omit_the_field_reasons_key() {
     // A row with no recorded reasons omits the key entirely — the desktop
     // treats absent the same as null.
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         seed_one_signal(store, acct, "g1", "t1", "hi");
     });
     let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
@@ -1107,7 +1051,7 @@ async fn updates_without_reasons_omit_the_field_reasons_key() {
 
 #[tokio::test]
 async fn band_query_filters_server_side() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         // A past_due bill (standing) plus a plain signal.
         let bill = store
             .upsert_message(&msg(acct, "g1", "t1", "PG&E past due", "pay"))
@@ -1132,7 +1076,7 @@ async fn band_query_filters_server_side() {
 
 #[tokio::test]
 async fn bad_band_and_status_are_400() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let r1 = app
         .clone()
         .oneshot(authed("GET", "/client/updates?band=bogus"))
@@ -1148,7 +1092,7 @@ async fn bad_band_and_status_are_400() {
 
 #[tokio::test]
 async fn dismiss_and_reopen_endpoint() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         seed_one_signal(store, acct, "g1", "t1", "hi");
     });
     let id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
@@ -1188,7 +1132,7 @@ async fn dismiss_and_reopen_endpoint() {
 
 #[tokio::test]
 async fn dismiss_unknown_message_is_404() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -1203,7 +1147,7 @@ async fn dismiss_unknown_message_is_404() {
 #[tokio::test]
 async fn dismiss_sealed_message_is_404() {
     // A sealed row must be invisible to the status endpoint.
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         let s = store
             .upsert_message(&msg(acct, "g1", "t1", "code", "123456"))
             .unwrap();
@@ -1228,7 +1172,7 @@ async fn dismiss_sealed_message_is_404() {
 #[tokio::test]
 async fn archive_success_resolves_target_to_done() {
     let (base, handle) = mock_gmail(1).await;
-    let (app, store, acct) = app_with_writes(base, |store, acct| {
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         seed_one_signal(store, acct, "gmail-abc", "t1", "hi");
     });
     let message_id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
@@ -1255,7 +1199,7 @@ async fn archive_success_resolves_target_to_done() {
 
 #[tokio::test]
 async fn update_rule_edits_in_place_and_404s_bogus() {
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
 
     let resp = app
         .clone()
@@ -1322,7 +1266,7 @@ async fn update_rule_edits_in_place_and_404s_bogus() {
 
 #[tokio::test]
 async fn rule_mutations_write_audit_rows() {
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
 
     // POST => rule.create, target = match_pattern.
     let resp = app
@@ -1379,7 +1323,7 @@ async fn rule_mutations_write_audit_rows() {
 #[tokio::test]
 async fn failed_rule_mutations_write_no_audit_row() {
     // A 404 (unknown id) on PUT/DELETE changed nothing, so it writes no row.
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
 
     let resp = app
         .clone()
@@ -1409,7 +1353,7 @@ async fn failed_rule_mutations_write_no_audit_row() {
 async fn stats_expose_stage2_usage_and_cost() {
     // Cost comes from the default Stage-2 per-MTok prices (3.0 in / 15.0 out).
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let (app, _s, _a) = app_with(move |store, acct| {
+    let Harness { app, .. } = harness(move |store, acct| {
         // 2 calls: 1_000_000 in, 200_000 out.
         store.stage2_bump_usage(acct, &day, 600_000, 100_000).unwrap();
         store.stage2_bump_usage(acct, &day, 400_000, 100_000).unwrap();
@@ -1430,7 +1374,7 @@ async fn stats_expose_stage2_usage_and_cost() {
 #[tokio::test]
 async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // Newest-first daily rows, totals costed at the default 3.0 in / 15.0 out.
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         store.stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000).unwrap();
         store.stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000).unwrap();
     });
@@ -1474,7 +1418,7 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
 
 #[tokio::test]
 async fn stats_expose_bands_and_last_surfaced_at() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let bill = store
             .upsert_message(&msg(acct, "g1", "t1", "bill due", "pay"))
             .unwrap();
@@ -1512,7 +1456,7 @@ async fn stats_expose_bands_and_last_surfaced_at() {
 
 #[tokio::test]
 async fn thread_response_carries_html_field() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         // One HTML message and one plain-text message in the same thread.
         let mut html_msg = msg(acct, "g-html", "t-html", "Newsletter", "flattened text");
         html_msg.body_html = Some("<p>Hello <strong>world</strong></p>".to_string());
@@ -1571,7 +1515,7 @@ fn seed_unsub_msg(
 async fn unsubscribe_returns_first_http_url_and_records_and_audits() {
     // The server returns the first http(s) URL for the client to open; it makes
     // no outbound request. A mailto ahead of the URL is skipped.
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         seed_unsub_msg(
             store,
             acct,
@@ -1609,7 +1553,7 @@ async fn unsubscribe_returns_first_http_url_and_records_and_audits() {
 
 #[tokio::test]
 async fn unsubscribe_browser_returns_url_and_does_not_fetch() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<https://sub.com/u/9>"), false);
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
@@ -1630,7 +1574,7 @@ async fn unsubscribe_browser_returns_url_and_does_not_fetch() {
 async fn unsubscribe_mailto_only_is_422() {
     // A mailto-only List-Unsubscribe has no http(s) link => 422; the server never
     // sends anything.
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<mailto:unsub@sub.com?subject=Bye>"), false);
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
@@ -1645,7 +1589,7 @@ async fn unsubscribe_mailto_only_is_422() {
 
 #[tokio::test]
 async fn unsubscribe_no_info_is_422() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         seed_unsub_msg(store, acct, "g1", "news@sub.com", None, false);
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
@@ -1658,7 +1602,7 @@ async fn unsubscribe_no_info_is_422() {
 
 #[tokio::test]
 async fn unsubscribe_unknown_and_sealed_are_404() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         // A sealed message that (defensively) carries an unsub header.
         let s = store
             .upsert_message(&{
@@ -1691,7 +1635,7 @@ async fn unsubscribe_unknown_and_sealed_are_404() {
 
 #[tokio::test]
 async fn list_unsubscribes_newest_first_and_bearer_gated() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         store
             .upsert_unsubscribe(acct, "old@x.com", "browser", None, chrono::Utc::now() - chrono::Duration::hours(3))
             .unwrap();
@@ -1719,7 +1663,7 @@ async fn list_unsubscribes_newest_first_and_bearer_gated() {
 
 #[tokio::test]
 async fn unsubscribe_resolution_sets_blocked_and_404s_unknown_and_400s_bad_value() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         store
             .upsert_unsubscribe(acct, "news@x.com", "browser", None, chrono::Utc::now())
             .unwrap();
@@ -1769,7 +1713,7 @@ async fn unsubscribe_resolution_sets_blocked_and_404s_unknown_and_400s_bad_value
 
 #[tokio::test]
 async fn thread_sealed_is_not_found_even_with_html() {
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         let mut sealed = msg(acct, "g-otp", "t-sealed", "verification code", "123456");
         sealed.body_html = Some("<p>code 123456</p>".to_string());
         let s = store.upsert_message(&sealed).unwrap();
@@ -1802,7 +1746,7 @@ async fn triage_config_get_default_shape() {
     // With no override rows and a default state, GET reports the built-in default
     // caps, all sources "default", the price fields, and null tokens/call (the
     // usage ledger is empty).
-    let (app, _s, _a) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let resp = app
         .oneshot(authed("GET", "/client/triage-config"))
         .await
@@ -1843,7 +1787,7 @@ async fn triage_config_get_default_shape() {
 
 #[tokio::test]
 async fn triage_config_post_persists_stage1_global_cap_override() {
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -1864,7 +1808,7 @@ async fn triage_config_post_persists_stage1_global_cap_override() {
 
 #[tokio::test]
 async fn triage_config_post_rejects_out_of_range_stage1_cap() {
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -1881,7 +1825,7 @@ async fn triage_config_post_rejects_out_of_range_stage1_cap() {
 async fn triage_config_get_computes_trailing_averages() {
     // Seed 4 recent inbound messages + a usage ledger day, and confirm the
     // trailing-14d averages and per-call token means.
-    let (app, _s, _a) = app_with(|store, acct| {
+    let Harness { app, .. } = harness(|store, acct| {
         for i in 0..4 {
             let m = msg(acct, &format!("g{i}"), &format!("t{i}"), "hi", "body");
             store.upsert_message(&m).unwrap();
@@ -1908,7 +1852,7 @@ async fn triage_config_get_computes_trailing_averages() {
 
 #[tokio::test]
 async fn triage_config_post_persists_override_and_reports_it() {
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
     // Set thread + global (omit sender — subset allowed).
     let resp = app
         .oneshot(authed_json(
@@ -1939,7 +1883,7 @@ async fn triage_config_post_persists_override_and_reports_it() {
 
 #[tokio::test]
 async fn triage_config_post_rejects_out_of_range_and_non_integer() {
-    let (app, store, acct) = app_with(|_, _| {});
+    let Harness { app, store, acct } = harness(|_, _| {});
 
     // Zero is below the min.
     let resp = app
@@ -1998,7 +1942,7 @@ fn header_str(resp: &axum::response::Response, name: header::HeaderName) -> Stri
 
 #[tokio::test]
 async fn thread_carries_attachment_metadata_and_empty_when_none() {
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         // Thread t1: one message with a stored pdf + an over-cap (NULL data) part.
         let m1 = store.upsert_message(&msg(acct, "g1", "t1", "s1", "b1")).unwrap();
         store
@@ -2045,7 +1989,7 @@ async fn attachment_bytes_headers_apply_render_safety_whitelist() {
     // Seed one attachment of each interesting mime; ids come back in insert order.
     let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i64, &'static str)>::new()));
     let ids_seed = ids.clone();
-    let (app, _store, _acct) = app_with(move |store, acct| {
+    let Harness { app, .. } = harness(move |store, acct| {
         let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
         store
             .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
@@ -2141,7 +2085,7 @@ async fn attachment_bytes_headers_apply_render_safety_whitelist() {
 async fn attachment_filename_is_sanitized_in_disposition() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
-    let (app, _store, _acct) = app_with(move |store, acct| {
+    let Harness { app, .. } = harness(move |store, acct| {
         let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
         store
             .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
@@ -2174,7 +2118,7 @@ async fn attachment_filename_is_sanitized_in_disposition() {
 async fn attachment_over_cap_is_410() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
-    let (app, _store, _acct) = app_with(move |store, acct| {
+    let Harness { app, .. } = harness(move |store, acct| {
         let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
         store
             .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
@@ -2196,7 +2140,7 @@ async fn attachment_over_cap_is_410() {
 async fn attachment_on_sealed_parent_is_404() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
-    let (app, _store, _acct) = app_with(move |store, acct| {
+    let Harness { app, .. } = harness(move |store, acct| {
         let m = store.upsert_message(&msg(acct, "g1", "t1", "code", "secret")).unwrap();
         store
             .set_triage(
@@ -2233,7 +2177,7 @@ async fn attachment_on_sealed_parent_is_404() {
 
 #[tokio::test]
 async fn attachment_requires_bearer_auth() {
-    let (app, _store, _acct) = app_with(|_, _| {});
+    let Harness { app, .. } = harness(|_, _| {});
     let req = Request::builder()
         .uri("/client/attachments/1")
         .body(Body::empty())
@@ -2245,7 +2189,7 @@ async fn attachment_requires_bearer_auth() {
 #[tokio::test]
 async fn triage_feedback_round_trip_records_and_audits() {
     let mut mid = 0;
-    let (app, store, acct) = app_with(|store, acct| {
+    let Harness { app, store, acct } = harness(|store, acct| {
         let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
         store
             .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
