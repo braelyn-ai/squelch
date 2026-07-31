@@ -36,8 +36,8 @@ struct RootView: View {
                 // list lives in the store, so fetching it now means opening the
                 // page lands on rows instead of on "loading mail…". This also
                 // warms the head rows' threads, so the first click reads from
-                // cache too.
-                Task { await store.refreshMail() }
+                // cache too. The inbox only — the noise page is a place you go.
+                Task { await store.refreshMail(.inbox) }
             } else {
                 SitrepPoller.shared.stop()
                 EventStream.shared.stop()

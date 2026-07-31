@@ -340,7 +340,13 @@ struct NewslettersZone: View {
         // missing feature, not as "nothing this week".
         ZoneCard(
             symbol: "envelope.open", title: "Newsletters", count: newsletters.count,
-            subtitle: "recurring noise · choose what you want"
+            subtitle: "recurring noise · choose what you want",
+            // This zone is a WEEK of RECURRING senders; the rest of the noise has
+            // no other door on the dashboard.
+            trailing: AnyView(
+                ChromeChip(text: "all noise", help: "the emails tab's noise page") {
+                    store.openMail(.noise)
+                })
         ) {
             if newsletters.isEmpty {
                 EmptyNote("No recurring senders this week.")

@@ -3,6 +3,10 @@
 // the row optimistically here because the action layer only removes it from the
 // sitrep bands. No persistent selection — the highlight renders only while the
 // keyboard drives, and action keys are inert without kbActive or a live hover.
+//
+// TWO PAGES, one list: the inbox and the noise bin (`n`, or the header's noise
+// count). Only the DATA SOURCE differs — every verb, the queue handed to the
+// reader and the cursor behave identically on noise rows.
 
 import SwiftUI
 
@@ -15,11 +19,15 @@ struct EmailsView: View {
     /// True only while the cursor is actually over a row.
     @State private var hovering = false
 
+    private var mode: MailMode { store.mailMode }
+    /// The cached page for whichever mode is showing.
+    private var page: Loadable<[AttentionUpdate]> { store.mailPage(mode) }
+
     /// The cached page MINUS anything resolved since it was fetched: the page
     /// only reloads on the 10s `store.lastRefresh` poll, so without this filter
     /// mail finished from the reader sits here visibly undone until the next tick.
     private var rows: [AttentionUpdate] {
-        (store.mail.value ?? []).filter { !store.resolvedIds.contains($0.id) }
+        (page.value ?? []).filter { !store.resolvedIds.contains($0.id) }
     }
     private var selected: AttentionUpdate? { rows[safe: index] }
     /// Action keys are inert unless something is actually highlighted.
@@ -35,12 +43,14 @@ struct EmailsView: View {
                         // keeps the last page on screen, so a revisit — or a
                         // failure while offline — updates underneath what you are
                         // already reading instead of replacing it with a word.
-                        if let error = store.mail.error, store.mail.value == nil {
+                        if let error = page.error, page.value == nil {
                             BandNote(error)
-                        } else if store.mail.value == nil {
-                            BandNote("loading mail…")
+                        } else if page.value == nil {
+                            BandNote(mode == .noise ? "loading noise…" : "loading mail…")
                         } else if rows.isEmpty {
-                            BandNote("No mail.")
+                            // The window the daemon answers with is 30 days, so an
+                            // empty noise page says so rather than implying "ever".
+                            BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
                         } else {
                             ForEach(Array(rows.enumerated()), id: \.element.id) { i, u in
                                 UpdateRow(
@@ -74,10 +84,13 @@ struct EmailsView: View {
             }
         }
         .keyBindings(.list, bindings)
-        // Fires on mount AND on each 10s poll. The store's short TTL is what
-        // makes the mount half free when a tick just landed; the tick half always
-        // outruns it and refreshes for real.
-        .task(id: store.lastRefresh) { await store.refreshMail() }
+        // Fires on mount, on each 10s poll AND on a mode switch — only the page
+        // being shown is refreshed, so the noise page costs nothing until you go
+        // there. The store's short TTL is what makes the mount half free when a
+        // tick just landed; the tick half always outruns it and refreshes for real.
+        .task(id: RefreshKey(tick: store.lastRefresh, mode: mode)) {
+            await store.refreshMail(mode)
+        }
         // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
         // a 500-row list fires one request for the row you stop on rather than
         // one per row you pass. Covers everything past the bounded head-warm.
@@ -90,6 +103,13 @@ struct EmailsView: View {
         .onChange(of: rows.count) { _, count in
             index = max(0, min(index, count - 1))
         }
+        // A mode switch replaces every row, so the cursor cannot keep its index —
+        // it would land on an unrelated email, and the verbs act on the highlight.
+        .onChange(of: mode) { _, _ in
+            index = 0
+            kbActive = false
+            hovering = false
+        }
         // Jump to (and highlight) a hand-off target from the sitrep rails.
         .onChange(of: store.selectedId) { _, id in
             guard let id, let i = rows.firstIndex(where: { $0.id == id }) else { return }
@@ -101,6 +121,7 @@ struct EmailsView: View {
     // MARK: - header
 
     private var header: some View {
+        @Bindable var store = store
         let signal = store.sitrep.standing.count + store.sitrep.new.count + store.sitrep.open.count
         let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
 
@@ -109,17 +130,33 @@ struct EmailsView: View {
                 Text("squelch")
                     .font(Typo.serif(19, weight: .medium))
                     .foregroundStyle(Palette.ink)
-                Text("all mail")
+                // The page you are on, not the tab's name.
+                Text(mode.label)
                     .font(Typo.micro)
                     .foregroundStyle(Palette.inkFaintest)
                     .textCase(.uppercase)
             }
+            GlassSegmented(
+                options: MailMode.allCases.map { ($0, $0.label) },
+                selection: $store.mailMode)
             Spacer(minLength: 12)
             HStack(spacing: 8) {
                 Text("\(signal)").font(Typo.num(12, weight: .bold)).foregroundStyle(Palette.accent)
                 Text("signal").font(Typo.micro).foregroundStyle(Palette.inkFaint)
-                Text("\(noise)").font(Typo.num(12, weight: .bold)).foregroundStyle(Palette.inkFaint)
-                Text("noise").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                // The count is the door to the page it counts. A jump, not a
+                // toggle: `n` and the segments are the way back.
+                Button { store.mailMode = .noise } label: {
+                    HStack(spacing: 8) {
+                        Text("\(noise)")
+                            .font(Typo.num(12, weight: .bold))
+                            .foregroundStyle(mode == .noise ? Palette.accent : Palette.inkFaint)
+                        Text("noise").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    }
+                    // The number and the word are one target, gap included.
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("the noise page — everything triage filed as noise (n)")
                 if let err = store.refreshError {
                     Text("· offline")
                         .font(Typo.micro).foregroundStyle(Palette.warn)
@@ -163,7 +200,19 @@ struct EmailsView: View {
             KeyBinding("k", "prev") { moveByKey(-1) },
             KeyBinding("ArrowDown", "next") { moveByKey(+1) },
             KeyBinding("ArrowUp", "prev") { moveByKey(-1) },
-            KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) },
+            // A LADDER, the same shape as the reader closing over a still-open
+            // side panel: from the noise page Escape steps back to the inbox, and
+            // only a second press leaves the tab.
+            KeyBinding("Escape", "back") {
+                if mode == .noise {
+                    store.mailMode = .inbox
+                } else {
+                    store.setView(.sitrep)
+                }
+            },
+            // One key both ways — noise is a page you dip into, not a mode you
+            // have to remember you are in.
+            KeyBinding("n", "noise / back") { store.mailMode = mode.flipped },
             KeyBinding("Enter", "drill in") {
                 guard actionable, let u = selected else { return }
                 // The ordered rows become the viewer's queue, so "done + next"
@@ -192,6 +241,13 @@ struct EmailsView: View {
             KeyBinding("u", "undo") { Task { await store.fireUndo() } },
             // `\` (theme) and `?` (help) are global bindings, not listed here.
         ]
+    }
+
+    /// `.task(id:)` key: a poll tick and a mode switch both have to refetch, and a
+    /// tuple of the two cannot be Hashable.
+    private struct RefreshKey: Hashable {
+        var tick: Date?
+        var mode: MailMode
     }
 
     private func moveByKey(_ delta: Int) {

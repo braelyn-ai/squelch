@@ -57,6 +57,34 @@ struct HistoryEntry: Equatable, Sendable {
 /// Cap the history so a long session can't grow it without bound.
 let historyCap = 50
 
+// MARK: - mail pages
+
+/// Which page the emails tab shows. `inbox` is the flat all-tiers list; `noise`
+/// is the spam-folder equivalent — the same rows and the same verbs, narrowed to
+/// the noise tier BY THE DAEMON so nothing has to be discarded client-side.
+enum MailMode: String, Sendable, Hashable, CaseIterable {
+    case inbox, noise
+
+    /// The page's name — the header title and the segmented control both.
+    var label: String {
+        switch self {
+        case .inbox: "all mail"
+        case .noise: "noise"
+        }
+    }
+
+    /// Server-side tier filter for the page; nil = every tier.
+    var tier: Tier? {
+        switch self {
+        case .inbox: nil
+        case .noise: .noise
+        }
+    }
+
+    /// What `n` flips to, so the key is one binding rather than two.
+    var flipped: MailMode { self == .noise ? .inbox : .noise }
+}
+
 // MARK: - side views
 
 /// The side panels. The thread drill-in is NOT one — it is the fullscreen viewer,
@@ -447,9 +475,19 @@ final class AppStore {
         pushHistory(HistoryEntry(view: view, selectedId: selectedId))
     }
 
+    /// Switch to the Emails view showing one PAGE — the header's noise count and
+    /// the sitrep's noise affordances are both this.
+    func openMail(_ mode: MailMode) {
+        mailMode = mode
+        setView(.emails)
+    }
+
     /// Switch to the Emails view with a specific update selected — the sitrep's
     /// "view" affordances hand off to the band list with the right row focused.
     func viewInEmails(_ id: Int) {
+        // A hand-off always targets a signal row, which the noise page does not
+        // hold: land on the inbox or the highlight would have nothing to find.
+        mailMode = .inbox
         route(to: .emails)
         selectedId = id
         closeThread()
@@ -599,7 +637,7 @@ final class AppStore {
     /// 10s sitrep poll drives the bands, which change minute to minute).
     private static let zoneTTL: TimeInterval = 45
 
-    // MARK: - the flat mail page
+    // MARK: - the flat mail pages
 
     /// One generous page — the read model is local, so this is cheap.
     private static let mailLimit = 500
@@ -611,68 +649,96 @@ final class AppStore {
     /// staleness past it is harmless because a reload keeps the rows on screen.
     private static let mailTTL: TimeInterval = 5
 
-    /// The emails page, HELD HERE RATHER THAN IN THE VIEW. `@State` is discarded
-    /// on navigate-away, so a view-owned list refetched from nothing on every
-    /// visit and showed "loading mail…" over an empty page each time. Held in the
-    /// store it survives navigation, and `Loadable` keeps the last rows through a
-    /// reload, so even a stale revisit paints rows first and updates underneath.
-    private(set) var mail = Loadable<[AttentionUpdate]>.loading
-    private var mailLoadedAt: Date?
-    private var mailRefresh: Task<Void, Never>?
+    /// The emails tab's pages, HELD HERE RATHER THAN IN THE VIEW. `@State` is
+    /// discarded on navigate-away, so a view-owned list refetched from nothing on
+    /// every visit and showed "loading mail…" over an empty page each time. Held in
+    /// the store they survive navigation, and `Loadable` keeps the last rows through
+    /// a reload, so even a stale revisit paints rows first and updates underneath.
+    private var mailPages: [MailMode: Loadable<[AttentionUpdate]>] = [:]
+    /// Which page the emails tab is on. Here for the same reason as the pages
+    /// themselves: a trip to the sitrep and back has to land where you left off.
+    var mailMode: MailMode = .inbox
+    /// Freshness and in-flight fetch, PER PAGE — one shared stamp would let the
+    /// inbox's TTL swallow the noise page's first fetch. Kept out of the
+    /// `Loadable`s, which the list reads: these are bookkeeping, not rows.
+    private var mailLoadedAt: [MailMode: Date] = [:]
+    private var mailRefreshes: [MailMode: Task<Void, Never>] = [:]
+
+    /// One page's rows. Never fetched reads as LOADING, so the first paint of a
+    /// page shows "loading" rather than claiming it is empty.
+    func mailPage(_ mode: MailMode) -> Loadable<[AttentionUpdate]> {
+        mailPages[mode] ?? .loading
+    }
 
     /// Same TTL-plus-join shape as `refreshZones`, for the same reasons: a
     /// revisit inside the window is free, and concurrent callers share one pass
     /// instead of each firing a 500-row fetch.
-    func refreshMail(force: Bool = false) async {
-        if !force, let loadedAt = mailLoadedAt,
+    func refreshMail(_ mode: MailMode, force: Bool = false) async {
+        if !force, let loadedAt = mailLoadedAt[mode],
             Date().timeIntervalSince(loadedAt) < Self.mailTTL
         {
             return
         }
-        if let running = mailRefresh {
+        if let running = mailRefreshes[mode] {
             await running.value
             if !force { return }
         }
-        let refresh = Task { await performMailRefresh() }
-        mailRefresh = refresh
+        let refresh = Task { await performMailRefresh(mode) }
+        mailRefreshes[mode] = refresh
         await refresh.value
-        if mailRefresh == refresh { mailRefresh = nil }
+        if mailRefreshes[mode] == refresh { mailRefreshes[mode] = nil }
     }
 
-    /// Drop a message from the cached page outright. For a resolve that must not
-    /// come back on the next poll's slower truth.
+    /// Drop a message from the cached pages outright. For a resolve that must not
+    /// come back on the next poll's slower truth. EVERY page, not just the one on
+    /// screen: the inbox filters no tier, so a noise row sits in both.
     func removeFromMail(_ messageId: Int) {
-        mail.value?.removeAll { $0.id == messageId }
+        for mode in MailMode.allCases {
+            mailPages[mode]?.value?.removeAll { $0.id == messageId }
+        }
     }
 
-    private func performMailRefresh() async {
-        mail.isLoading = true
+    private func performMailRefresh(_ mode: MailMode) async {
+        withMailPage(mode) { $0.isLoading = true }
         do {
-            let page = try await APIClient.shared.getUpdates(
-                UpdatesParams(limit: Self.mailLimit))
+            let fetched = try await APIClient.shared.getUpdates(
+                UpdatesParams(tier: mode.tier, limit: Self.mailLimit))
             // Done/archived mail leaves the inbox (gmail semantics), which also
             // keeps auto-resolved receipts out — they're rail records, not rows.
             let next =
-                page.items
+                fetched.items
                 .filter { $0.status != .done }
                 .sorted { a, b in
                     let ta = Self.receivedTS(a)
                     let tb = Self.receivedTS(b)
                     return ta != tb ? ta > tb : a.id > b.id
                 }
-            // Only touch the value when the list actually CHANGED: the poll
-            // re-runs this, and an identical assignment re-renders 500 rows.
-            if next != mail.value { mail.value = next }
-            mail.error = nil
-            mailLoadedAt = Date()
+            withMailPage(mode) { page in
+                // Only touch the value when the list actually CHANGED: the poll
+                // re-runs this, and an identical assignment re-renders 500 rows.
+                if next != page.value { page.value = next }
+                page.error = nil
+            }
+            mailLoadedAt[mode] = Date()
             // Pull the head rows' threads before any click, so an open renders
             // from cache. Runs on the launch warm too, not just on a visit.
             ThreadPrefetch.shared.warm(
                 next.prefix(Self.mailWarmRows).map(\.thread_id), immediate: 5)
         } catch {
-            mail.error = errText(error, "load failed")
+            withMailPage(mode) { $0.error = errText(error, "load failed") }
         }
-        mail.isLoading = false
+        withMailPage(mode) { $0.isLoading = false }
+    }
+
+    /// Mutate one page in place. Every call is its own access, which is the point:
+    /// a local copy held across the fetch would write back over a `removeFromMail`
+    /// that landed while the request was in flight.
+    private func withMailPage(
+        _ mode: MailMode, _ mutate: (inout Loadable<[AttentionUpdate]>) -> Void
+    ) {
+        var page = mailPages[mode] ?? .loading
+        mutate(&page)
+        mailPages[mode] = page
     }
 
     /// Epoch for "order received": surfaced_at approximates arrival, and items

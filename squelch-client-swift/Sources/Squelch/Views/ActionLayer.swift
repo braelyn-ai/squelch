@@ -253,6 +253,7 @@ struct ShortcutsOverlay: View {
                 (["⌘["], "back"),
                 (["⌘]"], "forward"),
                 (["a"], "browse all mail"),
+                (["n"], "noise page (and back)"),
                 (["/"], "search"),
                 (["⌘K"], "ask your inbox"),
                 (["⌘,"], "settings"),
