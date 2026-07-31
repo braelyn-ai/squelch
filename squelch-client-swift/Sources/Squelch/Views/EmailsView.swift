@@ -9,26 +9,17 @@ import SwiftUI
 struct EmailsView: View {
     @Environment(AppStore.self) private var store
 
-    /// One generous page — the read model is local, this is cheap.
-    private static let fetchLimit = 500
-    /// How many rows get their thread warmed ahead of any click — a bounded
-    /// prefix, because warming all 500 would stampede the daemon for mail nobody
-    /// scrolls to. Hover warming picks up anything past it.
-    private static let warmRows = 40
-
-    @State private var items: [AttentionUpdate]?
-    @State private var error: String?
     @State private var index = 0
     /// True only while the keyboard is driving the cursor.
     @State private var kbActive = false
     /// True only while the cursor is actually over a row.
     @State private var hovering = false
 
-    /// The local snapshot MINUS anything resolved since it was fetched: `items`
+    /// The cached page MINUS anything resolved since it was fetched: the page
     /// only reloads on the 10s `store.lastRefresh` poll, so without this filter
     /// mail finished from the reader sits here visibly undone until the next tick.
     private var rows: [AttentionUpdate] {
-        (items ?? []).filter { !store.resolvedIds.contains($0.id) }
+        (store.mail.value ?? []).filter { !store.resolvedIds.contains($0.id) }
     }
     private var selected: AttentionUpdate? { rows[safe: index] }
     /// Action keys are inert unless something is actually highlighted.
@@ -40,9 +31,13 @@ struct EmailsView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 1) {
-                        if let error {
+                        // Both notes are gated on having NO rows at all. A reload
+                        // keeps the last page on screen, so a revisit — or a
+                        // failure while offline — updates underneath what you are
+                        // already reading instead of replacing it with a word.
+                        if let error = store.mail.error, store.mail.value == nil {
                             BandNote(error)
-                        } else if items == nil {
+                        } else if store.mail.value == nil {
                             BandNote("loading mail…")
                         } else if rows.isEmpty {
                             BandNote("No mail.")
@@ -79,7 +74,10 @@ struct EmailsView: View {
             }
         }
         .keyBindings(.list, bindings)
-        .task(id: store.lastRefresh) { await load() }
+        // Fires on mount AND on each 10s poll. The store's short TTL is what
+        // makes the mount half free when a tick just landed; the tick half always
+        // outruns it and refreshes for real.
+        .task(id: store.lastRefresh) { await store.refreshMail() }
         // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
         // a 500-row list fires one request for the row you stop on rather than
         // one per row you pass. Covers everything past the bounded head-warm.
@@ -202,44 +200,10 @@ struct EmailsView: View {
     private func resolveSelected() {
         guard actionable, let u = selected else { return }
         Task { await Actions.done(u) }
-        items?.removeAll { $0.id == u.id }
-    }
-
-    // MARK: - data
-
-    /// Epoch for "order received": surfaced_at approximates arrival, and items
-    /// the triage loop hasn't surfaced yet are the newest mail, so they sort to
-    /// the top. Ties (and the nil bucket) break on id, which is ingest order.
-    private static func receivedTS(_ u: AttentionUpdate) -> Double {
-        guard let s = u.surfaced_at else { return .greatestFiniteMagnitude }
-        return Fmt.date(s)?.timeIntervalSince1970 ?? 0
-    }
-
-    private func load() async {
-        do {
-            let page = try await APIClient.shared.getUpdates(
-                UpdatesParams(limit: Self.fetchLimit))
-            // Done/archived mail leaves the inbox (gmail semantics), which also
-            // keeps auto-resolved receipts out — they're rail records, not rows.
-            let next =
-                page.items
-                .filter { $0.status != .done }
-                .sorted { a, b in
-                    let ta = Self.receivedTS(a)
-                    let tb = Self.receivedTS(b)
-                    return ta != tb ? ta > tb : a.id > b.id
-                }
-            // Only touch state when the list actually changed — the 10s poll
-            // re-runs this and an identical assignment would re-render 500 rows.
-            if next != items { items = next }
-            error = nil
-            // Pull the head rows' threads before any click, so an open renders
-            // from cache.
-            ThreadPrefetch.shared.warm(
-                (items ?? []).prefix(Self.warmRows).map(\.thread_id), immediate: 5)
-        } catch {
-            self.error = errText(error, "load failed")
-        }
+        // `rows` already filters on resolvedIds, so the row leaves on the next
+        // frame regardless; this keeps it out of the cached page too, so the
+        // next poll cannot briefly hand it back.
+        store.removeFromMail(u.id)
     }
 }
 

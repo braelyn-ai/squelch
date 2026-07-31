@@ -572,6 +572,90 @@ final class AppStore {
     /// 10s sitrep poll drives the bands, which change minute to minute).
     private static let zoneTTL: TimeInterval = 45
 
+    // MARK: - the flat mail page
+
+    /// One generous page — the read model is local, so this is cheap.
+    private static let mailLimit = 500
+    /// How many rows get their thread warmed ahead of any click. A bounded
+    /// prefix: warming all 500 would stampede the daemon for mail nobody scrolls
+    /// to, and hover warming picks up anything past it.
+    private static let mailWarmRows = 40
+    /// Only long enough to collapse a mount and a poll tick landing together;
+    /// staleness past it is harmless because a reload keeps the rows on screen.
+    private static let mailTTL: TimeInterval = 5
+
+    /// The emails page, HELD HERE RATHER THAN IN THE VIEW. `@State` is discarded
+    /// on navigate-away, so a view-owned list refetched from nothing on every
+    /// visit and showed "loading mail…" over an empty page each time. Held in the
+    /// store it survives navigation, and `Loadable` keeps the last rows through a
+    /// reload, so even a stale revisit paints rows first and updates underneath.
+    private(set) var mail = Loadable<[AttentionUpdate]>.loading
+    private var mailLoadedAt: Date?
+    private var mailRefresh: Task<Void, Never>?
+
+    /// Same TTL-plus-join shape as `refreshZones`, for the same reasons: a
+    /// revisit inside the window is free, and concurrent callers share one pass
+    /// instead of each firing a 500-row fetch.
+    func refreshMail(force: Bool = false) async {
+        if !force, let loadedAt = mailLoadedAt,
+            Date().timeIntervalSince(loadedAt) < Self.mailTTL
+        {
+            return
+        }
+        if let running = mailRefresh {
+            await running.value
+            if !force { return }
+        }
+        let refresh = Task { await performMailRefresh() }
+        mailRefresh = refresh
+        await refresh.value
+        if mailRefresh == refresh { mailRefresh = nil }
+    }
+
+    /// Drop a message from the cached page outright. For a resolve that must not
+    /// come back on the next poll's slower truth.
+    func removeFromMail(_ messageId: Int) {
+        mail.value?.removeAll { $0.id == messageId }
+    }
+
+    private func performMailRefresh() async {
+        mail.isLoading = true
+        do {
+            let page = try await APIClient.shared.getUpdates(
+                UpdatesParams(limit: Self.mailLimit))
+            // Done/archived mail leaves the inbox (gmail semantics), which also
+            // keeps auto-resolved receipts out — they're rail records, not rows.
+            let next =
+                page.items
+                .filter { $0.status != .done }
+                .sorted { a, b in
+                    let ta = Self.receivedTS(a)
+                    let tb = Self.receivedTS(b)
+                    return ta != tb ? ta > tb : a.id > b.id
+                }
+            // Only touch the value when the list actually CHANGED: the poll
+            // re-runs this, and an identical assignment re-renders 500 rows.
+            if next != mail.value { mail.value = next }
+            mail.error = nil
+            mailLoadedAt = Date()
+            // Pull the head rows' threads before any click, so an open renders
+            // from cache. Runs on the launch warm too, not just on a visit.
+            ThreadPrefetch.shared.warm(
+                next.prefix(Self.mailWarmRows).map(\.thread_id), immediate: 5)
+        } catch {
+            mail.error = errText(error, "load failed")
+        }
+        mail.isLoading = false
+    }
+
+    /// Epoch for "order received": surfaced_at approximates arrival, and items
+    /// the triage loop hasn't surfaced yet are the newest mail, so they sort to
+    /// the top. Ties (and the nil bucket) break on id, which is ingest order.
+    private static func receivedTS(_ u: AttentionUpdate) -> Double {
+        guard let s = u.surfaced_at else { return .greatestFiniteMagnitude }
+        return Fmt.date(s)?.timeIntervalSince1970 ?? 0
+    }
+
     /// Preload the emails behind the records the columns show, so clicking one
     /// opens instantly.
     private func warmZoneThreads() {

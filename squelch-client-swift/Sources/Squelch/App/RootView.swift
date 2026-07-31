@@ -32,6 +32,12 @@ struct RootView: View {
             if status == .connected {
                 SitrepPoller.shared.start()
                 EventStream.shared.start()
+                // Warm the emails page at CONNECT, not on its first visit: the
+                // list lives in the store, so fetching it now means opening the
+                // page lands on rows instead of on "loading mail…". This also
+                // warms the head rows' threads, so the first click reads from
+                // cache too.
+                Task { await store.refreshMail() }
             } else {
                 SitrepPoller.shared.stop()
                 EventStream.shared.stop()

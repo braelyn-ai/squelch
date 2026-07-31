@@ -99,6 +99,10 @@ struct SitrepView: View {
                     }
                     .padding(.bottom, 28)
                 }
+                // No bar on either column. Two of them side by side read as a
+                // split pane rather than one page, and the left one rides the
+                // column boundary instead of the window edge.
+                .scrollIndicators(.hidden)
                 .frame(maxWidth: .infinity, alignment: .top)
 
                 // THE RECORDS RAIL IS PINNED. These are reference columns you
@@ -117,6 +121,7 @@ struct SitrepView: View {
                     .padding(.bottom, 28)
                 }
                 .scrollBounceBehavior(.basedOnSize)
+                .scrollIndicators(.hidden)
                 .frame(width: 306)
             }
             .padding(.horizontal, 24)
