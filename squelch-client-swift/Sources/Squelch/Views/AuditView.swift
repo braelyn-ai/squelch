@@ -187,14 +187,14 @@ private struct AuditRow: View {
     let onSelect: () -> Void
     let onUndo: () -> Void
 
-    @State private var hovering = false
-
     private var hasResolved: Bool {
         !(entry.target_sender ?? "").isEmpty || !(entry.target_subject ?? "").isEmpty
     }
 
     var body: some View {
-        Button(action: onSelect) {
+        ListRow(
+            selected: selected, cornerRadius: 8, hPadding: 11, vPadding: 6, action: onSelect
+        ) { selected, _ in
             HStack(alignment: .top, spacing: 10) {
                 AuditView.actorChip(entry.actor)
                     .frame(width: 58, alignment: .leading)
@@ -245,12 +245,6 @@ private struct AuditRow: View {
                     .frame(width: 34, alignment: .trailing)
                     .help(entry.ts)
             }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .selectionFill(selected, hovering: hovering, cornerRadius: 8)
-        .onHover { hovering = $0 }
     }
 }

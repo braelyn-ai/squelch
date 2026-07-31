@@ -230,7 +230,12 @@ private struct TargetRow: View {
     }
 
     var body: some View {
-        Button(action: onPick) {
+        // hoverFill off: the pointer MOVES the selection here, so the selection
+        // fill is already following it — a hover wash under it would double up.
+        ListRow(
+            selected: selected, tint: axisTone, hPadding: 10, vPadding: 7,
+            hoverFill: false, onHoverChange: { if $0 { onHover() } }, action: onPick
+        ) { _, _ in
             HStack(spacing: 10) {
                 Chip(text: target.axis.chipLabel, tone: axisTone, filled: true)
                     .frame(width: 68, alignment: .leading)
@@ -253,12 +258,6 @@ private struct TargetRow: View {
                         .fixedSize()
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .selectionFill(selected, tint: axisTone, cornerRadius: 9)
-        .onHover { if $0 { onHover() } }
     }
 }

@@ -468,10 +468,11 @@ private struct AuthRow: View {
     let onSelect: () -> Void
     let onOpen: () -> Void
 
-    @State private var hovering = false
-
     var body: some View {
-        Button(action: onSelect) {
+        ListRow(
+            selected: selected, cornerRadius: 8, tint: Palette.lock,
+            hPadding: 10, vPadding: 6, action: onSelect
+        ) { _, _ in
             HStack(spacing: 9) {
                 Avatar(sender: meta.sender, size: 20)
                 Text(SenderCache.resolved(meta.sender).displayName)
@@ -501,13 +502,7 @@ private struct AuthRow: View {
                     .foregroundStyle(Palette.inkFaintest)
                     .frame(width: 30, alignment: .trailing)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .selectionFill(selected, hovering: hovering, tint: Palette.lock, cornerRadius: 8)
-        .onHover { hovering = $0 }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen() })
     }
 }

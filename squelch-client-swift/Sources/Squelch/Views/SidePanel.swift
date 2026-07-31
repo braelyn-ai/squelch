@@ -321,7 +321,12 @@ private struct BrowseRow: View {
     let open: () -> Void
 
     var body: some View {
-        Button(action: onSelect) {
+        // hoverFill off: this list has never washed on hover, and 500 rows of
+        // tracking area is not the place to start.
+        ListRow(
+            selected: selected, cornerRadius: 7, tint: Palette.tierColor(update.tier),
+            hPadding: 9, vPadding: 5, hoverFill: false, action: onSelect
+        ) { _, _ in
             HStack(spacing: 8) {
                 Circle()
                     .fill(Palette.tierColor(update.tier))
@@ -345,12 +350,7 @@ private struct BrowseRow: View {
                     .foregroundStyle(Palette.inkFaintest)
                     .frame(width: 28, alignment: .trailing)
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .selectionFill(selected, tint: Palette.tierColor(update.tier), cornerRadius: 7)
         .overlay(alignment: .leading) {
             if selected {
                 RoundedRectangle(cornerRadius: 1)

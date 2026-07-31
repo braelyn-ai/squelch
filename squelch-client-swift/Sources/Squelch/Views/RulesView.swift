@@ -175,12 +175,12 @@ private struct RuleRow: View {
     let onSelect: () -> Void
     let onEdit: () -> Void
 
-    @State private var hovering = false
-
     private var dispositionTone: Color { rule.disposition.tone }
 
     var body: some View {
-        Button(action: onSelect) {
+        ListRow(
+            selected: selected, cornerRadius: 8, hPadding: 11, vPadding: 7, action: onSelect
+        ) { selected, _ in
             HStack(spacing: 10) {
                 Chip(text: rule.disposition.label, tone: dispositionTone, filled: true)
                     .frame(width: 62, alignment: .leading)
@@ -209,13 +209,7 @@ private struct RuleRow: View {
                     .foregroundStyle(Palette.inkFaintest)
                     .frame(width: 34, alignment: .trailing)
             }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .selectionFill(selected, hovering: hovering, cornerRadius: 8)
-        .onHover { hovering = $0 }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onEdit() })
     }
 }

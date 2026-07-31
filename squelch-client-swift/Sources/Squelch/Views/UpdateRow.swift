@@ -15,8 +15,6 @@ struct UpdateRow: View {
     let onHover: () -> Void
     let onOpen: () -> Void
 
-    @State private var hovering = false
-
     /// The aging BADGE only earns its place past 48h; under that a STILL OPEN
     /// row shows the plain relative time like any other band.
     private var showAgeBadge: Bool {
@@ -26,10 +24,17 @@ struct UpdateRow: View {
     var body: some View {
         let chip = Fmt.deadlineChip(update.deadline)
 
-        Button {
-            onHover()
-            onOpen()
-        } label: {
+        // onHover BEFORE onOpen: the click moves the cursor to this row first,
+        // so the verb keys act on what was clicked, not on where the keyboard
+        // last was.
+        ListRow(
+            selected: selected, cornerRadius: 8, hPadding: 11, vPadding: 6,
+            onHoverChange: { if $0 { onHover() } },
+            action: {
+                onHover()
+                onOpen()
+            }
+        ) { selected, _ in
             HStack(spacing: 9) {
                 Text(Fmt.importanceMeter(update.importance))
                     .font(Typo.mono(10))
@@ -94,12 +99,7 @@ struct UpdateRow: View {
                 }
                 .layoutPriority(3)
             }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .selectionFill(selected, hovering: hovering, cornerRadius: 8)
         .overlay(alignment: .leading) {
             if showAgeBadge {
                 // Heavier rail as the item rots.
@@ -113,10 +113,6 @@ struct UpdateRow: View {
                     .frame(width: 2)
                     .padding(.vertical, 4)
             }
-        }
-        .onHover { over in
-            hovering = over
-            if over { onHover() }
         }
     }
 }
