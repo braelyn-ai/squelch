@@ -362,6 +362,7 @@ pub fn apply_result(
     queued: &Stage2Queued,
     out: &Stage2Output,
     model: &str,
+    known_contact_floor: u8,
     now: DateTime<Utc>,
 ) -> Stage2Applied {
     // Clamp importance to the valid range.
@@ -372,6 +373,19 @@ pub fn apply_result(
     let rule_says_no = out.matches_sender_rule == Some(false);
     if rule_says_no {
         importance = importance.min(NOISE_FLOOR);
+    }
+
+    // KNOWN-CONTACT GUARANTEE, same as stage-1's: someone the user has written
+    // to never lands below signal, whichever pass writes the verdict last. An
+    // explicit "don't want this" rule verdict beats it (the user outranks the
+    // heuristic), and record-shaped mail is exempt (the Banking rail owns it).
+    let category = crate::triage::stage1_llm::normalize_category(&out.category);
+    let floored = queued.is_known_contact
+        && !rule_says_no
+        && !crate::triage::stage1_llm::RECORD_CATEGORIES.contains(&category.as_str())
+        && importance < known_contact_floor;
+    if floored {
+        importance = known_contact_floor;
     }
 
     // A deadline claim is trusted for tiering only from a known sender, or on a
@@ -420,14 +434,23 @@ pub fn apply_result(
         )
     } else {
         let m = truncate_field_reason(out.importance_reason.trim());
-        if m.is_empty() {
+        let base = if m.is_empty() {
             format!("stage-2 ({model}): importance {importance}")
         } else {
             format!("stage-2: {m}")
+        };
+        if floored {
+            // The floor note must survive even a hostile max-length model
+            // reason, and the stored field stays bounded: shave the model's
+            // text, never the note.
+            let note = format!("; known-contact floor -> importance {importance}");
+            let keep = 300usize.saturating_sub(note.chars().count());
+            format!("{}{note}", truncate_chars(&base, keep))
+        } else {
+            base
         }
     };
 
-    let category = crate::triage::stage1_llm::normalize_category(&out.category);
     // The user's standing "don't want this" rule beats the model's exception
     // flag: email content is untrusted and could steer exception=true, but it
     // must never override an explicit instruction to bury the sender.
@@ -807,7 +830,7 @@ mod tests {
         let mut o = out(85);
         o.category = "banking_statement".into();
         o.exception = true;
-        let a = apply_result(&queued(true, None), &o, "m", now());
+        let a = apply_result(&queued(true, None), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline);
         assert_eq!(a.category.as_deref(), Some("banking_statement"));
     }
@@ -820,7 +843,7 @@ mod tests {
         o.matches_sender_rule = Some(false);
         o.exception = true;
         o.category = "transaction_alert".into();
-        let a = apply_result(&queued(false, Some("only outage notices")), &o, "m", now());
+        let a = apply_result(&queued(false, Some("only outage notices")), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Noise, "rule verdict buries the row, exception or not");
         assert!(a.importance <= 15, "importance floored to noise");
     }
@@ -829,11 +852,29 @@ mod tests {
 
     #[test]
     fn importance_is_clamped() {
-        let q = queued(true, None);
-        let hi = apply_result(&q, &out(250), "m", now());
+        // Unknown sender, so the known-contact floor stays out of the clamp's way.
+        let q = queued(false, None);
+        let hi = apply_result(&q, &out(250), "m", 70, now());
         assert_eq!(hi.importance, 100);
-        let lo = apply_result(&q, &out(-5), "m", now());
+        let lo = apply_result(&q, &out(-5), "m", 70, now());
         assert_eq!(lo.importance, 0);
+    }
+
+    #[test]
+    fn known_contact_floors_at_signal_but_a_rule_verdict_still_buries() {
+        // Same guarantee as stage-1: a known contact never lands below signal…
+        let a = apply_result(&queued(true, None), &out(30), "m", 70, now());
+        assert_eq!(a.importance, 70);
+        assert_eq!(a.tier, Tier::Signal);
+        assert!(a.field_reasons.importance.as_deref().unwrap().contains("known-contact floor"));
+
+        // …unless the user's own standing instruction says bury it: the user
+        // outranks the heuristic.
+        let mut o = out(30);
+        o.matches_sender_rule = Some(false);
+        let b = apply_result(&queued(true, Some("only invoices")), &o, "m", 70, now());
+        assert_eq!(b.tier, Tier::Noise);
+        assert!(b.importance <= NOISE_FLOOR);
     }
 
     // ---- apply_result: unknown-sender deadline cap ------------------------
@@ -845,7 +886,7 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-12-01T00:00:00Z".into()); // future
         o.deadline_kind = Some("invoice".into());
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline);
         let d = a.deadline.expect("deadline row");
         assert!(!d.past_due);
@@ -857,7 +898,7 @@ mod tests {
         let mut o = out(60);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline, "unknown-sender past-due caps at Deadline");
         let d = a.deadline.expect("deadline row");
         assert!(!d.past_due, "past_due flag suppressed for untrusted sender");
@@ -869,7 +910,7 @@ mod tests {
         let mut o = out(90);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::PastDue);
         assert!(a.deadline.unwrap().past_due);
     }
@@ -883,7 +924,7 @@ mod tests {
         let mut o = out(80);
         o.has_deadline = true;
         o.deadline_iso = Some("2025-07-10T00:00:00Z".into()); // 364d before receipt
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert!(a.deadline.is_none(), "year-slipped date must not persist");
         assert_ne!(a.tier, Tier::PastDue, "no phantom past_due from a year slip");
         let dr = a.field_reasons.deadline.as_deref().unwrap_or("");
@@ -897,7 +938,7 @@ mod tests {
         let mut o = out(90);
         o.has_deadline = true;
         o.deadline_iso = Some("2099-01-01T00:00:00Z".into()); // absurd future
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert!(a.deadline.is_none(), "absurd model date must not persist a row");
         // No usable date => falls back to the no-date bill: Deadline tier.
         assert_eq!(a.tier, Tier::Deadline);
@@ -910,7 +951,7 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.matches_sender_rule = Some(true);
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::PastDue, "rule-match trusts the deadline claim");
     }
 
@@ -923,7 +964,7 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.matches_sender_rule = Some(true); // unverifiable trust claim
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline, "no-rule row stays capped at Deadline");
         assert!(!a.deadline.expect("deadline row").past_due, "past_due suppressed");
     }
@@ -935,7 +976,7 @@ mod tests {
         let q = queued(false, Some("only discounts"));
         let mut o = out(95); // model tried to score it high
         o.matches_sender_rule = Some(false);
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert!(a.importance <= 15, "floored to noise range, got {}", a.importance);
         assert_eq!(a.tier, Tier::Noise);
         assert!(a.reason.contains("does not match"));
@@ -948,7 +989,7 @@ mod tests {
         let q = queued(true, None);
         let mut o = out(60);
         o.one_line = "x".repeat(500); // hostile model tries to balloon the row
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.one_line.chars().count(), 160, "one_line capped to 160 chars");
     }
 
@@ -959,17 +1000,18 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-12-01T00:00:00Z".into());
         o.deadline_kind = Some("k".repeat(200));
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         let d = a.deadline.expect("deadline row");
         assert_eq!(d.kind.chars().count(), 40, "deadline_kind capped to 40 chars");
     }
 
     #[test]
     fn tier_follows_importance_when_no_deadline_and_no_rule() {
-        let q = queued(true, None);
-        let sig = apply_result(&q, &out(75), "m", now());
+        // Unknown sender: the raw importance→tier map, no floor in play.
+        let q = queued(false, None);
+        let sig = apply_result(&q, &out(75), "m", 70, now());
         assert_eq!(sig.tier, Tier::Signal);
-        let noise = apply_result(&q, &out(30), "m", now());
+        let noise = apply_result(&q, &out(30), "m", 70, now());
         assert_eq!(noise.tier, Tier::Noise);
     }
 
@@ -983,7 +1025,7 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.deadline_reason = Some("invoice past due Jan 1".into());
-        let a = apply_result(&q, &o, "claude-haiku-4-5", now());
+        let a = apply_result(&q, &o, "claude-haiku-4-5", 70, now());
         assert_eq!(a.tier, Tier::PastDue);
         let fr = &a.field_reasons;
         assert!(fr.importance.as_deref().unwrap().contains("dated invoice"));
@@ -995,7 +1037,7 @@ mod tests {
     #[test]
     fn no_deadline_omits_the_deadline_reason() {
         let q = queued(true, None);
-        let a = apply_result(&q, &out(75), "m", now()); // has_deadline=false
+        let a = apply_result(&q, &out(75), "m", 70, now()); // has_deadline=false
         let fr = &a.field_reasons;
         assert!(fr.deadline.is_none(), "no stored deadline -> no deadline reason");
         assert!(fr.tier.as_deref().unwrap().contains("signal"));
@@ -1010,7 +1052,7 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         o.deadline_reason = Some("claims overdue".into());
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline);
         let tier = a.field_reasons.tier.as_deref().unwrap();
         assert!(tier.contains("capped at deadline"), "tier reason: {tier}");
@@ -1022,7 +1064,7 @@ mod tests {
         let q = queued(false, Some("only discounts"));
         let mut o = out(95);
         o.matches_sender_rule = Some(false);
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         let fr = &a.field_reasons;
         assert!(fr.importance.as_deref().unwrap().contains("standing instruction not matched"));
         assert!(fr.tier.as_deref().unwrap().contains("noise"));
@@ -1034,7 +1076,7 @@ mod tests {
         let q = queued(true, None);
         let mut o = out(50);
         o.importance_reason = "A".repeat(5000);
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         // Bounded well under the model's 5000 chars: the 300 cap plus a prefix.
         assert!(a.field_reasons.importance.as_deref().unwrap().chars().count() < 320);
     }
@@ -1042,7 +1084,7 @@ mod tests {
     #[test]
     fn model_used_is_stamped() {
         let q = queued(true, None);
-        let a = apply_result(&q, &out(50), "claude-haiku-4-5", now());
+        let a = apply_result(&q, &out(50), "claude-haiku-4-5", 70, now());
         assert_eq!(a.model_used, "claude-haiku-4-5");
     }
 

@@ -1424,7 +1424,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             eprintln!("squelch: stage-2 usage ledger bump failed ({e})");
                         }
                     }
-                    let applied = stage2::apply_result(row, &out, &cfg.model, Utc::now());
+                    let applied = stage2::apply_result(
+                        row,
+                        &out,
+                        &cfg.model,
+                        self.config.stage1.known_contact_importance,
+                        Utc::now(),
+                    );
                     match self.store.stage2_apply(&applied) {
                         Err(e) => {
                             eprintln!("squelch: stage-2 apply failed ({e}); row stays queued");
