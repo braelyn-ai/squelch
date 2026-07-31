@@ -347,9 +347,24 @@ pub fn apply_result(
     queued: &Stage1Queued,
     out: &Stage1Output,
     model: &str,
+    known_contact_floor: u8,
     now: DateTime<Utc>,
 ) -> Stage1Applied {
     let importance = out.importance.clamp(0, 100) as u8;
+    let category = normalize_category(&out.category);
+    // Rung 3 of the ingest-time engine promises mail from a KNOWN CONTACT
+    // (someone the user has written to) lands at signal; this async pass
+    // OVERWRITES that row, so it must keep the promise. The model may rank a
+    // known contact higher, never below the floor — "casual reply, no action
+    // needed" from a friend is still mail the user chose to surface. The floor
+    // is Stage1Config::known_contact_importance, threaded by the caller.
+    // RECORD-shaped mail is exempt: a bank's transaction alert lives in the
+    // Banking rail regardless of who sends it, and the record clamp below only
+    // demotes Deadline tiers — a floored Signal would slip past it.
+    let floored = queued.is_known_contact
+        && !RECORD_CATEGORIES.contains(&category.as_str())
+        && importance < known_contact_floor;
+    let importance = if floored { known_contact_floor } else { importance };
     // No matched-rule context here, so deadline trust rests on known-contact alone.
     let deadline_trusted = queued.is_known_contact;
 
@@ -371,14 +386,18 @@ pub fn apply_result(
     let reason = format!("stage-1 ({model}): {}", truncate_reason(&out.reason));
     let importance_reason = {
         let m = truncate_field_reason(out.importance_reason.trim());
-        if m.is_empty() {
+        let base = if m.is_empty() {
             format!("stage-1 ({model}): importance {importance}")
         } else {
             format!("stage-1: {m}")
+        };
+        if floored {
+            format!("{base}; known-contact floor -> importance {importance}")
+        } else {
+            base
         }
     };
 
-    let category = normalize_category(&out.category);
     let (tier, deadline, tier_reason) =
         clamp_record_tier(&category, out.exception, tier, deadline, tier_reason, "stage-1");
 
@@ -462,33 +481,65 @@ mod tests {
     fn category_is_normalized_on_apply_and_unknown_falls_back_to_general() {
         let mut o = out(60, true);
         o.category = "banking_statement".into();
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.category.as_deref(), Some("banking_statement"));
 
         o.category = "wat".into();
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.category.as_deref(), Some("general"), "unknown -> general");
     }
 
     #[test]
     fn confident_true_does_not_escalate() {
-        let a = apply_result(&queued(true), &out(75, true), "m", now());
+        let a = apply_result(&queued(true), &out(75, true), "m", 70, now());
         assert!(!a.needs_stage2, "confident=true must not escalate");
         assert_eq!(a.tier, Tier::Signal);
     }
 
     #[test]
     fn confident_false_escalates_to_stage2() {
-        let a = apply_result(&queued(false), &out(40, false), "m", now());
+        let a = apply_result(&queued(false), &out(40, false), "m", 70, now());
         assert!(a.needs_stage2, "confident=false must escalate");
     }
 
     #[test]
     fn importance_is_clamped() {
-        let hi = apply_result(&queued(true), &out(250, true), "m", now());
+        let hi = apply_result(&queued(true), &out(250, true), "m", 70, now());
         assert_eq!(hi.importance, 100);
-        let lo = apply_result(&queued(true), &out(-5, true), "m", now());
+        // Low clamp checked on an UNKNOWN sender — a known contact would floor.
+        let lo = apply_result(&queued(false), &out(-5, true), "m", 70, now());
         assert_eq!(lo.importance, 0);
+    }
+
+    #[test]
+    fn known_contact_floors_at_signal_and_says_so() {
+        // The model demoting a known contact ("casual reply, no action needed")
+        // must not bury it: rung 3's surface promise survives the async pass.
+        let a = apply_result(&queued(true), &out(55, true), "m", 70, now());
+        assert_eq!(a.importance, 70);
+        assert_eq!(a.tier, Tier::Signal);
+        assert!(
+            a.field_reasons.importance.as_deref().unwrap().contains("known-contact floor"),
+            "floor must be visible in field_reasons"
+        );
+
+        // Above the floor the model's score stands untouched.
+        let b = apply_result(&queued(true), &out(84, true), "m", 70, now());
+        assert_eq!(b.importance, 84);
+        assert!(!b.field_reasons.importance.as_deref().unwrap().contains("floor"));
+
+        // Unknown senders are the model's call alone.
+        let c = apply_result(&queued(false), &out(55, true), "m", 70, now());
+        assert_eq!(c.importance, 55);
+        assert_eq!(c.tier, Tier::Noise);
+
+        // Record-shaped mail never floors: the Banking rail owns it no matter
+        // who sent it, and the record clamp can't demote a floored Signal.
+        let mut rec = out(30, true);
+        rec.category = "transaction_alert".into();
+        let d = apply_result(&queued(true), &rec, "m", 70, now());
+        assert_eq!(d.importance, 30);
+        assert_eq!(d.tier, Tier::Noise);
     }
 
     #[test]
@@ -496,7 +547,7 @@ mod tests {
         let mut o = out(90, true);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::PastDue);
         assert!(a.deadline.unwrap().past_due);
     }
@@ -506,7 +557,7 @@ mod tests {
         let mut o = out(90, false);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
-        let a = apply_result(&queued(false), &o, "m", now());
+        let a = apply_result(&queued(false), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline, "unknown-sender past-due caps at Deadline");
         assert!(!a.deadline.unwrap().past_due);
         let tier = a.field_reasons.tier.as_deref().unwrap();
@@ -526,7 +577,7 @@ mod tests {
         o.category = "banking_statement".into();
         o.has_deadline = true;
         o.deadline_iso = Some("2026-07-20T00:00:00Z".into());
-        let a = apply_result(&q, &o, "m", now());
+        let a = apply_result(&q, &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Noise, "record categories never reach FYE");
         assert!(a.deadline.is_none(), "no deadline row for a record");
         let tr = a.field_reasons.tier.as_deref().unwrap_or("");
@@ -545,7 +596,7 @@ mod tests {
         o.exception = true;
         o.has_deadline = true;
         o.deadline_iso = None; // no concrete date stated -> deadline tier
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline, "failure alerts reach FYE");
         assert_eq!(a.category.as_deref(), Some("transaction_alert"));
     }
@@ -559,7 +610,7 @@ mod tests {
             let mut o = out(importance, true);
             o.category = "general".into();
             o.exception = true;
-            let a = apply_result(&queued(true), &o, "m", now());
+            let a = apply_result(&queued(true), &o, "m", 70, now());
             assert_eq!(a.tier, Tier::Deadline, "importance {importance}");
             let tr = a.field_reasons.tier.as_deref().unwrap();
             assert!(tr.contains("exception"), "reason names the exception: {tr}");
@@ -575,7 +626,7 @@ mod tests {
         o.exception = true;
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past
-        let a = apply_result(&queued(false), &o, "m", now());
+        let a = apply_result(&queued(false), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Deadline, "untrusted past date caps at Deadline");
     }
 
@@ -585,7 +636,7 @@ mod tests {
         // on importance alone; the record-shaped score keeps it out of FYE.
         let mut o = out(30, true);
         o.category = "transaction_alert".into();
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.tier, Tier::Noise);
         assert_eq!(a.category.as_deref(), Some("transaction_alert"));
     }
@@ -595,13 +646,13 @@ mod tests {
         // Same 160-char cap as Stage-2 (shared helper), applied at Stage-1's site.
         let mut o = out(60, true);
         o.one_line = "y".repeat(500);
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.one_line.chars().count(), 160, "one_line capped to 160 chars");
     }
 
     #[test]
     fn field_reasons_use_stage1_label() {
-        let a = apply_result(&queued(true), &out(80, true), "claude-haiku-4-5", now());
+        let a = apply_result(&queued(true), &out(80, true), "claude-haiku-4-5", 70, now());
         assert!(a.field_reasons.importance.as_deref().unwrap().starts_with("stage-1"));
         assert_eq!(a.stage1_model_used, "claude-haiku-4-5");
     }
@@ -611,7 +662,7 @@ mod tests {
         let mut o = out(90, true);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-08-01T00:00:00Z".into());
-        let a = apply_result(&queued(true), &o, "m", now());
+        let a = apply_result(&queued(true), &o, "m", 70, now());
         assert_eq!(a.deadline.unwrap().source, "stage1");
     }
 
