@@ -385,18 +385,11 @@ struct WindowConfigurator: NSViewRepresentable {
     /// walk is not enough: a few post-launch retries catch the initial build,
     /// and key/main/occlusion observers catch rebuilds for the window's life.
     static func hideTitlebarDecoration(in window: NSWindow) {
-        func walk(_ view: NSView) {
-            if String(describing: type(of: view)).contains("TitlebarDecoration") {
-                view.isHidden = true
-            }
-            view.subviews.forEach(walk)
-        }
-        func hide() {
-            if let frameView = window.contentView?.superview { walk(frameView) }
-        }
-        hide()
+        hideDecoration(in: window)
         for delay in [0.25, 0.75, 2.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { hide() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                MainActor.assumeIsolated { hideAllDecorations() }
+            }
         }
         for name in [
             NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
@@ -406,9 +399,31 @@ struct WindowConfigurator: NSViewRepresentable {
             NotificationCenter.default.addObserver(
                 forName: name, object: window, queue: .main
             ) { _ in
-                MainActor.assumeIsolated { hide() }
+                MainActor.assumeIsolated { hideAllDecorations() }
             }
         }
+    }
+
+    /// Re-walk every window. NOTHING IS CAPTURED, deliberately: these closures
+    /// are `@Sendable` and neither NSWindow nor Notification is Sendable, so
+    /// reaching the windows through NSApp at call time is what satisfies the
+    /// concurrency checker without an unchecked-Sendable box. The app has one or
+    /// two windows and this runs only on focus/occlusion changes.
+    @MainActor
+    private static func hideAllDecorations() {
+        for window in NSApp.windows { hideDecoration(in: window) }
+    }
+
+    /// One walk of the frame view, hiding any decoration view it finds.
+    @MainActor
+    private static func hideDecoration(in window: NSWindow) {
+        func walk(_ view: NSView) {
+            if String(describing: type(of: view)).contains("TitlebarDecoration") {
+                view.isHidden = true
+            }
+            view.subviews.forEach(walk)
+        }
+        if let frameView = window.contentView?.superview { walk(frameView) }
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
