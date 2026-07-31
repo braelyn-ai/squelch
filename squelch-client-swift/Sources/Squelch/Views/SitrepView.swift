@@ -23,7 +23,7 @@ private let eyesVisible = 10
 final class SitrepCursor {
     /// Index into the VISIBLE rows only — collapsed-away rows are unreachable.
     var index = 0
-    /// True only while the keyboard is driving; the focus glass renders on this.
+    /// True only while the keyboard is driving; the focus fill renders on this.
     var kbActive = false
     /// True only while the pointer is over a row.
     var hovering = false

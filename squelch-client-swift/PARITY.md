@@ -47,8 +47,8 @@ material is AppKit's own.
 | `Glass.regular` / `.clear` | panes vs. chrome (`GlassLevel`) | Rail and chips stay maximally see-through; content panes carry more presence |
 | `.tint(_:)` | brand + tier tints on glass | Carries squelch blue **into** the material instead of painting a blue box on a grey one; semantic surfaces tint with their tier color |
 | `.interactive()` | rail item, buttons, toasts | Material responds to press/hover |
-| `GlassEffectContainer` | sidebar rail, sitrep body, toast stack, ⌘K bar, triage palette | Adjacent glass **merges and separates fluidly** — the signature behavior with no web equivalent |
-| `.glassEffectID(_:in:)` + `@Namespace` | rail active indicator, **every list selection**, ask bar, triage palette | Matched-geometry glass: the active capsule **flows** between rail icons; the selection material **travels** row-to-row in the inbox / sitrep / auth / rules / audit / browse / palette instead of cross-fading; the palette **stretches** as its list narrows |
+| `GlassEffectContainer` | toast stack, ⌘K bar, triage palette | Adjacent glass **merges and separates fluidly** — the signature behavior with no web equivalent. Deliberately NOT around lists or the rail: a container re-coordinates every descendant whenever one changes, which made a hovered row relayout the page |
+| `.glassEffectID(_:in:)` + `@Namespace` | ask bar, triage palette | Matched-geometry glass: the bar **stretches** into its answer, the palette **stretches** as its list narrows. List selection and the rail indicator used to be here and are not any more — selection is a plain tinted fill (`selectionFill`), and the rail indicator moves by **geometry**, because both cost more as glass than they were worth |
 | `.buttonStyle(.glass)` / `.glassProminent` | every control in the app | No hand-rolled button backgrounds anywhere |
 | `NSVisualEffectView` (`.underWindowBackground`) | `WindowBackdrop` | The layer the whole language sits on; window is non-opaque so glass has real content to refract |
 

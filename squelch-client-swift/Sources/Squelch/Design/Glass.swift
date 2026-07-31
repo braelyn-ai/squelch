@@ -65,32 +65,6 @@ extension View {
         padding(.horizontal, 16).padding(.vertical, 14)
     }
 
-    /// The active-item material for a small selector (the rail). Only the active
-    /// item carries glass; items sharing one `glassEffectID` make the material
-    /// FLOW between them rather than fade out here and in there.
-    ///
-    /// Applied to the CONTENT, never as a sibling background: a
-    /// `GlassEffectContainer` deliberately raises its descendants above its
-    /// content view, so glass added behind an icon renders on top of it.
-    @ViewBuilder
-    func glassSelector(
-        _ active: Bool,
-        tint: Color = Palette.accent,
-        cornerRadius: CGFloat = 11,
-        id: String,
-        in namespace: Namespace.ID
-    ) -> some View {
-        if active {
-            self.glassEffect(
-                .regular.tint(tint.opacity(0.26)).interactive(),
-                in: .rect(cornerRadius: cornerRadius, style: .continuous)
-            )
-            .glassEffectID(id, in: namespace)
-        } else {
-            self
-        }
-    }
-
     /// Selection + hover for a list row: a tinted fill, ONE view identity, and
     /// no material anywhere.
     ///

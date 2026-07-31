@@ -8,7 +8,6 @@ import SwiftUI
 struct UpdateRow: View {
     let update: AttentionUpdate
     let selected: Bool
-    /// Shared with every row in the list so the selection material FLOWS.
     /// STILL OPEN band: escalating left-rail weight + age note.
     var aging = false
     /// 0..1 escalation weight for the STILL OPEN visual ramp.
