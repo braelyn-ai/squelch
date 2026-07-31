@@ -306,6 +306,14 @@ struct SitrepView: View {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 store.openThread(u.thread_id)
             },
+            // Same guard as every other verb here — inert unless a row is
+            // actually highlighted. Reply opens the email and composes inside it;
+            // no queue, exactly like Enter above (this dashboard is a set of
+            // records, not a walk).
+            KeyBinding("r", "reply") {
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
+                Actions.reply(u)
+            },
             KeyBinding("v", "fix triage") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 store.openTriageFix(

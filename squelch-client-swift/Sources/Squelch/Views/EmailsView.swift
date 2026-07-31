@@ -177,9 +177,11 @@ struct EmailsView: View {
                         messageId: u.id, sender: u.sender, subject: u.one_line,
                         tier: .some(u.tier.rawValue)))
             },
+            // Reply opens the email and composes in it, so it hands over the same
+            // queue Enter does — done + next keeps working from inside the reader.
             KeyBinding("r", "reply") {
                 guard actionable, let u = selected else { return }
-                Actions.reply(u)
+                Actions.reply(u, queue: rows)
             },
             KeyBinding("e", "done") { resolveSelected() },
             KeyBinding("d", "done") { resolveSelected() },

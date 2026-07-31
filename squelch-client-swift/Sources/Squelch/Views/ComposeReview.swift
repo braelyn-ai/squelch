@@ -3,6 +3,12 @@
 // override_guard to get the outbound-guard verdict. A clean pass has already
 // sent; a 422 shows the redacted guard kinds and demands a distinct override
 // (shift+Enter or the danger button). 403 means no write credential.
+//
+// This is the MODAL composer, and since Wave 5 replies no longer route here —
+// they open the reader's inline composer (InlineReply), which runs the same
+// ceremony against the same `ComposeSubmit`. What is left to this one is the
+// new-message path (`replyToMessageId == nil`), plus the reply shape it still
+// supports for any caller that has no thread to open.
 
 import SwiftUI
 
@@ -112,24 +118,22 @@ struct ComposeReview: View {
         }
     }
 
+    private var isReply: Bool { compose?.replyToMessageId != nil }
+
     /// Stands in for an empty subject on a reply, in both panes: the daemon titles
     /// it `Re: <parent subject>`, and the real parent subject is not in reach here
     /// (the update carries an LLM summary, not the header).
-    private static let derivedSubject = "Re: (derived from thread)"
-
-    private var isReply: Bool { compose?.replyToMessageId != nil }
-
     private var subjectPlaceholder: String {
-        isReply ? Self.derivedSubject : "subject"
+        isReply ? ComposeCopy.derivedSubject : "subject"
     }
 
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            reviewRow("to", compose.to.isEmpty ? "(none)" : compose.to)
-            reviewRow(
+            ComposeSummaryRow("to", compose.to.isEmpty ? "(none)" : compose.to)
+            ComposeSummaryRow(
                 "subject",
                 compose.subject.isEmpty
-                    ? (isReply ? Self.derivedSubject : "(none)") : compose.subject)
+                    ? (isReply ? ComposeCopy.derivedSubject : "(none)") : compose.subject)
 
             ScrollView {
                 Text(compose.body)
@@ -154,43 +158,8 @@ struct ComposeReview: View {
                         .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                 }
             } else {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 4) {
-                        Text("outbound guard blocked · matched (redacted):")
-                            .font(Typo.micro)
-                        Text(compose.guardKinds.joined(separator: ", "))
-                            .font(Typo.mono(11, weight: .semibold))
-                    }
-                    .foregroundStyle(Palette.danger)
-                    Text("review the recipients and body, then override to send anyway.")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkFaint)
-                }
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Palette.dangerSoft)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(Palette.danger.opacity(0.4), lineWidth: 1))
+                GuardVerdictBox(kinds: compose.guardKinds)
             }
-        }
-    }
-
-    private func reviewRow(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(label)
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaintest)
-                .textCase(.uppercase)
-                .frame(width: 60, alignment: .leading)
-            Text(value)
-                .font(Typo.mono(12))
-                .foregroundStyle(Palette.ink)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -283,45 +252,103 @@ struct ComposeReview: View {
         }
     }
 
+    /// The request lives in `ComposeSubmit`; what is left here is this surface's
+    /// own reaction to each outcome.
     private func fire(override: Bool) async {
         guard let compose = store.compose, !compose.sending else { return }
         patch {
             $0.sending = true
             $0.error = nil
         }
-        do {
-            try await APIClient.shared.actionSend(
-                body: compose.body, replyToMessageId: compose.replyToMessageId,
-                to: compose.to.isEmpty ? nil : compose.to,
-                // nil, never "": the daemon reads Some("") as an explicit blank
-                // subject and would send the reply untitled.
-                subject: compose.subject.isEmpty ? nil : compose.subject,
-                overrideGuard: override)
+        switch await ComposeSubmit.fire(compose, override: override) {
+        case .sent:
             // The daemon resolved the replied-to update; without this the row
             // sits in its band until the next poll, reading as a no-op. No undo
             // pairs with it — a send is the one irreversible action.
             if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
             store.pushToast("sent", .success)
             store.closeCompose()
-        } catch let apiError as APIError where apiError.kind == .guardBlocked {
+        case .guardBlocked(let kinds):
             // Stay in review with the redacted verdict; the override must be an
             // explicit second act, not a re-fire of the same call.
             patch {
                 $0.phase = .review
-                $0.guardKinds = apiError.guardKinds ?? []
+                $0.guardKinds = kinds
                 $0.sending = false
                 $0.error = nil
             }
-        } catch let apiError as APIError where apiError.kind == .forbidden {
+        case .forbidden:
             patch {
                 $0.sending = false
-                $0.error = "no write credential — run `squelchd auth --write`"
+                $0.error = ComposeCopy.noWriteCredential
             }
-        } catch {
+        case .failure(let text):
             patch {
                 $0.sending = false
-                $0.error = errText(error, "send failed")
+                $0.error = text
             }
+        }
+    }
+}
+
+// MARK: - shared review chrome
+
+/// THE outbound-guard verdict, rendered identically wherever a reply started.
+/// The one screen whose job is talking a reader out of a mistake must not read
+/// differently in the modal composer and in the reader's inline one.
+struct GuardVerdictBox: View {
+    /// The redacted kinds the guard matched. Never rendered as markup — they are
+    /// server strings.
+    let kinds: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text("outbound guard blocked · matched (redacted):")
+                    .font(Typo.micro)
+                Text(kinds.joined(separator: ", "))
+                    .font(Typo.mono(11, weight: .semibold))
+            }
+            .foregroundStyle(Palette.danger)
+            Text("review the recipients and body, then override to send anyway.")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaint)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Palette.dangerSoft)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Palette.danger.opacity(0.4), lineWidth: 1))
+    }
+}
+
+/// One `LABEL  value` row of a review summary. The value is mono because it is a
+/// header being checked character by character — a recipient, a subject.
+struct ComposeSummaryRow: View {
+    let label: String
+    let value: String
+
+    init(_ label: String, _ value: String) {
+        self.label = label
+        self.value = value
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(label)
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+                .textCase(.uppercase)
+                .frame(width: 60, alignment: .leading)
+            Text(value)
+                .font(Typo.mono(12))
+                .foregroundStyle(Palette.ink)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

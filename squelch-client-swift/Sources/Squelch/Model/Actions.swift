@@ -2,7 +2,8 @@
 //
 // UNDO-FIRST: archive/done/label fire instantly, the row leaves its band
 // optimistically, and a 5s undo toast carries the inverse call as its `revert`.
-// `send` is the only ceremony path (the compose overlay, reached via reply()).
+// `send` is the only ceremony path, and it does not live here: reply() opens the
+// email and the reader's inline composer runs the two-phase send inside it.
 
 import Foundation
 
@@ -79,13 +80,19 @@ enum Actions {
         }
     }
 
-    /// Reply: open the compose/review ceremony prefilled from the update.
-    /// Subject stays EMPTY — `u.one_line` is the LLM's summary, not the real
-    /// subject, and the daemon derives `Re: <parent subject>` when the send body
-    /// omits `subject` entirely. Typing one here overrides that derivation.
-    static func reply(_ u: AttentionUpdate) {
-        store.openCompose(
-            ComposeState(replyToMessageId: u.id, to: u.sender, subject: "", body: ""))
+    /// Reply: open the EMAIL and compose inside it. One reply surface for the
+    /// whole app — you answer where you read, with the thread on screen, rather
+    /// than in a modal that hides the mail you are answering.
+    ///
+    /// Nothing is prefilled: the request carries `reply_to_message_id` and the
+    /// body, and the daemon derives the recipient and `Re: <parent subject>` from
+    /// the parent message (`u.one_line` is the LLM's summary, not the header, so
+    /// it was never a subject worth sending).
+    ///
+    /// `queue` is the caller's own row order, so "done + next" still walks it
+    /// once the reader is open.
+    static func reply(_ u: AttentionUpdate, queue: [AttentionUpdate] = []) {
+        store.openThread(u.thread_id, queue: queue, replyTo: u.id)
     }
 
     /// Tune a sender: open the rule editor prefilled with *@domain.

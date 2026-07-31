@@ -233,6 +233,7 @@ struct ShortcutsOverlay: View {
             items: [
                 (["j", "k"], "older / newer message"),
                 (["h", "l"], "previous / next queued email"),
+                (["r"], "reply"),
                 (["e", "d"], "done + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),

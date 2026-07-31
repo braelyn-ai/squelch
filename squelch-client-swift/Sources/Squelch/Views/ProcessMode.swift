@@ -1,6 +1,8 @@
 // The `p` triage deck: a card-by-card walk of the new + still-open bands with the
-// list's verbs (r reply, e archive, d done, t tune, Space skip). Reads the live
-// bands from the store, so items resolved elsewhere drop out of the queue too.
+// list's verbs (e archive, d done, t tune, Space skip). Reads the live bands from
+// the store, so items resolved elsewhere drop out of the queue too. `r` is the
+// one verb that LEAVES: replying happens in the reader, so the deck closes and
+// hands the email over.
 
 import SwiftUI
 
@@ -90,7 +92,7 @@ struct ProcessMode: View {
             }
 
             HStack(spacing: 12) {
-                KeyHint("r", "reply")
+                KeyHint("r", "reply in reader")
                 KeyHint("e", "archive")
                 KeyHint("d", "done")
                 KeyHint("t", "tune")
@@ -137,7 +139,14 @@ struct ProcessMode: View {
                 guard !pending.isEmpty else { return }
                 index = (index - 1 + pending.count) % pending.count
             },
-            KeyBinding("r", "reply") { if let current { Actions.reply(current) } },
+            // Reply now happens in the reader, so the deck steps ASIDE for it
+            // rather than stacking a composer over its own overlay. Exiting first
+            // also keeps the process-mode keymap from sitting above the reader's.
+            KeyBinding("r", "reply") {
+                guard let current else { return }
+                onClose()
+                Actions.reply(current)
+            },
             KeyBinding("e", "archive") {
                 guard let current else { return }
                 Task { await Actions.archive(current) }

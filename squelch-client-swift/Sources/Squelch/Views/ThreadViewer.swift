@@ -3,6 +3,10 @@
 // hard-sandboxed EmailWebView, plain text in a selectable card. The outer column
 // is the ONE scroll surface — message frames size to their content and never
 // scroll internally. Esc, or a gutter click, closes back onto the surface below.
+//
+// It is also where you REPLY: `r` (or an `r` pressed on a list row, handed over
+// as `pendingReplyMessageId`) pins InlineReply under the stack, still inside this
+// surface.
 
 import SwiftUI
 
@@ -74,6 +78,19 @@ struct ThreadViewer: View {
             VStack(spacing: 0) {
                 header
                 content
+                // UNDER the mail, never over it: the message you are answering
+                // stays readable while you answer it.
+                //
+                // MOUNTED UNCONDITIONALLY, and gated on `store.inlineReply`
+                // INSIDE. Reading the draft from this body instead would make
+                // every keystroke in the reply invalidate the entire reader —
+                // every message card, every sandboxed web frame, a full relayout
+                // of the column — for a change that only ever touches the bar at
+                // the bottom. (`@Observable` tracks the property, not the field,
+                // so there is no way to read the draft's target here cheaply.)
+                InlineReply(
+                    messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
+                    onEchoed: { Task { await reloadAfterSend() } })
             }
 
             if let debugInfo {
@@ -92,7 +109,12 @@ struct ThreadViewer: View {
         }
         .keyContext(.thread)
         .keyBindings(.thread, bindings)
-        .task(id: threadId) { await load() }
+        .task(id: threadId) {
+            await load()
+            // Only once the thread is HERE: the hand-off names a message, and
+            // whether it is in this thread is not knowable until it has loaded.
+            consumePendingReply()
+        }
         .task(id: newestSender) { await refreshUnsub() }
         // Warm the NEXT queued thread while this one is being read, so e/d's
         // done+advance opens it instantly.
@@ -211,13 +233,22 @@ struct ThreadViewer: View {
                 .onChange(of: index) { _, i in
                     withAnimation(.easeOut(duration: 0.14)) { proxy.scrollTo(i, anchor: .top) }
                 }
+                // A refetch that PREPENDED a message — a sent reply's own echo —
+                // has to land on it, and the watcher above cannot do that job:
+                // `adopt` sets index to 0, which it already was, so it sees no
+                // change. Unanimated because on the initial load and on a thread
+                // switch this is the starting position, not a movement.
+                .onChange(of: messages.first?.id) { _, _ in
+                    proxy.scrollTo(0, anchor: .top)
+                }
             }
         }
     }
 
     /// The mail's measure. The dismissible gutter is defined as the complement
-    /// of it, so the two can never drift apart.
-    private static let columnWidth: CGFloat = 900
+    /// of it, so the two can never drift apart — and the inline composer pins
+    /// itself to the same measure, so the reply sits under the column it answers.
+    static let columnWidth: CGFloat = 900
 
     /// CLICK BESIDE THE MAIL TO LEAVE IT — the same exit as Esc.
     ///
@@ -246,6 +277,10 @@ struct ThreadViewer: View {
                 // that true if one ever stops doing so: dismissing a dialog must
                 // never also throw away the email behind it.
                 guard confirmMode == nil, debugInfo == nil, !store.modalOverlayOpen else { return }
+                // An unsent draft is not something a stray click beside the mail
+                // gets to destroy — there is no undo for a lost reply. Esc leaves
+                // the composer first, then the email.
+                guard store.inlineReply == nil else { return }
                 store.closeThread()
             }
     }
@@ -283,6 +318,12 @@ struct ThreadViewer: View {
             KeyBinding("e", "done + next") { Task { await doneAndNext() } },
             KeyBinding("d", "done + next") { Task { await doneAndNext() } },
             KeyBinding("u", "unsubscribe") { confirmMode = .ask },
+            // `r` = reply, and it lives HERE rather than in the composer's own
+            // set because it is what opens the composer when there is none. With
+            // one open the body has focus, so `r` is input-suppressed (no
+            // allowInInput) and types a character, which is what it should do
+            // inside a text field.
+            KeyBinding("r", "reply") { openReply() },
             // `t` = tune sender rule, same as on a list row: one verb, one key
             // everywhere. The target differs (the thread's sender rather than the
             // selected row's) but that is the only sender in view here. This
@@ -296,6 +337,40 @@ struct ThreadViewer: View {
     private func openSenderRule() {
         guard let newestSender else { return }
         Actions.tune(sender: newestSender)
+    }
+
+    // MARK: - reply
+
+    /// `r` — answer the NEWEST message, the same one `u` acts on and `e`/`d`
+    /// resolve. That is what a reader means by "reply": the bottom of the thread,
+    /// not whichever message j/k is parked on.
+    private func openReply() {
+        guard let newest else { return }
+        store.openInlineReply(replyTo: newest.id)
+    }
+
+    /// A hand-off from another surface: `r` on a list row navigates here and asks
+    /// for the composer on the row's own message. One-shot — cleared whether or
+    /// not it lands, so a stale request can never fire against a later thread.
+    private func consumePendingReply() {
+        guard let wanted = store.pendingReplyMessageId else { return }
+        store.pendingReplyMessageId = nil
+        // Must be OUR message. It is, by construction (we were opened with that
+        // row's thread_id), and the only way to miss is a parent the thread view
+        // does not return — in which case there is nothing to answer and `r`
+        // remains one press away.
+        guard thread?.messages.contains(where: { $0.id == wanted }) == true else { return }
+        store.openInlineReply(replyTo: wanted)
+    }
+
+    /// Refetch after a send whose echo has landed, so the sent copy is IN the
+    /// thread instead of appearing only after the next poll. The prefetch cache
+    /// holds the PRE-send copy, so it is overwritten rather than read — otherwise
+    /// reopening this thread would serve a version with the reply missing.
+    private func reloadAfterSend() async {
+        guard let view = try? await APIClient.shared.getThread(threadId) else { return }
+        ThreadPrefetch.shared.note(threadId, view)
+        adopt(view)
     }
 
     // MARK: - queue navigation

@@ -180,7 +180,8 @@ let ringSeconds: TimeInterval = 60
 
 // MARK: - compose
 
-/// Draft + review state for the send ceremony.
+/// Draft + review state for the send ceremony. ONE type for both composers: the
+/// modal `ComposeReview` (new message) and the reader's inline reply.
 struct ComposeState: Sendable, Equatable {
     enum Phase: Sendable { case edit, review }
     var replyToMessageId: Int?
@@ -277,6 +278,15 @@ final class AppStore {
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
     var compose: ComposeState?
+    /// The reader's inline reply composer. Deliberately NOT part of
+    /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
+    /// on one, so the thread behind it must stay unblurred and clickable — you
+    /// answer an email while reading it.
+    var inlineReply: ComposeState?
+    /// A reply the thread viewer should open its composer on the moment the
+    /// thread lands. Set by `openThread(replyTo:)`, so `r` on a list row is one
+    /// gesture: navigate, then compose. One-shot — the viewer clears it.
+    var pendingReplyMessageId: Int?
     var triageFix: TriageFixTarget?
     var ruleEditor: RuleEditorRequest?
     var processModeOpen = false
@@ -383,8 +393,7 @@ final class AppStore {
         refreshError = nil
         selectedId = nil
         route(to: .sitrep)
-        threadId = nil
-        threadQueue = []
+        closeThread()
         sideView = .none
         history = [HistoryEntry(view: .sitrep, selectedId: nil)]
         historyIndex = 0
@@ -420,9 +429,9 @@ final class AppStore {
     func setView(_ view: MainView, viaPointer: Bool = false) {
         // Navigating ANYWHERE dismisses an open thread viewer: the rail is visible
         // beside it, so a click there means "leave this email", not "change the
-        // page underneath the overlay".
-        threadId = nil
-        threadQueue = []
+        // page underneath the overlay". Through closeThread() so the reader's
+        // inline reply is torn down with it, wherever the exit was taken from.
+        closeThread()
         // No-op on the same view+selection, so a repeat press cannot spam
         // identical history entries.
         let cur = history.indices.contains(historyIndex) ? history[historyIndex] : nil
@@ -439,8 +448,7 @@ final class AppStore {
     func viewInEmails(_ id: Int) {
         route(to: .emails)
         selectedId = id
-        threadId = nil
-        threadQueue = []
+        closeThread()
         pushHistory(HistoryEntry(view: .emails, selectedId: id))
     }
 
@@ -484,20 +492,31 @@ final class AppStore {
 
     // MARK: - surfaces
 
-    func openThread(_ threadId: String, queue: [AttentionUpdate] = []) {
+    /// Open the fullscreen reader. `replyTo` is the unified `r` verb: the message
+    /// id the reader should open its inline composer on once the thread loads.
+    func openThread(_ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil) {
         self.threadId = threadId
         self.threadQueue = queue
+        // Both cleared unconditionally: moving to ANOTHER thread (h/l, done+next)
+        // must not carry the previous one's draft or its pending reply request
+        // into a thread they do not belong to.
+        inlineReply = nil
+        pendingReplyMessageId = replyTo
     }
 
     func closeThread() {
         threadId = nil
         threadQueue = []
+        inlineReply = nil
+        pendingReplyMessageId = nil
     }
 
     /// True while a modal owns the screen; the surfaces under it blur so the modal
     /// reads as focus rather than as a new page. Toasts are deliberately absent (a
     /// toast must never defocus the app), as are the side panels and the thread
-    /// viewer — those are surfaces you interact with, not overlays on one.
+    /// viewer — those are surfaces you interact with, not overlays on one. The
+    /// reader's `inlineReply` is absent for the same reason: it is part of the
+    /// viewer, and blurring the email you are answering would be absurd.
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen || compose != nil
             || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
@@ -686,6 +705,16 @@ final class AppStore {
 
     func openCompose(_ state: ComposeState) { compose = state }
     func closeCompose() { compose = nil }
+
+    /// Open the reader's inline reply on a specific message. Never resets a
+    /// composer that is already open — a draft is not something a repeated `r`
+    /// gets to throw away.
+    func openInlineReply(replyTo messageId: Int) {
+        guard inlineReply == nil else { return }
+        inlineReply = ComposeState(replyToMessageId: messageId)
+    }
+
+    func closeInlineReply() { inlineReply = nil }
 
     func openTriageFix(_ target: TriageFixTarget) { triageFix = target }
     func closeTriageFix() { triageFix = nil }
