@@ -404,16 +404,9 @@ private struct ObligationRow: View {
     let index: Int
     let cursor: SitrepCursor
 
-    /// Drives the hover wash. LOCAL on purpose: the row's own feedback never
-    /// depends on the dashboard re-rendering.
-    @State private var hovering = false
-
-    /// THE SHORT-CIRCUIT IS LOAD-BEARING. Observation records only the properties
-    /// a body actually TOUCHED, so with the keyboard idle this never reads
-    /// `cursor.index` — and the index write every hover event performs then has
-    /// no observer to invalidate. Collapsing this to a stored `focused` flag
-    /// passed from the parent is what used to make a scroll redraw the page.
-    private var focused: Bool { cursor.kbActive && cursor.index == index }
+    /// Hover, in a REFERENCE this body never reads — see `ObligationWash`. The
+    /// row deliberately reads neither hover nor focus, so neither can relayout it.
+    @State private var hover = RowHover()
 
     /// Best-effort money amount from an update's one_line ("$142.00"). Hand-
     /// scanned and memoized rather than regex: this runs for every visible row
@@ -474,10 +467,13 @@ private struct ObligationRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // Focus and hover are the same fill at different alphas, on ONE identity:
-        // a sweep recolours a rectangle and never rebuilds the row.
-        .selectionFill(
-            focused, hovering: hovering, tint: overdue ? Palette.danger : Palette.accent)
+        // A BACKGROUND, not a modifier on this body: a background is sized by its
+        // primary content, so the wash repainting can never resize the row.
+        .background {
+            ObligationWash(
+                index: index, cursor: cursor, hover: hover,
+                tint: overdue ? Palette.danger : Palette.accent)
+        }
         .overlay(alignment: .leading) {
             if overdue {
                 RoundedRectangle(cornerRadius: 1)
@@ -487,9 +483,59 @@ private struct ObligationRow: View {
             }
         }
         .onHover { over in
-            hovering = over
+            hover.on = over
             if over { cursor.hover(index) }
         }
+    }
+}
+
+/// One row's hover, as a reference so the row's own body never reads it.
+@MainActor
+@Observable
+private final class RowHover {
+    var on = false
+}
+
+/// The row's selection + hover paint, as a LEAF placed in `.background`.
+///
+/// WHY IT IS NOT PART OF THE ROW'S BODY. A `sample` taken during a stuttering
+/// scroll put the main thread overwhelmingly in stack SIZING —
+/// `LayoutEngineBox.explicitAlignment`, `StackLayout.prioritize`,
+/// `ViewDimensions.subscript` — and almost nowhere in view updates. So the cost
+/// of a hover was never the re-render; it was the RELAYOUT the re-render
+/// triggers. An obligation row is a stack of stacks carrying three
+/// layout-priority bands and a `Label`, and re-running its body re-measures all
+/// of that, then propagates up through the zone card and the column. A
+/// newsletter card, which has neither priorities nor a Label, went smooth as
+/// soon as its parent stopped redrawing; these rows did not, and this is why.
+///
+/// Down here nothing above can be resized: a background is sized by its primary
+/// content, so repainting this is paint and nothing else.
+private struct ObligationWash: View {
+    let index: Int
+    let cursor: SitrepCursor
+    let hover: RowHover
+    let tint: Color
+
+    private static let radius: CGFloat = 9
+
+    /// Short-circuits exactly as it did on the row: with the keyboard idle
+    /// `cursor.index` is never read, so the index write every hover performs
+    /// still reaches no observer.
+    private var focused: Bool { cursor.kbActive && cursor.index == index }
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+            .fill(
+                focused
+                    ? tint.opacity(SelectionTone.selected)
+                    : (hover.on ? Palette.hairline.opacity(SelectionTone.hover) : .clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                    .strokeBorder(
+                        focused ? tint.opacity(SelectionTone.border) : .clear, lineWidth: 1)
+            )
     }
 }
 
