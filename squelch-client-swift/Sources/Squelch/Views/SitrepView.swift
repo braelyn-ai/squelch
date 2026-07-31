@@ -202,9 +202,13 @@ struct SitrepView: View {
         }
     }
 
+    /// Shared by the button and by arrowing off the end of the collapsed list,
+    /// so both openings look like the same gesture.
+    private static let expandAnimation: Animation = .smooth(duration: 0.28)
+
     private func expander(_ overflow: Int) -> some View {
         Button {
-            withAnimation(.smooth(duration: 0.28)) { cursor.expanded.toggle() }
+            withAnimation(Self.expandAnimation) { cursor.expanded.toggle() }
         } label: {
             Text(cursor.expanded ? "show less" : "\(overflow) more")
                 .font(Typo.micro)
@@ -296,7 +300,22 @@ struct SitrepView: View {
     /// glass reappear.
     private func moveEyes(_ delta: Int) {
         cursor.kbActive = true
-        cursor.index = max(0, min(reachable.count - 1, cursor.index + delta))
+        // Ranked once here rather than through `reachable` twice: the expander
+        // check needs the full list and the cursor needs the visible one.
+        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        let rows = cursor.expanded ? ranked : Array(ranked.prefix(eyesVisible))
+        let next = cursor.index + delta
+
+        // DOWN OFF THE END OF A COLLAPSED LIST OPENS IT and keeps going, landing
+        // on the first newly-revealed row. Without this the expander is the one
+        // control in the zone that only a mouse can reach, and the cursor just
+        // stalls on the last row with no indication there is more beneath it.
+        if delta > 0, next >= rows.count, !cursor.expanded, ranked.count > rows.count {
+            withAnimation(Self.expandAnimation) { cursor.expanded = true }
+            cursor.index = rows.count
+            return
+        }
+        cursor.index = max(0, min(rows.count - 1, next))
     }
 
     private func markNewsletterDone(_ nl: Newsletter) async {
