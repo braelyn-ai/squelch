@@ -75,38 +75,51 @@ struct SitrepView: View {
 
         return VStack(spacing: 0) {
             masthead
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 18) {
-                    DashHero(standing: store.sitrep.standing)
-                        .padding(.horizontal, 4)
+            // THE HERO STAYS PUT. It sits above BOTH columns, so it cannot scroll
+            // with one of them and hold still for the other; and "one item needs
+            // you today" is the page's standing answer, which is worth keeping on
+            // screen rather than scrolling away first.
+            DashHero(standing: store.sitrep.standing)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 18)
 
-                    HStack(alignment: .top, spacing: 18) {
-                        VStack(spacing: 16) {
-                            if !store.sitrep.standing.isEmpty {
-                                forYourEyes(visible: visible, overflow: overflow)
-                            }
-                            if !store.sitrep.new.isEmpty { attentionZone }
-                            NewslettersZone(
-                                newsletters: Newsletters.prune(
-                                    store.zones.newsletters, resolved: store.resolvedIds),
-                                cursor: cursor)
-                            StatusStrip(rulesCount: rulesCount)
+            HStack(alignment: .top, spacing: 18) {
+                // THE ONLY THING THAT SCROLLS WITH THE PAGE.
+                ScrollView(.vertical) {
+                    VStack(spacing: 16) {
+                        if !store.sitrep.standing.isEmpty {
+                            forYourEyes(visible: visible, overflow: overflow)
                         }
-                        .frame(maxWidth: .infinity, alignment: .top)
-
-                        VStack(spacing: 14) {
-                            CalendarZone()
-                            ShipmentsZone()
-                            BankingZone()
-                            ReceiptsZone()
-                        }
-                        .frame(width: 306)
+                        if !store.sitrep.new.isEmpty { attentionZone }
+                        NewslettersZone(
+                            newsletters: Newsletters.prune(
+                                store.zones.newsletters, resolved: store.resolvedIds),
+                            cursor: cursor)
+                        StatusStrip(rulesCount: rulesCount)
                     }
+                    .padding(.bottom, 28)
                 }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 28)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .top)
+
+                // THE RECORDS RAIL IS PINNED. These are reference columns you
+                // read WHILE working the left side, so they must not leave with
+                // it. Its own scroll view rather than a plain stack so a rail
+                // taller than the window is still reachable —
+                // `.basedOnSize` is what keeps it completely inert until then,
+                // instead of rubber-banding against nothing.
+                ScrollView(.vertical) {
+                    VStack(spacing: 14) {
+                        CalendarZone()
+                        ShipmentsZone()
+                        BankingZone()
+                        ReceiptsZone()
+                    }
+                    .padding(.bottom, 28)
+                }
+                .scrollBounceBehavior(.basedOnSize)
+                .frame(width: 306)
             }
+            .padding(.horizontal, 24)
         }
         .keyContext(.sitrep)
         .keyBindings(.sitrep, bindings)
