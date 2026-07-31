@@ -637,6 +637,11 @@ final class AppStore {
         undos.removeAll { $0.id == entry.id }
         do {
             try await entry.revert()
+            // The message is open again, so it must stop being filtered out of
+            // every list that hides resolved ids — otherwise an undo looks like
+            // it did nothing until the next poll. Harmless for undo kinds that
+            // never resolved anything: the id simply is not in the set.
+            resolvedIds.remove(entry.messageId)
             pushToast("undone: \(entry.label)", .info)
         } catch {
             pushToast("undo failed: \(entry.label)", .error)

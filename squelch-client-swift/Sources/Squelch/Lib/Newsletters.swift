@@ -179,6 +179,36 @@ enum Newsletters {
     }
 
     /// The `*@domain` pattern a newsletter CTA prefills into the rule editor.
+    /// Drop already-resolved messages from a derived window, recomputing the
+    /// fields taken from the newest survivor and removing any sender left with
+    /// nothing at all.
+    ///
+    /// A READ-SIDE FILTER, not a mutation of the store. `derive` skips
+    /// `status == .done`, so the server's next poll produces this same answer —
+    /// this only covers the ten seconds in between, which is exactly the window
+    /// in which marking mail done looked like it had not worked. `resolvedIds`
+    /// is already the app's record of "resolved, poll has not caught up", and
+    /// undo clears it, so a restored message brings its card straight back.
+    static func prune(_ newsletters: [Newsletter], resolved: Set<Int>) -> [Newsletter] {
+        guard !resolved.isEmpty else { return newsletters }
+        return newsletters.compactMap { nl in
+            let live = nl.items.filter { !resolved.contains($0.id) }
+            if live.count == nl.items.count { return nl }
+            // Nothing left in the window: the card goes, rather than sitting
+            // there at zero until the poll agrees.
+            guard let newest = live.first else { return nil }
+            var out = nl
+            out.items = live
+            out.count = live.count
+            // `derive` sorts items newest-first and takes these three from the
+            // newest message, so the head of the surviving list carries them.
+            out.latest = dateOf(newest)
+            out.latestThreadId = newest.thread_id
+            if !newest.one_line.isEmpty { out.summary = newest.one_line }
+            return out
+        }
+    }
+
     static func domainPattern(_ address: String) -> String {
         let domain =
             SenderID.faviconDomain(address) ?? address.split(separator: "@").last.map(String.init)

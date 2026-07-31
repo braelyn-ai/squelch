@@ -87,7 +87,9 @@ struct SitrepView: View {
                             }
                             if !store.sitrep.new.isEmpty { attentionZone }
                             NewslettersZone(
-                                newsletters: store.zones.newsletters, cursor: cursor)
+                                newsletters: Newsletters.prune(
+                                    store.zones.newsletters, resolved: store.resolvedIds),
+                                cursor: cursor)
                             StatusStrip(rulesCount: rulesCount)
                         }
                         .frame(maxWidth: .infinity, alignment: .top)
@@ -324,6 +326,10 @@ struct SitrepView: View {
         do {
             for item in nl.items {
                 try await APIClient.shared.setStatus(item.id, .done)
+                // Record it as resolved, not just gone from this zone: the same
+                // message can be sitting in a band or on the mail page, and this
+                // path never went through removeFromBands.
+                store.noteResolved(item.id)
                 // Unpin as each one lands, not at the end: a throw partway
                 // through still leaves the resolved ones released. No undo on
                 // this path, so nothing re-pins.
