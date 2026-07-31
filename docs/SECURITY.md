@@ -157,11 +157,30 @@ queryable as normal mail — not even for an instant.
   `/client/sealed` and exactly one body at `/client/sealed/{id}/reveal`, which
   appends the audit row **before** returning and sets `Cache-Control: no-store`.
 
+**Local drafts (human-door-only table).** `drafts`
+(`squelch-core/src/store/sqlite/drafts.rs`, served only by `/client/drafts`) holds
+unsent compositions, one per reply target plus one new-message slot. It is **never
+synced to Gmail Drafts** and **never visible on `/mcp`** — an unsent draft is the
+user's own thinking, not mail the agent door was handed. It is also **never
+audited**: the audit log is the ledger of reveals and Gmail writes, and a
+composition that never left the machine is neither, so audit rows would only add a
+record of what the user was drafting. Reads and writes carry `Cache-Control:
+no-store`, like the reveal.
+- `handlers::put_draft` resolves the parent through the same lookup `send` uses, so
+  a draft can never be **saved** against sealed mail (sealed and unknown are one 404).
+- A **post-hoc** seal scrubs it: both seal paths — `feedback.rs:correct_triage`'s
+  seal branch (hand correction) and `messages.rs:ingest_message` (a re-ingest whose
+  triage row lands `sealed`) — `DELETE FROM drafts` for that message id in the same
+  transaction as the seal. `list_drafts` additionally filters a sealed parent
+  (`NOT EXISTS` on `triage`, the same shape as `deadlines`) as a belt.
+
 **Do not break.** Seal detection stays the first thing that touches a parsed body —
 any pass moved above it is a pass that has read an OTP. Sealed *absence* is the
 agent-door contract: do not add a `sensitivity` field to agent-door types "so callers
 can filter". Keep the guards returning errors, the reveal audited-before-served and
-`no-store`, and writes human-door only.
+`no-store`, and writes human-door only. Keep `drafts` off the agent door and out of
+the audit log, and keep both seal paths scrubbing it — a draft outliving its parent's
+seal is a quotation of auth mail the user has already decided is auth.
 
 ## 5. Outbound secret guard
 
@@ -192,13 +211,20 @@ audits under its own action `send.echo`, alongside the `send` row's own outcomes
 | `send.echo` detail | meaning |
 | --- | --- |
 | `skipped:no_id` | Gmail's send response carried no message id; nothing to fetch back. |
-| `failed:fetch` | the read-back GET or its base64url decode failed. |
+| `skipped:sealed` | the outbound copy tripped seal detection; nothing was committed. |
+| `failed:fetch` | the read-back GET timed out (5s), failed, decoded badly, or returned zero bytes. |
 | `failed:ingest` | the local store write failed. |
 | `ok:<local id>` | echoed; `<local id>` is the local `messages.id`. |
 
 The echoed row goes through the SAME seal-first ingest as any other message
-(`sync::ingest::ingest_sent`, `is_sent: true`), so it runs no LLM and — because
-seal detection precedes the `is_sent` branch — a reply quoting an OTP lands
-`sealed`, exactly as backfilled SENT mail does. Keep the echo's failures audited
-and swallowed; keep it out of core's write surface (the fetch lives in
-`squelch-api/src/gmail_write.rs`, core takes bytes).
+(`sync::ingest::ingest_sent`, `is_sent: true`), so it runs no LLM. Because seal
+detection precedes the `is_sent` branch, a reply quoting an OTP trips it — and such
+a copy is **not written at all** (`Ok(None)`, `skipped:sealed`). Committing it would
+put a sealed row in the thread, and `thread_guard_and_subject` 404s any thread
+holding one, so the echo would hide the counterparty's mail the user was reading a
+second ago; skipping degrades to "the reply appears on the next backfill", the
+pre-echo status quo. The read-back is also capped at **5s**
+(`ECHO_FETCH_TIMEOUT_SECS`): the client's POST timeout is 15s and `action_send` has
+already made two serial Gmail calls, so bookkeeping may not spend the rest of that
+budget. Keep the echo's failures audited and swallowed; keep it out of core's write
+surface (the fetch lives in `squelch-api/src/gmail_write.rs`, core takes bytes).

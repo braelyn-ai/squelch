@@ -82,10 +82,25 @@ impl SqliteStore {
     /// Every draft for an account, most recently touched first.
     pub fn list_drafts(&self, account_id: AccountId) -> Result<Vec<Draft>> {
         let conn = self.lock()?;
+        // SECURITY BELT (same shape as `deadlines`): exclude a draft whose parent
+        // is sealed. The seal paths already DELETE such drafts, so this only fires
+        // if one is ever missed — a draft quoting mail the user has since decided
+        // is auth must not come back out of the list.
+        //
+        // The NULL key (the new-message draft) compares NULL against
+        // `triage.message_id`, so the subquery matches nothing and NOT EXISTS
+        // holds: it is never filtered.
         let mut stmt = conn.prepare(
             "SELECT id, account_id, reply_to_message_id, to_addr, subject, body,
                     created_at, updated_at
-             FROM drafts WHERE account_id = ?1 ORDER BY updated_at DESC",
+             FROM drafts
+             WHERE account_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM triage t
+                   WHERE t.message_id = drafts.reply_to_message_id
+                     AND t.sensitivity = 'sealed'
+               )
+             ORDER BY updated_at DESC",
         )?;
         let out = stmt
             .query_map(params![account_id], map_draft)?

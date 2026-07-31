@@ -558,6 +558,17 @@ impl SqliteStore {
             ],
         )?;
 
+        // 2b. LOCAL DRAFT scrub, in the SAME transaction: a re-ingest can turn a
+        //     row that was normal when the draft was saved into a sealed one, and
+        //     `put_draft` would never accept a sealed parent. The reply
+        //     composition goes with the seal.
+        if triaged.sensitivity == Sensitivity::Sealed {
+            tx.execute(
+                "DELETE FROM drafts WHERE account_id = ?1 AND reply_to_message_id = ?2",
+                params![triaged.message.account_id, id],
+            )?;
+        }
+
         // 3. Deadlines: non-sealed mail only (Stage-1 never runs on sealed
         //    content), so a sealed re-ingest passes None and only clears.
         let ingest_deadline = if triaged.sensitivity == Sensitivity::Sealed {

@@ -175,6 +175,14 @@ impl SqliteStore {
                 "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
+            // And the LOCAL DRAFT replying to it, for the same reason: `put_draft`
+            // refuses a sealed parent, so a draft keyed to one is a row the human
+            // door would never have accepted, and it quotes mail the user has just
+            // decided is auth. Discarding a composition is the cost of the seal.
+            tx.execute(
+                "DELETE FROM drafts WHERE account_id = ?1 AND reply_to_message_id = ?2",
+                params![account_id, message_id],
+            )?;
             // And the NOTIFICATION EVENT, if one was already emitted: its
             // sender + one_line snapshot replays to every client cursor forever,
             // including onto a lock screen, and sealed content must not reach a

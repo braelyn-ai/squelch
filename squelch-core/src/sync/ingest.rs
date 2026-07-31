@@ -656,10 +656,13 @@ pub fn ingest_with_rules(
 /// `UNIQUE(account_id, gmail_msg_id)` upsert makes a re-ingest of the same Gmail
 /// id a no-op update, returning the existing local id.
 ///
-/// ACCEPTED QUIRK: seal detection runs BEFORE the `is_sent` branch (that ordering
-/// is the security invariant), so a reply that quotes an OTP lands `sealed` — the
-/// user's own outbound copy then hides behind the reveal gate. Consistent with how
-/// backfill already treats SENT mail; not worth weakening the ordering for.
+/// A SEALED OUTBOUND COPY IS NOT WRITTEN: `Ok(None)`, nothing committed. Seal
+/// detection runs BEFORE the `is_sent` branch (that ordering is the security
+/// invariant), so a reply quoting an OTP trips it. Committing that row would put a
+/// sealed message in the thread, and `thread_guard_and_subject` 404s any thread
+/// holding one, so echoing the reply would HIDE the counterparty's mail the user
+/// was reading a second ago. Skipping degrades to "your reply appears on the next
+/// backfill", which is exactly the pre-echo status quo.
 pub fn ingest_sent(
     store: &SqliteStore,
     account_id: AccountId,
@@ -669,7 +672,7 @@ pub fn ingest_sent(
     raw: Vec<u8>,
     internal_date: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-) -> crate::error::Result<i64> {
+) -> crate::error::Result<Option<i64>> {
     let fetched = RawFetched {
         account_id,
         gmail_msg_id: gmail_msg_id.to_string(),
@@ -682,7 +685,10 @@ pub fn ingest_sent(
     // Both arguments are unreachable on the sent path: Stage-1 (which cfg tunes)
     // and the contact lookup only run for non-sealed RECEIVED mail.
     let triaged = ingest(&fetched, &Stage1Config::default(), now, |_| false);
-    store.ingest_message(&triaged)
+    if triaged.sensitivity == Sensitivity::Sealed {
+        return Ok(None);
+    }
+    store.ingest_message(&triaged).map(Some)
 }
 
 #[cfg(test)]
@@ -1263,7 +1269,8 @@ mod tests {
             Some(now),
             now,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a normal outbound copy is committed");
 
         // Visible in the thread, neutral, and never a source of attention noise.
         let view = store.thread_view_with_html(acct, "thread-77").unwrap();
@@ -1288,11 +1295,79 @@ mod tests {
             now,
         )
         .unwrap();
-        assert_eq!(again, id, "idempotent on the UNIQUE(account, gmail id) upsert");
+        assert_eq!(again, Some(id), "idempotent on the UNIQUE(account, gmail id) upsert");
         assert_eq!(
             store.thread_view_with_html(acct, "thread-77").unwrap().messages.len(),
             1
         );
+    }
+
+    #[test]
+    fn ingest_sent_skips_a_sealed_outbound_copy_and_commits_nothing() {
+        // A reply quoting an OTP trips seal detection (which runs before the
+        // `is_sent` branch, by design). Committing that row would make
+        // `thread_guard_and_subject` 404 the thread the user is reading, so nothing
+        // is written at all.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let parent = store
+            .upsert_message(&NewMessage {
+                account_id: acct,
+                gmail_msg_id: "g-parent".to_string(),
+                thread_id: "thread-88".to_string(),
+                from_addr: "noreply@bank.com".to_string(),
+                from_name: None,
+                subject: "Your verification code".to_string(),
+                received_at: Utc::now(),
+                snippet: String::new(),
+                body: "hello".to_string(),
+                body_html: None,
+                is_sent: false,
+                list_unsubscribe: None,
+                list_unsub_one_click: false,
+            })
+            .unwrap();
+        store
+            .set_triage(
+                parent,
+                acct,
+                40,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Support <support@bank.com>\r\n\
+                   Subject: Re: Your verification code\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   I never asked for this. Your one-time passcode is 483920.\r\n";
+        let now = Utc::now();
+        let echoed = ingest_sent(
+            &store,
+            acct,
+            "me@example.com",
+            "sent-sealed",
+            Some("thread-88".to_string()),
+            eml.as_bytes().to_vec(),
+            Some(now),
+            now,
+        )
+        .unwrap();
+        assert!(echoed.is_none(), "a sealed outbound copy is not echoed");
+
+        // Nothing committed: no sealed row, and the thread still opens with the
+        // parent alone rather than 404ing on a sealed member.
+        assert!(store.sealed_messages(acct).unwrap().is_empty());
+        let view = store.thread_view_with_html(acct, "thread-88").unwrap();
+        assert_eq!(view.messages.len(), 1, "only the parent; the echo was skipped");
+        // Contacts are not seeded either — the whole write was skipped.
+        assert!(!store.is_known_contact(acct, "support@bank.com").unwrap());
     }
 
     #[test]

@@ -23,6 +23,7 @@ use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::types::{
     AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
 };
+use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::gmail_write::{
@@ -40,6 +41,9 @@ const DEFAULT_UPDATES_WINDOW_DAYS: i64 = 30;
 
 /// Actor label written into the audit log for human-door reveals.
 const AUDIT_ACTOR: &str = "human";
+
+/// How long the post-send echo may spend on its read-back (see [`echo_sent`]).
+const ECHO_FETCH_TIMEOUT_SECS: u64 = 5;
 
 // --- pagination cursor ------------------------------------------------------
 
@@ -759,12 +763,25 @@ impl From<Draft> for DraftView {
     }
 }
 
+/// The `Cache-Control: no-store` header pair, one spelling for every response
+/// that must not be retained anywhere on the path: a revealed sealed body, and a
+/// draft (an unsent composition is the user's own thinking, not something to leave
+/// in a proxy or a disk cache).
+fn no_store() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    headers
+}
+
 pub async fn list_drafts(
     State(state): State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let drafts = store_call(&state, |store, account_id| store.list_drafts(account_id)).await?;
     let items: Vec<DraftView> = drafts.into_iter().map(DraftView::from).collect();
-    Ok(Json(items))
+    Ok((no_store(), Json(items)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -789,8 +806,11 @@ pub async fn put_draft(
     State(state): State<ApiState>,
     Json(body): Json<DraftBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // A draft can never be keyed to sealed mail: the parent is resolved through
-    // the same lookup `send` uses, where sealed and unknown are one 404.
+    // No draft is ever SAVED against sealed mail: the parent is resolved through
+    // the same lookup `send` uses, where sealed and unknown are one 404. A
+    // POST-HOC seal (hand correction, or a re-ingest that trips detection) is the
+    // store's job — both seal paths delete the drafts keyed to that message, and
+    // `list_drafts` filters a sealed parent as a belt.
     if let Some(parent) = body.reply_to_message_id {
         resolve_target(&state, parent).await?;
     }
@@ -803,7 +823,7 @@ pub async fn put_draft(
         store.upsert_draft(account_id, reply_to, &to, &subject, &text, Utc::now())
     })
     .await?;
-    Ok(Json(DraftView::from(draft)))
+    Ok((no_store(), Json(DraftView::from(draft))))
 }
 
 /// `DELETE /client/drafts/{id}` — discard one draft. Another account's id and an
@@ -908,12 +928,7 @@ pub async fn reveal_sealed(
     };
 
     // Never cache a sealed body anywhere along the path.
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
-    Ok((headers, Json(payload)))
+    Ok((no_store(), Json(payload)))
 }
 
 // --- GET /client/audit -------------------------------------------------------
@@ -1528,7 +1543,8 @@ pub struct SendBody {
 /// IDS ONLY, never message content. Returns the local message id on success.
 ///
 /// AUDIT (contract, docs/SECURITY.md §5): action `send.echo`, detail
-/// `skipped:no_id` | `failed:fetch` | `failed:ingest` | `ok:<local id>`.
+/// `skipped:no_id` | `skipped:sealed` | `failed:fetch` | `failed:ingest` |
+/// `ok:<local id>`.
 async fn echo_sent(
     state: &ApiState,
     client: &GmailWriteClient,
@@ -1544,10 +1560,24 @@ async fn echo_sent(
         }
     };
 
-    let fetched = match client.fetch_raw(&gmail_msg_id).await {
-        Ok(f) => f,
-        Err(e) => {
+    // TIMEOUT BUDGET: the Swift client's POST timeout is 15s and `action_send` has
+    // already spent two serial Gmail calls (parent headers, then the send) before
+    // getting here. The echo is bookkeeping, so it may not spend what is left —
+    // past 5s it gives up and the reply lands on the next backfill instead.
+    let fetched = match tokio::time::timeout(
+        Duration::from_secs(ECHO_FETCH_TIMEOUT_SECS),
+        client.fetch_raw(&gmail_msg_id),
+    )
+    .await
+    {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
             eprintln!("squelch-api: echo of sent message {gmail_msg_id} failed to fetch: {e}");
+            audit_action(state, "send.echo", target, "failed:fetch").await;
+            return None;
+        }
+        Err(_elapsed) => {
+            eprintln!("squelch-api: echo of sent message {gmail_msg_id} timed out");
             audit_action(state, "send.echo", target, "failed:fetch").await;
             return None;
         }
@@ -1560,6 +1590,13 @@ async fn echo_sent(
             return None;
         }
     };
+    // A `format=raw` read that carried no `raw` field decodes to zero bytes, which
+    // would ingest as a message with no headers and no body. Nothing to echo.
+    if raw.is_empty() {
+        eprintln!("squelch-api: echo of sent message {gmail_msg_id} returned no bytes");
+        audit_action(state, "send.echo", target, "failed:fetch").await;
+        return None;
+    }
 
     let thread_id = fetched.thread_id.clone().or_else(|| sent.thread_id.clone());
     let internal_date = parse_internal_date(fetched.internal_date.as_deref());
@@ -1581,9 +1618,16 @@ async fn echo_sent(
     .await;
 
     match ingested {
-        Ok(local_id) => {
+        Ok(Some(local_id)) => {
             audit_action(state, "send.echo", target, &format!("ok:{local_id}")).await;
             Some(local_id)
+        }
+        // The outbound copy tripped seal detection, so core committed nothing: a
+        // sealed row in the thread would 404 the whole thread the user is reading.
+        // The reply shows up on the next backfill instead.
+        Ok(None) => {
+            audit_action(state, "send.echo", target, "skipped:sealed").await;
+            None
         }
         Err(_) => {
             eprintln!("squelch-api: echo of sent message {log_id} failed to ingest");

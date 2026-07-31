@@ -1149,6 +1149,133 @@ async fn echo_fetch_failure_never_fails_the_send() {
     );
 }
 
+/// The RFC822 for a sent reply whose body trips seal detection (a quoted OTP),
+/// base64url-encoded the way `format=raw` returns it. The SEND body is innocuous —
+/// what seals is the copy Gmail hands back, not what the client typed.
+fn sealed_reply_raw_b64() -> String {
+    use base64::Engine as _;
+    let eml = "From: Me <me@example.com>\r\n\
+               To: Support <support@bank.com>\r\n\
+               Subject: Re: Your verification code\r\n\
+               Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+               Content-Type: text/plain; charset=\"UTF-8\"\r\n\
+               \r\n\
+               I never asked for this. Your one-time passcode is 483920.\r\n";
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+}
+
+#[tokio::test]
+async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
+    // The echoed copy seals. Committing it would put a sealed row in the thread,
+    // and the thread view 404s any thread holding one — the reply would take the
+    // counterparty's mail down with it. So: no echo, and the thread still opens.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{}".to_string()),
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-77\"}".to_string()),
+        (
+            200,
+            format!(
+                "{{\"id\":\"sent-1\",\"threadId\":\"thread-77\",\
+                   \"internalDate\":\"1783591200000\",\"raw\":\"{}\"}}",
+                sealed_reply_raw_b64()
+            ),
+        ),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        let m = store
+            .upsert_message(&msg(acct, "gmail-parent", "thread-77", "Lunch?", "want lunch?"))
+            .unwrap();
+        store
+            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .unwrap();
+    });
+    let message_id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": message_id,
+                "body": "please look into this",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a skipped echo is not a failed send");
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "sent");
+    assert!(json["echo_message_id"].is_null(), "the sealed copy is not echoed");
+    assert_eq!(handle.await.unwrap().len(), 3);
+
+    // THE POINT: the thread the user was reading still opens, with the parent alone.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/thread/thread-77"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the thread must not 404");
+    let thread = body_json(resp).await;
+    assert_eq!(thread["messages"].as_array().map(Vec::len), Some(1));
+    // And nothing sealed was committed at all.
+    assert!(store.sealed_messages(acct).unwrap().is_empty());
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some("skipped:sealed"))
+    );
+}
+
+#[tokio::test]
+async fn echo_of_an_empty_raw_read_never_ingests() {
+    // A `format=raw` 200 with no `raw` field decodes to zero bytes, which would
+    // ingest as a message with neither headers nor body. It is a failed fetch.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["echo_message_id"].is_null());
+    assert_eq!(handle.await.unwrap().len(), 2);
+
+    // Nothing was written: no local message, sent or otherwise.
+    let stats = store.stats(acct).unwrap();
+    assert_eq!(
+        (stats.total, stats.sealed),
+        (0, 0),
+        "empty bytes must not become a message row"
+    );
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some("failed:fetch"))
+    );
+}
+
 // --- sitrep: seen-ledger + bands + resolution over HTTP ---------------------
 
 use squelch_core::types::AttentionStatus;
@@ -2618,6 +2745,28 @@ async fn delete_draft_then_deleting_it_again_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a second delete has nothing to remove");
+}
+
+#[tokio::test]
+async fn draft_reads_and_writes_are_no_store() {
+    // A draft is unsent thinking: like the revealed sealed body, it must not be
+    // retained by anything on the path to the client.
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "PUT",
+            "/client/drafts",
+            serde_json::json!({ "to": "bob@example.com", "body": "hi" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+    let resp = app.oneshot(authed("GET", "/client/drafts")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
 }
 
 #[tokio::test]

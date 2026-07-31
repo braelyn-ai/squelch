@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::support::*;
+use crate::types::SealedKind;
 
 /// A fixed base instant, so `updated_at` movement is asserted, not raced.
 fn t(minutes: i64) -> DateTime<Utc> {
@@ -140,6 +141,57 @@ fn list_drafts_orders_by_updated_at_desc_and_scopes_by_account() {
     let theirs = store.list_drafts(other).unwrap();
     assert_eq!(theirs.len(), 1);
     assert_eq!(theirs[0].subject, "theirs");
+}
+
+#[test]
+fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
+    // The BELT, not the scrub: the draft row is inserted straight and the parent
+    // is sealed by hand, so neither seal path runs. A draft keyed to sealed mail
+    // must still never come back out of the list.
+    let (store, acct) = store();
+    let parent = triaged(acct, "g1", "t1").seed(&store);
+    store
+        .upsert_draft(acct, Some(parent), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .unwrap();
+    store
+        .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t(1))
+        .unwrap();
+    assert_eq!(store.list_drafts(acct).unwrap().len(), 2);
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET sensitivity = 'sealed' WHERE message_id = ?1",
+            params![parent],
+        )
+        .unwrap();
+
+    let left = store.list_drafts(acct).unwrap();
+    assert_eq!(left.len(), 1, "the sealed parent's draft is filtered out");
+    assert!(
+        left[0].reply_to_message_id.is_none(),
+        "the NULL key compares against nothing and is never filtered"
+    );
+}
+
+#[test]
+fn reingest_that_seals_the_parent_deletes_its_draft() {
+    // The other seal path: a re-ingest can turn a row that was normal when the
+    // draft was saved into a sealed one, and it scrubs in the same transaction.
+    let (store, acct) = store();
+    let normal = triaged(acct, "g1", "t1");
+    let parent = normal.ingest(&store);
+    store
+        .upsert_draft(acct, Some(parent), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .unwrap();
+
+    let again = normal.clone().sealed(SealedKind::Otp).ingest(&store);
+    assert_eq!(again, parent, "same Gmail id, same local row");
+    assert!(
+        store.list_drafts(acct).unwrap().is_empty(),
+        "the re-ingest's seal took the draft with it"
+    );
 }
 
 #[test]

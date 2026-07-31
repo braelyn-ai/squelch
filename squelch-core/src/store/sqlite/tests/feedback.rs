@@ -174,6 +174,44 @@ fn unsealing_records_the_correction_and_frees_the_message() {
 }
 
 #[test]
+fn sealing_by_hand_discards_the_reply_draft() {
+    // A draft is only ever SAVED against non-sealed mail, so a post-hoc seal has
+    // to take the composition with it: the reply quotes mail the user has just
+    // decided is auth. The account's new-message draft is keyed to nothing and
+    // must survive.
+    let (store, acct) = store();
+    let t0 = Utc::now();
+    let id = inbound_triaged(acct, "g1", "t1", "noreply@bank.com", t0, false).ingest(&store);
+    let reply = store
+        .upsert_draft(acct, Some(id), "noreply@bank.com", "Re: code", "was this you?", t0)
+        .unwrap();
+    store
+        .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t0)
+        .unwrap();
+    assert_eq!(store.list_drafts(acct).unwrap().len(), 2);
+
+    store
+        .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+        .unwrap()
+        .unwrap();
+
+    // DELETED, not merely filtered: the row is gone from the table.
+    let left = store.list_drafts(acct).unwrap();
+    assert_eq!(left.len(), 1);
+    assert!(left[0].reply_to_message_id.is_none(), "the new-message draft stands");
+    let n: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM drafts WHERE id = ?1",
+            params![reply.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "the seal scrubs the row, it does not just hide it");
+}
+
+#[test]
 fn correcting_an_unknown_message_is_none_not_an_error() {
     let (store, acct) = store();
     let t0 = Utc::now();
