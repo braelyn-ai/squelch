@@ -5,8 +5,12 @@
 // (events, screens, session analytics) is one JSON POST to /batch, so the
 // client lives here where all of it can be read.
 //
-// PRIVACY: nothing content-shaped goes through this file. Events carry verbs
-// and screen names — never subjects, senders, bodies, or questions.
+// PRIVACY: nothing content-shaped goes through this file, and that is
+// ENFORCED, not just observed: every event name and every string value must
+// appear in the closed vocabulary below or it is dropped (and trips an assert
+// in a debug build). Email data — subjects, senders, bodies, labels, questions
+// — could only ever leave as a free-form string, so free-form strings cannot
+// leave at all.
 
 import AppKit
 import Foundation
@@ -45,12 +49,51 @@ enum Analytics {
         ) { _ in client.flushBlocking() }
     }
 
+    /// The closed set of event names this app emits. A new event is added HERE
+    /// first — an unknown name at a call site is a bug, not a data point.
+    private static let allowedEvents: Set<String> = [
+        "$screen", "Application Opened", "Application Backgrounded",
+        "email_archived", "email_done", "email_reopened", "email_labeled",
+        "block_rule_created", "compose_opened", "compose_send",
+        "thread_opened", "undo_fired", "assistant_asked",
+    ]
+
+    /// The closed set of STRING property values allowed off the machine.
+    /// Bools and numbers pass freely — cardinality that small cannot carry
+    /// mail. Strings can, so only these exact ones exist.
+    private static let allowedStrings: Set<String> =
+        Set(MainView.allCases.map(\.rawValue)).union([
+            // compose_send / compose_opened
+            "new", "reply", "sent", "guard_blocked", "forbidden", "failure",
+            // undo_fired kinds
+            "archive", "done", "label", "ruleDelete",
+        ])
+
     static func screen(_ name: String) {
+        guard allowedStrings.contains(name) else {
+            assertionFailure("analytics: screen name outside vocabulary")
+            return
+        }
         client?.capture("$screen", properties: ["$screen_name": name])
     }
 
     static func capture(_ event: String, _ properties: [String: Any] = [:]) {
-        client?.capture(event, properties: properties)
+        guard allowedEvents.contains(event) else {
+            assertionFailure("analytics: event outside vocabulary: \(event)")
+            return
+        }
+        var safe: [String: Any] = [:]
+        for (key, value) in properties {
+            switch value {
+            case is Bool, is Int, is Double:
+                safe[key] = value
+            case let s as String where allowedStrings.contains(s):
+                safe[key] = s
+            default:
+                assertionFailure("analytics: value outside vocabulary for \(key)")
+            }
+        }
+        client?.capture(event, properties: safe)
     }
 }
 
