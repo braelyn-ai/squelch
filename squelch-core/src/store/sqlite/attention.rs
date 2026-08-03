@@ -72,23 +72,15 @@ impl SqliteStore {
         //   open     = status = 'open'
         // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts out of the
         // band — a receipt is a record, not new inbox clutter.
-        let mut sql = String::from(
-            "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
-                    t.reason, t.deadline, t.matched_rule_id,
-                    t.status, t.surfaced_at, t.resolved_at, t.field_reasons,
-                    EXISTS(SELECT 1 FROM attachments a
-                           WHERE a.account_id = m.account_id
-                             AND a.message_id = m.id) AS has_atts
-             FROM triage t
-             JOIN messages m ON m.id = t.message_id
-             WHERE t.account_id = ?1
+        let mut where_sql = String::from(
+            "WHERE t.account_id = ?1
                AND t.sensitivity != 'sealed'
                AND m.is_sent = 0
                AND m.received_at >= ?2
                AND t.importance >= ?3",
         );
         if let Some(s) = status {
-            sql.push_str(match s {
+            where_sql.push_str(match s {
                 AttentionStatus::New => " AND t.status = 'new'",
                 AttentionStatus::Open => " AND t.status = 'open'",
                 AttentionStatus::Done => " AND t.status = 'done'",
@@ -96,25 +88,56 @@ impl SqliteStore {
         }
         match band {
             Some(SitrepBand::Standing) => {
-                sql.push_str(" AND t.tier IN ('past_due','deadline') AND t.status != 'done'");
+                where_sql.push_str(" AND t.tier IN ('past_due','deadline') AND t.status != 'done'");
             }
             Some(SitrepBand::New) => {
-                sql.push_str(" AND t.surfaced_at IS NULL AND t.status != 'done'")
+                where_sql.push_str(" AND t.surfaced_at IS NULL AND t.status != 'done'")
             }
-            Some(SitrepBand::Open) => sql.push_str(" AND t.status = 'open'"),
+            Some(SitrepBand::Open) => where_sql.push_str(" AND t.status = 'open'"),
             None => {}
         }
         // The `open` band is the aging one: age*importance floats
         // long-unresolved-and-important items, computed in SQL via julianday so
-        // the ordering stays server-side. Other bands sort by importance.
-        if band == Some(SitrepBand::Open) {
-            sql.push_str(
-                " ORDER BY (julianday(?4) - julianday(m.received_at)) * t.importance DESC,
-                          m.received_at DESC",
-            );
+        // the ordering stays server-side. Other bands sort by importance. The
+        // same expression orders WITHIN a thread (below) and BETWEEN the
+        // representatives, so the row shown is the one the sort would have put
+        // first anyway.
+        let (inner_order, outer_order) = if band == Some(SitrepBand::Open) {
+            (
+                "(julianday(?4) - julianday(m.received_at)) * t.importance DESC, m.received_at DESC",
+                "(julianday(?4) - julianday(received_at)) * importance DESC, received_at DESC",
+            )
         } else {
-            sql.push_str(" ORDER BY t.importance DESC, m.received_at DESC");
-        }
+            (
+                "t.importance DESC, m.received_at DESC",
+                "importance DESC, received_at DESC",
+            )
+        };
+        // ONE ROW PER THREAD: a two-message thread is one conversation and must
+        // not occupy two band rows. ROW_NUMBER picks the band-sort-first message
+        // as the representative; resolving it resolves the whole thread (see
+        // set_attention_status), so the hidden siblings can never pop back in.
+        // The thread key falls back to the message id for a blank thread_id, so
+        // an unthreaded row can only ever collapse with itself.
+        let sql = format!(
+            "SELECT * FROM (
+               SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
+                      t.reason, t.deadline, t.matched_rule_id,
+                      t.status, t.surfaced_at, t.resolved_at, t.field_reasons,
+                      EXISTS(SELECT 1 FROM attachments a
+                             WHERE a.account_id = m.account_id
+                               AND a.message_id = m.id) AS has_atts,
+                      m.received_at AS received_at,
+                      ROW_NUMBER() OVER (
+                          PARTITION BY COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id)
+                          ORDER BY {inner_order}
+                      ) AS rn
+               FROM triage t
+               JOIN messages m ON m.id = t.message_id
+               {where_sql})
+             WHERE rn = 1
+             ORDER BY {outer_order}"
+        );
 
         let now = Utc::now().to_rfc3339();
         let mut stmt = conn.prepare(&sql)?;
@@ -187,12 +210,32 @@ impl SqliteStore {
             AttentionStatus::Done => Some(Utc::now().to_rfc3339()),
             _ => None,
         };
-        let n = conn.execute(
-            "UPDATE triage
-             SET status = ?1, resolved_at = ?2
-             WHERE account_id = ?3 AND message_id = ?4 AND sensitivity != 'sealed'",
-            params![status.as_str(), resolved_at, account_id, message_id],
-        )?;
+        // DONE RESOLVES THE WHOLE THREAD: the bands show one row per thread
+        // (attention_updates), so resolving the representative must also resolve
+        // its siblings — otherwise a hidden sibling pops straight back into the
+        // band and done becomes whack-a-mole. Reopen (open/new) stays
+        // message-scoped: the undo path restores exactly the one row it removed,
+        // which is enough to re-surface the thread.
+        let n = match status {
+            AttentionStatus::Done => conn.execute(
+                "UPDATE triage
+                 SET status = ?1, resolved_at = ?2
+                 WHERE account_id = ?3 AND sensitivity != 'sealed'
+                   AND (message_id = ?4 OR message_id IN (
+                       SELECT sib.id FROM messages me
+                       JOIN messages sib ON sib.account_id = me.account_id
+                                        AND sib.thread_id = me.thread_id
+                       WHERE me.account_id = ?3 AND me.id = ?4
+                         AND me.thread_id != ''))",
+                params![status.as_str(), resolved_at, account_id, message_id],
+            )?,
+            _ => conn.execute(
+                "UPDATE triage
+                 SET status = ?1, resolved_at = ?2
+                 WHERE account_id = ?3 AND message_id = ?4 AND sensitivity != 'sealed'",
+                params![status.as_str(), resolved_at, account_id, message_id],
+            )?,
+        };
         Ok(n > 0)
     }
 
@@ -231,15 +274,21 @@ impl SqliteStore {
             .optional()?;
 
         // Sitrep band counts over non-sealed rows. These definitions MUST match
-        // the `band` query on attention_updates, or header and list disagree.
+        // the `band` query on attention_updates, or header and list disagree —
+        // including its one-row-per-thread collapse, hence DISTINCT thread keys
+        // (blank thread_id falls back to the message id, same as the list).
         let (standing, new_count, open_count): (i64, i64, i64) = conn.query_row(
             "SELECT
-                 COUNT(*) FILTER (
-                     WHERE tier IN ('past_due','deadline') AND status != 'done'),
-                 COUNT(*) FILTER (WHERE surfaced_at IS NULL AND status != 'done'),
-                 COUNT(*) FILTER (WHERE status = 'open')
-             FROM triage
-             WHERE account_id = ?1 AND sensitivity != 'sealed'",
+                 COUNT(DISTINCT CASE WHEN t.tier IN ('past_due','deadline')
+                     AND t.status != 'done' THEN tkey END),
+                 COUNT(DISTINCT CASE WHEN t.surfaced_at IS NULL
+                     AND t.status != 'done' THEN tkey END),
+                 COUNT(DISTINCT CASE WHEN t.status = 'open' THEN tkey END)
+             FROM (SELECT t.*, COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id) AS tkey
+                   FROM triage t
+                   JOIN messages m ON m.id = t.message_id
+                   WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
+                     AND m.is_sent = 0) t",
             params![account_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;

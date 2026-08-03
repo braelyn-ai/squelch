@@ -119,6 +119,55 @@ fn set_attention_status_resolves_and_reopens() {
 }
 
 #[test]
+fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
+    // THE DUPLICATE-THREAD BUG: two messages of one thread each carried a
+    // triage row and the band showed the conversation twice. The bands must
+    // collapse to one row per thread — the band-sort-first message — and
+    // resolving that representative must resolve the siblings, or the hidden
+    // row pops straight back in.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+
+    let older = ingest_normal(
+        &store, acct, "g1", "thr-dup", Tier::PastDue, 80,
+        Utc::now() - chrono::Duration::days(2),
+    );
+    let newer = ingest_normal(&store, acct, "g2", "thr-dup", Tier::PastDue, 90, Utc::now());
+    let other = ingest_normal(&store, acct, "g3", "thr-solo", Tier::Deadline, 70, Utc::now());
+
+    // One row for the duplicated thread, and it is the band-sort-first message
+    // (higher importance wins the representative slot).
+    let standing = store
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .unwrap();
+    assert_eq!(standing.len(), 2, "two threads, two rows: {standing:#?}");
+    assert_eq!(standing[0].update.id, newer, "representative is band-sort-first");
+    assert!(standing.iter().all(|u| u.update.id != older), "sibling hidden");
+
+    // Header counts agree with the collapsed list.
+    let stats = store.stats(acct).unwrap();
+    assert_eq!(stats.bands.standing, 2, "standing counts threads, not messages");
+    assert_eq!(stats.bands.new, 2, "new counts threads, not messages");
+
+    // Done on the representative resolves the WHOLE thread: the sibling must
+    // not reappear in any band.
+    assert!(store
+        .set_attention_status(acct, newer, AttentionStatus::Done)
+        .unwrap());
+    let standing2 = store
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .unwrap();
+    assert_eq!(standing2.len(), 1, "resolved thread fully gone: {standing2:#?}");
+    assert_eq!(standing2[0].update.id, other);
+
+    // The unrelated thread was untouched.
+    let done = store
+        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(done.iter().all(|u| u.update.id != other));
+}
+
+#[test]
 fn sealed_rows_never_surface_through_the_ledger() {
     let (store, acct) = store();
     let since = Utc::now() - chrono::Duration::days(1);
