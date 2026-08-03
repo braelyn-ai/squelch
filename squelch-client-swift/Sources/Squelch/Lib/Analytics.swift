@@ -14,7 +14,7 @@ import Foundation
 enum Analytics {
     /// PostHog PROJECT API key (phc_…, public by design — it can only ingest).
     /// Empty disables analytics entirely; the env var wins for dev overrides.
-    private static let apiKey = ""
+    private static let apiKey = "phc_uuYkpwXQYxrz33f4bQsi5ozAQ6LL5kPsnrnU7vVvshni"
     private static let host = "https://us.i.posthog.com"
 
     private static let client: PostHogClient? = {
