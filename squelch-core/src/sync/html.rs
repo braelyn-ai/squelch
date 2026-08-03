@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use ammonia::Builder;
 
 /// Sanitize an untrusted HTML email body into a storage-safe fragment. Pure (no
-/// I/O). Kept: formatting/table tags, `<img src>`, `<a href>` limited to
+/// I/O). Kept: formatting/table tags with their presentational layout attributes
+/// (`width`/`align`/`bgcolor`/…), `<img src>`, `<a href>` limited to
 /// http/https/mailto, `<style>` blocks with their CSS verbatim, and
 /// `style`/`class`/`id` on any allowed tag. Dropped: `<script>`, `on*` handlers,
 /// form controls, frames/plugins, `<meta>`/`<link>`/`<base>`, and every URL scheme
@@ -52,6 +53,18 @@ pub fn sanitize_email_html(html: &str) -> String {
     let img_attrs = tag_attributes.entry("img").or_default();
     for a in ["src", "alt", "width", "height", "title"] {
         img_attrs.insert(a);
+    }
+
+    // Presentational table attributes. Email layout is table-era HTML: the main
+    // column is `<table width="600" align="center">`, and ammonia's defaults keep
+    // `width` only on <img>/<hr> — stripping it leaves every section table
+    // auto-sized and the design falls apart. These are pure layout values, no URL
+    // or script surface; `background` (a URL fetch) stays banned.
+    for tag in ["table", "thead", "tbody", "tfoot", "tr", "td", "th", "col", "colgroup"] {
+        let attrs = tag_attributes.entry(tag).or_default();
+        for a in ["width", "height", "align", "valign", "bgcolor", "cellpadding", "cellspacing", "border"] {
+            attrs.insert(a);
+        }
     }
     builder.tag_attributes(tag_attributes);
 
@@ -141,6 +154,27 @@ mod tests {
         assert!(out.contains("https://example.com"));
         assert!(out.contains("https://cdn.example.com/logo.png"));
         assert!(out.contains("alt=\"logo\""));
+    }
+
+    #[test]
+    fn table_layout_attributes_survive() {
+        // The 600px centered column every marketing email is built on. Losing
+        // `width` here is what un-centers mail (the media-query fallback only
+        // applies under 600px viewports).
+        let out = sanitize_email_html(
+            "<table width=\"600\" align=\"center\" bgcolor=\"#F1F2F4\" border=\"0\" \
+             cellpadding=\"0\" cellspacing=\"0\" background=\"https://evil/x.png\">\
+             <tr><td width=\"300\" valign=\"top\" align=\"left\" height=\"40\">cell</td></tr></table>",
+        );
+        for kept in [
+            "width=\"600\"", "align=\"center\"", "bgcolor=\"#F1F2F4\"", "border=\"0\"",
+            "cellpadding=\"0\"", "cellspacing=\"0\"", "width=\"300\"", "valign=\"top\"",
+            "height=\"40\"",
+        ] {
+            assert!(out.contains(kept), "must survive: {kept} in {out}");
+        }
+        // `background` is a resource fetch, not layout — still stripped.
+        assert!(!out.contains("background="), "background attr must die: {out}");
     }
 
     #[test]
