@@ -146,41 +146,47 @@ struct ThreadViewer: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if prefs.developerMode {
-                Button("triage debug") { Task { await openDebug() } }
+            // EVERY ACTION HERE NEEDS THE THREAD: they act on its newest message
+            // and they all call the daemon. With nothing loaded they are a row of
+            // controls that silently do nothing, offered next to an error saying
+            // the server is unreachable. Only `back` still means something.
+            if thread != nil {
+                if prefs.developerMode {
+                    Button("triage debug") { Task { await openDebug() } }
+                        .buttonStyle(.textAction).font(Typo.micro)
+                    Button(retriaging ? "re-triaging…" : "re-triage") {
+                        Task { await retriageThis() }
+                    }
                     .buttonStyle(.textAction).font(Typo.micro)
-                Button(retriaging ? "re-triaging…" : "re-triage") {
-                    Task { await retriageThis() }
+                    .disabled(retriaging)
+                    .help("dev: reset this email's LLM verdicts and re-run triage")
                 }
-                .buttonStyle(.textAction).font(Typo.micro)
-                .disabled(retriaging)
-                .help("dev: reset this email's LLM verdicts and re-run triage")
-            }
 
-            Button { openSenderRule() } label: {
-                HStack(spacing: 4) {
-                    Kbd("t")
-                    Text("new rule").font(Typo.micro)
-                }
-            }
-            .buttonStyle(.textAction)
-            .help("write a rule for this sender — shows the ones already in effect")
-
-            Button {
-                confirmMode = .ask
-            } label: {
-                if let unsub {
-                    Text("unsubscribe requested \(Fmt.relAge(unsub.requested_at)) ago")
-                        .font(Typo.micro)
-                } else {
+                Button { openSenderRule() } label: {
                     HStack(spacing: 4) {
-                        Kbd("u")
-                        Text("unsubscribe").font(Typo.micro)
+                        Kbd("t")
+                        Text("new rule").font(Typo.micro)
                     }
                 }
+                .buttonStyle(.textAction)
+                .help("write a rule for this sender — shows the ones already in effect")
+
+                Button {
+                    confirmMode = .ask
+                } label: {
+                    if let unsub {
+                        Text("unsubscribe requested \(Fmt.relAge(unsub.requested_at)) ago")
+                            .font(Typo.micro)
+                    } else {
+                        HStack(spacing: 4) {
+                            Kbd("u")
+                            Text("unsubscribe").font(Typo.micro)
+                        }
+                    }
+                }
+                .buttonStyle(.textAction)
+                .help("unsubscribe from this sender")
             }
-            .buttonStyle(.textAction)
-            .help("unsubscribe from this sender")
 
             Button { store.closeThread() } label: {
                 HStack(spacing: 4) {
@@ -199,10 +205,8 @@ struct ThreadViewer: View {
     private var content: some View {
         if loading {
             centeredNote("loading thread…")
-        } else if let error {
-            centeredNote(error, tone: Palette.danger)
-        } else if thread == nil {
-            centeredNote("no thread.")
+        } else if error != nil || thread == nil {
+            failurePane
         } else if messages.isEmpty {
             centeredNote("no messages in this thread.")
         } else {
@@ -290,6 +294,63 @@ struct ThreadViewer: View {
             .font(Typo.rowSub)
             .foregroundStyle(tone)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// A thread that will not load is a DEAD END, and the reader navigated into
+    /// it deliberately — so it owes them what went wrong and a way out, not one
+    /// line of red text adrift in an empty window. Same shape as
+    /// `DaemonDownPane`, because this is usually the same outage seen from
+    /// inside the reader.
+    ///
+    /// The daemon being down is called out separately from a thread that simply
+    /// failed: "the mail is on your machine, the thing that serves it isn't
+    /// answering" is a materially different problem from "this email is broken",
+    /// and only one of them is worth waiting out.
+    private var failurePane: some View {
+        let down = store.daemonDown
+        return VStack(spacing: 14) {
+            Image(systemName: down ? "bolt.horizontal.circle" : "exclamationmark.triangle")
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(down ? Palette.warn : Palette.danger)
+
+            Text(down ? "can't reach the squelch daemon" : "couldn't open this email")
+                .font(Typo.serif(26, weight: .medium))
+                .foregroundStyle(Palette.ink)
+
+            Text(
+                down
+                    ? "This email is already on your machine — the daemon that serves it isn't answering. Is squelchd running? Retrying every 10 seconds."
+                    : (error ?? "The server didn't return this thread.")
+            )
+            .font(.system(size: 13))
+            .foregroundStyle(Palette.inkFaint)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 380)
+
+            HStack(spacing: 10) {
+                Button {
+                    Task { await load() }
+                } label: {
+                    Label("try again", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .medium))
+                        .symbolEffect(.rotate, isActive: loading)
+                }
+                .buttonStyle(.glass)
+                .disabled(loading)
+
+                Button { store.closeThread() } label: {
+                    HStack(spacing: 5) {
+                        Kbd("esc")
+                        Text("back").font(.system(size: 12, weight: .medium))
+                    }
+                }
+                .buttonStyle(.glass)
+            }
+            .padding(.top, 4)
+        }
+        .padding(38)
+        .squelchGlass(.pane, cornerRadius: 22, tint: down ? Palette.warnSoft : Palette.dangerSoft)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - keymap
