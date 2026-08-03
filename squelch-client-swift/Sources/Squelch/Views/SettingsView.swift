@@ -409,10 +409,13 @@ private struct MailSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Mail") {
-            InlineRow(key: "images") {
-                GlassSegmented(
-                    options: [(true, "Always"), (false, "On demand")],
-                    selection: $prefs.loadRemoteImages)
+            InlineRow(key: "images", alignment: .top) {
+                Picker("images", selection: $prefs.loadRemoteImages) {
+                    Text("Always").tag(true)
+                    Text("On demand").tag(false)
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
             }
             SettingsHint(
                 "Tracking pixels are removed either way, and images load with no referrer.")
