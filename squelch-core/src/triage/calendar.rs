@@ -98,10 +98,11 @@ struct CalendarDetector {
     rsvp_template: Regex,
     /// Reservation subject shapes, one per resulting kind. Each demands the
     /// state word as a SUFFIXED form (confirmed/confirmation, cancelled,
-    /// modified…) within a short window of "reservation"/"booking", in either
-    /// order — "Confirm your reservation" (an imperative) has no suffix and
-    /// falls through. Checked cancel/update BEFORE confirmed, so "your modified
-    /// reservation is confirmed" reads as the modification it is.
+    /// modified…) within a short window of "reservation"/"booking"/"rental",
+    /// in either order — "Confirm your reservation" (an imperative) has no
+    /// suffix and falls through. Checked cancel/update BEFORE confirmed, so
+    /// "your modified reservation is confirmed" reads as the modification it
+    /// is.
     resv_canceled: Regex,
     resv_updated: Regex,
     resv_confirmed: Regex,
@@ -170,13 +171,13 @@ fn detector() -> &'static CalendarDetector {
                 rx(r"\bhas (accepted|declined|tentatively accepted) this (meeting|event|invitation)\b"),
             ],
             resv_canceled: rx(
-                r"\b(?:reservation|booking)\b.{0,40}\bcancell?(?:ed|ation)\b|\bcancell?(?:ed|ation)\b.{0,40}\b(?:reservation|booking)\b",
+                r"\b(?:reservation|booking|rental)\b.{0,40}\bcancell?(?:ed|ation)\b|\bcancell?(?:ed|ation)\b.{0,40}\b(?:reservation|booking|rental)\b",
             ),
             resv_updated: rx(
-                r"\b(?:reservation|booking)\b.{0,40}\b(?:modified|updated|changed|rescheduled)\b|\b(?:modified|updated|changed|rescheduled)\b.{0,40}\b(?:reservation|booking)\b",
+                r"\b(?:reservation|booking|rental)\b.{0,40}\b(?:modified|updated|changed|rescheduled)\b|\b(?:modified|updated|changed|rescheduled)\b.{0,40}\b(?:reservation|booking|rental)\b",
             ),
             resv_confirmed: rx(
-                r"\b(?:reservation|booking)\b.{0,40}\bconfirm(?:ed|ation)\b|\bconfirm(?:ed|ation)\b.{0,40}\b(?:reservation|booking)\b",
+                r"\b(?:reservation|booking|rental)\b.{0,40}\bconfirm(?:ed|ation)\b|\bconfirm(?:ed|ation)\b.{0,40}\b(?:reservation|booking|rental)\b",
             ),
             resv_corroborate: vec![
                 rx(r"\bconfirmation\s*(?:#|(?:number|no\.?|code)\b)"),
@@ -187,7 +188,7 @@ fn detector() -> &'static CalendarDetector {
                 rx(r"\bitinerary\b"),
             ],
             resv_venue: rx(
-                r"\b(?:reservation|booking)\b[^:]*?\s+(?:for|at)\s+(?P<v>.+?)(?:\s+(?:is|was|has been)\s+(?:confirmed|cancell?ed|modified|updated|changed|rescheduled))?\s*[.!]?\s*$",
+                r"\b(?:reservation|booking|rental)\b[^:]*?\s+(?:for|at)\s+(?P<v>.+?)(?:\s+(?:is|was|has been)\s+(?:confirmed|cancell?ed|modified|updated|changed|rescheduled))?\s*[.!]?\s*$",
             ),
             rsvp_template: rx(
                 r"^(?P<who>[^:@\r\n]{1,60}?)\s+(?:has\s+)?(?:accepted|declined|tentatively accepted)\s+your\s+(?P<title>.+?)\s+invitation\b[.!\s]*(?:\((?P<dates>[^)]+)\))?\s*$",
@@ -753,6 +754,23 @@ mod tests {
         .expect("modified reservation");
         assert_eq!(c.kind, CalendarKind::Update);
         assert_eq!(c.starts_at, Some(ts(2026, 8, 7, 19, 30)));
+    }
+
+    #[test]
+    fn car_rental_confirmation_with_itinerary_is_a_reservation() {
+        // The Expedia shape: "rental" is the anchor (no "reservation"/
+        // "booking" in the subject) and the itinerary number corroborates.
+        let c = detect_calendar(
+            "noreply@expedia.com",
+            Some("Expedia"),
+            "Expedia car rental confirmation - Wed, Aug 5 - (Itinerary # 73512995336428)",
+            "Pick-up: Wednesday, August 5, 2026 at 10:00 am. Itinerary # 73512995336428.",
+            at(2026, 7, 31),
+        )
+        .expect("car rental reservation");
+        assert_eq!(c.kind, CalendarKind::Reservation);
+        assert_eq!(c.starts_at, Some(ts(2026, 8, 5, 10, 0)));
+        assert_eq!(c.organizer.as_deref(), Some("Expedia"));
     }
 
     #[test]
