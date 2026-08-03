@@ -82,14 +82,87 @@ pub fn html_to_text(html: &str) -> String {
             _ => out.push(c),
         }
     }
-    let decoded = out
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
+    let decoded = decode_entities(&out);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Decode HTML entities into text: numeric forms (`&#8204;`, `&#x200b;`) and
+/// the named ones email bodies actually use. Unknown entities pass through
+/// literally (better a visible `&foo;` than eaten text). Zero-width characters
+/// (ZWNJ/ZWJ/ZWSP/soft hyphen/BOM) decode to NOTHING — they are invisible
+/// layout hacks (preheader padding), and as literal text they would pollute
+/// FTS tokens and the LLM/embed input.
+fn decode_entities(s: &str) -> String {
+    fn named(name: &str) -> Option<&'static str> {
+        Some(match name {
+            "nbsp" => " ",
+            "amp" => "&",
+            "lt" => "<",
+            "gt" => ">",
+            "quot" => "\"",
+            "apos" => "'",
+            "zwnj" | "zwj" | "shy" => "",
+            "mdash" => "\u{2014}",
+            "ndash" => "\u{2013}",
+            "lsquo" => "\u{2018}",
+            "rsquo" => "\u{2019}",
+            "ldquo" => "\u{201C}",
+            "rdquo" => "\u{201D}",
+            "hellip" => "\u{2026}",
+            "copy" => "\u{A9}",
+            "reg" => "\u{AE}",
+            "trade" => "\u{2122}",
+            "bull" => "\u{2022}",
+            "middot" => "\u{B7}",
+            _ => return None,
+        })
+    }
+    /// Invisible layout characters that must not survive as text.
+    fn zero_width(c: char) -> bool {
+        matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{AD}' | '\u{FEFF}' | '\u{2060}')
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        // An entity is `&` + up to ~10 name/number chars + `;`. Anything else
+        // is a literal ampersand.
+        let semi = tail[1..].find(';').map(|i| i + 1).filter(|&i| i <= 12);
+        let decoded = semi.and_then(|semi| {
+            let name = &tail[1..semi];
+            if let Some(rep) = named(name) {
+                Some((rep.to_string(), semi + 1))
+            } else if let Some(num) = name.strip_prefix('#') {
+                let cp = match num.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => num.parse::<u32>().ok(),
+                };
+                let c = cp.and_then(char::from_u32)?;
+                Some((if zero_width(c) { String::new() } else { c.to_string() }, semi + 1))
+            } else {
+                None
+            }
+        });
+        match decoded {
+            Some((rep, consumed)) => {
+                out.push_str(&rep);
+                rest = &tail[consumed..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    // Zero-width characters that arrived as RAW characters (an already-decoded
+    // source) get the same treatment as their entity forms.
+    if out.chars().any(zero_width) {
+        out.retain(|c| !zero_width(c));
+    }
+    out
 }
 
 fn first_addr(addr: &Address) -> (String, Option<String>) {
@@ -723,6 +796,20 @@ mod tests {
     fn html_flatten_strips_tags_and_entities() {
         let t = html_to_text("<p>Hello&nbsp;<b>world</b> &amp; <i>friends</i></p>");
         assert_eq!(t, "Hello world & friends");
+    }
+
+    #[test]
+    fn entity_decode_covers_numeric_named_and_zero_width() {
+        // Preheader padding (&zwnj;) must vanish entirely, not survive as
+        // literal "&zwnj;" tokens in the text fed to FTS/LLM/embeddings.
+        let t = html_to_text("<p>Hi&zwnj;&zwnj; there &#8212; it&#x2019;s 6&nbsp;pm &copy;2026</p>");
+        assert_eq!(t, "Hi there \u{2014} it\u{2019}s 6 pm \u{A9}2026");
+        // Unknown entities and bare ampersands pass through literally.
+        let t = html_to_text("<p>AT&T &customentity; a &amp; b</p>");
+        assert_eq!(t, "AT&T &customentity; a & b");
+        // Raw zero-width characters (already decoded upstream) are removed too.
+        let t = html_to_text("<p>a\u{200C}b\u{200B}c</p>");
+        assert_eq!(t, "abc");
     }
 
     #[test]
