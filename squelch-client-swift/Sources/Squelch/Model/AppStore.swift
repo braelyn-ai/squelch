@@ -454,6 +454,9 @@ final class AppStore {
     /// the previous one — assigning `activeView` directly would inherit whatever
     /// the last click set and slide the rail for a keyboard route.
     private func route(to view: MainView, viaPointer: Bool = false) {
+        // On change only: the repeat-press no-op in setView re-routes to the
+        // same view, and that is not a navigation worth an event.
+        if view != activeView { Analytics.screen(view.rawValue) }
         routeWasPointer = viaPointer
         activeView = view
     }
@@ -537,6 +540,7 @@ final class AppStore {
     /// Open the fullscreen reader. `replyTo` is the unified `r` verb: the message
     /// id the reader should open its inline composer on once the thread loads.
     func openThread(_ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil) {
+        Analytics.capture("thread_opened", ["via_reply": replyTo != nil])
         self.threadId = threadId
         self.threadQueue = queue
         // Both cleared unconditionally: moving to ANOTHER thread (h/l, done+next)
@@ -780,6 +784,9 @@ final class AppStore {
     func openCompose(_ state: ComposeState) {
         compose = state
         DraftSaver.shared.noteOpened(.compose)
+        Analytics.capture(
+            "compose_opened",
+            ["kind": state.replyToMessageId == nil ? "new" : "reply"])
     }
 
     /// `c` / ⌘N — the new-message composer, RESTORED. The account holds at most
@@ -896,6 +903,7 @@ final class AppStore {
             // never resolved anything: the id simply is not in the set.
             resolvedIds.remove(entry.messageId)
             pushToast("undone: \(entry.label)", .info)
+            Analytics.capture("undo_fired", ["kind": String(describing: entry.kind)])
         } catch {
             pushToast("undo failed: \(entry.label)", .error)
         }

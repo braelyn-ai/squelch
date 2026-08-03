@@ -40,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // was not running is delivered the moment a delegate exists, and a
         // center without one drops it.
         Notifier.shared.install()
+        Analytics.start()
+        // The boot view never passes through route(to:), so its screen event
+        // is recorded here or not at all.
+        Analytics.screen(AppStore.shared.activeView.rawValue)
     }
 
     // FALSE, because the app is a notifier: terminating on last-window-close

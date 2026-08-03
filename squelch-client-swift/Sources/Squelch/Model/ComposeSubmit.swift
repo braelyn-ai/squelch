@@ -40,14 +40,29 @@ enum ComposeSubmit {
                 // subject and would send the reply untitled.
                 subject: c.subject.isEmpty ? nil : c.subject,
                 overrideGuard: override, draftId: c.draftId)
+            capture(c, override, "sent")
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
+            capture(c, override, "guard_blocked")
             return .guardBlocked(apiError.guardKinds ?? [])
         } catch let apiError as APIError where apiError.kind == .forbidden {
+            capture(c, override, "forbidden")
             return .forbidden
         } catch {
+            capture(c, override, "failure")
             return .failure(errText(error, "send failed"))
         }
+    }
+
+    /// Outcome shape only — the draft's content never rides along.
+    private static func capture(_ c: ComposeState, _ override: Bool, _ outcome: String) {
+        Analytics.capture(
+            "compose_send",
+            [
+                "kind": c.replyToMessageId == nil ? "new" : "reply",
+                "outcome": outcome,
+                "override": override,
+            ])
     }
 }
 

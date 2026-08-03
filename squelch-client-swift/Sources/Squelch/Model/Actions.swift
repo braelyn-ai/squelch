@@ -19,6 +19,7 @@ enum Actions {
         let restore = store.removeFromBands(u.id)
         do {
             try await APIClient.shared.actionArchive(u.id)
+            Analytics.capture("email_archived")
             store.pushUndo(kind: .archive, messageId: u.id, label: "archived \(u.sender)") {
                 // archive undo = re-add the INBOX label; the poll refreshes.
                 try await APIClient.shared.actionLabel(u.id, add: [inboxLabel])
@@ -38,6 +39,7 @@ enum Actions {
         let restore = store.removeFromBands(u.id)
         do {
             try await APIClient.shared.setStatus(u.id, .done)
+            Analytics.capture("email_done")
             // The message leaves the working set: drop its remembered height and
             // unpin its images. The bytes stay on disk — the undo below is five
             // seconds away and re-pins them.
@@ -57,6 +59,7 @@ enum Actions {
     static func reopen(_ u: AttentionUpdate) async {
         do {
             try await APIClient.shared.setStatus(u.id, .open)
+            Analytics.capture("email_reopened")
             store.pushToast("reopened \(u.sender)", .info)
         } catch {
             store.pushToast(errText(error, "reopen failed"), .error)
@@ -68,6 +71,7 @@ enum Actions {
     static func label(_ u: AttentionUpdate, add: [String] = [], remove: [String] = []) async {
         do {
             try await APIClient.shared.actionLabel(u.id, add: add, remove: remove)
+            Analytics.capture("email_labeled")
             store.pushUndo(kind: .label, messageId: u.id, label: "labeled \(u.sender)") {
                 try await APIClient.shared.actionLabel(u.id, add: remove, remove: add)
             }
@@ -107,5 +111,6 @@ enum Actions {
             CreateRuleBody(
                 match_pattern: sender.trimmingCharacters(in: .whitespaces).lowercased(),
                 want: "", disposition: .squelch))
+        Analytics.capture("block_rule_created")
     }
 }

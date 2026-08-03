@@ -245,6 +245,8 @@ enum Assistant {
     /// Ask a question and return a cited answer. Throws on a missing key, a
     /// wrong-provider key, a provider error, a refusal, or the step limit.
     static func ask(_ question: String) async throws -> AssistantAnswer {
+        // The event alone — the question text is the user's mail, not telemetry.
+        Analytics.capture("assistant_asked")
         let status = await AssistantKeyStore.statusAsync()
         guard status.present else {
             throw AssistantError(message: "No assistant key set — add one in Settings.")
