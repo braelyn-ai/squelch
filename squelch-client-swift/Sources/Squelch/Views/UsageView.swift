@@ -23,12 +23,20 @@ struct UsageView: View {
         var model: String
     }
 
+    /// The server enumerates the ledger, so ids arrive that this build has never
+    /// heard of — a new extractor needs no client release. Known ids get a
+    /// written label; an `extract_*` id is titled from its own suffix; anything
+    /// else falls through as itself rather than being hidden.
     private static func categoryLabel(_ id: String) -> String {
         switch id {
-        case "stage1": "Stage 1 — every email"
-        case "stage2": "Stage 2 — escalations"
-        default: id
+        case "stage1": return "Stage 1 — every email"
+        case "stage2": return "Stage 2 — escalations"
+        default: break
         }
+        guard let subject = id.split(separator: "_", maxSplits: 1).last,
+            id.hasPrefix("extract_"), !subject.isEmpty
+        else { return id }
+        return "Extract — \(subject.replacingOccurrences(of: "_", with: " "))"
     }
 
     private static func categorySubtitle(_ id: String) -> String {
@@ -37,7 +45,10 @@ struct UsageView: View {
             "Server-side stage-1 classification (runs on every email; your squelch server's key)."
         case "stage2":
             "Server-side stage-2 classification (escalations; your squelch server's key)."
-        default: "Server-side classification spend (your squelch server's key)."
+        default:
+            id.hasPrefix("extract_")
+                ? "Server-side record extraction (runs on the stage-1 small model, same key and cap)."
+                : "Server-side classification spend (your squelch server's key)."
         }
     }
 

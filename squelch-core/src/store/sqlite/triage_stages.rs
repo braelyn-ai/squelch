@@ -351,6 +351,35 @@ impl SqliteStore {
         list_usage_category(&conn, account_id, days, "stage1")
     }
 
+    /// Distinct categories first, then each one's history through the same
+    /// per-category helper the named readers use — rather than one windowed
+    /// query, because `days` is a per-category ROW limit and reproducing that
+    /// across categories in SQL buys nothing at this cardinality (a handful of
+    /// stages and extractors).
+    pub(super) fn list_usage_by_category(
+        &self,
+        account_id: AccountId,
+        days: u32,
+    ) -> Result<Vec<(String, Vec<Stage2UsageDay>)>> {
+        let conn = self.lock()?;
+        let categories: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT category FROM stage2_usage
+                 WHERE account_id = ?1
+                 ORDER BY category",
+            )?
+            .query_map(params![account_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        categories
+            .into_iter()
+            .map(|c| {
+                let rows = list_usage_category(&conn, account_id, days, &c)?;
+                Ok((c, rows))
+            })
+            .collect()
+    }
+
     pub(super) fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>> {
         let conn = self.lock()?;
         // Queue predicate: Stage-1 finished the row, flagged it for escalation,

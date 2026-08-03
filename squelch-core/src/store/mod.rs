@@ -1032,6 +1032,18 @@ pub trait Store: Send + Sync {
     /// Stage-1 usage history: the most recent `days` rows, newest-first (sparse).
     fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>>;
 
+    /// EVERY ledger category with its history, sorted by category name.
+    ///
+    /// The ledger is open-ended — each extractor writes its own category — so a
+    /// caller that names the categories it wants silently drops every one added
+    /// after it was written. That is exactly how extractor spend went unreported
+    /// while it accrued daily. Enumerate, don't enumerate-by-hand.
+    fn list_usage_by_category(
+        &self,
+        account_id: AccountId,
+        days: u32,
+    ) -> Result<Vec<(String, Vec<Stage2UsageDay>)>>;
+
     /// Up to `limit` queued Stage-2 rows (`stage1_model_used IS NOT NULL AND
     /// needs_stage2=1 AND model_used IS NULL AND sensitivity='normal'`) with
     /// message context and any matched Filtered rule's `want_text`. Newest-first,

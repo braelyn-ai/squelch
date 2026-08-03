@@ -822,6 +822,14 @@ impl Store for SqliteStore {
         self.list_usage_stage1(account_id, days)
     }
 
+    fn list_usage_by_category(
+        &self,
+        account_id: AccountId,
+        days: u32,
+    ) -> Result<Vec<(String, Vec<Stage2UsageDay>)>> {
+        self.list_usage_by_category(account_id, days)
+    }
+
     fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>> {
         self.stage2_queue(account_id, limit)
     }

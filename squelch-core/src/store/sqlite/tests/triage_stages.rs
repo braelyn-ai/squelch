@@ -263,6 +263,43 @@ fn stage1_usage_ledger_is_a_separate_category() {
 }
 
 #[test]
+fn list_usage_by_category_surfaces_extractors_nobody_named() {
+    let (store, acct) = store();
+    store.stage1_bump_usage(acct, "2026-07-09", 100, 20).unwrap();
+    store.stage2_bump_usage(acct, "2026-07-09", 500, 90).unwrap();
+    // An extractor category, and a category invented right here: the point of
+    // enumerating is that a ledger writer added LATER still reports, without
+    // anyone editing the reader.
+    store
+        .extract_bump_usage(acct, "2026-07-09", "extract_banking", 40, 8)
+        .unwrap();
+    store
+        .extract_bump_usage(acct, "2026-07-10", "extract_something_new", 7, 3)
+        .unwrap();
+
+    let all = store.list_usage_by_category(acct, 30).unwrap();
+    let names: Vec<&str> = all.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "extract_banking",
+            "extract_something_new",
+            "stage1",
+            "stage2"
+        ],
+        "every ledger category, sorted by name"
+    );
+
+    let banking = &all.iter().find(|(c, _)| c == "extract_banking").unwrap().1;
+    assert_eq!(banking.len(), 1);
+    assert_eq!(banking[0].input_tokens, 40);
+    assert_eq!(banking[0].output_tokens, 8);
+    // Categories stay isolated — the extractor rows do not leak into stage-1.
+    let s1 = &all.iter().find(|(c, _)| c == "stage1").unwrap().1;
+    assert_eq!(s1[0].input_tokens, 100);
+}
+
+#[test]
 fn stage2_queue_selects_only_normal_unprocessed_rows() {
     let (store, acct) = store();
 

@@ -1018,12 +1018,19 @@ pub async fn get_usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let days = q.days.unwrap_or(DEFAULT_USAGE_DAYS).clamp(1, MAX_USAGE_DAYS);
-    let (s2_rows, s1_rows) = store_call(&state, move |store, account_id| {
-        let s2 = store.list_usage(account_id, days)?;
-        let s1 = store.list_usage_stage1(account_id, days)?;
-        Ok((s2, s1))
+    // EVERY category in the ledger, not a hand-written list: extractors each
+    // write their own, so naming them here means every extractor added later
+    // spends invisibly. `extract_banking` did exactly that for ten days.
+    let by_category = store_call(&state, move |store, account_id| {
+        store.list_usage_by_category(account_id, days)
     })
     .await?;
+
+    let s2_rows: Vec<squelch_core::store::Stage2UsageDay> = by_category
+        .iter()
+        .find(|(c, _)| c == "stage2")
+        .map(|(_, rows)| rows.clone())
+        .unwrap_or_default();
 
     // Stage-1 and Stage-2 are SEPARATE categories, each costed from its own
     // per-MTok prices; the client renders whatever categories arrive.
@@ -1059,16 +1066,44 @@ pub async fn get_usage(
         )
     };
 
+    // Stage-2 only, for the flat top-level fields older clients read. Every
+    // category, Stage-2 included, is rolled up again below for `categories`.
     let (s2_out, s2_totals) = rollup(
         s2_rows,
         state.stage2_price_in_per_mtok,
         state.stage2_price_out_per_mtok,
     );
-    let (s1_out, s1_totals) = rollup(
-        s1_rows,
-        state.stage1_price_in_per_mtok,
-        state.stage1_price_out_per_mtok,
-    );
+
+    // One entry per ledger category. Only Stage-2 runs the capable model and its
+    // prices; EVERYTHING ELSE — Stage-1 and every extractor — runs the stage-1
+    // small model and shares its config, so it costs at stage-1 rates. See
+    // `extract_pass`: "Extractors run on the STAGE-1 (small) model and share its
+    // config + cap."
+    let mut categories = serde_json::Map::new();
+    for (name, rows) in &by_category {
+        let is_stage2 = name == "stage2";
+        let (price_in, price_out) = if is_stage2 {
+            (
+                state.stage2_price_in_per_mtok,
+                state.stage2_price_out_per_mtok,
+            )
+        } else {
+            (
+                state.stage1_price_in_per_mtok,
+                state.stage1_price_out_per_mtok,
+            )
+        };
+        let model = if is_stage2 {
+            state.stage2_model.as_ref()
+        } else {
+            state.stage1_model.as_ref()
+        };
+        let (out_rows, totals) = rollup(rows.clone(), price_in, price_out);
+        categories.insert(
+            name.clone(),
+            json!({ "model": model, "rows": out_rows, "totals": totals }),
+        );
+    }
 
     Ok(Json(json!({
         // Top-level fields are Stage-2 (backward-compatible shape).
@@ -1076,18 +1111,7 @@ pub async fn get_usage(
         "totals": s2_totals,
         "provider": state.stage2_provider.as_deref(),
         "model": state.stage2_model.as_ref(),
-        "categories": {
-            "stage1": {
-                "model": state.stage1_model.as_ref(),
-                "rows": s1_out,
-                "totals": s1_totals,
-            },
-            "stage2": {
-                "model": state.stage2_model.as_ref(),
-                "rows": s2_out,
-                "totals": s2_totals,
-            },
-        },
+        "categories": categories,
     })))
 }
 
