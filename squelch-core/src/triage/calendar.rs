@@ -10,6 +10,13 @@
 //! additionally demanding corroboration (an "@ <date>" clause, a calendar-
 //! notifier sender, or invite machinery in the body), or the full relayed-RSVP
 //! subject template. A newsletter that merely mentions "calendar" must not match.
+//!
+//! RESERVATIONS follow the same bar: the subject must ASSERT a reservation
+//! state ("reservation/booking … confirmed/confirmation/canceled/modified" —
+//! the suffix is required, so an imperative "Confirm your reservation" never
+//! matches), AND the body must carry booking machinery (a confirmation number,
+//! "table for N", check-in, …). A confirmed reservation is a time-anchored
+//! commitment the user already made — calendar state, not attention-band mail.
 
 use crate::triage::text::rx;
 use crate::types::str_enum;
@@ -20,20 +27,26 @@ use std::sync::OnceLock;
 str_enum! {
     /// What kind of calendar update this message is. [`as_str`] is a WIRE CONTRACT:
     /// it serializes into `calendar_updates.kind` AND the /client/calendar shape —
-    /// "invite" | "update" | "cancellation" | "response".
+    /// "invite" | "update" | "cancellation" | "response" | "reservation".
     ///
     /// [`as_str`]: CalendarKind::as_str
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum CalendarKind {
         /// A new invitation ("Invitation: …").
         Invite => "invite",
-        /// A change to an existing event ("Updated invitation: …", "Updated: …").
+        /// A change to an existing event ("Updated invitation: …", "Updated: …"),
+        /// or a modified reservation.
         Update => "update",
-        /// The event was canceled ("Canceled event: …", "Canceled: …").
+        /// The event was canceled ("Canceled event: …", "Canceled: …"), or a
+        /// canceled reservation.
         Cancellation => "cancellation",
         /// An attendee's RSVP ("Accepted: …", "Declined: …", "Tentatively
         /// accepted: …", "New time proposed: …").
         Response => "response",
+        /// A confirmed reservation/booking (OpenTable, Resy, hotels, …): a
+        /// time-anchored commitment the user already made, so it is calendar
+        /// state, not attention-band mail.
+        Reservation => "reservation",
     }
 }
 
@@ -83,6 +96,22 @@ struct CalendarDetector {
     /// Prose never matches: detection is subject-shape only, and the template
     /// requires a non-empty title between "your" and "invitation".
     rsvp_template: Regex,
+    /// Reservation subject shapes, one per resulting kind. Each demands the
+    /// state word as a SUFFIXED form (confirmed/confirmation, cancelled,
+    /// modified…) within a short window of "reservation"/"booking", in either
+    /// order — "Confirm your reservation" (an imperative) has no suffix and
+    /// falls through. Checked cancel/update BEFORE confirmed, so "your modified
+    /// reservation is confirmed" reads as the modification it is.
+    resv_canceled: Regex,
+    resv_updated: Regex,
+    resv_confirmed: Regex,
+    /// Booking machinery a real reservation email carries in its body; prose
+    /// that merely mentions a reservation does not. Corroboration is REQUIRED
+    /// for every reservation match.
+    resv_corroborate: Vec<Regex>,
+    /// Venue tail: "reservation/booking … for/at <venue>", with any trailing
+    /// "is confirmed"-style clause stripped by the optional group.
+    resv_venue: Regex,
     /// "Organizer: …" body line (Google/Outlook both emit one).
     organizer_line: Regex,
     /// Date-ish leadin (weekday/month/recurrence word) for the clause after
@@ -140,6 +169,26 @@ fn detector() -> &'static CalendarDetector {
                 rx(r"\bmeeting request\b"),
                 rx(r"\bhas (accepted|declined|tentatively accepted) this (meeting|event|invitation)\b"),
             ],
+            resv_canceled: rx(
+                r"\b(?:reservation|booking)\b.{0,40}\bcancell?(?:ed|ation)\b|\bcancell?(?:ed|ation)\b.{0,40}\b(?:reservation|booking)\b",
+            ),
+            resv_updated: rx(
+                r"\b(?:reservation|booking)\b.{0,40}\b(?:modified|updated|changed|rescheduled)\b|\b(?:modified|updated|changed|rescheduled)\b.{0,40}\b(?:reservation|booking)\b",
+            ),
+            resv_confirmed: rx(
+                r"\b(?:reservation|booking)\b.{0,40}\bconfirm(?:ed|ation)\b|\bconfirm(?:ed|ation)\b.{0,40}\b(?:reservation|booking)\b",
+            ),
+            resv_corroborate: vec![
+                rx(r"\bconfirmation\s*(?:#|(?:number|no\.?|code)\b)"),
+                rx(r"\b(?:reservation|booking)\s+(?:#|(?:number|id|reference)\b)"),
+                rx(r"\b(?:party|table)\s+(?:of|for)\s+\d"),
+                rx(r"\b\d+\s+guests?\b"),
+                rx(r"\bcheck[- ]?in\b"),
+                rx(r"\bitinerary\b"),
+            ],
+            resv_venue: rx(
+                r"\b(?:reservation|booking)\b[^:]*?\s+(?:for|at)\s+(?P<v>.+?)(?:\s+(?:is|was|has been)\s+(?:confirmed|cancell?ed|modified|updated|changed|rescheduled))?\s*[.!]?\s*$",
+            ),
             rsvp_template: rx(
                 r"^(?P<who>[^:@\r\n]{1,60}?)\s+(?:has\s+)?(?:accepted|declined|tentatively accepted)\s+your\s+(?P<title>.+?)\s+invitation\b[.!\s]*(?:\((?P<dates>[^)]+)\))?\s*$",
             ),
@@ -162,6 +211,29 @@ fn has_corroboration(from_addr: &str, body: &str) -> bool {
     let d = detector();
     d.corroborate_sender.iter().any(|re| re.is_match(from_addr))
         || d.corroborate_text.iter().any(|re| re.is_match(body))
+}
+
+/// Classify a reservation subject, or `None`. Both halves of the structural
+/// bar live here: the subject asserts a reservation state, AND the body
+/// carries booking machinery ([`CalendarDetector::resv_corroborate`]) — subject
+/// shape alone never matches, so an article about booking confirmations with a
+/// prose body stays out. Canceled/updated map onto the existing kinds; only a
+/// confirmation is [`CalendarKind::Reservation`].
+fn detect_reservation_kind(subject: &str, body: &str) -> Option<CalendarKind> {
+    let d = detector();
+    let kind = if d.resv_canceled.is_match(subject) {
+        CalendarKind::Cancellation
+    } else if d.resv_updated.is_match(subject) {
+        CalendarKind::Update
+    } else if d.resv_confirmed.is_match(subject) {
+        CalendarKind::Reservation
+    } else {
+        return None;
+    };
+    d.resv_corroborate
+        .iter()
+        .any(|re| re.is_match(body))
+        .then_some(kind)
 }
 
 /// Split the post-prefix subject into `(title, date_clause)` on the " @ <date>"
@@ -279,6 +351,26 @@ pub fn detect_calendar(
             .map(|m| m.as_str().trim().to_string())
             .filter(|w| !w.is_empty());
         (CalendarKind::Response, title, clause, who)
+    } else if let Some(kind) = detect_reservation_kind(subject, body) {
+        // Reservations diverge from the arms above: the start time lives in the
+        // BODY ("Table for 4 on Monday, August 3, 2026 at 6:00 pm"), never in a
+        // subject "@ <date>" clause, so this arm finishes on its own.
+        let event_title = d
+            .resv_venue
+            .captures(subject)
+            .and_then(|c| c.name("v"))
+            .map(|m| m.as_str().trim().to_string())
+            .filter(|v| !v.is_empty());
+        return Some(CalendarInfo {
+            kind,
+            event_title,
+            starts_at: parse_starts_at(body, received_at),
+            organizer: from_name
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(String::from)
+                .or_else(|| Some(from_addr.to_string())),
+        });
     } else {
         return None;
     };
@@ -601,6 +693,91 @@ mod tests {
         )
         .expect("still a calendar update");
         assert_eq!(c.event_title, None);
+    }
+
+    // ---- reservations ------------------------------------------------------
+
+    #[test]
+    fn opentable_confirmation_is_a_reservation() {
+        let c = detect_calendar(
+            "reservations@opentable.com",
+            Some("OpenTable"),
+            "Your reservation confirmation for EPIC Steak",
+            "Reservation confirmed\nThanks for using OpenTable!\nEPIC Steak\n\
+             Table for 4 on Monday, August 3, 2026 at 6:00 pm\n\
+             Name: Braelyn Boynton\nConfirmation #: 2110425567",
+            at(2026, 7, 31),
+        )
+        .expect("opentable reservation");
+        assert_eq!(c.kind, CalendarKind::Reservation);
+        assert_eq!(c.event_title.as_deref(), Some("EPIC Steak"));
+        assert_eq!(c.starts_at, Some(ts(2026, 8, 3, 18, 0)));
+        assert_eq!(c.organizer.as_deref(), Some("OpenTable"));
+    }
+
+    #[test]
+    fn hotel_booking_confirmed_with_checkin_is_a_reservation() {
+        let c = detect_calendar(
+            "noreply@hotels.example.com",
+            Some("Hotel Vitale"),
+            "Your booking at Hotel Vitale is confirmed",
+            "Check-in: Sep 14, 2026 3pm. Check-out: Sep 16, 2026.",
+            at(2026, 7, 31),
+        )
+        .expect("hotel booking");
+        assert_eq!(c.kind, CalendarKind::Reservation);
+        assert_eq!(c.event_title.as_deref(), Some("Hotel Vitale"));
+        assert_eq!(c.starts_at, Some(ts(2026, 9, 14, 15, 0)));
+    }
+
+    #[test]
+    fn canceled_and_modified_reservations_map_to_existing_kinds() {
+        let c = detect_calendar(
+            "reservations@opentable.com",
+            Some("OpenTable"),
+            "Your reservation at Nopa has been canceled",
+            "Confirmation #: 998877. We hope to see you again.",
+            at(2026, 7, 31),
+        )
+        .expect("canceled reservation");
+        assert_eq!(c.kind, CalendarKind::Cancellation);
+        assert_eq!(c.event_title.as_deref(), Some("Nopa"));
+
+        let c = detect_calendar(
+            "reservations@opentable.com",
+            Some("OpenTable"),
+            "Your reservation at Nopa has been modified",
+            "Table for 2 on Friday, August 7, 2026 at 7:30 pm. Confirmation #: 12345",
+            at(2026, 7, 31),
+        )
+        .expect("modified reservation");
+        assert_eq!(c.kind, CalendarKind::Update);
+        assert_eq!(c.starts_at, Some(ts(2026, 8, 7, 19, 30)));
+    }
+
+    #[test]
+    fn confirm_imperative_and_uncorroborated_reservations_are_rejected() {
+        // "Confirm your reservation" is a REQUEST — bare "confirm" has no
+        // suffix, so the subject shape itself refuses it.
+        let c = detect_calendar(
+            "reservations@opentable.com",
+            Some("OpenTable"),
+            "Confirm your reservation at EPIC Steak",
+            "Confirmation #: 2110425567. Table for 4.",
+            at(2026, 7, 31),
+        );
+        assert!(c.is_none(), "imperative must not match: {c:?}");
+
+        // Right subject shape, but a body with no booking machinery — an
+        // article or promo ABOUT reservations, not one.
+        let c = detect_calendar(
+            "news@foodblog.com",
+            Some("Food Blog"),
+            "Reservation confirmed: why hot restaurants overbook",
+            "This week we look at the economics of no-shows. Unsubscribe.",
+            at(2026, 7, 31),
+        );
+        assert!(c.is_none(), "uncorroborated must not match: {c:?}");
     }
 
     // ---- negatives: structure required, topics rejected -------------------

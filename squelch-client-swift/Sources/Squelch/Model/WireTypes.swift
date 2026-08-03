@@ -263,7 +263,7 @@ struct Receipt: Codable, Sendable, Identifiable, Hashable, SenderStringConvertib
 }
 
 enum CalendarKind: String, LenientRawEnum {
-    case invite, update, cancellation, response
+    case invite, update, cancellation, response, reservation
     static var unknownFallback: CalendarKind { .invite }
 
     /// Row tag for the non-default kinds; a plain invite needs no label.
@@ -273,6 +273,7 @@ enum CalendarKind: String, LenientRawEnum {
         case .update: "updated"
         case .cancellation: "canceled"
         case .response: "rsvp"
+        case .reservation: "reservation"
         }
     }
 }
