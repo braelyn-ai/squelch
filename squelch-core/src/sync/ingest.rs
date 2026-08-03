@@ -384,12 +384,24 @@ pub fn ingest(
                 // This flattened `text` is the UNCHANGED path that feeds triage,
                 // FTS, and the agent door — it must not be affected by the HTML
                 // work below.
-                let text = if m.text_body_count() > 0 {
-                    m.body_text(0).map(|c| c.into_owned()).unwrap_or_default()
-                } else if m.html_body_count() > 0 {
-                    html_to_text(&m.body_html(0).map(|c| c.into_owned()).unwrap_or_default())
-                } else {
-                    String::new()
+                //
+                // IMPORTANT: for an alternative carrying ONLY an HTML part,
+                // mail-parser registers that part under `text_body` too, so
+                // `body_text(0)` would run MAIL-PARSER'S html-to-text — which
+                // glues adjacent block elements ("EPIC SteakTable for 4") and
+                // leaks `<script type=...>` content (JSON-LD blobs), wrecking
+                // every word-boundary regex and the LLM/FTS/embed text
+                // downstream. Check the actual part type and route real HTML
+                // through OUR flattener, exactly like the body_html capture
+                // below.
+                let text = match m.text_part(0) {
+                    Some(p) if !p.is_text_html() => {
+                        p.text_contents().unwrap_or_default().to_string()
+                    }
+                    _ => match m.html_part(0).and_then(|p| p.text_contents()) {
+                        Some(h) => html_to_text(h),
+                        None => String::new(),
+                    },
                 };
                 // Separately: capture the RENDERED HTML body (when present) and
                 // sanitize it server-side for the human door. `None` for
@@ -832,6 +844,52 @@ mod tests {
         assert_eq!(t.tier, Tier::Noise);
         assert!(t.message.body.contains("Unsubscribe"));
         assert!(!t.message.body.contains('<'));
+    }
+
+    #[test]
+    fn html_only_alternative_uses_our_flattener_not_mail_parsers() {
+        // THE OPENTABLE BUG: an alternative with ONLY an HTML part lands in
+        // mail-parser's `text_body` list, and its converter glues block
+        // elements ("SteakTable for 4") and leaks <script> JSON-LD — which
+        // broke every word-boundary regex (the reservation detector saw
+        // "BoyntonConfirmation #"). Ours must separate blocks, drop scripts,
+        // and the reservation must then detect end-to-end.
+        let eml = "From: OpenTable <reservations@opentable.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your reservation confirmation for EPIC Steak\r\n\
+                   Date: Fri, 31 Jul 2026 19:47:00 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=X\r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <div>EPIC Steak</div><div>Table for 4 on Monday, August 3, 2026 at 6:00 pm</div>\
+                   <div>Name: Braelyn Boynton</div><div>Confirmation #: 2110425567</div>\
+                   <script type=\"application/ld+json\">{\"@type\":\"FoodEstablishmentReservation\"}</script>\r\n\
+                   --X--\r\n";
+        let f = raw(1, "g-resv", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+
+        assert!(
+            t.message.body.contains("Boynton Confirmation #"),
+            "blocks must be separated: {}",
+            t.message.body
+        );
+        assert!(
+            t.message.body.contains("Steak Table for 4"),
+            "blocks must be separated: {}",
+            t.message.body
+        );
+        assert!(
+            !t.message.body.contains("FoodEstablishmentReservation"),
+            "script content must not leak: {}",
+            t.message.body
+        );
+
+        let c = t.calendar.expect("reservation detected end-to-end");
+        assert_eq!(c.kind, crate::triage::CalendarKind::Reservation);
+        assert_eq!(c.event_title.as_deref(), Some("EPIC Steak"));
     }
 
     #[test]
