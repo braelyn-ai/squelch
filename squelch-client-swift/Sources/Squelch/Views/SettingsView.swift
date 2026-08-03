@@ -32,6 +32,8 @@ struct SettingsView: View {
                             RankingSection()
                         case .assistant:
                             AssistantSection()
+                        case .privacy:
+                            PrivacySection()
                         case .account:
                             AccountSection()
                         }
@@ -856,6 +858,28 @@ private struct AssistantSection: View {
         status = await AssistantKeyStore.statusAsync()
         note = .ok("key forgotten")
         busy = false
+    }
+}
+
+// MARK: - privacy
+
+/// The developer-telemetry level. Opt-out (Full is the default); the gate
+/// itself lives in Analytics, which reads the pref on every event.
+private struct PrivacySection: View {
+    @Environment(Prefs.self) private var prefs
+
+    var body: some View {
+        @Bindable var prefs = prefs
+        SectionCard(label: "Developer Telemetry") {
+            InlineRow(key: "telemetry") {
+                GlassSegmented(
+                    options: TelemetryLevel.allCases.map { ($0, $0.label) },
+                    selection: $prefs.telemetry)
+            }
+            SettingsHint(
+                "Anonymous usage telemetry that helps improve Squelch. Full never includes email data or anything derived from it — no subjects, senders, bodies, labels, or assistant questions; only which screens and actions are used. Minimal sends app opens and screen views only. None sends nothing."
+            )
+        }
     }
 }
 

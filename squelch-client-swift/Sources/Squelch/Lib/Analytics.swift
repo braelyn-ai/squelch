@@ -30,6 +30,15 @@ enum Analytics {
         return PostHogClient(apiKey: key, endpoint: url)
     }()
 
+    /// The Settings > Privacy level, read straight from UserDefaults on every
+    /// event — thread-safe where the main-actor Prefs is not, and a change in
+    /// the pane applies to the very next capture without any plumbing.
+    private static var level: TelemetryLevel {
+        TelemetryLevel(
+            rawValue: UserDefaults.standard.string(forKey: TelemetryLevel.prefKey) ?? "")
+            ?? .full
+    }
+
     /// Install lifecycle observers and record the first screen. Call once from
     /// the app delegate; every other entry point is safe to call regardless.
     static func start() {
@@ -37,16 +46,23 @@ enum Analytics {
         let nc = NotificationCenter.default
         nc.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil
-        ) { _ in client.capture("Application Opened") }
+        ) { _ in lifecycle("Application Opened") }
         nc.addObserver(
             forName: NSApplication.didResignActiveNotification, object: nil, queue: nil
         ) { _ in
-            client.capture("Application Backgrounded")
+            lifecycle("Application Backgrounded")
             client.flush()
         }
         nc.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: nil
         ) { _ in client.flushBlocking() }
+    }
+
+    /// Lifecycle events ride at the `minimal` level — they are what makes a
+    /// session visible at all.
+    private static func lifecycle(_ event: String) {
+        guard level != .none else { return }
+        client?.capture(event)
     }
 
     /// The closed set of event names this app emits. A new event is added HERE
@@ -69,7 +85,9 @@ enum Analytics {
             "archive", "done", "label", "ruleDelete",
         ])
 
+    /// Screen views ride at `minimal` alongside lifecycle events.
     static func screen(_ name: String) {
+        guard level != .none else { return }
         guard allowedStrings.contains(name) else {
             assertionFailure("analytics: screen name outside vocabulary")
             return
@@ -77,7 +95,9 @@ enum Analytics {
         client?.capture("$screen", properties: ["$screen_name": name])
     }
 
+    /// Action verbs are `full`-only — `minimal` keeps sessions and screens.
     static func capture(_ event: String, _ properties: [String: Any] = [:]) {
+        guard level == .full else { return }
         guard allowedEvents.contains(event) else {
             assertionFailure("analytics: event outside vocabulary: \(event)")
             return

@@ -7,7 +7,7 @@ import SwiftUI
 
 /// The Settings sub-nav sections; the last-active one is restored on reopen.
 enum SettingsSection: String, CaseIterable, Sendable {
-    case general, mail, triage, assistant, account
+    case general, mail, triage, assistant, privacy, account
 
     var label: String {
         switch self {
@@ -15,7 +15,28 @@ enum SettingsSection: String, CaseIterable, Sendable {
         case .mail: "Mail"
         case .triage: "Triage"
         case .assistant: "Assistant"
+        case .privacy: "Privacy"
         case .account: "Account"
+        }
+    }
+}
+
+/// How much developer telemetry (PostHog) leaves the app. Opt-out: `full` is
+/// the default. `minimal` keeps sessions and screen views but drops the action
+/// verbs; `none` sends nothing at all.
+///
+/// The key is public because Analytics reads the raw value straight from
+/// UserDefaults — capture can fire off the main actor, where Prefs lives.
+enum TelemetryLevel: String, CaseIterable, Sendable {
+    case full, minimal, none
+
+    static let prefKey = "squelch.pref.telemetry"
+
+    var label: String {
+        switch self {
+        case .full: "Full"
+        case .minimal: "Minimal"
+        case .none: "None"
         }
     }
 }
@@ -56,6 +77,7 @@ final class Prefs {
         static let theme = "squelch.pref.theme"
         static let userName = "squelch.name"
         static let assistantModel = "squelch.assistant.model"
+        static let telemetry = TelemetryLevel.prefKey
     }
 
     private init() {
@@ -65,6 +87,7 @@ final class Prefs {
             Key.rankWeight: defaultRankWeight,
             Key.developerMode: false,
             Key.theme: ThemeChoice.system.rawValue,
+            Key.telemetry: TelemetryLevel.full.rawValue,
         ])
         _loadRemoteImages = defaults.bool(forKey: Key.loadRemoteImages)
         _settingsSection =
@@ -73,6 +96,8 @@ final class Prefs {
         _rankWeight = defaults.double(forKey: Key.rankWeight)
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
+        _telemetry =
+            TelemetryLevel(rawValue: defaults.string(forKey: Key.telemetry) ?? "") ?? .full
         _userName = defaults.string(forKey: Key.userName) ?? ""
         _assistantModel =
             AssistantModel(rawValue: defaults.string(forKey: Key.assistantModel) ?? "")
@@ -117,6 +142,17 @@ final class Prefs {
         set {
             _developerMode = newValue
             defaults.set(newValue, forKey: Key.developerMode)
+        }
+    }
+
+    /// Developer telemetry level. Analytics gates on the UserDefaults value
+    /// this writes, so a change here takes effect on the very next event.
+    private var _telemetry: TelemetryLevel
+    var telemetry: TelemetryLevel {
+        get { _telemetry }
+        set {
+            _telemetry = newValue
+            defaults.set(newValue.rawValue, forKey: Key.telemetry)
         }
     }
 
