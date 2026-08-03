@@ -1901,6 +1901,76 @@ async fn unsubscribe_browser_returns_url_and_does_not_fetch() {
 }
 
 #[tokio::test]
+async fn unsubscribe_resolves_the_source_email_to_done() {
+    // Unsubscribing IS the disposition of that email: the triage row must not
+    // stay open demanding a second act.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<https://sub.com/u/9>"), false);
+    });
+    let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(done.iter().any(|u| u.update.id == mid), "unsubscribed email is done");
+}
+
+#[tokio::test]
+async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
+    // Blocking a sender from an email marks that email done; a surface rule is
+    // tuning, not a verdict, and must leave its source open.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false);
+        seed_unsub_msg(store, acct, "g2", "friend@nice.com", None, false);
+    });
+    let ids: Vec<i64> = store.search(acct, "Newsletter", 10, 0).unwrap().iter().map(|m| m.id).collect();
+    let (spam_id, nice_id) = (ids[0].max(ids[1]), ids[0].min(ids[1]));
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "spam@evil.com",
+                "want": "",
+                "disposition": "squelch",
+                "source_message_id": spam_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "friend@nice.com",
+                "want": "always surface",
+                "disposition": "surface",
+                "source_message_id": nice_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(done.iter().any(|u| u.update.id == spam_id), "squelch-rule source is done");
+    assert!(!done.iter().any(|u| u.update.id == nice_id), "surface-rule source stays open");
+}
+
+#[tokio::test]
 async fn unsubscribe_mailto_only_is_422() {
     // A mailto-only List-Unsubscribe has no http(s) link => 422; the server never
     // sends anything.

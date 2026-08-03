@@ -105,12 +105,15 @@ enum Actions {
     }
 
     /// Create a squelch rule matching `sender` EXACTLY (not *@domain) — this one
-    /// sender abused the situation, not necessarily its whole domain.
-    static func createBlockRule(sender: String) async throws {
+    /// sender abused the situation, not necessarily its whole domain. Pass the
+    /// message the block was invoked from (when one is on screen) and the
+    /// server resolves it to done — blocking IS that email's disposition.
+    static func createBlockRule(sender: String, sourceMessageId: Int? = nil) async throws {
         try await APIClient.shared.createRule(
             CreateRuleBody(
                 match_pattern: sender.trimmingCharacters(in: .whitespaces).lowercased(),
-                want: "", disposition: .squelch))
+                want: "", disposition: .squelch,
+                source_message_id: sourceMessageId))
         Analytics.capture("block_rule_created")
     }
 }

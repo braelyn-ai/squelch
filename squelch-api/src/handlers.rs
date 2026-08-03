@@ -665,6 +665,11 @@ pub struct CreateRuleBody {
     match_pattern: String,
     want: String,
     disposition: String,
+    /// The message the user was acting FROM (the block-sender flows), so a
+    /// squelch rule can resolve it: blocking the sender IS that email's
+    /// disposition. Optional — the rule editor has no source message.
+    #[serde(default)]
+    source_message_id: Option<i64>,
 }
 
 pub async fn create_rule(
@@ -678,12 +683,21 @@ pub async fn create_rule(
         .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
 
     let pattern = body.match_pattern.clone();
+    let source_message_id = body.source_message_id;
     let id = store_call(&state, move |store, account_id| {
         store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
     // Best-effort audit: target is the match_pattern, detail the new rule id.
     audit_action(&state, "rule.create", Some(pattern), &id.to_string()).await;
+    // RESOLUTION: a squelch rule created from an email marks that email done —
+    // the user just said "never again" about its sender. Squelch only: a
+    // surface/filtered rule is tuning, not a verdict on the message.
+    if disposition == Disposition::Squelch
+        && let Some(mid) = source_message_id
+    {
+        resolve_done(&state, mid).await;
+    }
     Ok((StatusCode::CREATED, Json(json!({ "rule_id": id }))))
 }
 
@@ -1886,6 +1900,9 @@ pub async fn unsubscribe(
             // only, never the URL.
             record_unsub(&state, &sender, "browser", message_id).await?;
             audit_action(&state, "unsubscribe", target, &format!("browser:{sender}")).await;
+            // RESOLUTION: unsubscribing IS the disposition of this email —
+            // asking it to stop and leaving it open would demand a second act.
+            resolve_done(&state, message_id).await;
             Ok(Json(json!({ "method": "browser", "sender": sender, "url": url })))
         }
     }

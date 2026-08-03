@@ -332,6 +332,11 @@ struct CreateRuleBody: Codable, Sendable {
     var match_pattern: String
     var want: String
     var disposition: Disposition
+    /// The message the block was invoked FROM, when there is one on screen: a
+    /// squelch rule resolves it server-side (blocking is that email's
+    /// disposition). Encodes as absent when nil, so the rule editor's plain
+    /// creates are unchanged.
+    var source_message_id: Int? = nil
 }
 
 struct CreatedRule: Codable, Sendable { var rule_id: Int }

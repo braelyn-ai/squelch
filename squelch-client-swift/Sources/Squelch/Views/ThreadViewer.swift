@@ -483,6 +483,9 @@ struct ThreadViewer: View {
         do {
             let result = try await APIClient.shared.unsubscribe(messageId: newest.id)
             Opener.open(result.url)
+            // The server resolved this email to done (unsubscribing IS its
+            // disposition); drop the row now rather than waiting on the poll.
+            _ = store.removeFromBands(newest.id)
             store.pushToast("opened unsubscribe page — \(result.sender)", .success)
             await refreshUnsub()
             confirmMode = nil
@@ -501,7 +504,10 @@ struct ThreadViewer: View {
         confirmBusy = true
         defer { confirmBusy = false }
         do {
-            try await Actions.createBlockRule(sender: newestSender)
+            // Carrying the message id lets the server resolve this email to
+            // done alongside the rule; drop the row optimistically to match.
+            try await Actions.createBlockRule(sender: newestSender, sourceMessageId: newest?.id)
+            if let id = newest?.id { _ = store.removeFromBands(id) }
             store.pushToast("blocked \(newestSender)", .success)
         } catch {
             store.pushToast(errText(error, "block failed"), .error)
