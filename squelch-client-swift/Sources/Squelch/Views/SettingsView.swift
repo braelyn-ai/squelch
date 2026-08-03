@@ -871,10 +871,14 @@ private struct PrivacySection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Developer Telemetry") {
-            InlineRow(key: "telemetry") {
-                GlassSegmented(
-                    options: TelemetryLevel.allCases.map { ($0, $0.label) },
-                    selection: $prefs.telemetry)
+            InlineRow(key: "telemetry", alignment: .top) {
+                Picker("telemetry", selection: $prefs.telemetry) {
+                    ForEach(TelemetryLevel.allCases, id: \.self) { level in
+                        Text(level.label).tag(level)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
             }
             SettingsHint(
                 "Anonymous usage telemetry that helps improve Squelch. Full never includes email data or anything derived from it — no subjects, senders, bodies, labels, or assistant questions; only which screens and actions are used. Minimal sends app opens and screen views only. None sends nothing."
