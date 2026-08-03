@@ -22,6 +22,7 @@ fn update_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Update> {
         matched_rule: r.get(8)?,
         field_reasons: None,
         has_attachments: None,
+        from_name: None,
     })
 }
 
@@ -127,6 +128,7 @@ impl SqliteStore {
                       EXISTS(SELECT 1 FROM attachments a
                              WHERE a.account_id = m.account_id
                                AND a.message_id = m.id) AS has_atts,
+                      m.from_name AS from_name,
                       m.received_at AS received_at,
                       ROW_NUMBER() OVER (
                           PARTITION BY COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id)
@@ -151,6 +153,11 @@ impl SqliteStore {
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
             update.has_attachments = Some(r.get::<_, i64>(13)? != 0);
+            // Blank is the same as absent: an empty display name must not
+            // render as "" <addr>, which parses to a nameless sender anyway.
+            update.from_name = r
+                .get::<_, Option<String>>(14)?
+                .filter(|n| !n.trim().is_empty());
             Ok(AttentionUpdate {
                 update,
                 status: AttentionStatus::parse(&r.get::<_, String>(9)?)

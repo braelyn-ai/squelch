@@ -335,7 +335,7 @@ private struct BrowseRow: View {
                     .font(Typo.num(11, weight: .semibold))
                     .foregroundStyle(Palette.importanceColor(update.importance))
                     .frame(width: 24, alignment: .trailing)
-                Text(SenderCache.resolved(update.sender).displayName)
+                Text(SenderCache.resolved(update.senderString).displayName)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)

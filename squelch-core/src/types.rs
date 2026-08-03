@@ -156,6 +156,17 @@ pub struct Update {
     /// HUMAN-DOOR ONLY, same discipline as `field_reasons`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_attachments: Option<bool>,
+    /// The `From:` display name, so the reader can render "Dollar Car Rental"
+    /// instead of reverse-engineering a label out of `sender`'s domain — which
+    /// is how `marketing@emails.dollar.com` came to be shown as "Emails".
+    ///
+    /// HUMAN-DOOR ONLY, same discipline as the two above, and for a sharper
+    /// reason than either: this is UNTRUSTED, attacker-chosen header text. A
+    /// human reading mail expects display names and can weigh one against the
+    /// address beside it; an agent making decisions should keep seeing only the
+    /// address it can actually verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
 }
 
 str_enum! {
@@ -729,7 +740,24 @@ mod tests {
             matched_rule: None,
             field_reasons: None,
             has_attachments: None,
+            from_name: None,
         }
+    }
+
+    /// The agent door leaves `from_name` unset, and an absent display name must
+    /// be structurally ABSENT rather than null — same contract the two fields
+    /// above already hold, and the reason the MCP path can stay strict.
+    #[test]
+    fn update_without_from_name_omits_the_key() {
+        let v = serde_json::to_value(base_update()).unwrap();
+        assert!(v.get("from_name").is_none(), "None from_name must not serialize");
+
+        let named = Update {
+            from_name: Some("Dollar Car Rental".into()),
+            ..base_update()
+        };
+        let v = serde_json::to_value(named).unwrap();
+        assert_eq!(v["from_name"], serde_json::json!("Dollar Car Rental"));
     }
 
     /// An `Update` with `field_reasons == None` serializes with no such key.

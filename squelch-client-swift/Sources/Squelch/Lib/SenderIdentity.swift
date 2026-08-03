@@ -136,12 +136,18 @@ enum SenderID {
         "confirmations", "tracking", "delivery", "digest", "bulletin",
     ]
 
-    /// Mail-ish subdomain prefixes to peel so notifications.github.com resolves
-    /// the github.com favicon.
-    private static let mailSubdomains: Set<String> = [
-        "mail", "email", "e", "em", "mg", "mta", "smtp", "news", "info", "mailer", "marketing",
-        "notification", "notifications", "alert", "alerts", "sfmail", "bounce", "reply", "link",
-        "click", "go", "m",
+    /// Two-part public suffixes, so `foo.co.uk` is not read as the site "co".
+    /// NOT the full Public Suffix List — that is thousands of entries and a
+    /// standing maintenance debt for what is, here, a favicon lookup and a
+    /// fallback label. These are the ones a reader actually receives mail from;
+    /// anything missed degrades to a slightly wrong label, never a crash.
+    private static let compoundSuffixes: Set<String> = [
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au",
+        "co.jp", "or.jp", "ne.jp", "ac.jp",
+        "co.nz", "co.za", "co.in", "co.kr", "co.il", "co.th",
+        "com.br", "com.mx", "com.sg", "com.tr", "com.cn", "com.hk", "com.tw",
+        "com.ar", "com.co", "com.pl", "com.ua",
     ]
 
     /// Unambiguous automation markers, matched against the local-part with its
@@ -173,9 +179,23 @@ enum SenderID {
         var host = String(parts[parts.count - 1]).lowercased()
         while host.hasSuffix(".") { host.removeLast() }
         guard host.contains(".") else { return nil }
-        var labels = host.split(separator: ".").map(String.init)
-        if labels.count > 2, mailSubdomains.contains(labels[0]) { labels.removeFirst() }
-        return labels.count >= 2 ? labels.joined(separator: ".") : nil
+        let labels = host.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return nil }
+
+        // THE REGISTRABLE DOMAIN, not a whitelist of prefixes to peel.
+        //
+        // This used to strip a leading label only when it appeared in a list of
+        // mail-ish words — so `emails.dollar.com`, plural and therefore not on
+        // the list, kept its subdomain and named Dollar Car Rental "Emails",
+        // then asked an icon service about a host that has no icon. Taking the
+        // last two labels has no list to fall behind: every `<anything>.
+        // dollar.com` resolves to dollar.com, and the apex is also far likelier
+        // to actually serve a favicon than a bulk-mail subdomain is.
+        let lastTwo = labels.suffix(2).joined(separator: ".")
+        if labels.count >= 3, compoundSuffixes.contains(lastTwo) {
+            return labels.suffix(3).joined(separator: ".")
+        }
+        return lastTwo
     }
 
     /// The brand's base label — the first label of the favicon domain.

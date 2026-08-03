@@ -42,9 +42,9 @@ struct UpdateRow: View {
                     .accessibilityLabel("importance \(update.importance)")
                     .layoutPriority(2)
 
-                Avatar(sender: update.sender, size: 20)
+                Avatar(sender: update.senderString, size: 20)
 
-                Text(SenderCache.resolved(update.sender).displayName)
+                Text(SenderCache.resolved(update.senderString).displayName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)

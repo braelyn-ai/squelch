@@ -130,7 +130,7 @@ enum Newsletters {
 
             if byAddr[address] == nil {
                 byAddr[address] = Bucket(
-                    sender: u.sender,
+                    sender: u.senderString,
                     robot: SenderID.isRobot(u.sender) || SenderID.isBrand(u.sender))
                 order.append(address)
             }

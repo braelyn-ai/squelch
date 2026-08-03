@@ -150,11 +150,22 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     var field_reasons: FieldReasons?
     /// ABSENT on rows served by a pre-attachment daemon — treat as false.
     var has_attachments: Bool?
+    /// The `From:` display name. ABSENT on rows served by an older daemon, and
+    /// on the agent door, which is why every read goes through `senderString`
+    /// rather than this directly.
+    var from_name: String?
     var status: AttentionStatus
     var surfaced_at: String?
     var resolved_at: String?
 
     var hasAttachments: Bool { has_attachments ?? false }
+}
+
+/// The wire calls the address `sender` here and `from_addr` everywhere else, so
+/// this is the one place that reconciles the two. With it, an update renders its
+/// sender through exactly the same path as a message, a receipt or a search hit.
+extension AttentionUpdate: SenderStringConvertible {
+    var from_addr: String { sender }
 }
 
 // MARK: - thread / messages

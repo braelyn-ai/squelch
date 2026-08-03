@@ -487,8 +487,8 @@ private struct ObligationRow: View {
             store.openThread(update.thread_id)
         } label: {
             HStack(spacing: 9) {
-                Avatar(sender: update.sender, size: 22)
-                Text(SenderCache.resolved(update.sender).displayName)
+                Avatar(sender: update.senderString, size: 22)
+                Text(SenderCache.resolved(update.senderString).displayName)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)

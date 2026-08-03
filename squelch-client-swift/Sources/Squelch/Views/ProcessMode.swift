@@ -65,7 +65,7 @@ struct ProcessMode: View {
     private func card(_ u: AttentionUpdate) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                Avatar(sender: u.sender, size: 28)
+                Avatar(sender: u.senderString, size: 28)
                 Text(SenderID.displayName(u.sender))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Palette.ink)
