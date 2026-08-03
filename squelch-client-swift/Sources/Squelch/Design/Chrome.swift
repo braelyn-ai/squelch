@@ -191,30 +191,63 @@ struct SectionCard<Content: View>: View {
 
 // MARK: - segmented control
 
-/// A two-state (or n-state) segmented control drawn in glass.
+/// The control's coordinate space. FILE-SCOPE for the same reason as the
+/// rail's: the buttons read it inside `onGeometryChange`'s Sendable closure.
+/// One name serves every instance — a lookup resolves the nearest ancestor.
+private let segmentedSpace = "glass-segmented"
+
+/// A sliding segmented control, mechanics borrowed from the sidebar rail: the
+/// options are bare text, and ONE long-lived pane behind them slides between
+/// slots the buttons report as they lay out — moved by geometry, not identity,
+/// which is what lets the travel animate.
 struct GlassSegmented<T: Hashable>: View {
     let options: [(value: T, label: String)]
     @Binding var selection: T
 
+    /// Where each option sits in the control's own space.
+    @State private var slots: [T: CGRect] = [:]
+
+    /// Same crossing time as the rail, so the two selectors read as one motion
+    /// vocabulary.
+    private static var travel: Animation { .smooth(duration: 0.32) }
+
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 2) {
             ForEach(options, id: \.value) { option in
                 Button {
                     selection = option.value
                 } label: {
                     Text(option.label)
                         .font(Typo.chip)
+                        .foregroundStyle(selection == option.value ? .white : Palette.ink)
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                        .onGeometryChange(for: CGRect.self) {
+                            $0.frame(in: .named(segmentedSpace))
+                        } action: { slots[option.value] = $0 }
                 }
-                .buttonStyle(
-                    selection == option.value
-                        ? AnyButtonStyle(GlassProminentButtonStyle())
-                        : AnyButtonStyle(GlassButtonStyle())
-                )
-                .tint(Palette.accent)
-                .foregroundStyle(selection == option.value ? .white : Palette.inkFaint)
+                .buttonStyle(.plain)
             }
+        }
+        .coordinateSpace(.named(segmentedSpace))
+        .background(alignment: .topLeading) { selector }
+        .animation(Self.travel, value: selection)
+        .background(Capsule().fill(Palette.hairline.opacity(0.5)))
+    }
+
+    /// The travelling pane: absent only until the first layout pass reports a
+    /// slot, then one view for the life of the control.
+    @ViewBuilder
+    private var selector: some View {
+        if let slot = slots[selection] {
+            Color.clear
+                .frame(width: slot.width, height: slot.height)
+                .glassEffect(.regular.tint(Palette.accent.opacity(0.55)), in: Capsule())
+                // Sits over the active button — an interactive material would
+                // eat that option's clicks.
+                .allowsHitTesting(false)
+                .offset(x: slot.minX, y: slot.minY)
         }
     }
 }
