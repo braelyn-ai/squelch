@@ -1079,8 +1079,22 @@ pub async fn get_usage(
     // small model and shares its config, so it costs at stage-1 rates. See
     // `extract_pass`: "Extractors run on the STAGE-1 (small) model and share its
     // config + cap."
+    //
+    // The two STAGES are always present, empty or not: they are permanent parts
+    // of the pipeline, and a reader who spent nothing on escalations today is
+    // owed "Stage 2: nothing" rather than a section that silently vanishes.
+    // Extractors are the opposite — they come and go with what the ledger has
+    // actually seen, which is what makes a new one report with no edit here.
+    let mut listed: Vec<(String, Vec<squelch_core::store::Stage2UsageDay>)> = by_category.clone();
+    for stage in ["stage1", "stage2"] {
+        if !listed.iter().any(|(c, _)| c == stage) {
+            listed.push((stage.to_string(), Vec::new()));
+        }
+    }
+    listed.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut categories = serde_json::Map::new();
-    for (name, rows) in &by_category {
+    for (name, rows) in &listed {
         let is_stage2 = name == "stage2";
         let (price_in, price_out) = if is_stage2 {
             (
