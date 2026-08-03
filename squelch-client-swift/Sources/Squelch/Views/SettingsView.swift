@@ -344,17 +344,10 @@ private struct AppearanceSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Appearance") {
-            InlineRow(key: "theme", alignment: .top) {
-                // Three-state, so a Toggle can't hold it. macOS 26 draws
-                // segmented Pickers in glass, indistinguishable from our own
-                // GlassSegmented; radios read as stock AppKit.
-                Picker("theme", selection: $prefs.theme) {
-                    ForEach(ThemeChoice.allCases, id: \.self) { choice in
-                        Text(choice.label).tag(choice)
-                    }
-                }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
+            InlineRow(key: "theme") {
+                GlassSegmented(
+                    options: ThemeChoice.allCases.map { ($0, $0.label) },
+                    selection: $prefs.theme)
             }
             SettingsHint("Auto follows the system appearance. \\ flips light/dark from anywhere.")
         }
@@ -409,13 +402,10 @@ private struct MailSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Mail") {
-            InlineRow(key: "images", alignment: .top) {
-                Picker("images", selection: $prefs.loadRemoteImages) {
-                    Text("Always").tag(true)
-                    Text("On demand").tag(false)
-                }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
+            InlineRow(key: "images") {
+                GlassSegmented(
+                    options: [(true, "Always"), (false, "On demand")],
+                    selection: $prefs.loadRemoteImages)
             }
             SettingsHint(
                 "Tracking pixels are removed either way, and images load with no referrer.")
@@ -874,14 +864,10 @@ private struct PrivacySection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Developer Telemetry") {
-            InlineRow(key: "telemetry", alignment: .top) {
-                Picker("telemetry", selection: $prefs.telemetry) {
-                    ForEach(TelemetryLevel.allCases, id: \.self) { level in
-                        Text(level.label).tag(level)
-                    }
-                }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
+            InlineRow(key: "telemetry") {
+                GlassSegmented(
+                    options: TelemetryLevel.allCases.map { ($0, $0.label) },
+                    selection: $prefs.telemetry)
             }
             SettingsHint(
                 "Anonymous usage telemetry that helps improve Squelch. Full never includes email data or anything derived from it — no subjects, senders, bodies, labels, or assistant questions; only which screens and actions are used. Minimal sends app opens and screen views only. None sends nothing."
