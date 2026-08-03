@@ -68,6 +68,21 @@ struct ThreadViewer: View {
         return names.prefix(3).joined(separator: ", ") + " +\(names.count - 3)"
     }
 
+    /// Display index of the first message needing attention (newest-first order,
+    /// so ties go to the most recent obligation), or nil for a calm thread.
+    private var attentionIndex: Int? {
+        messages.firstIndex(where: \.needsAttention)
+    }
+
+    /// The jump chip's copy: the deadline chip text when a date exists
+    /// ("12d PAST DUE" / "due Aug 15"), else a plain pointer.
+    private var attentionJumpLabel: String {
+        guard let target = attentionIndex, let m = messages[safe: target] else {
+            return "needs attention"
+        }
+        return Fmt.deadlineChip(m.deadline)?.text.lowercased() ?? "needs attention"
+    }
+
     var body: some View {
         ZStack {
             Rectangle()
@@ -151,6 +166,25 @@ struct ThreadViewer: View {
             // controls that silently do nothing, offered next to an error saying
             // the server is unreachable. Only `back` still means something.
             if thread != nil {
+                // JUMP TO WHAT SURFACED THE THREAD: shown only while the
+                // attention-bearing message is not the selected one — a
+                // highlight below the fold helps nobody. Selecting it scrolls
+                // (the index watcher owns the animation).
+                if let target = attentionIndex, target != index {
+                    Button { index = target } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.down.to.line.compact")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(attentionJumpLabel).font(Typo.micro)
+                        }
+                    }
+                    .buttonStyle(.textAction)
+                    .foregroundStyle(
+                        messages[safe: target]?.tier == .pastDue ? Palette.danger : Palette.warn
+                    )
+                    .help(messages[safe: target]?.one_line ?? "jump to the message that needs attention")
+                }
+
                 if prefs.developerMode {
                     Button("triage debug") { Task { await openDebug() } }
                         .buttonStyle(.textAction).font(Typo.micro)
@@ -627,6 +661,18 @@ private struct MessageCard: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Palette.ink)
                 Spacer(minLength: 8)
+                // THE ATTENTION MARK: this message's own unresolved standing-tier
+                // verdict — the reason the thread surfaced. Same chip grammar as
+                // the list rows, so the mark reads as "that row, this message".
+                if message.needsAttention {
+                    let chip = Fmt.deadlineChip(message.deadline)
+                    Chip(
+                        text: chip?.text ?? "needs attention",
+                        tone: (chip?.overdue ?? false) ? Palette.danger : Palette.warn,
+                        filled: chip?.overdue ?? false
+                    )
+                    .help(message.one_line ?? "this message put the thread in for-your-eyes")
+                }
                 Text(Fmt.dateTime(message.received_at))
                     .font(Typo.num(11))
                     .foregroundStyle(Palette.inkFaintest)
@@ -650,6 +696,18 @@ private struct MessageCard: View {
         // modifier here would give selected and unselected separate view
         // identities, so every j/k would tear down the message's subtree and
         // make its web frame re-measure from scratch.
+        //
+        // The attention rail shares the selection rail's slot and yields to it:
+        // selection is where you ARE, and two adjacent rails would read as a
+        // rendering glitch. The chip in the header keeps marking the message
+        // while it is selected.
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(message.tier == .pastDue ? Palette.danger : Palette.warn)
+                .frame(width: 3)
+                .padding(.vertical, 11)
+                .opacity(message.needsAttention && !selected ? 0.75 : 0)
+        }
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(Palette.accent)

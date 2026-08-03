@@ -318,11 +318,16 @@ impl SqliteStore {
         // so this human-door variant never reveals a sealed thread's html.
         let subject = thread_guard_and_subject(&conn, account_id, thread_id)?;
 
+        // Per-message triage rides along for in-thread attention highlighting.
+        // LEFT JOIN: a message somehow missing its triage row still renders,
+        // just unhighlighted.
         let mut stmt = conn.prepare(
-            "SELECT id, from_addr, from_name, received_at, body, body_html
-             FROM messages
-             WHERE account_id=?1 AND thread_id=?2
-             ORDER BY received_at ASC",
+            "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
+                    t.tier, t.deadline, t.status, t.one_line
+             FROM messages m
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id=?1 AND m.thread_id=?2
+             ORDER BY m.received_at ASC",
         )?;
         // Collect first, releasing `stmt`'s borrow of `conn`, so the per-message
         // attachment query below can run on the same connection.
@@ -336,6 +341,14 @@ impl SqliteStore {
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
+                    tier: r.get::<_, Option<String>>(6)?.as_deref().and_then(Tier::parse),
+                    deadline: dt_opt(r, 7)?,
+                    attention_open: r
+                        .get::<_, Option<String>>(8)?
+                        .map(|s| s != "done"),
+                    one_line: r
+                        .get::<_, Option<String>>(9)?
+                        .filter(|s| !s.is_empty()),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

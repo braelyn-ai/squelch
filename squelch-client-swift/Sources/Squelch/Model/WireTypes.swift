@@ -179,8 +179,24 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     var content: String
     var html: String?
     var attachments: [Attachment]?
+    /// This message's OWN triage verdict — ABSENT on a pre-highlight daemon.
+    /// Drives the in-thread attention highlight: the bands show one row per
+    /// thread, so the reader is where "which message is the reason" is answered.
+    var tier: Tier?
+    var deadline: String?
+    /// Whether the attention row is still unresolved; a resolved obligation
+    /// must not keep glowing.
+    var attention_open: Bool?
+    var one_line: String?
 
     var attachmentList: [Attachment] { attachments ?? [] }
+
+    /// The highlight predicate: an UNRESOLVED row in a standing tier. Same
+    /// definition as the list's for-your-eyes band, so reader and list agree
+    /// on what deserves the mark.
+    var needsAttention: Bool {
+        (attention_open ?? false) && (tier == .pastDue || tier == .deadline)
+    }
 }
 
 /// core::types::ClientThreadView (GET /client/thread/{id}).

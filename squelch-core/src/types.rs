@@ -223,6 +223,22 @@ pub struct ClientMessage {
     /// GET /client/attachments/{id}. HUMAN-DOOR ONLY, like `html`.
     #[serde(default)]
     pub attachments: Vec<ClientAttachment>,
+    /// This message's OWN triage verdict, for in-thread attention highlighting:
+    /// the band shows one row per thread, so the reader is where "which message
+    /// is the reason" gets answered. All optional — absent on a pre-highlight
+    /// daemon — and `None` never serializes, keeping old clients' decoders calm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
+    /// Whether this message's attention row is still unresolved (`status !=
+    /// 'done'`). Highlighting keys on THIS, not tier alone, so a resolved
+    /// obligation stops glowing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_open: Option<bool>,
+    /// The stage-1 one-line summary — the highlight's tooltip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_line: Option<String>,
 }
 
 /// One attachment's metadata on the HUMAN DOOR. Carries NO bytes.
@@ -664,6 +680,10 @@ mod tests {
                         size: 1234,
                         downloadable: true,
                     }],
+                    tier: Some(Tier::PastDue),
+                    deadline: None,
+                    attention_open: Some(true),
+                    one_line: Some("bill is 12 days past due".into()),
                 },
                 ClientMessage {
                     id: 2,
@@ -673,6 +693,10 @@ mod tests {
                     content: "plain".into(),
                     html: None,
                     attachments: vec![],
+                    tier: None,
+                    deadline: None,
+                    attention_open: None,
+                    one_line: None,
                 },
             ],
         };
@@ -684,6 +708,12 @@ mod tests {
         assert_eq!(v["messages"][0]["attachments"][0]["filename"], serde_json::json!("doc.pdf"));
         assert_eq!(v["messages"][0]["attachments"][0]["downloadable"], serde_json::json!(true));
         assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
+        // Triage highlight fields: present when set, structurally ABSENT when
+        // None (not null) — an old client's strict decoder never sees the keys.
+        assert_eq!(v["messages"][0]["tier"], serde_json::json!("past_due"));
+        assert_eq!(v["messages"][0]["attention_open"], serde_json::json!(true));
+        assert!(v["messages"][1].get("tier").is_none(), "None tier must not serialize");
+        assert!(v["messages"][1].get("attention_open").is_none());
     }
 
     fn base_update() -> Update {

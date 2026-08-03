@@ -1815,6 +1815,9 @@ async fn thread_response_carries_html_field() {
     assert_eq!(msgs[1]["html"], Value::Null);
     // Text content is always present (client fallback).
     assert_eq!(msgs[0]["content"], "flattened text");
+    // Per-message triage rides along for in-thread attention highlighting.
+    assert_eq!(msgs[0]["tier"], "signal");
+    assert_eq!(msgs[0]["attention_open"], true, "unresolved row reads open");
 }
 
 // --- UNSUBSCRIBE endpoints ---------------------------------------------------
