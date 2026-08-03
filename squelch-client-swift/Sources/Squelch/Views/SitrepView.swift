@@ -1,7 +1,8 @@
 // SITREP VIEW — the abstracted dashboard and default surface on launch: ranked
-// standing items, an attention aggregate, newsletters, a status strip and the
-// records rail. Owns the "sitrep" KeyContext. No persistent selection — the
-// focus fill renders only while the keyboard drives, and hover must NOT drag it.
+// standing items, newsletters, a status strip and the records rail. Mail still
+// landing is a spinner in the masthead (IngestIndicator), not a board zone.
+// Owns the "sitrep" KeyContext. No persistent selection — the focus fill renders
+// only while the keyboard drives, and hover must NOT drag it.
 
 import SwiftUI
 
@@ -90,7 +91,6 @@ struct SitrepView: View {
                         if !store.sitrep.standing.isEmpty {
                             forYourEyes(visible: visible, overflow: overflow)
                         }
-                        if !store.sitrep.new.isEmpty { attentionZone }
                         NewslettersZone(
                             newsletters: Newsletters.prune(
                                 store.zones.newsletters, resolved: store.resolvedIds),
@@ -160,6 +160,7 @@ struct SitrepView: View {
                     .textCase(.uppercase)
             }
             Spacer(minLength: 12)
+            IngestIndicator()
             RetriageButton()
             if needNow > 0 {
                 HStack(spacing: 5) {
@@ -241,36 +242,6 @@ struct SitrepView: View {
         .padding(.top, 6)
     }
 
-    // MARK: - (b) attention
-
-    private var attentionZone: some View {
-        Button {
-            store.setView(.emails)
-        } label: {
-            ZoneCard(
-                symbol: "bell", title: "Attention",
-                trailing: AnyView(
-                    Image(systemName: "arrow.up.right")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Palette.inkFaintest))
-            ) {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack(spacing: 4) {
-                        Text("\(store.sitrep.new.count)")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(Palette.ink)
-                        Text(
-                            "new since \(Fmt.lastChecked(store.sitrep.stats?.last_surfaced_at))"
-                        )
-                        .font(Typo.rowSub)
-                        .foregroundStyle(Palette.inkDim)
-                    }
-                    SenderChips(items: store.sitrep.new)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-    }
 
     // MARK: - keymap
 
@@ -371,6 +342,45 @@ struct SitrepView: View {
         }
     }
 
+}
+
+/// MAIL LANDING, as a spinner in the masthead rather than a card on the board.
+///
+/// The signal is the `new` band — `surfaced_at IS NULL` — and "surfaced" means
+/// the client has FETCHED the row: `get_updates` stamps the very page it
+/// returns. So a freshly triaged message sits here for about one poll and is
+/// then gone, having moved to wherever its tier belongs.
+///
+/// That one-poll window is exactly why this is no longer a zone card. As a card
+/// it announced arriving mail as anonymous sender chips a beat BEFORE the same
+/// mail took its real place in For-your-eyes — the same item, twice, under a
+/// name derived from its sending domain. It is a transient STATUS, not a
+/// destination, so it reads as one now: no count of things to go look at, no
+/// click target that vanishes while you reach for it.
+private struct IngestIndicator: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        let count = store.sitrep.new.count
+        if count > 0 {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 10, weight: .semibold))
+                    .symbolEffect(.rotate, isActive: true)
+                Text(count == 1 ? "ingesting" : "ingesting \(count)")
+            }
+            .font(Typo.chip)
+            .foregroundStyle(Palette.accent)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 3)
+            .glassCapsule(tint: Palette.accent.opacity(0.18), interactive: false)
+            .help(
+                count == 1
+                    ? "a new email is being triaged; it lands in its band on the next refresh"
+                    : "\(count) new emails are being triaged; they land in their bands on the next refresh"
+            )
+        }
+    }
 }
 
 /// The masthead's freshness stamp, isolated ON PURPOSE: `lastRefresh` changes on
@@ -590,54 +600,6 @@ private struct ObligationWash: View {
                     .strokeBorder(
                         focused ? tint.opacity(SelectionTone.border) : .clear, lineWidth: 1)
             )
-    }
-}
-
-// MARK: - sender chips
-
-private struct SenderChips: View {
-    let items: [AttentionUpdate]
-
-    /// Dedupe by sender, keeping the first occurrence.
-    private var chips: [AttentionUpdate] {
-        var seen = Set<String>()
-        var out: [AttentionUpdate] = []
-        for u in items {
-            let key = u.sender.lowercased()
-            if seen.contains(key) { continue }
-            seen.insert(key)
-            out.append(u)
-        }
-        return out
-    }
-
-    var body: some View {
-        let shown = Array(chips.prefix(12))
-        let extra = chips.count - shown.count
-        FlowLayout(spacing: 6) {
-            ForEach(shown) { u in
-                HStack(spacing: 5) {
-                    Avatar(sender: u.sender, size: 16)
-                    Text(SenderCache.resolved(u.sender).displayName)
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkDim)
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                // A plain capsule, NOT glass: a dozen live glass passes costs
-                // real frames and reads no better than a tinted pill this size.
-                .background(Capsule().fill(Palette.hairline.opacity(0.7)))
-                .help(u.sender)
-            }
-            if extra > 0 {
-                Text("+\(extra) more")
-                    .font(Typo.micro)
-                    .foregroundStyle(Palette.inkFaintest)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 4)
-            }
-        }
     }
 }
 
