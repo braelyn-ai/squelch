@@ -133,6 +133,14 @@ at all. Serving the push route open is a supported nuisance; serving the drain
 open would hand strangers live tracking tokens and let them wipe the buffer on
 the way out.
 
+## Which mode for which tier
+
+- **Self-hosted:** Mode A, or Mode B with a relay you run yourself. You do not
+  need anyone else's relay for read tracking — the pixel is ordinary HTTP and
+  your daemon already serves it.
+- **Hosted:** the operator runs both the daemon and the relay, provisions the
+  bearer on both ends, and the user configures nothing.
+
 ## What the pixel route does and does not do
 
 Both the daemon's and the relay's `GET /t/{token}` behave identically:
