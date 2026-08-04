@@ -2202,6 +2202,52 @@ async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
 }
 
 #[tokio::test]
+async fn a_literal_auto_squelch_is_inferred_and_never_resolves_open_mail() {
+    // The literal "auto" asks for inference; it is NOT the client making the
+    // decision, so the verdict it produces is exactly as inferred as an absent
+    // key's. Nothing else distinguishes the two spellings — the no-LLM tests
+    // can't, both paths land on filtered — so this is the one test standing
+    // between "auto" and the explicit-squelch mass-resolve gate.
+    let seeded = std::cell::RefCell::new(Vec::<i64>::new());
+    let Harness { app, store, acct } = app_with_rule_inference("squelch", |store, acct| {
+        seeded
+            .borrow_mut()
+            .push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
+    })
+    .await;
+    let spam_id = seeded.borrow()[0];
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "spam@evil.com",
+                "want": "never show me anything from them",
+                "disposition": "auto",
+                "source_message_id": spam_id,
+                "sweep": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["disposition"], "squelch", "the rule IS squelch");
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Squelch
+    );
+
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(
+        !done.iter().any(|u| u.update.id == spam_id),
+        "an \"auto\" squelch is an inferred squelch: it resolves nothing"
+    );
+}
+
+#[tokio::test]
 async fn rule_mutations_write_audit_rows() {
     let Harness { app, store, acct } = harness(|_, _| {});
 
