@@ -71,6 +71,15 @@ pub struct ApiState {
     /// graceful shutdown waits for open connections, so without this one
     /// resident client would hold squelchd open forever.
     pub(crate) shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// PUBLIC base URL that reaches this daemon's `/t/:token` pixel route, from
+    /// `[tracking] base_url` / `SQUELCH_TRACK_URL`. THE FEATURE FLAG for
+    /// minting: `None` means no send is ever tracked, whatever the client asks
+    /// for, and `/client/tracking-config` reports `configured: false`.
+    pub(crate) tracking_base_url: Option<Arc<str>>,
+    /// Slots for in-flight tracking-pixel writes. The pixel route is the one
+    /// unauthenticated thing that touches the store, so its share of the store
+    /// mutex is capped rather than left to whoever floods it.
+    pub(crate) pixel_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Capacity of the `GET /client/events` wake channel. THE PAYLOAD IS ONLY A HINT
@@ -149,6 +158,8 @@ impl ApiState {
             refresh: None,
             event_notifier: None,
             shutdown: None,
+            tracking_base_url: None,
+            pixel_slots: Arc::new(tokio::sync::Semaphore::new(crate::tracking::PIXEL_CONCURRENCY)),
         })
     }
 
@@ -184,6 +195,36 @@ impl ApiState {
     /// The event-notification broadcast, if one was wired in.
     pub(crate) fn event_notifier(&self) -> Option<&tokio::sync::broadcast::Sender<i64>> {
         self.event_notifier.as_ref()
+    }
+
+    /// Set the public base URL the read-tracking pixel is minted against. A
+    /// blank value is treated as unset: an exported-but-empty setting must not
+    /// put `/t/<token>` into outbound mail. A value without an http(s) scheme is
+    /// unset too — it would ride into the HTML as a RELATIVE url and resolve
+    /// against whatever the recipient's mail client happens to be, so a typo
+    /// must disable tracking rather than mint a pixel that points anywhere.
+    pub fn with_tracking_base_url(mut self, base_url: Option<String>) -> Self {
+        self.tracking_base_url = base_url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .filter(|u| {
+                let lower = u.to_ascii_lowercase();
+                lower.starts_with("http://") || lower.starts_with("https://")
+            })
+            .map(|u| Arc::from(u.as_str()));
+        self
+    }
+
+    /// The tracking base URL, already trimmed of a trailing slash. `None` =>
+    /// tracking is not configured and no send may mint a token.
+    pub(crate) fn tracking_base_url(&self) -> Option<&str> {
+        self.tracking_base_url.as_deref()
+    }
+
+    /// Slots for concurrent tracking-pixel writes; see
+    /// [`crate::tracking::PIXEL_CONCURRENCY`].
+    pub(crate) fn pixel_slots(&self) -> &tokio::sync::Semaphore {
+        &self.pixel_slots
     }
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
@@ -345,7 +386,8 @@ impl ApiState {
                 cfg.stage1.price_in_per_mtok,
                 cfg.stage1.price_out_per_mtok,
                 cfg.stage1.global_daily_cap,
-            );
+            )
+            .with_tracking_base_url(cfg.tracking.base_url.clone());
 
         Ok(match cfg.oauth_client() {
             Ok(client) => state.with_write_credentials(

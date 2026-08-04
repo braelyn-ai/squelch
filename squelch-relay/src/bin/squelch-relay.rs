@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let topics = config.apns_topics.len();
     let environment = config.apns_env.as_str();
     let overridden = config.apns_url_override.is_some();
+    let ephemeral_buffer = config.db_path.is_none();
 
     let state = RelayState::new(config)?;
     let app = router(state);
@@ -45,6 +46,11 @@ async fn main() -> anyhow::Result<()> {
     if overridden {
         tracing::warn!(
             "SQUELCH_RELAY_APNS_URL_OVERRIDE is set; pushes are NOT going to Apple (test-only)"
+        );
+    }
+    if ephemeral_buffer {
+        tracing::warn!(
+            "SQUELCH_RELAY_DB_PATH is unset; the open buffer is in memory and any open the daemon has not drained is LOST on restart"
         );
     }
 

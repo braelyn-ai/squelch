@@ -103,6 +103,10 @@ struct ComposePane: View {
                     .disabled(compose.sending)
                 }
             } else {
+                // Edit phase only: what goes out is settled by the time review
+                // is up, and a switch beside the send button is a switch nobody
+                // meant to touch.
+                TrackerToggle(on: bindFlag(\.includeTracker))
                 Button("esc cancel") { store.closeCompose() }
                     .buttonStyle(.glass)
                 Button("review →") { toReview() }
@@ -117,11 +121,7 @@ struct ComposePane: View {
 
     private var editPane: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Field(label: "to") {
-                TextField("recipient@example.com", text: bind(\.to))
-                    .textFieldStyle(.plain)
-                    .focused($focusedField, equals: .to)
-            }
+            RecipientField(text: bind(\.to), focus: $focusedField, field: FocusTarget.to)
             Field(label: "subject") {
                 // Left blank on a reply the daemon titles from the parent; the
                 // placeholder says so, because an empty field otherwise reads as
@@ -168,6 +168,12 @@ struct ComposePane: View {
                 "subject",
                 compose.subject.isEmpty
                     ? (isReply ? ComposeCopy.derivedSubject : "(none)") : compose.subject)
+            // Review states what is about to go out, and an invisible pixel in
+            // it is part of that. Only when armed: a row saying "no" on every
+            // ordinary send is a row nobody reads.
+            if compose.includeTracker && store.trackingAvailable {
+                ComposeSummaryRow("tracking", ComposeCopy.trackedSend)
+            }
 
             ScrollView {
                 // The scanner's own styling, so review shows the formatting the
@@ -279,6 +285,14 @@ struct ComposePane: View {
                 patch { $0[keyPath: keyPath] = value }
                 DraftSaver.shared.noteChange(.compose)
             })
+    }
+
+    /// Same shape as `bind`, minus the autosave: a draft records what was
+    /// written, not how the next send is addressed.
+    private func bindFlag(_ keyPath: WritableKeyPath<ComposeState, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { store.compose?[keyPath: keyPath] ?? false },
+            set: { value in patch { $0[keyPath: keyPath] = value } })
     }
 
     private func patch(_ mutate: (inout ComposeState) -> Void) {

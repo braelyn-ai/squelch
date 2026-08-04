@@ -22,6 +22,7 @@ fn config_reads_the_environment() {
         "SQUELCH_RELAY_AUTH_TOKEN",
         "SQUELCH_RELAY_ALLOW_ANONYMOUS",
         "SQUELCH_RELAY_APNS_URL_OVERRIDE",
+        "SQUELCH_RELAY_DB_PATH",
     ];
     fn clear() {
         for v in VARS {
@@ -69,6 +70,8 @@ fn config_reads_the_environment() {
     assert_eq!(cfg.apns_env, Environment::Production);
     assert!(cfg.auth_token.is_none());
     assert!(cfg.apns_url_override.is_none());
+    // Unset means the open buffer lives in memory.
+    assert!(cfg.db_path.is_none());
     // The key parses into a usable signer.
     RelayState::new(cfg).unwrap();
 
@@ -82,9 +85,15 @@ fn config_reads_the_environment() {
     // A PEM flattened onto one line with literal `\n` sequences is unmangled,
     // and still signs.
     unsafe { std::env::remove_var("SQUELCH_RELAY_APNS_KEY_PATH") };
-    set("SQUELCH_RELAY_APNS_KEY", &KEY.trim_end().replace('\n', "\\n"));
+    set(
+        "SQUELCH_RELAY_APNS_KEY",
+        &KEY.trim_end().replace('\n', "\\n"),
+    );
     let cfg = Config::from_env().unwrap();
-    assert!(cfg.apns_key_pem.contains('\n'), "sequences became real newlines");
+    assert!(
+        cfg.apns_key_pem.contains('\n'),
+        "sequences became real newlines"
+    );
     assert!(!cfg.apns_key_pem.contains('\\'), "no backslash survives");
     RelayState::new(cfg).unwrap();
     unsafe { std::env::remove_var("SQUELCH_RELAY_APNS_KEY") };
@@ -124,6 +133,20 @@ fn config_reads_the_environment() {
 
     set("SQUELCH_RELAY_APNS_KEY_PATH", "tests/does-not-exist.p8");
     assert!(Config::from_env().is_err());
+    set("SQUELCH_RELAY_APNS_KEY_PATH", "tests/fixture_test_key.p8");
+
+    // The open buffer opens (and creates) the configured file.
+    let db = std::env::temp_dir().join(format!(
+        "squelch-relay-config-{}.sqlite3",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&db);
+    set("SQUELCH_RELAY_DB_PATH", db.to_str().unwrap());
+    let cfg = Config::from_env().unwrap();
+    assert_eq!(cfg.db_path.as_deref(), Some(db.as_path()));
+    RelayState::new(cfg).unwrap();
+    assert!(db.exists(), "the buffer file is created at startup");
+    let _ = std::fs::remove_file(&db);
 
     clear();
 }

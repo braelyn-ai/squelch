@@ -217,9 +217,14 @@ private struct RuleRow: View {
 
 // MARK: - rule editor
 
-/// The `t` tune-sender modal, and the rules view's create/edit. Edit is
-/// create-new *then* delete-old, in that order, so a mid-flight failure can only
-/// leave a transient duplicate, never lose the rule — there is no PUT route.
+/// The `t` tune-sender modal, and the rules view's create/edit.
+///
+/// NL-FIRST: the plain-English want text IS the rule, and it is stored VERBATIM
+/// — nothing rewrites it on the way out, because the daemon hands it to Stage 2
+/// as the owner's own instruction. The glob that decides WHO the rule covers is
+/// derived from the sender on screen and demoted behind `advanced`, and the
+/// disposition is a required pick: there is no honest default for "what should
+/// happen to this sender".
 struct RuleEditor: View {
     let request: RuleEditorRequest
     let onClose: () -> Void
@@ -228,7 +233,11 @@ struct RuleEditor: View {
 
     @State private var pattern: String
     @State private var want: String
-    @State private var disposition: Disposition
+    /// nil means NOT PICKED YET, which is what holds save shut in create/tune.
+    /// Edit opens on the rule's current value — the choice was already made.
+    @State private var disposition: Disposition?
+    /// Whether the raw match pattern is on screen and editable.
+    @State private var advanced: Bool
     @State private var saving = false
     @State private var error: String?
     /// Rules whose match_pattern already covers `request.sender`; nil until the
@@ -247,12 +256,21 @@ struct RuleEditor: View {
             _pattern = State(initialValue: rule.match_pattern)
             _want = State(initialValue: rule.want_text)
             _disposition = State(initialValue: rule.disposition)
+            // Editing IS pattern work: hiding the glob would hide the thing
+            // being edited.
+            _advanced = State(initialValue: true)
         } else {
             _pattern = State(
                 initialValue: request.pattern
                     ?? request.sender.map(SenderID.patternFromSender) ?? "")
             _want = State(initialValue: request.want ?? "")
-            _disposition = State(initialValue: request.disposition ?? .squelch)
+            // No default. A caller that names one has made the choice on the
+            // user's behalf deliberately (the newsletters CTA); everyone else
+            // picks before save unlocks.
+            _disposition = State(initialValue: request.disposition)
+            // With no sender there is nothing to derive a glob from, so the
+            // glob field is the only way to say who the rule is about.
+            _advanced = State(initialValue: request.sender == nil)
         }
     }
 
@@ -273,59 +291,18 @@ struct RuleEditor: View {
     var body: some View {
         OverlayScrim(onDismiss: onClose) {
             ModalCard(width: 470) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(Typo.sectionLabel)
-                        .foregroundStyle(Palette.ink)
-                        .textCase(.uppercase)
-                    subtitle
-                }
-                .padding(.bottom, 4)
-
+                header
                 alreadyInEffect
-
-                Field(label: "match pattern") {
-                    TextField("*@example.com", text: $pattern)
-                        .textFieldStyle(.plain)
-                        .font(Typo.mono(12))
-                        .focused($focusedField, equals: .pattern)
-                        .autocorrectionDisabled()
-                }
-                Field(label: "want (what should happen)") {
-                    TextField("e.g. only surface if it mentions an invoice", text: $want)
-                        .textFieldStyle(.plain)
-                        .focused($focusedField, equals: .want)
-                }
-
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 4) {
-                        Text("disposition")
-                            .font(Typo.micro).foregroundStyle(Palette.inkFaint)
-                        Kbd("tab")
-                        Text("to cycle").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    }
-                    GlassSegmented(
-                        options: Disposition.allCases.map { ($0, $0.label) },
-                        selection: $disposition)
-                    Text(disposition.hint)
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkFaintest)
-                }
+                wantField
+                appliesTo
+                dispositionPicker
+                advancedSection
 
                 if let error {
                     Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
                 }
 
-                HStack(spacing: 8) {
-                    Spacer()
-                    Button("esc cancel", action: onClose).buttonStyle(.glass)
-                    Button(saving ? "saving…" : (mode == .edit ? "update rule" : "save rule")) {
-                        Task { await save() }
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(Palette.accent)
-                    .disabled(saving)
-                }
+                footer
             }
         }
         .keyContext(.modal)
@@ -333,58 +310,230 @@ struct RuleEditor: View {
             KeyBinding("Escape", "cancel", allowInInput: true) { onClose() },
             KeyBinding("Tab", "cycle disposition", allowInInput: true) { cycle(1) },
             KeyBinding("shift+Tab", "cycle disposition (back)", allowInInput: true) { cycle(-1) },
+            // ⌘-chorded because the want field owns every bare letter, and the
+            // hint row below teaches it.
+            KeyBinding("d", "advanced", meta: true, allowInInput: true) { toggleAdvanced() },
             KeyBinding("Enter", "save rule", allowInInput: true) { Task { await save() } },
         ])
         .onAppear {
-            // Create starts on the empty pattern field; the other modes prefill
-            // it, so focus lands on the want text instead.
+            // The want text is the rule, so it takes focus everywhere except
+            // create-from-scratch, where there is no sender and the empty glob
+            // is the first thing that has to be written.
             focusedField = mode == .create ? .pattern : .want
         }
         .task { await loadInEffect() }
     }
 
-    /// What already governs this sender, above the fields that would add another
-    /// — scoped by the same glob the triage pipeline matches with. Tune mode only:
-    /// create has no address to scope by, edit already shows the rule it replaces.
+    /// Title plus WHO the rule is about. The sender is email-derived, so it is
+    /// rendered as Text only, never as markup.
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(Typo.sectionLabel)
+                .foregroundStyle(Palette.ink)
+                .textCase(.uppercase)
+            if let sender = request.sender {
+                HStack(spacing: 8) {
+                    Avatar(sender: sender, size: 26)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(SenderCache.resolved(sender).displayName)
+                            .font(Typo.row)
+                            .foregroundStyle(Palette.ink)
+                            .lineLimit(1)
+                        if SenderCache.resolved(sender).displayName.lowercased()
+                            != SenderID.address(sender)
+                        {
+                            Text(SenderID.address(sender))
+                                .font(Typo.mono(10))
+                                .foregroundStyle(Palette.inkFaintest)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            } else {
+                subtitle
+            }
+        }
+        .padding(.bottom, 2)
+    }
+
+    /// The rule itself, in the user's own words. Multi-line because a real one
+    /// is a sentence, not a keyword.
+    private var wantField: some View {
+        Field(label: wantLabel) {
+            TextField(
+                "in plain english. e.g. only order confirmations, or: i dont care about the approval emails",
+                text: $want, axis: .vertical
+            )
+            .textFieldStyle(.plain)
+            .lineLimit(2...5)
+            .focused($focusedField, equals: .want)
+        }
+    }
+
+    private var wantLabel: String {
+        mode == .tune ? "what do you want from this sender?" : "what do you want?"
+    }
+
+    /// The derived glob, visible but not editable: what the rule will match is
+    /// never a secret, it just is not the question being asked here.
+    @ViewBuilder
+    private var appliesTo: some View {
+        if !advanced {
+            HStack(spacing: 5) {
+                Text("applies to").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                Text(pattern)
+                    .font(Typo.mono(10))
+                    .foregroundStyle(Palette.inkFaint)
+                    .lineLimit(1)
+                Spacer()
+            }
+        }
+    }
+
+    private var dispositionPicker: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 4) {
+                Text("disposition").font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                Kbd("tab")
+                Text("to cycle").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                Spacer()
+                if disposition == nil {
+                    Text("required").font(Typo.micro).foregroundStyle(Palette.warn)
+                }
+            }
+            GlassSegmented(options: dispositionOptions, selection: $disposition)
+            Text(disposition?.hint ?? "nothing is preselected: say what this rule does.")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+        }
+    }
+
+    /// Optional-valued on purpose: with nothing selected no slot matches, so the
+    /// travelling pane simply is not drawn and the control reads as unanswered.
+    private var dispositionOptions: [(value: Disposition?, label: String)] {
+        Disposition.allCases.map { (value: Optional($0), label: $0.label) }
+    }
+
+    @ViewBuilder
+    private var advancedSection: some View {
+        Button(action: toggleAdvanced) {
+            HStack(spacing: 5) {
+                Image(systemName: advanced ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                Text("advanced").font(Typo.micro)
+                Kbd("⌘d")
+                Spacer()
+            }
+            .foregroundStyle(Palette.inkFaint)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if advanced {
+            Field(label: "match pattern") {
+                TextField("*@example.com", text: $pattern)
+                    .textFieldStyle(.plain)
+                    .font(Typo.mono(12))
+                    .focused($focusedField, equals: .pattern)
+                    .autocorrectionDisabled()
+            }
+        }
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 4) {
+                KeyHint("tab", "disposition")
+                Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                KeyHint("⌘d", "advanced")
+                Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                KeyHint("⌥↵", "new line")
+                Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                KeyHint("↵", "save")
+                Spacer()
+            }
+            HStack(spacing: 8) {
+                if let blocked {
+                    Text(blocked)
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.warn)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Button("esc cancel", action: onClose).buttonStyle(.glass)
+                Button(saving ? "saving…" : (mode == .edit ? "update rule" : "save rule")) {
+                    Task { await save() }
+                }
+                .buttonStyle(.glassProminent)
+                .tint(Palette.accent)
+                .disabled(saving || blocked != nil)
+            }
+        }
+    }
+
+    /// Why save is shut, in the user's terms, or nil when it is open. Checked
+    /// BEFORE the round trip so the filtered-needs-want rule the store enforces
+    /// lands as a hint rather than as an error over a form you already left.
+    private var blocked: String? {
+        if pattern.trimmed.isEmpty { return "needs a match pattern" }
+        if disposition == nil { return "pick one: allow, mute or filter" }
+        if disposition == .filtered, want.trimmed.isEmpty {
+            return "filter needs a line saying what you do or do not want"
+        }
+        return nil
+    }
+
+    /// ⌘d and the disclosure row are one gesture. Collapsing never discards the
+    /// glob, it only stops showing it, so a hand-written pattern survives a
+    /// stray toggle.
+    private func toggleAdvanced() {
+        withAnimation(Motion.disclose) { advanced.toggle() }
+        focusedField = advanced ? .pattern : .want
+    }
+
+    /// What already governs this sender, above the field that would add another,
+    /// scoped by the same glob the triage pipeline matches with. Tune mode only:
+    /// create has no address to scope by, edit already shows the rule it edits.
+    /// One line per rule now that the card leads with the sender and the want
+    /// text; the full want stays in the tooltip.
     @ViewBuilder
     private var alreadyInEffect: some View {
-        if mode == .tune, let inEffect {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(inEffect.isEmpty ? "nothing covers this sender yet" : "already in effect")
+        if mode == .tune, let inEffect, !inEffect.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("already in effect")
                     .font(Typo.sectionLabel)
                     .foregroundStyle(Palette.inkFaint)
                     .textCase(.uppercase)
-                if !inEffect.isEmpty {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(inEffect) { rule in
-                                HStack(spacing: 9) {
-                                    Chip(
-                                        text: rule.disposition.label,
-                                        tone: rule.disposition.tone, filled: true
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(inEffect) { rule in
+                            HStack(spacing: 9) {
+                                Chip(
+                                    text: rule.disposition.label,
+                                    tone: rule.disposition.tone, filled: true
+                                )
+                                .frame(width: 54, alignment: .leading)
+                                Text(rule.match_pattern)
+                                    .font(Typo.mono(11))
+                                    .foregroundStyle(Palette.ink)
+                                    .lineLimit(1)
+                                Text(rule.want_text.isEmpty ? "·" : rule.want_text)
+                                    .font(Typo.micro)
+                                    .foregroundStyle(
+                                        rule.want_text.isEmpty
+                                            ? Palette.inkFaintest : Palette.inkDim
                                     )
-                                    .frame(width: 62, alignment: .leading)
-                                    Text(rule.match_pattern)
-                                        .font(Typo.mono(11))
-                                        .foregroundStyle(Palette.ink)
-                                        .lineLimit(1)
-                                    Text(rule.want_text.isEmpty ? "—" : rule.want_text)
-                                        .font(Typo.micro)
-                                        .foregroundStyle(
-                                            rule.want_text.isEmpty
-                                                ? Palette.inkFaintest : Palette.inkDim
-                                        )
-                                        .lineLimit(1)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .help(rule.want_text)
-                                }
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .help(rule.want_text)
                             }
                         }
                     }
-                    // A sender with a pile of rules must not push the fields that
-                    // write the next one off the card.
-                    .frame(maxHeight: 92)
                 }
+                // A sender with a pile of rules must not push the field that
+                // writes the next one off the card.
+                .frame(maxHeight: 66)
             }
             .padding(.bottom, 2)
         }
@@ -408,7 +557,7 @@ struct RuleEditor: View {
             Text("from \(request.sender ?? "")")
                 .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
         case .edit:
-            Text("editing \(request.rule?.match_pattern ?? "") · save replaces it")
+            Text("editing \(request.rule?.match_pattern ?? "")")
                 .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
         case .create:
             Text("define a sender rule from scratch")
@@ -416,26 +565,33 @@ struct RuleEditor: View {
         }
     }
 
+    /// Cycling starts from NOTHING picked: forward lands on the first option,
+    /// back on the last, so the required choice is one keystroke away either way.
     private func cycle(_ direction: Int) {
         let all = Disposition.allCases
-        guard let i = all.firstIndex(of: disposition) else { return }
+        guard let current = disposition, let i = all.firstIndex(of: current) else {
+            disposition = direction > 0 ? all.first : all.last
+            return
+        }
         disposition = all[(i + direction + all.count) % all.count]
     }
 
+    /// Create POSTs (the store upserts on match_pattern, so re-tuning a sender
+    /// edits its rule instead of stacking another); edit PUTs the id, so a
+    /// pattern change moves the row it is looking at rather than orphaning it.
+    /// The want text goes out exactly as typed, trimmed at the ends and nothing
+    /// else.
     private func save() async {
-        guard !saving else { return }
-        guard !pattern.trimmed.isEmpty else {
-            error = "match pattern is empty"
-            return
-        }
+        guard !saving, blocked == nil, let disposition else { return }
         saving = true
         error = nil
+        let body = CreateRuleBody(
+            match_pattern: pattern.trimmed, want: want.trimmed, disposition: disposition)
         do {
-            try await APIClient.shared.createRule(
-                CreateRuleBody(
-                    match_pattern: pattern.trimmed, want: want.trimmed, disposition: disposition))
             if let existing = request.rule {
-                try await APIClient.shared.deleteRule(existing.id)
+                try await APIClient.shared.updateRule(existing.id, body)
+            } else {
+                try await APIClient.shared.createRule(body)
             }
             Analytics.capture(
                 "rule_created",
@@ -445,12 +601,12 @@ struct RuleEditor: View {
                     "edit": request.rule != nil,
                 ])
             store.pushToast(
-                "\(request.rule != nil ? "rule updated" : "rule saved") · \(pattern.trimmed) → \(disposition.rawValue)",
+                "\(request.rule != nil ? "rule updated" : "rule saved") · \(pattern.trimmed) → \(disposition.label)",
                 .success)
             request.onSaved?()
             onClose()
         } catch let apiError as APIError where apiError.kind == .forbidden {
-            error = "no write credential — run `squelchd auth --write`"
+            error = "no write credential · run squelchd auth --write"
             saving = false
         } catch {
             self.error = errText(error, "save failed")

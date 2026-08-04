@@ -28,5 +28,25 @@ pub fn config(apns_url_override: Option<String>, auth_token: Option<String>) -> 
         apns_env: Environment::Production,
         auth_token,
         apns_url_override,
+        // In-memory open buffer: it lives as long as the `RelayState` the test
+        // holds, and never leaves a file behind.
+        db_path: None,
     }
+}
+
+/// Serve `config` on an ephemeral port and return its base URL. Connect info is
+/// attached because the rate limiters key on the peer address.
+pub async fn spawn_relay(config: Config) -> String {
+    let app = squelch_relay::router(squelch_relay::RelayState::new(config).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    format!("http://{addr}")
 }

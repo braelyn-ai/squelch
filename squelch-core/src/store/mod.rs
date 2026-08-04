@@ -58,6 +58,17 @@ pub struct SyncState {
     pub last_uid: u64,
 }
 
+/// One Sent-derived contact, as both the autocomplete hit shape and the
+/// Sent-history harvest's merge input (same fields either way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactEntry {
+    pub addr: String,
+    /// Mailbox display name from Sent To/Cc headers, when one was ever seen.
+    pub display_name: Option<String>,
+    pub sent_count: i64,
+    pub last_sent_at: Option<DateTime<Utc>>,
+}
+
 /// A fully-triaged message committed in one transaction by
 /// [`Store::ingest_message`]: message row and triage row together, so a sealed
 /// message is never observable as normal mail (docs/SECURITY.md §4).
@@ -225,6 +236,39 @@ pub struct Device {
     /// Refreshed on every re-registration — iOS re-hands its token each launch,
     /// so this, not `created_at`, is the liveness signal.
     pub last_registered_at: DateTime<Utc>,
+}
+
+/// One observed open of a tracked outbound message.
+///
+/// SERIALIZED SHAPE IS A WIRE CONTRACT — this is the element type of
+/// `GET /client/messages/{id}/opens`. `opened_at` is unix seconds.
+///
+/// `classification` describes the FETCHER, never a human: `proxied` means Gmail's
+/// image proxy asked for the pixel (which may be a cache warm rather than a
+/// read), `unknown` is everything else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageOpen {
+    pub opened_at: i64,
+    pub user_agent: Option<String>,
+    pub classification: String,
+}
+
+/// Open classification for a fetch Gmail's image proxy made.
+pub const OPEN_PROXIED: &str = "proxied";
+/// Open classification for every other fetcher.
+pub const OPEN_UNKNOWN: &str = "unknown";
+
+/// The message a tracking token points at, resolved in one hop from the token.
+/// Only ever `Some` when the tracker exists, belongs to the account, and its
+/// echo backfilled a local message id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedMessage {
+    /// Local `messages.id` of the echoed copy of the sent mail.
+    pub message_id: i64,
+    pub thread_id: String,
+    pub subject: String,
+    /// The sent row's `From:` — the account's own address.
+    pub from_addr: String,
 }
 
 /// One local draft: an unsent composition addressed either at a message being
@@ -719,6 +763,17 @@ pub trait Store: Send + Sync {
     /// "people I know" signal the sync engine feeds to Stage-1).
     fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool>;
 
+    /// HUMAN-DOOR ONLY (`/client/contacts`): rank Sent-derived contacts for a
+    /// typed fragment — recipient autocomplete. MUST NOT be reachable from MCP;
+    /// the agent door never learns who the user writes to.
+    fn search_contacts(&self, account_id: AccountId, q: &str, limit: u32)
+    -> Result<Vec<ContactEntry>>;
+
+    /// Merge the Sent-history harvest's per-address aggregate (MAX semantics —
+    /// idempotent across harvest re-runs and overlap with ingest seeding).
+    fn merge_harvested_contacts(&self, account_id: AccountId, batch: &[ContactEntry])
+    -> Result<()>;
+
     /// Read the sync cursor for a mailbox key, if one has been persisted.
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>>;
 
@@ -1137,6 +1192,50 @@ pub trait Store: Send + Sync {
     /// Read the daily-cap overrides in ONE query. A cap is `None` when no row
     /// exists OR the stored value does not parse as an integer in `1..=100000`.
     fn stage2_cap_overrides(&self, account_id: AccountId) -> Result<Stage2CapOverrides>;
+
+    // OUTBOUND READ TRACKING. Written by the human door's send path and by the
+    // two open sinks (the direct `/t/:token` route and the opens poller); read
+    // only by the human door. The agent door never touches any of it.
+
+    /// Record a minted tracking token. `message_id` is `None` until the send's
+    /// echo lands; `created_at` is unix seconds.
+    fn insert_send_tracker(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        message_id: Option<i64>,
+        created_at: i64,
+    ) -> Result<()>;
+
+    /// Backfill the local message id of a tracker once the echo has ingested.
+    /// `false` for a token this account did not mint.
+    fn set_send_tracker_message(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        message_id: i64,
+    ) -> Result<bool>;
+
+    /// Append one open. `Ok(false)` — no row written — when `token` names no
+    /// tracker for this account: both open sinks accept arbitrary tokens from
+    /// the outside, so an unknown one must leave nothing behind.
+    fn record_open(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        opened_at: i64,
+        user_agent: Option<&str>,
+        classification: &str,
+    ) -> Result<bool>;
+
+    /// Every open of one local message, oldest first, joined through the
+    /// trackers minted for it. Empty for an untracked or unknown message.
+    fn message_opens(&self, account_id: AccountId, message_id: i64) -> Result<Vec<MessageOpen>>;
+
+    /// Resolve a tracking token to the message it was minted for, or `None` when
+    /// the token is unknown to this account or its echo never backfilled an id.
+    fn tracked_message(&self, account_id: AccountId, token: &str)
+    -> Result<Option<TrackedMessage>>;
 
     /// Count NON-SENT (`is_sent=0`) messages received at or after `since`. Feeds
     /// the `avg_inbound_per_day` figure on `/client/triage-config`.

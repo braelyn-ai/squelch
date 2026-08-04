@@ -65,7 +65,7 @@ What each party sees:
 
 | Party | Sees |
 |---|---|
-| relay | device tokens, event ids, timing |
+| relay | device tokens, event ids, opaque open tokens, timing |
 | Apple | the same, plus the generic alert text |
 | user's daemon | everything (as it already does) |
 
@@ -73,7 +73,9 @@ Same posture as sealed mail: infrastructure gets timing metadata, never content.
 
 ## Shape of the service
 
-Stateless. One endpoint that matters. No database in v1.
+Two endpoints that matter, plus a queue. The only state is the open buffer, and
+it is a queue rather than an archive: rows are deleted the moment the daemon
+acknowledges them.
 
 - `POST /v1/push` — body: device token(s), opaque event id, optional collapse
   id (e.g. per-thread so a busy thread coalesces). Relay signs an APNs JWT
@@ -85,11 +87,17 @@ Stateless. One endpoint that matters. No database in v1.
   `event_id`, collapse id if given. Visible notification (not
   `content-available` background push — those get throttled; a visible
   mutable notification runs the NSE reliably).
+- `GET /t/{token}` — the read-tracking pixel, and the one route strangers
+  reach: mail clients cannot present a bearer. It buffers `(opaque token,
+  timestamp, user agent)` and serves a 1x1 transparent GIF. `GET /v1/opens`
+  hands the buffer to the daemon, which is the only party that can map a token
+  back to a message.
 
 Config: APNs auth key (`.p8`), key id, team id, bundle id(s), sandbox/production
-toggle. That's the whole surface.
+toggle, and where the open buffer lives. That's the whole surface.
 
-Logging: request timing and status codes only. Never log tokens or payloads.
+Logging: request timing and status codes only. Never log device tokens, open
+tokens, or payloads.
 
 ## Running
 
@@ -119,6 +127,7 @@ authentication is allowed but never *defaulted* into — a missing
 | `SQUELCH_RELAY_APNS_ENV` | no | `production` | `production` or `sandbox`; a request may override per push. |
 | `SQUELCH_RELAY_AUTH_TOKEN` | yes* | — | Bearer required by `POST /v1/push` (constant-time compare). Minimum 32 characters. |
 | `SQUELCH_RELAY_ALLOW_ANONYMOUS` | no | `0` | `1` serves `POST /v1/push` open-but-rate-limited, and is the *only* way to omit the bearer. Setting both is an error. |
+| `SQUELCH_RELAY_DB_PATH` | no | — | SQLite file for the open buffer. Unset keeps it in memory: the binary warns at startup, and opens the daemon has not drained are lost on restart. |
 | `SQUELCH_RELAY_LOG` | no | `info` | `tracing` env filter. |
 | `SQUELCH_RELAY_APNS_URL_OVERRIDE` | no | — | **Test only.** Points the relay at a mock APNs base URL instead of Apple. Never set in production; the binary logs a warning when it is. |
 
@@ -164,6 +173,31 @@ finished within the 30-second whole-batch budget reports `status: 0` with reason
 `429` (120 requests/minute per client IP, in-memory and per-process; the limiter
 sits *inside* the auth layer, so unauthenticated junk cannot spend a real
 client's budget).
+
+`GET /t/{token}` → always `200` with a 42-byte transparent GIF,
+`Content-Type: image/gif`, `Cache-Control: no-store, no-cache`,
+`Pragma: no-cache`. No auth — the callers are mail clients — and metered against
+its own per-IP buckets (600/minute) so pixel traffic can never spend the
+daemon's push budget. The response is **byte-identical for every token**: valid,
+unknown, expired, or garbage. A token matching `^[A-Za-z0-9_-]{16,64}$` is
+buffered as `(token, opened_at, user_agent)` with the user agent truncated to
+512 bytes; anything else is served the same pixel and dropped. At most 50 rows
+are kept per token, and rows older than 90 days are swept.
+
+`GET /v1/opens?cursor=N` — behind the same bearer as `/v1/push`:
+
+```json
+{"opens": [
+  {"id": 12, "token": "<opaque>", "opened_at": 1754300000, "user_agent": "..."}
+]}
+```
+
+Rows with `id > N`, in id order, up to 500 per call; `cursor` defaults to 0.
+**The cursor is an acknowledgement**: presenting `N` deletes every row at or
+below it in the same transaction as the read, so the daemon advances its cursor
+only once it has durably stored what it received, and a crash mid-drain replays
+instead of losing. Ids are `AUTOINCREMENT` and never reused, so a new open can
+never land under a cursor that has already been acked.
 
 ### Development
 
@@ -220,9 +254,11 @@ A single small binary (Rust/axum to match the rest of the codebase). It is a
 workspace member so it shares the lockfile and one `cargo test`, but it stays a
 separate deployable on its own release cadence: nothing in the daemon links
 against it, and it links against nothing of the daemon's — no `squelch-core`,
-no store, no mail types. Stateless, so any small VPS or fly.io-class host works;
-scale is a rounding error. TLS terminated by the host. The `.p8` key is the
-only secret.
+no store, no mail types. Any small VPS or fly.io-class host works; scale is a
+rounding error. TLS terminated by the host. The `.p8` key is the only secret.
+The one piece of state is the open buffer: point `SQUELCH_RELAY_DB_PATH` at a
+persistent volume, or accept that a restart drops whatever the daemon had not
+drained yet (a missed open, never a wrong one).
 
 Concretely: the repo root carries a `Dockerfile` and `railway.toml` that build
 and run only this crate, so `railway up` is the whole deploy. Nothing is

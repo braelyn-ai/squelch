@@ -8,7 +8,8 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::config::Config;
 use crate::jwt::JwtSigner;
-use crate::ratelimit::{REQUESTS_PER_MINUTE, RateLimiter};
+use crate::opens::OpenStore;
+use crate::ratelimit::{PIXEL_REQUESTS_PER_MINUTE, REQUESTS_PER_MINUTE, RateLimiter};
 
 /// State threaded through the router, the auth layer, and the rate limiter.
 /// Cheap to clone (one `Arc`): the config, HTTP client, token cache, and limiter
@@ -28,7 +29,12 @@ struct Inner {
     http: reqwest::Client,
     signer: JwtSigner,
     limiter: Mutex<RateLimiter>,
+    /// The pixel route gets its OWN buckets. Both routes see the proxy's address
+    /// and so share one bucket per limiter; on a single limiter, one popular
+    /// newsletter's opens would spend the daemon's push budget.
+    pixel_limiter: Mutex<RateLimiter>,
     apns_inflight: Semaphore,
+    opens: OpenStore,
 }
 
 impl RelayState {
@@ -48,13 +54,16 @@ impl RelayState {
             .pool_idle_timeout(Duration::from_secs(600))
             .timeout(Duration::from_secs(10))
             .build()?;
+        let opens = OpenStore::open(config.db_path.as_deref())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 http,
                 signer,
                 limiter: Mutex::new(RateLimiter::per_minute(REQUESTS_PER_MINUTE)),
+                pixel_limiter: Mutex::new(RateLimiter::per_minute(PIXEL_REQUESTS_PER_MINUTE)),
                 apns_inflight: Semaphore::new(MAX_INFLIGHT_APNS),
+                opens,
             }),
         })
     }
@@ -86,6 +95,20 @@ impl RelayState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .check(ip, Instant::now())
+    }
+
+    /// Charge one pixel fetch against `ip`'s separate bucket.
+    pub(crate) fn check_pixel_rate(&self, ip: IpAddr) -> bool {
+        self.inner
+            .pixel_limiter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check(ip, Instant::now())
+    }
+
+    /// The open buffer.
+    pub(crate) fn opens(&self) -> &OpenStore {
+        &self.inner.opens
     }
 
     /// Wait for a slot in the process-wide APNs concurrency budget; the permit

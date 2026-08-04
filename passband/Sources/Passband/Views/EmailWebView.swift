@@ -16,6 +16,11 @@ struct EmailWebView: View {
     /// de-duplicates against itself, collapsing the signature copies a quoted
     /// history drags along behind it.
     let seenEarlier: Set<String>
+    /// The sender is somebody the user has written to (`sender_known` on the
+    /// wire), so this body's tracking pixels are left in the document: a trusted
+    /// correspondent is allowed to learn the mail was opened. Everyone else is
+    /// stripped exactly as before, and the default is the strict one.
+    let allowTrackers: Bool
 
     @Environment(Prefs.self) private var prefs
     @Environment(AppStore.self) private var store
@@ -34,18 +39,27 @@ struct EmailWebView: View {
 
     /// `prepared` is seeded from the warm cache HERE: `@State` cannot be assigned
     /// from `body`, and every later hook is a frame too late.
-    init(html: String, cacheKey: String? = nil, seenEarlier: Set<String> = []) {
+    init(
+        html: String, cacheKey: String? = nil, seenEarlier: Set<String> = [],
+        allowTrackers: Bool = false
+    ) {
         self.html = html
         self.cacheKey = cacheKey
         self.seenEarlier = seenEarlier
+        self.allowTrackers = allowTrackers
         _prepared = State(
-            initialValue: PreparedBodies.shared.get(Prepared.cacheKey(html, seenEarlier)) ?? .empty)
+            initialValue: PreparedBodies.shared.get(
+                Prepared.cacheKey(html, seenEarlier, allowTrackers)) ?? .empty)
     }
 
     struct Prepared: Equatable, Sendable {
         var sourceHash: Int
         var html: String
-        var blocked: Int
+        /// Tracking pixels the strip pass FOUND. Removed from `html` unless
+        /// `trackersAllowed`, in which case they are still in the document and
+        /// this is only what the badge reports.
+        var trackers: Int
+        var trackersAllowed: Bool
         var hasRemoteCandidates: Bool
         var links: [EmailLink]
         /// The ORIGINAL http(s) urls behind this body's proxied references, in
@@ -54,15 +68,21 @@ struct EmailWebView: View {
         var imageURLs: [String]
 
         static let empty = Prepared(
-            sourceHash: 0, html: "", blocked: 0, hasRemoteCandidates: false, links: [],
-            imageURLs: [])
+            sourceHash: 0, html: "", trackers: 0, trackersAllowed: false,
+            hasRemoteCandidates: false, links: [], imageURLs: [])
 
-        static func make(from html: String, seenEarlier: Set<String>) -> Prepared {
-            // ORDER MATTERS: trackers come out FIRST, so a tracking pixel can
-            // never be the "first occurrence" that suppresses a real image
-            // further down the thread. Dedupe layers on top, never in place of it.
+        static func make(from html: String, seenEarlier: Set<String>, allowTrackers: Bool = false)
+            -> Prepared
+        {
+            // The pass runs either way — one regex sweep, and its COUNT is what
+            // the badge reports — but a known sender's body keeps its pixels.
+            // ORDER MATTERS when it does strip: trackers come out FIRST, so a
+            // tracking pixel can never be the "first occurrence" that suppresses
+            // a real image further down the thread. Dedupe layers on top, never
+            // in place of it.
             let stripped = Trackers.strip(html)
-            let deduped = ImageRepeats.dropRepeats(stripped.html, alreadySeen: seenEarlier)
+            let body = allowTrackers ? html : stripped.html
+            let deduped = ImageRepeats.dropRepeats(body, alreadySeen: seenEarlier)
             // Read off the DEDUPED html: a message whose only images were
             // repeats has nothing left to fetch, so it must not offer the
             // "load remote images" bar.
@@ -73,9 +93,10 @@ struct EmailWebView: View {
             // no longer recognise as remote.
             let proxied = ImageProxy.rewrite(deduped)
             return Prepared(
-                sourceHash: cacheKey(html, seenEarlier),
+                sourceHash: cacheKey(html, seenEarlier, allowTrackers),
                 html: proxied.html,
-                blocked: stripped.blocked,
+                trackers: stripped.blocked,
+                trackersAllowed: allowTrackers,
                 hasRemoteCandidates: hasRemoteCandidates,
                 links: links,
                 imageURLs: proxied.urls)
@@ -83,11 +104,16 @@ struct EmailWebView: View {
 
         /// The suppression set is an input, so it is part of the identity of what
         /// was prepared — keying on the html alone would hand a message the
-        /// previous thread's dedupe result.
-        static func cacheKey(_ html: String, _ seenEarlier: Set<String>) -> Int {
+        /// previous thread's dedupe result. So is the tracker policy: the two
+        /// policies produce DIFFERENT documents from the same body, and a shared
+        /// key would serve one message's pixels inside another's frame.
+        static func cacheKey(_ html: String, _ seenEarlier: Set<String>, _ allowTrackers: Bool)
+            -> Int
+        {
             var hasher = Hasher()
             hasher.combine(html)
             hasher.combine(seenEarlier)
+            hasher.combine(allowTrackers)
             return hasher.finalize()
         }
     }
@@ -183,8 +209,9 @@ struct EmailWebView: View {
             }
             let source = html
             let seen = seenEarlier
+            let allow = allowTrackers
             let made = await Task.detached(priority: .userInitiated) {
-                Prepared.make(from: source, seenEarlier: seen)
+                Prepared.make(from: source, seenEarlier: seen, allowTrackers: allow)
             }.value
             PreparedBodies.shared.set(key, made)
             guard !Task.isCancelled else { return }
@@ -204,7 +231,7 @@ struct EmailWebView: View {
         }
     }
 
-    private var preparedKey: Int { Prepared.cacheKey(html, seenEarlier) }
+    private var preparedKey: Int { Prepared.cacheKey(html, seenEarlier, allowTrackers) }
     private var rememberedHeight: CGFloat? { cacheKey.flatMap { FrameHeights.shared.get($0) } }
     private var displayHeight: CGFloat {
         height > 0 ? height : (rememberedHeight ?? Self.placeholderHeight)
@@ -225,9 +252,25 @@ struct EmailWebView: View {
             .foregroundStyle(Palette.inkFaint)
             .help(
                 "remote images are off by default (Settings → Mail); load them for this email only")
-        } else if prepared.blocked > 0 {
+        } else if prepared.trackers > 0, prepared.trackersAllowed {
+            // The count is honest about what was LEFT IN: this sender is someone
+            // the user writes to, so they are allowed to see the open. Muted, not
+            // green — nothing was protected here.
             Label(
-                "\(prepared.blocked) tracker\(prepared.blocked == 1 ? "" : "s") blocked",
+                "trackers allowed — known sender",
+                systemImage: "eye"
+            )
+            .font(Typo.micro)
+            .foregroundStyle(Palette.inkFaint)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .glassCapsule(interactive: false)
+            .help(
+                "\(prepared.trackers) tracking pixel\(prepared.trackers == 1 ? "" : "s") left in place: you have emailed this sender, so they may see that you opened this"
+            )
+        } else if prepared.trackers > 0 {
+            Label(
+                "\(prepared.trackers) tracker\(prepared.trackers == 1 ? "" : "s") blocked",
                 systemImage: "eye.slash"
             )
             .font(Typo.micro)

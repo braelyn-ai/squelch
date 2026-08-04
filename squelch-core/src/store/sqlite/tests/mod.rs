@@ -11,4 +11,5 @@ mod migrate;
 mod rules;
 mod search;
 mod specialists;
+mod tracking;
 mod triage_stages;

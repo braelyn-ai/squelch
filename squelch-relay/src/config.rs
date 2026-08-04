@@ -80,6 +80,9 @@ pub struct Config {
     /// TEST-ONLY base-URL override for the APNs host; wins over `apns_env`'s
     /// host. Production deployments must leave this unset.
     pub apns_url_override: Option<String>,
+    /// Where the open buffer lives. `None` keeps it in memory, so anything the
+    /// daemon has not drained is lost on restart.
+    pub db_path: Option<PathBuf>,
 }
 
 /// Hand-written so neither the `.p8` nor the bearer token can reach a log
@@ -98,6 +101,7 @@ impl std::fmt::Debug for Config {
                 &self.auth_token.as_ref().map(|_| "<redacted>"),
             )
             .field("apns_url_override", &self.apns_url_override)
+            .field("db_path", &self.db_path)
             .finish()
     }
 }
@@ -191,7 +195,7 @@ impl Config {
             }
             (None, false) => {
                 return Err(ConfigError::invalid(
-                    "SQUELCH_RELAY_AUTH_TOKEN is required (set SQUELCH_RELAY_ALLOW_ANONYMOUS=1 to deliberately serve /v1/push open)",
+                    "SQUELCH_RELAY_AUTH_TOKEN is required (set SQUELCH_RELAY_ALLOW_ANONYMOUS=1 to deliberately serve /v1/push open; /v1/opens is then not served at all)",
                 ));
             }
             (None, true) => None,
@@ -217,6 +221,8 @@ impl Config {
             }
         };
 
+        let db_path = var("SQUELCH_RELAY_DB_PATH").map(PathBuf::from);
+
         Ok(Self {
             bind,
             apns_key_pem,
@@ -226,6 +232,7 @@ impl Config {
             apns_env,
             auth_token,
             apns_url_override,
+            db_path,
         })
     }
 
@@ -290,6 +297,7 @@ mod tests {
             apns_env: Environment::Production,
             auth_token: None,
             apns_url_override: None,
+            db_path: None,
         }
     }
 

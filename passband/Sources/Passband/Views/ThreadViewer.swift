@@ -34,6 +34,9 @@ struct ThreadViewer: View {
     /// messageId -> image srcs an earlier message in this thread already showed.
     /// Rebuilt with the thread and thrown away with it; nothing crosses threads.
     @State private var repeatedImages: [Int: Set<String>] = [:]
+    /// messageId -> recorded opens of the user's own tracked sends. Only sent,
+    /// tracked messages ever have an entry; see `refreshOpens`.
+    @State private var opens: [Int: [MessageOpen]] = [:]
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -131,6 +134,7 @@ struct ThreadViewer: View {
             // Only once the thread is HERE: the hand-off names a message, and
             // whether it is in this thread is not knowable until it has loaded.
             consumePendingReply()
+            await refreshOpens()
         }
         .task(id: newestSender) { await refreshUnsub() }
         // Warm the NEXT queued thread while this one is being read, so e/d's
@@ -274,7 +278,8 @@ struct ThreadViewer: View {
                         ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                             MessageCard(
                                 message: m, selected: i == index, ruled: i > 0,
-                                seenEarlier: repeatedImages[m.id] ?? []
+                                seenEarlier: repeatedImages[m.id] ?? [],
+                                opens: opens[m.id] ?? []
                             ) {
                                 index = i
                             }
@@ -493,6 +498,10 @@ struct ThreadViewer: View {
         guard let view = try? await APIClient.shared.getThread(threadId) else { return }
         ThreadPrefetch.shared.note(threadId, view)
         adopt(view)
+        // The echo is a new message id, so the receipt map has nothing for it
+        // yet. Nothing has opened it a second after it went out — this is what
+        // arms the mark for the poll that eventually finds one.
+        await refreshOpens()
     }
 
     // MARK: - queue navigation
@@ -579,6 +588,22 @@ struct ThreadViewer: View {
             ThreadPrefetch.shared.cachedRepeatedImages(threadId)
             ?? ThreadPrefetch.repeatedImages(in: view)
         index = 0  // newest renders first — land on it
+    }
+
+    /// Read receipts for this thread's messages.
+    ///
+    /// Every message is asked about rather than only the ones the user sent:
+    /// the wire carries no "this copy is mine" flag, only a TRACKED SEND can
+    /// have opens, and an untracked or inbound id answers with an empty list.
+    /// The whole pass is skipped while the daemon has no tracking configured —
+    /// then there are no receipts anywhere and this would be pure round-trips.
+    private func refreshOpens() async {
+        guard store.trackingAvailable, let messages = thread?.messages, !messages.isEmpty
+        else {
+            opens = [:]
+            return
+        }
+        opens = await ReadReceipts.opens(for: messages.map(\.id))
     }
 
     /// Best-effort: a failed lookup just leaves the hint in its default state.
@@ -674,6 +699,9 @@ private struct MessageCard: View {
     let ruled: Bool
     /// Image srcs an earlier message already showed; dropped from this body.
     let seenEarlier: Set<String>
+    /// Recorded opens of this message, when it is one of the user's own tracked
+    /// sends. Empty for everything else, which renders no mark.
+    let opens: [MessageOpen]
     let onSelect: () -> Void
 
     var body: some View {
@@ -696,6 +724,7 @@ private struct MessageCard: View {
                     )
                     .help(message.one_line ?? "this message put the thread in for-your-eyes")
                 }
+                ReadReceiptMark(opens: opens)
                 Text(Fmt.dateTime(message.received_at))
                     .font(Typo.num(11))
                     .foregroundStyle(Palette.inkFaintest)
@@ -703,7 +732,8 @@ private struct MessageCard: View {
 
             if let html = message.html, !html.isEmpty {
                 EmailWebView(
-                    html: html, cacheKey: String(message.id), seenEarlier: seenEarlier)
+                    html: html, cacheKey: String(message.id), seenEarlier: seenEarlier,
+                    allowTrackers: message.allowsTrackers)
             } else {
                 PlainBody(content: message.content)
             }

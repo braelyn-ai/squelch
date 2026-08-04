@@ -418,6 +418,24 @@ fn cmd_serve(
     // appended during startup is missed.
     let pusher_wake = event_tx.subscribe();
 
+    // The opens poller runs the same relay in the other direction: it collects
+    // read-tracking pixel hits the relay saw and appends the `opened` events the
+    // pusher then delivers. Gated on the SAME `SQUELCH_RELAY_URL`; a daemon
+    // whose pixel is reached directly needs none of this.
+    let opens_poller = match squelch_core::tracking::OpensPoller::from_config(
+        store.clone() as Arc<dyn squelch_core::store::Store>,
+        account_id,
+        &config,
+    ) {
+        Ok(poller) => poller,
+        Err(e) => {
+            eprintln!(
+                "squelchd: opens poller NOT started: a relay is configured but its HTTP client could not be built: {e}"
+            );
+            None
+        }
+    };
+
     // The human door refuses to build without SQUELCH_API_TOKEN. The shared
     // config->state wiring also attaches the WRITE-bound credential store that
     // enables the action endpoints; the sync engine below gets a separate
@@ -456,6 +474,25 @@ fn cmd_serve(
             }
         };
 
+        // Drains observed opens off the same relay. Shares the shutdown watch
+        // and is awaited on the way out, like the pusher.
+        let opens_handle = match opens_poller {
+            Some(poller) => {
+                eprintln!("squelchd: opens poller enabled (relay configured)");
+                let shutdown_rx = shutdown_rx.clone();
+                Some(tokio::spawn(async move { poller.run(shutdown_rx).await }))
+            }
+            None => {
+                eprintln!(
+                    "squelchd: opens poller disabled (no SQUELCH_RELAY_URL / [pusher] relay_url)"
+                );
+                None
+            }
+        };
+
+        // READ-bound store, shared by the sync loop and the contacts harvest.
+        let sync_creds = make_credential_store(backend, account_id, email.clone(), creds_path, client);
+
         // No embedder override: the loop resolves it from the shared store each
         // tick, so it picks up the background-attached one.
         let sync_handle = {
@@ -463,8 +500,7 @@ fn cmd_serve(
             let email = email.clone();
             let config = config.clone();
             let refresh = refresh.clone();
-            let creds =
-                make_credential_store(backend, account_id, email.clone(), creds_path, client);
+            let creds = sync_creds.clone();
             tokio::spawn(async move {
                 SyncEngine::new(store, creds, account_id, email, config)
                     .with_refresh(refresh)
@@ -472,6 +508,26 @@ fn cmd_serve(
                     .await
             })
         };
+
+        // One-time Sent-history sweep seeding recipient autocomplete (headers
+        // only, read credential). Staggered past the startup sync burst; a
+        // failure just retries on the next daemon start — the done flag is only
+        // set on completion.
+        {
+            let store = store.clone();
+            let email = email.clone();
+            let config = config.clone();
+            let creds = sync_creds.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(180)).await;
+                let engine = SyncEngine::new(store, creds, account_id, email, config);
+                if let Err(e) = engine.harvest_sent_contacts().await {
+                    eprintln!(
+                        "squelchd: sent-contacts harvest incomplete (retries next start): {e}"
+                    );
+                }
+            });
+        }
 
         // Auth-mail retention runs here because this process owns the write
         // credential (sync is bound to gmail.readonly by hard invariant). No-op
@@ -564,6 +620,13 @@ fn cmd_serve(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("squelchd: APNs pusher ended with error: {e}"),
                 Err(e) => eprintln!("squelchd: APNs pusher task join error: {e}"),
+            }
+        }
+        if let Some(handle) = opens_handle {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("squelchd: opens poller ended with error: {e}"),
+                Err(e) => eprintln!("squelchd: opens poller task join error: {e}"),
             }
         }
 

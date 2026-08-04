@@ -14,6 +14,7 @@ pub mod gmail_write;
 mod handlers;
 mod markdown;
 mod state;
+pub mod tracking;
 pub mod unsubscribe;
 
 pub use auth::require_bearer;
@@ -29,9 +30,19 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
-/// Build the `/client/*` router. Bearer auth is already layered over every
-/// route; [`ApiState::from_env`] / [`ApiState::new`] refuse an empty token.
+/// Build this crate's router: the bearer-authed `/client/*` tree, plus the ONE
+/// unauthenticated route — `GET /t/{token}`, the read-tracking pixel a
+/// recipient's mail client fetches. They are built separately and merged so the
+/// auth boundary is a line you can see: everything in [`client_router`] is
+/// behind the bearer, [`tracking::pixel_router`] holds exactly one route and
+/// nothing else is ever added to it.
 pub fn router(state: ApiState) -> Router {
+    client_router(state.clone()).merge(tracking::pixel_router(state))
+}
+
+/// The `/client/*` router. Bearer auth is layered over every route in it;
+/// [`ApiState::from_env`] / [`ApiState::new`] refuse an empty token.
+fn client_router(state: ApiState) -> Router {
     Router::new()
         .route("/client/updates", get(handlers::get_updates))
         .route(
@@ -62,6 +73,9 @@ pub fn router(state: ApiState) -> Router {
             get(handlers::list_drafts).put(handlers::put_draft),
         )
         .route("/client/drafts/{id}", delete(handlers::delete_draft))
+        // Recipient autocomplete over Sent-derived contacts. Human door only —
+        // the agent door must never see who the user writes to.
+        .route("/client/contacts", get(handlers::get_contacts))
         .route("/client/sealed", get(handlers::list_sealed))
         .route(
             "/client/sealed/{message_id}/reveal",
@@ -70,6 +84,18 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/client/shredder",
             get(handlers::get_shredder).post(handlers::set_shredder),
+        )
+        // Read tracking, human door only: the opens of the user's OWN sent mail,
+        // and whether the client should default new sends to tracked. The pixel
+        // that produces these rows is the unauthenticated route merged in
+        // `router`; the agent door has neither.
+        .route(
+            "/client/messages/{message_id}/opens",
+            get(tracking::get_message_opens),
+        )
+        .route(
+            "/client/tracking-config",
+            get(tracking::get_tracking_config).post(tracking::set_tracking_config),
         )
         .route("/client/shredder/run", post(handlers::run_shredder))
         .route("/client/marketing", get(handlers::get_marketing))

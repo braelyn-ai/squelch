@@ -239,6 +239,22 @@ pub struct PusherConfig {
     pub environment: Option<String>,
 }
 
+/// Outbound read-tracking config; see [`crate::tracking`].
+///
+/// `base_url` IS THE FEATURE FLAG for MINTING: absent (the default), no send
+/// ever gets a pixel no matter what the client asks for, and the human door
+/// reports tracking as unconfigured so the client can hide the toggle. It is
+/// deliberately separate from `[pusher] relay_url` — the pixel has to be
+/// reachable from a stranger's mail client, which the relay may or may not be.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TrackingConfig {
+    /// PUBLIC base URL that reaches this daemon's `/t/:token` route (e.g.
+    /// `https://track.example.com`); the pixel is `{base_url}/t/{token}`.
+    /// Env: `SQUELCH_TRACK_URL`. `None` => tracking is off for every send.
+    pub base_url: Option<String>,
+}
+
 /// Default embedding-weights cache dir, a sibling of the sqlite db under the
 /// XDG data dir; CWD-relative only when `HOME` is unset.
 pub fn default_embed_cache_dir() -> PathBuf {
@@ -648,6 +664,8 @@ pub struct Config {
     /// APNs pusher: the blind relay's URL + bearer. Absent `relay_url` means the
     /// task is never spawned.
     pub pusher: PusherConfig,
+    /// Outbound read tracking. Absent `base_url` means no send is ever tracked.
+    pub tracking: TrackingConfig,
 }
 
 impl Default for Config {
@@ -667,6 +685,7 @@ impl Default for Config {
             embed: EmbedConfig::default(),
             notify: NotifyConfig::default(),
             pusher: PusherConfig::default(),
+            tracking: TrackingConfig::default(),
         }
     }
 }
@@ -749,6 +768,11 @@ impl Config {
             ("SQUELCH_RELAY_TOKEN", &mut self.pusher.relay_token),
             ("SQUELCH_RELAY_TOPIC", &mut self.pusher.topic),
             ("SQUELCH_RELAY_APNS_ENV", &mut self.pusher.environment),
+            // ---- Outbound read tracking ------------------------------------
+            // Same rule as the relay block: trimmed, and a blank value is
+            // "unset" rather than "configured with nothing", so an exported-but-
+            // empty var cannot mint pixels pointing at "/t/<token>".
+            ("SQUELCH_TRACK_URL", &mut self.tracking.base_url),
         ] {
             if let Ok(v) = std::env::var(name) {
                 let v = v.trim();
@@ -1185,6 +1209,45 @@ backfill_days = 90
         unsafe {
             std::env::remove_var("SQUELCH_DB_PATH");
             std::env::remove_var("SQUELCH_DB");
+        }
+    }
+
+    /// `SQUELCH_TRACK_URL` follows the relay block's rules exactly: it overrides
+    /// the file, it is trimmed, and a blank value leaves tracking OFF rather than
+    /// configured with nothing (which would mint pixels pointing at `/t/<token>`).
+    #[test]
+    fn track_url_env_override_matches_the_relay_block() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_TRACK_URL");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.tracking.base_url, None, "unset => tracking is off");
+
+        unsafe {
+            std::env::set_var("SQUELCH_TRACK_URL", "   ");
+        }
+        let mut c = Config::default();
+        c.tracking.base_url = Some("https://from-file.example".to_string());
+        c.apply_env_overrides();
+        assert_eq!(
+            c.tracking.base_url.as_deref(),
+            Some("https://from-file.example"),
+            "a blank env value does not clobber the file"
+        );
+
+        unsafe {
+            std::env::set_var("SQUELCH_TRACK_URL", "  https://track.example.com  ");
+        }
+        let mut c = Config::default();
+        c.tracking.base_url = Some("https://from-file.example".to_string());
+        c.apply_env_overrides();
+        assert_eq!(c.tracking.base_url.as_deref(), Some("https://track.example.com"));
+
+        unsafe {
+            std::env::remove_var("SQUELCH_TRACK_URL");
         }
     }
 

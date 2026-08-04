@@ -253,13 +253,17 @@ pub fn stage1_with_config(
                     tier: Some(format!("surface rule #{} -> signal", rule.id)),
                 },
             },
-            // Filtered: `want_text` is a natural-language predicate we cannot
-            // evaluate without the LLM. Park in Noise, NOT confident, so Stage-2
-            // picks it up.
+            // Filtered: `want_text` is the account owner's own standing
+            // instruction for this sender, written in whatever polarity they
+            // like — mail they DO want ("only school closures") or mail they do
+            // NOT care about ("i dont care about the approval emails"). Either
+            // way it is a natural-language predicate we cannot evaluate without
+            // the LLM. Park in Noise, NOT confident, so Stage-2 picks it up.
             //
-            // TODO(stage2): inject `rule.want_text` as a TRUSTED user instruction
-            // (the user's own rule, not attacker-controlled email content) and let
-            // the LLM decide surface-vs-squelch against it.
+            // Stage-2 injects the verbatim `want_text` into its TRUSTED CONTEXT
+            // block (owner- or agent-authored through an audited door; never
+            // email body content) and decides surface-vs-squelch against it; see
+            // [`stage2::build_user_message`] and `stage2::apply_result`.
             Disposition::Filtered => Stage1Result {
                 tier: Tier::Noise,
                 importance: cfg.rule_filtered_importance,

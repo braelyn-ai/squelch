@@ -111,9 +111,11 @@ fn seed_contacts_conn(
             continue;
         }
         conn.execute(
-            "INSERT INTO contacts(account_id, addr, sent_count, first_seen)
-             VALUES(?1,?2,1,?3)
-             ON CONFLICT(account_id, addr) DO UPDATE SET sent_count = sent_count + 1",
+            "INSERT INTO contacts(account_id, addr, sent_count, first_seen, last_sent_at)
+             VALUES(?1,?2,1,?3,?3)
+             ON CONFLICT(account_id, addr) DO UPDATE SET
+                 sent_count = sent_count + 1,
+                 last_sent_at = MAX(COALESCE(last_sent_at,''), ?3)",
             params![account_id, addr, first_seen],
         )?;
     }

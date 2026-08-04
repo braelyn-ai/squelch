@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS contacts (
     addr       TEXT NOT NULL,
     sent_count INTEGER NOT NULL DEFAULT 0,
     first_seen TEXT NOT NULL,
+    -- Recency + pretty-name columns for recipient autocomplete. last_sent_at is
+    -- RFC3339 UTC (lexicographically ordered); display_name comes from the Sent
+    -- harvest's To/Cc mailbox names and may lag for post-harvest contacts.
+    last_sent_at TEXT,
+    display_name TEXT,
     PRIMARY KEY(account_id, addr)
 );
 
@@ -493,7 +498,7 @@ CREATE TABLE IF NOT EXISTS events (
     account_id  INTEGER NOT NULL,
     message_id  INTEGER NOT NULL UNIQUE,
     thread_id   TEXT NOT NULL,
-    kind        TEXT NOT NULL,         -- urgent | deadline | surfaced
+    kind        TEXT NOT NULL,         -- urgent | deadline | surfaced | opened
     tier        TEXT NOT NULL,
     importance  INTEGER NOT NULL,
     sender      TEXT NOT NULL,
@@ -561,3 +566,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_reply
     ON drafts(account_id, reply_to_message_id) WHERE reply_to_message_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_new
     ON drafts(account_id) WHERE reply_to_message_id IS NULL;
+
+-- OUTBOUND READ TRACKING. One `send_trackers` row per tracked send: the minted
+-- token IS the pixel URL's path segment, so it is the only thing a recipient's
+-- mail client ever hands back. Tracking is opt-in per send AND requires
+-- `[tracking] base_url`; an untracked send writes nothing here.
+--
+-- `message_id` is the LOCAL messages.id of the echoed copy of the sent mail,
+-- backfilled after the send's echo lands, and NULL when the echo did not (a
+-- sealed or failed echo). Timestamps are unix seconds, not the RFC3339 text the
+-- mail tables use — nothing here is a mail date, and the opens feed carries
+-- epoch integers end to end.
+--
+-- PRIVACY: a token is unguessable capability material minted per send. It is
+-- never logged and never crosses the agent door; /mcp does not know these
+-- tables exist.
+CREATE TABLE IF NOT EXISTS send_trackers (
+    token      TEXT PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    message_id INTEGER,
+    created_at INTEGER NOT NULL
+);
+
+-- ONE ROW PER OBSERVED OPEN, append-only. Rows arrive two ways: the daemon's own
+-- unauthenticated GET /t/:token, and the opens poller draining the relay. Both
+-- insert ONLY for a token that names an existing `send_trackers` row, so an
+-- unknown token leaves no trace.
+--
+-- `classification` is what the fetch's User-Agent implies, never a claim about a
+-- human: 'proxied' for Gmail's image proxy (an open that may be a cache warm),
+-- 'unknown' otherwise.
+CREATE TABLE IF NOT EXISTS message_opens (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    token          TEXT NOT NULL,
+    opened_at      INTEGER NOT NULL,
+    user_agent     TEXT,
+    classification TEXT NOT NULL DEFAULT 'unknown'
+);
+
+-- The read pattern is exactly "every open for this token".
+CREATE INDEX IF NOT EXISTS idx_message_opens_token ON message_opens(token);

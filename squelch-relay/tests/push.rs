@@ -3,7 +3,6 @@
 //! process-global environment and can run in parallel. The env path itself is
 //! covered by `tests/config_env.rs`, which needs a process to itself.
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -15,11 +14,10 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use squelch_relay::{Config, RelayState, router};
 use tokio::net::TcpListener;
 
 mod common;
-use common::{BETA_TOPIC, TOPIC, config};
+use common::{BETA_TOPIC, TOPIC, config, spawn_relay};
 
 /// A live token, a token APNs has retired, and one APNs calls malformed.
 const LIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
@@ -77,21 +75,6 @@ async fn spawn_mock() -> (String, Mock) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), mock)
-}
-
-async fn spawn_relay(config: Config) -> String {
-    let app = router(RelayState::new(config).unwrap());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    format!("http://{addr}")
 }
 
 /// Relay + mock, wired together.

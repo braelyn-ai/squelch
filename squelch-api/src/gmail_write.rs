@@ -80,6 +80,57 @@ pub struct ReplyParts {
     /// never caller-supplied, so the guard's scan of `body` covers it. Some =
     /// multipart/alternative with `body` as the text/plain part.
     pub body_html: Option<String>,
+    /// Read-tracking pixel URL. Some also forces multipart/alternative: the
+    /// `<img>` rides in the HTML part ONLY, so a plain-text reader fetches
+    /// nothing and reads nothing back to us.
+    pub pixel_url: Option<String>,
+}
+
+/// Escape text for interpolation into HTML markup or a double-quoted attribute
+/// value. `&` first, or it would double-escape the entities emitted after it.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Plain text as minimal HTML: blank lines split paragraphs, single newlines
+/// inside one become `<br>`. Used only when no `body_html` was rendered —
+/// something has to carry the pixel.
+fn paragraphs_html(body: &str) -> String {
+    let normalized = body.replace("\r\n", "\n");
+    let mut out = String::new();
+    for para in normalized.split("\n\n") {
+        let para = para.trim_matches('\n');
+        if para.trim().is_empty() {
+            continue;
+        }
+        let lines: Vec<String> = para.lines().map(escape_html).collect();
+        out.push_str(&format!("<p>{}</p>\n", lines.join("<br>")));
+    }
+    out
+}
+
+/// The HTML alternative, or `None` when the message stays text/plain. Present
+/// when there is rendered HTML to send, a pixel to carry, or both.
+fn html_alternative(parts: &ReplyParts) -> Option<String> {
+    if parts.body_html.is_none() && parts.pixel_url.is_none() {
+        return None;
+    }
+    let inner = match parts.body_html.as_deref() {
+        Some(html) => html.to_string(),
+        None => paragraphs_html(&parts.body),
+    };
+    let pixel = match parts.pixel_url.as_deref() {
+        Some(url) => format!(
+            "<img src=\"{}\" width=\"1\" height=\"1\" alt=\"\">\n",
+            escape_html(url)
+        ),
+        None => String::new(),
+    };
+    Some(format!("<html><body>\n{inner}{pixel}</body></html>\n"))
 }
 
 /// A multipart boundary none of the parts contain. Deterministic: a fixed
@@ -100,10 +151,10 @@ fn multipart_boundary(parts: &[&str]) -> String {
 /// Build a minimal RFC822 message from [`ReplyParts`], guarded against CRLF
 /// header injection. Returns raw bytes ready for base64url encoding.
 ///
-/// With `body_html` set the message is multipart/alternative: text/plain first
-/// (the raw source, exactly as typed), text/html second. Body content stays
-/// structurally inert — the only string that delimits parts is the boundary,
-/// and [`multipart_boundary`] guarantees neither part contains it.
+/// With `body_html` or `pixel_url` set the message is multipart/alternative:
+/// text/plain first (the raw source, exactly as typed), text/html second. Body
+/// content stays structurally inert — the only string that delimits parts is
+/// the boundary, and [`multipart_boundary`] guarantees neither part contains it.
 pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     // No field that becomes a header line may contain CR or LF. The body may
     // (it lives after the blank line).
@@ -134,7 +185,7 @@ pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     }
     // Bodies: normalize bare LFs to CRLF for RFC822 line endings.
     let text = parts.body.replace("\r\n", "\n").replace('\n', "\r\n");
-    match parts.body_html.as_deref() {
+    match html_alternative(parts).as_deref() {
         None => {
             out.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
             out.push_str("MIME-Version: 1.0\r\n");
@@ -479,6 +530,7 @@ mod tests {
             in_reply_to: Some("<parent@x>".into()),
             references: Some("<root@x> <parent@x>".into()),
             body_html: None,
+            pixel_url: None,
         };
         let raw = build_reply_rfc822(&parts).unwrap();
         let s = String::from_utf8(raw).unwrap();
@@ -499,6 +551,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             body_html: None,
+            pixel_url: None,
         };
         assert!(matches!(
             build_reply_rfc822(&parts),
@@ -515,6 +568,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             body_html: Some("<div><strong>bold</strong> text</div>".into()),
+            pixel_url: None,
         };
         let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
         assert!(s.contains(
@@ -527,6 +581,137 @@ mod tests {
         assert!(s.contains("\r\n\r\n**bold** text\r\n"));
         assert!(s.contains("<strong>bold</strong>"));
         assert!(s.ends_with("--=_passband_alt_0--\r\n"));
+    }
+
+    /// A ReplyParts with everything optional off; tests set what they exercise.
+    fn bare_parts(body: &str) -> ReplyParts {
+        ReplyParts {
+            to: "alice@example.com".into(),
+            subject: "hi".into(),
+            body: body.into(),
+            in_reply_to: None,
+            references: None,
+            body_html: None,
+            pixel_url: None,
+        }
+    }
+
+    /// Split a built message into its top headers and `(part_headers,
+    /// part_body)` pairs, using the boundary the message itself declares.
+    fn parse_multipart(s: &str) -> (String, Vec<(String, String)>) {
+        let (headers, body) = s.split_once("\r\n\r\n").unwrap();
+        let ct = headers
+            .lines()
+            .find(|l| l.starts_with("Content-Type: multipart/alternative"))
+            .expect("multipart content-type");
+        let boundary = ct
+            .split("boundary=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let body = body
+            .strip_suffix(&format!("--{boundary}--\r\n"))
+            .expect("closing delimiter");
+        let parts = body
+            .split(&format!("--{boundary}\r\n"))
+            .skip(1)
+            .map(|chunk| {
+                let (ph, pb) = chunk.split_once("\r\n\r\n").unwrap();
+                (ph.to_string(), pb.strip_suffix("\r\n").unwrap().to_string())
+            })
+            .collect();
+        (headers.to_string(), parts)
+    }
+
+    #[test]
+    fn no_html_and_no_pixel_stays_text_plain() {
+        let s = String::from_utf8(build_reply_rfc822(&bare_parts("x")).unwrap()).unwrap();
+        assert!(s.contains("Content-Type: text/plain; charset=\"UTF-8\"\r\n"));
+        assert!(!s.contains("multipart/alternative"));
+        assert!(!s.contains("<html>"));
+    }
+
+    #[test]
+    fn pixel_alone_forces_multipart_and_rides_the_html_part_only() {
+        let mut parts = bare_parts("hello\nthere");
+        parts.pixel_url = Some("https://p.passband.app/o/abc123.gif".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        let (_headers, mime) = parse_multipart(&s);
+        assert_eq!(mime.len(), 2);
+        let (plain_h, plain_b) = &mime[0];
+        let (html_h, html_b) = &mime[1];
+        assert!(plain_h.contains("Content-Type: text/plain; charset=\"UTF-8\""));
+        assert!(html_h.contains("Content-Type: text/html; charset=\"UTF-8\""));
+        // The plain part is byte-for-byte what the text/plain-only build emits.
+        assert_eq!(plain_b, "hello\r\nthere");
+        assert!(!plain_b.contains("img"));
+        assert!(html_b.contains(
+            "<img src=\"https://p.passband.app/o/abc123.gif\" width=\"1\" height=\"1\" alt=\"\">"
+        ));
+        // The pixel is the last thing in the document, inside <body>.
+        let img = html_b.find("<img ").unwrap();
+        assert!(img < html_b.find("</body>").unwrap());
+        assert!(html_b.starts_with("<html><body>"));
+    }
+
+    #[test]
+    fn no_pixel_url_means_no_img() {
+        let mut parts = bare_parts("x");
+        parts.body_html = Some("<div>x</div>".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("<img"));
+    }
+
+    #[test]
+    fn pixel_rides_beside_rendered_html_without_replacing_it() {
+        let mut parts = bare_parts("**bold**");
+        parts.body_html = Some("<div><strong>bold</strong></div>".into());
+        parts.pixel_url = Some("https://p.passband.app/o/z.gif".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        let (_h, mime) = parse_multipart(&s);
+        let html_b = &mime[1].1;
+        assert!(html_b.contains("<strong>bold</strong>"));
+        assert!(html_b.contains("<img src=\"https://p.passband.app/o/z.gif\""));
+        // The raw markdown source is untouched in the plain part.
+        assert_eq!(mime[0].1, "**bold**");
+    }
+
+    #[test]
+    fn generated_html_escapes_and_renders_paragraphs() {
+        let mut parts = bare_parts("a <b> & \"c\"\nsecond line\n\nnew para");
+        parts.pixel_url = Some("https://p.passband.app/o/z.gif".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        let (_h, mime) = parse_multipart(&s);
+        let html_b = &mime[1].1;
+        assert!(html_b.contains("<p>a &lt;b&gt; &amp; &quot;c&quot;<br>second line</p>"));
+        assert!(html_b.contains("<p>new para</p>"));
+        assert!(!html_b.contains("<b>"));
+        // The plain part keeps the characters as typed.
+        assert!(mime[0].1.contains("a <b> & \"c\""));
+    }
+
+    #[test]
+    fn pixel_url_is_attribute_escaped() {
+        let mut parts = bare_parts("x");
+        parts.pixel_url = Some("https://p.x/o/a?b=1&c=2\"><script>alert(1)</script>".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("<script>"));
+        assert!(s.contains("a?b=1&amp;c=2&quot;&gt;&lt;script&gt;"));
+    }
+
+    #[test]
+    fn boundary_never_appears_inside_a_part() {
+        let mut parts = bare_parts("look: =_passband_alt_0 and =_passband_alt_1");
+        parts.pixel_url = Some("https://p.passband.app/o/z.gif".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("boundary=\"=_passband_alt_2\""));
+        let (_h, mime) = parse_multipart(&s);
+        assert_eq!(mime.len(), 2);
+        for (_ph, pb) in &mime {
+            assert!(!pb.contains("=_passband_alt_2"));
+        }
     }
 
     #[test]
@@ -548,6 +733,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             body_html: Some("<p>x</p>".into()),
+            pixel_url: None,
         };
         assert!(matches!(
             build_reply_rfc822(&parts),
@@ -564,6 +750,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             body_html: None,
+            pixel_url: None,
         };
         assert!(matches!(
             build_reply_rfc822(&parts),

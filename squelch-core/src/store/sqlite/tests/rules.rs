@@ -132,6 +132,45 @@ fn update_sender_rule_edits_by_id_and_404s_unknown() {
 }
 
 #[test]
+fn update_sender_rule_onto_an_existing_pattern_is_invalid_input_not_a_raw_sqlite_error() {
+    // UNIQUE(account_id, match_pattern): retargeting rule A onto rule B's
+    // pattern is a user mistake. It must surface as InvalidInput (a 4xx the
+    // client can render), never as a raw sqlite error the API collapses to 500.
+    let (store, acct) = store();
+    let a = store
+        .set_sender_rule(acct, "*@a.com", "want a", Disposition::Squelch)
+        .unwrap();
+    store
+        .set_sender_rule(acct, "*@b.com", "want b", Disposition::Squelch)
+        .unwrap();
+
+    let e = store
+        .update_sender_rule(acct, a, "*@b.com", "want a", Disposition::Squelch)
+        .unwrap_err();
+    match &e {
+        CoreError::InvalidInput(m) => assert!(m.contains("already exists"), "message: {m}"),
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    // Nothing moved: both rules keep their patterns.
+    let mut pats: Vec<String> = store
+        .list_sender_rules(acct)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.match_pattern)
+        .collect();
+    pats.sort();
+    assert_eq!(pats, vec!["*@a.com".to_string(), "*@b.com".to_string()]);
+
+    // A rule updated onto its OWN pattern is not a collision.
+    assert!(
+        store
+            .update_sender_rule(acct, a, "*@a.com", "want a2", Disposition::Surface)
+            .unwrap()
+    );
+}
+
+#[test]
 fn set_sender_rule_audited_writes_both_rows() {
     let (store, acct) = store();
     let audit = NewAuditEntry {

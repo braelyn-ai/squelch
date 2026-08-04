@@ -111,10 +111,16 @@ final class ThreadPrefetch {
             for message in view.messages {
                 guard let html = message.html, !html.isEmpty else { continue }
                 let seenEarlier = map[message.id] ?? []
-                let key = EmailWebView.Prepared.cacheKey(html, seenEarlier)
+                // The tracker policy is part of the prepared identity, so the
+                // warmer must key on the SAME one the card will render under or
+                // every known-sender body misses and re-scans on the main path.
+                let allow = message.allowsTrackers
+                let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, allow)
                 guard PreparedBodies.shared.get(key) == nil else { continue }
                 PreparedBodies.shared.set(
-                    key, EmailWebView.Prepared.make(from: html, seenEarlier: seenEarlier))
+                    key,
+                    EmailWebView.Prepared.make(
+                        from: html, seenEarlier: seenEarlier, allowTrackers: allow))
             }
             await MainActor.run { ThreadPrefetch.shared.noteRepeated(threadId, map) }
         }
@@ -133,8 +139,10 @@ final class ThreadPrefetch {
     /// not the newest-first order the reader sees — display order would suppress
     /// the copy in the message that introduced the image.
     ///
-    /// Scans TRACKER-STRIPPED html: letting a pixel register as a "first
-    /// occurrence" could suppress a real image sharing its src. `nonisolated`
+    /// Scans TRACKER-STRIPPED html UNCONDITIONALLY, known sender or not: letting
+    /// a pixel register as a "first occurrence" could suppress a real image
+    /// sharing its src, and a per-message open is exactly what an allowed
+    /// tracker is for — deduping one away would under-report it. `nonisolated`
     /// because the warmer runs it off the main actor and the cold path on it.
     nonisolated static func repeatedImages(in view: ClientThreadView) -> [Int: Set<String>] {
         var seen = Set<String>()

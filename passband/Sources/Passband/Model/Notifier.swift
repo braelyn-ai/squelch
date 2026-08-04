@@ -58,6 +58,25 @@ final class Notifier {
         let sender = flatten(SenderID.displayName(event.sender), max: 64)
         let summary = flatten(event.one_line, max: 240)
         let due = Fmt.deadlineChip(event.deadline, now: now)?.text ?? ""
+        // Coalescing key: events on one thread stack into ONE group. The
+        // fallback must be unique, or an empty thread id would glue unrelated
+        // mail together.
+        let group =
+            event.thread_id.isEmpty ? "passband.event.\(event.id)" : event.thread_id
+
+        // A read receipt on the user's OWN tracked mail, and NOT a triage
+        // verdict: `sender` is the account's own address (using it as the title
+        // would read as mail from yourself), `one_line` is the sent subject, and
+        // `importance` is a placeholder. It renders on its own terms.
+        if event.kind == .opened {
+            return Copy(
+                title: "Opened",
+                subtitle: "",
+                body: summary.isEmpty ? "Someone opened your email." : "Opened: \(summary)",
+                threadIdentifier: group,
+                // News, not an obligation — no chime.
+                sound: false)
+        }
 
         let subtitle: String
         switch event.kind {
@@ -66,8 +85,9 @@ final class Notifier {
         case .urgent: subtitle = due.isEmpty ? "needs attention" : due
         case .deadline: subtitle = due
         // No second line for the ordinary case: a subtitle on every
-        // notification is a subtitle that means nothing.
-        case .surfaced: subtitle = ""
+        // notification is a subtitle that means nothing. `.opened` returned
+        // above and is listed only to keep this switch exhaustive.
+        case .surfaced, .opened: subtitle = ""
         }
 
         return Copy(
@@ -76,11 +96,7 @@ final class Notifier {
             // An empty one_line means triage stored no summary; say something
             // true rather than posting a blank banner.
             body: summary.isEmpty ? "New mail worth your attention." : summary,
-            // Coalescing key: events on one thread stack into ONE group. The
-            // fallback must be unique, or an empty thread id would glue
-            // unrelated mail together.
-            threadIdentifier: event.thread_id.isEmpty
-                ? "passband.event.\(event.id)" : event.thread_id,
+            threadIdentifier: group,
             // Sound only for the time-bound kinds — a chime per surfaced email
             // is how a notification stream gets muted wholesale.
             sound: event.kind != .surfaced)

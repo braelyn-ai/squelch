@@ -3,16 +3,34 @@
 use super::*;
 
 /// Validate a sender-rule write, on the path of every door. A FILTERED rule with
-/// an empty `want_text` is a contradiction ("filter everything except nothing"):
-/// Stage-2 would get no instruction to evaluate, so the rule would silently
-/// degrade while still reading as a rule in the UI.
+/// an empty `want_text` is a contradiction (there is no standing instruction to
+/// filter by): Stage-2 would get no instruction to evaluate, so the rule would
+/// silently degrade while still reading as a rule in the UI. The message is
+/// client-visible, so it stays polarity-blind: `want_text` may name what the
+/// owner wants OR what they do not care about.
 fn validate_sender_rule(want_text: &str, disposition: Disposition) -> Result<()> {
     if disposition == Disposition::Filtered && want_text.trim().is_empty() {
         return Err(CoreError::InvalidInput(
-            "a filtered rule requires a non-empty want_text (what SHOULD get through)".into(),
+            "a filtered rule needs a want_text saying what you do, or do not, want from this sender"
+                .into(),
         ));
     }
     Ok(())
+}
+
+/// Map a UNIQUE-constraint failure into a client-legible [`CoreError::InvalidInput`].
+/// `sender_rules` carries `UNIQUE(account_id, match_pattern)`, so editing one
+/// rule onto another's pattern is a user mistake, not a server fault: without
+/// this it surfaces as a raw sqlite error that squelch-api collapses to a 500.
+fn map_pattern_conflict(e: rusqlite::Error) -> CoreError {
+    match &e {
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            CoreError::InvalidInput("a rule for that pattern already exists".into())
+        }
+        _ => CoreError::from(e),
+    }
 }
 
 impl SqliteStore {
@@ -106,19 +124,24 @@ impl SqliteStore {
     ) -> Result<bool> {
         validate_sender_rule(want_text, disposition)?;
         let conn = self.lock()?;
-        let n = conn.execute(
-            "UPDATE sender_rules SET
+        // Retargeting this rule onto a pattern another rule already owns trips
+        // UNIQUE(account_id, match_pattern); map it to InvalidInput so the door
+        // returns a 4xx the user can act on instead of a 500.
+        let n = conn
+            .execute(
+                "UPDATE sender_rules SET
                  match_pattern = ?3, want_text = ?4, disposition = ?5, updated_at = ?6
              WHERE account_id = ?1 AND id = ?2",
-            params![
-                account_id,
-                id,
-                match_pattern,
-                want_text,
-                disposition.as_str(),
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
+                params![
+                    account_id,
+                    id,
+                    match_pattern,
+                    want_text,
+                    disposition.as_str(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(map_pattern_conflict)?;
         Ok(n > 0)
     }
 

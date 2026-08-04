@@ -90,6 +90,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 | Side panels (browse / search) | **done** | Conditional-mount so the modal context is never pinned |
 | Compose review ceremony | **done** | edit → review → guard verdict → explicit override |
 | Draft autosave + restore | **done** | Debounced `PUT /client/drafts` per composer slot, flushed on every exit, silent; `c` / ⌘N restores the new-message draft, `r` restores the reply's |
+| Read tracking | **done** (no desktop equivalent) | Per-send pixel toggle in both composers (edit phase; hidden when the daemon has no `[tracking] base_url`), stated again in review, Settings → Mail holds the persistent default; the reader marks a sent message "opened 2h ago", "(via proxy)" when the fetch was Gmail's image proxy |
 | Triage-fix palette (`v`) | **done** | Ranked, ambiguity shown not guessed |
 | ⌘K ask-your-inbox bar | **done** | BYOK agent loop w/ citations |
 | 2FA code modal | **done** | Auto-reveal, 30s countdown, copy pauses the timer |
@@ -175,7 +176,7 @@ exactly. Routes: `updates`, `thread/{id}`, `search`, `stats`, `usage`,
 (GET/POST/DELETE), `unsubscribe`, `unsubscribes`, `unsubscribes/resolution`,
 `sealed`, `sealed/{id}/reveal`, `updates/{id}/status`, `actions/{archive,label,send}`,
 `refresh`, `retriage`, `shredder` (GET/POST), `shredder/run`, `triage-feedback`
-(GET/POST).
+(GET/POST), `messages/{id}/opens`, `tracking-config` (GET/POST).
 
 Hardening carried over: 15s request timeout (30s for attachments), the token
 only ever in an `Authorization` header, and error messages that never echo the

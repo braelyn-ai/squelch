@@ -15,7 +15,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "36EC44445B0E4812B0AC7D65"
+               BlueprintIdentifier = "7F9441F4F38B8847FF4BC62A"
                BuildableName = "Passband.app"
                BlueprintName = "Passband"
                ReferencedContainer = "container:Passband.xcodeproj">
@@ -32,7 +32,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "36EC44445B0E4812B0AC7D65"
+            BlueprintIdentifier = "7F9441F4F38B8847FF4BC62A"
             BuildableName = "Passband.app"
             BlueprintName = "Passband"
             ReferencedContainer = "container:Passband.xcodeproj">
@@ -55,7 +55,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "36EC44445B0E4812B0AC7D65"
+            BlueprintIdentifier = "7F9441F4F38B8847FF4BC62A"
             BuildableName = "Passband.app"
             BlueprintName = "Passband"
             ReferencedContainer = "container:Passband.xcodeproj">
@@ -74,7 +74,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "36EC44445B0E4812B0AC7D65"
+            BlueprintIdentifier = "7F9441F4F38B8847FF4BC62A"
             BuildableName = "Passband.app"
             BlueprintName = "Passband"
             ReferencedContainer = "container:Passband.xcodeproj">

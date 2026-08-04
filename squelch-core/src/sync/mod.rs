@@ -18,8 +18,8 @@ use serde::Deserialize;
 use crate::config::{Config, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
-use crate::store::{Store, SyncState};
-use crate::sync::ingest::{RawFetched, ingest_with_rules};
+use crate::store::{ContactEntry, Store, SyncState};
+use crate::sync::ingest::{RawFetched, ingest_with_rules, is_robot_address};
 use crate::triage::events;
 use crate::triage::extract::{self, banking, marketing};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
@@ -39,6 +39,10 @@ const LABEL_SENT: &str = "SENT";
 
 /// The single `sync_state` row key for the REST engine's historyId cursor.
 const HISTORY_KEY: &str = "history";
+
+/// `sync_state` row key for the one-time Sent-contacts harvest's done flag
+/// (`last_uid >= 1` = complete; absent/0 = redo on next daemon start).
+const SENT_CONTACTS_KEY: &str = "sent_contacts";
 
 /// `wake_budget.thread_id` sentinel for the per-account-per-day Stage-2 budget.
 /// Gmail thread ids are hex, so no real thread can collide with it.
@@ -570,6 +574,109 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
         let history_id = self.fetch_profile_history_id().await?;
         self.store_history_cursor(history_id)?;
+        Ok(())
+    }
+
+    // ---- Sent-contacts harvest --------------------------------------------
+
+    /// ONE-TIME sweep of the ENTIRE Sent mailbox — no window — seeding the
+    /// contacts table from every To/Cc the account has ever written to.
+    /// `format=metadata` with only To/Cc requested: headers, never bodies, so
+    /// deep history costs one light call per sent message. Merged with MAX
+    /// semantics ([`Store::merge_harvested_contacts`]) so overlap with the
+    /// ingest path's own seeding and an interrupted re-run cannot double-count.
+    ///
+    /// Completion is a `sync_state` flag (`mailbox = 'sent_contacts'`); an
+    /// interrupted pass leaves it unset and the next daemon start redoes the
+    /// sweep from scratch — idempotent, just re-paged.
+    pub async fn harvest_sent_contacts(&self) -> Result<()> {
+        let done = self
+            .store
+            .sync_state(self.account_id, SENT_CONTACTS_KEY)?
+            .map(|s| s.last_uid >= 1)
+            .unwrap_or(false);
+        if done {
+            return Ok(());
+        }
+
+        let ids = self.list_message_ids(LABEL_SENT, None).await?;
+        eprintln!(
+            "squelch: sent-contacts harvest scanning {} sent messages (headers only)",
+            ids.len()
+        );
+
+        let self_addr = self.account_email.trim().to_ascii_lowercase();
+        // addr -> aggregate. Counting per message occurrence matches the ingest
+        // path's per-send bump closely enough for ranking.
+        let mut agg: std::collections::HashMap<String, ContactEntry> =
+            std::collections::HashMap::new();
+        for (i, id) in ids.iter().enumerate() {
+            let url = format!(
+                "{GMAIL_API_BASE}/messages/{id}?format=metadata\
+                 &metadataHeaders=To&metadataHeaders=Cc"
+            );
+            let msg: GmailMessage = self.get_json(&url).await?;
+            let sent_at = parse_internal_date(msg.internal_date.as_deref());
+            let headers = msg.payload.map(|p| p.headers).unwrap_or_default();
+            // Through mail-parser via header synthesis, so grouped lists, quoted
+            // display names and RFC2047 encoding parse exactly as ingest does.
+            let blob = synthesize_rfc822_headers(&headers);
+            let Some(parsed) = mail_parser::MessageParser::default().parse(blob.as_bytes())
+            else {
+                continue;
+            };
+            for list in [parsed.to(), parsed.cc()].into_iter().flatten() {
+                for mailbox in list.iter() {
+                    let Some(addr) = mailbox.address() else { continue };
+                    let addr = addr.trim().to_ascii_lowercase();
+                    // Same gate as ingest seeding: never the account itself,
+                    // never robot/unsubscribe traffic.
+                    if addr.is_empty() || addr == self_addr || is_robot_address(&addr) {
+                        continue;
+                    }
+                    let name = mailbox
+                        .name()
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty());
+                    let entry = agg.entry(addr.clone()).or_insert_with(|| ContactEntry {
+                        addr,
+                        display_name: None,
+                        sent_count: 0,
+                        last_sent_at: None,
+                    });
+                    entry.sent_count += 1;
+                    if entry.display_name.is_none() {
+                        entry.display_name = name;
+                    }
+                    if sent_at > entry.last_sent_at {
+                        entry.last_sent_at = sent_at;
+                    }
+                }
+            }
+            if (i + 1) % 1000 == 0 {
+                eprintln!(
+                    "squelch: sent-contacts harvest {}/{} messages scanned",
+                    i + 1,
+                    ids.len()
+                );
+            }
+        }
+
+        let batch: Vec<ContactEntry> = agg.into_values().collect();
+        self.store
+            .merge_harvested_contacts(self.account_id, &batch)?;
+        self.store.set_sync_state(
+            self.account_id,
+            SENT_CONTACTS_KEY,
+            &SyncState {
+                uidvalidity: 1,
+                last_uid: 1,
+            },
+        )?;
+        eprintln!(
+            "squelch: sent-contacts harvest complete — {} unique recipients",
+            batch.len()
+        );
         Ok(())
     }
 
@@ -1595,10 +1702,10 @@ pub fn parse_internal_date(s: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_millis(ms)
 }
 
-/// Rebuild a header-only RFC822 blob from Gmail metadata headers so the
-/// mail-parser ingest path runs over it unchanged; the trailing blank line ends
-/// the header section (empty body). Test-only, for the contacts-seeding tests.
-#[cfg(test)]
+/// Rebuild a header-only RFC822 blob from Gmail metadata headers so mail-parser
+/// runs over it unchanged; the trailing blank line ends the header section
+/// (empty body). Used by the Sent-contacts harvest (`format=metadata` carries
+/// headers only) and the contacts-seeding tests.
 fn synthesize_rfc822_headers(headers: &[MessageHeader]) -> String {
     let mut out = String::new();
     for h in headers {

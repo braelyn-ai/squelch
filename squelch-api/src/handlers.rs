@@ -23,6 +23,7 @@ use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::types::{
     AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::ApiError;
@@ -318,6 +319,30 @@ pub async fn triage_debug(
 
 // --- GET /client/thread/{thread_id} -----------------------------------------
 
+/// One message of the served thread: the store's [`ClientMessage`] verbatim,
+/// flattened, plus the read-time known-sender bit. Flattened rather than nested
+/// so every field a client already decodes keeps its place on the wire.
+#[derive(Debug, Serialize)]
+struct ThreadMessageView {
+    #[serde(flatten)]
+    message: squelch_core::types::ClientMessage,
+    /// `true` when this message's `from_addr` is a Sent-derived contact — the
+    /// SAME `Store::is_known_contact` signal triage trusts, not a parallel
+    /// notion. The reader uses it to decide whether to strip tracking pixels:
+    /// somebody the user writes to is allowed to learn the mail was opened.
+    /// Computed per request, so a newly-written-to sender takes effect on the
+    /// next open with no re-ingest.
+    sender_known: bool,
+}
+
+/// `ClientThreadView` on the wire, message-for-message, with the extra bit.
+#[derive(Debug, Serialize)]
+struct ThreadResponse {
+    thread_id: String,
+    subject: String,
+    messages: Vec<ThreadMessageView>,
+}
+
 pub async fn get_thread(
     State(state): State<ApiState>,
     Path(thread_id): Path<String>,
@@ -325,7 +350,31 @@ pub async fn get_thread(
     // Sealed and nonexistent threads are the SAME NotFound. Each message carries
     // its server-sanitized `html`, null for plain-text-only mail.
     query(&state, move |store, account_id| {
-        store.thread_view_with_html(account_id, &thread_id)
+        let view = store.thread_view_with_html(account_id, &thread_id)?;
+        // Memoized per distinct sender: a thread is usually two addresses
+        // repeated, and each miss is a round trip to `contacts`. NOCASE is the
+        // column's own collation, so the key is lowercased to match.
+        let mut seen: HashMap<String, bool> = HashMap::new();
+        let mut messages = Vec::with_capacity(view.messages.len());
+        for message in view.messages {
+            let sender_known = match seen.get(&message.from_addr.to_ascii_lowercase()) {
+                Some(known) => *known,
+                None => {
+                    let known = store.is_known_contact(account_id, &message.from_addr)?;
+                    seen.insert(message.from_addr.to_ascii_lowercase(), known);
+                    known
+                }
+            };
+            messages.push(ThreadMessageView {
+                message,
+                sender_known,
+            });
+        }
+        Ok(ThreadResponse {
+            thread_id: view.thread_id,
+            subject: view.subject,
+            messages,
+        })
     })
     .await
 }
@@ -804,6 +853,54 @@ pub async fn list_drafts(
 ) -> Result<impl IntoResponse, ApiError> {
     let drafts = store_call(&state, |store, account_id| store.list_drafts(account_id)).await?;
     let items: Vec<DraftView> = drafts.into_iter().map(DraftView::from).collect();
+    Ok((no_store(), Json(items)))
+}
+
+// --- GET /client/contacts ---------------------------------------------------
+//
+// Recipient autocomplete over the Sent-derived contacts table. HUMAN DOOR ONLY:
+// who the user writes to is exactly the kind of graph the agent door must never
+// see, so no `/mcp` surface touches this table.
+
+#[derive(Debug, Deserialize)]
+pub struct ContactsQuery {
+    q: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContactView {
+    addr: String,
+    display_name: Option<String>,
+    sent_count: i64,
+    last_sent_at: Option<String>,
+}
+
+pub async fn get_contacts(
+    State(state): State<ApiState>,
+    Query(params): Query<ContactsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let q = params.q.trim().to_string();
+    if q.is_empty() {
+        return Ok((no_store(), Json(Vec::<ContactView>::new())));
+    }
+    // Suggestion-menu sized by default; capped so no caller turns this into a
+    // contacts dump endpoint.
+    let limit = params.limit.unwrap_or(8).min(25);
+    let hits = store_call(&state, move |store, account_id| {
+        store.search_contacts(account_id, &q, limit)
+    })
+    .await?;
+    let items: Vec<ContactView> = hits
+        .into_iter()
+        .map(|c| ContactView {
+            addr: c.addr,
+            display_name: c.display_name,
+            sent_count: c.sent_count,
+            last_sent_at: c.last_sent_at.map(|d| d.to_rfc3339()),
+        })
+        .collect();
     Ok((no_store(), Json(items)))
 }
 
@@ -1614,6 +1711,13 @@ pub struct SendBody {
     /// recoverable.
     #[serde(default)]
     draft_id: Option<i64>,
+    /// Ask for a read-tracking pixel on this send. Absent is `false`, so every
+    /// existing caller stays untracked. Honored ONLY when `[tracking] base_url`
+    /// is configured; without it the send goes out untracked rather than failing
+    /// — the client learns tracking is unavailable from
+    /// `GET /client/tracking-config`, not from a refused send.
+    #[serde(default)]
+    include_tracker: Option<bool>,
 }
 
 /// ECHO the just-sent message into the local store so the thread view shows the
@@ -1733,6 +1837,64 @@ async fn discard_sent_draft(state: &ApiState, draft_id: i64) {
     }
 }
 
+/// Mint and persist this send's read-tracking token, returning
+/// `(token, pixel_url)`.
+///
+/// `None` covers every reason a send goes out untracked: the client did not ask,
+/// no `[tracking] base_url` is configured, or the tracker row would not persist.
+/// THE ROW COMES FIRST BY DESIGN — a pixel whose token is not in
+/// `send_trackers` records nothing, so it must never reach the wire.
+///
+/// AUDIT: action `send.tracker`, detail `minted` | `failed:entropy` |
+/// `failed:store`. The token itself is never audited and never logged.
+async fn mint_tracker(
+    state: &ApiState,
+    requested: bool,
+    target: Option<String>,
+) -> Option<(String, String)> {
+    if !requested {
+        return None;
+    }
+    let base = state.tracking_base_url()?;
+    let token = match squelch_core::tracking::mint_token() {
+        Ok(t) => t,
+        Err(_) => {
+            audit_action(state, "send.tracker", target, "failed:entropy").await;
+            return None;
+        }
+    };
+    let created_at = Utc::now().timestamp();
+    let stored = token.clone();
+    if store_call(state, move |store, account_id| {
+        store.insert_send_tracker(account_id, &stored, None, created_at)
+    })
+    .await
+    .is_err()
+    {
+        audit_action(state, "send.tracker", target, "failed:store").await;
+        return None;
+    }
+    let pixel_url = format!("{base}/t/{token}");
+    audit_action(state, "send.tracker", target, "minted").await;
+    Some((token, pixel_url))
+}
+
+/// Point a send's tracker at the echoed local copy, which is what makes
+/// `GET /client/messages/{id}/opens` able to find it. BEST-EFFORT: the mail is
+/// away and the pixel already works, so a failure only leaves opens recorded
+/// against a tracker no message names yet.
+async fn link_tracker(state: &ApiState, token: &str, message_id: i64) {
+    let token = token.to_string();
+    if store_call(state, move |store, account_id| {
+        store.set_send_tracker_message(account_id, &token, message_id)
+    })
+    .await
+    .is_err()
+    {
+        eprintln!("squelch-api: sent message {message_id} was not linked to its tracker");
+    }
+}
+
 pub async fn action_send(
     State(state): State<ApiState>,
     Json(body): Json<SendBody>,
@@ -1830,6 +1992,14 @@ pub async fn action_send(
         None => (None, None),
     };
 
+    // Last thing before composing, so every rejection above costs no token.
+    let tracker = mint_tracker(
+        &state,
+        body.include_tracker.unwrap_or(false),
+        target.clone(),
+    )
+    .await;
+
     let parts = ReplyParts {
         to,
         subject,
@@ -1840,6 +2010,7 @@ pub async fn action_send(
             Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
             _ => None,
         },
+        pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
     };
     let raw = match build_reply_rfc822(&parts) {
         Ok(r) => r,
@@ -1862,6 +2033,9 @@ pub async fn action_send(
             // The mail is away; everything below is bookkeeping that cannot fail
             // the request.
             let echo_message_id = echo_sent(&state, &client, target, &sent).await;
+            if let (Some((token, _)), Some(message_id)) = (&tracker, echo_message_id) {
+                link_tracker(&state, token, message_id).await;
+            }
             // A cold send falls back to the thread Gmail just created, so the
             // client can open it.
             let thread = thread_id.or(sent.thread_id);

@@ -189,6 +189,14 @@ enum Fmt {
         rendered(iso, "dt|") { $0.formatted(.dateTime.month(.abbreviated).day().hour().minute()) }
     }
 
+    /// Same, for a Date already in hand — read-tracking opens arrive as unix
+    /// seconds rather than the RFC3339 text the rest of the wire carries.
+    /// Uncached on purpose: a Date is not a stable cache key the way the
+    /// server's stamp string is.
+    static func dateTime(_ then: Date) -> String {
+        then.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+    }
+
     /// Time-of-day like "3:00 PM" (calendar rail).
     static func timeOfDay(_ iso: String?) -> String {
         rendered(iso, "t|") { $0.formatted(.dateTime.hour().minute()) }

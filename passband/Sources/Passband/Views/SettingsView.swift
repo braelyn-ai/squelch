@@ -26,6 +26,7 @@ struct SettingsView: View {
                             YouSection()
                         case .mail:
                             MailSection()
+                            ReadTrackingSection()
                         case .triage:
                             TriagePipelineSection()
                             TriageBudgetSection()
@@ -409,6 +410,64 @@ private struct MailSection: View {
             }
             SettingsHint(
                 "Tracking pixels are removed either way, and images load with no referrer.")
+        }
+    }
+}
+
+/// Whether new composers start with the read-tracking pixel armed. The switch
+/// is a DEFAULT, not a policy: the daemon never applies it — every send states
+/// its own `include_tracker`, and each composer can still flip it.
+///
+/// The whole card is replaced by an explainer when the daemon has no tracking
+/// base_url, because there the answer is "no" whatever this says.
+private struct ReadTrackingSection: View {
+    @Environment(AppStore.self) private var store
+    @State private var busy = false
+    @State private var error: String?
+
+    var body: some View {
+        SectionCard(label: "Read tracking") {
+            if store.trackingAvailable {
+                InlineRow(key: "track by default") {
+                    Toggle(
+                        "track by default",
+                        isOn: Binding(
+                            get: { store.tracking?.default_enabled ?? false },
+                            set: { save($0) })
+                    )
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .tint(Palette.accent)
+                    .disabled(busy)
+                }
+                SettingsHint(
+                    "Puts an invisible 1×1 image in mail you send, so the reader shows when it was opened. It is a weak signal, not proof of reading: Gmail fetches images through its own proxy and can load the pixel before anybody looks at the message — those opens are labelled \"via proxy\"."
+                )
+            } else {
+                SettingsHint(
+                    "Not configured. The daemon needs a publicly reachable address to serve the pixel from — set `[tracking] base_url` (or SQUELCH_TRACK_URL) and restart squelchd. Until then every send goes out untracked."
+                )
+            }
+            if let error {
+                Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
+            }
+        }
+        .task { await store.refreshTrackingConfig() }
+    }
+
+    /// Fire-and-wait rather than optimistic: the toggle renders the STORED
+    /// answer, so a failed write must leave it where the daemon still has it.
+    private func save(_ enabled: Bool) {
+        guard !busy else { return }
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await store.setTrackingDefault(enabled)
+            } catch {
+                self.error = errText(error, "could not save")
+            }
+            busy = false
         }
     }
 }

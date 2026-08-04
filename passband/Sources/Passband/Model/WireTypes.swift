@@ -67,11 +67,11 @@ enum Disposition: String, LenientRawEnum, CaseIterable {
     case surface, squelch, filtered
     static var unknownFallback: Disposition { .squelch }
 
-    /// User-facing label. `squelch` is the daemon's wire value, not a UI verb —
-    /// the chip reads "mute" while the wire value stays `squelch`.
+    /// User-facing label. The wire values are the daemon's, not UI verbs — the
+    /// chips read allow/mute/filter while `surface`/`squelch` stay on the wire.
     var label: String {
         switch self {
-        case .surface: "surface"
+        case .surface: "allow"
         case .squelch: "mute"
         case .filtered: "filter"
         }
@@ -79,9 +79,9 @@ enum Disposition: String, LenientRawEnum, CaseIterable {
 
     var hint: String {
         switch self {
-        case .surface: "always surface — never mute this sender"
-        case .squelch: "mute — keep out of the sitrep unless it escalates"
-        case .filtered: "filter — drop before triage entirely"
+        case .surface: "allow: always surface this sender, never mute them"
+        case .squelch: "mute: keep out of the sitrep unless it escalates"
+        case .filtered: "filter: a plain english line decides what gets through, in either direction"
         }
     }
 }
@@ -102,6 +102,11 @@ enum EventKind: String, LenientRawEnum {
     case deadline
     /// Importance landed at or above the notify threshold.
     case surfaced
+    /// Somebody opened the user's OWN tracked outbound mail. Not a triage
+    /// verdict at all: `sender` is the account's own address, `one_line` is the
+    /// sent subject, and `importance` is a fixed placeholder rather than a
+    /// score. One per message ever, however many times it is reopened.
+    case opened
     /// An unheard-of kind still earns a banner; it only loses urgent styling.
     static var unknownFallback: EventKind { .surfaced }
 }
@@ -199,8 +204,18 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     /// must not keep glowing.
     var attention_open: Bool?
     var one_line: String?
+    /// True when `from_addr` is somebody the user has sent mail to (the daemon's
+    /// Sent-derived contacts, computed per request). ABSENT on a pre-tracking
+    /// daemon, which reads as unknown — the strict side. Governs the reader's
+    /// tracker strip: see `allowsTrackers`.
+    var sender_known: Bool?
 
     var attachmentList: [Attachment] { attachments ?? [] }
+
+    /// Whether this message's tracking pixels may load. Trusted people are
+    /// allowed to learn their mail was opened; everyone else is stripped as
+    /// before. `nil` (old daemon) is NOT allowed — the default stays private.
+    var allowsTrackers: Bool { sender_known ?? false }
 
     /// The highlight predicate: an UNRESOLVED row in a standing tier. Same
     /// definition as the list's for-your-eyes band, so reader and list agree
@@ -633,6 +648,62 @@ struct SendBody: Codable, Sendable {
     var override_guard: Bool?
     /// Server-side draft to delete once the send succeeds.
     var draft_id: Int?
+    /// Mint a read-tracking pixel for this send. OMITTED when false, the same
+    /// way `subject` is: absent reads as false server-side. `true` on a daemon
+    /// with no tracking base_url is NOT an error — the mail goes out untracked.
+    var include_tracker: Bool?
+}
+
+// MARK: - read tracking
+
+/// GET /client/messages/{id}/opens — one recorded fetch of a sent message's
+/// pixel. `{id}` is the LOCAL message id, i.e. the `echo_message_id` a send
+/// handed back; an untracked or unknown id answers with an empty list, so
+/// asking about somebody else's message is a legal question with a dull answer.
+struct MessageOpen: Codable, Sendable, Hashable {
+    /// Unix SECONDS — the one stamp on this wire that is not RFC3339 text.
+    var opened_at: Int
+    var user_agent: String?
+    /// "proxied" or "unknown". Kept as a String because the daemon's set is
+    /// open-ended: an unrecognised value must read as the weaker claim rather
+    /// than be collapsed onto the stronger one.
+    var classification: String
+
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(opened_at)) }
+
+    /// The fetch came from Gmail's image proxy, which may be warming a cache
+    /// rather than showing a human the mail. The copy says so.
+    var viaProxy: Bool { classification == "proxied" }
+}
+
+struct MessageOpensResult: Codable, Sendable {
+    var opens: [MessageOpen]
+}
+
+/// GET/POST /client/tracking-config. `configured` false means the daemon has
+/// nowhere to point a pixel, so every send goes out untracked whatever the
+/// client asks — hide the affordance rather than offer a dead switch.
+/// `default_enabled` is remembered CLIENT preference: the daemon never reads it
+/// when sending, every send states its own `include_tracker`.
+struct TrackingConfig: Codable, Sendable, Hashable {
+    var default_enabled: Bool
+    var configured: Bool
+}
+
+/// POST /client/tracking-config. An omitted field leaves the stored value alone.
+struct TrackingConfigBody: Codable, Sendable {
+    var default_enabled: Bool?
+}
+
+/// GET /client/contacts — one recipient-autocomplete hit, ranked server-side
+/// (prefix > substring, then frequency and recency).
+struct ContactHit: Codable, Sendable, Equatable, Identifiable {
+    var addr: String
+    var display_name: String?
+    var sent_count: Int
+    var last_sent_at: String?
+
+    var id: String { addr }
 }
 
 struct StatusResult: Codable, Sendable {

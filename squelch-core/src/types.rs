@@ -434,6 +434,12 @@ str_enum! {
         Deadline => "deadline",
         /// Importance landed at or above the notify threshold (above the line).
         Surfaced => "surfaced",
+        /// The recipient of the user's OWN tracked outbound mail opened it. Not
+        /// produced by triage at all — it is written by
+        /// [`crate::tracking::OpensPoller`], so `sender` is the account's own
+        /// address, `one_line` is the sent message's subject, and `importance`
+        /// is a fixed placeholder rather than a score.
+        Opened => "opened",
     }
 }
 

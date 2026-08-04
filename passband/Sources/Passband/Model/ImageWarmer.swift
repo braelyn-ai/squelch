@@ -88,13 +88,18 @@ final class ImageWarmer {
     /// The warm cache's answer, or a fresh pass OFF the main actor: an
     /// already-prepared body costs one dictionary probe, and one that is not
     /// prepared is never scanned on the main thread.
+    ///
+    /// ALWAYS the STRIPPED preparation, even for a known sender whose pixels the
+    /// reader will keep: this runs before the mail is opened, and pre-fetching a
+    /// tracking pixel would report an open that never happened. The known-sender
+    /// body is prepared for real when the card renders it.
     private static func prepared(_ html: String, _ seenEarlier: Set<String>)
         async -> EmailWebView.Prepared
     {
-        let key = EmailWebView.Prepared.cacheKey(html, seenEarlier)
+        let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, false)
         if let warm = PreparedBodies.shared.get(key) { return warm }
         let made = await Task.detached(priority: .utility) {
-            EmailWebView.Prepared.make(from: html, seenEarlier: seenEarlier)
+            EmailWebView.Prepared.make(from: html, seenEarlier: seenEarlier, allowTrackers: false)
         }.value
         PreparedBodies.shared.set(key, made)
         return made

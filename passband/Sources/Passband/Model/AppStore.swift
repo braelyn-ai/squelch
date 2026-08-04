@@ -228,6 +228,10 @@ struct ComposeState: Sendable, Equatable {
     var guardKinds: [String] = []
     var sending = false
     var error: String?
+    /// Ask the daemon to mint a read-tracking pixel for this one send. Seeded
+    /// from the account's stored default when the composer opens, then owned by
+    /// the composer — the daemon applies no default of its own.
+    var includeTracker = false
 }
 
 /// The email currently being reclassified by the `v` palette.
@@ -334,6 +338,12 @@ final class AppStore {
     var authRings: [AuthRing] = []
     /// Newest-first queue of code-modal entries (only otp/verification).
     var authQueue: [AuthCodeEntry] = []
+
+    // MARK: read tracking
+    /// The daemon's tracking answer, fetched once on connect. nil = never
+    /// asked (or the daemon did not answer), which reads exactly like
+    /// unconfigured: no toggle anywhere, no receipts fetched.
+    var tracking: TrackingConfig?
 
     private init() {}
 
@@ -792,7 +802,11 @@ final class AppStore {
     }
 
     func openCompose(_ state: ComposeState) {
-        compose = state
+        var next = state
+        // Seeded HERE rather than by the caller, so every way into a composer
+        // starts at the account's default and none can forget to.
+        next.includeTracker = trackingDefault
+        compose = next
         DraftSaver.shared.noteOpened(.compose)
         Analytics.capture(
             "compose_opened",
@@ -846,7 +860,7 @@ final class AppStore {
     /// gets to throw away.
     func openInlineReply(replyTo messageId: Int) {
         guard inlineReply == nil else { return }
-        inlineReply = ComposeState(replyToMessageId: messageId)
+        inlineReply = ComposeState(replyToMessageId: messageId, includeTracker: trackingDefault)
         DraftSaver.shared.noteOpened(.inlineReply)
         // Both ways in (the reader's `r` and the list's hand-off) come through
         // here, so the restore is wired once.
@@ -871,6 +885,30 @@ final class AppStore {
     func closeInlineReply() {
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
+    }
+
+    // MARK: - read tracking
+
+    /// Whether a composer may offer the pixel at all. A daemon with no tracking
+    /// base_url ignores `include_tracker` on every send, so offering a switch
+    /// there would be offering a lie.
+    var trackingAvailable: Bool { tracking?.configured == true }
+
+    /// What a freshly-opened composer starts at. Unconfigured wins over the
+    /// stored preference — a default of "on" that cannot happen is still off.
+    var trackingDefault: Bool { trackingAvailable && tracking?.default_enabled == true }
+
+    /// Read the daemon's tracking answer. Silent on failure: `tracking` staying
+    /// nil means the feature simply is not offered this session, which is the
+    /// same thing an unconfigured daemon means.
+    func refreshTrackingConfig() async {
+        tracking = try? await APIClient.shared.getTrackingConfig()
+    }
+
+    /// Persist the default for future composers. The response is the daemon's
+    /// post-write view, so `configured` is refreshed alongside it.
+    func setTrackingDefault(_ enabled: Bool) async throws {
+        tracking = try await APIClient.shared.setTrackingDefault(enabled)
     }
 
     func openTriageFix(_ target: TriageFixTarget) { triageFix = target }

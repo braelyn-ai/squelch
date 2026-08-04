@@ -99,6 +99,9 @@ struct InlineReply: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 8)
+            // Edit phase only, same as the pane composer: review is for reading
+            // what is about to go out, not for changing it.
+            if !inReview { TrackerToggle(on: bindFlag(\.includeTracker)) }
             if compose.sending {
                 Text("sending…")
                     .font(Typo.micro)
@@ -132,6 +135,11 @@ struct InlineReply: View {
         VStack(alignment: .leading, spacing: 9) {
             ComposeSummaryRow("to", parent.from_addr)
             ComposeSummaryRow("subject", replySubject)
+            // Same as the pane composer: review states everything about to go
+            // out, and the pixel is the one part the body cannot show.
+            if compose.includeTracker && store.trackingAvailable {
+                ComposeSummaryRow("tracking", ComposeCopy.trackedSend)
+            }
 
             ScrollView {
                 // Same styling as the live editor, so review is the send's
@@ -231,6 +239,14 @@ struct InlineReply: View {
                 patch { $0[keyPath: keyPath] = value }
                 DraftSaver.shared.noteChange(.inlineReply)
             })
+    }
+
+    /// Same shape as `bind`, minus the autosave: a draft records what was
+    /// written, not how the next send is addressed.
+    private func bindFlag(_ keyPath: WritableKeyPath<ComposeState, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { store.inlineReply?[keyPath: keyPath] ?? false },
+            set: { value in patch { $0[keyPath: keyPath] = value } })
     }
 
     private func patch(_ mutate: (inout ComposeState) -> Void) {

@@ -220,6 +220,12 @@ actor APIClient {
             ])
     }
 
+    /// Recipient autocomplete over Sent-derived contacts (people the user has
+    /// actually written to). Ranked server-side; empty fragment returns [].
+    func contacts(_ q: String, limit: Int = 8) async throws -> [ContactHit] {
+        try await get("/client/contacts", query: ["q": q, "limit": String(limit)])
+    }
+
     func getStats() async throws -> StoreStats { try await get("/client/stats") }
 
     func getUsage(days: Int? = nil) async throws -> UsageResponse {
@@ -304,6 +310,14 @@ actor APIClient {
         try await post("/client/rules", body: body)
     }
 
+    /// Edit one rule IN PLACE. The body mirrors create's exactly (the route
+    /// decodes the same struct), so a pattern change is an update rather than a
+    /// second row. Another account's id and an unknown id are the same 404.
+    @discardableResult
+    func updateRule(_ id: Int, _ body: CreateRuleBody) async throws -> CreatedRule {
+        try await put("/client/rules/\(id)", body: body)
+    }
+
     func deleteRule(_ id: Int) async throws { try await deleteNoContent("/client/rules/\(id)") }
 
     // MARK: - unsubscribe
@@ -373,7 +387,7 @@ actor APIClient {
     @discardableResult
     func actionSend(
         body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
-        overrideGuard: Bool = false, draftId: Int? = nil
+        overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
@@ -382,7 +396,32 @@ actor APIClient {
                 // Both composers write markdown; the daemon renders the HTML
                 // half from this same source after the guard has scanned it.
                 body_format: "markdown",
-                confirm: true, override_guard: overrideGuard, draft_id: draftId))
+                confirm: true, override_guard: overrideGuard, draft_id: draftId,
+                // Omitted rather than `false`, like `subject`: an untracked send
+                // says nothing about tracking at all.
+                include_tracker: includeTracker ? true : nil))
+    }
+
+    // MARK: - read tracking
+
+    /// Every recorded open of one SENT message, oldest first. `messageId` is the
+    /// local id — the `echo_message_id` the send returned. Never a 404: an
+    /// untracked or unknown message is an empty list.
+    func messageOpens(_ messageId: Int) async throws -> [MessageOpen] {
+        let result: MessageOpensResult = try await get("/client/messages/\(messageId)/opens")
+        return result.opens
+    }
+
+    func getTrackingConfig() async throws -> TrackingConfig {
+        try await get("/client/tracking-config")
+    }
+
+    /// Persist the client's default. The daemon never reads it when sending —
+    /// it is remembered preference, and every send still states its own
+    /// `include_tracker`.
+    @discardableResult
+    func setTrackingDefault(_ enabled: Bool) async throws -> TrackingConfig {
+        try await post("/client/tracking-config", body: TrackingConfigBody(default_enabled: enabled))
     }
 
     // MARK: - drafts

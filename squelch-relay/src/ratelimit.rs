@@ -1,9 +1,13 @@
-//! Per-client-IP token bucket over `POST /v1/push`: in-memory, per-process
-//! abuse dampening, not a quota system — a restart forgives everyone.
+//! Per-client-IP token buckets over the routes that do work: in-memory,
+//! per-process abuse dampening, not a quota system — a restart forgives
+//! everyone.
 //!
 //! The client IP is the TCP peer address, so behind the expected TLS proxy the
 //! whole deployment shares one bucket. `X-Forwarded-For` is deliberately NOT
-//! trusted: caller-supplied, it would mint unlimited fresh identities.
+//! trusted: caller-supplied, it would mint unlimited fresh identities. That
+//! shared bucket is why the tracking pixel is metered against a SEPARATE
+//! limiter: mail clients fetching pixels are the whole internet, and on one
+//! limiter they would spend the daemon's push budget.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -17,8 +21,15 @@ use axum::{
     response::Response,
 };
 
+use crate::state::RelayState;
+
 /// Sustained rate, in requests per minute, per client IP.
 pub const REQUESTS_PER_MINUTE: f64 = 120.0;
+
+/// The same, for `GET /t/{token}`. Higher because every recipient's mail client
+/// arrives here — one send to a large list is a burst of legitimate fetches —
+/// and cheaper to serve: one bounded insert, no APNs round trip.
+pub const PIXEL_REQUESTS_PER_MINUTE: f64 = 600.0;
 
 /// Buckets idle longer than this are dropped on the next prune — two windows of
 /// slack, so a burst-then-pause client is not credited a full bucket early.
@@ -141,6 +152,25 @@ pub async fn limit(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    gate(&state, RelayState::check_rate, "push", req, next).await
+}
+
+/// Middleware: the same for `GET /t/{token}`, against its own buckets.
+pub async fn limit_pixel(
+    State(state): State<crate::state::RelayState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, RelayState::check_pixel_rate, "pixel", req, next).await
+}
+
+async fn gate(
+    state: &RelayState,
+    charge: fn(&RelayState, IpAddr) -> bool,
+    route: &'static str,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
     // `ConnectInfo` is absent when the router is driven directly as a `Service`
     // (tower `oneshot`); those callers share the unspecified address. Production
     // always serves with connect info attached.
@@ -148,11 +178,11 @@ pub async fn limit(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ConnectInfo(a)| a.ip());
-    if state.check_rate(ip) {
+    if charge(state, ip) {
         Ok(next.run(req).await)
     } else {
         // No client detail is logged beyond the fact that a limit was hit.
-        tracing::warn!("push rate limit exceeded");
+        tracing::warn!(route, "rate limit exceeded");
         Err(StatusCode::TOO_MANY_REQUESTS)
     }
 }

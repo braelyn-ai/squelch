@@ -89,6 +89,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "triage", "category", "TEXT")?;
     add_column_if_missing(conn, "triage", "extractor_model_used", "TEXT")?;
 
+    // Recipient-autocomplete columns. NULL is fine on old rows: the Sent
+    // harvest fills both for all of history, and ongoing seeding stamps
+    // last_sent_at from then on.
+    add_column_if_missing(conn, "contacts", "last_sent_at", "TEXT")?;
+    add_column_if_missing(conn, "contacts", "display_name", "TEXT")?;
+
     // Adding `stage1_model_used` leaves it NULL on every historical row — exactly
     // the Stage-1 queue predicate — so without this backfill the whole mailbox
     // re-classifies through the paid model. Rows already classified or already

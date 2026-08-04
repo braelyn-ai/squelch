@@ -10,6 +10,7 @@
 
 mod attention;
 mod audit;
+mod contacts;
 mod drafts;
 mod events;
 mod feedback;
@@ -18,6 +19,7 @@ mod migrate;
 mod rules;
 mod search;
 mod specialists;
+mod tracking;
 mod triage_stages;
 #[cfg(test)]
 mod tests;
@@ -33,10 +35,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{CoreError, Result};
 use crate::store::{
     TriageDebug,
-    AttachmentBytes, BankingApplied, ExtractQueued, MarketingApplied, MarketingOffer,
-    Device, Draft, MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
+    AttachmentBytes, BankingApplied, ContactEntry, ExtractQueued, MarketingApplied, MarketingOffer,
+    Device, Draft, MessageOpen, MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
     SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TriagedMessage,
+    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
+    TrackedMessage, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -582,6 +585,23 @@ impl Store for SqliteStore {
         self.is_known_contact(account_id, addr)
     }
 
+    fn search_contacts(
+        &self,
+        account_id: AccountId,
+        q: &str,
+        limit: u32,
+    ) -> Result<Vec<ContactEntry>> {
+        self.search_contacts(account_id, q, limit)
+    }
+
+    fn merge_harvested_contacts(
+        &self,
+        account_id: AccountId,
+        batch: &[ContactEntry],
+    ) -> Result<()> {
+        self.merge_harvested_contacts(account_id, batch)
+    }
+
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>> {
         self.sync_state(account_id, mailbox)
     }
@@ -901,6 +921,48 @@ impl Store for SqliteStore {
 
     fn stage2_cap_overrides(&self, account_id: AccountId) -> Result<Stage2CapOverrides> {
         self.stage2_cap_overrides(account_id)
+    }
+
+    fn insert_send_tracker(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        message_id: Option<i64>,
+        created_at: i64,
+    ) -> Result<()> {
+        self.insert_send_tracker(account_id, token, message_id, created_at)
+    }
+
+    fn set_send_tracker_message(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        message_id: i64,
+    ) -> Result<bool> {
+        self.set_send_tracker_message(account_id, token, message_id)
+    }
+
+    fn record_open(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        opened_at: i64,
+        user_agent: Option<&str>,
+        classification: &str,
+    ) -> Result<bool> {
+        self.record_open(account_id, token, opened_at, user_agent, classification)
+    }
+
+    fn message_opens(&self, account_id: AccountId, message_id: i64) -> Result<Vec<MessageOpen>> {
+        self.message_opens(account_id, message_id)
+    }
+
+    fn tracked_message(
+        &self,
+        account_id: AccountId,
+        token: &str,
+    ) -> Result<Option<TrackedMessage>> {
+        self.tracked_message(account_id, token)
     }
 
     fn count_inbound_since(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<u64> {

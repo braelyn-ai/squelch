@@ -78,6 +78,7 @@ mod tests {
             apns_env: Environment::Production,
             auth_token,
             apns_url_override: None,
+            db_path: None,
         })
         .unwrap();
         Router::new()

@@ -38,6 +38,10 @@ struct RootView: View {
                 // warms the head rows' threads, so the first click reads from
                 // cache too. The inbox only — the noise page is a place you go.
                 Task { await store.refreshMail(.inbox) }
+                // Whether this daemon can track opens at all. Needed before the
+                // first composer opens, and it decides whether the reader spends
+                // any requests looking for receipts.
+                Task { await store.refreshTrackingConfig() }
             } else {
                 SitrepPoller.shared.stop()
                 EventStream.shared.stop()

@@ -1,17 +1,17 @@
-//! `GET /healthz` and `POST /v1/push`.
+//! `GET /healthz`, `POST /v1/push`, `GET /t/{token}`, and `GET /v1/opens`.
 //!
 //! Each token's APNs status passes through VERBATIM — `410 Unregistered`
 //! especially, since the daemon owns dead-token cleanup. A malformed request
 //! 4xxs the whole batch; a failed token is data (`status: 0`), never a batch
 //! failure. PRIVACY: no token value, payload, bearer, or APNs JWT is logged.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use futures::stream::{self, StreamExt};
@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::config::Environment;
+use crate::opens::{MAX_USER_AGENT, Open};
 use crate::state::RelayState;
 
 /// An unbounded token list would let one call hold a connection open forever.
@@ -46,6 +47,21 @@ const BATCH_BUDGET: Duration = Duration::from_secs(30);
 /// cannot reach the user's daemon to fetch real content. It must say nothing.
 const ALERT_TITLE: &str = "squelch";
 const ALERT_BODY: &str = "New mail surfaced";
+
+/// Open-token bounds. The alphabet is URL-safe base64 without padding, so a
+/// token can neither reshape the path it arrives on nor smuggle anything into
+/// a log line an operator reads.
+const OPEN_TOKEN_MIN_LEN: usize = 16;
+const OPEN_TOKEN_MAX_LEN: usize = 64;
+
+/// A 1x1 fully transparent GIF89a: 42 bytes, rendered by every mail client and
+/// visible in none. Embedded rather than read from disk so the pixel route has
+/// no runtime failure mode at all.
+const PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x44, 0x00, 0x3B,
+];
 
 /// A handler error carrying an HTTP status and a client-safe message.
 #[derive(Debug)]
@@ -113,6 +129,109 @@ pub struct PushResponse {
 
 pub async fn healthz() -> &'static str {
     "ok"
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpensQuery {
+    #[serde(default)]
+    cursor: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpensResponse {
+    pub opens: Vec<Open>,
+}
+
+/// `GET /t/{token}` — the read-tracking pixel, fetched by mail clients this
+/// relay will never authenticate, so the route is PUBLIC.
+///
+/// The response is byte-identical for every token: valid, expired, unknown,
+/// malformed, or undecodable. A 404, a redirect, or a different body would make
+/// this route an oracle for which tokens exist.
+pub async fn pixel(
+    State(state): State<RelayState>,
+    token: Option<Path<String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(Path(token)) = token
+        && is_open_token(&token)
+    {
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .map(truncate_user_agent);
+        if let Err(e) = state
+            .opens()
+            .record(&token, now_unix(), user_agent.as_deref())
+        {
+            // PRIVACY: the token names a message to anyone holding the mapping,
+            // so it never reaches a log line — not here, not at any level. A
+            // buffer failure is also never visible to the fetching client.
+            tracing::warn!(error = %e, "failed to buffer an open");
+        }
+    }
+
+    (
+        [
+            (header::CONTENT_TYPE, "image/gif"),
+            // Caching would collapse repeat opens — the signal we exist to
+            // record — into a single fetch, and mail clients cache hard.
+            (header::CACHE_CONTROL, "no-store, no-cache"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        PIXEL_GIF,
+    )
+        .into_response()
+}
+
+/// `GET /v1/opens?cursor=N` — the daemon draining its buffered opens.
+///
+/// Presenting `cursor` ACKS everything at or below it: those rows are deleted
+/// before the read. The daemon therefore advances its cursor only once the rows
+/// are durably stored, and a crash mid-transfer replays rather than loses.
+pub async fn opens(
+    State(state): State<RelayState>,
+    Query(q): Query<OpensQuery>,
+) -> Result<Json<OpensResponse>, RelayError> {
+    // A negative cursor acks nothing rather than being an error the daemon has
+    // to handle mid-drain.
+    let cursor = q.cursor.unwrap_or(0).max(0);
+    let opens = state.opens().drain(cursor).map_err(|e| {
+        tracing::error!(error = %e, "open buffer read failed");
+        RelayError::new(StatusCode::INTERNAL_SERVER_ERROR, "open buffer unavailable")
+    })?;
+    // PRIVACY: a count and a cursor. Tokens are the response body, never the log.
+    tracing::info!(acked = cursor, returned = opens.len(), "opens");
+    Ok(Json(OpensResponse { opens }))
+}
+
+/// The token shape the daemon mints: URL-safe base64, 16..=64 characters.
+/// Anything else is served the pixel and dropped on the floor.
+fn is_open_token(token: &str) -> bool {
+    (OPEN_TOKEN_MIN_LEN..=OPEN_TOKEN_MAX_LEN).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// User agents are attacker-controlled and arrive as long as a header allows.
+fn truncate_user_agent(ua: &str) -> String {
+    if ua.len() <= MAX_USER_AGENT {
+        return ua.to_string();
+    }
+    let mut end = MAX_USER_AGENT;
+    while end > 0 && !ua.is_char_boundary(end) {
+        end -= 1;
+    }
+    ua[..end].to_string()
+}
+
+/// Seconds since the epoch. A clock before 1970 records as 0 rather than
+/// panicking a route that must always answer.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// A request that has passed validation.
@@ -390,6 +509,7 @@ mod tests {
             apns_env: Environment::Production,
             auth_token: None,
             apns_url_override: None,
+            db_path: None,
         };
         RelayState::new(config).unwrap()
     }
@@ -558,6 +678,53 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn accepts_only_url_safe_tokens_of_the_right_length() {
+        assert!(is_open_token(&"a".repeat(OPEN_TOKEN_MIN_LEN)));
+        assert!(is_open_token(&"a".repeat(OPEN_TOKEN_MAX_LEN)));
+        assert!(is_open_token("aaaaAAAA1111-_bb"));
+
+        assert!(!is_open_token(""));
+        assert!(!is_open_token(&"a".repeat(OPEN_TOKEN_MIN_LEN - 1)));
+        assert!(!is_open_token(&"a".repeat(OPEN_TOKEN_MAX_LEN + 1)));
+        // Nothing that could reshape a path, a query, or a log line.
+        for bad in [
+            "aaaaaaaaaaaaaaa/",
+            "aaaaaaaaaaaaaa..",
+            "aaaaaaaaaaaaaa%2",
+            "aaaaaaaaaaaaaa b",
+            "aaaaaaaaaaaaaa\nb",
+            "aaaaaaaaaaaaaaa'",
+        ] {
+            assert!(!is_open_token(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn truncates_a_long_user_agent_on_a_char_boundary() {
+        assert_eq!(truncate_user_agent("Mozilla/5.0"), "Mozilla/5.0");
+        let long = "a".repeat(MAX_USER_AGENT + 100);
+        assert_eq!(truncate_user_agent(&long).len(), MAX_USER_AGENT);
+        // A multi-byte character straddling the cut must not panic or split.
+        let wide = "é".repeat(MAX_USER_AGENT);
+        let cut = truncate_user_agent(&wide);
+        assert!(cut.len() <= MAX_USER_AGENT);
+        assert!(wide.starts_with(&cut));
+    }
+
+    /// The bytes are what every mail client renders; a typo here is a broken
+    /// image in someone's inbox.
+    #[test]
+    fn the_pixel_is_a_1x1_gif() {
+        assert_eq!(PIXEL_GIF.len(), 42);
+        assert_eq!(&PIXEL_GIF[..6], b"GIF89a");
+        // Width and height, little-endian.
+        assert_eq!(&PIXEL_GIF[6..10], &[0x01, 0x00, 0x01, 0x00]);
+        // Graphic control extension with the transparency flag set.
+        assert_eq!(&PIXEL_GIF[19..23], &[0x21, 0xF9, 0x04, 0x01]);
+        assert_eq!(*PIXEL_GIF.last().unwrap(), 0x3B);
     }
 
     #[test]

@@ -39,7 +39,10 @@ enum ComposeSubmit {
                 // nil, never "": the daemon reads Some("") as an explicit blank
                 // subject and would send the reply untitled.
                 subject: c.subject.isEmpty ? nil : c.subject,
-                overrideGuard: override, draftId: c.draftId)
+                overrideGuard: override, draftId: c.draftId,
+                // The composer's own switch, every time — the daemon's stored
+                // default is a client preference it never applies itself.
+                includeTracker: c.includeTracker)
             capture(c, override, "sent")
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
@@ -62,6 +65,7 @@ enum ComposeSubmit {
                 "kind": c.replyToMessageId == nil ? "new" : "reply",
                 "outcome": outcome,
                 "override": override,
+                "tracked": c.includeTracker,
             ])
     }
 }
@@ -74,6 +78,10 @@ enum ComposeSubmit {
 enum ComposeCopy {
     /// 403: the read credential cannot send.
     static let noWriteCredential = "no write credential — run `squelchd auth --write`"
+
+    /// The review pane's line for an armed read-tracking pixel — the one thing
+    /// about to go out that the body does not show.
+    static let trackedSend = "read receipt pixel attached"
 
     /// Stands in for a subject the daemon will derive but that is NOT in reach to
     /// show: the pane composer works off an update, which carries an LLM summary

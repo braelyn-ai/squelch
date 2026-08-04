@@ -1276,6 +1276,203 @@ async fn echo_of_an_empty_raw_read_never_ingests() {
     );
 }
 
+// --- read tracking on the send path -----------------------------------------
+
+/// A public base URL for the pixel; nothing is ever fetched from it in tests.
+const TRACK_BASE: &str = "https://track.example.test";
+
+/// [`app_with_writes`] plus a configured `[tracking] base_url`.
+fn app_with_tracking(
+    base: String,
+    track_base: Option<&str>,
+    seed: impl FnOnce(&SqliteStore, i64),
+) -> Harness {
+    let (state, store, acct) = common::state_with(seed);
+    let state = state
+        .with_write_test_harness(Arc::new(StubCreds), base)
+        .with_tracking_base_url(track_base.map(str::to_string));
+    Harness {
+        app: router(state),
+        store,
+        acct,
+    }
+}
+
+/// The RFC822 a captured `messages/send` request carried, decoded out of its
+/// `raw` field.
+fn sent_mime(req: &str) -> String {
+    use base64::Engine as _;
+    let start = req.find("\"raw\":\"").expect("send body carries raw") + 7;
+    let end = start + req[start..].find('"').expect("raw is terminated");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&req[start..end])
+        .expect("raw is base64url");
+    String::from_utf8(bytes).expect("mime is utf-8")
+}
+
+/// The token out of the one pixel URL in a built message.
+fn pixel_token(mime: &str) -> String {
+    let marker = format!("<img src=\"{TRACK_BASE}/t/");
+    let start = mime.find(&marker).expect("the html part carries a pixel") + marker.len();
+    let end = start + mime[start..].find('"').expect("the src is terminated");
+    mime[start..end].to_string()
+}
+
+#[tokio::test]
+async fn include_tracker_mints_a_pixel_the_store_can_resolve() {
+    // Cold send: the send POST, then the echo's raw read-back.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (
+            200,
+            format!(
+                "{{\"id\":\"sent-1\",\"threadId\":\"thread-new\",\
+                   \"internalDate\":\"1783591200000\",\"raw\":\"{}\"}}",
+                sent_reply_raw_b64()
+            ),
+        ),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_tracking(base, Some(TRACK_BASE), |_, _| {});
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true,
+                "include_tracker": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let echo_id = body_json(resp).await["echo_message_id"]
+        .as_i64()
+        .expect("echoed local id");
+
+    let reqs = handle.await.unwrap();
+    let mime = sent_mime(&reqs[0]);
+    // The pixel rides the HTML alternative only; the plain part stays clean.
+    assert!(mime.contains("multipart/alternative"));
+    let token = pixel_token(&mime);
+    assert_eq!(token.len(), 32, "32 url-safe chars");
+    assert_eq!(
+        mime.matches("<img").count(),
+        1,
+        "exactly one pixel, in the html part"
+    );
+
+    // The tracker is REAL: an open against its token records, and the echo
+    // backfill makes it readable per message.
+    assert!(
+        store.record_open(acct, &token, 1_700, Some("Apple Mail/16.0"), "unknown").unwrap(),
+        "the minted token names a stored tracker"
+    );
+    let opens = store.message_opens(acct, echo_id).unwrap();
+    assert_eq!(opens.len(), 1);
+    assert_eq!(opens[0].opened_at, 1_700);
+
+    let audit = store.list_audit(acct, 20).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.tracker" && a.detail.as_deref() == Some("minted"))
+    );
+    // The audit trail must never carry the capability itself.
+    assert!(
+        !audit.iter().any(|a| a.detail.as_deref().is_some_and(|d| d.contains(&token))),
+        "the token is never audited"
+    );
+}
+
+#[tokio::test]
+async fn include_tracker_without_a_configured_base_url_sends_untracked() {
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_tracking(base, None, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true,
+                "include_tracker": true
+            }),
+        ))
+        .await
+        .unwrap();
+    // Unconfigured is not an error: the mail goes out, just unwatched.
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let reqs = handle.await.unwrap();
+    let mime = sent_mime(&reqs[0]);
+    assert!(!mime.contains("<img"), "no pixel without a base url");
+    assert!(
+        mime.contains("Content-Type: text/plain"),
+        "and no html part was invented to carry one"
+    );
+    assert!(!mime.contains("multipart/alternative"));
+    assert!(
+        !store
+            .list_audit(acct, 20)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "send.tracker"),
+        "nothing was minted, so nothing is audited"
+    );
+}
+
+#[tokio::test]
+async fn a_send_that_does_not_ask_for_tracking_never_gets_a_pixel() {
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    // Tracking IS configured; the send simply does not ask for it.
+    let Harness { app, store, acct } = app_with_tracking(base, Some(TRACK_BASE), |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let reqs = handle.await.unwrap();
+    let mime = sent_mime(&reqs[0]);
+    assert!(!mime.contains("<img"));
+    assert!(!mime.contains(TRACK_BASE));
+    assert!(!mime.contains("multipart/alternative"));
+    assert!(
+        !store
+            .list_audit(acct, 20)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "send.tracker")
+    );
+}
+
 // --- sitrep: seen-ledger + bands + resolution over HTTP ---------------------
 
 use squelch_core::types::AttentionStatus;
@@ -3001,4 +3198,73 @@ async fn draft_routes_require_bearer_auth() {
             "{method} {uri} must be behind auth"
         );
     }
+}
+
+#[tokio::test]
+async fn thread_view_marks_sent_to_senders_known_and_strangers_not() {
+    use squelch_core::store::ContactEntry;
+    let Harness { app, .. } = harness(|store, acct| {
+        store.upsert_message(&msg(acct, "g1", "t1", "lunch?", "from a known contact")).unwrap();
+        let mut stranger = msg(acct, "g2", "t1", "lunch?", "from a stranger");
+        stranger.from_addr = "promo@nowhere.io".into();
+        stranger.from_name = None;
+        store.upsert_message(&stranger).unwrap();
+        // Seeded through the Sent-derived contacts table — the same signal
+        // triage's known-contact floor reads. Cased differently from the
+        // message's `from_addr` on purpose: the column is NOCASE.
+        store
+            .merge_harvested_contacts(
+                acct,
+                &[ContactEntry {
+                    addr: "Alice@Example.com".into(),
+                    display_name: None,
+                    sent_count: 1,
+                    last_sent_at: None,
+                }],
+            )
+            .unwrap();
+    });
+
+    let resp = app.oneshot(authed("GET", "/client/thread/t1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let msgs = json["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    let known = |addr: &str| -> Value {
+        msgs.iter()
+            .find(|m| m["from_addr"] == addr)
+            .unwrap_or_else(|| panic!("{addr} missing from the thread"))["sender_known"]
+            .clone()
+    };
+    assert_eq!(known("alice@example.com"), Value::Bool(true));
+    assert_eq!(known("promo@nowhere.io"), Value::Bool(false));
+    // The flatten must not have disturbed the fields the reader already decodes.
+    assert!(msgs[0]["id"].is_i64());
+    assert!(msgs[0].get("html").is_some());
+    assert!(msgs[0]["attachments"].is_array());
+}
+
+#[tokio::test]
+async fn thread_view_sender_known_needs_a_sent_message_not_merely_contact_row() {
+    use squelch_core::store::ContactEntry;
+    let Harness { app, .. } = harness(|store, acct| {
+        store.upsert_message(&msg(acct, "g1", "t1", "hi", "body")).unwrap();
+        // sent_count 0: harvested but never actually written to. `is_known_contact`
+        // requires sent_count > 0, and the read-time bit must not soften that.
+        store
+            .merge_harvested_contacts(
+                acct,
+                &[ContactEntry {
+                    addr: "alice@example.com".into(),
+                    display_name: None,
+                    sent_count: 0,
+                    last_sent_at: None,
+                }],
+            )
+            .unwrap();
+    });
+
+    let resp = app.oneshot(authed("GET", "/client/thread/t1")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["messages"][0]["sender_known"], Value::Bool(false));
 }
