@@ -120,32 +120,18 @@ restart. Without it the relay still runs, but any open the daemon has not yet
 drained dies on every redeploy. The container chowns the mount point before
 dropping privileges, so the volume may arrive root-owned.
 
-### The relay bearer is not a user account
+### One relay serves one daemon
 
-`SQUELCH_RELAY_AUTH_TOKEN` is an **abuse gate**, not a tenancy boundary. It
-exists so strangers cannot spend the operator's APNs quota. It assumes one owner
-on both ends.
-
-**Do not share one relay bearer between two daemons.** The open buffer has no
-tenant column and `/v1/opens` has a single global cursor, so two daemons draining
-the same relay will ack-delete each other's rows — each silently never sees the
-opens the other collected. Multi-tenant relay operation is unbuilt; until it
-exists, one relay serves one daemon.
+`SQUELCH_RELAY_AUTH_TOKEN` is an abuse gate, not a user account. Run your relay
+for your own daemon and do not share its bearer: the open buffer has no tenant
+column and `/v1/opens` has a single global cursor, so two daemons draining the
+same relay will ack-delete each other's rows, and each silently never sees the
+opens the other collected.
 
 An anonymous relay (`SQUELCH_RELAY_ALLOW_ANONYMOUS=1`) does not serve `/v1/opens`
 at all. Serving the push route open is a supported nuisance; serving the drain
 open would hand strangers live tracking tokens and let them wipe the buffer on
 the way out.
-
-## Which mode for which tier
-
-- **Self-hosted:** Mode A unless you need always-on collection. You do not need
-  anyone else's relay for read tracking — the pixel is ordinary HTTP and your
-  daemon already serves it. (APNs push is different: it requires an Apple
-  developer key you may not have, which is the one thing a self-hoster genuinely
-  cannot do alone.)
-- **Hosted:** the operator runs both the daemon and the relay, provisions the
-  bearer on both ends, and the user configures nothing.
 
 ## What the pixel route does and does not do
 
