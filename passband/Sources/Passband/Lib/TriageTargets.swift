@@ -53,7 +53,12 @@ struct TriageTarget: Identifiable, Hashable, Sendable {
     /// rather than implying a move.
     var lands: String? {
         switch (axis, value) {
-        // standing = tier IN ('past_due','deadline') AND status != 'done'
+        // standing = a dated obligation OR live correspondence: tier IN
+        // ('past_due','deadline'), OR a thread the user has written in, OR a
+        // sender the user has written to (contacts.sent_count > 0) — all AND
+        // status != 'done', and never sealed or the user's own sent mail. Only
+        // the tier arm is reachable from a correction: the correspondence arms
+        // are facts about the thread, not values this palette can write.
         case (.tier, "past_due"), (.tier, "deadline"): "For your eyes"
         // Every band excludes sealed mail, and the Auth page IS that set.
         case (.sensitivity, "sealed"): "Auth"

@@ -80,7 +80,7 @@ final class Notifier {
 
         let subtitle: String
         switch event.kind {
-        // Urgent is the standing band. When there is a real date, SAY it —
+        // Urgent is the dated-obligation tiers. When there is a real date, SAY it —
         // "2d PAST DUE" is why the banner is worth interrupting for.
         case .urgent: subtitle = due.isEmpty ? "needs attention" : due
         case .deadline: subtitle = due

@@ -26,6 +26,42 @@ fn update_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Update> {
     })
 }
 
+/// Membership test for the `standing` band, written against the `triage t` /
+/// `messages m` join that both band sites share. It lives in ONE place because
+/// the list query and the header's count must agree row for row, or the sitrep
+/// header contradicts the list it heads.
+///
+/// STANDING IS A PROPERTY, NOT A TIMESTAMP: the band is mail owed the user's
+/// attention — a dated obligation (`past_due`/`deadline`), or live
+/// correspondence: a thread the user has written in, or a sender the user has
+/// written to. A dateless "can you send me the form?" from a real correspondent
+/// is exactly as owed as a bill, and the surfacing clock must never rotate it
+/// out. Because this is a definition over stored rows, widening it is
+/// retroactive: mail already triaged joins the band on the next read.
+///
+/// What participation deliberately does NOT do: it never unseals anything (the
+/// base predicate's `sensitivity != 'sealed'` is the only gate that matters,
+/// and it is outside this expression), and it never surfaces the user's own
+/// sent mail — the sent sibling is evidence, and `m.is_sent = 0` keeps it out
+/// of every listing.
+///
+/// Address matching folds case on BOTH sides: `messages.from_addr` is stored as
+/// the header spelled it, and `contacts.addr` is lowercased by the Sent-history
+/// harvest but kept verbatim by the per-message Sent ingest, so neither side can
+/// be assumed normalized.
+const STANDING_BAND: &str = "(t.tier IN ('past_due','deadline')
+        OR (m.thread_id != '' AND EXISTS(
+                SELECT 1 FROM messages s
+                WHERE s.account_id = m.account_id
+                  AND s.thread_id = m.thread_id
+                  AND s.is_sent = 1))
+        OR EXISTS(
+                SELECT 1 FROM contacts c
+                WHERE c.account_id = t.account_id
+                  AND c.addr = lower(trim(m.from_addr)) COLLATE NOCASE
+                  AND c.sent_count > 0))
+       AND t.status != 'done'";
+
 impl SqliteStore {
     pub(super) fn ranked_updates(
         &self,
@@ -50,7 +86,10 @@ impl SqliteStore {
         )?;
         // AGENT DOOR: `update_from_row` leaves field_reasons/has_attachments None.
         let out = stmt
-            .query_map(params![account_id, since.to_rfc3339(), min], update_from_row)?
+            .query_map(
+                params![account_id, since.to_rfc3339(), min],
+                update_from_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(out)
     }
@@ -68,7 +107,8 @@ impl SqliteStore {
 
         // Base predicate: sealed excluded, sent excluded, since/importance window.
         // Bands:
-        //   standing = tier IN ('past_due','deadline') AND status != 'done'
+        //   standing = dated obligation OR live correspondence, not yet done
+        //              (see STANDING_BAND for the definition and its limits)
         //   new      = surfaced_at IS NULL AND status != 'done'
         //   open     = status = 'open'
         // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts out of the
@@ -89,7 +129,7 @@ impl SqliteStore {
         }
         match band {
             Some(SitrepBand::Standing) => {
-                where_sql.push_str(" AND t.tier IN ('past_due','deadline') AND t.status != 'done'");
+                where_sql.push_str(&format!(" AND {STANDING_BAND}"));
             }
             Some(SitrepBand::New) => {
                 where_sql.push_str(" AND t.surfaced_at IS NULL AND t.status != 'done'")
@@ -176,7 +216,11 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub(super) fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
+    pub(super) fn mark_surfaced(
+        &self,
+        account_id: AccountId,
+        message_ids: &[i64],
+    ) -> Result<usize> {
         if message_ids.is_empty() {
             return Ok(0);
         }
@@ -308,18 +352,22 @@ impl SqliteStore {
         // the `band` query on attention_updates, or header and list disagree —
         // including its one-row-per-thread collapse, hence DISTINCT thread keys
         // (blank thread_id falls back to the message id, same as the list).
+        // Standing is decided in the subquery, where the `m` join alias the
+        // shared expression is written against is still in scope.
         let (standing, new_count, open_count): (i64, i64, i64) = conn.query_row(
-            "SELECT
-                 COUNT(DISTINCT CASE WHEN t.tier IN ('past_due','deadline')
-                     AND t.status != 'done' THEN tkey END),
-                 COUNT(DISTINCT CASE WHEN t.surfaced_at IS NULL
-                     AND t.status != 'done' THEN tkey END),
-                 COUNT(DISTINCT CASE WHEN t.status = 'open' THEN tkey END)
-             FROM (SELECT t.*, COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id) AS tkey
-                   FROM triage t
-                   JOIN messages m ON m.id = t.message_id
-                   WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
-                     AND m.is_sent = 0) t",
+            &format!(
+                "SELECT
+                     COUNT(DISTINCT CASE WHEN t.standing = 1 THEN tkey END),
+                     COUNT(DISTINCT CASE WHEN t.surfaced_at IS NULL
+                         AND t.status != 'done' THEN tkey END),
+                     COUNT(DISTINCT CASE WHEN t.status = 'open' THEN tkey END)
+                 FROM (SELECT t.*, COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id) AS tkey,
+                              ({STANDING_BAND}) AS standing
+                       FROM triage t
+                       JOIN messages m ON m.id = t.message_id
+                       WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
+                         AND m.is_sent = 0) t"
+            ),
             params![account_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;

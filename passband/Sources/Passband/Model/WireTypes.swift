@@ -96,7 +96,9 @@ enum Band: String, Sendable, CaseIterable {
 /// core::types::EventKind — why an event was emitted. Server-side precedence
 /// when classifying a verdict is urgent > deadline > surfaced.
 enum EventKind: String, LenientRawEnum {
-    /// Tier is past_due/deadline — the standing band, immune to thresholds.
+    /// Tier is past_due/deadline — the dated-obligation tiers, immune to
+    /// thresholds. A subset of the standing band, which also holds live
+    /// correspondence; a row in the band on that footing earns no event here.
     case urgent
     /// A deadline on a message that is not itself urgent-tier.
     case deadline
@@ -217,9 +219,10 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     /// before. `nil` (old daemon) is NOT allowed — the default stays private.
     var allowsTrackers: Bool { sender_known ?? false }
 
-    /// The highlight predicate: an UNRESOLVED row in a standing tier. Same
-    /// definition as the list's for-your-eyes band, so reader and list agree
-    /// on what deserves the mark.
+    /// The highlight predicate: an UNRESOLVED row in a dated-obligation tier.
+    /// Deliberately NARROWER than the for-your-eyes band, which also carries
+    /// live correspondence: the mark answers "which message is the obligation",
+    /// and a mark on every message from a known contact answers nothing.
     var needsAttention: Bool {
         (attention_open ?? false) && (tier == .pastDue || tier == .deadline)
     }

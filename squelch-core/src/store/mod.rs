@@ -14,7 +14,7 @@ use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, Receipt,
     SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier,
-    TriageAxis, TriageFeedback, Update, UnsubscribeRecord,
+    TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,12 @@ use serde::{Deserialize, Serialize};
 /// Server-side bucket for the sitrep chassis, selected by the `band` param on
 /// `/client/updates`. See [`Store::attention_updates`].
 ///
-/// - `Standing` — tier `past_due`/`deadline` AND status != 'done'; immune to the
-///   surfacing clock, never rotates out until resolved.
+/// - `Standing` — mail owed the user's attention, immune to the surfacing clock
+///   and never rotating out until resolved: a dated obligation (tier
+///   `past_due`/`deadline`) OR live correspondence — a thread the user has
+///   written in, or a sender the user has written to — with status != 'done'.
+///   Participation only widens membership: it never unseals anything, and it
+///   never surfaces the user's own sent rows, which no band lists.
 /// - `New` — `surfaced_at IS NULL`: never surfaced through ANY door.
 /// - `Open` — status = 'open', ordered by `age * importance` descending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,11 +595,7 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<AttachmentBytes>>;
 
     /// MCP-facing deadlines within `within_days` (None = all). Sealed excluded.
-    fn deadlines(
-        &self,
-        account_id: AccountId,
-        within_days: Option<u32>,
-    ) -> Result<Vec<Deadline>>;
+    fn deadlines(&self, account_id: AccountId, within_days: Option<u32>) -> Result<Vec<Deadline>>;
 
     /// Upsert a shipment keyed by `(account_id, tracking_number)`. A later mail
     /// about the same tracking number UPDATES the row through the no-regress
@@ -766,8 +766,12 @@ pub trait Store: Send + Sync {
     /// HUMAN-DOOR ONLY (`/client/contacts`): rank Sent-derived contacts for a
     /// typed fragment — recipient autocomplete. MUST NOT be reachable from MCP;
     /// the agent door never learns who the user writes to.
-    fn search_contacts(&self, account_id: AccountId, q: &str, limit: u32)
-    -> Result<Vec<ContactEntry>>;
+    fn search_contacts(
+        &self,
+        account_id: AccountId,
+        q: &str,
+        limit: u32,
+    ) -> Result<Vec<ContactEntry>>;
 
     /// Merge the Sent-history harvest's per-address aggregate (MAX semantics —
     /// idempotent across harvest re-runs and overlap with ingest seeding).
@@ -778,12 +782,8 @@ pub trait Store: Send + Sync {
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>>;
 
     /// Upsert the sync cursor for a mailbox key.
-    fn set_sync_state(
-        &self,
-        account_id: AccountId,
-        mailbox: &str,
-        state: &SyncState,
-    ) -> Result<()>;
+    fn set_sync_state(&self, account_id: AccountId, mailbox: &str, state: &SyncState)
+    -> Result<()>;
 
     /// LOCAL-ONLY (TUI): list sealed messages. This is the ONLY method that
     /// exposes sealed content and must never be reachable from MCP.
@@ -876,7 +876,12 @@ pub trait Store: Send + Sync {
 
     /// Events with `id > after_id`, oldest first, capped at `limit`. The replay
     /// query behind `GET /client/events?after=<cursor>`.
-    fn events_after(&self, account_id: AccountId, after_id: i64, limit: usize) -> Result<Vec<Event>>;
+    fn events_after(
+        &self,
+        account_id: AccountId,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>>;
 
     /// One event by id, scoped to the account. `None` for an unknown id — this
     /// is what the iOS Notification Service Extension calls after an opaque
@@ -921,11 +926,7 @@ pub trait Store: Send + Sync {
 
     /// DEV DEBUG: the full triage row for one NON-SEALED message. `None` for
     /// missing OR sealed (indistinguishable). Human door only.
-    fn triage_debug(
-        &self,
-        account_id: AccountId,
-        message_id: i64,
-    ) -> Result<Option<TriageDebug>>;
+    fn triage_debug(&self, account_id: AccountId, message_id: i64) -> Result<Option<TriageDebug>>;
 
     /// Upsert the unsubscribe row for `(account_id, sender)`. On conflict this
     /// RESETS the violation ledger (`violation_count -> 0`, `last_violation_at`
@@ -1123,8 +1124,7 @@ pub trait Store: Send + Sync {
     /// Today's Stage-2 API-call count for a budget scope: `thread_id` is either a
     /// real Gmail thread id (per-thread cap) or the `'__global__'` sentinel
     /// (per-account cap). `day` is caller-provided so tests are deterministic.
-    fn stage2_budget_used(&self, account_id: AccountId, thread_id: &str, day: &str)
-    -> Result<u32>;
+    fn stage2_budget_used(&self, account_id: AccountId, thread_id: &str, day: &str) -> Result<u32>;
 
     /// Increment (and return the new value of) today's Stage-2 API-call count
     /// for a budget scope. Called BEFORE the API attempt so retries count and

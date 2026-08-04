@@ -1,7 +1,9 @@
 //! Gmail sync: REST + polling. REST, not IMAP — the read-only `gmail.readonly`
 //! scope works over REST and IMAP XOAUTH2 rejects it. First run backfills
 //! `backfill_days` of INBOX+SENT and records the `historyId`; after that
-//! `history.list` polls `messageAdded`, a 404 falling back to a full catch-up.
+//! `history.list` polls `messageAdded` under BOTH labels — INBOX for incoming
+//! mail, SENT for whatever the user wrote from another client — a 404 falling
+//! back to a full catch-up.
 //! Tokens, headers and bodies are NEVER logged; ingest seals first (SECURITY.md).
 
 pub mod html;
@@ -86,7 +88,13 @@ const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 /// `.`, and the result is capped so a pathological header can't flood the log.
 fn sanitize_ascii(s: &str, max: usize) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '.' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '.'
+            }
+        })
         .take(max)
         .collect()
 }
@@ -148,6 +156,21 @@ pub enum HistoryDecision {
 /// observed in a page — never backwards. Pure, so it is unit-testable.
 pub fn advance_history_cursor(current: u64, observed: impl IntoIterator<Item = u64>) -> u64 {
     observed.into_iter().fold(current, u64::max)
+}
+
+/// Drop from `ids` every id also in `claimed`, preserving order. Used to hand the
+/// SENT batch only what the INBOX batch did NOT already ingest: a self-addressed
+/// message carries both labels, and the store's message upsert writes
+/// `is_sent = excluded.is_sent` on conflict, so re-ingesting it as sent would
+/// hide the visible copy. Pure, so the precedence rule is unit-testable.
+fn subtract_ids(ids: Vec<String>, claimed: &[String]) -> Vec<String> {
+    if claimed.is_empty() {
+        return ids;
+    }
+    let claimed: std::collections::HashSet<&str> = claimed.iter().map(|s| s.as_str()).collect();
+    ids.into_iter()
+        .filter(|id| !claimed.contains(id.as_str()))
+        .collect()
 }
 
 // ---- Gmail REST response shapes (only the fields we consume) ---------------
@@ -289,6 +312,10 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// Per-cap-kind last-warned UTC day. In-memory only; a restart re-arms them,
     /// and one fresh notice on restart is acceptable.
     warn_days: std::sync::Mutex<WarnDays>,
+    /// Gmail REST base for every call this engine makes. Always
+    /// [`GMAIL_API_BASE`] in production; the tests point it at a loopback mock so
+    /// the walk/cursor rules are asserted on the wire rather than on a struct.
+    api_base: String,
 }
 
 impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C> {
@@ -325,7 +352,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             embedder: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
+            api_base: GMAIL_API_BASE.to_string(),
         }
+    }
+
+    /// Point every Gmail call at `base` instead of [`GMAIL_API_BASE`]. Test-only:
+    /// a build that could be aimed at an arbitrary host would be a bearer-token
+    /// exfiltration primitive.
+    #[cfg(test)]
+    fn with_api_base(mut self, base: String) -> Self {
+        self.api_base = base;
+        self
     }
 
     /// Share a manual-refresh [`Notify`](tokio::sync::Notify) so the human door's
@@ -502,19 +539,99 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Walk `history.list` from `start_history_id`, ingesting newly added INBOX
-    /// messages and advancing the persisted cursor. Propagates
-    /// [`CoreError::NotFound`] on an expired historyId so the caller can fall
-    /// back to a catch-up.
+    /// One incremental poll: TWO label-filtered `history.list` walks from the
+    /// SAME start cursor, INBOX then SENT, with the cursor committed ONCE at the
+    /// end at the max historyId either walk observed.
+    ///
+    /// The SENT walk is what makes mail the user writes from Gmail web or their
+    /// phone land here at all: such a message never carries INBOX, so an
+    /// INBOX-only walk is blind to it, and the api's post-send echo covers only
+    /// what was sent through the daemon itself. Both walks start from the same
+    /// `start_history_id` because one Gmail cursor spans the whole mailbox.
+    ///
+    /// ORDER IS LOAD-BEARING. A self-addressed message carries both labels and so
+    /// appears in both walks, and the store's message upsert writes
+    /// `is_sent = excluded.is_sent` on conflict — last writer wins — so a SENT
+    /// copy landing second would flip the row to `is_sent = 1` and drop it out of
+    /// every band. The INBOX walk therefore runs FIRST and its ids are subtracted
+    /// from the SENT batch, making the visible copy authoritative no matter what
+    /// the conflict clause does.
+    ///
+    /// Propagates [`CoreError::NotFound`] on an expired historyId so the caller
+    /// can fall back to a catch-up.
     async fn history_walk(&self, start_history_id: u64) -> Result<()> {
+        let (inbox_ids, inbox_cursor) = self
+            .history_walk_label(start_history_id, LABEL_INBOX)
+            .await?;
+        if !inbox_ids.is_empty() {
+            let n = self
+                .fetch_raw_and_ingest(&inbox_ids, false, IngestOrigin::Incremental)
+                .await?;
+            eprintln!("squelch: ingested {n} new INBOX messages");
+        }
+
+        // The SENT half is best-effort AGAINST THE CURSOR: any failure holds the
+        // cursor where it is and returns, so the next poll re-walks both labels
+        // from the same start rather than stepping over INBOX history that the
+        // successful half already covered. Re-walking costs a few fetches and
+        // changes nothing: `UNIQUE(account_id, gmail_msg_id)` collapses the
+        // message rows and `UNIQUE(message_id)` on `events` collapses the
+        // notifications.
+        let (sent_ids, sent_cursor) =
+            match self.history_walk_label(start_history_id, LABEL_SENT).await {
+                Ok(v) => v,
+                // An expired historyId is not a SENT-specific failure: the cursor
+                // itself is gone and only a catch-up can recover it.
+                Err(CoreError::NotFound) => return Err(CoreError::NotFound),
+                Err(e) => {
+                    eprintln!("squelch: sent history walk failed ({e}); holding the cursor");
+                    return Ok(());
+                }
+            };
+
+        let sent_only = subtract_ids(sent_ids, &inbox_ids);
+        if !sent_only.is_empty() {
+            // `Incremental`, like the INBOX half: the silence guarantee for the
+            // user's own mail is NOT the origin but `events::worthy_kind`, which
+            // returns `None` for an `is_sent` row, and the 'n/a' stage markers
+            // ingest stamps, which keep it out of both LLM queues.
+            match self
+                .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
+                .await
+            {
+                Ok(n) => eprintln!("squelch: ingested {n} new SENT messages"),
+                Err(e) => {
+                    eprintln!("squelch: sent ingest failed ({e}); holding the cursor");
+                    return Ok(());
+                }
+            }
+        }
+
+        self.store_history_cursor(advance_history_cursor(
+            start_history_id,
+            [inbox_cursor, sent_cursor],
+        ))?;
+        Ok(())
+    }
+
+    /// Walk `history.list` from `start_history_id` under ONE label filter,
+    /// returning the deduped `messageAdded` ids and the max historyId observed.
+    /// Persists nothing: the caller owns the single cursor commit that covers
+    /// every label. Propagates [`CoreError::NotFound`] on an expired historyId.
+    async fn history_walk_label(
+        &self,
+        start_history_id: u64,
+        label: &str,
+    ) -> Result<(Vec<String>, u64)> {
         let mut cursor = start_history_id;
         let mut page_token: Option<String> = None;
         let mut new_ids: Vec<String> = Vec::new();
 
         loop {
             let mut url = format!(
-                "{GMAIL_API_BASE}/history?startHistoryId={start_history_id}\
-                 &historyTypes=messageAdded&labelId={LABEL_INBOX}"
+                "{}/history?startHistoryId={start_history_id}\
+                 &historyTypes=messageAdded&labelId={label}",
+                self.api_base
             );
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&pageToken={tok}"));
@@ -546,20 +663,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // dedup at the store keys on (account_id, gmail_msg_id).
         new_ids.sort_unstable();
         new_ids.dedup();
-
-        if !new_ids.is_empty() {
-            let n = self
-                .fetch_raw_and_ingest(&new_ids, false, IngestOrigin::Incremental)
-                .await?;
-            eprintln!("squelch: ingested {n} new INBOX messages");
-        }
-        self.store_history_cursor(cursor)?;
-        Ok(())
+        Ok((new_ids, cursor))
     }
 
-    /// Fresh catch-up: re-run the backfill-window INBOX fetch (dedup makes it
-    /// idempotent) and re-establish the historyId. Used on first run's poll and
-    /// on an expired-history 404.
+    /// Fresh catch-up: re-run the backfill-window INBOX fetch, then the SENT
+    /// fetch over the same window (dedup makes both idempotent), and
+    /// re-establish the historyId. Used on first run's poll and on an
+    /// expired-history 404 — exactly the cases where the history walk cannot
+    /// account for the gap, so the sent half has to be re-listed too or mail the
+    /// user wrote from another client during it is lost for good.
     async fn catch_up(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
@@ -572,6 +684,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         if n > 0 {
             eprintln!("squelch: catch-up ingested {n} INBOX messages");
         }
+
+        // INBOX first, and its ids subtracted, for the same reason the history
+        // walk orders itself that way: a self-addressed message is in both
+        // listings and its visible copy must win the unique-key race.
+        let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
+        let sent_only = subtract_ids(sent_ids, &ids);
+        let sent_n = self
+            .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
+            .await?;
+        if sent_n > 0 {
+            eprintln!("squelch: catch-up ingested {sent_n} SENT messages");
+        }
+
         let history_id = self.fetch_profile_history_id().await?;
         self.store_history_cursor(history_id)?;
         Ok(())
@@ -612,8 +737,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             std::collections::HashMap::new();
         for (i, id) in ids.iter().enumerate() {
             let url = format!(
-                "{GMAIL_API_BASE}/messages/{id}?format=metadata\
-                 &metadataHeaders=To&metadataHeaders=Cc"
+                "{}/messages/{id}?format=metadata\
+                 &metadataHeaders=To&metadataHeaders=Cc",
+                self.api_base
             );
             let msg: GmailMessage = self.get_json(&url).await?;
             let sent_at = parse_internal_date(msg.internal_date.as_deref());
@@ -621,13 +747,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // Through mail-parser via header synthesis, so grouped lists, quoted
             // display names and RFC2047 encoding parse exactly as ingest does.
             let blob = synthesize_rfc822_headers(&headers);
-            let Some(parsed) = mail_parser::MessageParser::default().parse(blob.as_bytes())
-            else {
+            let Some(parsed) = mail_parser::MessageParser::default().parse(blob.as_bytes()) else {
                 continue;
             };
             for list in [parsed.to(), parsed.cc()].into_iter().flatten() {
                 for mailbox in list.iter() {
-                    let Some(addr) = mailbox.address() else { continue };
+                    let Some(addr) = mailbox.address() else {
+                        continue;
+                    };
                     let addr = addr.trim().to_ascii_lowercase();
                     // Same gate as ingest seeding: never the account itself,
                     // never robot/unsubscribe traffic.
@@ -688,7 +815,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let mut url = format!("{GMAIL_API_BASE}/messages?labelIds={label}");
+            let mut url = format!("{}/messages?labelIds={label}", self.api_base);
             if let Some(q) = q {
                 url.push_str(&format!("&q={}", urlencode(q)));
             }
@@ -722,7 +849,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut count = 0usize;
 
         for id in ids {
-            let url = format!("{GMAIL_API_BASE}/messages/{id}?format=raw");
+            let url = format!("{}/messages/{id}?format=raw", self.api_base);
             let msg: GmailMessage = self.get_json(&url).await?;
             let raw_b64 = match &msg.raw {
                 Some(r) => r,
@@ -738,7 +865,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             };
             let fetched = RawFetched {
                 account_id: self.account_id,
-                gmail_msg_id: if msg.id.is_empty() { id.clone() } else { msg.id.clone() },
+                gmail_msg_id: if msg.id.is_empty() {
+                    id.clone()
+                } else {
+                    msg.id.clone()
+                },
                 gmail_thread_id: msg.thread_id.clone(),
                 raw,
                 internal_date: parse_internal_date(msg.internal_date.as_deref()),
@@ -765,13 +896,21 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         now: DateTime<Utc>,
         origin: IngestOrigin,
     ) -> Result<Option<(i64, String)>> {
-        let triaged = ingest_with_rules(
-            fetched,
-            &self.config.stage1,
-            now,
-            rules,
-            |addr| self.store.is_known_contact(self.account_id, addr).unwrap_or(false),
-        );
+        let triaged = ingest_with_rules(fetched, &self.config.stage1, now, rules, |addr| {
+            self.store
+                .is_known_contact(self.account_id, addr)
+                .unwrap_or(false)
+        });
+        // A SEALED OUTBOUND COPY IS NOT COMMITTED — the same rule
+        // [`ingest::ingest_sent`] holds the api's send echo to, and now that the
+        // sent walk delivers outbound mail on every poll it has to hold here too.
+        // `thread_guard_and_subject` 404s any thread containing a sealed message,
+        // so storing the user's own reply that quotes an OTP would HIDE the
+        // counterparty's mail they were reading a second ago. Seal detection runs
+        // BEFORE ingest's `is_sent` branch precisely so this case is catchable.
+        if fetched.is_sent && triaged.sensitivity != Sensitivity::Normal {
+            return Ok(None);
+        }
         let id = self.store.ingest_message(&triaged)?;
         // Notify on a CONFIDENT heuristic seed only; a guess waits for the
         // Stage-1/Stage-2 apply sites. ACCEPTED TRADEOFF: Stage-1 may later
@@ -845,7 +984,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         .await;
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("squelch: embed failed for message {message_id} (recoverable via backfill): {e}"),
+            Ok(Err(e)) => eprintln!(
+                "squelch: embed failed for message {message_id} (recoverable via backfill): {e}"
+            ),
             Err(e) => eprintln!("squelch: embed task join error for message {message_id}: {e}"),
         }
     }
@@ -964,11 +1105,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .store
             .stage2_cap_overrides(self.account_id)
             .unwrap_or_default();
-        let global_daily_cap = caps
-            .stage1_global_daily_cap
-            .unwrap_or(cfg.global_daily_cap);
+        let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued = match self.store.stage1_queue(self.account_id, cfg.batch_per_cycle) {
+        let queued = match self
+            .store
+            .stage1_queue(self.account_id, cfg.batch_per_cycle)
+        {
             Ok(q) => q,
             Err(e) => {
                 eprintln!("squelch: stage-1 queue read failed ({e}); skipping pass");
@@ -1157,16 +1299,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .unwrap_or_default();
         let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued = match self
-            .store
-            .extract_queue(self.account_id, &categories, cfg.batch_per_cycle)
-        {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("squelch: extract queue read failed ({e}); skipping pass");
-                return;
-            }
-        };
+        let queued =
+            match self
+                .store
+                .extract_queue(self.account_id, &categories, cfg.batch_per_cycle)
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("squelch: extract queue read failed ({e}); skipping pass");
+                    return;
+                }
+            };
         if queued.is_empty() {
             return;
         }
@@ -1376,7 +1519,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let sender_daily_cap = caps.sender_daily_cap.unwrap_or(cfg.sender_daily_cap);
         let global_daily_cap = caps.global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued = match self.store.stage2_queue(self.account_id, cfg.batch_per_cycle) {
+        let queued = match self
+            .store
+            .stage2_queue(self.account_id, cfg.batch_per_cycle)
+        {
             Ok(q) => q,
             Err(e) => {
                 eprintln!("squelch: stage-2 queue read failed ({e}); skipping pass");
@@ -1504,9 +1650,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 eprintln!("squelch: stage-2 thread budget increment failed ({e}); skipping row");
                 continue;
             }
-            if let Err(e) =
-                self.store
-                    .stage2_increment_budget(self.account_id, &sender_key, &day)
+            if let Err(e) = self
+                .store
+                .stage2_increment_budget(self.account_id, &sender_key, &day)
             {
                 eprintln!("squelch: stage-2 sender budget increment failed ({e}); skipping row");
                 continue;
@@ -1611,7 +1757,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
     /// `users.getProfile` -> the account's current historyId.
     async fn fetch_profile_history_id(&self) -> Result<u64> {
-        let url = format!("{GMAIL_API_BASE}/profile");
+        let url = format!("{}/profile", self.api_base);
         let profile: ProfileResp = self.get_json(&url).await?;
         Ok(parse_history_id(&profile.history_id))
     }
@@ -1880,12 +2026,20 @@ mod tests {
         );
         let f = fixture(acct, "g-pastdue", &eml, false);
         let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
-        assert_eq!(ev, None, "old mail is silent no matter what the verdict says");
+        assert_eq!(
+            ev, None,
+            "old mail is silent no matter what the verdict says"
+        );
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
 
         // Sanity: the guard stopped it, not a mis-triage.
-        let updates = store.ranked_updates(acct, old - ChronoDuration::days(1), None).unwrap();
-        let bill = updates.iter().find(|u| u.id == mid).expect("bill surfaced in the client");
+        let updates = store
+            .ranked_updates(acct, old - ChronoDuration::days(1), None)
+            .unwrap();
+        let bill = updates
+            .iter()
+            .find(|u| u.id == mid)
+            .expect("bill surfaced in the client");
         assert_eq!(bill.tier, Tier::PastDue);
     }
 
@@ -1908,7 +2062,11 @@ mod tests {
         let (_, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
         assert_eq!(ev, None, "sealed mail must never notify");
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
-        assert_eq!(store.sealed_messages(acct).unwrap().len(), 1, "it WAS sealed");
+        assert_eq!(
+            store.sealed_messages(acct).unwrap().len(),
+            1,
+            "it WAS sealed"
+        );
     }
 
     #[test]
@@ -1920,7 +2078,12 @@ mod tests {
         // A SQUELCH rule outranks the heuristic that would otherwise have
         // surfaced this sender (proved above).
         store
-            .set_sender_rule(acct, "*@monitoring.example", "not urgent", Disposition::Squelch)
+            .set_sender_rule(
+                acct,
+                "*@monitoring.example",
+                "not urgent",
+                Disposition::Squelch,
+            )
             .unwrap();
         let eml = alert_eml(now);
         let f = fixture(acct, "g-alert", &eml, false);
@@ -2066,7 +2229,10 @@ mod tests {
             .into_iter()
             .find(|r| r.message_id == mid)
             .expect("queued");
-        assert!(row.received_at > now + ChronoDuration::days(1000), "the Date: header won");
+        assert!(
+            row.received_at > now + ChronoDuration::days(1000),
+            "the Date: header won"
+        );
 
         assert_eq!(
             refine_and_notify(&store, acct, mid, Tier::PastDue, 100, now),
@@ -2090,7 +2256,12 @@ mod tests {
         let (mid, _) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
 
         store
-            .set_sender_rule(acct, "*@monitoring.example", "not urgent", Disposition::Squelch)
+            .set_sender_rule(
+                acct,
+                "*@monitoring.example",
+                "not urgent",
+                Disposition::Squelch,
+            )
             .unwrap();
         assert_eq!(
             refine_and_notify(&store, acct, mid, Tier::PastDue, 100, now),
@@ -2117,9 +2288,15 @@ mod tests {
         let a = redact_sender("attacker@evil.example");
         assert!(a.starts_with("sender#"), "tagged form: {a}");
         assert_eq!(a.len(), "sender#".len() + 12, "12 hex chars of sha256");
-        assert!(!a.contains("attacker") && !a.contains("evil"), "address must not leak: {a}");
+        assert!(
+            !a.contains("attacker") && !a.contains("evil"),
+            "address must not leak: {a}"
+        );
         let hex = &a["sender#".len()..];
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "hex only: {hex}");
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex only: {hex}"
+        );
         // Deterministic (correlatable across a day) and injective per sender.
         assert_eq!(a, redact_sender("attacker@evil.example"));
         assert_ne!(a, redact_sender("someone@else.example"));
@@ -2130,7 +2307,10 @@ mod tests {
         // Newlines (log-forging), ANSI escapes, and RTL-override become '.'.
         let clean = sanitize_ascii("abc\n\x1b[31mDEF\u{202e}", 64);
         assert!(!clean.contains('\n') && !clean.contains('\u{1b}') && !clean.contains('\u{202e}'));
-        assert!(clean.starts_with("abc."), "printable kept, control replaced: {clean}");
+        assert!(
+            clean.starts_with("abc."),
+            "printable kept, control replaced: {clean}"
+        );
         // Pathologically long header can't flood the log.
         assert_eq!(sanitize_ascii(&"a".repeat(200), 10).chars().count(), 10);
     }
@@ -2194,8 +2374,14 @@ mod tests {
 
     #[test]
     fn history_decision_full_catchup_when_absent_or_zero() {
-        assert_eq!(history_poll_decision(None, false), HistoryDecision::FullCatchUp);
-        assert_eq!(history_poll_decision(Some(0), false), HistoryDecision::FullCatchUp);
+        assert_eq!(
+            history_poll_decision(None, false),
+            HistoryDecision::FullCatchUp
+        );
+        assert_eq!(
+            history_poll_decision(Some(0), false),
+            HistoryDecision::FullCatchUp
+        );
     }
 
     // ---- header synthesis for metadata-only sent seeding ------------------
@@ -2204,11 +2390,26 @@ mod tests {
     fn synthesize_headers_seeds_recipients_not_self() {
         // From is the account itself; contacts come from To/Cc recipients.
         let headers = vec![
-            MessageHeader { name: "From".into(), value: "me@example.com".into() },
-            MessageHeader { name: "To".into(), value: "alice@friends.com".into() },
-            MessageHeader { name: "Cc".into(), value: "bob@friends.com".into() },
-            MessageHeader { name: "Subject".into(), value: "re: lunch".into() },
-            MessageHeader { name: "Date".into(), value: "Mon, 7 Jul 2026 10:00:00 +0000".into() },
+            MessageHeader {
+                name: "From".into(),
+                value: "me@example.com".into(),
+            },
+            MessageHeader {
+                name: "To".into(),
+                value: "alice@friends.com".into(),
+            },
+            MessageHeader {
+                name: "Cc".into(),
+                value: "bob@friends.com".into(),
+            },
+            MessageHeader {
+                name: "Subject".into(),
+                value: "re: lunch".into(),
+            },
+            MessageHeader {
+                name: "Date".into(),
+                value: "Mon, 7 Jul 2026 10:00:00 +0000".into(),
+            },
         ];
         let raw = synthesize_rfc822_headers(&headers);
         assert!(raw.ends_with("\r\n\r\n"));
@@ -2320,7 +2521,11 @@ mod tests {
                     hello\r\n";
         let sf = fixture(acct, "g-seed", seed, /* is_sent */ true);
         ingest_into(&store, acct, &sf, Utc::now());
-        assert!(store.is_known_contact(acct, "billing@utilityco.com").unwrap());
+        assert!(
+            store
+                .is_known_contact(acct, "billing@utilityco.com")
+                .unwrap()
+        );
 
         let eml = "From: Utility <billing@utilityco.com>\r\n\
                    Subject: PAST DUE: Your electric bill\r\n\
@@ -2373,7 +2578,10 @@ mod tests {
         let updates = store
             .ranked_updates(acct, now - ChronoDuration::days(1), None)
             .unwrap();
-        assert!(updates.is_empty(), "sent mail must never surface in ranked_updates");
+        assert!(
+            updates.is_empty(),
+            "sent mail must never surface in ranked_updates"
+        );
 
         // And it must not appear in search results either.
         let hits = store.search(acct, "lunch", 10, 0).unwrap();
@@ -2462,7 +2670,10 @@ mod tests {
             .set_sync_state(
                 acct,
                 HISTORY_KEY,
-                &SyncState { uidvalidity: 0, last_uid: big },
+                &SyncState {
+                    uidvalidity: 0,
+                    last_uid: big,
+                },
             )
             .unwrap();
         let s = store.sync_state(acct, HISTORY_KEY).unwrap().unwrap();
@@ -2474,5 +2685,637 @@ mod tests {
         assert_eq!(urlencode("newer_than:30d"), "newer_than:30d");
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("x&y"), "x%26y");
+    }
+
+    #[test]
+    fn subtract_ids_drops_the_claimed_and_keeps_order() {
+        let claimed = vec!["b".to_string(), "d".to_string()];
+        let ids = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert_eq!(
+            subtract_ids(ids, &claimed),
+            vec!["a".to_string(), "c".into()]
+        );
+        // Nothing claimed: the batch passes through untouched.
+        assert_eq!(
+            subtract_ids(vec!["a".to_string()], &[]),
+            vec!["a".to_string()]
+        );
+    }
+
+    // ---- the two-walk incremental poll, on the wire ------------------------
+    //
+    // `history.list` is LABEL-FILTERED, so an INBOX-only poll is structurally
+    // blind to mail the user sends from Gmail web or their phone. Everything
+    // under test here — walk ORDER, the single cursor commit, a cursor HELD on a
+    // sent-side failure — lives in the sequence of HTTP calls and cannot be
+    // asserted on a struct, so these drive the real engine against an axum app on
+    // an ephemeral loopback port (the shape tests/push_relay.rs already uses).
+
+    use async_trait::async_trait;
+    use axum::extract::{Path as AxumPath, Query, State};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// One label's scripted `history.list` answer.
+    #[derive(Clone, Default)]
+    struct LabelHistory {
+        /// `messageAdded` records, as (historyId, message ids).
+        records: Vec<(u64, Vec<String>)>,
+        /// The page-level newest historyId.
+        top: u64,
+        /// Answer 500 instead: an outage that hits ONE label's walk.
+        fail: bool,
+    }
+
+    impl LabelHistory {
+        fn added(top: u64, records: &[(u64, &str)]) -> Self {
+            Self {
+                records: records
+                    .iter()
+                    .map(|(hid, id)| (*hid, vec![id.to_string()]))
+                    .collect(),
+                top,
+                fail: false,
+            }
+        }
+        fn quiet(top: u64) -> Self {
+            Self {
+                records: Vec::new(),
+                top,
+                fail: false,
+            }
+        }
+        fn broken() -> Self {
+            Self {
+                records: Vec::new(),
+                top: 0,
+                fail: true,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct GmailState {
+        /// labelId -> its `history.list` answer.
+        history: HashMap<String, LabelHistory>,
+        /// labelIds -> the ids `messages.list` returns (the catch-up path).
+        listing: HashMap<String, Vec<String>>,
+        /// gmail message id -> RFC822 source.
+        bodies: HashMap<String, String>,
+        /// `users.getProfile`'s historyId.
+        profile_history_id: u64,
+        /// Every call this mock served, in order, as `verb:key`.
+        seen: Vec<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockGmail(Arc<Mutex<GmailState>>);
+
+    impl MockGmail {
+        fn history(&self, label: &str, h: LabelHistory) -> &Self {
+            self.0.lock().unwrap().history.insert(label.to_string(), h);
+            self
+        }
+        fn listing(&self, label: &str, ids: &[&str]) -> &Self {
+            self.0.lock().unwrap().listing.insert(
+                label.to_string(),
+                ids.iter().map(|s| s.to_string()).collect(),
+            );
+            self
+        }
+        fn body(&self, id: &str, eml: String) -> &Self {
+            self.0.lock().unwrap().bodies.insert(id.to_string(), eml);
+            self
+        }
+        fn profile(&self, history_id: u64) -> &Self {
+            self.0.lock().unwrap().profile_history_id = history_id;
+            self
+        }
+        fn seen(&self) -> Vec<String> {
+            self.0.lock().unwrap().seen.clone()
+        }
+        fn calls(&self, key: &str) -> usize {
+            self.seen().iter().filter(|s| *s == key).count()
+        }
+        /// Index of `key` in the call log; panics if it was never served.
+        fn at(&self, key: &str) -> usize {
+            self.seen()
+                .iter()
+                .position(|s| s == key)
+                .unwrap_or_else(|| panic!("{key} was never called; saw {:?}", self.seen()))
+        }
+    }
+
+    async fn mock_history(
+        State(g): State<MockGmail>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Response {
+        let label = q.get("labelId").cloned().unwrap_or_default();
+        let mut st = g.0.lock().unwrap();
+        st.seen.push(format!("history:{label}"));
+        let h = st.history.get(&label).cloned().unwrap_or_default();
+        if h.fail {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let records: Vec<Value> = h
+            .records
+            .iter()
+            .map(|(hid, ids)| {
+                json!({
+                    "id": hid.to_string(),
+                    "messagesAdded": ids
+                        .iter()
+                        .map(|m| json!({ "message": { "id": m } }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Json(json!({ "history": records, "historyId": h.top.to_string() })).into_response()
+    }
+
+    async fn mock_messages_list(
+        State(g): State<MockGmail>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let label = q.get("labelIds").cloned().unwrap_or_default();
+        let mut st = g.0.lock().unwrap();
+        st.seen.push(format!("list:{label}"));
+        let ids = st.listing.get(&label).cloned().unwrap_or_default();
+        Json(json!({
+            "messages": ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn mock_message_get(
+        State(g): State<MockGmail>,
+        AxumPath(id): AxumPath<String>,
+    ) -> Response {
+        let mut st = g.0.lock().unwrap();
+        st.seen.push(format!("get:{id}"));
+        match st.bodies.get(&id) {
+            Some(eml) => Json(json!({
+                "id": id,
+                "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml),
+                "internalDate": Utc::now().timestamp_millis().to_string(),
+            }))
+            .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn mock_profile(State(g): State<MockGmail>) -> Json<Value> {
+        let st = g.0.lock().unwrap();
+        Json(json!({ "historyId": st.profile_history_id.to_string() }))
+    }
+
+    /// Bind the mock on an ephemeral loopback port; returns its API base.
+    async fn serve_mock(g: MockGmail) -> String {
+        let app = Router::new()
+            .route("/history", get(mock_history))
+            .route("/messages", get(mock_messages_list))
+            .route("/messages/{id}", get(mock_message_get))
+            .route("/profile", get(mock_profile))
+            .with_state(g);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A credential store handing out one fixed token; the mock ignores it.
+    struct FixedToken;
+
+    #[async_trait]
+    impl CredentialStore for FixedToken {
+        async fn token(&self, _account: AccountId) -> Result<crate::credentials::OAuthToken> {
+            Ok(crate::credentials::OAuthToken {
+                access_token: "test-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+            })
+        }
+    }
+
+    fn engine(
+        store: Arc<SqliteStore>,
+        acct: AccountId,
+        base: &str,
+    ) -> SyncEngine<SqliteStore, FixedToken> {
+        SyncEngine::new(
+            store,
+            Arc::new(FixedToken),
+            acct,
+            "me@example.com".to_string(),
+            Config::default(),
+        )
+        .with_api_base(base.to_string())
+    }
+
+    /// Open an in-memory store with a live history cursor at `cursor`.
+    fn store_at_cursor(cursor: Option<u64>) -> (Arc<SqliteStore>, AccountId) {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        if let Some(c) = cursor {
+            store
+                .set_sync_state(
+                    acct,
+                    HISTORY_KEY,
+                    &SyncState {
+                        uidvalidity: 0,
+                        last_uid: c,
+                    },
+                )
+                .unwrap();
+        }
+        (store, acct)
+    }
+
+    fn cursor_of(store: &SqliteStore, acct: AccountId) -> Option<u64> {
+        store
+            .sync_state(acct, HISTORY_KEY)
+            .unwrap()
+            .map(|s| s.last_uid)
+    }
+
+    /// Mail the user WROTE, dated `at` so it is inside the freshness window —
+    /// the storm guard must not be what makes these tests quiet.
+    fn sent_eml(at: DateTime<Utc>, to: &str, subject: &str) -> String {
+        format!(
+            "From: me@example.com\r\n\
+             To: {to}\r\n\
+             Subject: {subject}\r\n\
+             Date: {}\r\n\
+             \r\n\
+             writing this from the phone app\r\n",
+            at.to_rfc2822()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_sent_history_record_ingests_neutral_and_silent() {
+        // Sent from the phone: SENT only, never INBOX. Before the sent walk this
+        // message simply did not exist locally until the next full backfill.
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::quiet(100));
+        g.history(LABEL_SENT, LabelHistory::added(140, &[(140, "g-phone")]));
+        g.body(
+            "g-phone",
+            sent_eml(now, "alice@friends.com", "lunch thursday"),
+        );
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        // The row landed...
+        let view = store.thread_view(acct, "g-phone").unwrap();
+        assert_eq!(view.messages.len(), 1);
+        let mid = view.messages[0].id;
+
+        // ...NEUTRAL, and out of both LLM queues: no triage spend on the user's
+        // own writing, ever.
+        let row = store.triage_debug(acct, mid).unwrap().expect("triage row");
+        assert_eq!(row.tier, "noise");
+        assert_eq!(row.importance, 0);
+        assert_eq!(row.stage1_model_used.as_deref(), Some("n/a"));
+        assert!(!row.needs_stage2);
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+
+        // THE SILENCE INVARIANT: never a push for mail the user sent themselves.
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        assert_eq!(store.latest_event_id(acct).unwrap(), 0);
+
+        // And it stays out of the bands and out of search, as sent mail must.
+        assert!(
+            store
+                .ranked_updates(acct, now - ChronoDuration::days(1), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search(acct, "lunch", 10, 0).unwrap().is_empty());
+
+        // The recipients still seed contacts, which is half the point of having
+        // the mail at all.
+        assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
+        assert_eq!(cursor_of(&store, acct), Some(140));
+    }
+
+    #[tokio::test]
+    async fn a_sealed_outbound_copy_is_never_committed() {
+        // The user replies from their phone to a thread quoting an OTP. Seal
+        // detection fires on the reply, and `thread_guard_and_subject` 404s any
+        // thread holding a sealed row — so committing it would hide the
+        // counterparty's mail the user is reading. Nothing is written at all.
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+        let reply = format!(
+            "From: me@example.com\r\n\
+             To: Bank <noreply@bank.example>\r\n\
+             Subject: Re: Your verification code\r\n\
+             Date: {}\r\n\
+             \r\n\
+             got it, thanks\r\n\
+             > Your one-time passcode is 483920. Enter this code to continue.\r\n",
+            now.to_rfc2822()
+        );
+
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::quiet(100));
+        g.history(
+            LABEL_SENT,
+            LabelHistory::added(170, &[(170, "g-sealed-out")]),
+        );
+        g.body("g-sealed-out", reply);
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert!(
+            store.thread_view(acct, "g-sealed-out").is_err(),
+            "no row is committed for a sealed outbound copy"
+        );
+        assert!(
+            store.sealed_messages(acct).unwrap().is_empty(),
+            "not committed-then-sealed: not committed at all"
+        );
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        // The poll is otherwise normal: the cursor still commits.
+        assert_eq!(cursor_of(&store, acct), Some(170));
+    }
+
+    #[tokio::test]
+    async fn a_self_addressed_send_keeps_its_visible_inbox_copy() {
+        // Mail to yourself carries BOTH labels, so both filtered walks return it.
+        // The message upsert writes `is_sent = excluded.is_sent` on conflict, so a
+        // sent copy landing second would hide the message from every band.
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+        let eml = format!(
+            "From: me@example.com\r\n\
+             To: me@example.com\r\n\
+             Subject: note to self about the lease\r\n\
+             Date: {}\r\n\
+             \r\n\
+             remember to countersign\r\n",
+            now.to_rfc2822()
+        );
+
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::added(150, &[(150, "g-self")]));
+        g.history(LABEL_SENT, LabelHistory::added(150, &[(150, "g-self")]));
+        g.body("g-self", eml);
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        // ONE row, and it is the visible one.
+        let view = store.thread_view(acct, "g-self").unwrap();
+        assert_eq!(view.messages.len(), 1, "one row, not two");
+        let visible = store
+            .ranked_updates(acct, now - ChronoDuration::days(1), None)
+            .unwrap();
+        assert_eq!(
+            visible.len(),
+            1,
+            "the inbox copy must win the unique-key race"
+        );
+        assert_eq!(visible[0].id, view.messages[0].id);
+
+        // The INBOX walk ran FIRST and claimed the id, so the sent half never even
+        // re-fetched it.
+        assert!(
+            g.at("history:INBOX") < g.at("history:SENT"),
+            "{:?}",
+            g.seen()
+        );
+        assert_eq!(g.calls("get:g-self"), 1, "fetched once, not twice");
+    }
+
+    #[tokio::test]
+    async fn a_failing_sent_walk_keeps_the_inbox_batch_and_holds_the_cursor() {
+        // Losing the sent half is survivable; losing INBOX progress is not. The
+        // cursor stays put and the next poll re-walks both labels from it.
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+        let eml = format!(
+            "From: Alice <alice@friends.com>\r\n\
+             To: me@example.com\r\n\
+             Subject: the lease\r\n\
+             Date: {}\r\n\
+             \r\n\
+             sending the countersigned copy over\r\n",
+            now.to_rfc2822()
+        );
+
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::added(150, &[(150, "g-in")]));
+        g.history(LABEL_SENT, LabelHistory::broken());
+        g.body("g-in", eml);
+        let base = serve_mock(g.clone()).await;
+
+        // The poll SUCCEEDS: a sent-side outage is not worth a backoff cycle.
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .ranked_updates(acct, now - ChronoDuration::days(1), None)
+                .unwrap()
+                .len(),
+            1,
+            "the inbox batch is ingested even though the sent walk failed"
+        );
+        assert_eq!(
+            cursor_of(&store, acct),
+            Some(100),
+            "a partial poll must not commit the cursor"
+        );
+
+        // The re-walk next poll is idempotent: still one row, still one event.
+        let events_before = store.events_after(acct, 0, 100).unwrap().len();
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+        assert_eq!(store.thread_view(acct, "g-in").unwrap().messages.len(), 1);
+        assert_eq!(
+            store.events_after(acct, 0, 100).unwrap().len(),
+            events_before
+        );
+        assert_eq!(cursor_of(&store, acct), Some(100));
+    }
+
+    #[tokio::test]
+    async fn the_cursor_commits_once_at_the_max_across_both_walks() {
+        // One commit, at the highest historyId either walk saw — committing per
+        // walk would let the second one rewind the first.
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::added(150, &[(150, "g-in")]));
+        g.history(LABEL_SENT, LabelHistory::added(220, &[(220, "g-out")]));
+        g.body(
+            "g-in",
+            format!(
+                "From: Alice <alice@friends.com>\r\n\
+                 To: me@example.com\r\n\
+                 Subject: the lease\r\n\
+                 Date: {}\r\n\
+                 \r\n\
+                 countersigned copy attached\r\n",
+                now.to_rfc2822()
+            ),
+        );
+        g.body("g-out", sent_eml(now, "alice@friends.com", "re: the lease"));
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(cursor_of(&store, acct), Some(220), "max across both walks");
+        // Both landed, each on its own side of the visibility line.
+        assert_eq!(
+            store
+                .ranked_updates(acct, now - ChronoDuration::days(1), None)
+                .unwrap()
+                .len(),
+            1,
+            "only the received message is in a band"
+        );
+        assert_eq!(store.thread_view(acct, "g-out").unwrap().messages.len(), 1);
+        assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
+    }
+
+    #[tokio::test]
+    async fn catch_up_lists_inbox_and_sent_over_the_same_window() {
+        // No cursor: the history walk cannot account for the gap, so both labels
+        // are re-listed or everything written from another client is lost.
+        let (store, acct) = store_at_cursor(None);
+        let now = Utc::now();
+
+        let g = MockGmail::default();
+        // "g-self" is in BOTH listings, as a self-addressed message is.
+        g.listing(LABEL_INBOX, &["g-in", "g-self"]);
+        g.listing(LABEL_SENT, &["g-out", "g-self"]);
+        g.body(
+            "g-in",
+            format!(
+                "From: Alice <alice@friends.com>\r\n\
+                 To: me@example.com\r\n\
+                 Subject: the lease\r\n\
+                 Date: {}\r\n\
+                 \r\n\
+                 countersigned copy attached\r\n",
+                now.to_rfc2822()
+            ),
+        );
+        g.body("g-out", sent_eml(now, "bob@friends.com", "re: the lease"));
+        g.body(
+            "g-self",
+            format!(
+                "From: me@example.com\r\n\
+                 To: me@example.com\r\n\
+                 Subject: note to self\r\n\
+                 Date: {}\r\n\
+                 \r\n\
+                 countersign this\r\n",
+                now.to_rfc2822()
+            ),
+        );
+        g.profile(900);
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert!(g.at("list:INBOX") < g.at("list:SENT"), "{:?}", g.seen());
+        assert_eq!(store.thread_view(acct, "g-out").unwrap().messages.len(), 1);
+        assert!(store.is_known_contact(acct, "bob@friends.com").unwrap());
+        // The dual-listed message keeps its visible copy, exactly as in the walk.
+        let visible: Vec<String> = store
+            .ranked_updates(acct, now - ChronoDuration::days(1), None)
+            .unwrap()
+            .into_iter()
+            .map(|u| u.thread_id)
+            .collect();
+        assert!(visible.contains(&"g-in".to_string()));
+        assert!(visible.contains(&"g-self".to_string()));
+        assert_eq!(g.calls("get:g-self"), 1, "fetched once, not twice");
+        assert_eq!(cursor_of(&store, acct), Some(900));
+    }
+
+    #[tokio::test]
+    async fn a_message_the_api_already_echoed_redelivers_as_a_no_op() {
+        // The api echoes a send at send time; the sent walk then delivers the very
+        // same Gmail id on the next poll.
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+        let eml = sent_eml(now, "alice@friends.com", "re: the lease");
+
+        let echoed = ingest::ingest_sent(
+            &store,
+            acct,
+            "me@example.com",
+            "g-echo",
+            None,
+            eml.clone().into_bytes(),
+            Some(now),
+            now,
+        )
+        .unwrap()
+        .expect("the echo commits a row");
+
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::quiet(100));
+        g.history(LABEL_SENT, LabelHistory::added(160, &[(160, "g-echo")]));
+        g.body("g-echo", eml);
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        let view = store.thread_view(acct, "g-echo").unwrap();
+        assert_eq!(view.messages.len(), 1, "one row, not a second copy");
+        assert_eq!(view.messages[0].id, echoed, "the same local row");
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        assert!(
+            store
+                .ranked_updates(acct, now - ChronoDuration::days(1), None)
+                .unwrap()
+                .is_empty(),
+            "re-delivery must not promote the echo into a band"
+        );
+        let row = store
+            .triage_debug(acct, echoed)
+            .unwrap()
+            .expect("triage row");
+        assert_eq!(row.tier, "noise");
+        assert_eq!(row.importance, 0);
     }
 }

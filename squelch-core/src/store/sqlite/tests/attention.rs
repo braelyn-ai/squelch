@@ -93,9 +93,11 @@ fn set_attention_status_resolves_and_reopens() {
     let since = Utc::now() - chrono::Duration::days(1);
     let id = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, Utc::now());
 
-    assert!(store
-        .set_attention_status(acct, id, AttentionStatus::Done)
-        .unwrap());
+    assert!(
+        store
+            .set_attention_status(acct, id, AttentionStatus::Done)
+            .unwrap()
+    );
     let done = store
         .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
         .unwrap();
@@ -103,9 +105,11 @@ fn set_attention_status_resolves_and_reopens() {
     assert!(done[0].resolved_at.is_some(), "done stamps resolved_at");
 
     // Reopen clears resolved_at.
-    assert!(store
-        .set_attention_status(acct, id, AttentionStatus::Open)
-        .unwrap());
+    assert!(
+        store
+            .set_attention_status(acct, id, AttentionStatus::Open)
+            .unwrap()
+    );
     let open = store
         .attention_updates(acct, since, None, Some(AttentionStatus::Open), None)
         .unwrap();
@@ -113,9 +117,11 @@ fn set_attention_status_resolves_and_reopens() {
     assert!(open[0].resolved_at.is_none(), "reopen clears resolved_at");
 
     // Unknown id => false.
-    assert!(!store
-        .set_attention_status(acct, 999, AttentionStatus::Done)
-        .unwrap());
+    assert!(
+        !store
+            .set_attention_status(acct, 999, AttentionStatus::Done)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -125,9 +131,18 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
     // exactly like the unsubscribe not having worked.
     let (store, acct) = store();
     let now = Utc::now();
-    let a = triaged(acct, "g1", "t1").from("news@shop.com").received_at(now).seed(&store);
-    let b = triaged(acct, "g2", "t2").from("NEWS@Shop.com").received_at(now).seed(&store);
-    let other = triaged(acct, "g3", "t3").from("real@person.com").received_at(now).seed(&store);
+    let a = triaged(acct, "g1", "t1")
+        .from("news@shop.com")
+        .received_at(now)
+        .seed(&store);
+    let b = triaged(acct, "g2", "t2")
+        .from("NEWS@Shop.com")
+        .received_at(now)
+        .seed(&store);
+    let other = triaged(acct, "g3", "t3")
+        .from("real@person.com")
+        .received_at(now)
+        .seed(&store);
     let sealed = triaged(acct, "g4", "t4")
         .from("news@shop.com")
         .received_at(now)
@@ -149,8 +164,14 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
     let done = store
         .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
         .unwrap();
-    assert!(done.iter().all(|u| u.update.id != other), "another sender is untouched");
-    assert!(done.iter().all(|u| u.update.id != sealed), "sealed is never touched");
+    assert!(
+        done.iter().all(|u| u.update.id != other),
+        "another sender is untouched"
+    );
+    assert!(
+        done.iter().all(|u| u.update.id != sealed),
+        "sealed is never touched"
+    );
 
     // Idempotent: a second call moves nothing, so an already-done row keeps the
     // resolved_at (and the reason) it was first given.
@@ -170,11 +191,24 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
     let since = Utc::now() - chrono::Duration::days(30);
 
     let older = ingest_normal(
-        &store, acct, "g1", "thr-dup", Tier::PastDue, 80,
+        &store,
+        acct,
+        "g1",
+        "thr-dup",
+        Tier::PastDue,
+        80,
         Utc::now() - chrono::Duration::days(2),
     );
     let newer = ingest_normal(&store, acct, "g2", "thr-dup", Tier::PastDue, 90, Utc::now());
-    let other = ingest_normal(&store, acct, "g3", "thr-solo", Tier::Deadline, 70, Utc::now());
+    let other = ingest_normal(
+        &store,
+        acct,
+        "g3",
+        "thr-solo",
+        Tier::Deadline,
+        70,
+        Utc::now(),
+    );
 
     // One row for the duplicated thread, and it is the band-sort-first message
     // (higher importance wins the representative slot).
@@ -182,23 +216,38 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
         .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
         .unwrap();
     assert_eq!(standing.len(), 2, "two threads, two rows: {standing:#?}");
-    assert_eq!(standing[0].update.id, newer, "representative is band-sort-first");
-    assert!(standing.iter().all(|u| u.update.id != older), "sibling hidden");
+    assert_eq!(
+        standing[0].update.id, newer,
+        "representative is band-sort-first"
+    );
+    assert!(
+        standing.iter().all(|u| u.update.id != older),
+        "sibling hidden"
+    );
 
     // Header counts agree with the collapsed list.
     let stats = store.stats(acct).unwrap();
-    assert_eq!(stats.bands.standing, 2, "standing counts threads, not messages");
+    assert_eq!(
+        stats.bands.standing, 2,
+        "standing counts threads, not messages"
+    );
     assert_eq!(stats.bands.new, 2, "new counts threads, not messages");
 
     // Done on the representative resolves the WHOLE thread: the sibling must
     // not reappear in any band.
-    assert!(store
-        .set_attention_status(acct, newer, AttentionStatus::Done)
-        .unwrap());
+    assert!(
+        store
+            .set_attention_status(acct, newer, AttentionStatus::Done)
+            .unwrap()
+    );
     let standing2 = store
         .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
         .unwrap();
-    assert_eq!(standing2.len(), 1, "resolved thread fully gone: {standing2:#?}");
+    assert_eq!(
+        standing2.len(),
+        1,
+        "resolved thread fully gone: {standing2:#?}"
+    );
     assert_eq!(standing2[0].update.id, other);
 
     // The unrelated thread was untouched.
@@ -220,22 +269,28 @@ fn sealed_rows_never_surface_through_the_ledger() {
         .seed(&store);
 
     // Never appears in attention_updates (any band).
-    assert!(store
-        .attention_updates(acct, since, None, None, None)
-        .unwrap()
-        .is_empty());
-    assert!(store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New))
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .attention_updates(acct, since, None, None, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .unwrap()
+            .is_empty()
+    );
 
     // mark_surfaced refuses to stamp a sealed row.
     let n = store.mark_surfaced(acct, &[sealed]).unwrap();
     assert_eq!(n, 0);
     // set_attention_status refuses a sealed row.
-    assert!(!store
-        .set_attention_status(acct, sealed, AttentionStatus::Done)
-        .unwrap());
+    assert!(
+        !store
+            .set_attention_status(acct, sealed, AttentionStatus::Done)
+            .unwrap()
+    );
 
     // Stats: sealed row contributes to `sealed`, never to any band, and
     // never advances last_surfaced_at.
@@ -245,6 +300,263 @@ fn sealed_rows_never_surface_through_the_ledger() {
     assert_eq!(stats.bands.standing, 0);
     assert_eq!(stats.bands.open, 0);
     assert!(stats.last_surfaced_at.is_none());
+}
+
+// ---- standing band: live correspondence ---------------------------------
+
+/// Land a contacts row through the Sent-history merge — the path the harvest
+/// uses — so the known-contact half of the standing band has something to match.
+fn contact(store: &SqliteStore, acct: AccountId, addr: &str, sent_count: i64) {
+    store
+        .merge_harvested_contacts(
+            acct,
+            &[ContactEntry {
+                addr: addr.to_string(),
+                display_name: None,
+                sent_count,
+                last_sent_at: None,
+            }],
+        )
+        .unwrap();
+}
+
+/// A dateless signal-tier inbound from `from` — the shape that carries a real
+/// ask but no deadline, so tier alone never lands it in the standing band.
+fn dateless(store: &SqliteStore, acct: AccountId, gmail: &str, thread: &str, from: &str) -> i64 {
+    triaged(acct, gmail, thread)
+        .from(from)
+        .received_at(Utc::now())
+        .importance(70)
+        .tier(Tier::Signal)
+        .seed(store)
+}
+
+fn standing_ids(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<i64> {
+    store
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .unwrap()
+        .into_iter()
+        .map(|u| u.update.id)
+        .collect()
+}
+
+#[test]
+fn standing_admits_dateless_mail_from_a_sender_the_user_has_written_to() {
+    // THE MISSED ASK: a real correspondent wanted something, attached no date,
+    // so no deadline tier — and the surfacing clock rotated it out of view.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "johanna@wvfc.org", 12);
+    contact(&store, acct, "list@wvfc.org", 0);
+
+    let known = dateless(&store, acct, "g1", "t1", "johanna@wvfc.org");
+    let never_written_to = dateless(&store, acct, "g2", "t2", "list@wvfc.org");
+    let stranger = dateless(&store, acct, "g3", "t3", "hello@bigbox.com");
+
+    let standing = standing_ids(&store, acct, since);
+    assert_eq!(standing, vec![known], "only the known contact stands");
+    assert!(
+        !standing.contains(&never_written_to),
+        "sent_count 0 is not a correspondent"
+    );
+    assert!(
+        !standing.contains(&stranger),
+        "a stranger's dateless mail is not owed"
+    );
+    assert_eq!(store.stats(acct).unwrap().bands.standing, 1);
+}
+
+#[test]
+fn standing_known_contact_match_folds_address_case() {
+    // from_addr is stored as the header spelled it; the contact row is
+    // lowercased by the harvest. Neither side may be assumed normalized.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "johanna@wvfc.org", 3);
+
+    let shouty = dateless(&store, acct, "g1", "t1", "Johanna@WVFC.org");
+    assert_eq!(standing_ids(&store, acct, since), vec![shouty]);
+    assert_eq!(store.stats(acct).unwrap().bands.standing, 1);
+}
+
+#[test]
+fn standing_admits_a_thread_the_user_has_written_in() {
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+
+    // A thread carrying the user's own reply, plus one the user never joined.
+    let reply = triaged(acct, "g-sent", "thr-live")
+        .from("me@example.com")
+        .is_sent(true)
+        .importance(90)
+        .tier(Tier::Signal)
+        .seed(&store);
+    let theirs = dateless(&store, acct, "g1", "thr-live", "stranger@bigbox.com");
+    let quiet = dateless(&store, acct, "g2", "thr-quiet", "stranger@bigbox.com");
+
+    let standing = standing_ids(&store, acct, since);
+    assert_eq!(standing, vec![theirs], "writing in a thread makes it live");
+    assert!(!standing.contains(&quiet), "an unjoined thread stays out");
+
+    // SECURITY/UX: the evidence row is never itself listed, in any band.
+    let all = store
+        .attention_updates(acct, since, None, None, None)
+        .unwrap();
+    assert!(
+        all.iter().all(|u| u.update.id != reply),
+        "sent mail is never listed"
+    );
+    assert!(!standing.contains(&reply));
+    assert_eq!(store.stats(acct).unwrap().bands.standing, 1);
+}
+
+#[test]
+fn standing_drops_a_resolved_participated_thread() {
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "johanna@wvfc.org", 5);
+    let known = dateless(&store, acct, "g1", "t1", "johanna@wvfc.org");
+
+    assert_eq!(standing_ids(&store, acct, since), vec![known]);
+    assert!(
+        store
+            .set_attention_status(acct, known, AttentionStatus::Done)
+            .unwrap()
+    );
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "done leaves the band"
+    );
+    assert_eq!(store.stats(acct).unwrap().bands.standing, 0);
+}
+
+#[test]
+fn standing_correspondence_arms_do_not_cross_accounts() {
+    // SECURITY: both EXISTS arms are account-scoped. One account's correspondence
+    // is not evidence for another's: a shared work address the user writes to
+    // from account B must not pull B-shaped mail into account A's band, and a
+    // thread id colliding across mailboxes must not count as participation.
+    let (store, a) = store();
+    let b = store.ensure_account("other@example.com").unwrap();
+    let since = Utc::now() - chrono::Duration::days(30);
+
+    // Only account B has ever written to Johanna, or written in this thread.
+    contact(&store, b, "johanna@wvfc.org", 12);
+    triaged(b, "g-b-sent", "thr-shared")
+        .from("other@example.com")
+        .is_sent(true)
+        .seed(&store);
+
+    let a_from_b_contact = dateless(&store, a, "g-a1", "t-a1", "johanna@wvfc.org");
+    let a_in_b_thread = dateless(&store, a, "g-a2", "thr-shared", "stranger@bigbox.com");
+
+    let standing_a = standing_ids(&store, a, since);
+    assert!(
+        standing_a.is_empty(),
+        "account B's correspondence must not widen account A's band: {standing_a:?}"
+    );
+    assert!(!standing_a.contains(&a_from_b_contact));
+    assert!(!standing_a.contains(&a_in_b_thread));
+    assert_eq!(store.stats(a).unwrap().bands.standing, 0, "header agrees");
+
+    // The same rows DO stand once account A itself is the correspondent.
+    contact(&store, a, "johanna@wvfc.org", 4);
+    assert_eq!(standing_ids(&store, a, since), vec![a_from_b_contact]);
+    assert_eq!(store.stats(a).unwrap().bands.standing, 1);
+}
+
+#[test]
+fn standing_never_admits_sealed_mail_from_a_correspondent() {
+    // SECURITY: participation widens the band's DEFINITION, never its clearance.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "johanna@wvfc.org", 5);
+
+    let sealed_known = triaged(acct, "g1", "t1")
+        .from("johanna@wvfc.org")
+        .importance(90)
+        .tier(Tier::Signal)
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+    triaged(acct, "g-sent", "thr-live")
+        .from("me@example.com")
+        .is_sent(true)
+        .seed(&store);
+    let sealed_thread = triaged(acct, "g2", "thr-live")
+        .from("stranger@bigbox.com")
+        .importance(90)
+        .tier(Tier::Signal)
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+
+    let standing = standing_ids(&store, acct, since);
+    assert!(
+        standing.is_empty(),
+        "sealed rows are absent from the band: {standing:?}"
+    );
+    assert!(!standing.contains(&sealed_known));
+    assert!(!standing.contains(&sealed_thread));
+    assert_eq!(store.stats(acct).unwrap().bands.standing, 0);
+}
+
+#[test]
+fn stats_standing_count_matches_the_listed_standing_band() {
+    // Header and list must agree over the widened definition, thread collapse
+    // included.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "johanna@wvfc.org", 5);
+
+    let bill = ingest_normal(
+        &store,
+        acct,
+        "g-bill",
+        "t-bill",
+        Tier::PastDue,
+        95,
+        Utc::now(),
+    );
+    let known = dateless(&store, acct, "g-known", "t-known", "johanna@wvfc.org");
+    // A live thread with TWO inbound rows: one band row, one counted thread.
+    triaged(acct, "g-sent", "thr-live")
+        .from("me@example.com")
+        .is_sent(true)
+        .seed(&store);
+    dateless(&store, acct, "g-live1", "thr-live", "stranger@bigbox.com");
+    let live_newer = triaged(acct, "g-live2", "thr-live")
+        .from("stranger@bigbox.com")
+        .received_at(Utc::now())
+        .importance(88)
+        .tier(Tier::Signal)
+        .seed(&store);
+    // Out: a stranger, a done row, a sealed row.
+    dateless(&store, acct, "g-cold", "t-cold", "hello@bigbox.com");
+    let done = dateless(&store, acct, "g-done", "t-done", "johanna@wvfc.org");
+    store
+        .set_attention_status(acct, done, AttentionStatus::Done)
+        .unwrap();
+    triaged(acct, "g-sealed", "t-sealed")
+        .from("johanna@wvfc.org")
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+
+    let standing = standing_ids(&store, acct, since);
+    assert_eq!(
+        standing.len(),
+        3,
+        "bill + known contact + live thread: {standing:?}"
+    );
+    assert!(standing.contains(&bill));
+    assert!(standing.contains(&known));
+    assert!(
+        standing.contains(&live_newer),
+        "thread collapses to its sort-first row"
+    );
+    assert_eq!(
+        store.stats(acct).unwrap().bands.standing as usize,
+        standing.len(),
+        "header count equals the listed band"
+    );
 }
 
 #[test]

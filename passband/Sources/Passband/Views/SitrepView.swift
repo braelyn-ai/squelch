@@ -261,6 +261,10 @@ struct SitrepView: View {
 
     // MARK: - (a) for your eyes
 
+    /// The standing band, ranked: dated obligations AND live correspondence
+    /// (threads the reader has written in, senders they have written to). A row
+    /// here is therefore no promise of a deadline — `Ranking` scores a dateless
+    /// row at urgency 0, which is what keeps the real dates at the top.
     private func forYourEyes(visible: [AttentionUpdate], overflow: Int) -> some View {
         ZoneCard(
             symbol: "eye", title: "For your eyes", count: store.sitrep.standing.count
@@ -540,6 +544,11 @@ private struct ObligationRow: View {
     /// on every render, and Swift `Regex` is far too slow for that path.
     private var amount: String? { MoneyScan.amount(in: update.one_line) }
 
+    /// Whether this row's TIER asserts a date. Reading the tier rather than the
+    /// band is the point: the band admits dateless mail on its own terms, so
+    /// only a tier that promised a date can be missing one.
+    private var claimsDate: Bool { update.tier == .pastDue || update.tier == .deadline }
+
     var body: some View {
         let chip = Fmt.deadlineChip(update.deadline)
         let overdue = chip?.overdue ?? false
@@ -581,7 +590,11 @@ private struct ObligationRow: View {
                         filled: overdue
                     )
                     .layoutPriority(3)
-                } else {
+                } else if claimsDate {
+                    // Said ONLY where the tier asserts a date the row does not
+                    // carry. Most of this zone is dateless by design — live
+                    // correspondence — and stamping every one of those rows
+                    // "no due date" annotates an omission they never had.
                     Text("no due date")
                         .font(Typo.micro)
                         .foregroundStyle(Palette.inkFaintest)
