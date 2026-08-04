@@ -108,12 +108,22 @@ enum Actions {
     /// sender abused the situation, not necessarily its whole domain. Pass the
     /// message the block was invoked from (when one is on screen) and the
     /// server resolves it to done — blocking IS that email's disposition.
+    ///
+    /// The disposition is stated EXPLICITLY and must stay that way: this path
+    /// has no want text to infer from, and the daemon only sweeps on an explicit
+    /// squelch. Do not "simplify" it to the inferred (absent) form.
+    ///
+    /// This is also the ONE caller that sets `sweep`, and it should: blocking a
+    /// sender means their open mail goes too, not just the message on screen.
+    /// Every other create path (the rule editor's save, an undo recreating a
+    /// deleted rule) leaves the flag absent and touches nothing already in the
+    /// bands.
     static func createBlockRule(sender: String, sourceMessageId: Int? = nil) async throws {
         try await APIClient.shared.createRule(
             CreateRuleBody(
                 match_pattern: sender.trimmingCharacters(in: .whitespaces).lowercased(),
                 want: "", disposition: .squelch,
-                source_message_id: sourceMessageId))
+                source_message_id: sourceMessageId, sweep: true))
         Analytics.capture("block_rule_created")
     }
 }

@@ -373,15 +373,38 @@ struct SenderRule: Codable, Sendable, Identifiable, Hashable {
 struct CreateRuleBody: Codable, Sendable {
     var match_pattern: String
     var want: String
-    var disposition: Disposition
+    /// ABSENT asks the daemon to infer the outcome from `want` — the owner's own
+    /// sentence, and nothing else, ever. Encodes as absent when nil, the same way
+    /// `source_message_id` does. A caller that means one specific outcome (the
+    /// block flow, an undo restoring a deleted rule, an explicit override in the
+    /// editor's advanced section) still names it, and a named value wins.
+    var disposition: Disposition?
     /// The message the block was invoked FROM, when there is one on screen: a
     /// squelch rule resolves it server-side (blocking is that email's
     /// disposition). Encodes as absent when nil, so the rule editor's plain
     /// creates are unchanged.
     var source_message_id: Int? = nil
+    /// Asks the daemon to ALSO resolve every open message already on file from
+    /// this sender, not just the one the rule was created from. Encodes as
+    /// absent when nil and the server reads absent as false, so only a caller
+    /// that means "clear this sender out of my inbox" sends it.
+    ///
+    /// Deliberately separate from an explicit `.squelch`: stating the outcome
+    /// says what the rule IS, this says what to do about mail that already
+    /// arrived. An undo recreating a deleted mute rule needs the first without
+    /// the second, so it omits this and nothing gets swept.
+    var sweep: Bool? = nil
 }
 
-struct CreatedRule: Codable, Sendable { var rule_id: Int }
+/// POST /client/rules and PUT /client/rules/{id}.
+struct CreatedRule: Codable, Sendable {
+    var rule_id: Int
+    /// What the rule ACTUALLY ended up as, which is the only place the client
+    /// can learn the answer when it asked for inference. Optional because a
+    /// pre-inference daemon answers with `rule_id` alone: absent means "the
+    /// server did not say", never "no disposition".
+    var disposition: Disposition?
+}
 
 // MARK: - unsubscribe
 

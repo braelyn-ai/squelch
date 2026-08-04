@@ -40,3 +40,8 @@ zerocopy = { workspace = true }
 # a real guarantee if it is checked on the wire, not on a struct. Same axum 0.8
 # line the rest of the workspace pins.
 axum = { version = "0.8" }
+# Virtual time (`#[tokio::test(start_paused = true)]`) for the tests that assert
+# a wall-clock BOUND instead of sitting through it: the rule-inference budget
+# wraps a retry ladder whose real duration is minutes. tokio's "full" feature set
+# deliberately leaves test-util out, so it is asked for here.
+tokio = { workspace = true, features = ["test-util"] }

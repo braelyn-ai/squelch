@@ -20,6 +20,8 @@ use squelch_core::store::{
     ActionMessageRef, Draft, NewAuditEntry, SitrepBand, SqliteStore, Store,
 };
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
+use squelch_core::triage::llm::Usage;
+use squelch_core::triage::rule_infer;
 use squelch_core::types::{
     AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
 };
@@ -713,12 +715,148 @@ pub async fn list_rules(
 pub struct CreateRuleBody {
     match_pattern: String,
     want: String,
-    disposition: String,
+    /// What the rule DOES. Optional: absent (or the literal `"auto"`) means the
+    /// daemon infers it from `want`, the plain-English sentence the composer
+    /// asks for, so the client never has to make the user pick a taxonomy.
+    /// An explicit value is honored verbatim.
+    #[serde(default)]
+    disposition: Option<String>,
     /// The message the user was acting FROM (the block-sender flows), so a
     /// squelch rule can resolve it: blocking the sender IS that email's
     /// disposition. Optional — the rule editor has no source message.
     #[serde(default)]
     source_message_id: Option<i64>,
+    /// INTENT TO MASS-RESOLVE. `true` only from the block-sender flow, where the
+    /// user's click means "and clear what they already sent"; every other path
+    /// (the rule editor's save, an undo recreating a deleted rule) omits it.
+    ///
+    /// Separate from the disposition on purpose: "this rule squelches" and "sweep
+    /// this sender out of the inbox right now" are different claims, and undoing
+    /// a rule delete must be able to make the first without making the second.
+    #[serde(default)]
+    sweep: bool,
+}
+
+/// The literal `disposition` value that asks for inference explicitly, for a
+/// client that would rather send a value than omit the key. EXACT MATCH: the real
+/// dispositions parse exactly, so this one does too.
+const DISPOSITION_AUTO: &str = "auto";
+
+const DISPOSITION_HINT: &str =
+    "disposition must be surface, squelch, or filtered (or omitted, or \"auto\", \
+     to infer it from want)";
+
+/// A rule write's disposition, plus WHO decided it. The flag is
+/// security-relevant: an inferred verdict is a guess about one sentence, so it
+/// may set what the rule does but must not trigger the destructive side effect
+/// an explicit squelch does. See [`create_rule`].
+struct ResolvedDisposition {
+    disposition: Disposition,
+    /// `true` when the REQUEST BODY named this disposition; `false` when a model
+    /// inferred it from `want`.
+    explicit: bool,
+    /// What the inference call spent, when one ran. Billed by the caller into
+    /// [`RULE_INFER_LEDGER_CATEGORY`]; `None` when no call happened.
+    usage: Option<Usage>,
+}
+
+/// The usage-ledger category for rule-disposition inference. Its own line, not
+/// folded into `stage1`: this is interactive, user-triggered spend, and a call
+/// that lands in no category is spend no cap and no report can see.
+const RULE_INFER_LEDGER_CATEGORY: &str = "rule_infer";
+
+/// Bill one inference call. Best-effort by design: the rule is already written
+/// when this runs, and a ledger write that fails must not fail the save. Runs
+/// INSIDE the caller's existing store hop, so it costs no extra blocking task.
+fn bill_rule_inference(store: &SqliteStore, account_id: AccountId, usage: Option<Usage>) {
+    let Some(u) = usage else { return };
+    let day = Utc::now().format("%Y-%m-%d").to_string();
+    if let Err(e) = store.extract_bump_usage(
+        account_id,
+        &day,
+        RULE_INFER_LEDGER_CATEGORY,
+        u.input_tokens,
+        u.output_tokens,
+    ) {
+        eprintln!("squelch: rule inference usage ledger bump failed ({e})");
+    }
+}
+
+/// Resolve the disposition for a rule write: an explicit value parses as before,
+/// and an absent/`auto` one is inferred from the owner's `want` sentence.
+///
+/// The classifier is fed the OWNER'S SENTENCE ONLY — never a subject, body, or
+/// any other message content — so a hostile email can never author a rule about
+/// its own sender. See [`squelch_core::triage::rule_infer`].
+///
+/// Inference NEVER fails a save: no LLM configured, an API error, or a refusal
+/// all resolve to `filtered`, which is the safe answer (a filtered rule defers to
+/// Stage-2, which reads the verbatim want text per email).
+///
+/// INFERENCE IS OPT-IN, EXACTLY: only an ABSENT key or the exact literal `"auto"`
+/// asks for it. Every other present value must parse as a real disposition or the
+/// write is a 400 — a typo, a stray empty string, or a case variant is a client
+/// bug, and quietly inferring instead would hand a model a decision the client
+/// believed it had made itself.
+async fn resolve_disposition(
+    state: &ApiState,
+    body: &CreateRuleBody,
+) -> Result<ResolvedDisposition, ApiError> {
+    let named = match body.disposition.as_deref() {
+        None => None,
+        Some(DISPOSITION_AUTO) => None,
+        Some(raw) => Some(raw),
+    };
+
+    if let Some(raw) = named {
+        let disposition =
+            Disposition::parse(raw).ok_or_else(|| ApiError::bad_request(DISPOSITION_HINT))?;
+        return Ok(ResolvedDisposition {
+            disposition,
+            explicit: true,
+            usage: None,
+        });
+    }
+
+    // Inference needs something to read. An empty want with no disposition is
+    // not a rule anyone could act on, so it is a 400 rather than a silent
+    // filtered rule the store would reject anyway.
+    if body.want.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "want must not be empty when disposition is omitted; say in plain words what you \
+             do, or do not, want from this sender",
+        ));
+    }
+
+    let (disposition, usage) = match state.rule_infer() {
+        Some(llm) => rule_infer::infer_disposition(&body.want, llm).await,
+        // No model configured: filtered is the safe standing answer.
+        None => (Disposition::Filtered, None),
+    };
+    Ok(ResolvedDisposition {
+        disposition,
+        // MUTATION UNDER TEST: is "auto" pinned as inferred anywhere?
+        explicit: body.disposition.as_deref() == Some(DISPOSITION_AUTO),
+        usage,
+    })
+}
+
+/// SIDE-EFFECT GUARD (security-relevant): may this rule write mark the sender's
+/// existing mail resolved?
+///
+/// TWO CONDITIONS, BOTH REQUIRED.
+///
+/// 1. An EXPLICIT squelch. An INFERRED squelch is one cheap model's read of one
+///    sentence, and the side effect is destructive at scale (every open row from
+///    that sender goes to done); a misclassification must never mass-resolve
+///    mail. The inferred rule still takes effect on FUTURE mail, which is
+///    recoverable by editing the rule.
+/// 2. `sweep`, the client's separate statement that this write means "and clear
+///    what they already sent". Only the block-sender flow sets it. A rule editor
+///    save, or an undo recreating a rule the user just deleted, restores the
+///    squelch WITHOUT re-sweeping an inbox the user may have since gone through.
+fn may_resolve_sender_mail(resolved: &ResolvedDisposition, sweep: bool) -> bool {
+    sweep && resolved.explicit && resolved.disposition == Disposition::Squelch
 }
 
 pub async fn create_rule(
@@ -728,35 +866,54 @@ pub async fn create_rule(
     if body.match_pattern.trim().is_empty() {
         return Err(ApiError::bad_request("match_pattern must not be empty"));
     }
-    let disposition = Disposition::parse(&body.disposition)
-        .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
+    let resolved = resolve_disposition(&state, &body).await?;
+    let disposition = resolved.disposition;
 
     let pattern = body.match_pattern.trim().to_string();
     let source_message_id = body.source_message_id;
+    let sweep = body.sweep;
+    let usage = resolved.usage;
     let id = store_call(&state, move |store, account_id| {
-        store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)
+        let id = store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)?;
+        bill_rule_inference(store, account_id, usage);
+        Ok(id)
     })
     .await?;
-    // Best-effort audit: target is the match_pattern, detail the new rule id.
-    audit_action(&state, "rule.create", Some(pattern.clone()), &id.to_string()).await;
+    // Best-effort audit: target is the match_pattern, detail the new rule id and
+    // the RESOLVED disposition — an inferred verdict has to be as traceable as a
+    // named one, since nothing in the request body records it.
+    audit_action(
+        &state,
+        "rule.create",
+        Some(pattern.clone()),
+        &format!("{id} disposition={}", disposition.as_str()),
+    )
+    .await;
     // RESOLUTION: a squelch rule marks that sender's open mail done — the user
     // just said "never again" about them, and leaving the mail they already sent
     // in the bands makes the rule look like it did nothing. Squelch only: a
     // surface/filtered rule is tuning, not a verdict.
+    //
+    // EXPLICIT squelch AND `sweep` — see [`may_resolve_sender_mail`]: an inferred
+    // squelch never mass-resolves mail, and neither does a save that did not ask
+    // to sweep (the editor, an undo).
     //
     // Driven by the PATTERN, not by source_message_id, so the block prompt in
     // the action layer — which has no message on screen to name — resolves too.
     // Wildcards are left alone: `*@acme.com` is a domain verdict, and resolving
     // every address under a domain from one click is a bigger claim than the
     // click made.
-    if disposition == Disposition::Squelch && !pattern.contains('*') {
-        resolve_sender_done(&state, &pattern).await;
-    } else if disposition == Disposition::Squelch
-        && let Some(mid) = source_message_id
-    {
-        resolve_done(&state, mid).await;
+    if may_resolve_sender_mail(&resolved, sweep) {
+        if !pattern.contains('*') {
+            resolve_sender_done(&state, &pattern).await;
+        } else if let Some(mid) = source_message_id {
+            resolve_done(&state, mid).await;
+        }
     }
-    Ok((StatusCode::CREATED, Json(json!({ "rule_id": id }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "rule_id": id, "disposition": disposition.as_str() })),
+    ))
 }
 
 pub async fn update_rule(
@@ -767,18 +924,35 @@ pub async fn update_rule(
     if body.match_pattern.trim().is_empty() {
         return Err(ApiError::bad_request("match_pattern must not be empty"));
     }
-    let disposition = Disposition::parse(&body.disposition)
-        .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
+    // An edit re-infers from the SUBMITTED want when the client omits the
+    // disposition: the sentence is what the rule means, so rewriting it can
+    // legitimately change what the rule does.
+    let resolved = resolve_disposition(&state, &body).await?;
+    let disposition = resolved.disposition;
 
     let pattern = body.match_pattern.clone();
+    let usage = resolved.usage;
     let updated = store_call(&state, move |store, account_id| {
-        store.update_sender_rule(account_id, id, &body.match_pattern, &body.want, disposition)
+        let updated =
+            store.update_sender_rule(account_id, id, &body.match_pattern, &body.want, disposition)?;
+        // Billed even when the id was bogus: the model call happened and was
+        // paid for regardless of what the store did with the row.
+        bill_rule_inference(store, account_id, usage);
+        Ok(updated)
     })
     .await?;
     if updated {
         // Only a real edit is recorded; a 404 changed nothing, so no row.
-        audit_action(&state, "rule.update", Some(pattern), &id.to_string()).await;
-        Ok(Json(json!({ "rule_id": id })))
+        audit_action(
+            &state,
+            "rule.update",
+            Some(pattern),
+            &format!("{id} disposition={}", disposition.as_str()),
+        )
+        .await;
+        Ok(Json(
+            json!({ "rule_id": id, "disposition": disposition.as_str() }),
+        ))
     } else {
         Err(ApiError::not_found())
     }

@@ -122,7 +122,12 @@ struct RulesView: View {
             Analytics.capture("rule_deleted", ["disposition": rule.disposition.rawValue])
             // Optimistic removal; a re-fetch happens on undo or next open.
             rulesState.value?.removeAll { $0.id == rule.id }
-            // The undo toast recreates the rule from these cached values.
+            // The undo toast recreates the rule from these cached values,
+            // disposition included and explicit: an undo restores what was
+            // there, it does not re-infer it from the want text. `sweep` is
+            // never sent, so restoring a mute rule brings the rule back without
+            // the side effect of resolving that sender's open mail — undo puts
+            // things back, it does not go clear the inbox.
             store.pushUndo(
                 kind: .ruleDelete, messageId: rule.id,
                 label: "deleted rule \(rule.match_pattern)"
@@ -222,9 +227,13 @@ private struct RuleRow: View {
 /// NL-FIRST: the plain-English want text IS the rule, and it is stored VERBATIM
 /// — nothing rewrites it on the way out, because the daemon hands it to Stage 2
 /// as the owner's own instruction. The glob that decides WHO the rule covers is
-/// derived from the sender on screen and demoted behind `advanced`, and the
-/// disposition is a required pick: there is no honest default for "what should
-/// happen to this sender".
+/// derived from the sender on screen and demoted behind `advanced`.
+///
+/// The disposition is NOT asked for. The daemon reads the same sentence and
+/// resolves allow/mute/filter from it, so the simple card has exactly one
+/// question on it; advanced carries an override for the times the guess is
+/// wrong. That inference sees the OWNER'S RULE TEXT ONLY — never a subject,
+/// body or header — so no sender can write themselves an allow rule.
 struct RuleEditor: View {
     let request: RuleEditorRequest
     let onClose: () -> Void
@@ -233,8 +242,10 @@ struct RuleEditor: View {
 
     @State private var pattern: String
     @State private var want: String
-    /// nil means NOT PICKED YET, which is what holds save shut in create/tune.
-    /// Edit opens on the rule's current value — the choice was already made.
+    /// The OVERRIDE. nil means auto: the request goes out with no disposition and
+    /// the daemon resolves one from the want text. Edit opens on the rule's
+    /// current value, which is explicit by definition — the rule already is
+    /// something, and reopening it must not silently re-roll that.
     @State private var disposition: Disposition?
     /// Whether the raw match pattern is on screen and editable.
     @State private var advanced: Bool
@@ -264,9 +275,9 @@ struct RuleEditor: View {
                 initialValue: request.pattern
                     ?? request.sender.map(SenderID.patternFromSender) ?? "")
             _want = State(initialValue: request.want ?? "")
-            // No default. A caller that names one has made the choice on the
-            // user's behalf deliberately (the newsletters CTA); everyone else
-            // picks before save unlocks.
+            // nil = auto, which is what every ordinary create/tune sends. A
+            // caller that names one is deliberately overriding on the user's
+            // behalf, so its choice travels as an explicit value.
             _disposition = State(initialValue: request.disposition)
             // With no sender there is nothing to derive a glob from, so the
             // glob field is the only way to say who the rule is about.
@@ -295,7 +306,6 @@ struct RuleEditor: View {
                 alreadyInEffect
                 wantField
                 appliesTo
-                dispositionPicker
                 advancedSection
 
                 if let error {
@@ -308,8 +318,19 @@ struct RuleEditor: View {
         .keyContext(.modal)
         .keyBindings(.modal, [
             KeyBinding("Escape", "cancel", allowInInput: true) { onClose() },
-            KeyBinding("Tab", "cycle disposition", allowInInput: true) { cycle(1) },
-            KeyBinding("shift+Tab", "cycle disposition (back)", allowInInput: true) { cycle(-1) },
+            // Tab only means something while the override is on screen. With
+            // advanced closed it DECLINES, so the key falls through to AppKit
+            // and moves focus the way it does in every other card.
+            KeyBinding(declining: "Tab", "cycle disposition", allowInInput: true) {
+                guard advanced else { return false }
+                cycle(1)
+                return true
+            },
+            KeyBinding(declining: "shift+Tab", "cycle disposition (back)", allowInInput: true) {
+                guard advanced else { return false }
+                cycle(-1)
+                return true
+            },
             // ⌘-chorded because the want field owns every bare letter, and the
             // hint row below teaches it.
             KeyBinding("d", "advanced", meta: true, allowInInput: true) { toggleAdvanced() },
@@ -357,12 +378,16 @@ struct RuleEditor: View {
         .padding(.bottom, 2)
     }
 
-    /// The rule itself, in the user's own words. Multi-line because a real one
-    /// is a sentence, not a keyword.
+    /// The rule itself, in the user's own words, and now the ONLY question on
+    /// the simple card: the sentence decides both what Stage 2 does with the
+    /// mail and which disposition the rule lands on. Multi-line because a real
+    /// one is a sentence, not a keyword. The examples stay polarity-diverse on
+    /// purpose, since a card that only ever showed "i dont care about X" would
+    /// teach people this box is a mute button.
     private var wantField: some View {
         Field(label: wantLabel) {
             TextField(
-                "in plain english. e.g. only order confirmations, or: i dont care about the approval emails",
+                "in plain english. e.g. always show these, or: only order confirmations, or: i dont care about the approval emails",
                 text: $want, axis: .vertical
             )
             .textFieldStyle(.plain)
@@ -375,44 +400,61 @@ struct RuleEditor: View {
         mode == .tune ? "what do you want from this sender?" : "what do you want?"
     }
 
-    /// The derived glob, visible but not editable: what the rule will match is
-    /// never a secret, it just is not the question being asked here.
+    /// The two things the card decided FOR you, both dim and neither editable
+    /// here: the glob it derived, and where the outcome is coming from. Visible
+    /// because nothing about a rule should be a surprise; demoted because
+    /// neither one is the question being asked.
     @ViewBuilder
     private var appliesTo: some View {
         if !advanced {
-            HStack(spacing: 5) {
-                Text("applies to").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                Text(pattern)
-                    .font(Typo.mono(10))
-                    .foregroundStyle(Palette.inkFaint)
-                    .lineLimit(1)
-                Spacer()
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text("applies to").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    Text(pattern)
+                        .font(Typo.mono(10))
+                        .foregroundStyle(Palette.inkFaint)
+                        .lineLimit(1)
+                    Spacer()
+                }
+                Text(outcomeNote)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
             }
         }
     }
 
-    private var dispositionPicker: some View {
+    /// Where the disposition is coming from, said once, in the collapsed card.
+    private var outcomeNote: String {
+        guard let disposition else { return "the outcome is read from what you wrote." }
+        return "outcome: \(disposition.label) · change it under advanced"
+    }
+
+    /// The override. Lives in advanced because the honest default is now "let
+    /// the daemon read the sentence", and a control on the front of the card
+    /// would re-ask a question that has already been answered above it.
+    private var dispositionOverride: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 4) {
                 Text("disposition").font(Typo.micro).foregroundStyle(Palette.inkFaint)
                 Kbd("tab")
                 Text("to cycle").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                 Spacer()
-                if disposition == nil {
-                    Text("required").font(Typo.micro).foregroundStyle(Palette.warn)
-                }
             }
             GlassSegmented(options: dispositionOptions, selection: $disposition)
-            Text(disposition?.hint ?? "nothing is preselected: say what this rule does.")
+            Text(disposition?.hint ?? "auto: resolved from the line you wrote above.")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
         }
     }
 
-    /// Optional-valued on purpose: with nothing selected no slot matches, so the
-    /// travelling pane simply is not drawn and the control reads as unanswered.
+    /// "auto" IS one of the values, not the absence of one: nil is the default
+    /// state, so the travelling pane parks on it and the control never reads as
+    /// unanswered.
     private var dispositionOptions: [(value: Disposition?, label: String)] {
-        Disposition.allCases.map { (value: Optional($0), label: $0.label) }
+        var options: [(value: Disposition?, label: String)] = [(value: nil, label: "auto")]
+        options.append(
+            contentsOf: Disposition.allCases.map { (value: Optional($0), label: $0.label) })
+        return options
     }
 
     @ViewBuilder
@@ -438,14 +480,19 @@ struct RuleEditor: View {
                     .focused($focusedField, equals: .pattern)
                     .autocorrectionDisabled()
             }
+            dispositionOverride
         }
     }
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 4) {
-                KeyHint("tab", "disposition")
-                Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                // Taught only while it does something: tab is a focus key
+                // everywhere else in the app.
+                if advanced {
+                    KeyHint("tab", "disposition")
+                    Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                }
                 KeyHint("⌘d", "advanced")
                 Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                 KeyHint("⌥↵", "new line")
@@ -475,11 +522,19 @@ struct RuleEditor: View {
     /// Why save is shut, in the user's terms, or nil when it is open. Checked
     /// BEFORE the round trip so the filtered-needs-want rule the store enforces
     /// lands as a hint rather than as an error over a form you already left.
+    ///
+    /// The want text is what holds save shut now: on auto it is the only input
+    /// the disposition can be resolved from, so an empty one asks the daemon to
+    /// guess from nothing. An explicit allow/mute override says the outcome out
+    /// loud, so it may save wantless — which is also what keeps a legacy
+    /// block-created rule (empty want, explicit mute) editable.
     private var blocked: String? {
         if pattern.trimmed.isEmpty { return "needs a match pattern" }
-        if disposition == nil { return "pick one: allow, mute or filter" }
-        if disposition == .filtered, want.trimmed.isEmpty {
-            return "filter needs a line saying what you do or do not want"
+        if want.trimmed.isEmpty {
+            if disposition == .filtered {
+                return "filter needs a line saying what you do or do not want"
+            }
+            if disposition == nil { return "say what you want in plain english" }
         }
         return nil
     }
@@ -565,15 +620,13 @@ struct RuleEditor: View {
         }
     }
 
-    /// Cycling starts from NOTHING picked: forward lands on the first option,
-    /// back on the last, so the required choice is one keystroke away either way.
+    /// Walks the override ring, auto included, so handing the decision back is
+    /// as cheap as taking it — shift+tab from auto lands straight on filter.
     private func cycle(_ direction: Int) {
-        let all = Disposition.allCases
-        guard let current = disposition, let i = all.firstIndex(of: current) else {
-            disposition = direction > 0 ? all.first : all.last
-            return
-        }
-        disposition = all[(i + direction + all.count) % all.count]
+        var ring: [Disposition?] = [nil]
+        ring.append(contentsOf: Disposition.allCases.map(Optional.init))
+        let i = ring.firstIndex(of: disposition) ?? 0
+        disposition = ring[(i + direction + ring.count) % ring.count]
     }
 
     /// Create POSTs (the store upserts on match_pattern, so re-tuning a sender
@@ -581,27 +634,37 @@ struct RuleEditor: View {
     /// pattern change moves the row it is looking at rather than orphaning it.
     /// The want text goes out exactly as typed, trimmed at the ends and nothing
     /// else.
+    ///
+    /// `disposition` rides only when the user overrode it; otherwise the field
+    /// is absent and the RESPONSE tells us what the rule became. That answer is
+    /// what the toast and the analytics report, because the client no longer
+    /// knows it up front.
     private func save() async {
-        guard !saving, blocked == nil, let disposition else { return }
+        guard !saving, blocked == nil else { return }
         saving = true
         error = nil
         let body = CreateRuleBody(
             match_pattern: pattern.trimmed, want: want.trimmed, disposition: disposition)
         do {
+            let saved: CreatedRule
             if let existing = request.rule {
-                try await APIClient.shared.updateRule(existing.id, body)
+                saved = try await APIClient.shared.updateRule(existing.id, body)
             } else {
-                try await APIClient.shared.createRule(body)
+                saved = try await APIClient.shared.createRule(body)
             }
-            Analytics.capture(
-                "rule_created",
-                [
-                    "disposition": disposition.rawValue,
-                    "has_want": !want.trimmed.isEmpty,
-                    "edit": request.rule != nil,
-                ])
+            // A daemon too old to answer with the resolved value leaves us with
+            // whatever we sent — nil there means we genuinely do not know, and
+            // the toast says less rather than guessing.
+            let resolved = saved.disposition ?? disposition
+            var properties: [String: Any] = [
+                "has_want": !want.trimmed.isEmpty,
+                "edit": request.rule != nil,
+            ]
+            if let resolved { properties["disposition"] = resolved.rawValue }
+            Analytics.capture("rule_created", properties)
+            let outcome = resolved.map { " → \($0.label)" } ?? ""
             store.pushToast(
-                "\(request.rule != nil ? "rule updated" : "rule saved") · \(pattern.trimmed) → \(disposition.label)",
+                "\(request.rule != nil ? "rule updated" : "rule saved") · \(pattern.trimmed)\(outcome)",
                 .success)
             request.onSaved?()
             onClose()

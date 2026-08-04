@@ -1791,6 +1791,416 @@ async fn update_rule_edits_in_place_and_404s_bogus() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A mock provider serving the same `status`/`body` to every request, returning
+/// its URL. Serves repeatedly, not once: a single request can bill more than one
+/// classifier call (create, then edit) and a spent one-shot would look like a
+/// transport failure rather than a verdict.
+async fn spawn_classifier_mock(status: u16, body: String) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A state whose rule inference points at `url`. The classifier is the only thing
+/// this state can talk to.
+fn harness_pointing_inference_at(url: String, seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
+    use squelch_core::config::Stage2Provider;
+    use squelch_core::triage::rule_infer::RuleInferClient;
+
+    let (state, store, acct) = common::state_with(seed);
+    let state = state.with_rule_inference(Some(RuleInferClient::new(
+        reqwest::Client::new(),
+        url,
+        "sk-test",
+        Stage2Provider::Anthropic,
+        "claude-haiku-4-5",
+    )));
+    Harness {
+        app: router(state),
+        store,
+        acct,
+    }
+}
+
+/// A one-shot mock of the Anthropic Messages API answering with `verdict`, plus
+/// the state decorated to point rule inference at it. Usage on the mocked
+/// response is 50 in / 5 out, which is what the ledger assertions expect.
+async fn app_with_rule_inference(
+    verdict: &'static str,
+    seed: impl FnOnce(&SqliteStore, i64),
+) -> Harness {
+    let body = format!(
+        r#"{{"content":[{{"type":"text","text":"{{\"disposition\":\"{verdict}\"}}"}}],"stop_reason":"end_turn","usage":{{"input_tokens":50,"output_tokens":5}}}}"#
+    );
+    let url = spawn_classifier_mock(200, body).await;
+    harness_pointing_inference_at(url, seed)
+}
+
+/// The same wiring against a classifier that FAILS permanently (a 400).
+async fn app_with_failing_rule_inference(seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
+    let body =
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}"#.to_string();
+    let url = spawn_classifier_mock(400, body).await;
+    harness_pointing_inference_at(url, seed)
+}
+
+#[tokio::test]
+async fn omitted_disposition_is_inferred_and_returned() {
+    // No LLM configured on the default harness, so inference resolves to the
+    // safe answer: filtered, stored and echoed back so the client can say so.
+    let Harness { app, store, acct } = harness(|_, _| {});
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "billing@acme.com",
+                "want": "i only care about the invoices"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    assert_eq!(created["disposition"], "filtered", "the resolved disposition rides the response");
+    let rule_id = created["rule_id"].as_i64().unwrap();
+
+    let rules = store.list_sender_rules(acct).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, rule_id);
+    assert_eq!(rules[0].disposition, squelch_core::types::Disposition::Filtered);
+    assert_eq!(rules[0].want_text, "i only care about the invoices");
+}
+
+#[tokio::test]
+async fn literal_auto_disposition_infers_like_an_absent_one() {
+    let Harness { app, store, acct } = harness(|_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "news@acme.com",
+                "want": "the weekly digest is noise",
+                "disposition": "auto"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["disposition"], "filtered");
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Filtered
+    );
+}
+
+#[tokio::test]
+async fn only_an_absent_key_or_exact_auto_asks_for_inference() {
+    // INFERENCE IS OPT-IN, EXACTLY. A present-but-unparseable disposition is a
+    // client bug, and folding it into "infer it then" hands a model a decision
+    // the client thought it had made. Empty string, wrong case, and garbage all
+    // 400 for the same reason "SURFACE" does.
+    let Harness { app, store, acct } = harness(|_, _| {});
+
+    for bad in ["", "   ", "AUTO", "Auto", "SURFACE", " squelch", "block"] {
+        let resp = app
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                "/client/rules",
+                serde_json::json!({
+                    "match_pattern": "x@acme.com",
+                    "want": "never show me anything from them",
+                    "disposition": bad
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "disposition {bad:?} must be a 400, not a silent inference"
+        );
+    }
+    assert!(store.list_sender_rules(acct).unwrap().is_empty(), "nothing stored");
+
+    // The exact lowercase literal is the one spelling that infers.
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "x@acme.com",
+                "want": "never show me anything from them",
+                "disposition": "auto"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["disposition"], "filtered");
+}
+
+#[tokio::test]
+async fn a_configured_classifier_that_fails_still_saves_the_rule() {
+    // A CONFIGURED but broken classifier is the interesting case: "no LLM at all"
+    // short-circuits before the network. The save must still land, filtered.
+    let Harness { app, store, acct } = app_with_failing_rule_inference(|_, _| {}).await;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "billing@acme.com",
+                "want": "never show me anything from them"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "inference never fails a save");
+    assert_eq!(body_json(resp).await["disposition"], "filtered");
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Filtered
+    );
+    // A call that produced no verdict produced no billable usage either.
+    assert!(
+        !store
+            .list_usage_by_category(acct, 30)
+            .unwrap()
+            .iter()
+            .any(|(c, _)| c == "rule_infer"),
+        "a failed call writes no ledger row"
+    );
+}
+
+#[tokio::test]
+async fn rule_inference_spend_lands_in_its_own_ledger_category() {
+    // UNMETERED SPEND IS THE BUG: this is a model call on an interactive path, so
+    // it has to show up in the ledger like every other one. Create and update
+    // both bill it.
+    let Harness { app, store, acct } = app_with_rule_inference("filtered", |_, _| {}).await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "news@acme.com",
+                "want": "the weekly digest is noise"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let rule_id = body_json(resp).await["rule_id"].as_i64().unwrap();
+
+    let row = |store: &SqliteStore| {
+        store
+            .list_usage_by_category(acct, 30)
+            .unwrap()
+            .into_iter()
+            .find(|(c, _)| c == "rule_infer")
+            .map(|(_, days)| days)
+    };
+    let days = row(&store).expect("the create call is billed under rule_infer");
+    assert_eq!(days.len(), 1, "one day of spend");
+    assert_eq!(days[0].calls, 1);
+    assert_eq!(days[0].input_tokens, 50);
+    assert_eq!(days[0].output_tokens, 5);
+
+    // The edit re-infers, so it bills a second call onto the same line.
+    let resp = app
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/client/rules/{rule_id}"),
+            serde_json::json!({
+                "match_pattern": "news@acme.com",
+                "want": "actually just the billing ones"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let days = row(&store).expect("the update path bills too");
+    assert_eq!(days[0].calls, 2, "create and update each bill their own call");
+    assert_eq!(days[0].input_tokens, 100);
+    assert_eq!(days[0].output_tokens, 10);
+
+    // And it stays its OWN category: never folded into stage1/stage2 spend.
+    let cats: Vec<String> = store
+        .list_usage_by_category(acct, 30)
+        .unwrap()
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    assert_eq!(cats, vec!["rule_infer".to_string()]);
+}
+
+#[tokio::test]
+async fn explicit_disposition_is_honored_verbatim_and_echoed() {
+    // Inference never runs when the client names a disposition: "surface" with a
+    // conditional-sounding want stays surface.
+    let Harness { app, store, acct } = harness(|_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "boss@acme.com",
+                "want": "only the ones about the launch",
+                "disposition": "surface"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["disposition"], "surface");
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Surface
+    );
+}
+
+#[tokio::test]
+async fn omitted_disposition_with_empty_want_is_400() {
+    // There is nothing to infer FROM, and a rule that says nothing is not a rule.
+    let Harness { app, store, acct } = harness(|_, _| {});
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({ "match_pattern": "x@acme.com", "want": "   " }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(store.list_sender_rules(acct).unwrap().is_empty(), "nothing stored");
+
+    // Same on the edit path.
+    let resp = app
+        .oneshot(authed_json(
+            "PUT",
+            "/client/rules/1",
+            serde_json::json!({ "match_pattern": "x@acme.com", "want": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn update_reinfers_from_the_submitted_want_when_disposition_is_omitted() {
+    let Harness { app, store, acct } = harness(|_, _| {});
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "a@acme.com",
+                "want": "always show me these",
+                "disposition": "surface"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let rule_id = body_json(resp).await["rule_id"].as_i64().unwrap();
+
+    // The edit omits the disposition: it is re-read from the new sentence, and
+    // with no LLM wired in that is filtered.
+    let resp = app
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/client/rules/{rule_id}"),
+            serde_json::json!({
+                "match_pattern": "a@acme.com",
+                "want": "actually just the billing ones"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated = body_json(resp).await;
+    assert_eq!(updated["rule_id"].as_i64().unwrap(), rule_id);
+    assert_eq!(updated["disposition"], "filtered");
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Filtered
+    );
+}
+
+#[tokio::test]
+async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
+    // SIDE-EFFECT GUARD: the model says squelch, so the RULE is squelch — but a
+    // misclassification must never mass-resolve a sender's mail, so the resolve
+    // side effect stays behind an EXPLICIT squelch. Asking to sweep does not buy
+    // past that: sweep is permission, not authority.
+    let seeded = std::cell::RefCell::new(Vec::<i64>::new());
+    let Harness { app, store, acct } = app_with_rule_inference("squelch", |store, acct| {
+        seeded
+            .borrow_mut()
+            .push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
+    })
+    .await;
+    let spam_id = seeded.borrow()[0];
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "spam@evil.com",
+                "want": "never show me anything from them",
+                "source_message_id": spam_id,
+                "sweep": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["disposition"], "squelch", "the rule IS squelch");
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Squelch
+    );
+
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(
+        !done.iter().any(|u| u.update.id == spam_id),
+        "an INFERRED squelch resolves nothing, sweep or no sweep"
+    );
+}
+
 #[tokio::test]
 async fn rule_mutations_write_audit_rows() {
     let Harness { app, store, acct } = harness(|_, _| {});
@@ -1840,9 +2250,18 @@ async fn rule_mutations_write_audit_rows() {
     assert!(audit.iter().all(|a| a.actor == "client-api"));
     let create = audit.iter().find(|a| a.action == "rule.create").unwrap();
     assert_eq!(create.target.as_deref(), Some("*@old.com"));
-    assert_eq!(create.detail.as_deref(), Some(rule_id.to_string().as_str()));
+    // The detail carries the id AND the resolved disposition: an inferred
+    // verdict is nowhere in the request body, so the log is the only record.
+    assert_eq!(
+        create.detail.as_deref(),
+        Some(format!("{rule_id} disposition=squelch").as_str())
+    );
     let update = audit.iter().find(|a| a.action == "rule.update").unwrap();
     assert_eq!(update.target.as_deref(), Some("*@new.com"));
+    assert_eq!(
+        update.detail.as_deref(),
+        Some(format!("{rule_id} disposition=surface").as_str())
+    );
     let delete = audit.iter().find(|a| a.action == "rule.delete").unwrap();
     assert_eq!(delete.target.as_deref(), Some(rule_id.to_string().as_str()));
 }
@@ -2146,7 +2565,8 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
                 "match_pattern": "spam@evil.com",
                 "want": "",
                 "disposition": "squelch",
-                "source_message_id": spam_id
+                "source_message_id": spam_id,
+                "sweep": true
             }),
         ))
         .await
@@ -2161,7 +2581,8 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
                 "match_pattern": "friend@nice.com",
                 "want": "always surface",
                 "disposition": "surface",
-                "source_message_id": nice_id
+                "source_message_id": nice_id,
+                "sweep": true
             }),
         ))
         .await
@@ -2173,6 +2594,123 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
         .unwrap();
     assert!(done.iter().any(|u| u.update.id == spam_id), "squelch-rule source is done");
     assert!(!done.iter().any(|u| u.update.id == nice_id), "surface-rule source stays open");
+}
+
+#[tokio::test]
+async fn an_explicit_squelch_without_sweep_resolves_nothing() {
+    // THE UNDO CASE. Deleting a squelch rule and undoing the delete recreates it
+    // with the same explicit disposition, and that recreate must not re-sweep an
+    // inbox the user has since worked through. Same for the rule editor's save.
+    // `sweep` is the client saying "and clear what they already sent"; without it
+    // the rule is written and nothing else happens.
+    let seeded = std::cell::RefCell::new(Vec::<i64>::new());
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seeded.borrow_mut().push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
+    });
+    let spam_id = seeded.borrow()[0];
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "spam@evil.com",
+                "want": "never show me anything from them",
+                "disposition": "squelch",
+                "source_message_id": spam_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        squelch_core::types::Disposition::Squelch,
+        "the rule is still a squelch"
+    );
+
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(
+        !done.iter().any(|u| u.update.id == spam_id),
+        "no sweep was asked for, so the sender's open mail stays open"
+    );
+}
+
+/// Seed one triaged message from `from` on its OWN thread. Distinct threads
+/// matter here: the bands collapse a thread to one representative row, so
+/// same-thread seeds would hide exactly the sibling a sweep is supposed to clear.
+fn seed_from_on_thread(store: &SqliteStore, acct: i64, gmail: &str, thread: &str, from: &str) -> i64 {
+    let mut m = msg(acct, gmail, thread, "Newsletter", "body");
+    m.from_addr = from.to_string();
+    let id = store.upsert_message(&m).unwrap();
+    store
+        .set_triage(id, acct, 10, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn sweep_resolves_by_sender_and_a_wildcard_resolves_only_the_source() {
+    // WITH sweep, both resolve paths run: a plain address clears every open row
+    // from that sender, and a wildcard clears ONLY the message the click came
+    // from, because "*@evil.com" is a domain verdict and mass-resolving a whole
+    // domain is a bigger claim than the click made.
+    let seeded = std::cell::RefCell::new(Vec::<i64>::new());
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let mut s = seeded.borrow_mut();
+        s.push(seed_from_on_thread(store, acct, "g1", "t1", "spam@evil.com"));
+        s.push(seed_from_on_thread(store, acct, "g2", "t2", "spam@evil.com"));
+        s.push(seed_from_on_thread(store, acct, "g3", "t3", "other@junk.com"));
+        s.push(seed_from_on_thread(store, acct, "g4", "t4", "someone@junk.com"));
+    });
+    let (spam_a, spam_b, junk_src, junk_other) = {
+        let s = seeded.borrow();
+        (s[0], s[1], s[2], s[3])
+    };
+
+    // Non-wildcard + sweep => resolve_sender_done: BOTH of that sender's rows.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "spam@evil.com",
+                "want": "never show me anything from them",
+                "disposition": "squelch",
+                "sweep": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Wildcard + sweep => resolve_done on the source message only.
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/rules",
+            serde_json::json!({
+                "match_pattern": "*@junk.com",
+                "want": "never show me anything from them",
+                "disposition": "squelch",
+                "source_message_id": junk_src,
+                "sweep": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let done = store
+        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    let is_done = |id: i64| done.iter().any(|u| u.update.id == id);
+    assert!(is_done(spam_a) && is_done(spam_b), "every row from the swept sender is done");
+    assert!(is_done(junk_src), "the wildcard's source message is done");
+    assert!(!is_done(junk_other), "the rest of the domain is untouched");
 }
 
 #[tokio::test]

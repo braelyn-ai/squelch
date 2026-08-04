@@ -7,6 +7,7 @@ use squelch_core::credentials::{
     CredentialKind, CredentialStore, FileCredentialStore, KeyringCredentialStore,
 };
 use squelch_core::store::SqliteStore;
+use squelch_core::triage::rule_infer::RuleInferClient;
 use squelch_core::types::AccountId;
 
 /// State threaded through every `/client/*` handler and the auth middleware.
@@ -80,6 +81,12 @@ pub struct ApiState {
     /// unauthenticated thing that touches the store, so its share of the store
     /// mutex is capped rather than left to whoever floods it.
     pub(crate) pixel_slots: Arc<tokio::sync::Semaphore>,
+    /// The cheap-model handle behind rule-disposition inference: when a rule
+    /// write omits `disposition`, the owner's `want` sentence is classified with
+    /// this. `None` (no API key configured, and every test harness) means
+    /// inference resolves to `filtered`, which is the safe default. HUMAN DOOR
+    /// ONLY, like every other rule write.
+    pub(crate) rule_infer: Option<Arc<RuleInferClient>>,
 }
 
 /// Capacity of the `GET /client/events` wake channel. THE PAYLOAD IS ONLY A HINT
@@ -160,6 +167,7 @@ impl ApiState {
             shutdown: None,
             tracking_base_url: None,
             pixel_slots: Arc::new(tokio::sync::Semaphore::new(crate::tracking::PIXEL_CONCURRENCY)),
+            rule_infer: None,
         })
     }
 
@@ -225,6 +233,23 @@ impl ApiState {
     /// [`crate::tracking::PIXEL_CONCURRENCY`].
     pub(crate) fn pixel_slots(&self) -> &tokio::sync::Semaphore {
         &self.pixel_slots
+    }
+
+    /// Attach the cheap-model handle that infers a rule's disposition from the
+    /// owner's plain-English `want`. `None` disables inference gracefully:
+    /// rule writes that omit `disposition` are stored `filtered`, which is what
+    /// the daemon does when no API key is configured.
+    ///
+    /// The classifier only ever sees the OWNER'S SENTENCE. See
+    /// [`squelch_core::triage::rule_infer`].
+    pub fn with_rule_inference(mut self, client: Option<RuleInferClient>) -> Self {
+        self.rule_infer = client.map(Arc::new);
+        self
+    }
+
+    /// The rule-disposition classifier, if one is configured.
+    pub(crate) fn rule_infer(&self) -> Option<&RuleInferClient> {
+        self.rule_infer.as_deref()
     }
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
@@ -387,7 +412,11 @@ impl ApiState {
                 cfg.stage1.price_out_per_mtok,
                 cfg.stage1.global_daily_cap,
             )
-            .with_tracking_base_url(cfg.tracking.base_url.clone());
+            .with_tracking_base_url(cfg.tracking.base_url.clone())
+            // Rule-disposition inference rides the SAME key/provider the triage
+            // stages resolve and the Stage-1 model; no key => `None` => rules
+            // that omit a disposition are stored filtered.
+            .with_rule_inference(RuleInferClient::from_config(cfg));
 
         Ok(match cfg.oauth_client() {
             Ok(client) => state.with_write_credentials(

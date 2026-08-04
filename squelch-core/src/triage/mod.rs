@@ -11,6 +11,7 @@ pub mod extract;
 pub mod llm;
 pub mod receipt;
 pub mod receipt_match;
+pub mod rule_infer;
 pub mod rules;
 pub mod seal;
 pub mod shipment;
