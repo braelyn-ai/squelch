@@ -35,7 +35,7 @@ struct RulesView: View {
             } else if rules.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 4) {
-                        Text("no rules yet — press").font(Typo.rowSub)
+                        Text("no rules yet. press").font(Typo.rowSub)
                         Kbd("n")
                         Text("to create one, or").font(Typo.rowSub)
                         Kbd("t")
@@ -190,7 +190,7 @@ private struct RuleRow: View {
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)
                     .frame(width: 190, alignment: .leading)
-                Text(rule.want_text.isEmpty ? "—" : rule.want_text)
+                Text(rule.want_text.isEmpty ? "·" : rule.want_text)
                     .font(Typo.micro)
                     .foregroundStyle(
                         rule.want_text.isEmpty ? Palette.inkFaintest : Palette.inkDim
@@ -205,7 +205,7 @@ private struct RuleRow: View {
                         matchCount == 0
                             ? "no currently-loaded updates match this rule"
                             : "\(matchCount) loaded update(s) matched")
-                Text(Fmt.relAge(rule.updated_at).isEmpty ? "—" : Fmt.relAge(rule.updated_at))
+                Text(Fmt.relAge(rule.updated_at).isEmpty ? "·" : Fmt.relAge(rule.updated_at))
                     .font(Typo.num(10))
                     .foregroundStyle(Palette.inkFaintest)
                     .frame(width: 34, alignment: .trailing)
