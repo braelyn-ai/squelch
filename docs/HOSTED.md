@@ -79,6 +79,9 @@ verifier, which never leaves the daemon. We are not trusted with tokens because 
 nice; we are incapable of minting them. This sentence belongs on the website. The
 relay deploys next to the existing APNs relay (Railway).
 
+Status: implemented in-repo as `squelch-broker` (2026-08-04) to the wire contract in
+`docs/BROKER.md`, deployment pending.
+
 ### One project, one verification
 
 `gmail.readonly` / `gmail.modify` are restricted scopes: any public offering needs
@@ -170,7 +173,9 @@ The actual path, in order:
    with both clients. Longest lead time, zero code.
 2. **Phase 1 — self-host as a product:** GHCR multi-arch image, consent relay in the
    broker, first-run auth UX. Ships value to real users while verification grinds,
-   and de-risks the consent patterns hosted signup reuses.
+   and de-risks the consent patterns hosted signup reuses. Status: the broker is
+   implemented in-repo as `squelch-broker` (2026-08-04) per `docs/BROKER.md`,
+   deployment pending.
 3. **Phase 2 — hosted MVP:** `squelch-control`, systemd provisioning on the VPS,
    human-door issued tokens + `/mcp` bearer auth, web signup → app pairing,
    Litestream, invite codes.

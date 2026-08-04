@@ -253,3 +253,89 @@ curl -sS http://127.0.0.1:8848/mcp \
 If both respond, the box is live. Ctrl-C / `systemctl stop squelchd` shuts down
 gracefully: it stops accepting connections, tears down MCP sessions, and lets the
 sync loop finish in-flight work and flush before exit.
+
+---
+
+## 8. The consent relay (`squelch-broker`) on Railway
+
+Optional, and not part of the box above: this is the service that makes
+`squelchd auth --broker <url>` work, so §4's `ssh -L` tunnel stops being the only
+way to consent on a host with no browser. It parks one Google authorization code
+per session, in memory, for ten minutes. It holds no OAuth client credentials and
+no tokens: the code it parks is useless without the PKCE verifier, which never
+leaves the daemon. Wire contract: [../docs/BROKER.md](../docs/BROKER.md);
+operational reference: [../squelch-broker/README.md](../squelch-broker/README.md).
+
+It is a SECOND Railway service from the same repo, not another copy of the relay.
+The two share a posture and nothing else, and they must not share a service:
+`railway.toml` at the repo root builds the relay.
+
+**Service settings**
+
+| Setting | Value |
+|---|---|
+| `RAILWAY_DOCKERFILE_PATH` | `Dockerfile.broker` (a service variable) |
+| Config-as-code path | clear it, or point it at a broker-specific file. Left at the default it picks up the root `railway.toml`, which pins `dockerfilePath = "Dockerfile"` and would build the relay from this service. |
+| Healthcheck path | `/healthz` — unauthenticated and outside both rate limiters, so it answers while a client is being throttled |
+| Restart policy | on failure. A restart drops every pending consent, which is the design: the recovery is re-running `squelchd auth`. |
+| Custom domain | `auth.passband.email` |
+
+**Environment**
+
+```ini
+# REQUIRED. No default, because guessing it would mean guessing the redirect_uri
+# every daemon is checked against, and a wrong guess rejects every registration
+# this deployment will ever see. Origin only: a path, query, fragment, or
+# userinfo is a refusal to boot.
+SQUELCH_BROKER_PUBLIC_URL=https://auth.passband.email
+
+# SQUELCH_BROKER_BIND is deliberately NOT set: the image entrypoint derives it
+# from Railway's injected PORT (0.0.0.0:$PORT), because the broker's own default
+# is loopback. Set it only to override that.
+# SQUELCH_BROKER_LOG=info
+```
+
+Two things must agree with `SQUELCH_BROKER_PUBLIC_URL` exactly, or consent fails
+before the broker is ever involved: the custom domain, and the redirect URI
+`https://auth.passband.email/callback` registered on the Google OAuth client the
+daemons use.
+
+**Verify the deploy**
+
+```sh
+curl -sS https://auth.passband.email/healthz
+# => ok
+
+# An unknown session is a 404 page, not a redirect anywhere:
+curl -s -o /dev/null -w '%{http_code}\n' 'https://auth.passband.email/link?s=nope'
+# => 404
+```
+
+Then, on the box (or in `/etc/squelch/env` as `SQUELCH_BROKER_URL`):
+
+```sh
+sudo -u squelch env $(sudo cat /etc/squelch/env | grep -v '^#' | xargs) \
+  squelchd auth --broker https://auth.passband.email
+```
+
+It prints one `https://auth.passband.email/link?s=...` URL to open on any device,
+then polls until you finish consent. `--write` works the same way, two links in
+sequence.
+
+**Locally, before you push it anywhere**
+
+```sh
+docker build -f Dockerfile.broker -t squelch-broker .
+docker run --rm -p 8851:8851 \
+  -e SQUELCH_BROKER_PUBLIC_URL=http://127.0.0.1:8851 squelch-broker
+```
+
+With `PORT` unset the entrypoint falls back to 8851. A plain-`http` public URL
+logs a one-line warning and is for local runs only: Google would deliver
+authorization codes to `/callback` in the clear.
+
+One operational property worth knowing before this is public: the rate limiters
+key on the TCP peer and never on `X-Forwarded-For`, which is caller-supplied, so
+behind Railway's edge every daemon in the world shares one bucket (600/min for
+the JSON routes, 300/min for the pages). Generous for the traffic a consent flow
+makes, and the number to revisit first if legitimate polling ever gets throttled.

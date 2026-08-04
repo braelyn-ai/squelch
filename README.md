@@ -57,6 +57,8 @@ cargo run --bin squelchd -- serve    # sync + both doors on one port
 
 On a headless box use `squelchd auth --headless` and forward the port: `ssh -L 8847:127.0.0.1:8847 yourbox`. Grant write scopes later with `squelchd auth --write` (only needed for archive/send actions) — that runs two consent flows, minting the write credential and re-minting the read one, so the two slots stay in sync.
 
+Where no browser can reach the box's loopback at all (docker on a NAS, a VPS), `squelchd auth --broker <url>` drops the tunnel: it prints one link to open on any device, and a consent relay parks Google's one-time code until your daemon collects it. The relay cannot turn that code into a token, because the PKCE verifier never leaves your machine. Run your own from `Dockerfile.broker` ([deploy/DEPLOY.md](deploy/DEPLOY.md) §8); the hosted one at `auth.passband.email` is not up yet.
+
 ### 4. Connect an agent
 
 Point any MCP client at the streamable HTTP endpoint:

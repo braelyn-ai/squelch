@@ -1,8 +1,7 @@
 # squelch-broker
 
-**Status: v1 implemented, no deployment yet.** The daemon side
-(`squelchd auth --broker <url>`) is not written; nothing runs at
-`auth.passband.email`.
+**Status: v1 implemented, daemon side shipped (`squelchd auth --broker <url>`),
+no deployment yet.** Nothing runs at `auth.passband.email`.
 
 The consent relay. It parks a Google OAuth authorization code for a few minutes
 so a headless daemon (docker on a NAS, a VPS) can finish consent without an
@@ -23,6 +22,10 @@ SQUELCH_BROKER_PUBLIC_URL=https://auth.passband.email \
 
 Config is environment-only and validated at startup: a bad value is a refusal to
 boot, never a surprise on somebody's first consent.
+
+In a container it is `Dockerfile.broker` at the repo root, whose entrypoint binds
+`0.0.0.0:$PORT` because the default below is loopback and would be unreachable.
+The Railway service is [`deploy/DEPLOY.md` §8](../deploy/DEPLOY.md).
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|

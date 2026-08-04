@@ -8,4 +8,4 @@ deploy/
 scripts/
 *.md
 .dockerignore
-Dockerfile
+Dockerfile*

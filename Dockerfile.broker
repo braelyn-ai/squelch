@@ -1,0 +1,41 @@
+# Builds squelch-broker — the consent relay. It is the second piece of squelch
+# that runs on shared/public infrastructure: its own Railway service at
+# auth.passband.email, separate from the APNs relay (see deploy/DEPLOY.md §8).
+# The root Dockerfile builds the relay; Railway selects this one per-service
+# with RAILWAY_DOCKERFILE_PATH.
+#
+# The build context must be the workspace root: squelch-broker is a workspace
+# member and cargo needs the root manifest + lockfile to resolve it.
+
+FROM rust:1-slim-bookworm AS builder
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY squelch-core ./squelch-core
+COPY squelch-httpauth ./squelch-httpauth
+COPY squelch-mcp ./squelch-mcp
+COPY squelch-tui ./squelch-tui
+COPY squelch-api ./squelch-api
+COPY squelch-relay ./squelch-relay
+COPY squelchd ./squelchd
+COPY squelch-broker ./squelch-broker
+
+RUN cargo build --release --locked -p squelch-broker
+
+FROM debian:bookworm-slim
+# No ca-certificates, unlike the relay image: the broker makes no outbound
+# request to anything. It never talks to Google — the daemon does the token
+# exchange itself — and TLS on the way in is terminated by the platform edge.
+RUN useradd --system --no-create-home broker
+
+COPY --from=builder /build/target/release/squelch-broker /usr/local/bin/squelch-broker
+COPY squelch-broker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# No volume, no mount point, no chown: the only state this service has is a
+# HashMap that lives for ten minutes, and an authorization code that survived a
+# restart would be a liability, not a feature. So unlike the relay there is
+# nothing that must happen as root, and the image never runs privileged even for
+# the length of an entrypoint.
+USER broker
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

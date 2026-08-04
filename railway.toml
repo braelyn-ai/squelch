@@ -1,4 +1,8 @@
 # Railway deployment config for squelch-relay (built by the root Dockerfile).
+# The consent broker is a SECOND Railway service off this same repo and must NOT
+# pick this file up: it selects Dockerfile.broker via RAILWAY_DOCKERFILE_PATH,
+# and the dockerfilePath below would send it back to the relay image
+# (deploy/DEPLOY.md §8).
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"

@@ -16,6 +16,37 @@ use tracing_subscriber::EnvFilter;
 /// TTL is far more often than it needs to be and still costs nothing.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+/// Ctrl-C, or the SIGTERM a container runtime stops us with.
+///
+/// SIGTERM is not optional here: this process is PID 1 in its image, and PID 1
+/// has no default disposition for a signal it does not handle. Without this the
+/// platform's stop would be ignored and every redeploy would wait out the grace
+/// period for a SIGKILL.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            // Losing the handler costs a slower stop, never correctness: there
+            // is no state to flush.
+            Err(e) => {
+                tracing::warn!(error = %e, "no SIGTERM handler; stopping on ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -63,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         // Pending consents die with the process, by design: the recovery is
         // re-running `squelchd auth`.
         tracing::info!("squelch-broker: shutting down");
