@@ -149,10 +149,30 @@ struct ThreadViewer: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(thread?.subject ?? "…")
-                    .font(Typo.serif(19, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(2)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    // The subject IS the copy affordance — no icon earns a
+                    // place in this header for a once-in-a-while verb.
+                    Button {
+                        if let subject = thread?.subject, !subject.isEmpty {
+                            Clip.copy(subject, flashing: $subjectCopied)
+                        }
+                    } label: {
+                        Text(thread?.subject ?? "…")
+                            .font(Typo.serif(19, weight: .medium))
+                            .foregroundStyle(Palette.ink)
+                            .lineLimit(2)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("copy subject")
+                    if subjectCopied {
+                        Text("copied!")
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.positive)
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeOut(duration: 0.18), value: subjectCopied)
                 if !participantLine.isEmpty {
                     Text(participantLine)
                         .font(Typo.rowSub)
