@@ -59,6 +59,10 @@ struct ProcessMode: View {
         }
         .onChange(of: pending.count) { _, count in
             if index > count - 1 { index = max(0, count - 1) }
+            // The deck just emptied: one completed run, sized by its snapshot.
+            if count == 0, !queue.isEmpty {
+                Analytics.capture("process_completed", ["count": queue.count])
+            }
         }
     }
 

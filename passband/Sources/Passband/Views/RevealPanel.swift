@@ -113,5 +113,8 @@ struct RevealPanel: View {
         await $revealState.load("reveal failed") {
             try await APIClient.shared.revealSealed(meta.id)
         }
+        // How often humans actually need behind the seal — the count and
+        // nothing else; the body itself never leaves the view above.
+        if revealState.value != nil { Analytics.capture("sealed_revealed") }
     }
 }

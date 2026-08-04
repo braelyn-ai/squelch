@@ -119,6 +119,7 @@ struct RulesView: View {
     private func delete(_ rule: SenderRule) async {
         do {
             try await APIClient.shared.deleteRule(rule.id)
+            Analytics.capture("rule_deleted", ["disposition": rule.disposition.rawValue])
             // Optimistic removal; a re-fetch happens on undo or next open.
             rulesState.value?.removeAll { $0.id == rule.id }
             // The undo toast recreates the rule from these cached values.
@@ -436,6 +437,13 @@ struct RuleEditor: View {
             if let existing = request.rule {
                 try await APIClient.shared.deleteRule(existing.id)
             }
+            Analytics.capture(
+                "rule_created",
+                [
+                    "disposition": disposition.rawValue,
+                    "has_want": !want.trimmed.isEmpty,
+                    "edit": request.rule != nil,
+                ])
             store.pushToast(
                 "\(request.rule != nil ? "rule updated" : "rule saved") · \(pattern.trimmed) → \(disposition.rawValue)",
                 .success)

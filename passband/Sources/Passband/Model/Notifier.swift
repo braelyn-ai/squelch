@@ -133,6 +133,7 @@ final class Notifier {
     /// A tap: front the app, restore the window if it was closed, open the
     /// thread.
     func handleTap(threadId: String?) {
+        Analytics.capture("notification_opened", ["has_thread": !(threadId ?? "").isEmpty])
         NSApp.activate(ignoringOtherApps: true)
         MainWindow.show()
         guard let threadId, !threadId.isEmpty else { return }

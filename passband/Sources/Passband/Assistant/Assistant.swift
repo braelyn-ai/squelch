@@ -245,8 +245,13 @@ enum Assistant {
     /// Ask a question and return a cited answer. Throws on a missing key, a
     /// wrong-provider key, a provider error, a refusal, or the step limit.
     static func ask(_ question: String) async throws -> AssistantAnswer {
-        // The event alone — the question text is the user's mail, not telemetry.
-        Analytics.capture("assistant_asked")
+        // The event and the model tier alone — the question text is the user's
+        // mail, not telemetry. Raw UserDefaults: this path is off the main
+        // actor, where Prefs lives.
+        let raw = UserDefaults.standard.string(forKey: "passband.assistant.model") ?? ""
+        Analytics.capture(
+            "assistant_asked",
+            ["model": AssistantModel(rawValue: raw)?.shortLabel.lowercased() ?? "haiku"])
         let status = await AssistantKeyStore.statusAsync()
         guard status.present else {
             throw AssistantError(message: "No assistant key set — add one in Settings.")

@@ -198,6 +198,17 @@ struct TriageFixPalette: View {
             busy = false
             return
         }
+        // The accuracy metric: which closed-vocabulary value moved where. The
+        // "was" value for the corrected axis, when the caller fetched it —
+        // "unset" otherwise, so the confusion pair stays inside the vocabulary.
+        let from: String =
+            switch hit.axis {
+            case .tier: (target.tier ?? nil) ?? "unset"
+            case .category: (target.category ?? nil) ?? "unset"
+            case .sensitivity: "unset"
+            }
+        Analytics.capture(
+            "triage_corrected", ["axis": hit.axis.rawValue, "from": from, "to": hit.value])
         switch hit.exit {
         case .stays: break
         case .standing: store.removeFromStanding(target.messageId)

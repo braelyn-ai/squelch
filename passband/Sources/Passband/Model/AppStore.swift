@@ -373,6 +373,7 @@ final class AppStore {
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             connStatus = .connected
             connError = nil
+            Analytics.capture("connect_succeeded")
             // Fresh connection = fresh sync history; a stale lastRefresh from a
             // prior session must not make a failing daemon look recently synced.
             lastRefresh = nil
@@ -541,7 +542,14 @@ final class AppStore {
     /// Open the fullscreen reader. `replyTo` is the unified `r` verb: the message
     /// id the reader should open its inline composer on once the thread loads.
     func openThread(_ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil) {
-        Analytics.capture("thread_opened", ["via_reply": replyTo != nil])
+        // from_noise: an open from below the squelch line — someone digging for
+        // mail the triage muted, which is the false-negative signal.
+        Analytics.capture(
+            "thread_opened",
+            [
+                "via_reply": replyTo != nil,
+                "from_noise": activeView == .emails && mailMode == .noise,
+            ])
         self.threadId = threadId
         self.threadQueue = queue
         // Both cleared unconditionally: moving to ANOTHER thread (h/l, done+next)

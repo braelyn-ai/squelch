@@ -72,6 +72,23 @@ enum Analytics {
         "email_archived", "email_done", "email_reopened", "email_labeled",
         "block_rule_created", "compose_opened", "compose_send",
         "thread_opened", "undo_fired", "assistant_asked",
+        "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
+        "process_completed", "notification_opened", "sealed_revealed",
+        "connect_succeeded", "connection_lost", "connection_restored",
+    ]
+
+    /// The counter events that ride at `minimal`: anonymous counts and
+    /// closed-vocabulary enums that measure whether the product works (sends,
+    /// triage volume, corrections, connection health) with no behavioral
+    /// detail. `full` adds the remaining action verbs (`compose_opened`,
+    /// `email_labeled`) — the "which actions are used" layer.
+    private static let minimalEvents: Set<String> = [
+        "email_archived", "email_done", "email_reopened",
+        "block_rule_created", "compose_send", "thread_opened",
+        "undo_fired", "assistant_asked",
+        "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
+        "process_completed", "notification_opened", "sealed_revealed",
+        "connect_succeeded", "connection_lost", "connection_restored",
     ]
 
     /// The closed set of STRING property values allowed off the machine.
@@ -83,6 +100,16 @@ enum Analytics {
             "new", "reply", "sent", "guard_blocked", "forbidden", "failure",
             // undo_fired kinds
             "archive", "done", "label", "ruleDelete",
+            // triage_corrected axes and wire values — the daemon's closed
+            // TriageAxis::allowed vocabulary, mirrored in TriageTargets.
+            "tier", "category", "sensitivity",
+            "past_due", "deadline", "signal", "noise",
+            "invoice", "autopay_bill", "banking_statement", "transaction_alert",
+            "marketing", "general", "sealed", "normal", "unset",
+            // rule_created dispositions
+            "surface", "squelch", "filtered",
+            // assistant_asked models
+            "haiku", "opus",
         ])
 
     /// Screen views ride at `minimal` alongside lifecycle events.
@@ -95,9 +122,14 @@ enum Analytics {
         client?.capture("$screen", properties: ["$screen_name": name])
     }
 
-    /// Action verbs are `full`-only — `minimal` keeps sessions and screens.
+    /// Counter events (`minimalEvents`) ride at `minimal`; the remaining
+    /// action verbs are `full`-only.
     static func capture(_ event: String, _ properties: [String: Any] = [:]) {
-        guard level == .full else { return }
+        switch level {
+        case .none: return
+        case .minimal: guard minimalEvents.contains(event) else { return }
+        case .full: break
+        }
         guard allowedEvents.contains(event) else {
             assertionFailure("analytics: event outside vocabulary: \(event)")
             return
@@ -114,6 +146,19 @@ enum Analytics {
             }
         }
         client?.capture(event, properties: safe)
+    }
+
+    /// At-most-daily events, for periodic snapshot counters like
+    /// `triage_digest`. UserDefaults-backed so a relaunch does not re-emit;
+    /// the level gate stays in `capture`.
+    static func daily(_ event: String, _ properties: [String: Any] = [:]) {
+        guard level != .none else { return }  // don't stamp a day we sent nothing
+        let key = "app.passband.analytics.daily.\(event)"
+        let last = UserDefaults.standard.double(forKey: key)
+        let now = Date().timeIntervalSince1970
+        guard now - last >= 24 * 3600 else { return }
+        UserDefaults.standard.set(now, forKey: key)
+        capture(event, properties)
     }
 }
 

@@ -22,8 +22,11 @@ enum SettingsSection: String, CaseIterable, Sendable {
 }
 
 /// How much developer telemetry (PostHog) leaves the app. Opt-out: `full` is
-/// the default. `minimal` keeps sessions and screen views but drops the action
-/// verbs; `none` sends nothing at all.
+/// the default. `minimal` keeps sessions, screen views, and the anonymous
+/// counter events (sends, triage volume, corrections, connection health — see
+/// `Analytics.minimalEvents`) but drops the remaining action verbs; `none`
+/// sends nothing at all. No level carries content at any time: every string
+/// that leaves is in `Analytics.allowedStrings`.
 ///
 /// The key is public because Analytics reads the raw value straight from
 /// UserDefaults — capture can fire off the main actor, where Prefs lives.

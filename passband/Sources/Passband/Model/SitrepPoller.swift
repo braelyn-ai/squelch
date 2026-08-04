@@ -122,8 +122,26 @@ final class SitrepPoller {
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
             if next != store.sitrep { store.sitrep = next }
-            if store.refreshError != nil { store.refreshError = nil }
+            if store.refreshError != nil {
+                store.refreshError = nil
+                // Transition only — a healthy poll every 10s is not an event.
+                Analytics.capture("connection_restored")
+            }
             store.lastRefresh = Date()
+            // Daily triage-volume counters, all ints: the denominator for the
+            // correction rate, and the surfaced-vs-squelched split. Tier counts
+            // are flattened onto fixed keys so no server string ever rides.
+            Analytics.daily(
+                "triage_digest",
+                [
+                    "total": st.total, "sealed": st.sealed,
+                    "band_standing": st.bands.standing, "band_new": st.bands.new,
+                    "band_open": st.bands.open,
+                    "tier_past_due": st.tier_counts["past_due"] ?? 0,
+                    "tier_deadline": st.tier_counts["deadline"] ?? 0,
+                    "tier_signal": st.tier_counts["signal"] ?? 0,
+                    "tier_noise": st.tier_counts["noise"] ?? 0,
+                ])
             // The bands half of the launch image warm's input; refreshZones
             // below supplies the rest.
             ImageWarmer.shared.noteSitrepLanded()
@@ -139,6 +157,9 @@ final class SitrepPoller {
             await store.refreshZones()
             return true
         } catch {
+            // Transition only, before the error lands — count outages, not
+            // every failing poll of one.
+            if store.refreshError == nil { Analytics.capture("connection_lost") }
             // Keep the kind so the UI can say "daemon unreachable" vs "token
             // rejected" rather than one undifferentiated failure.
             if let api = error as? APIError {
