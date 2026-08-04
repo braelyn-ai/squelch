@@ -835,8 +835,7 @@ async fn resolve_disposition(
     };
     Ok(ResolvedDisposition {
         disposition,
-        // MUTATION UNDER TEST: is "auto" pinned as inferred anywhere?
-        explicit: body.disposition.as_deref() == Some(DISPOSITION_AUTO),
+        explicit: false,
         usage,
     })
 }
