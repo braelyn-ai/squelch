@@ -58,6 +58,26 @@ fn config_reads_the_environment() {
         Config::from_env().is_err(),
         "a token too short to be worth a constant-time compare"
     );
+    // A secret pasted across two lines: long enough, but it can never ride in
+    // an HTTP header, so booting would 401 every client forever with nothing in
+    // the logs. The ends are trimmed, so only an INTERIOR break survives to here.
+    set(
+        "SQUELCH_RELAY_AUTH_TOKEN",
+        "0123456789abcdef0123456789abcdef0123456789\nabcdef0123456789abcdef",
+    );
+    assert!(
+        Config::from_env().is_err(),
+        "a token with an interior newline is unpresentable, not merely ugly"
+    );
+    // Surrounding whitespace is still fine: var() trims the ends.
+    set(
+        "SQUELCH_RELAY_AUTH_TOKEN",
+        "  0123456789abcdef0123456789abcdef0123456789ab  ",
+    );
+    assert!(
+        Config::from_env().is_ok(),
+        "trimmable padding must not be confused with an interior break"
+    );
     unsafe { std::env::remove_var("SQUELCH_RELAY_AUTH_TOKEN") };
     set("SQUELCH_RELAY_ALLOW_ANONYMOUS", "nope");
     assert!(Config::from_env().is_err(), "unparseable opt-out");

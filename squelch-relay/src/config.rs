@@ -205,6 +205,17 @@ impl Config {
                         "SQUELCH_RELAY_AUTH_TOKEN must be at least {MIN_AUTH_TOKEN_LEN} characters"
                     )));
                 }
+                // A token carrying whitespace or a control character can never
+                // be presented: it cannot go in an HTTP header. `var()` trims
+                // the ends, so what is left is interior — a secret pasted across
+                // two lines, which is exactly the shape a wrapped copy produces.
+                // Booting anyway would serve a relay that 401s every client
+                // forever, with a bare 401 and nothing in the logs to explain it.
+                if t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    return Err(ConfigError::invalid(
+                        "SQUELCH_RELAY_AUTH_TOKEN contains whitespace or a control character, so it can never be sent as a bearer header; re-set it as one unbroken line",
+                    ));
+                }
                 Some(t)
             }
         };
