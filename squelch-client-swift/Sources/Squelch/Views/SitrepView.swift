@@ -52,6 +52,17 @@ struct SitrepView: View {
     /// Hover + keyboard cursor. A reference, deliberately — see `SitrepCursor`.
     @State private var cursor = SitrepCursor()
 
+    /// Below this page width the records rail stops being a pinned column and
+    /// stacks under the left content, the whole page scrolling as one — a
+    /// squeezed side-by-side starves the left column first, and that column is
+    /// the work surface. At the window's minimum the page measures ~920, so
+    /// the smallest windows always stack.
+    private static let railBreakpoint: CGFloat = 960
+
+    /// Measured page width the breakpoint is judged against. Starts infinite
+    /// so the first pass lays out side-by-side rather than flashing stacked.
+    @State private var pageWidth: CGFloat = .infinity
+
     /// Zone data lives in the STORE, not in `@State`: `@State` is discarded on
     /// navigate-away, so a revisit would show empty cards until refetch.
     private var rulesCount: Int? { store.zones.rulesCount }
@@ -84,48 +95,57 @@ struct SitrepView: View {
                 .padding(.horizontal, 28)
                 .padding(.bottom, 18)
 
-            HStack(alignment: .top, spacing: 18) {
-                // THE ONLY THING THAT SCROLLS WITH THE PAGE.
+            if pageWidth < Self.railBreakpoint {
+                // NARROW: one scroll, records under the work surface. The rail
+                // zones are reference material, so they yield the fold to the
+                // items that need acting on — but the status strip stays the
+                // page's last line either way.
                 ScrollView(.vertical) {
                     VStack(spacing: 16) {
-                        if !store.sitrep.standing.isEmpty {
-                            forYourEyes(visible: visible, overflow: overflow)
-                        }
-                        NewslettersZone(
-                            newsletters: Newsletters.prune(
-                                store.zones.newsletters, resolved: store.resolvedIds),
-                            cursor: cursor)
+                        leftZones(visible: visible, overflow: overflow)
+                        railZones
                         StatusStrip(rulesCount: rulesCount)
                     }
                     .padding(.bottom, 28)
                 }
-                // No bar on either column. Two of them side by side read as a
-                // split pane rather than one page, and the left one rides the
-                // column boundary instead of the window edge.
                 .scrollIndicators(.hidden)
-                .frame(maxWidth: .infinity, alignment: .top)
-
-                // THE RECORDS RAIL IS PINNED. These are reference columns you
-                // read WHILE working the left side, so they must not leave with
-                // it. Its own scroll view rather than a plain stack so a rail
-                // taller than the window is still reachable —
-                // `.basedOnSize` is what keeps it completely inert until then,
-                // instead of rubber-banding against nothing.
-                ScrollView(.vertical) {
-                    VStack(spacing: 14) {
-                        CalendarZone()
-                        ShipmentsZone()
-                        BankingZone()
-                        ReceiptsZone()
+                .padding(.horizontal, 24)
+            } else {
+                HStack(alignment: .top, spacing: 18) {
+                    // THE ONLY THING THAT SCROLLS WITH THE PAGE.
+                    ScrollView(.vertical) {
+                        VStack(spacing: 16) {
+                            leftZones(visible: visible, overflow: overflow)
+                            StatusStrip(rulesCount: rulesCount)
+                        }
+                        .padding(.bottom, 28)
                     }
-                    .padding(.bottom, 28)
+                    // No bar on either column. Two of them side by side read as a
+                    // split pane rather than one page, and the left one rides the
+                    // column boundary instead of the window edge.
+                    .scrollIndicators(.hidden)
+                    .frame(maxWidth: .infinity, alignment: .top)
+
+                    // THE RECORDS RAIL IS PINNED. These are reference columns you
+                    // read WHILE working the left side, so they must not leave with
+                    // it. Its own scroll view rather than a plain stack so a rail
+                    // taller than the window is still reachable —
+                    // `.basedOnSize` is what keeps it completely inert until then,
+                    // instead of rubber-banding against nothing.
+                    ScrollView(.vertical) {
+                        VStack(spacing: 14) {
+                            railZones
+                        }
+                        .padding(.bottom, 28)
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .scrollIndicators(.hidden)
+                    .frame(width: 306)
                 }
-                .scrollBounceBehavior(.basedOnSize)
-                .scrollIndicators(.hidden)
-                .frame(width: 306)
+                .padding(.horizontal, 24)
             }
-            .padding(.horizontal, 24)
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { pageWidth = $0 }
         .keyContext(.sitrep)
         .keyBindings(.sitrep, bindings)
         // Refreshes underneath what is already on screen — rows are never
@@ -144,6 +164,30 @@ struct SitrepView: View {
         .onChange(of: visible.count) { _, count in
             cursor.index = max(0, min(cursor.index, max(0, count - 1)))
         }
+    }
+
+    // MARK: - columns
+
+    /// The work-surface zones, shared by both layouts. The status strip is NOT
+    /// here — each layout places it last on the page itself.
+    @ViewBuilder
+    private func leftZones(visible: [AttentionUpdate], overflow: Int) -> some View {
+        if !store.sitrep.standing.isEmpty {
+            forYourEyes(visible: visible, overflow: overflow)
+        }
+        NewslettersZone(
+            newsletters: Newsletters.prune(
+                store.zones.newsletters, resolved: store.resolvedIds),
+            cursor: cursor)
+    }
+
+    /// The records zones, shared by both layouts.
+    @ViewBuilder
+    private var railZones: some View {
+        CalendarZone()
+        ShipmentsZone()
+        BankingZone()
+        ReceiptsZone()
     }
 
     // MARK: - masthead
