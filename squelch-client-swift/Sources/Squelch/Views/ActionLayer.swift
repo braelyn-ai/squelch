@@ -185,6 +185,9 @@ struct ActionLayer: View {
         do {
             // Exact sender address, not the domain.
             try await Actions.createBlockRule(sender: record.sender)
+            // No message on screen to name, but the rule is still a verdict on
+            // the sender, so the same rows clear here as anywhere else.
+            store.noteSenderResolved(record.sender)
             try await APIClient.shared.setUnsubResolution(
                 sender: record.sender, resolution: .blocked)
             store.pushToast("blocked \(record.sender)", .success)

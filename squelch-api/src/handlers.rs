@@ -682,18 +682,27 @@ pub async fn create_rule(
     let disposition = Disposition::parse(&body.disposition)
         .ok_or_else(|| ApiError::bad_request("disposition must be surface, squelch, or filtered"))?;
 
-    let pattern = body.match_pattern.clone();
+    let pattern = body.match_pattern.trim().to_string();
     let source_message_id = body.source_message_id;
     let id = store_call(&state, move |store, account_id| {
         store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)
     })
     .await?;
     // Best-effort audit: target is the match_pattern, detail the new rule id.
-    audit_action(&state, "rule.create", Some(pattern), &id.to_string()).await;
-    // RESOLUTION: a squelch rule created from an email marks that email done —
-    // the user just said "never again" about its sender. Squelch only: a
-    // surface/filtered rule is tuning, not a verdict on the message.
-    if disposition == Disposition::Squelch
+    audit_action(&state, "rule.create", Some(pattern.clone()), &id.to_string()).await;
+    // RESOLUTION: a squelch rule marks that sender's open mail done — the user
+    // just said "never again" about them, and leaving the mail they already sent
+    // in the bands makes the rule look like it did nothing. Squelch only: a
+    // surface/filtered rule is tuning, not a verdict.
+    //
+    // Driven by the PATTERN, not by source_message_id, so the block prompt in
+    // the action layer — which has no message on screen to name — resolves too.
+    // Wildcards are left alone: `*@acme.com` is a domain verdict, and resolving
+    // every address under a domain from one click is a bigger claim than the
+    // click made.
+    if disposition == Disposition::Squelch && !pattern.contains('*') {
+        resolve_sender_done(&state, &pattern).await;
+    } else if disposition == Disposition::Squelch
         && let Some(mid) = source_message_id
     {
         resolve_done(&state, mid).await;
@@ -1377,6 +1386,21 @@ async fn resolve_done(state: &ApiState, message_id: i64) {
     .await;
 }
 
+/// RESOLUTION, SENDER-WIDE: the same bookkeeping for an action that is a verdict
+/// on a SENDER rather than on one message — unsubscribing, and a squelch rule.
+///
+/// Resolving only the thread the reader happened to have open leaves the rest of
+/// that sender's mail in the bands, which is indistinguishable from the action
+/// having failed: unsubscribe from a newsletter with nine emails in the window
+/// and eight of them stay. Best-effort like `resolve_done`, for the same reason.
+async fn resolve_sender_done(state: &ApiState, sender: &str) {
+    let sender = sender.to_string();
+    let _ = store_call(state, move |store, account_id| {
+        store.resolve_sender(account_id, &sender)
+    })
+    .await;
+}
+
 /// Resolve the WRITE-bound gmail client, or 403 with a hint if none configured.
 fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
     match state.write_creds() {
@@ -1900,9 +1924,10 @@ pub async fn unsubscribe(
             // only, never the URL.
             record_unsub(&state, &sender, "browser", message_id).await?;
             audit_action(&state, "unsubscribe", target, &format!("browser:{sender}")).await;
-            // RESOLUTION: unsubscribing IS the disposition of this email —
-            // asking it to stop and leaving it open would demand a second act.
-            resolve_done(&state, message_id).await;
+            // RESOLUTION: unsubscribing IS the disposition of this SENDER —
+            // asking them to stop and leaving their mail open would demand a
+            // second act, once per thread they already sent.
+            resolve_sender_done(&state, &sender).await;
             Ok(Json(json!({ "method": "browser", "sender": sender, "url": url })))
         }
     }

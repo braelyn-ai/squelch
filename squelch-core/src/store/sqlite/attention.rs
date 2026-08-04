@@ -246,6 +246,30 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
+    pub(super) fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize> {
+        let sender = sender_addr.trim().to_lowercase();
+        if sender.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock()?;
+        // Already-done rows are left alone so their original resolved_at — and
+        // whatever resolved them — survives. Sealed excluded, as everywhere.
+        let n = conn.execute(
+            "UPDATE triage
+             SET status = 'done', resolved_at = ?1
+             WHERE account_id = ?2
+               AND sensitivity != 'sealed'
+               AND status != 'done'
+               AND message_id IN (
+                   SELECT m.id FROM messages m
+                   WHERE m.account_id = ?2
+                     AND LOWER(TRIM(m.from_addr)) = ?3
+               )",
+            params![Utc::now().to_rfc3339(), account_id, sender],
+        )?;
+        Ok(n)
+    }
+
     pub(super) fn stats(&self, account_id: AccountId) -> Result<StoreStats> {
         let conn = self.lock()?;
 

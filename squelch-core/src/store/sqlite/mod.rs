@@ -633,6 +633,10 @@ impl Store for SqliteStore {
         self.set_attention_status(account_id, message_id, status)
     }
 
+    fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize> {
+        self.resolve_sender(account_id, sender_addr)
+    }
+
     fn delete_sender_rule(&self, account_id: AccountId, id: i64) -> Result<bool> {
         self.delete_sender_rule(account_id, id)
     }

@@ -1002,6 +1002,30 @@ final class AppStore {
         sitrep.open.removeAll { $0.id == messageId }
     }
 
+    /// The same, for every message from one sender: the client half of the
+    /// server's `resolve_sender`, so unsubscribing or blocking empties that
+    /// sender NOW rather than one poll later.
+    ///
+    /// Matched on the BARE ADDRESS, because the bands carry raw sender strings
+    /// ("Name <addr>") while the caller has whatever the action was performed
+    /// against. Everything the server resolved must be recorded here too — a row
+    /// that stays in `sitrep` but is done on the server reappears on no refresh
+    /// and vanishes on the next, which reads as a glitch.
+    func noteSenderResolved(_ senderAddr: String) {
+        let target = SenderID.address(senderAddr)
+        guard !target.isEmpty else { return }
+        let matches = { (u: AttentionUpdate) in SenderID.address(u.sender) == target }
+        for u in sitrep.standing + sitrep.new + sitrep.open where matches(u) {
+            resolvedIds.insert(u.id)
+        }
+        for mode in MailMode.allCases {
+            for u in mailPage(mode).value ?? [] where matches(u) { resolvedIds.insert(u.id) }
+        }
+        sitrep.standing.removeAll(where: matches)
+        sitrep.new.removeAll(where: matches)
+        sitrep.open.removeAll(where: matches)
+    }
+
     /// Optimistically pull a message out of the STANDING band ONLY — the one a tier
     /// correction empties. Standing is tier-defined server-side (`tier IN
     /// ('past_due','deadline') AND status != 'done'`) while `new`/`open` come from

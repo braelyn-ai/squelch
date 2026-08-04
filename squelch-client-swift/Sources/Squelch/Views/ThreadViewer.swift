@@ -29,6 +29,8 @@ struct ThreadViewer: View {
     @State private var confirmBusy = false
     @State private var retriaging = false
     @State private var debugInfo: TriageDebug?
+    /// True for `Clip.flashWindow` after the subject is clicked-to-copy.
+    @State private var subjectCopied = false
     /// messageId -> image srcs an earlier message in this thread already showed.
     /// Rebuilt with the thread and thrown away with it; nothing crosses threads.
     @State private var repeatedImages: [Int: Set<String>] = [:]
@@ -578,9 +580,10 @@ struct ThreadViewer: View {
         do {
             let result = try await APIClient.shared.unsubscribe(messageId: newest.id)
             Opener.open(result.url)
-            // The server resolved this email to done (unsubscribing IS its
-            // disposition); drop the row now rather than waiting on the poll.
-            _ = store.removeFromBands(newest.id)
+            // The server resolved this SENDER's open mail (unsubscribing is a
+            // verdict on them, not on one thread); drop those rows now rather
+            // than waiting on the poll.
+            store.noteSenderResolved(result.sender)
             store.pushToast("opened unsubscribe page — \(result.sender)", .success)
             await refreshUnsub()
             confirmMode = nil
@@ -599,10 +602,10 @@ struct ThreadViewer: View {
         confirmBusy = true
         defer { confirmBusy = false }
         do {
-            // Carrying the message id lets the server resolve this email to
-            // done alongside the rule; drop the row optimistically to match.
+            // The exact-address rule lets the server resolve this sender's
+            // open mail alongside it; drop those rows optimistically to match.
             try await Actions.createBlockRule(sender: newestSender, sourceMessageId: newest?.id)
-            if let id = newest?.id { _ = store.removeFromBands(id) }
+            store.noteSenderResolved(newestSender)
             store.pushToast("blocked \(newestSender)", .success)
         } catch {
             store.pushToast(errText(error, "block failed"), .error)

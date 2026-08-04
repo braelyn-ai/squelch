@@ -766,6 +766,17 @@ pub trait Store: Send + Sync {
         status: AttentionStatus,
     ) -> Result<bool>;
 
+    /// Resolve EVERY still-open triage row from one sender address, returning how
+    /// many moved. Case-insensitive on `from_addr`; sealed rows excluded in SQL,
+    /// exactly as `set_attention_status`.
+    ///
+    /// For the two actions that are verdicts on a SENDER rather than on a
+    /// message — unsubscribing, and a squelch rule. Resolving only the thread
+    /// the reader happened to be looking at leaves the rest of that sender's
+    /// mail sitting in the bands, which is indistinguishable from the action not
+    /// having worked. Never call this for a per-message action.
+    fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize>;
+
     /// FTS5 keyword search over non-sealed messages. `limit`/`offset` paginate.
     /// SECURITY: sealed rows are excluded in SQL, exactly like `ranked_updates`.
     fn search(

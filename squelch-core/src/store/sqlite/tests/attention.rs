@@ -119,6 +119,47 @@ fn set_attention_status_resolves_and_reopens() {
 }
 
 #[test]
+fn resolve_sender_clears_every_open_thread_from_that_address() {
+    // THE BUG: unsubscribing resolved only the thread the reader had open, so a
+    // sender with nine emails in the window kept eight of them — which looks
+    // exactly like the unsubscribe not having worked.
+    let (store, acct) = store();
+    let now = Utc::now();
+    let a = triaged(acct, "g1", "t1").from("news@shop.com").received_at(now).seed(&store);
+    let b = triaged(acct, "g2", "t2").from("NEWS@Shop.com").received_at(now).seed(&store);
+    let other = triaged(acct, "g3", "t3").from("real@person.com").received_at(now).seed(&store);
+    let sealed = triaged(acct, "g4", "t4")
+        .from("news@shop.com")
+        .received_at(now)
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+
+    // Case-insensitive on the address, and a different sender is untouched.
+    assert_eq!(store.resolve_sender(acct, "  News@Shop.com ").unwrap(), 2);
+
+    let since = now - chrono::Duration::days(1);
+    let open = store
+        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None)
+        .unwrap();
+    assert!(
+        !open.iter().any(|u| u.update.id == a || u.update.id == b),
+        "both of that sender's threads are resolved"
+    );
+
+    let done = store
+        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+        .unwrap();
+    assert!(done.iter().all(|u| u.update.id != other), "another sender is untouched");
+    assert!(done.iter().all(|u| u.update.id != sealed), "sealed is never touched");
+
+    // Idempotent: a second call moves nothing, so an already-done row keeps the
+    // resolved_at (and the reason) it was first given.
+    assert_eq!(store.resolve_sender(acct, "news@shop.com").unwrap(), 0);
+    // A blank address must never resolve the whole account.
+    assert_eq!(store.resolve_sender(acct, "   ").unwrap(), 0);
+}
+
+#[test]
 fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
     // THE DUPLICATE-THREAD BUG: two messages of one thread each carried a
     // triage row and the band showed the conversation twice. The bands must
