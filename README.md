@@ -130,3 +130,4 @@ Override the profile name with `NOTARY_PROFILE=`. Apple's turnaround is typicall
 - The sync credential is scoped `gmail.readonly`. The write credential (`gmail.modify` + `gmail.send`) lives in a separate slot and is only reachable from the human door's action handlers, which require an explicit confirm flag, run an outbound secret scan on sends, and audit every attempt.
 - Auth emails (2FA codes, password resets, login alerts) are sealed at ingest and never appear in any MCP response, any LLM call, or any list endpoint. Revealing one takes an explicit authenticated request and writes an audit row.
 - Email content is treated as untrusted input everywhere. Tokens never appear in logs.
+- Read tracking on mail you send is off by default and opt-in per send; the record lives in your daemon, never on shared infrastructure. Self-hosted deployments serve the pixel themselves and need no relay — see [docs/TRACKING.md](docs/TRACKING.md).

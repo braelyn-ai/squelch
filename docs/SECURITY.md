@@ -75,6 +75,10 @@ numbered as the source comments number them:
 
 **Invariant.** Remote images may load, but only through our own audited fetch path,
 never with cookies or a referrer, and never for a reference we did not mint.
+Tracking pixels are stripped from mail whose sender the user has never written to.
+
+Outbound read tracking is the mirror image of this section and is documented
+separately in [TRACKING.md](TRACKING.md).
 
 **Current behavior — VERIFIED, and not what old comments claimed.** Remote images
 **load by default**: `Lib/Prefs.swift` registers `squelch.pref.loadRemoteImages =
@@ -92,6 +96,20 @@ refuses it before the handler is reached).
   tracker is one opaque referrer-less GET, a false strip visibly breaks the mail.
   **No reserialization**: every non-`<img>` byte survives verbatim, because a DOM
   round-trip would rewrite markup ammonia already vetted.
+- **The strip is CONDITIONAL as of 2026-08-04.** `GET /client/thread/{id}` carries
+  a per-message `sender_known`, true iff `Store::is_known_contact` — a `contacts`
+  row with `sent_count > 0`, the same predicate Stage-1 uses. When it is true
+  `EmailWebView.Prepared.make` renders the unstripped body: someone the user
+  writes to is allowed to learn they opened the mail. The bypass is scoped to
+  `Trackers.strip` ALONE — `ImageProxy.rewrite`, the `squelch-img:` CSP, the
+  ingest sanitizer, and the remote-images default all still apply, so an allowed
+  pixel still needs remote images on before it fetches. `allowTrackers` is part of
+  `Prepared.cacheKey`, and `ImageWarmer` always prefetches the STRIPPED body so
+  warming can never report an open the reader never made.
+  **Known limitation:** `sender_known` trusts the `From` header with no DKIM or
+  DMARC check, so a sender who knows one of the user's correspondents can spoof
+  their way past the strip (issue #10). The exposure is mostly the badge lending
+  false trust: with remote images on, any full-size image already leaks the open.
 - `Lib/ImageProxy.swift:rewrite` rewrites every http(s) image reference — `<img
   src>`, `style="…"` `url()`, `<style>` block CSS — to
   `squelch-img://local/<hmac>?u=<encoded>`. `@import`/`@font-face` are skipped on
