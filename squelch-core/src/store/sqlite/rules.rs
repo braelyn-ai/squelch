@@ -163,7 +163,7 @@ impl SqliteStore {
         // mail resolves to `None` (=> 404) exactly like an unknown id.
         let row = conn
             .query_row(
-                "SELECT m.from_addr, m.list_unsubscribe, m.list_unsub_one_click
+                "SELECT m.from_addr, m.list_unsubscribe, m.list_unsub_one_click, m.body_html
                  FROM messages m
                  LEFT JOIN triage t ON t.message_id = m.id
                  WHERE m.account_id = ?1 AND m.id = ?2
@@ -174,14 +174,16 @@ impl SqliteStore {
                         r.get::<_, String>(0)?,
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.map(|(from_addr, list_unsubscribe, one_click)| MessageUnsub {
+        Ok(row.map(|(from_addr, list_unsubscribe, one_click, body_html)| MessageUnsub {
             from_addr,
             list_unsubscribe,
             list_unsub_one_click: one_click != 0,
+            body_html,
         }))
     }
 

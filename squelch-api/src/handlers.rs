@@ -1909,7 +1909,17 @@ pub async fn unsubscribe(
     .ok_or_else(ApiError::not_found)?;
 
     let sender = fields.from_addr.trim().to_ascii_lowercase();
-    let plan = crate::unsubscribe::classify_unsubscribe(fields.list_unsubscribe.as_deref());
+    // HEADER FIRST, body second. `List-Unsubscribe` is the sender NAMING its own
+    // endpoint; a footer link is us reading the mail and picking one. Plenty of
+    // senders ship no header at all, and telling those readers "there is no
+    // unsubscribe link" while one sits visible at the bottom of the message is
+    // simply wrong.
+    let plan = match crate::unsubscribe::classify_unsubscribe(fields.list_unsubscribe.as_deref()) {
+        crate::unsubscribe::UnsubPlan::None => {
+            crate::unsubscribe::classify_unsubscribe_body(fields.body_html.as_deref())
+        }
+        header => header,
+    };
 
     match plan {
         crate::unsubscribe::UnsubPlan::None => {

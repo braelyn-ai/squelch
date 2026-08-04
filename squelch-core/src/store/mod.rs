@@ -178,6 +178,10 @@ pub struct MessageUnsub {
     pub list_unsubscribe: Option<String>,
     /// RFC 8058 one-click advertised.
     pub list_unsub_one_click: bool,
+    /// The SANITIZED body, for the footer-link fallback when no header exists.
+    /// Sanitized rather than raw on purpose: it is the markup the reader was
+    /// actually shown, and scripts and handlers are already gone from it.
+    pub body_html: Option<String>,
 }
 
 /// A row to append to the human-door audit log.
