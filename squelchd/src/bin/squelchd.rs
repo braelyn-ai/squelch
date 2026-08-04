@@ -6,7 +6,9 @@
 //!   the human door (`/client/*`).
 
 use clap::{Args, Parser, Subcommand};
-use squelch_core::auth::{AuthFlowOptions, AuthScopes, DEFAULT_HEADLESS_PORT, run_auth_flow};
+use squelch_core::auth::{
+    AuthFlowOptions, AuthScopes, DEFAULT_HEADLESS_PORT, run_auth_flow, run_broker_flow,
+};
 use squelch_core::config::{Config, CredentialBackend, OAuthClientConfig, Stage2CapSources};
 use squelch_core::credentials::{
     CredentialStore, FileCredentialStore, KeyringCredentialStore, load_token_backend,
@@ -49,6 +51,8 @@ enum Command {
     /// HEADLESS: `--headless [--port N]` prints the consent URL and binds a
     /// FIXED loopback port (default 8847) to forward with
     /// `ssh -L 8847:127.0.0.1:8847 <host>`; both flows reuse that one port.
+    /// `--broker <URL>` needs no port and no tunnel at all: consent lands on a
+    /// relay that parks the code for this daemon to collect.
     Auth(AuthArgs),
     /// Run the sync loop only. No HTTP doors are served.
     Run,
@@ -80,6 +84,18 @@ struct AuthArgs {
     /// Fixed loopback port for --headless (default 8847). Ignored otherwise.
     #[arg(long, default_value_t = DEFAULT_HEADLESS_PORT)]
     port: u16,
+
+    /// Run consent through a hosted consent relay instead of a loopback
+    /// listener.
+    ///
+    /// For hosts where no browser can reach 127.0.0.1 (docker, a NAS, a VPS):
+    /// this prints a link to open on any device, and the broker parks Google's
+    /// one-time code until this daemon collects it. The broker never sees a
+    /// token and cannot mint one: the PKCE verifier stays here. Replaces
+    /// --headless and --port, so it conflicts with both.
+    #[arg(long, value_name = "URL", env = "SQUELCH_BROKER_URL",
+          conflicts_with_all = ["headless", "port"])]
+    broker: Option<String>,
 }
 
 fn other_err(msg: String) -> squelch_core::CoreError {
@@ -218,7 +234,12 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
             "squelchd: --write renews BOTH credentials so they cannot drift apart; \
              {total} separate Google consent screens are coming, one per credential."
         );
-        if args.headless {
+        if args.broker.is_some() {
+            eprintln!(
+                "squelchd: each flow prints its OWN consent link; open them one at a time, \
+                 as they appear."
+            );
+        } else if args.headless {
             eprintln!(
                 "squelchd: both flows reuse loopback port {}, so a single SSH tunnel covers both.",
                 args.port
@@ -265,12 +286,19 @@ fn mint_credential(
         backend
     );
 
-    let opts = AuthFlowOptions {
-        scopes,
-        headless: args.headless,
-        port: args.port,
+    let token = match args.broker.as_deref() {
+        // The broker flow needs no listener, so no port and no tunnel; the
+        // scope set, the slot it lands in, and the exchange are unchanged.
+        Some(broker) => run_broker_flow(client, broker, scopes)?,
+        None => {
+            let opts = AuthFlowOptions {
+                scopes,
+                headless: args.headless,
+                port: args.port,
+            };
+            run_auth_flow(client, &opts)?
+        }
     };
-    let token = run_auth_flow(client, &opts)?;
     store_token_backend(backend, creds_path, email, kind, &token)?;
 
     // Confirm persistence without ever printing the token material.
@@ -706,6 +734,11 @@ mod tests {
                 assert!(!args.write);
                 assert!(!args.headless);
                 assert_eq!(args.port, DEFAULT_HEADLESS_PORT);
+                // `SQUELCH_BROKER_URL` is the other way this gets set, so the
+                // default only holds when the environment is quiet.
+                if std::env::var_os("SQUELCH_BROKER_URL").is_none() {
+                    assert!(args.broker.is_none());
+                }
             }
             _ => panic!("expected auth subcommand"),
         }
@@ -732,13 +765,17 @@ mod tests {
             write: false,
             headless: false,
             port: DEFAULT_HEADLESS_PORT,
+            broker: None,
         });
         assert_eq!(read_only, vec![AuthScopes::Read]);
 
+        // The plan is the scope sets, not the transport: a broker run mints the
+        // same two credentials into the same two slots.
         let both = auth_plan(&AuthArgs {
             write: true,
-            headless: true,
+            headless: false,
             port: DEFAULT_HEADLESS_PORT,
+            broker: Some("https://auth.passband.email".to_string()),
         });
         assert_eq!(both, vec![AuthScopes::Write, AuthScopes::Read]);
         assert_eq!(both[0].kind(), CredentialKind::Write);
@@ -754,6 +791,45 @@ mod tests {
             write_scopes.iter().all(|s| !read_scopes.contains(s)),
             "write and read scope sets must not be merged into one consent"
         );
+    }
+
+    /// `--broker` REPLACES the loopback listener rather than decorating it, so
+    /// asking for both is a usage error rather than a silent pick.
+    #[test]
+    fn broker_flag_parses_and_excludes_the_loopback_flags() {
+        let cli = Cli::parse_from([
+            "squelchd",
+            "auth",
+            "--broker",
+            "https://auth.passband.email",
+        ]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert_eq!(args.broker.as_deref(), Some("https://auth.passband.email"));
+                assert!(!args.headless);
+            }
+            _ => panic!("expected auth subcommand"),
+        }
+
+        for argv in [
+            vec![
+                "squelchd",
+                "auth",
+                "--broker",
+                "https://auth.passband.email",
+                "--headless",
+            ],
+            vec![
+                "squelchd",
+                "auth",
+                "--broker",
+                "https://auth.passband.email",
+                "--port",
+                "9100",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} was accepted");
+        }
     }
 
     /// `serve` parses, with and without an explicit `--bind`.

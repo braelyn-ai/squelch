@@ -21,7 +21,11 @@ toml = { workspace = true }
 tiny_http = { workspace = true }
 webbrowser = { workspace = true }
 url = { workspace = true }
-reqwest = { workspace = true }
+# `blocking` for the consent-broker flow only: `squelchd auth` runs before any
+# runtime exists (the loopback flow already blocks on a TcpListener there), so
+# the broker's register/poll calls are on the same synchronous path. Everything
+# else in this crate uses the async client.
+reqwest = { workspace = true, features = ["blocking"] }
 mail-parser = { workspace = true }
 base64 = { workspace = true }
 ammonia = "4"

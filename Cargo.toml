@@ -27,7 +27,9 @@ regex = "1"
 async-trait = "0.1"
 oauth2 = { version = "5", features = ["reqwest", "reqwest-blocking", "rustls-tls"], default-features = false }
 keyring = "4"
-clap = { version = "4", features = ["derive"] }
+# `env` so `squelchd auth --broker` can be set once in a container's environment
+# (SQUELCH_BROKER_URL) instead of on every invocation.
+clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 tiny_http = "0.12"
 webbrowser = "1"
