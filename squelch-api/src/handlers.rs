@@ -1598,6 +1598,12 @@ pub struct SendBody {
     #[serde(default)]
     subject: Option<String>,
     body: String,
+    /// `"markdown"` = `body` is markdown source: it goes out verbatim as the
+    /// text/plain part with a server-rendered HTML alternative beside it. The
+    /// guard scans `body` either way — the HTML is derived from nothing else.
+    /// Absent/other = today's single-part plain send, byte-identical.
+    #[serde(default)]
+    body_format: Option<String>,
     #[serde(default)]
     confirm: bool,
     /// Override the outbound secret guard (still audited).
@@ -1830,6 +1836,10 @@ pub async fn action_send(
         body: body.body.clone(),
         in_reply_to,
         references,
+        body_html: match body.body_format.as_deref() {
+            Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
+            _ => None,
+        },
     };
     let raw = match build_reply_rfc822(&parts) {
         Ok(r) => r,

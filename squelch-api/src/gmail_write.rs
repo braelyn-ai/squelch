@@ -76,10 +76,34 @@ pub struct ReplyParts {
     pub in_reply_to: Option<String>,
     /// The accumulated `References` chain, if known (for a reply).
     pub references: Option<String>,
+    /// HTML alternative rendered SERVER-SIDE from `body` (see `markdown.rs`) —
+    /// never caller-supplied, so the guard's scan of `body` covers it. Some =
+    /// multipart/alternative with `body` as the text/plain part.
+    pub body_html: Option<String>,
+}
+
+/// A multipart boundary none of the parts contain. Deterministic: a fixed
+/// distinctive prefix, and if a part actually contains it (someone typed it),
+/// bump the suffix until none does — content can imitate any single boundary,
+/// but not every member of an unbounded family.
+fn multipart_boundary(parts: &[&str]) -> String {
+    let mut n = 0u32;
+    loop {
+        let boundary = format!("=_passband_alt_{n}");
+        if parts.iter().all(|p| !p.contains(&boundary)) {
+            return boundary;
+        }
+        n += 1;
+    }
 }
 
 /// Build a minimal RFC822 message from [`ReplyParts`], guarded against CRLF
 /// header injection. Returns raw bytes ready for base64url encoding.
+///
+/// With `body_html` set the message is multipart/alternative: text/plain first
+/// (the raw source, exactly as typed), text/html second. Body content stays
+/// structurally inert — the only string that delimits parts is the boundary,
+/// and [`multipart_boundary`] guarantees neither part contains it.
 pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     // No field that becomes a header line may contain CR or LF. The body may
     // (it lives after the blank line).
@@ -108,11 +132,32 @@ pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     if let Some(refs) = parts.references.as_deref().filter(|s| !s.is_empty()) {
         out.push_str(&format!("References: {refs}\r\n"));
     }
-    out.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
-    out.push_str("MIME-Version: 1.0\r\n");
-    out.push_str("\r\n");
-    // Body: normalize bare LFs to CRLF for RFC822 line endings.
-    out.push_str(&parts.body.replace("\r\n", "\n").replace('\n', "\r\n"));
+    // Bodies: normalize bare LFs to CRLF for RFC822 line endings.
+    let text = parts.body.replace("\r\n", "\n").replace('\n', "\r\n");
+    match parts.body_html.as_deref() {
+        None => {
+            out.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
+            out.push_str("MIME-Version: 1.0\r\n");
+            out.push_str("\r\n");
+            out.push_str(&text);
+        }
+        Some(html) => {
+            let html = html.replace("\r\n", "\n").replace('\n', "\r\n");
+            let boundary = multipart_boundary(&[&text, &html]);
+            out.push_str(&format!(
+                "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n"
+            ));
+            out.push_str("MIME-Version: 1.0\r\n");
+            out.push_str("\r\n");
+            out.push_str(&format!(
+                "--{boundary}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{text}\r\n"
+            ));
+            out.push_str(&format!(
+                "--{boundary}\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n{html}\r\n"
+            ));
+            out.push_str(&format!("--{boundary}--\r\n"));
+        }
+    }
     Ok(out.into_bytes())
 }
 
@@ -433,6 +478,7 @@ mod tests {
             body: "hello\nthere".into(),
             in_reply_to: Some("<parent@x>".into()),
             references: Some("<root@x> <parent@x>".into()),
+            body_html: None,
         };
         let raw = build_reply_rfc822(&parts).unwrap();
         let s = String::from_utf8(raw).unwrap();
@@ -452,6 +498,56 @@ mod tests {
             body: "x".into(),
             in_reply_to: None,
             references: None,
+            body_html: None,
+        };
+        assert!(matches!(
+            build_reply_rfc822(&parts),
+            Err(WriteError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn reply_rfc822_multipart_carries_both_parts() {
+        let parts = ReplyParts {
+            to: "alice@example.com".into(),
+            subject: "hi".into(),
+            body: "**bold** text".into(),
+            in_reply_to: None,
+            references: None,
+            body_html: Some("<div><strong>bold</strong> text</div>".into()),
+        };
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains(
+            "Content-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n"
+        ));
+        // Plain part FIRST and verbatim — the raw markdown source, stars and all.
+        let plain = s.find("Content-Type: text/plain").unwrap();
+        let html = s.find("Content-Type: text/html").unwrap();
+        assert!(plain < html);
+        assert!(s.contains("\r\n\r\n**bold** text\r\n"));
+        assert!(s.contains("<strong>bold</strong>"));
+        assert!(s.ends_with("--=_passband_alt_0--\r\n"));
+    }
+
+    #[test]
+    fn multipart_boundary_dodges_content_collision() {
+        // A body that types out boundary 0 forces boundary 1.
+        assert_eq!(
+            multipart_boundary(&["look: =_passband_alt_0", "<p>x</p>"]),
+            "=_passband_alt_1"
+        );
+        assert_eq!(multipart_boundary(&["plain", "html"]), "=_passband_alt_0");
+    }
+
+    #[test]
+    fn reply_rfc822_multipart_still_rejects_header_injection() {
+        let parts = ReplyParts {
+            to: "a@b.com".into(),
+            subject: "hi\r\nBcc: evil@x.com".into(),
+            body: "x".into(),
+            in_reply_to: None,
+            references: None,
+            body_html: Some("<p>x</p>".into()),
         };
         assert!(matches!(
             build_reply_rfc822(&parts),
@@ -467,6 +563,7 @@ mod tests {
             body: "x".into(),
             in_reply_to: None,
             references: None,
+            body_html: None,
         };
         assert!(matches!(
             build_reply_rfc822(&parts),

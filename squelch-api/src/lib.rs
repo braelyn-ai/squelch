@@ -12,6 +12,7 @@ mod events;
 pub mod guard;
 pub mod gmail_write;
 mod handlers;
+mod markdown;
 mod state;
 pub mod unsubscribe;
 

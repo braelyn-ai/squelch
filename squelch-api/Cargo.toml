@@ -39,6 +39,9 @@ tokio-util = "0.7"
 reqwest = { workspace = true }
 base64 = { workspace = true }
 regex = { workspace = true }
+# Markdown → HTML for the send path's multipart/alternative body. `html` only;
+# raw HTML in the source is escaped in src/markdown.rs, never passed through.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
