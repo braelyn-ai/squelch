@@ -625,6 +625,10 @@ struct SendBody: Codable, Sendable {
     /// only when the field is absent — `Some("")` is an explicit empty subject.
     var subject: String?
     var body: String
+    /// `"markdown"`: `body` is markdown source — it goes out verbatim as the
+    /// text/plain part and the daemon renders the HTML alternative beside it.
+    /// Absent = single-part plain text, exactly the pre-markdown wire.
+    var body_format: String?
     var confirm: Bool
     var override_guard: Bool?
     /// Server-side draft to delete once the send succeeds.

@@ -4,19 +4,27 @@
 // sent; a 422 shows the redacted guard kinds and demands a distinct override
 // (shift+Enter or the danger button). 403 means no write credential.
 //
-// This is the MODAL composer, and since Wave 5 replies no longer route here —
-// they open the reader's inline composer (InlineReply), which runs the same
-// ceremony against the same `ComposeSubmit`. What is left to this one is the
-// new-message path (`replyToMessageId == nil`), plus the reply shape it still
-// supports for any caller that has no thread to open.
+// This is the PANE composer: a right-hand working surface in MainShell's
+// layout, half the window wide — the page beside it shrinks and stays live,
+// because starting an email should not mean losing sight of the inbox that
+// prompted it. No scrim, no blur; Esc closes it like the side panels. Since
+// Wave 5 replies no longer route here — they open the reader's inline composer
+// (InlineReply), which runs the same ceremony against the same `ComposeSubmit`.
+// What is left to this one is the new-message path (`replyToMessageId == nil`),
+// plus the reply shape it still supports for any caller with no thread to open.
+//
+// The body is markdown, styled LIVE with the markers kept visible (see
+// MarkdownTextView); the daemon renders the HTML half of what actually goes
+// out from this same source (`body_format: "markdown"`).
 
+import AppKit
 import SwiftUI
 
-struct ComposeReview: View {
+struct ComposePane: View {
     @Environment(AppStore.self) private var store
     @FocusState private var focusedField: FocusTarget?
 
-    private enum FocusTarget { case to, subject, body }
+    private enum FocusTarget { case to, subject }
 
     private var compose: ComposeState? { store.compose }
     private var inReview: Bool { compose?.phase == .review }
@@ -24,64 +32,87 @@ struct ComposeReview: View {
 
     var body: some View {
         if let compose {
-            OverlayScrim(onDismiss: { store.closeCompose() }) {
-                ModalCard(width: 620) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(inReview ? "review · confirm send" : "compose")
-                            .font(Typo.sectionLabel)
-                            .foregroundStyle(Palette.ink)
-                            .textCase(.uppercase)
-                        Spacer()
-                        Text(compose.replyToMessageId != nil ? "reply" : "new message")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaintest)
-                    }
+            VStack(alignment: .leading, spacing: 0) {
+                header(compose)
 
+                VStack(alignment: .leading, spacing: 12) {
                     if inReview {
                         reviewPane(compose)
                     } else {
                         editPane
                     }
-
                     if let error = compose.error {
                         Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
                     }
-
-                    HStack(spacing: 8) {
-                        hint
-                        Spacer()
-                        if inReview {
-                            Button("esc back") { patch { $0.phase = .edit; $0.error = nil } }
-                                .buttonStyle(.glass)
-                            if guarded {
-                                Button(compose.sending ? "sending…" : "override + send") {
-                                    Task { await fire(override: true) }
-                                }
-                                .buttonStyle(.glassProminent)
-                                .tint(Palette.danger)
-                                .disabled(compose.sending)
-                            } else {
-                                Button(compose.sending ? "sending…" : "send") {
-                                    Task { await fire(override: false) }
-                                }
-                                .buttonStyle(.glassProminent)
-                                .tint(Palette.accent)
-                                .disabled(compose.sending)
-                            }
-                        } else {
-                            Button("esc cancel") { store.closeCompose() }
-                                .buttonStyle(.glass)
-                            Button("review →") { toReview() }
-                                .buttonStyle(.glassProminent)
-                                .tint(Palette.accent)
-                        }
-                    }
                 }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                footer(compose)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .passbandGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
+            .shadow(color: .black.opacity(0.24), radius: 40, x: -14)
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
             .onAppear { if !inReview { focusedField = .to } }
         }
+    }
+
+    private func header(_ compose: ComposeState) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(inReview ? "review · confirm send" : "compose")
+                .font(Typo.sectionLabel)
+                .foregroundStyle(Palette.ink)
+                .textCase(.uppercase)
+            Text(compose.replyToMessageId != nil ? "reply" : "new message")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+            Spacer()
+            HStack(spacing: 4) {
+                Kbd("Esc")
+                Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 13)
+        .overlay(alignment: .bottom) { Hairline() }
+    }
+
+    private func footer(_ compose: ComposeState) -> some View {
+        HStack(spacing: 8) {
+            hint
+            Spacer()
+            if inReview {
+                Button("esc back") { patch { $0.phase = .edit; $0.error = nil } }
+                    .buttonStyle(.glass)
+                if guarded {
+                    Button(compose.sending ? "sending…" : "override + send") {
+                        Task { await fire(override: true) }
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(Palette.danger)
+                    .disabled(compose.sending)
+                } else {
+                    Button(compose.sending ? "sending…" : "send") {
+                        Task { await fire(override: false) }
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(Palette.accent)
+                    .disabled(compose.sending)
+                }
+            } else {
+                Button("esc cancel") { store.closeCompose() }
+                    .buttonStyle(.glass)
+                Button("review →") { toReview() }
+                    .buttonStyle(.glassProminent)
+                    .tint(Palette.accent)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .overlay(alignment: .top) { Hairline() }
     }
 
     private var editPane: some View {
@@ -100,12 +131,14 @@ struct ComposeReview: View {
                     .focused($focusedField, equals: .subject)
             }
             VStack(alignment: .leading, spacing: 5) {
-                Text("body").font(Typo.micro).foregroundStyle(Palette.inkFaint)
-                TextEditor(text: bind(\.body))
-                    .font(.system(size: 13))
-                    .scrollContentBackground(.hidden)
-                    .focused($focusedField, equals: .body)
-                    .frame(height: 170)
+                HStack(spacing: 6) {
+                    Text("body").font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                    Text("markdown — **bold**, *italic*, `code`, [links](url)")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                }
+                MarkdownTextView(text: bind(\.body))
+                    .frame(maxHeight: .infinity)
                     .padding(8)
                     .background(
                         RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -115,6 +148,7 @@ struct ComposeReview: View {
                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                             .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
             }
+            .frame(maxHeight: .infinity)
         }
     }
 
@@ -136,13 +170,13 @@ struct ComposeReview: View {
                     ? (isReply ? ComposeCopy.derivedSubject : "(none)") : compose.subject)
 
             ScrollView {
-                Text(compose.body)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Palette.inkDim)
+                // The scanner's own styling, so review shows the formatting the
+                // HTML half will carry — not a second interpretation of it.
+                Text(MarkdownStyle.attributed(compose.body))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 220)
+            .frame(maxHeight: .infinity)
             .padding(10)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -190,6 +224,13 @@ struct ComposeReview: View {
 
     // MARK: - keymap
 
+    /// True while the caret sits in the body editor. The body is an NSTextView
+    /// now (FocusState cannot see into AppKit), and plain Enter there must stay
+    /// a newline.
+    private var bodyHasFocus: Bool {
+        NSApp.keyWindow?.firstResponder is NSTextView
+    }
+
     private var bindings: [KeyBinding] {
         [
             KeyBinding("Escape", inReview ? "back to edit" : "cancel", allowInInput: true) {
@@ -204,7 +245,7 @@ struct ComposeReview: View {
             KeyBinding(declining: "Enter", inReview ? "send" : "review", allowInInput: true) {
                 guard let compose = store.compose else { return false }
                 if compose.phase == .edit {
-                    guard focusedField != .body else { return false }  // let it type a newline
+                    guard !bodyHasFocus else { return false }  // let it type a newline
                     toReview()
                 } else {
                     Task { await fire(override: false) }
@@ -305,7 +346,7 @@ struct ComposeReview: View {
 
 /// THE outbound-guard verdict, rendered identically wherever a reply started.
 /// The one screen whose job is talking a reader out of a mistake must not read
-/// differently in the modal composer and in the reader's inline one.
+/// differently in the pane composer and in the reader's inline one.
 struct GuardVerdictBox: View {
     /// The redacted kinds the guard matched. Never rendered as markup — they are
     /// server strings.

@@ -66,6 +66,13 @@ struct MainShell: View {
     var body: some View {
         @Bindable var store = store
 
+        // The compose pane takes HALF the window — the routed page shrinks
+        // beside it rather than disappearing under a modal. GeometryReader is
+        // the window's own measure; the floor keeps the pane usable when the
+        // window itself is narrow.
+        GeometryReader { geo in
+            let composeWidth = max(420, geo.size.width / 2)
+
         ZStack(alignment: .topLeading) {
             // EVERYTHING A MODAL SITS ON TOP OF, blurred as one layer while a
             // modal is up. Blurring is what keeps the app visible behind ⌘K:
@@ -86,6 +93,13 @@ struct MainShell: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // The composer: a working surface in the layout, NOT an overlay
+                // — no scrim, no blur, the page beside it stays live.
+                if store.compose != nil {
+                    ComposePane()
+                        .frame(width: composeWidth)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
 
             // Side panel surfaces (browse / search).
@@ -116,6 +130,14 @@ struct MainShell: View {
                             .frame(width: sidePanelWidth)
                             .allowsHitTesting(false)
                     }
+                    // Same reservation for the compose pane: `c` from the reader
+                    // opens it in the layout BELOW this layer, and the reader
+                    // insetting past it is what keeps it visible.
+                    if store.compose != nil {
+                        Color.clear
+                            .frame(width: composeWidth)
+                            .allowsHitTesting(false)
+                    }
                 }
                 // NO TRANSITION. Opening an email is a jump, not a dissolve: a
                 // crossfade shows two surfaces at once on a surface the reader
@@ -132,10 +154,14 @@ struct MainShell: View {
         }
         .animation(.easeOut(duration: 0.18), value: store.modalOverlayOpen)
         .animation(.smooth(duration: 0.22), value: store.sideView)
+        // The BOOL, never the ComposeState: the state changes on every
+        // keystroke, and animating that would smear typing.
+        .animation(.smooth(duration: 0.22), value: store.compose != nil)
         // threadId is deliberately NOT animated — opening a thread is a jump.
         .keyBindings(.global, globalBindings)
         .onChange(of: store.sitrep.sealed) { _, sealed in
             AuthArrival.shared.observe(sealed: sealed)
+        }
         }
     }
 

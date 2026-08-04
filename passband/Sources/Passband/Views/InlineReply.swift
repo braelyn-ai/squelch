@@ -1,12 +1,13 @@
 // REPLY WHERE YOU READ. A pinned composer under the message stack rather than a
-// modal over it: the email you are answering stays on screen, unblurred and
+// panel over it: the email you are answering stays on screen, unblurred and
 // scrollable, which is the whole point of answering from the reader.
 //
-// The ceremony is the modal composer's, unchanged and LOCKED: ⌘Enter goes to
+// The ceremony is the pane composer's, unchanged and LOCKED: ⌘Enter goes to
 // review, Enter submits ONCE WITHOUT override (that call is what fetches the
 // outbound-guard verdict), and only a blocked verdict unlocks shift+Enter to send
 // anyway. Both composers run it through `ComposeSubmit`, so there is one request
-// shape and one error mapping.
+// shape and one error mapping. The body is markdown, live-styled by the same
+// MarkdownTextView the pane uses.
 //
 // Body only, on purpose: the request carries `reply_to_message_id` and the body,
 // and the daemon derives the recipient and `Re: <subject>` from the parent. The
@@ -29,7 +30,6 @@ struct InlineReply: View {
     let onEchoed: () -> Void
 
     @Environment(AppStore.self) private var store
-    @FocusState private var focused: Bool
 
     private var compose: ComposeState? { store.inlineReply }
     private var inReview: Bool { compose?.phase == .review }
@@ -108,11 +108,12 @@ struct InlineReply: View {
     }
 
     private func editor(_ compose: ComposeState) -> some View {
-        TextEditor(text: bind(\.body))
-            .font(.system(size: 13))
-            .scrollContentBackground(.hidden)
-            .focused($focused)
-            .disabled(compose.sending)
+        // autofocus is the affordance: `r` must land the cursor in the body, or
+        // the composer is a box you have to go click. It lives on the EDITOR,
+        // not the bar: the editor also mounts on the way BACK from review (the
+        // bar never left), so Esc out of review would otherwise drop the cursor
+        // and hand every letter you typed next to the reader's verbs.
+        MarkdownTextView(text: bind(\.body), autofocus: true, disabled: compose.sending)
             .frame(height: 150)
             .padding(8)
             .background(
@@ -122,14 +123,6 @@ struct InlineReply: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
-            // Focus is the affordance: `r` must land the cursor in the body, or
-            // the composer is a box you have to go click. Same programmatic-focus
-            // shape as AskBar and RuleEditor — but attached to the EDITOR, not to
-            // the bar: the editor also appears on the way BACK from review, and a
-            // bar-level onAppear does not fire for that (the bar never left), so
-            // Esc out of review would drop the cursor and hand every letter you
-            // typed next to the reader's verbs.
-            .onAppear { focused = true }
     }
 
     /// Read-only, because review is for reading: the recipient and subject the
@@ -141,9 +134,9 @@ struct InlineReply: View {
             ComposeSummaryRow("subject", replySubject)
 
             ScrollView {
-                Text(compose.body)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Palette.inkDim)
+                // Same styling as the live editor, so review is the send's
+                // formatting, not a second interpretation of it.
+                Text(MarkdownStyle.attributed(compose.body))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

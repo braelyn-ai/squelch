@@ -209,7 +209,8 @@ let ringSeconds: TimeInterval = 60
 // MARK: - compose
 
 /// Draft + review state for the send ceremony. ONE type for both composers: the
-/// modal `ComposeReview` (new message) and the reader's inline reply.
+/// `ComposePane` (new message, the right-hand pane) and the reader's inline
+/// reply.
 struct ComposeState: Sendable, Equatable {
     enum Phase: Sendable { case edit, review }
     var replyToMessageId: Int?
@@ -563,12 +564,13 @@ final class AppStore {
 
     /// True while a modal owns the screen; the surfaces under it blur so the modal
     /// reads as focus rather than as a new page. Toasts are deliberately absent (a
-    /// toast must never defocus the app), as are the side panels and the thread
-    /// viewer — those are surfaces you interact with, not overlays on one. The
-    /// reader's `inlineReply` is absent for the same reason: it is part of the
-    /// viewer, and blurring the email you are answering would be absurd.
+    /// toast must never defocus the app), as are the side panels, the thread
+    /// viewer, and the compose pane — those are surfaces you work beside, not
+    /// overlays on one. The reader's `inlineReply` is absent for the same reason:
+    /// it is part of the viewer, and blurring the email you are answering would
+    /// be absurd.
     var modalOverlayOpen: Bool {
-        askBarOpen || shortcutsOpen || processModeOpen || compose != nil
+        askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
     }
 
@@ -793,7 +795,7 @@ final class AppStore {
     /// one new-message draft by construction, so there is one row to look for and
     /// no picker to show.
     ///
-    /// The modal opens BLANK and immediately, because the keypress has to feel
+    /// The pane opens BLANK and immediately, because the keypress has to feel
     /// instant; the saved draft lands into it a round-trip later, and only if
     /// nothing has been typed in the meantime (see `restoreNewMessage`).
     func openComposeNew() {

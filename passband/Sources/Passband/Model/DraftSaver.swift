@@ -8,7 +8,7 @@
 // never interrupt what they are writing to report on itself. The only thing a
 // failure costs is the restore.
 //
-// Two slots, saved independently — the modal composer and the reader's inline
+// Two slots, saved independently — the pane composer and the reader's inline
 // reply are two live drafts at once, keyed differently server-side (nil vs. the
 // parent message id), so they debounce and flush on their own timers.
 

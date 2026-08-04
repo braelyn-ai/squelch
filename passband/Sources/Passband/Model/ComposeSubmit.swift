@@ -1,4 +1,4 @@
-// The NETWORK half of the send ceremony, lifted out of the modal composer so the
+// The NETWORK half of the send ceremony, lifted out of the pane composer so the
 // reader's inline reply fires the identical request and maps the identical
 // failures. What stays with each caller is only the UI half: which toast, which
 // surface closes, where the verdict renders.
@@ -69,14 +69,14 @@ enum ComposeSubmit {
 // MARK: - shared copy
 
 /// Sentences both composers say. Held together because a reply that starts in
-/// the reader and a reply that starts in the modal must not describe the same
+/// the reader and a reply that starts in the pane must not describe the same
 /// state in two different voices.
 enum ComposeCopy {
     /// 403: the read credential cannot send.
     static let noWriteCredential = "no write credential — run `squelchd auth --write`"
 
     /// Stands in for a subject the daemon will derive but that is NOT in reach to
-    /// show: the modal composer works off an update, which carries an LLM summary
+    /// show: the pane composer works off an update, which carries an LLM summary
     /// rather than the real header.
     static let derivedSubject = "Re: (derived from thread)"
 

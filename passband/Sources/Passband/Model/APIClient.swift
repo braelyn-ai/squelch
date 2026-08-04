@@ -379,6 +379,9 @@ actor APIClient {
             "/client/actions/send",
             body: SendBody(
                 reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body,
+                // Both composers write markdown; the daemon renders the HTML
+                // half from this same source after the guard has scanned it.
+                body_format: "markdown",
                 confirm: true, override_guard: overrideGuard, draft_id: draftId))
     }
 

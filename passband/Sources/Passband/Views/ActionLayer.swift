@@ -1,6 +1,7 @@
 // The global action surface, above every other layer: undo/notice toasts, the
-// unsubscribe-violation prompt, compose review, rule editor, process mode, the
-// 2FA modal, triage-fix palette, ⌘K ask bar, shortcuts overlay.
+// unsubscribe-violation prompt, rule editor, process mode, the 2FA modal,
+// triage-fix palette, ⌘K ask bar, shortcuts overlay. The composer is NOT here
+// anymore — it is a layout pane (see ComposePane in MainShell), not an overlay.
 // Read views own the list keymap; this layer extends that same "list" context
 // with t and p. Modal-context keys live inside each overlay.
 
@@ -30,7 +31,6 @@ struct ActionLayer: View {
             .padding(.leading, 74)
             .padding(.bottom, 18)
 
-            if store.compose != nil { ComposeReview() }
             if let request = store.ruleEditor {
                 RuleEditor(request: request) { store.closeRuleEditor() }
             }
