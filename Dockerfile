@@ -14,6 +14,7 @@ COPY squelch-httpauth ./squelch-httpauth
 COPY squelch-mcp ./squelch-mcp
 COPY squelch-tui ./squelch-tui
 COPY squelch-api ./squelch-api
+COPY squelch-broker ./squelch-broker
 COPY squelchd ./squelchd
 COPY squelch-relay ./squelch-relay
 

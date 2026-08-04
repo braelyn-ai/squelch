@@ -90,7 +90,7 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 | `squelch-client-swift` | the native macOS client over the human door |
 | [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
 
-Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
+Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md); the Docker path (prebuilt images on GHCR, env-var config only) is [`deploy/DOCKER.md`](deploy/DOCKER.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
 
 ## Building the macOS client
 
