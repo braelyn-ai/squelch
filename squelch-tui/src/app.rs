@@ -463,6 +463,7 @@ mod tests {
             matched_rule: None,
             field_reasons: None,
             has_attachments: None,
+            from_name: None,
         }
     }
 
