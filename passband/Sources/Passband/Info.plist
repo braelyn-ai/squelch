@@ -13,14 +13,14 @@
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Squelch</string>
+	<string>Passband</string>
 	<key>CFBundleIconFile</key>
-	<string>Squelch</string>
-	<!-- The new-format icon compiled from ./Squelch.icon into Assets.car;
+	<string>Passband</string>
+	<!-- The new-format icon compiled from ./Passband.icon into Assets.car;
 	     without this name macOS 26 falls back to the icns and renders it
 	     shrunken on a plain squircle as an unadopted legacy icon. -->
 	<key>CFBundleIconName</key>
-	<string>Squelch</string>
+	<string>Passband</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

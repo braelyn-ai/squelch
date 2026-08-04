@@ -30,7 +30,7 @@ enum SettingsSection: String, CaseIterable, Sendable {
 enum TelemetryLevel: String, CaseIterable, Sendable {
     case full, minimal, none
 
-    static let prefKey = "squelch.pref.telemetry"
+    static let prefKey = "passband.pref.telemetry"
 
     var label: String {
         switch self {
@@ -70,13 +70,13 @@ final class Prefs {
     private let defaults = UserDefaults.standard
 
     private enum Key {
-        static let loadRemoteImages = "squelch.pref.loadRemoteImages"
-        static let settingsSection = "squelch.pref.settingsSection"
-        static let rankWeight = "squelch.pref.rankWeight"
-        static let developerMode = "squelch.pref.developerMode"
-        static let theme = "squelch.pref.theme"
-        static let userName = "squelch.name"
-        static let assistantModel = "squelch.assistant.model"
+        static let loadRemoteImages = "passband.pref.loadRemoteImages"
+        static let settingsSection = "passband.pref.settingsSection"
+        static let rankWeight = "passband.pref.rankWeight"
+        static let developerMode = "passband.pref.developerMode"
+        static let theme = "passband.pref.theme"
+        static let userName = "passband.name"
+        static let assistantModel = "passband.assistant.model"
         static let telemetry = TelemetryLevel.prefKey
     }
 

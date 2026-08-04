@@ -15,8 +15,8 @@ final class Notifier {
 
     /// userInfo keys — a tap routes on the thread id. `nonisolated` because the
     /// delegate reads the payload on whatever queue the system delivers it to.
-    nonisolated static let threadKey = "squelch.thread_id"
-    nonisolated static let eventKey = "squelch.event_id"
+    nonisolated static let threadKey = "passband.thread_id"
+    nonisolated static let eventKey = "passband.event_id"
 
     /// UNUserNotificationCenter holds its delegate WEAKLY. This property is the
     /// only strong reference in the process — assigning a freshly-made delegate
@@ -27,7 +27,7 @@ final class Notifier {
     private init() {}
 
     /// Install the delegate. Call from applicationDidFinishLaunching: a
-    /// notification tapped while Squelch was not running is delivered as soon as
+    /// notification tapped while Passband was not running is delivered as soon as
     /// the delegate exists, and a center without one drops it.
     func install() {
         UNUserNotificationCenter.current().delegate = delegate
@@ -71,7 +71,7 @@ final class Notifier {
         }
 
         return Copy(
-            title: sender.isEmpty ? "Squelch" : sender,
+            title: sender.isEmpty ? "Passband" : sender,
             subtitle: subtitle,
             // An empty one_line means triage stored no summary; say something
             // true rather than posting a blank banner.
@@ -80,7 +80,7 @@ final class Notifier {
             // fallback must be unique, or an empty thread id would glue
             // unrelated mail together.
             threadIdentifier: event.thread_id.isEmpty
-                ? "squelch.event.\(event.id)" : event.thread_id,
+                ? "passband.event.\(event.id)" : event.thread_id,
             // Sound only for the time-bound kinds — a chime per surfaced email
             // is how a notification stream gets muted wholesale.
             sound: event.kind != .surfaced)
@@ -113,7 +113,7 @@ final class Notifier {
         // overlapping the live seam after a reconnect) replace its own banner
         // rather than stack a second copy.
         let request = UNNotificationRequest(
-            identifier: "squelch.event.\(event.id)", content: content, trigger: nil)
+            identifier: "passband.event.\(event.id)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
 

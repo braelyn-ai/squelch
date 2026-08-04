@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a distributable Squelch.app: Developer ID signature, hardened runtime,
+# Build a distributable Passband.app: Developer ID signature, hardened runtime,
 # Apple notarization, stapled ticket. The result opens by double-click on any
 # Mac; an ad-hoc build from plain ./build.sh does not.
 #
@@ -9,11 +9,11 @@
 # One-time setup — store an app-specific password from appleid.apple.com under
 # a keychain profile that this script reads by name:
 #
-#   xcrun notarytool store-credentials squelch-notary \
+#   xcrun notarytool store-credentials passband-notary \
 #     --apple-id <your apple id> --team-id <your team id>
 #
 # Overridable: SIGN_ID (defaults to the Developer ID Application cert found in
-# the keychain) and NOTARY_PROFILE (defaults to squelch-notary).
+# the keychain) and NOTARY_PROFILE (defaults to passband-notary).
 
 set -euo pipefail
 
@@ -22,8 +22,8 @@ cd "$(dirname "$0")"
 NOTARIZE=1
 [ "${1:-}" = "--no-notary" ] && NOTARIZE=0
 
-APP="build/Squelch.app"
-NOTARY_PROFILE="${NOTARY_PROFILE:-squelch-notary}"
+APP="build/Passband.app"
+NOTARY_PROFILE="${NOTARY_PROFILE:-passband-notary}"
 
 # ---------------------------------------------------------------- identity ---
 # Fall back to whatever Developer ID Application cert is in the keychain, so a
@@ -46,7 +46,7 @@ SIGN_ID="$SIGN_ID" HARDENED=1 ./build.sh release
 
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
 BUILD_NUM=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")
-STEM="Squelch-$VERSION"
+STEM="Passband-$VERSION"
 
 echo "==> verifying signature"
 codesign --verify --strict --verbose=2 "$APP"

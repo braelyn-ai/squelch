@@ -24,7 +24,7 @@ enum GlassLevel {
 extension View {
     /// The app's standard glass card. Pass a tier color for semantic surfaces,
     /// nil for a neutral pane.
-    func squelchGlass(
+    func passbandGlass(
         _ level: GlassLevel = .pane,
         cornerRadius: CGFloat = 16,
         tint: Color? = Palette.glassTint,
@@ -40,7 +40,7 @@ extension View {
 
     /// A glass surface participating in matched-geometry morphing. Pair with a
     /// `GlassEffectContainer` and a shared `@Namespace`.
-    func squelchGlass<ID: Hashable & Sendable>(
+    func passbandGlass<ID: Hashable & Sendable>(
         _ level: GlassLevel = .pane,
         cornerRadius: CGFloat = 16,
         tint: Color? = Palette.glassTint,
@@ -48,7 +48,7 @@ extension View {
         id: ID,
         in namespace: Namespace.ID
     ) -> some View {
-        squelchGlass(level, cornerRadius: cornerRadius, tint: tint, interactive: interactive)
+        passbandGlass(level, cornerRadius: cornerRadius, tint: tint, interactive: interactive)
             .glassEffectID(id, in: namespace)
     }
 
@@ -119,7 +119,7 @@ struct ZoneCard<Content: View>: View {
     let title: String
     var count: Int?
     var subtitle: String?
-    /// A semantic tint; nil uses the standard squelch wash.
+    /// A semantic tint; nil uses the standard passband wash.
     var tint: Color?
     var trailing: AnyView?
     @ViewBuilder var content: Content
@@ -175,7 +175,7 @@ struct ZoneCard<Content: View>: View {
         }
         .zonePadding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .squelchGlass(.pane, cornerRadius: 18, tint: tint?.opacity(0.12) ?? Palette.glassTint)
+        .passbandGlass(.pane, cornerRadius: 18, tint: tint?.opacity(0.12) ?? Palette.glassTint)
     }
 }
 
@@ -250,7 +250,7 @@ struct ModalCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) { content }
             .padding(18)
             .frame(width: width)
-            .squelchGlass(.pane, cornerRadius: 20, tint: tint)
+            .passbandGlass(.pane, cornerRadius: 20, tint: tint)
             .shadow(color: .black.opacity(0.28), radius: 40, y: 18)
     }
 }
@@ -286,7 +286,7 @@ struct WindowBackdrop: View {
                     Color(light: 0xD5E5F8, dark: 0x080E19).opacity(Self.canvasBottom),
                 ],
                 startPoint: .top, endPoint: .bottom)
-            // The brand wash on top, so empty window area is squelch's too.
+            // The brand wash on top, so empty window area is passband's too.
             Palette.glassTint.opacity(Self.brandWash)
         }
     }

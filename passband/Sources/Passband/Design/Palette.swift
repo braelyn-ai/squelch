@@ -1,4 +1,4 @@
-// The squelch palette. Every color is defined for BOTH appearances: on glass,
+// The passband palette. Every color is defined for BOTH appearances: on glass,
 // ink has to be darker in light mode and lighter in dark than it would be on an
 // opaque fill, because the material lets the backdrop's luminance through.
 // The accent marks state, never decoration. Tier colors are fixed and never
@@ -9,7 +9,7 @@ import SwiftUI
 enum Palette {
     // MARK: - the accent
 
-    /// The squelch blue. Saturated on purpose.
+    /// The passband blue. Saturated on purpose.
     static let accent = Color(
         light: Color(hex: 0x2B7FD4), dark: Color(hex: 0x4E9BEA))
     /// Deeper blue for amounts, links and pressed states.
@@ -23,7 +23,7 @@ enum Palette {
     /// The glass tint the app's own chrome uses. Alpha stays low: a tint this
     /// saturated stops being glass and becomes a blue box.
     static let glassTint = Color(hex: 0x2B7FD4).opacity(0.10)
-    /// A stronger tint for surfaces that must read as "squelch's own".
+    /// A stronger tint for surfaces that must read as "passband's own".
     static let glassTintStrong = Color(hex: 0x2B7FD4).opacity(0.18)
 
     // MARK: - tier semantics

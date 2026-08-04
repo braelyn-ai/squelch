@@ -13,7 +13,7 @@ import Foundation
 final class AuthArrival {
     static let shared = AuthArrival()
 
-    private static let seenKey = "squelch.auth-seen"
+    private static let seenKey = "passband.auth-seen"
     private static let seenCap = 200
     /// A message older than this on first sight is treated as history.
     private static let freshWindow: TimeInterval = 2 * 60

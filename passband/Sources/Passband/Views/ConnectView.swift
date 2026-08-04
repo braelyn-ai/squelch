@@ -16,7 +16,7 @@ struct ConnectView: View {
         ZStack {
             VStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("squelch")
+                    Text("passband")
                         .font(Typo.serif(40, weight: .medium))
                         .foregroundStyle(Palette.ink)
                     Text("connect to your human door")
@@ -71,7 +71,7 @@ struct ConnectView: View {
             }
             .padding(30)
             .frame(width: 440)
-            .squelchGlass(.pane, cornerRadius: 24, tint: Palette.glassTintStrong)
+            .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -1,4 +1,4 @@
-// Typed client for the squelch human door (/client/*). One method per route.
+// Typed client for the squelchd human door (/client/*). One method per route.
 // Bearer token + base URL come from the keychain; call `configure()` once before
 // any request.
 //

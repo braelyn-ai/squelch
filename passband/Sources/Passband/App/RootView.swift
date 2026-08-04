@@ -49,7 +49,7 @@ struct RootView: View {
 private struct LoadingGate: View {
     var body: some View {
         VStack(spacing: 14) {
-            Text("squelch")
+            Text("passband")
                 .font(Typo.serif(34, weight: .medium))
                 .foregroundStyle(Palette.ink)
             ProgressView()

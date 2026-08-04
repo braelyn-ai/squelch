@@ -103,7 +103,7 @@ struct SitrepView: View {
                 ScrollView(.vertical) {
                     VStack(spacing: 16) {
                         leftZones(visible: visible, overflow: overflow)
-                        railZones
+                        railCards
                         StatusStrip(rulesCount: rulesCount)
                     }
                     .padding(.bottom, 28)
@@ -181,7 +181,7 @@ struct SitrepView: View {
             cursor: cursor)
     }
 
-    /// The records zones, shared by both layouts.
+    /// The records zones as the pinned rail shows them: full-width rows.
     @ViewBuilder
     private var railZones: some View {
         CalendarZone()
@@ -190,12 +190,31 @@ struct SitrepView: View {
         ReceiptsZone()
     }
 
+    /// The records as HALF-WIDTH cards for the stacked layout. Two top-aligned
+    /// columns rather than a LazyVGrid: a grid row takes its tallest cell's
+    /// height, and these cards are never the same height, so a grid opens
+    /// gaps that independent columns simply pack.
+    private var railCards: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(spacing: 16) {
+                CalendarZone()
+                BankingZone()
+            }
+            .frame(maxWidth: .infinity)
+            VStack(spacing: 16) {
+                ShipmentsZone()
+                ReceiptsZone()
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
     // MARK: - masthead
 
     private var masthead: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Text("squelch")
+                Text("passband")
                     .font(Typo.serif(19, weight: .medium))
                     .foregroundStyle(Palette.ink)
                 Text("sitrep")

@@ -44,7 +44,7 @@ struct DaemonDownPane: View {
                 .padding(.top, 4)
             }
             .padding(38)
-            .squelchGlass(.pane, cornerRadius: 22, tint: auth ? Palette.lockSoft : Palette.warnSoft)
+            .passbandGlass(.pane, cornerRadius: 22, tint: auth ? Palette.lockSoft : Palette.warnSoft)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }

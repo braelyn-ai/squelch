@@ -102,7 +102,7 @@ final class EventStream {
     /// `integer(forKey:)`: the absent case must stay nil, because `after=0` is
     /// the legitimate "replay the entire log" cursor on the server. Reading a
     /// missing key as 0 would turn every fresh install into a backlog storm.
-    private static let cursorKey = "squelch.events.lastSeen"
+    private static let cursorKey = "passband.events.lastSeen"
 
     private static let backoffBase: TimeInterval = 1
     private static let backoffCap: TimeInterval = 60

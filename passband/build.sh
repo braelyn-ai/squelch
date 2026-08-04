@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Squelch.app straight from the command line with swiftc — no xcodebuild,
+# Build Passband.app straight from the command line with swiftc — no xcodebuild,
 # no IDE. This is the canonical build for this repo because the Xcode CLI on
 # this machine intermittently fails to load its simulator plug-ins, which
 # xcodebuild treats as fatal even for a macOS-only target. `swiftc` itself is
@@ -20,8 +20,8 @@ cd "$(dirname "$0")"
 . ./signing.sh
 
 MODE="${1:-debug}"
-APP="build/Squelch.app"
-SRC_DIR="Sources/Squelch"
+APP="build/Passband.app"
+SRC_DIR="Sources/Passband"
 RES_DIR="$SRC_DIR/Resources"
 
 # Versioning. ./VERSION is the single source of truth for the user-facing
@@ -54,7 +54,7 @@ echo "==> compiling ($MODE) v$MARKETING_VERSION build $BUILD_NUMBER"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# Every .swift under Sources/Squelch, excluding the resources folder.
+# Every .swift under Sources/Passband, excluding the resources folder.
 # (`mapfile` is bash 4+; macOS ships bash 3.2, so read the list the portable way.)
 SOURCES=()
 while IFS= read -r file; do
@@ -62,13 +62,13 @@ while IFS= read -r file; do
 done < <(find "$SRC_DIR" -name '*.swift' -not -path "$RES_DIR/*" | sort)
 echo "    ${#SOURCES[@]} source files"
 
-xcrun swiftc "${SWIFT_FLAGS[@]}" -o "$APP/Contents/MacOS/Squelch" "${SOURCES[@]}"
+xcrun swiftc "${SWIFT_FLAGS[@]}" -o "$APP/Contents/MacOS/Passband" "${SOURCES[@]}"
 
 echo "==> assembling bundle"
 # Info.plist with the build-setting placeholders resolved.
-sed -e 's/\$(EXECUTABLE_NAME)/Squelch/g' \
-    -e 's/\$(PRODUCT_BUNDLE_IDENTIFIER)/dev.squelch.client/g' \
-    -e 's/\$(PRODUCT_NAME)/Squelch/g' \
+sed -e 's/\$(EXECUTABLE_NAME)/Passband/g' \
+    -e 's/\$(PRODUCT_BUNDLE_IDENTIFIER)/app.passband.client/g' \
+    -e 's/\$(PRODUCT_NAME)/Passband/g' \
     -e "s/\\\$(MARKETING_VERSION)/$MARKETING_VERSION/g" \
     -e "s/\\\$(CURRENT_PROJECT_VERSION)/$BUILD_NUMBER/g" \
     -e 's/\$(MACOSX_DEPLOYMENT_TARGET)/26.0/g' \
@@ -76,16 +76,16 @@ sed -e 's/\$(EXECUTABLE_NAME)/Squelch/g' \
 
 cp -R "$RES_DIR/." "$APP/Contents/Resources/" 2>/dev/null || true
 
-# App icon. ./Squelch.icon is the only icon source in the repo; actool compiles
+# App icon. ./Passband.icon is the only icon source in the repo; actool compiles
 # it to the Assets.car that CFBundleIconName points at — macOS 26 shrinks any
 # bundle without one onto a plain squircle as an unadopted legacy icon — and
-# also emits the flattened Squelch.icns fallback that CFBundleIconFile names.
+# also emits the flattened Passband.icns fallback that CFBundleIconFile names.
 # actool ships with full Xcode, not the CommandLineTools; a machine without it
 # just builds an iconless bundle instead of failing.
-if ! xcrun actool Squelch.icon \
+if ! xcrun actool Passband.icon \
     --compile "$APP/Contents/Resources" \
     --platform macosx --minimum-deployment-target 26.0 \
-    --app-icon Squelch \
+    --app-icon Passband \
     --output-partial-info-plist build/actool-partial.plist \
     --output-format human-readable-text >/dev/null; then
   echo "    WARNING: actool failed; bundle has no app icon" >&2
@@ -102,7 +102,7 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # Developer ID requirement is keyed to the team and never changes, so the ACL
 # keeps matching for the life of the certificate. Ad-hoc remains the fallback
 # so the build still works on a machine with no certificate.
-ENTITLEMENTS="$SRC_DIR/Squelch.entitlements"
+ENTITLEMENTS="$SRC_DIR/Passband.entitlements"
 if [ -z "${SIGN_ID:-}" ]; then
   SIGN_ID="$(detect_sign_identity)"
   SIGN_ID="${SIGN_ID:--}"
@@ -119,8 +119,8 @@ else
   # Local builds need get-task-allow so a debugger can attach. Notarization
   # rejects that entitlement outright, so it is injected into a throwaway copy
   # and can never reach a release build.
-  ENTITLEMENTS="build/Squelch.debug.entitlements"
-  cp "$SRC_DIR/Squelch.entitlements" "$ENTITLEMENTS"
+  ENTITLEMENTS="build/Passband.debug.entitlements"
+  cp "$SRC_DIR/Passband.entitlements" "$ENTITLEMENTS"
   /usr/libexec/PlistBuddy -c \
     'Add :com.apple.security.get-task-allow bool true' "$ENTITLEMENTS" >/dev/null
 fi

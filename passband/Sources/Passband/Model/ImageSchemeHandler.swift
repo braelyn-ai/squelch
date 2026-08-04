@@ -1,7 +1,7 @@
-// The `squelch-img:` responder — the only thing that can answer a rewritten email
+// The `passband-img:` responder — the only thing that can answer a rewritten email
 // image reference (ImageProxy mints them). NOT a generic fetch proxy: the sole
 // accepted input is a `u` that parses as http(s) AND carries this launch's
-// signature, which is what separates our own rewrite from a `url(squelch-img://…)`
+// signature, which is what separates our own rewrite from a `url(passband-img://…)`
 // the mail wrote itself in a kept <style> block. The load-on-demand gate is
 // upstream in the CSP, so everything reaching here was already permitted by the
 // document. See docs/SECURITY.md §3.

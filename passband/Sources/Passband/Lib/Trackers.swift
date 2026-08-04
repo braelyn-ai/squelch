@@ -1,6 +1,6 @@
 // Strip tracking pixels from email HTML before it reaches the webview.
 //
-// The CSP is host-agnostic (img-src is the signed squelch-img: proxy — see
+// The CSP is host-agnostic (img-src is the signed passband-img: proxy — see
 // docs/SECURITY.md §3), so this pass is the only seam that can tell a tracker
 // from a hero image. The bias is asymmetric — a missed tracker is one opaque
 // referrer-less GET, a false strip visibly breaks the mail — so strip only on

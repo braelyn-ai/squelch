@@ -197,7 +197,7 @@ enum Assistant {
     private static let maxTokens = 1024
 
     private static let system = """
-        You are the user's personal inbox assistant, embedded in an app called squelch.
+        You are the user's personal inbox assistant, embedded in an app called Passband.
         Answer questions about their email using the tools — search_mail first to find
         relevant messages, then get_thread only when a snippet isn't enough.
 
@@ -447,7 +447,7 @@ struct AssistantUsage: Sendable, Equatable {
 
 @MainActor
 enum AssistantUsageLedger {
-    private static let key = "squelch.assistant.usage"
+    private static let key = "passband.assistant.usage"
 
     static func read() -> AssistantUsage {
         let d = UserDefaults.standard

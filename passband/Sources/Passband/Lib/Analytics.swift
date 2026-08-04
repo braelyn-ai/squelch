@@ -23,8 +23,8 @@ enum Analytics {
 
     private static let client: PostHogClient? = {
         let env = ProcessInfo.processInfo.environment
-        let key = env["SQUELCH_POSTHOG_KEY"] ?? apiKey
-        let endpoint = env["SQUELCH_POSTHOG_HOST"] ?? host
+        let key = env["PASSBAND_POSTHOG_KEY"] ?? apiKey
+        let endpoint = env["PASSBAND_POSTHOG_HOST"] ?? host
         guard key.hasPrefix("phc_"), let url = URL(string: "\(endpoint)/batch/")
         else { return nil }
         return PostHogClient(apiKey: key, endpoint: url)
@@ -122,7 +122,7 @@ enum Analytics {
 final class PostHogClient: @unchecked Sendable {
     private let apiKey: String
     private let endpoint: URL
-    private let queue = DispatchQueue(label: "dev.squelch.analytics")
+    private let queue = DispatchQueue(label: "app.passband.analytics")
 
     private var buffer: [[String: Any]] = []
     private var inFlight = false
@@ -155,13 +155,13 @@ final class PostHogClient: @unchecked Sendable {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let version = info["CFBundleShortVersionString"] as? String ?? "0"
         return [
-            "$app_name": "Squelch",
+            "$app_name": "Passband",
             "$app_version": version,
             "$app_build": info["CFBundleVersion"] as? String ?? "0",
             "$os_name": "macOS",
             "$os_version": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
             "$device_type": "Desktop",
-            "$lib": "squelch-native",
+            "$lib": "passband-native",
             "$lib_version": version,
         ]
     }()
@@ -170,7 +170,7 @@ final class PostHogClient: @unchecked Sendable {
         self.apiKey = apiKey
         self.endpoint = endpoint
 
-        let key = "dev.squelch.analytics.distinctId"
+        let key = "app.passband.analytics.distinctId"
         if let saved = UserDefaults.standard.string(forKey: key) {
             distinctId = saved
         } else {

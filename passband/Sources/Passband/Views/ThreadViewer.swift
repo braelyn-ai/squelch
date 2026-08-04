@@ -405,7 +405,7 @@ struct ThreadViewer: View {
             .padding(.top, 4)
         }
         .padding(38)
-        .squelchGlass(.pane, cornerRadius: 22, tint: down ? Palette.warnSoft : Palette.dangerSoft)
+        .passbandGlass(.pane, cornerRadius: 22, tint: down ? Palette.warnSoft : Palette.dangerSoft)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 

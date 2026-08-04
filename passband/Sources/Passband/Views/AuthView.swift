@@ -228,7 +228,7 @@ struct AuthView: View {
             }
             .zonePadding()
             .frame(maxWidth: .infinity, alignment: .leading)
-            .squelchGlass(.pane, cornerRadius: 18, tint: Palette.lockSoft.opacity(0.7))
+            .passbandGlass(.pane, cornerRadius: 18, tint: Palette.lockSoft.opacity(0.7))
 
             ShredderCard()
         }
@@ -367,7 +367,7 @@ private struct FocusPanel: View {
         }
         .zonePadding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .squelchGlass(.pane, cornerRadius: 20, tint: Palette.lockSoft.opacity(0.8))
+        .passbandGlass(.pane, cornerRadius: 20, tint: Palette.lockSoft.opacity(0.8))
     }
 
     private var digits: some View {
@@ -449,7 +449,7 @@ private struct FocusPanel: View {
     private var note: String {
         if revealed, let code, !code.isEmpty {
             return
-                "Held in memory for this screen only — squelch never stores it. Revealing was written to the audit log."
+                "Held in memory for this screen only — Passband never stores it. Revealing was written to the audit log."
         }
         if revealed {
             return "Revealed, but no code could be read from this one. Open it to read it yourself."
@@ -634,7 +634,7 @@ private struct ShredderCard: View {
                 }
                 .zonePadding()
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .squelchGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
+                .passbandGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
             }
         }
         .task { await load() }

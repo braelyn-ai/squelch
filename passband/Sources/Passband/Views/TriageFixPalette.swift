@@ -31,7 +31,7 @@ struct TriageFixPalette: View {
                     footer
                 }
                 .frame(width: 560)
-                .squelchGlass(
+                .passbandGlass(
                     .pane, cornerRadius: 20, tint: Palette.glassTintStrong,
                     id: "palette", in: paletteGlass)
                 .shadow(color: .black.opacity(0.32), radius: 46, y: 20)

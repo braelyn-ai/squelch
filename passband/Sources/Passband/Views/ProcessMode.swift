@@ -103,7 +103,7 @@ struct ProcessMode: View {
         }
         .padding(22)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .squelchGlass(.pane, cornerRadius: 20, tint: Palette.glassTint)
+        .passbandGlass(.pane, cornerRadius: 20, tint: Palette.glassTint)
         .shadow(color: .black.opacity(0.3), radius: 44, y: 18)
     }
 
@@ -125,7 +125,7 @@ struct ProcessMode: View {
         }
         .frame(maxWidth: .infinity)
         .padding(36)
-        .squelchGlass(.pane, cornerRadius: 20, tint: Palette.positiveSoft)
+        .passbandGlass(.pane, cornerRadius: 20, tint: Palette.positiveSoft)
         .shadow(color: .black.opacity(0.3), radius: 44, y: 18)
     }
 

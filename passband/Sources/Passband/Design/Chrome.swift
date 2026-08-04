@@ -185,7 +185,7 @@ struct SectionCard<Content: View>: View {
         }
         .zonePadding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .squelchGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
+        .passbandGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
     }
 }
 

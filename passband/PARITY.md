@@ -1,4 +1,4 @@
-# squelch-client-swift — parity with `squelch-desktop`
+# passband — parity with `squelch-desktop`
 
 A native macOS/SwiftUI rewrite of the Tauri + React client, targeting macOS 26
 so it can use **real Liquid Glass** rather than CSS that imitates it.
@@ -13,7 +13,7 @@ required. Open questions are recorded at the bottom.
 ## Build
 
 ```bash
-./build.sh            # debug  -> build/Squelch.app
+./build.sh            # debug  -> build/Passband.app
 ./build.sh release    # optimized
 ./build.sh run        # build + launch
 ```
@@ -26,7 +26,7 @@ checked in and produces the same bundle when `xcodebuild` is healthy:
 
 ```bash
 xcodegen generate
-xcodebuild -project Squelch.xcodeproj -scheme Squelch -destination 'platform=macOS' build
+xcodebuild -project Passband.xcodeproj -scheme Passband -destination 'platform=macOS' build
 ```
 
 Current state: **50 Swift source files, debug and release both build clean with
@@ -43,16 +43,16 @@ material is AppKit's own.
 
 | API | Where it is used | Why |
 | --- | --- | --- |
-| `.glassEffect(_:in:)` | `squelchGlass()` — every zone card, modal, panel, chip | The real material: samples the window backdrop, refracts it, draws its own specular edge |
+| `.glassEffect(_:in:)` | `passbandGlass()` — every zone card, modal, panel, chip | The real material: samples the window backdrop, refracts it, draws its own specular edge |
 | `Glass.regular` / `.clear` | panes vs. chrome (`GlassLevel`) | Rail and chips stay maximally see-through; content panes carry more presence |
-| `.tint(_:)` | brand + tier tints on glass | Carries squelch blue **into** the material instead of painting a blue box on a grey one; semantic surfaces tint with their tier color |
+| `.tint(_:)` | brand + tier tints on glass | Carries passband blue **into** the material instead of painting a blue box on a grey one; semantic surfaces tint with their tier color |
 | `.interactive()` | rail item, buttons, toasts | Material responds to press/hover |
 | `GlassEffectContainer` | toast stack, ⌘K bar, triage palette | Adjacent glass **merges and separates fluidly** — the signature behavior with no web equivalent. Deliberately NOT around lists or the rail: a container re-coordinates every descendant whenever one changes, which made a hovered row relayout the page |
 | `.glassEffectID(_:in:)` + `@Namespace` | ask bar, triage palette | Matched-geometry glass: the bar **stretches** into its answer, the palette **stretches** as its list narrows. List selection and the rail indicator used to be here and are not any more — selection is a plain tinted fill (`selectionFill`), and the rail indicator moves by **geometry**, because both cost more as glass than they were worth |
 | `.buttonStyle(.glass)` / `.glassProminent` | every control in the app | No hand-rolled button backgrounds anywhere |
 | `NSVisualEffectView` (`.underWindowBackground`) | `WindowBackdrop` | The layer the whole language sits on; window is non-opaque so glass has real content to refract |
 
-**Identity, not stock grey.** The accent is the saturated squelch blue
+**Identity, not stock grey.** The accent is the saturated passband blue
 `#2b7fd4` (`Palette.accent`), used only to mark state. The bundled **Newsreader**
 serif (converted woff2 → ttf, registered via `ATSApplicationFontsPath`) appears
 in exactly one place per screen — the sitrep hero headline, the thread subject,
@@ -186,9 +186,10 @@ tier/kind value cannot break an older client's page decode.
 
 ## Security posture
 
-**Credentials.** Same keychain service (`squelch-desktop`) and same account
-slots (`server_url`, `api_token`, `assistant_api_key`) as the Tauri shell, so an
-existing install's credentials are picked up with no re-entry.
+**Credentials.** Keychain service `passband` with the same account slots
+(`server_url`, `api_token`, `assistant_api_key`) the Tauri shell used under
+`squelch-desktop`. The rename orphans credentials stored by pre-rename builds —
+one-time re-entry in Settings (squelch-desktop itself is retired).
 
 **The BYOK assistant key is unreachable from the view layer.**
 `AssistantKeyStore.read()` is `fileprivate` to `Keychain.swift`, and `LLMProxy`

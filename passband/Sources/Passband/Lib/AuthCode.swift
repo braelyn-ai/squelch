@@ -140,7 +140,7 @@ final class AuthDecisions {
         return decisionKinds.contains(kind)
     }
 
-    private static let key = "squelch.auth-decisions"
+    private static let key = "passband.auth-decisions"
     /// Cap the stored map so it cannot grow without bound.
     private static let cap = 300
 

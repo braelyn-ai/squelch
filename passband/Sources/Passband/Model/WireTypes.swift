@@ -67,8 +67,8 @@ enum Disposition: String, LenientRawEnum, CaseIterable {
     case surface, squelch, filtered
     static var unknownFallback: Disposition { .squelch }
 
-    /// User-facing label. "squelch" is the product name, not a UI verb — the
-    /// chip reads "mute" while the wire value stays `squelch`.
+    /// User-facing label. `squelch` is the daemon's wire value, not a UI verb —
+    /// the chip reads "mute" while the wire value stays `squelch`.
     var label: String {
         switch self {
         case .surface: "surface"

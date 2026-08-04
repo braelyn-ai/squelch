@@ -260,7 +260,7 @@ private struct PDFPreview: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: Self.cardSize.width, height: Self.cardSize.height)
-        .squelchGlass(.pane, cornerRadius: 13, tint: Palette.glassTint)
+        .passbandGlass(.pane, cornerRadius: 13, tint: Palette.glassTint)
         .shadow(color: .black.opacity(0.3), radius: 40, y: 16)
         // The card swallows clicks so they never reach the dismiss scrim under it
         // — otherwise selecting text in the PDF would close the preview.

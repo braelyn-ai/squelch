@@ -10,7 +10,7 @@ import Foundation
 import Security
 
 /// Keyring service name shared by every stored field.
-private let keychainService = "squelch-desktop"
+private let keychainService = "passband"
 /// Keyring "account" (username) slots within the service.
 private let accountURL = "server_url"
 private let accountToken = "api_token"

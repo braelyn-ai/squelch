@@ -73,7 +73,7 @@ struct AuthCodeModal: View {
                     .frame(height: 2)
                 }
                 .frame(width: 420)
-                .squelchGlass(.pane, cornerRadius: 22, tint: Palette.lockSoft.opacity(0.9))
+                .passbandGlass(.pane, cornerRadius: 22, tint: Palette.lockSoft.opacity(0.9))
                 .shadow(color: .black.opacity(0.34), radius: 50, y: 22)
             }
             .keyContext(.modal)

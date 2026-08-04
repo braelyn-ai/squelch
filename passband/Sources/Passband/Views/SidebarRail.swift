@@ -96,7 +96,7 @@ struct SidebarRail: View {
     private var railStack: some View {
             VStack(spacing: 6) {
                 // NO TOP SPACER: the first icon sits on the SAME LINE as the
-                // "squelch" wordmark beside it, which is what makes the rail read
+                // "passband" wordmark beside it, which is what makes the rail read
                 // as part of the page header. The traffic lights end ~19pt above
                 // where it starts, so no extra clearance is needed.
                 ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in

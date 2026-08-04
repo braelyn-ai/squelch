@@ -73,7 +73,7 @@ struct RevealPanel: View {
                 .padding(.vertical, 10)
             }
             .frame(width: 720)
-            .squelchGlass(.pane, cornerRadius: 20, tint: Palette.lockSoft.opacity(0.85))
+            .passbandGlass(.pane, cornerRadius: 20, tint: Palette.lockSoft.opacity(0.85))
             .shadow(color: .black.opacity(0.32), radius: 46, y: 20)
         }
         .keyContext(.modal)

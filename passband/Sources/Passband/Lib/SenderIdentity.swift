@@ -267,7 +267,7 @@ enum SenderID {
 @MainActor
 final class FaviconCache {
     static let shared = FaviconCache()
-    private static let key = "squelch.favicons"
+    private static let key = "passband.favicons"
     /// How long a failure is trusted before the domain is worth another attempt.
     private static let failedRetry: TimeInterval = 7 * 24 * 60 * 60
 

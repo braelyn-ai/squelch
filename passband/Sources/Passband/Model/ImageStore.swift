@@ -102,7 +102,7 @@ actor ImageStore {
     private init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        dir = base.appendingPathComponent("Squelch/ImageCache", isDirectory: true)
+        dir = base.appendingPathComponent("Passband/ImageCache", isDirectory: true)
         manifestURL = dir.appendingPathComponent("manifest.json")
     }
 

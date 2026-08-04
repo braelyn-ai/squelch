@@ -165,7 +165,7 @@ struct ActionLayer: View {
             .controlSize(.small)
         }
         .padding(13)
-        .squelchGlass(.pane, cornerRadius: 14, tint: Palette.dangerSoft)
+        .passbandGlass(.pane, cornerRadius: 14, tint: Palette.dangerSoft)
         .transition(.move(edge: .leading).combined(with: .opacity))
     }
 

@@ -69,7 +69,7 @@ struct EmailWebView: View {
             let hasRemoteCandidates = Trackers.hasNetworkImages(deduped)
             let links = Trackers.extractLinks(deduped)
             // LAST, after the two reads above: the rewrite replaces every http(s)
-            // image reference with a `squelch-img:` one, which those scans would
+            // image reference with a `passband-img:` one, which those scans would
             // no longer recognise as remote.
             let proxied = ImageProxy.rewrite(deduped)
             return Prepared(
@@ -389,7 +389,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
     private static let measuringScript = """
         (function () {
           var send = function (payload) {
-            try { window.webkit.messageHandlers.squelch.postMessage(payload); } catch (e) {}
+            try { window.webkit.messageHandlers.passband.postMessage(payload); } catch (e) {}
           };
 
           // Declared UP HERE because the quoted-history collapse below calls
@@ -455,7 +455,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
           }
 
           var quoteNodes = findQuoteNodes();
-          window.__squelchSetQuotes = function (collapsed) {
+          window.__passbandSetQuotes = function (collapsed) {
             for (var i = 0; i < quoteNodes.length; i++) {
               quoteNodes[i].style.display = collapsed ? 'none' : '';
             }
@@ -463,7 +463,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
           };
           // Collapsed by default, BEFORE the first measure, so the frame sizes
           // to the collapsed content and never flashes the full chain.
-          window.__squelchSetQuotes(true);
+          window.__passbandSetQuotes(true);
           send({ kind: 'quoted', value: quoteNodes.length > 0 });
 
           // ---- height ------------------------------------------------------
@@ -505,7 +505,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
           // host knows neither the height nor whether a quoted chain exists.
           // Clearing `last` is the trick — measure() suppresses an unchanged
           // height, and a re-shown frame is exactly unchanged.
-          window.__squelchResend = function () {
+          window.__passbandResend = function () {
             send({ kind: 'quoted', value: quoteNodes.length > 0 });
             last = -1;
             measure();
@@ -619,7 +619,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
                 self.onQuotedFound(quoted)
                 if height > 0 { self.onHeight(height) }
             }
-            entry.webView.evaluateJavaScript("window.__squelchResend && window.__squelchResend()")
+            entry.webView.evaluateJavaScript("window.__passbandResend && window.__passbandResend()")
         }
 
         /// Give the frame up: to the pool if it is worth keeping, otherwise to
@@ -643,7 +643,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
 
         func setQuotesCollapsed(_ webView: WKWebView, collapsed: Bool) {
             webView.evaluateJavaScript(
-                "window.__squelchSetQuotes && window.__squelchSetQuotes(\(collapsed))")
+                "window.__passbandSetQuotes && window.__passbandSetQuotes(\(collapsed))")
         }
 
         /// LAYER 4: allow exactly the in-memory loads WE started, refuse everything
@@ -669,14 +669,14 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
         /// deliberately OPAQUE white: body copy over a live wallpaper is
         /// unreadable, and mail ships its own colors assuming a white canvas.
         nonisolated static func document(html: String, allowRemote: Bool) -> String {
-            // `squelch-img:` and NOT `http: https:` — every remote image was
+            // `passband-img:` and NOT `http: https:` — every remote image was
             // rewritten to the proxy scheme (ImageProxy), so the network is
             // reachable only through ImageSchemeHandler and anything the rewrite
             // missed fails closed; `data:` stays for inline art. This is ALSO the
             // whole load-on-demand gate: an un-opted message has no
-            // `squelch-img:` in its policy, so the document refuses the request
+            // `passband-img:` in its policy, so the document refuses the request
             // before the handler is reached and nothing downstream re-checks.
-            let imgSrc = allowRemote ? "squelch-img: data:" : "data:"
+            let imgSrc = allowRemote ? "passband-img: data:" : "data:"
             let csp = "default-src 'none'; style-src 'unsafe-inline'; img-src \(imgSrc)"
             return """
                 <!doctype html><html><head>\
@@ -714,7 +714,7 @@ private struct EmailWebViewRepresentable: NSViewRepresentable {
 private final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
     WKUIDelegate
 {
-    static let name = "squelch"
+    static let name = "passband"
 
     /// Weak on purpose: SwiftUI owns coordinators, and a frame must never be
     /// the reason a dead view's callbacks stay alive.
@@ -856,7 +856,7 @@ private final class WebFramePool {
         // under the new view's collapsed default. The relay records the resulting
         // height with no owner attached, so it is what the next checkout reports.
         entry.webView.evaluateJavaScript(
-            "window.__squelchSetQuotes && window.__squelchSetQuotes(true)")
+            "window.__passbandSetQuotes && window.__passbandSetQuotes(true)")
 
         // Two frames of one document: keep the one just used.
         if let incumbent = frames.removeValue(forKey: key) {

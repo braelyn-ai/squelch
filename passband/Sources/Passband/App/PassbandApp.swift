@@ -5,7 +5,7 @@ import AppKit
 import SwiftUI
 
 @main
-struct SquelchApp: App {
+struct PassbandApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var store = AppStore.shared
     @State private var prefs = Prefs.shared
@@ -15,7 +15,7 @@ struct SquelchApp: App {
     }
 
     var body: some Scene {
-        Window("Squelch", id: "main") {
+        Window("Passband", id: "main") {
             RootView()
                 .environment(store)
                 .environment(prefs)
@@ -28,7 +28,7 @@ struct SquelchApp: App {
         .defaultSize(width: 1320, height: 880)
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
-        .commands { SquelchCommands(store: store, prefs: prefs) }
+        .commands { PassbandCommands(store: store, prefs: prefs) }
     }
 }
 
@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        // Install before launch finishes: a notification tapped while Squelch
+        // Install before launch finishes: a notification tapped while Passband
         // was not running is delivered the moment a delegate exists, and a
         // center without one drops it.
         Notifier.shared.install()
@@ -63,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Native menu equivalents for the app's global chords. These duplicate
 /// registry bindings on purpose: the registry owns dispatch semantics (its
 /// layering and input guard), the menu owns discoverability.
-struct SquelchCommands: Commands {
+struct PassbandCommands: Commands {
     let store: AppStore
     let prefs: Prefs
 

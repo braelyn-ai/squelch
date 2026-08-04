@@ -127,7 +127,7 @@ struct EmailsView: View {
 
         return HStack(spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Text("squelch")
+                Text("passband")
                     .font(Typo.serif(19, weight: .medium))
                     .foregroundStyle(Palette.ink)
                 // The page you are on, not the tab's name.

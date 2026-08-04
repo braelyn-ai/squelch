@@ -264,7 +264,7 @@ enum KeyNames {
     }
 }
 
-/// Installs the ONE global key monitor. Sits at the app level (SquelchApp) so
+/// Installs the ONE global key monitor. Sits at the app level (PassbandApp) so
 /// there is exactly one listener.
 @MainActor
 final class KeyMonitor {

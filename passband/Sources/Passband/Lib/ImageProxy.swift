@@ -1,6 +1,6 @@
 // Route every http(s) image reference through our own scheme —
-// `squelch-img://local/<hmac>?u=<encoded>`, answered only by ImageSchemeHandler
-// — so `img-src` is `squelch-img: data:` alone and a reference this pass misses
+// `passband-img://local/<hmac>?u=<encoded>`, answered only by ImageSchemeHandler
+// — so `img-src` is `passband-img: data:` alone and a reference this pass misses
 // FAILS CLOSED (a broken-image glyph, never an un-proxied request). The
 // per-launch HMAC makes "minted by this rewrite" a checkable claim. cid:, data:
 // and protocol-relative are left alone. See docs/SECURITY.md §3.
@@ -11,7 +11,7 @@ import Foundation
 enum ImageProxy {
     /// The custom scheme. Registered on every email configuration and nowhere
     /// else; handled by ImageSchemeHandler.
-    static let scheme = "squelch-img"
+    static let scheme = "passband-img"
 
     /// How many distinct urls ONE body contributes to the warm list. The warmer
     /// PINS what it fetches, so an uncapped list is an uncapped claim on the
@@ -78,7 +78,7 @@ enum ImageProxy {
         }
 
         // A message can spell our own scheme: ammonia scheme-filters href/src
-        // only, so a hand-written `url(squelch-img://…)` survives in a kept
+        // only, so a hand-written `url(passband-img://…)` survives in a kept
         // <style>. The signature check already refuses it; neutering the token
         // demotes it to a scheme the CSP never dispatches. MUST run before the
         // rewrite so it cannot touch what the rewrite mints.
@@ -227,7 +227,7 @@ enum ImageProxy {
     /// (`url(http://h/a/*b)`) would otherwise silently un-rewrite every image
     /// after it. A miss costs a phantom fetch, a false skip a broken email.
     nonisolated(unsafe) private static let cssComment = /(?s)\/\*.*?\*\//
-    nonisolated(unsafe) private static let schemeToken = /(?i)squelch-img:/
+    nonisolated(unsafe) private static let schemeToken = /(?i)passband-img:/
 
     /// RFC 3986 unreserved, spelled out rather than taken from
     /// `CharacterSet.alphanumerics` — that set admits non-ASCII letters, which

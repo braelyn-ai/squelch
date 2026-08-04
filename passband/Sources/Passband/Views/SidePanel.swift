@@ -39,7 +39,7 @@ struct SidePanel: View {
             }
             .frame(width: sidePanelWidth)
             .frame(maxHeight: .infinity)
-            .squelchGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
+            .passbandGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.24), radius: 40, x: -14)
         }
         .keyContext(.modal)

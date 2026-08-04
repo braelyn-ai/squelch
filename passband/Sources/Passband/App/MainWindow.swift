@@ -1,5 +1,5 @@
 // Finding the app's ONE window from AppKit. The scene is a singleton
-// `Window("Squelch", id: "main")`, and it has to be findable from places
+// `Window("Passband", id: "main")`, and it has to be findable from places
 // SwiftUI's `openWindow` cannot reach: a notification tap and a Dock-icon
 // reopen both arrive at the AppDelegate, outside any view's environment.
 
@@ -21,7 +21,7 @@ enum MainWindow {
     static func find() -> NSWindow? {
         let candidates = NSApp.windows.filter { !($0 is NSPanel) }
         return candidates.first { $0.identifier?.rawValue.contains("main") == true }
-            ?? candidates.first { $0.title == "Squelch" }
+            ?? candidates.first { $0.title == "Passband" }
             ?? candidates.first
     }
 }

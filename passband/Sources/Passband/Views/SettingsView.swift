@@ -870,7 +870,7 @@ private struct PrivacySection: View {
                     selection: $prefs.telemetry)
             }
             SettingsHint(
-                "Anonymous usage telemetry that helps improve Squelch. Full never includes email data or anything derived from it — no subjects, senders, bodies, labels, or assistant questions; only which screens and actions are used. Minimal sends app opens and screen views only. None sends nothing."
+                "Anonymous usage telemetry that helps improve Passband. Full never includes email data or anything derived from it — no subjects, senders, bodies, labels, or assistant questions; only which screens and actions are used. Minimal sends app opens and screen views only. None sends nothing."
             )
         }
     }

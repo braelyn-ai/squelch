@@ -28,7 +28,7 @@ struct AskBar: View {
                     body_
                 }
                 .frame(width: 620)
-                .squelchGlass(
+                .passbandGlass(
                     .pane, cornerRadius: 20, tint: Palette.glassTintStrong,
                     id: "askbar", in: askGlass)
                 .shadow(color: .black.opacity(0.34), radius: 50, y: 22)
