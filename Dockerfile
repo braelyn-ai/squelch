@@ -29,15 +29,16 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/squelch-relay /usr/local/bin/squelch-relay
 
 # Mount point for the open buffer (SQUELCH_RELAY_DB_PATH=/data/opens.sqlite3).
-# Created and owned here because the process is not root: a volume mounted over
-# a root-owned path leaves the relay unable to create its SQLite file, and it
-# refuses to boot rather than run with a buffer it cannot persist. Without a
-# volume the relay still runs, holding opens in memory until the daemon drains.
-RUN mkdir -p /data && chown relay /data
-VOLUME ["/data"]
+# Owned here for the no-volume case; when a volume IS mounted it arrives owned
+# by root and overlays this, which is what the entrypoint fixes before dropping
+# privileges. Without a volume the relay still runs, holding opens in memory
+# until the daemon drains them.
+RUN mkdir -p /data && chown relay:relay /data
 
-USER relay
+COPY squelch-relay/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Railway injects PORT and terminates TLS at its edge; bind whatever it gives
-# us on all interfaces unless the operator pinned SQUELCH_RELAY_BIND themselves.
-CMD ["/bin/sh", "-c", "SQUELCH_RELAY_BIND=\"${SQUELCH_RELAY_BIND:-0.0.0.0:${PORT:-8850}}\" exec /usr/local/bin/squelch-relay"]
+# Deliberately still root at this point: the entrypoint chowns the mounted
+# volume and then execs the relay as `relay` via setpriv. The server itself
+# never runs privileged.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
