@@ -1,16 +1,79 @@
 # squelch-broker: the consent relay
 
-The broker fixes headless consent UX (docker on a NAS, a VPS) without ever being
-trusted. It parks a Google OAuth authorization code for a few minutes so the
-daemon that requested it can claim it. It holds **no OAuth client credentials,
-no tokens, no mail** — the auth code it parks is cryptographically useless
-without the PKCE verifier, which never leaves the daemon. We are not trusted
-with tokens because we're nice; we are incapable of minting them.
+> **STATUS 2026-08-04: DO NOT DEPLOY for the self-host tier. The code-parking
+> flow below cannot be granted by Google.** The crate is built, hardened, and
+> tested; the flow it implements is the one flow Google will not authorize for
+> the client type self-host requires. Details in "The blocker" immediately
+> below, and the replacement design in "Where this goes instead". The hosted
+> tier's web-client callback is unaffected and is where this code lands next.
+
+The broker was designed to fix headless consent UX (docker on a NAS, a VPS)
+without ever being trusted. It parks a Google OAuth authorization code for a few
+minutes so the daemon that requested it can claim it. It holds **no OAuth client
+credentials, no tokens, no mail** — the auth code it parks is cryptographically
+useless without the PKCE verifier, which never leaves the daemon.
+
+One correction to that framing, from the security audit: the broker holds no
+tokens, but in this design it does hold **consent origination for the whole
+fleet** — it stores the consent URL and decides where each user's browser goes.
+That is worth stealing, and "holds nothing worth stealing" was too strong.
+
+## The blocker
+
+Self-host must own its refresh token outright: a refresh token is bound to the
+client that minted it, so if the daemon's client were confidential (held by us)
+our uptime would be in the path of every hourly refresh. That forces a
+**Desktop-type client**, whose secret Google treats as non-confidential.
+
+Google permits Desktop clients exactly one kind of redirect target: **loopback**
+(`http://127.0.0.1:port`, `http://[::1]:port`). Custom URI schemes are removed
+("no longer supported due to the risk of app impersonation") and out-of-band
+copy/paste is removed. So `https://auth.passband.email/callback` **cannot be
+registered** on the client self-hosted daemons use, and the OAuth code never
+reaches the broker.
+
+The two ways out of that are both worse than the thing they buy:
+
+- **Use a Web-type client for self-host.** Its secret is confidential and must
+  not ship in a public image, and refresh needs it, so the daemon depends on our
+  infra forever. This is precisely what `docs/HOSTED.md` rejected.
+- **Publish a Web client's secret in the image anyway.** Then anyone can drive a
+  Google-verified, Passband-branded consent screen, and Google resets the client
+  when they notice, breaking every deployed daemon at once.
+
+Google's own OOB migration guide offers nothing for browserless hosts: the
+loopback flow "requires you to be listening on a local web server."
+
+## Where this goes instead
+
+The code lands on the machine running the *browser*, so the only real question
+is how to move it to the daemon. Two steps, neither of which needs an OAuth
+redirect on our domain:
+
+1. **`squelchd auth --export` / `--import` (ship first).** Run consent on any
+   machine that has a browser and the binary, where the sanctioned loopback flow
+   works unchanged; it prints a token blob that you paste into the headless
+   daemon over stdin. This is rclone's `rclone authorize` pattern. Zero infra,
+   zero new Google configuration, available today. The pasted blob is a live
+   refresh token, so it is read from stdin and never from argv.
+2. **The broker as an encrypted token courier (saves this crate).** The daemon
+   generates an ephemeral X25519 keypair and prints a link carrying the session
+   id; the exporting machine encrypts the token blob to that public key and
+   posts the ciphertext; the daemon claims and decrypts. Google is never
+   redirected to our domain, so the client-type wall does not apply. The session
+   store, TTL, one-time claim, rate limiting, and interstitial all survive; only
+   the parked payload changes from an auth code to ciphertext, and the
+   registration validation changes from consent-URL shape to key material.
+
+   This makes the trust claim *stronger*, not weaker: today's version is
+   incapable of minting because of PKCE, that version is incapable of reading
+   because of end-to-end encryption.
+
+Everything below this line describes the flow as implemented and audited. It is
+accurate about the code and blocked as a deployment.
 
 Deployed as its own service (`auth.passband.email`), separate from the APNs
-relay. See `docs/HOSTED.md` for the two-client OAuth architecture that makes
-this shape load-bearing: self-hosted daemons exchange and refresh tokens
-directly with Google, so our uptime is never their dependency.
+relay. See `docs/HOSTED.md` for the two-client OAuth architecture.
 
 ## Flow
 

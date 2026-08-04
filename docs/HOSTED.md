@@ -79,6 +79,17 @@ verifier, which never leaves the daemon. We are not trusted with tokens because 
 nice; we are incapable of minting them. This sentence belongs on the website. The
 relay deploys next to the existing APNs relay (Railway).
 
+> **Correction, 2026-08-04: steps 3 and 4 above cannot be built.** Google permits
+> Desktop-type clients to redirect only to loopback, so `auth.passband.email/callback`
+> can never be registered on the self-host client and the code never reaches the
+> broker. The crate exists (`squelch-broker`, built and audited) but this flow is
+> not deployable for self-host. The replacement, which keeps every property this
+> section wanted, is in `docs/BROKER.md`: consent runs on a machine that has a
+> browser (sanctioned loopback flow, unchanged), and the broker becomes an
+> end-to-end-encrypted courier for the resulting token rather than a parker of auth
+> codes. Hosted's web client is unaffected: an https callback is correct there, and
+> the crate already implements it.
+
 Status: implemented in-repo as `squelch-broker` (2026-08-04) to the wire contract in
 `docs/BROKER.md`, deployment pending.
 
