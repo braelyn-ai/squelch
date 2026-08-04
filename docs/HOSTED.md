@@ -3,6 +3,26 @@
 Status: planned 2026-08-03, not yet started. This is the decision record and roadmap
 for offering squelch beyond "clone the repo and run cargo".
 
+## Naming (decided 2026-08-03)
+
+The user-facing product is **Passband**; the daemon stays **squelchd** (the
+dockerd/git-plumbing pattern). The name is the other half of the same radio
+metaphor: squelch mutes everything below the threshold, and the passband is the
+band the filter lets through — the daemon kills the noise, Passband is where you
+see what made it through.
+
+- Mac client: **Passband.app**. Repo, crates, and binary names stay `squelch*`.
+- Domains (all unregistered as of 2026-08-03 — **register immediately**):
+  `passband.app` (product/homepage), `passband.email` (hosted:
+  `<user>.passband.email`, consent relay at `auth.passband.email`),
+  `passband.io` (defensive).
+- Deep link scheme: `passband://`.
+- Collision search found no software product named Passband; a proper USPTO
+  trademark search is still owed before Phase 0 paperwork is filed under the name.
+- Rename pass (when shipping starts): Swift client bundle/display name — note the
+  bundle-identifier change will re-prompt keychain ACLs — plus README reframing
+  ("Passband, powered by squelchd") and the Google consent screen name.
+
 ## The two tiers
 
 There is a clean philosophical line and exactly two products on either side of it:
@@ -47,7 +67,7 @@ Headless docker (NAS, VPS) has no browser on the host, and the current answer
 being trusted:
 
 1. Daemon generates a PKCE verifier + session id, prints
-   `https://auth.squelch.app/link?s=<session>` to its logs.
+   `https://auth.passband.email/link?s=<session>` to its logs.
 2. User opens that URL on any device, lands on Google consent.
 3. Google redirects the auth code to the broker; the broker parks it in memory
    (short TTL, one-time claim).
@@ -100,10 +120,10 @@ everything else):
 - Provisioning behind a trait (`Provisioner`); first impl is systemd template units
   (`squelchd@<user>`) on a single VPS. The trait is what lets the backend graduate
   later without a rearchitecture.
-- Routing: `<user>.squelch.app` subdomains via Caddy + wildcard cert. Subdomains over
+- Routing: `<user>.passband.email` subdomains via Caddy + wildcard cert. Subdomains over
   path-prefixes for clean per-tenant cookie/CORS isolation forever.
 - Invite-code gate for launch. **No Stripe in the MVP** — billing is Phase 3.
-- Signup → native app handoff: finish signup, page shows a `squelch://pair?token=…`
+- Signup → native app handoff: finish signup, page shows a `passband://pair?token=…`
   deep link / QR.
 
 **Changes to existing code (all in service of hosted, all benefiting self-host too):**
