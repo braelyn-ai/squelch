@@ -1,7 +1,8 @@
 target/
 .git/
-squelch-client-swift/
 squelch-desktop/
+passband/
+passband-site/
 docs/
 deploy/
 scripts/

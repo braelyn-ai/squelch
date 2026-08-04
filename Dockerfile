@@ -28,6 +28,14 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/squelch-relay /usr/local/bin/squelch-relay
 
+# Mount point for the open buffer (SQUELCH_RELAY_DB_PATH=/data/opens.sqlite3).
+# Created and owned here because the process is not root: a volume mounted over
+# a root-owned path leaves the relay unable to create its SQLite file, and it
+# refuses to boot rather than run with a buffer it cannot persist. Without a
+# volume the relay still runs, holding opens in memory until the daemon drains.
+RUN mkdir -p /data && chown relay /data
+VOLUME ["/data"]
+
 USER relay
 
 # Railway injects PORT and terminates TLS at its edge; bind whatever it gives
