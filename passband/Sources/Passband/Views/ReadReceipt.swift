@@ -71,7 +71,7 @@ struct ReadReceiptMark: View {
             : "\(opens.count) opens · latest \(Fmt.dateTime(latest.date))"
         guard latest.viaProxy else { return head }
         return head
-            + " — fetched by Gmail's image proxy, which sometimes loads images before "
+            + ". Fetched by Gmail's image proxy, which sometimes loads images before "
             + "the recipient reads the message."
     }
 }

@@ -441,11 +441,11 @@ private struct ReadTrackingSection: View {
                     .disabled(busy)
                 }
                 SettingsHint(
-                    "Puts an invisible 1×1 image in mail you send, so the reader shows when it was opened. It is a weak signal, not proof of reading: Gmail fetches images through its own proxy and can load the pixel before anybody looks at the message — those opens are labelled \"via proxy\"."
+                    "Puts an invisible 1×1 image in mail you send, so the reader shows when it was opened. It is a weak signal, not proof of reading: Gmail fetches images through its own proxy and can load the pixel before anybody looks at the message. Those opens are labelled \"via proxy\"."
                 )
             } else {
                 SettingsHint(
-                    "Not configured. The daemon needs a publicly reachable address to serve the pixel from — set `[tracking] base_url` (or SQUELCH_TRACK_URL) and restart squelchd. Until then every send goes out untracked."
+                    "Not configured. The daemon needs a publicly reachable address to serve the pixel from: set `[tracking] base_url` (or SQUELCH_TRACK_URL) and restart squelchd. Until then every send goes out untracked."
                 )
             }
             if let error {

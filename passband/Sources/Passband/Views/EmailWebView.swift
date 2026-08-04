@@ -257,7 +257,7 @@ struct EmailWebView: View {
             // the user writes to, so they are allowed to see the open. Muted, not
             // green — nothing was protected here.
             Label(
-                "trackers allowed — known sender",
+                "trackers allowed (known sender)",
                 systemImage: "eye"
             )
             .font(Typo.micro)
