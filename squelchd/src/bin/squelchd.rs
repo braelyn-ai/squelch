@@ -355,6 +355,56 @@ fn resolve_bind(args: &ServeArgs) -> Result<SocketAddr, squelch_core::CoreError>
         .map_err(|e| other_err(format!("invalid bind address `{raw}`: {e}")))
 }
 
+/// Say, at startup, whether outbound mail can be tracked and how opens are
+/// expected to get back — the two switches are independent and BOTH failure
+/// modes are silent.
+///
+/// `[tracking] base_url` decides where the pixel POINTS, and so which door the
+/// recipient's mail client knocks on. `[pusher] relay_url` decides whether this
+/// daemon DRAINS a relay. Point the pixel at a relay while leaving `relay_url`
+/// unset and every layer still reports success: the pixel serves, the relay
+/// buffers the row, and this daemon simply never asks for it. From Passband
+/// that is indistinguishable from nobody ever opening the mail.
+fn report_tracking_posture(config: &Config) {
+    let configured = config
+        .tracking
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    let Some(base) = configured else {
+        eprintln!(
+            "squelchd: read tracking disabled (no SQUELCH_TRACK_URL / [tracking] base_url); sends go out untracked"
+        );
+        return;
+    };
+
+    // The human door drops a scheme-less base URL, because it would ride into
+    // outbound HTML as a RELATIVE url and resolve against the recipient's mail
+    // client. Silent there; loud here.
+    let lower = base.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        eprintln!(
+            "squelchd: read tracking DISABLED: base_url `{base}` has no http(s) scheme, so it was rejected; sends go out untracked"
+        );
+        return;
+    }
+
+    eprintln!("squelchd: read tracking enabled, pixel at {base}/t/{{token}}");
+    if config
+        .pusher
+        .relay_url
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        eprintln!(
+            "squelchd:   no relay configured, so opens are recorded ONLY if that URL reaches THIS daemon's /t/ route. \
+             If it points at a relay, opens will buffer there and never be collected."
+        );
+    }
+}
+
 /// The router hosting both doors: `/mcp` (agent door, read-only, sealed-absent)
 /// and `/client/*` (human door, bearer-authed, the only write capability). They
 /// share the store; the agent door never sees the write credential.
@@ -435,6 +485,12 @@ fn cmd_serve(
             None
         }
     };
+
+    // Read tracking has two independent switches and no runtime error path: a
+    // send the client asked to track just goes out untracked, and an open the
+    // daemon never collects looks exactly like nobody opening the mail. Neither
+    // is visible from Passband, so the posture is stated here or nowhere.
+    report_tracking_posture(&config);
 
     // The human door refuses to build without SQUELCH_API_TOKEN. The shared
     // config->state wiring also attaches the WRITE-bound credential store that
