@@ -3702,6 +3702,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "squelch-broker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "squelch-core"
 version = "0.1.0"
 dependencies = [

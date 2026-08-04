@@ -1,0 +1,35 @@
+[package]
+name = "squelch-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squelch-broker"
+path = "src/bin/squelch-broker.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Full-feature axum on the same 0.8 line the rest of the workspace pins.
+axum = { version = "0.8" }
+# Parsing the registered consent URL. A hand-rolled parser is exactly how an
+# open redirect gets shipped, so the host/path/query checks run against a real
+# URL parser and nothing else.
+url = { workspace = true }
+# SHA-256 of the presented claim token. The only cryptography here: the broker
+# holds no signing key and no client secret.
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
