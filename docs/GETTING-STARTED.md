@@ -111,12 +111,18 @@ the resulting credential moves to the NAS.
 On your Mac, with Docker installed:
 
 ```sh
+umask 077
 docker run --rm -it -p 8847:8847 \
   -e SQUELCH_CLIENT_ID=<client id> \
   -e SQUELCH_CLIENT_SECRET=<client secret> \
   ghcr.io/braelyn-ai/squelchd:latest \
   auth --export --expose-consent-listener > cred.txt
 ```
+
+The `umask 077` matters: the shell creates `cred.txt`, not squelchd, and the
+default umask would make it world readable. Running squelchd directly rather
+than in a container, use `--export --out cred.txt` instead, which writes the
+file mode 0600 itself.
 
 Your browser opens, you approve, and `cred.txt` ends up holding one line. Then
 on the NAS, from the compose directory:
@@ -133,10 +139,12 @@ Two things that will bite you if they go wrong:
 - **Use the same client ID and secret on both machines.** A Gmail refresh token
   is bound to the OAuth client that minted it. It moves between machines fine
   and between clients not at all.
-- **The import checks the account.** If the blob was minted for a different
-  Gmail account than `SQUELCH_ACCOUNT_EMAIL`, the import refuses and names both
-  addresses. That check exists so you cannot quietly end up syncing the wrong
-  mailbox.
+- **The import checks the account with Google.** Before it stores anything, the
+  import refreshes each credential in the blob and asks Google which mailbox the
+  result opens. If that is not `SQUELCH_ACCOUNT_EMAIL`, it refuses and names both
+  addresses. The blob is unsigned, so what it says about itself is a claim; the
+  check exists so you cannot quietly end up syncing someone else's mailbox as
+  your own. If one credential in the blob fails, none of them are stored.
 
 `--expose-consent-listener` is opt in because it binds the consent listener on
 every interface for the length of one login, which it has to do to be reachable
@@ -201,6 +209,7 @@ it. Mint it by exporting with `--write`, which runs two consent screens and
 carries both credentials in one blob:
 
 ```sh
+umask 077
 docker run --rm -it -p 8847:8847 \
   -e SQUELCH_CLIENT_ID=<client id> -e SQUELCH_CLIENT_SECRET=<client secret> \
   ghcr.io/braelyn-ai/squelchd:latest \
@@ -227,8 +236,8 @@ no such restriction, which is why the client works without this.
 | `401` from the client or curl | The token does not match. Compare the app's api token against `SQUELCH_API_TOKEN` in `.env`, and confirm the container restarted after you changed it. |
 | Connection refused from the Mac | The port is not published to the LAN. Check for `"8848:8848"` rather than `"127.0.0.1:8848:8848"`, and that the NAS firewall allows it. |
 | `403` on `/mcp` but the client works | Expected until you set `SQUELCH_MCP_ALLOWED_HOSTS` to the hostname you are using. The human door does not do host checks. |
-| `invalid_client` on refresh | The daemon and the exporting machine used different OAuth clients. Re export with the same client ID and secret. |
-| Import refuses and names two addresses | The credential was minted for a different Gmail account than `SQUELCH_ACCOUNT_EMAIL`. Consent as the right account, or fix the variable. |
+| `invalid_client` on refresh, or an import that says the blob was minted by a different OAuth client | The daemon and the exporting machine used different OAuth clients. Re export with the same client ID and secret. |
+| Import refuses and names two addresses | Google says the credential opens a different Gmail account than `SQUELCH_ACCOUNT_EMAIL`. Consent as the right account, or fix the variable. |
 | "Google hasn't verified this app" | Expected for your own OAuth client. Continue past it. |
 | `denied: denied` pulling the image | No access to the private package. Log in to ghcr.io with a `read:packages` token, or build from source. |
 | Client connects but is empty | The first sync is still running. Watch `docker compose logs -f squelchd`. |

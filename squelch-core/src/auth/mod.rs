@@ -18,6 +18,10 @@
 //! [`run_export_flow`] is the loopback flow run on a machine that has NO daemon
 //! config: it discovers the mailbox instead of verifying one, and hands back a
 //! token for [`transfer`] to carry to a headless host. See `docs/BROKER.md`.
+//!
+//! A blob arriving at the other end goes through [`verify_transfer_credential`],
+//! which asks Google the same two questions the exchange asks. Nothing in a blob
+//! is signed, so nothing a blob SAYS about itself is evidence.
 
 mod transfer;
 pub use transfer::{
@@ -76,9 +80,23 @@ const BROKER_POLL_TIMEOUT: Duration = Duration::from_secs(600);
 const BROKER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Ceiling on a broker-supplied string echoed into the terminal. The broker is a
-/// host the user named, not a host anyone vetted.
-const MAX_BROKER_DETAIL: usize = 200;
+/// Ceiling on an untrusted string echoed into the terminal: a broker's error
+/// detail, or the account a pasted credential blob claims for itself. Neither
+/// comes from anywhere anybody vetted.
+const MAX_UNTRUSTED_DETAIL: usize = 200;
+
+/// How long a one-shot consent listener waits for the browser redirect before
+/// giving up. Matches the broker's session TTL: the whole budget is spent on one
+/// human reading one consent screen.
+const CONSENT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Per-connection read budget on that listener. The redirect is one small GET
+/// that is already on the wire when the connection opens, so anything slower is
+/// not the browser we are waiting for.
+const CONSENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the accept loop wakes to re-check its deadline.
+const CONSENT_ACCEPT_POLL: Duration = Duration::from_millis(200);
 
 /// Ceiling on any response body this module reads. Every answer in the broker
 /// contract and Gmail's profile answer are a few hundred bytes of JSON, so this
@@ -118,6 +136,17 @@ impl AuthScopes {
         match self {
             AuthScopes::Read => "read-only Gmail (gmail.readonly)",
             AuthScopes::Write => "Gmail modify + send (gmail.modify, gmail.send)",
+        }
+    }
+}
+
+/// The scope set a slot REQUIRES. The inverse of [`AuthScopes::kind`], and the
+/// reason a token can be held against the slot a credential blob claims for it.
+impl From<CredentialKind> for AuthScopes {
+    fn from(kind: CredentialKind) -> Self {
+        match kind {
+            CredentialKind::Read => AuthScopes::Read,
+            CredentialKind::Write => AuthScopes::Write,
         }
     }
 }
@@ -220,12 +249,7 @@ fn exchange_code(
     code: String,
     pkce_verifier: PkceCodeVerifier,
 ) -> Result<(String, StoredToken)> {
-    let http = oauth2::reqwest::blocking::ClientBuilder::new()
-        // Never follow redirects: guards against SSRF on the token endpoint.
-        .redirect(oauth2::reqwest::redirect::Policy::none())
-        .timeout(EXCHANGE_HTTP_TIMEOUT)
-        .build()
-        .map_err(map_oauth_err("building http client"))?;
+    let http = guarded_http()?;
 
     let token = oauth
         .exchange_code(AuthorizationCode::new(code))
@@ -250,6 +274,121 @@ fn exchange_code(
             token.refresh_token().map(|r| r.secret().to_string()),
             token.expires_in(),
         ),
+    ))
+}
+
+/// The client for a guarded exchange and for a transfer verification. Shared so
+/// that both paths to a stored token carry the same two properties: redirects
+/// are REFUSED (an open redirect on the token endpoint is SSRF, and the request
+/// carries the client secret), and one round trip has a bounded life.
+fn guarded_http() -> Result<reqwest::blocking::Client> {
+    oauth2::reqwest::blocking::ClientBuilder::new()
+        .redirect(oauth2::reqwest::redirect::Policy::none())
+        .timeout(EXCHANGE_HTTP_TIMEOUT)
+        .build()
+        .map_err(map_oauth_err("building http client"))
+}
+
+/// Prove one credential out of a pasted blob before ANY of it is stored: that
+/// this host's OAuth client minted it, that Google says it opens the configured
+/// mailbox, and that its grant covers what the slot it claims actually needs.
+///
+/// A blob is base64url JSON with no signature over it, so its `account` and
+/// `kind` fields are the paster's claims and nothing more. Every other path to a
+/// stored token runs the exchange, which holds the token against the configured
+/// account precisely because "the exchange response names a token, never an
+/// account"; import has to ask the same question of the same authority. Without
+/// this, a hand-edited blob files an attacker's refresh token under the user's
+/// address (the sync loop then ingests a stranger's mailbox and serves it to
+/// `/mcp` as the user's own, and mail composed in the client sends from it), and
+/// a hand-edited `kind` files a modify+send token in the Read slot, which is the
+/// whole two-door split gone.
+///
+/// The refresh is what proves the client: a refresh token only works for the
+/// `client_id`/`client_secret` that minted it, so a blob from a different OAuth
+/// client fails HERE, at paste time, instead of as a mystery `invalid_client` on
+/// the first sync an hour later.
+///
+/// Costs one refresh and one profile call per credential. Callers run the cheap
+/// local checks first.
+pub fn verify_transfer_credential(
+    client: &OAuthClientConfig,
+    expected_account: &str,
+    kind: CredentialKind,
+    token: &StoredToken,
+) -> Result<()> {
+    let refresh = token.refresh_token.as_deref().ok_or_else(|| {
+        CoreError::Credential(format!(
+            "the {kind:?} credential in this blob has no refresh token, so nothing about it can \
+             be verified and it would stop working within the hour; nothing was stored."
+        ))
+    })?;
+
+    let refreshed = crate::credentials::refresh_stored_token_detailed(client, refresh)
+        .map_err(|e| transfer_client_error(kind, &e))?;
+    let http = guarded_http()?;
+    let mailbox = fetch_profile_email(&http, &refreshed.token.access_token)?;
+
+    judge_transfer_credential(
+        expected_account,
+        kind,
+        &mailbox,
+        refreshed.granted_scopes.as_deref(),
+    )
+}
+
+/// What Google's answers mean for one blob entry. Pure, and separate from the
+/// two calls that collect them, so every refusal is exercised without a network.
+fn judge_transfer_credential(
+    expected_account: &str,
+    kind: CredentialKind,
+    mailbox: &str,
+    granted: Option<&[String]>,
+) -> Result<()> {
+    check_account_match(expected_account, mailbox).map_err(|_| {
+        CoreError::Credential(format!(
+            "Google says the {kind:?} credential in this blob opens {}, but this daemon is \
+             configured for {expected_account}; nothing was stored. The account named inside a \
+             blob is not evidence, which is why Google was asked. Export again while signed in \
+             as {expected_account}, or fix account_email in the config.",
+            printable(mailbox)
+        ))
+    })?;
+
+    // An absent `scope` means "same as the request" on an exchange (RFC 6749
+    // §5.1), and there IS no request to compare against on a refresh. Which slot
+    // this token belongs in would be the blob's word alone, so it fails closed.
+    let Some(granted) = granted else {
+        return Err(CoreError::Credential(format!(
+            "Google named no scopes when refreshing the {kind:?} credential in this blob, so \
+             there is no proof it belongs in the {kind:?} slot rather than the other one; \
+             nothing was stored. Authorize this host directly with `squelchd auth` instead."
+        )));
+    };
+    check_scope_grant(AuthScopes::from(kind), Some(granted)).map_err(|e| {
+        CoreError::Credential(format!(
+            "the {kind:?} credential in this blob does not carry the scopes the {kind:?} slot \
+             needs, so storing it there would put a token with the wrong reach behind that \
+             door: {e}"
+        ))
+    })
+}
+
+/// The message for a refresh that failed during verification. `invalid_client`
+/// is the ONE outcome worth naming: it means the blob was minted by a different
+/// OAuth client, which is the single most common way an import goes wrong.
+fn transfer_client_error(kind: CredentialKind, err: &CoreError) -> CoreError {
+    let text = err.to_string();
+    if text.contains("invalid_client") || text.contains("unauthorized_client") {
+        return CoreError::Credential(format!(
+            "Google refused the {kind:?} credential in this blob for THIS host's OAuth client, \
+             so it was minted by a different one; nothing was stored. Export again on a machine \
+             using the same SQUELCH_CLIENT_ID and SQUELCH_CLIENT_SECRET as this host."
+        ));
+    }
+    CoreError::Credential(format!(
+        "the {kind:?} credential in this blob could not be checked with Google, so nothing was \
+         stored: {text}"
     ))
 }
 
@@ -442,7 +581,14 @@ pub fn run_auth_flow(
         println!("Waiting for the OAuth redirect on {redirect_uri} ...");
     }
 
-    let code = wait_for_code(&listener, csrf_token.secret())?;
+    // Loopback: only something already on this machine can connect, so a
+    // mismatched `state` is worth ending the flow over.
+    let code = wait_for_code(
+        &listener,
+        csrf_token.secret(),
+        StrangerPolicy::Fatal,
+        CONSENT_WAIT_TIMEOUT,
+    )?;
 
     let (_mailbox, token) = exchange_code(
         &oauth,
@@ -467,12 +613,21 @@ pub enum ConsentBind {
     ///
     /// Under `docker run -p 8847:8847` a listener on `127.0.0.1` is unreachable,
     /// because that loopback is the CONTAINER's; the published port only reaches
-    /// a process bound to every interface. EXPOSURE: for the length of one
-    /// consent, anything that can route to this host's `port` can connect to the
-    /// listener. What it could deliver there is an authorization code, which is
-    /// inert without the PKCE verifier held in this process and is checked
-    /// against a per-flow `state` before it is redeemed. That is a real
-    /// reduction, not zero, which is why this is opt-in and never the default.
+    /// a process bound to every interface.
+    ///
+    /// EXPOSURE, CREDENTIAL: for the length of one consent, anything that can
+    /// route to this host's `port` can connect to the listener. What it could
+    /// deliver there is an authorization code, which is inert without the PKCE
+    /// verifier held in this process and is checked against a per-flow `state`
+    /// before it is redeemed. That is a real reduction, not zero, which is why
+    /// this is opt-in and never the default.
+    ///
+    /// EXPOSURE, AVAILABILITY: those strangers can also connect and say nothing,
+    /// or say the wrong thing. So on this bind a mismatched `state` is answered
+    /// 400 and WAITED OUT rather than treated as fatal (the real redirect still
+    /// wins on state equality, so no check is weakened), every connection has a
+    /// read timeout, and the wait as a whole has a deadline. The worst a
+    /// stranger can do is make the operator run the export again.
     AllInterfaces { port: u16 },
 }
 
@@ -484,6 +639,27 @@ impl ConsentBind {
             ConsentBind::AllInterfaces { port } => format!("0.0.0.0:{port}"),
         }
     }
+
+    /// What a request carrying the wrong `state` means on this bind. Off
+    /// loopback it is a stranger who must not be able to end the flow; on
+    /// loopback it is a local process doing something odd, and the operator is
+    /// better served by hearing about it.
+    fn stranger_policy(self) -> StrangerPolicy {
+        match self {
+            ConsentBind::Loopback => StrangerPolicy::Fatal,
+            ConsentBind::AllInterfaces { .. } => StrangerPolicy::KeepWaiting,
+        }
+    }
+}
+
+/// What the consent listener does with a request that is not the redirect it is
+/// waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrangerPolicy {
+    /// End the flow. Only whatever shares this machine can reach the listener.
+    Fatal,
+    /// Answer 400 and keep waiting, because anything routable can reach it.
+    KeepWaiting,
 }
 
 /// Bind the one-shot consent listener and derive the `redirect_uri` for it.
@@ -506,13 +682,20 @@ fn bind_consent_listener(bind_addr: &str) -> Result<(TcpListener, String)> {
 /// the mailbox Google named along with the token. Nothing is stored: the caller
 /// packs the token into a [`CredentialTransfer`] for a headless host.
 ///
-/// Same client, same PKCE, same guarded exchange as [`run_auth_flow`]. The one
-/// difference is that there is no configured account to hold the token against,
-/// so the mailbox is reported for the operator to confirm instead.
+/// Same client, same PKCE, same guarded exchange as [`run_auth_flow`].
+///
+/// `expected_account` is the exporting machine's OWN configured account when it
+/// has one, and `None` only when it genuinely does not. The export machine is
+/// usually a laptop with no daemon config, which is why this flow can discover
+/// the mailbox instead of verifying one. But when the config IS there, skipping
+/// the check would mint and PRINT a live refresh token for whichever Google
+/// session happened to be signed in, and printing it is the part that cannot be
+/// taken back. So the check runs whenever the answer is available.
 ///
 /// Every line this prints goes to STDERR, because stdout is the blob.
 pub fn run_export_flow(
     client: &OAuthClientConfig,
+    expected_account: Option<&str>,
     scopes: AuthScopes,
     bind: ConsentBind,
 ) -> Result<(String, StoredToken)> {
@@ -537,8 +720,13 @@ pub fn run_export_flow(
     }
     eprintln!("Waiting for the OAuth redirect on {redirect_uri} ...");
 
-    let code = wait_for_code(&listener, csrf_token.secret())?;
-    exchange_code(&oauth, None, scopes, code, pkce_verifier)
+    let code = wait_for_code(
+        &listener,
+        csrf_token.secret(),
+        bind.stranger_policy(),
+        CONSENT_WAIT_TIMEOUT,
+    )?;
+    exchange_code(&oauth, expected_account, scopes, code, pkce_verifier)
 }
 
 /// Run the consent flow through a broker (`docs/BROKER.md`) instead of a
@@ -890,36 +1078,83 @@ fn broker_detail(body: &str) -> Option<String> {
     (!message.trim().is_empty()).then_some(message)
 }
 
-/// A broker-supplied string, made safe to print. It lands in a terminal, and the
-/// broker is a host the user named rather than one anyone vetted.
+/// An untrusted string, made safe to print. Use it on anything that reaches a
+/// terminal from a broker the user merely named or from a credential blob
+/// somebody pasted.
 ///
 /// ASCII graphic plus space is the entire alphabet of a contract-conformant
 /// message, and it is also the only alphabet that cannot rearrange the trusted
-/// literal text this detail is spliced into: control characters would be escape
-/// sequences rather than text, and bidi/format characters (`U+202E` and
-/// friends) would let the broker reverse the rendered line and compose advice
-/// nobody wrote out of our own words. Length is theirs to choose unless it is
-/// bounded here too.
-fn printable(s: &str) -> String {
+/// literal text such a detail is spliced into: control characters would be
+/// escape sequences rather than text (an `ESC` clears the screen, a `BEL`
+/// retitles the window), and bidi/format characters (`U+202E` and friends) would
+/// let the source reverse the rendered line and compose advice nobody wrote out
+/// of our own words. Length is theirs to choose unless it is bounded here too.
+pub fn printable(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(MAX_BROKER_DETAIL)
+        .take(MAX_UNTRUSTED_DETAIL)
         .collect()
 }
 
-/// Block on the loopback listener for a single redirect request, validate the
-/// CSRF `state`, and return the authorization `code`.
-fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    // Loop so stray pokes (favicon probes) don't consume the one-shot listener.
+/// Wait on the consent listener for the browser redirect, validate the CSRF
+/// `state`, and return the authorization `code`.
+///
+/// NOTHING here may block without an end: on `AllInterfaces` the listener is
+/// reachable by anything that can route to the host, so one stranger who
+/// connects and says nothing would otherwise wedge the export forever, and one
+/// who says the wrong thing would end it. Hence three bounds — an overall
+/// `budget`, a per-connection read timeout, and `policy` for what a wrong
+/// `state` costs. A request whose `state` MATCHES is still authoritative in
+/// every case, so none of this weakens the CSRF check.
+fn wait_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+    policy: StrangerPolicy,
+    budget: Duration,
+) -> Result<String> {
+    let deadline = Instant::now() + budget;
+    // Non-blocking accept is what makes the deadline reachable at all: a
+    // blocking one parks until somebody connects, which may be never.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| CoreError::Credential(format!("arming the consent listener: {e}")))?;
+
+    // Loop so stray pokes (favicon probes, port scanners) don't consume the
+    // one-shot listener.
     loop {
-        let (mut stream, _) = listener
-            .accept()
-            .map_err(|e| CoreError::Credential(format!("accept failed: {e}")))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CoreError::Credential(format!(
+                "no consent arrived within {} minutes, so the authorization was abandoned and \
+                 nothing was stored; re-run the command to try again.",
+                budget.as_secs().div_ceil(60)
+            )));
+        }
+
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(CONSENT_ACCEPT_POLL.min(remaining));
+                continue;
+            }
+            Err(e) => return Err(CoreError::Credential(format!("accept failed: {e}"))),
+        };
+        // A socket accepted from a non-blocking listener inherits that flag on
+        // some platforms, and the read below is meant to block up to its budget.
+        let timeouts = stream
+            .set_nonblocking(false)
+            .and_then(|()| stream.set_read_timeout(Some(CONSENT_READ_TIMEOUT.min(remaining))))
+            .and_then(|()| stream.set_write_timeout(Some(CONSENT_READ_TIMEOUT.min(remaining))));
+        if timeouts.is_err() {
+            continue;
+        }
 
         let mut buf = [0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .map_err(|e| CoreError::Credential(format!("reading request: {e}")))?;
+        // A connection that stalls or dies is somebody else's problem, never the
+        // end of the flow: drop it and keep waiting for the browser.
+        let Ok(n) = stream.read(&mut buf) else {
+            continue;
+        };
         let request = String::from_utf8_lossy(&buf[..n]);
 
         // First line: "GET /?code=...&state=... HTTP/1.1"
@@ -930,6 +1165,9 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
             .unwrap_or("");
 
         let (code, state) = parse_redirect_query(path);
+        let ours = state
+            .as_deref()
+            .is_some_and(|s| constant_time_eq(s, expected_state));
 
         // No OAuth params at all (favicon, empty probe): answer and keep waiting.
         if code.is_none() && state.is_none() {
@@ -937,21 +1175,27 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
             continue;
         }
 
-        let (status, body): (&str, &str) = match (code.as_deref(), state.as_deref()) {
-            (Some(code_val), Some(state_val))
-                if constant_time_eq(state_val, expected_state) && !code_val.is_empty() =>
-            {
-                let ok = "squelch is authorized. You can close this tab and return to the terminal.";
+        if ours {
+            // State equality identifies THIS flow, so whatever arrived is the
+            // answer to it: the code, or Google reporting there will not be one.
+            if let Some(code_val) = code.as_deref().filter(|c| !c.is_empty()) {
+                let ok =
+                    "squelch is authorized. You can close this tab and return to the terminal.";
                 write_http(&mut stream, "200 OK", ok);
                 return Ok(code_val.to_string());
             }
-            (_, Some(state_val)) if !constant_time_eq(state_val, expected_state) => {
-                ("400 Bad Request", "state mismatch (possible CSRF); aborting")
-            }
-            _ => ("400 Bad Request", "missing authorization code"),
-        };
-        write_http(&mut stream, status, body);
-        return Err(CoreError::Credential(body.to_string()));
+            let body = "the consent screen returned no authorization code; aborting";
+            write_http(&mut stream, "400 Bad Request", body);
+            return Err(CoreError::Credential(body.to_string()));
+        }
+
+        let body = "state mismatch (possible CSRF)";
+        write_http(&mut stream, "400 Bad Request", body);
+        match policy {
+            StrangerPolicy::Fatal => return Err(CoreError::Credential(body.to_string())),
+            // The real redirect can still arrive and still wins on state.
+            StrangerPolicy::KeepWaiting => continue,
+        }
     }
 }
 
@@ -1493,7 +1737,249 @@ mod tests {
             broker_detail(&format!(r#"{{"error":"{}"}}"#, "x".repeat(5000)))
                 .unwrap()
                 .len(),
-            MAX_BROKER_DETAIL
+            MAX_UNTRUSTED_DETAIL
         );
+    }
+
+    // --- the transfer verification -----------------------------------------
+    //
+    // The two network calls are the same ones the exchange makes; what they
+    // MEAN for a pasted blob is decided here, and asserted without Google.
+
+    fn read_grant() -> Vec<String> {
+        vec![GMAIL_READONLY_SCOPE.to_string()]
+    }
+
+    fn write_grant() -> Vec<String> {
+        WRITE_SCOPES.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The blob's `account` field is a claim by whoever pasted it. Google's
+    /// answer is the fact, and a disagreement refuses the whole import.
+    #[test]
+    fn a_blob_google_disagrees_with_is_refused_and_names_both() {
+        let err = judge_transfer_credential(
+            "victim@gmail.com",
+            CredentialKind::Read,
+            "attacker@gmail.com",
+            Some(&read_grant()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("attacker@gmail.com"), "{err}");
+        assert!(err.contains("victim@gmail.com"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+        assert!(err.contains("not evidence"), "{err}");
+
+        // The mailbox Google names is echoed, so it is disarmed first.
+        let err = judge_transfer_credential(
+            "victim@gmail.com",
+            CredentialKind::Read,
+            "a\u{1b}[2Jb@gmail.com",
+            Some(&read_grant()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains('\u{1b}'), "escape survived: {err}");
+    }
+
+    /// A hand-edited `kind` decides which slot a token lands in. The Read slot
+    /// holding a modify+send token is the two-door split gone, so the grant has
+    /// to cover the slot rather than the other way round.
+    #[test]
+    fn a_write_token_cannot_be_filed_in_the_read_slot() {
+        let err = judge_transfer_credential(
+            "me@gmail.com",
+            CredentialKind::Read,
+            "me@gmail.com",
+            Some(&write_grant()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("wrong reach"), "{err}");
+        assert!(err.contains(GMAIL_READONLY_SCOPE), "{err}");
+
+        // And the converse: a read token in the Write slot cannot send.
+        let err = judge_transfer_credential(
+            "me@gmail.com",
+            CredentialKind::Write,
+            "me@gmail.com",
+            Some(&read_grant()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(GMAIL_SEND_SCOPE), "{err}");
+
+        // Each grant in its own slot is what a real export produces.
+        assert!(
+            judge_transfer_credential(
+                "me@gmail.com",
+                CredentialKind::Read,
+                "ME@gmail.com",
+                Some(&read_grant())
+            )
+            .is_ok()
+        );
+        assert!(
+            judge_transfer_credential(
+                "me@gmail.com",
+                CredentialKind::Write,
+                "me@gmail.com",
+                Some(&write_grant())
+            )
+            .is_ok()
+        );
+    }
+
+    /// On a refresh there is no request for an absent `scope` to mean "same as",
+    /// so silence proves nothing and the blob's own `kind` would be the only
+    /// word on which slot this belongs in.
+    #[test]
+    fn a_refresh_that_names_no_scopes_is_refused_rather_than_assumed() {
+        let err =
+            judge_transfer_credential("me@gmail.com", CredentialKind::Write, "me@gmail.com", None)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("no scopes"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+    }
+
+    /// A refresh token only works for the client that minted it, so a blob from
+    /// another OAuth client fails at paste time with the fix named, instead of
+    /// as a mystery `invalid_client` on the first sync an hour later.
+    #[test]
+    fn a_blob_from_another_oauth_client_says_so() {
+        let err = transfer_client_error(
+            CredentialKind::Read,
+            &CoreError::Credential(
+                "refresh failed: Server returned error response: invalid_client".to_string(),
+            ),
+        )
+        .to_string();
+        assert!(err.contains("SQUELCH_CLIENT_ID"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+
+        // Anything else keeps the underlying reason, which is what a network
+        // failure needs.
+        let err = transfer_client_error(
+            CredentialKind::Read,
+            &CoreError::Credential("refresh failed: connection reset by peer".to_string()),
+        )
+        .to_string();
+        assert!(err.contains("connection reset by peer"), "{err}");
+    }
+
+    /// Every slot maps to the scope set it requires, both ways. If this ever
+    /// crossed, verification would hold a token against the wrong bar.
+    #[test]
+    fn credential_kinds_and_scope_sets_map_both_ways() {
+        for kind in [CredentialKind::Read, CredentialKind::Write] {
+            assert_eq!(AuthScopes::from(kind).kind(), kind);
+        }
+        assert_eq!(AuthScopes::from(CredentialKind::Read), AuthScopes::Read);
+        assert_eq!(AuthScopes::from(CredentialKind::Write), AuthScopes::Write);
+    }
+
+    // --- the consent listener ----------------------------------------------
+
+    /// One request to the listener, from a client that behaves like a browser.
+    fn get(port: u16, path: &str) {
+        use std::net::TcpStream;
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes());
+        let mut sink = Vec::new();
+        let _ = s.read_to_end(&mut sink);
+    }
+
+    /// Off loopback, anything routable can connect. A wrong-`state` request must
+    /// not end the flow, and the real redirect still wins on state equality.
+    #[test]
+    fn an_exposed_listener_waits_out_a_stranger() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            get(port, "/?code=stranger-code&state=not-our-state");
+            get(port, "/favicon.ico");
+            get(port, "/?code=the-real-code&state=our-state");
+        });
+
+        let code = wait_for_code(
+            &listener,
+            "our-state",
+            StrangerPolicy::KeepWaiting,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(code, "the-real-code", "a stranger must not win the flow");
+        let _ = client.join();
+    }
+
+    /// On loopback the only thing that can connect already shares the machine,
+    /// and the operator is better served by hearing about it.
+    #[test]
+    fn a_loopback_listener_treats_a_state_mismatch_as_fatal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || get(port, "/?code=c&state=wrong"));
+
+        let err = wait_for_code(
+            &listener,
+            "our-state",
+            StrangerPolicy::Fatal,
+            Duration::from_secs(10),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("state mismatch"), "{err}");
+        let _ = client.join();
+    }
+
+    /// A stranger who connects and then says nothing must not wedge the export:
+    /// the read is bounded, and so is the wait as a whole.
+    #[test]
+    fn a_silent_connection_cannot_wedge_the_listener() {
+        use std::net::TcpStream;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let squatter = std::thread::spawn(move || {
+            let _held = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // Hold the connection open, saying nothing, until the wait is over.
+            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+        });
+
+        let started = Instant::now();
+        let err = wait_for_code(
+            &listener,
+            "our-state",
+            StrangerPolicy::KeepWaiting,
+            Duration::from_millis(400),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no consent arrived"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait outlived its budget: {:?}",
+            started.elapsed()
+        );
+        let _ = done_tx.send(());
+        let _ = squatter.join();
+    }
+
+    /// An empty deadline is the flow giving up, not a panic or a busy loop.
+    #[test]
+    fn the_consent_wait_gives_up_when_nobody_connects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let err = wait_for_code(
+            &listener,
+            "our-state",
+            StrangerPolicy::Fatal,
+            Duration::from_millis(200),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no consent arrived"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
     }
 }

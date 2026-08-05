@@ -5,16 +5,16 @@
 //! - `serve`: sync loop plus one axum server hosting the agent door (`/mcp`) and
 //!   the human door (`/client/*`).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use squelch_core::auth::{
     AuthFlowOptions, AuthScopes, ConsentBind, CredentialTransfer, DEFAULT_HEADLESS_PORT,
-    TransferCredential, decode_transfer, encode_transfer, run_auth_flow, run_broker_flow,
-    run_export_flow,
+    TransferCredential, decode_transfer, encode_transfer, printable, run_auth_flow,
+    run_broker_flow, run_export_flow, verify_transfer_credential,
 };
 use squelch_core::config::{Config, CredentialBackend, OAuthClientConfig, Stage2CapSources};
 use squelch_core::credentials::{
     CredentialStore, FileCredentialStore, KeyringCredentialStore, load_token_backend,
-    store_token_backend,
+    store_token_backend, store_tokens_backend, write_private,
 };
 use squelch_core::embed::{Embedder, FastEmbedder};
 use squelch_core::store::SqliteStore;
@@ -100,9 +100,15 @@ struct AuthArgs {
     /// this prints a link to open on any device, and the broker parks Google's
     /// one-time code until this daemon collects it. The broker never sees a
     /// token and cannot mint one: the PKCE verifier stays here. Replaces
-    /// --headless and --port, so it conflicts with both.
-    #[arg(long, value_name = "URL", env = "SQUELCH_BROKER_URL",
-          conflicts_with_all = ["headless", "port"])]
+    /// --headless, --port, --export, and --import rather than decorating them.
+    // NO `conflicts_with_all` here, and none naming "broker" elsewhere: clap
+    // counts an env-sourced value as present for conflicts, so with
+    // SQUELCH_BROKER_URL exported every one of those pairs would fail on a flag
+    // the operator never typed — including `--import`, which is the sanctioned
+    // replacement for the broker (docs/BROKER.md: DO NOT DEPLOY). The conflicts
+    // are enforced in `resolve_transport`, which can see WHERE the value came
+    // from and only refuses what was actually asked for on the command line.
+    #[arg(long, value_name = "URL", env = "SQUELCH_BROKER_URL")]
     broker: Option<String>,
 
     /// Run consent HERE and print a credential blob on stdout; store nothing.
@@ -111,12 +117,27 @@ struct AuthArgs {
     /// the one line it prints to `squelchd auth --import` on the daemon's host.
     /// Google delivers a code only to loopback on the machine running the
     /// browser, so the TOKEN moves instead of the code. Needs no account_email
-    /// configured: it reports on stderr which mailbox Google named. All prose
-    /// goes to stderr, so `squelchd auth --export > cred.txt` is a clean file.
-    /// With --write the blob carries BOTH credentials. Replaces the loopback and
-    /// broker transports, so it conflicts with both.
-    #[arg(long, conflicts_with_all = ["headless", "broker", "import"])]
+    /// configured, and reports on stderr which mailbox Google named; when one IS
+    /// configured, the consent must land on it. Write the blob with
+    /// `--out <path>` (mode 0600) rather than a redirect, which takes the
+    /// ambient umask. With --write the blob carries BOTH credentials. Replaces
+    /// the loopback and broker transports.
+    #[arg(long, conflicts_with_all = ["headless", "import"])]
     export: bool,
+
+    /// With --export: write the blob to PATH, created mode 0600, instead of
+    /// stdout.
+    ///
+    /// `--export > cred.txt` creates that file with the ambient umask, which is
+    /// 0644 on most hosts, and the file is a live refresh token. This is the
+    /// same private write every other credential in squelch gets.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "export",
+        conflicts_with = "import"
+    )]
+    out: Option<PathBuf>,
 
     /// Store a credential blob read from STDIN, minted by `--export` elsewhere.
     ///
@@ -124,7 +145,7 @@ struct AuthArgs {
     /// and lands in shell history. The blob's mailbox must match this daemon's
     /// configured account_email. What it carries decides what is stored, so this
     /// conflicts with --write.
-    #[arg(long, conflicts_with_all = ["headless", "broker", "write", "export"])]
+    #[arg(long, conflicts_with_all = ["headless", "write", "export"])]
     import: bool,
 
     /// With --export: bind the consent listener to every interface instead of
@@ -148,6 +169,116 @@ struct AuthArgs {
 /// slack, and it exists so a redirected file or a wedged pipe cannot be read
 /// into memory without bound.
 const MAX_BLOB_BYTES: usize = 64 * 1024;
+
+/// Where one flag's value came from.
+///
+/// `--broker` also reads `SQUELCH_BROKER_URL`, and clap counts an env-sourced
+/// value as PRESENT for conflict resolution. That is why the broker's conflicts
+/// are enforced here instead: an ambient URL in the environment must not refuse
+/// a transport the operator asked for by name, least of all `--import`, which is
+/// what replaced the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlagSource {
+    /// Typed on this command line.
+    CommandLine,
+    /// A default or an environment variable: inherited, not asked for.
+    Ambient,
+}
+
+/// Which of `auth`'s transport flags were typed rather than inherited.
+#[derive(Debug, Clone, Copy)]
+struct AuthFlagSources {
+    broker: FlagSource,
+    port: FlagSource,
+}
+
+impl AuthFlagSources {
+    /// Read clap's own record of where each value came from.
+    fn from_matches(matches: &clap::ArgMatches) -> Self {
+        let Some(auth) = matches.subcommand_matches("auth") else {
+            return Self {
+                broker: FlagSource::Ambient,
+                port: FlagSource::Ambient,
+            };
+        };
+        let source = |id: &str| match auth.value_source(id) {
+            Some(clap::parser::ValueSource::CommandLine) => FlagSource::CommandLine,
+            _ => FlagSource::Ambient,
+        };
+        Self {
+            broker: source("broker"),
+            port: source("port"),
+        }
+    }
+}
+
+/// Which consent transport one `auth` run uses. Each REPLACES the others rather
+/// than decorating them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Transport {
+    /// Consent here, print a blob, store nothing.
+    Export,
+    /// Store a blob minted elsewhere.
+    Import,
+    /// Consent lands on a relay that parks the code.
+    Broker(String),
+    /// Consent lands on a listener this process owns.
+    Loopback,
+}
+
+/// Pick the transport, and refuse only the combinations the operator actually
+/// asked for.
+///
+/// An ambient `SQUELCH_BROKER_URL` is a default, not an instruction: any
+/// transport named on the command line wins over it, silently and without an
+/// exit 2 about a flag nobody typed. A `--broker` that WAS typed still conflicts
+/// with every other transport, which is the check clap can no longer make.
+fn resolve_transport(
+    args: &AuthArgs,
+    sources: AuthFlagSources,
+) -> Result<Transport, squelch_core::CoreError> {
+    let typed_broker = args.broker.is_some() && sources.broker == FlagSource::CommandLine;
+    let refuse = |other: &str| {
+        Err(other_err(format!(
+            "--broker and {other} are two different ways to run consent, and this run asked for \
+             both; pick one."
+        )))
+    };
+
+    if args.export {
+        if typed_broker {
+            return refuse("--export");
+        }
+        return Ok(Transport::Export);
+    }
+    if args.import {
+        if typed_broker {
+            return refuse("--import");
+        }
+        return Ok(Transport::Import);
+    }
+    match &args.broker {
+        Some(url) if typed_broker => {
+            if args.headless {
+                return refuse("--headless");
+            }
+            if sources.port == FlagSource::CommandLine {
+                return refuse("--port");
+            }
+            Ok(Transport::Broker(url.clone()))
+        }
+        // Inherited from the environment: it is the transport only when nothing
+        // on the command line names another one.
+        Some(url) => {
+            if args.headless || sources.port == FlagSource::CommandLine {
+                Ok(Transport::Loopback)
+            } else {
+                Ok(Transport::Broker(url.clone()))
+            }
+        }
+        None => Ok(Transport::Loopback),
+    }
+}
 
 fn other_err(msg: String) -> squelch_core::CoreError {
     squelch_core::CoreError::Other(anyhow::anyhow!(msg))
@@ -234,11 +365,18 @@ fn main() -> ExitCode {
         mirror_env_to_config(&path);
     }
 
-    let cli = Cli::parse();
+    // Parsed through `ArgMatches` rather than `Cli::parse()` so `auth` can see
+    // which of its flags were typed and which came out of the environment.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    let flag_sources = AuthFlagSources::from_matches(&matches);
     let (config, cap_sources) = load_config(&cli);
 
     let result = match &cli.command {
-        Command::Auth(args) => cmd_auth(&config, args),
+        Command::Auth(args) => cmd_auth(&config, args, flag_sources),
         Command::Run => run_daemon(config),
         Command::Serve(args) => cmd_serve(config, cap_sources, args),
     };
@@ -272,13 +410,25 @@ fn auth_plan(args: &AuthArgs) -> Vec<AuthScopes> {
 }
 
 /// Run the OAuth consent flow(s) and persist tokens for the configured account.
-fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreError> {
-    if args.export {
-        return cmd_auth_export(config, args);
+fn cmd_auth(
+    config: &Config,
+    args: &AuthArgs,
+    sources: AuthFlagSources,
+) -> Result<(), squelch_core::CoreError> {
+    let transport = resolve_transport(args, sources)?;
+    if args.broker.is_some() && !matches!(transport, Transport::Broker(_)) {
+        eprintln!(
+            "squelchd: SQUELCH_BROKER_URL is set, but this run asked for another transport on \
+             the command line, so the broker is not being used."
+        );
     }
-    if args.import {
-        return cmd_auth_import(config);
-    }
+
+    let broker = match &transport {
+        Transport::Export => return cmd_auth_export(config, args),
+        Transport::Import => return cmd_auth_import(config),
+        Transport::Broker(url) => Some(url.as_str()),
+        Transport::Loopback => None,
+    };
 
     let client = config.oauth_client()?;
     let email = config.require_account_email()?;
@@ -292,7 +442,7 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
             "squelchd: --write renews BOTH credentials so they cannot drift apart; \
              {total} separate Google consent screens are coming, one per credential."
         );
-        if args.broker.is_some() {
+        if broker.is_some() {
             eprintln!(
                 "squelchd: each flow prints its OWN consent link; open them one at a time, \
                  as they appear."
@@ -313,7 +463,8 @@ fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreEr
         );
         // Strictly sequential: each flow's loopback listener is dropped before
         // the next binds, so headless can reuse the one fixed port.
-        if let Err(e) = mint_credential(&client, &email, backend, &creds_path, scopes, args) {
+        if let Err(e) = mint_credential(&client, &email, backend, &creds_path, scopes, args, broker)
+        {
             if step > 1 {
                 eprintln!(
                     "squelchd: the credential(s) minted earlier in this run ARE stored; \
@@ -336,6 +487,7 @@ fn mint_credential(
     creds_path: &std::path::Path,
     scopes: AuthScopes,
     args: &AuthArgs,
+    broker: Option<&str>,
 ) -> Result<(), squelch_core::CoreError> {
     let kind = scopes.kind();
     println!(
@@ -344,7 +496,7 @@ fn mint_credential(
         backend
     );
 
-    let token = match args.broker.as_deref() {
+    let token = match broker {
         // The broker flow needs no listener, so no port and no tunnel; the
         // scope set, the slot it lands in, and the exchange are unchanged.
         // Both arms are handed `email`: the exchange refuses to return a token
@@ -383,6 +535,19 @@ fn store_and_announce(
 ) -> Result<(), squelch_core::CoreError> {
     store_token_backend(backend, creds_path, email, kind, token)?;
     let _ = load_token_backend(backend, creds_path, email, kind)?;
+    announce_stored(backend, creds_path, email, kind);
+    Ok(())
+}
+
+/// Say where one credential landed. Split out because an import writes every
+/// slot before it announces ANY of them: a line saying "stored" that a later
+/// failure walks back is worse than no line at all.
+fn announce_stored(
+    backend: CredentialBackend,
+    creds_path: &std::path::Path,
+    email: &str,
+    kind: squelch_core::credentials::CredentialKind,
+) {
     match backend {
         CredentialBackend::Keyring => {
             println!(
@@ -396,18 +561,32 @@ fn store_and_announce(
             );
         }
     }
-    Ok(())
 }
 
 /// `--export`: run consent on THIS machine and print a transfer blob, storing
 /// nothing.
 ///
-/// No `account_email` is required or read: the exporting machine is whatever
-/// laptop has a browser, not the daemon's host, and the mailbox is whatever
-/// Google names on the consent screen. It is reported on stderr so the operator
-/// can see they approved as the account they meant to.
+/// No `account_email` is REQUIRED: the exporting machine is whatever laptop has
+/// a browser, not the daemon's host, and the mailbox is whatever Google names on
+/// the consent screen. It is reported on stderr so the operator can see they
+/// approved as the account they meant to. When one IS configured here (same
+/// binary, same config.toml, possibly the same .env), the check is available and
+/// runs: a consent finished under the wrong Google session would otherwise mint
+/// and PRINT a live refresh token, and printing it is the part that cannot be
+/// taken back.
 fn cmd_auth_export(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreError> {
     let client = config.oauth_client()?;
+    let expected_account = config
+        .account_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty());
+    if let Some(account) = expected_account {
+        eprintln!(
+            "squelchd: this machine is configured for {account}, so every consent must be \
+             approved as that account."
+        );
+    }
     let bind = if args.expose_consent_listener {
         ConsentBind::AllInterfaces { port: args.port }
     } else {
@@ -431,7 +610,7 @@ fn cmd_auth_export(config: &Config, args: &AuthArgs) -> Result<(), squelch_core:
             scope_word(scopes),
             i + 1
         );
-        let (mailbox, token) = run_export_flow(&client, scopes, bind)?;
+        let (mailbox, token) = run_export_flow(&client, expected_account, scopes, bind)?;
 
         // A blob names ONE mailbox, and the importer stores every entry under
         // it. Two consents finished as different Google accounts would file a
@@ -466,11 +645,27 @@ fn cmd_auth_export(config: &Config, args: &AuthArgs) -> Result<(), squelch_core:
     let account = account.ok_or_else(|| other_err("no credential was authorized".to_string()))?;
     let blob = encode_transfer(&CredentialTransfer::new(account.clone(), credentials))?;
 
-    // The ONE thing on stdout, so `--export > cred.txt` is a file that imports
-    // exactly as pasted.
-    println!("{blob}");
+    match &args.out {
+        // Mode 0600 from the moment it exists, which a shell redirect cannot do:
+        // `> cred.txt` takes the ambient umask, and the file is a live token.
+        Some(path) => {
+            let mut bytes = blob.into_bytes();
+            bytes.push(b'\n');
+            write_private(path, &bytes)?;
+            eprintln!(
+                "\nsquelchd: wrote {} credential(s) for {account} to {} (mode 0600).",
+                total,
+                path.display()
+            );
+        }
+        // The ONE thing on stdout, so a redirect is still a file that imports
+        // exactly as pasted.
+        None => {
+            println!("{blob}");
+            eprintln!("\nsquelchd: exported {total} credential(s) for {account}.");
+        }
+    }
 
-    eprintln!("\nsquelchd: exported {total} credential(s) for {account}.");
     eprintln!(
         "squelchd: that line is a LIVE refresh token in plaintext. Import it, then delete it \
          from the file, the clipboard, and anywhere you pasted it."
@@ -485,23 +680,49 @@ fn cmd_auth_export(config: &Config, args: &AuthArgs) -> Result<(), squelch_core:
 }
 
 /// `--import`: store a blob minted by `--export` on another machine.
+///
+/// A blob is unsigned JSON, so nothing it SAYS about itself is evidence: the
+/// `account` field is the paster's claim, and so is the `kind` that decides
+/// which slot each token lands in. Every entry is therefore taken to Google
+/// before ANY of them is written, which is the same question the exchange asks
+/// on every other path to a stored token.
 fn cmd_auth_import(config: &Config) -> Result<(), squelch_core::CoreError> {
+    let client = config.oauth_client()?;
     let email = config.require_account_email()?;
     let backend = config.credential_backend;
     let creds_path = config.resolve_credentials_path();
 
     let transfer = decode_transfer(&read_transfer_blob()?)?;
+    // The cheap local checks first: no network is spent on a blob that could not
+    // land whatever Google says about it.
     check_transfer_account(&email, &transfer.account)?;
-    // Every entry is judged before any is written: a blob half-stored leaves the
-    // two slots disagreeing about which consent they came from.
     check_transfer_usable(&transfer)?;
 
     println!(
-        "Importing {} credential(s) for {email} into the {backend:?} backend.",
+        "Checking {} credential(s) with Google before anything is stored...",
         transfer.credentials.len()
     );
     for cred in &transfer.credentials {
-        store_and_announce(backend, &creds_path, &email, cred.kind, &cred.token)?;
+        verify_transfer_credential(&client, &email, cred.kind, &cred.token)?;
+        println!(
+            "  {:?}: Google confirms this token opens {email} with the scopes the {:?} slot needs.",
+            cred.kind, cred.kind
+        );
+    }
+
+    // One unit: either both slots come from this blob or neither does, so the
+    // two doors can never end up describing different consents.
+    let entries: Vec<_> = transfer
+        .credentials
+        .iter()
+        .map(|c| (c.kind, c.token.clone()))
+        .collect();
+    store_tokens_backend(backend, &creds_path, &email, &entries)?;
+    for (kind, _) in &entries {
+        let _ = load_token_backend(backend, &creds_path, &email, *kind)?;
+    }
+    for (kind, _) in &entries {
+        announce_stored(backend, &creds_path, &email, *kind);
     }
     println!("\nsquelch can renew access automatically; the exported blob is no longer needed.");
     Ok(())
@@ -510,22 +731,62 @@ fn cmd_auth_import(config: &Config) -> Result<(), squelch_core::CoreError> {
 /// Read the blob from STDIN.
 ///
 /// Never argv: the blob is a live refresh token, and argv is world-readable in
-/// `ps` and lands in shell history. An interactive run gets a prompt rather than
-/// a process that looks hung.
+/// `ps` and lands in shell history.
+///
+/// A TTY gets ONE LINE, because that is what a paste is and because reading to
+/// EOF there would need a Ctrl-D nobody is expecting: the prompt would sit there
+/// looking hung after the enter. A pipe still gets read to EOF, which is what
+/// `< cred.txt` delivers. Both are capped.
 fn read_transfer_blob() -> Result<String, squelch_core::CoreError> {
-    use std::io::{IsTerminal, Read};
+    use std::io::IsTerminal;
 
     let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprintln!("squelchd: paste the line from `squelchd auth --export`, then press enter:");
+    if !stdin.is_terminal() {
+        return read_blob_capped(stdin.lock(), BlobRead::ToEndOfInput);
     }
+
+    eprintln!("squelchd: paste the single line from `squelchd auth --export` and press enter.");
+    eprintln!(
+        "squelchd: the paste is not echoed. Piping the file in is still safer, since a terminal \
+         keeps its own copy of anything it does echo: squelchd auth --import < cred.txt"
+    );
+    // Echo off for the same reason a password prompt does it, restored when the
+    // guard drops.
+    let echo = TerminalEcho::suppressed();
+    let blob = read_blob_capped(stdin.lock(), BlobRead::OneLine);
+    drop(echo);
+    // The enter that ended the line was not echoed either.
+    eprintln!();
+    blob
+}
+
+/// How far [`read_blob_capped`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobRead {
+    /// A paste at a prompt, which ends at the enter that follows it.
+    OneLine,
+    /// A pipe or a redirect, which ends at EOF.
+    ToEndOfInput,
+}
+
+/// The read itself, split from the terminal handling so both shapes are
+/// testable. Capped either way, because a redirected file or a wedged pipe is
+/// not a blob.
+fn read_blob_capped(
+    reader: impl std::io::BufRead,
+    how: BlobRead,
+) -> Result<String, squelch_core::CoreError> {
+    use std::io::{BufRead, Read};
+
     let mut buf = String::new();
     // One byte past the ceiling: reading it is how an overrun shows up.
-    stdin
-        .lock()
-        .take(MAX_BLOB_BYTES as u64 + 1)
-        .read_to_string(&mut buf)
-        .map_err(|e| other_err(format!("reading the credential blob from stdin: {e}")))?;
+    let mut capped = reader.take(MAX_BLOB_BYTES as u64 + 1);
+    match how {
+        BlobRead::OneLine => capped.read_line(&mut buf),
+        BlobRead::ToEndOfInput => capped.read_to_string(&mut buf),
+    }
+    .map_err(|e| other_err(format!("reading the credential blob from stdin: {e}")))?;
+
     if buf.len() > MAX_BLOB_BYTES {
         return Err(other_err(format!(
             "more than {MAX_BLOB_BYTES} bytes arrived on stdin, which no credential blob is; \
@@ -543,6 +804,63 @@ fn read_transfer_blob() -> Result<String, squelch_core::CoreError> {
     Ok(blob)
 }
 
+/// Terminal echo, off for as long as this is alive and back on when it drops.
+///
+/// The line pasted at the import prompt is a live refresh token. A terminal that
+/// echoes it leaves a copy in the scrollback of whatever window it was pasted
+/// into, which outlives the paste by however long that window does.
+///
+/// Restoring is best effort by construction: a run killed by a signal never
+/// reaches the drop, and the fix for that terminal is `stty sane`. Failing to
+/// suppress at all is not fatal either, because refusing the import over it
+/// would be worse than the echo.
+struct TerminalEcho {
+    #[cfg(unix)]
+    restore: Option<libc::termios>,
+}
+
+impl TerminalEcho {
+    #[cfg(unix)]
+    fn suppressed() -> Self {
+        // SAFETY: both calls take a pointer to a termios this frame owns, and
+        // neither retains it. A non-tty stdin fails tcgetattr, which is handled.
+        unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut term) != 0 {
+                return Self { restore: None };
+            }
+            let restore = term;
+            term.c_lflag &= !libc::ECHO;
+            // FLUSH so anything typed ahead of the prompt is dropped rather than
+            // echoed, and on restore so a stray second line does not fall
+            // through to the shell.
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &term) != 0 {
+                return Self { restore: None };
+            }
+            Self {
+                restore: Some(restore),
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn suppressed() -> Self {
+        Self {}
+    }
+}
+
+impl Drop for TerminalEcho {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(term) = self.restore.as_ref() {
+            // SAFETY: `term` is the settings read in `suppressed`, unchanged.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, term);
+            }
+        }
+    }
+}
+
 /// Fail unless the blob was minted for the mailbox this daemon is configured
 /// for.
 ///
@@ -551,10 +869,21 @@ fn read_transfer_blob() -> Result<String, squelch_core::CoreError> {
 /// stranger's mail and serve it as this account's own. Trimmed and
 /// case-insensitive, because Gmail addresses are ASCII and both values are
 /// hand-typed somewhere.
+///
+/// This is a CHEAP PRE-FILTER, not the guarantee. The blob's `account` is a
+/// string whoever pasted it chose; only [`verify_transfer_credential`] can say
+/// what a token actually opens. It runs first because it costs nothing and
+/// catches the honest mistake (the wrong file, the wrong account) before any
+/// network call.
+///
+/// The blob's value is attacker-chosen and this message reaches a terminal, so
+/// it is disarmed on the way in: raw, an `ESC` in it clears the screen and a
+/// `BEL` retitles the window.
 fn check_transfer_account(configured: &str, blob: &str) -> Result<(), squelch_core::CoreError> {
     if configured.trim().eq_ignore_ascii_case(blob.trim()) {
         return Ok(());
     }
+    let blob = printable(blob);
     Err(squelch_core::CoreError::Credential(format!(
         "this blob was exported for {blob}, but this daemon is configured for {configured}; \
          nothing was stored. Export again while signed in as {configured}, or fix account_email \
@@ -981,6 +1310,8 @@ mod tests {
     use super::*;
     use squelch_core::credentials::{CredentialKind, StoredToken};
 
+    const BROKER: &str = "https://auth.passband.email";
+
     /// Every flag off, for tests that vary one at a time.
     fn bare_auth_args() -> AuthArgs {
         AuthArgs {
@@ -989,8 +1320,29 @@ mod tests {
             port: DEFAULT_HEADLESS_PORT,
             broker: None,
             export: false,
+            out: None,
             import: false,
             expose_consent_listener: false,
+        }
+    }
+
+    /// Nothing typed on the command line: the state an `auth` run is in when
+    /// only the environment has an opinion.
+    fn ambient_sources() -> AuthFlagSources {
+        AuthFlagSources {
+            broker: FlagSource::Ambient,
+            port: FlagSource::Ambient,
+        }
+    }
+
+    /// Parse an argv the way `main` does, so `value_source` is available and
+    /// tests see exactly what the binary sees.
+    fn parse_auth(argv: &[&str]) -> (AuthArgs, AuthFlagSources) {
+        let matches = Cli::command().try_get_matches_from(argv).expect("parses");
+        let sources = AuthFlagSources::from_matches(&matches);
+        match Cli::from_arg_matches(&matches).unwrap().command {
+            Command::Auth(args) => (args, sources),
+            _ => panic!("expected auth subcommand"),
         }
     }
 
@@ -1059,41 +1411,103 @@ mod tests {
     }
 
     /// `--broker` REPLACES the loopback listener rather than decorating it, so
-    /// asking for both is a usage error rather than a silent pick.
+    /// asking for both is a usage error rather than a silent pick. The refusal
+    /// is `resolve_transport`'s rather than clap's, because clap cannot tell a
+    /// typed `--broker` from an inherited `SQUELCH_BROKER_URL`.
     #[test]
-    fn broker_flag_parses_and_excludes_the_loopback_flags() {
-        let cli = Cli::parse_from([
-            "squelchd",
-            "auth",
-            "--broker",
-            "https://auth.passband.email",
-        ]);
-        match cli.command {
-            Command::Auth(args) => {
-                assert_eq!(args.broker.as_deref(), Some("https://auth.passband.email"));
-                assert!(!args.headless);
-            }
-            _ => panic!("expected auth subcommand"),
-        }
+    fn a_typed_broker_excludes_every_other_transport() {
+        let (args, sources) = parse_auth(["squelchd", "auth", "--broker", BROKER].as_ref());
+        assert_eq!(args.broker.as_deref(), Some(BROKER));
+        assert_eq!(sources.broker, FlagSource::CommandLine);
+        assert_eq!(
+            resolve_transport(&args, sources).unwrap(),
+            Transport::Broker(BROKER.to_string())
+        );
 
         for argv in [
-            vec![
-                "squelchd",
-                "auth",
-                "--broker",
-                "https://auth.passband.email",
-                "--headless",
-            ],
-            vec![
-                "squelchd",
-                "auth",
-                "--broker",
-                "https://auth.passband.email",
-                "--port",
-                "9100",
-            ],
+            vec!["squelchd", "auth", "--broker", BROKER, "--headless"],
+            vec!["squelchd", "auth", "--broker", BROKER, "--port", "9100"],
+            vec!["squelchd", "auth", "--broker", BROKER, "--export"],
+            vec!["squelchd", "auth", "--broker", BROKER, "--import"],
         ] {
-            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} was accepted");
+            let (args, sources) = parse_auth(&argv);
+            let err = resolve_transport(&args, sources)
+                .expect_err(&format!("{argv:?} was accepted"))
+                .to_string();
+            assert!(err.contains("--broker"), "{argv:?}: {err}");
+            assert!(err.contains("pick one"), "{argv:?}: {err}");
+        }
+    }
+
+    /// An exported `SQUELCH_BROKER_URL` is a default, not an instruction.
+    ///
+    /// clap counts an env-sourced value as PRESENT for conflicts, so with the
+    /// broker's conflicts declared there, an ambient URL made `auth --import`
+    /// exit 2 naming a flag the operator never typed. Export and import are the
+    /// sanctioned replacement for the broker (docs/BROKER.md: DO NOT DEPLOY), so
+    /// an environment variable must not be able to disable them.
+    #[test]
+    fn an_ambient_broker_url_never_disables_another_transport() {
+        let ambient = |extra: &[&str]| {
+            let mut args = bare_auth_args();
+            args.broker = Some(BROKER.to_string());
+            for flag in extra {
+                match *flag {
+                    "--export" => args.export = true,
+                    "--import" => args.import = true,
+                    "--headless" => args.headless = true,
+                    other => panic!("unhandled {other}"),
+                }
+            }
+            args
+        };
+
+        // Alone it IS the transport; that is the point of the variable.
+        assert_eq!(
+            resolve_transport(&ambient(&[]), ambient_sources()).unwrap(),
+            Transport::Broker(BROKER.to_string())
+        );
+        // Anything named on the command line wins over it, silently.
+        assert_eq!(
+            resolve_transport(&ambient(&["--import"]), ambient_sources()).unwrap(),
+            Transport::Import
+        );
+        assert_eq!(
+            resolve_transport(&ambient(&["--export"]), ambient_sources()).unwrap(),
+            Transport::Export
+        );
+        assert_eq!(
+            resolve_transport(&ambient(&["--headless"]), ambient_sources()).unwrap(),
+            Transport::Loopback
+        );
+        let typed_port = AuthFlagSources {
+            broker: FlagSource::Ambient,
+            port: FlagSource::CommandLine,
+        };
+        assert_eq!(
+            resolve_transport(&ambient(&[]), typed_port).unwrap(),
+            Transport::Loopback
+        );
+
+        // And with no broker anywhere, the listener is the transport.
+        assert_eq!(
+            resolve_transport(&bare_auth_args(), ambient_sources()).unwrap(),
+            Transport::Loopback
+        );
+    }
+
+    /// The parse itself must no longer refuse these pairs, or the runtime check
+    /// above never gets a chance to make the distinction.
+    #[test]
+    fn the_broker_conflicts_are_no_longer_clap_s_to_enforce() {
+        for argv in [
+            vec!["squelchd", "auth", "--import", "--broker", BROKER],
+            vec!["squelchd", "auth", "--export", "--broker", BROKER],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{argv:?} must reach resolve_transport"
+            );
         }
     }
 
@@ -1140,11 +1554,9 @@ mod tests {
             _ => panic!("expected auth subcommand"),
         }
 
-        // `--broker` also reads SQUELCH_BROKER_URL, which counts as present for
-        // conflict purposes, so the broker pairs only mean anything with the
-        // environment quiet.
-        let broker_env_quiet = std::env::var_os("SQUELCH_BROKER_URL").is_none();
-        let mut bad: Vec<Vec<&str>> = vec![
+        // Every one of these is a conflict between flags that can ONLY come
+        // from the command line, so clap can still settle them itself.
+        for argv in [
             vec!["squelchd", "auth", "--export", "--import"],
             vec!["squelchd", "auth", "--export", "--headless"],
             vec!["squelchd", "auth", "--import", "--headless"],
@@ -1153,25 +1565,94 @@ mod tests {
             // Exposure is a property of the export listener and nothing else.
             vec!["squelchd", "auth", "--expose-consent-listener"],
             vec!["squelchd", "auth", "--import", "--expose-consent-listener"],
-        ];
-        if broker_env_quiet {
-            bad.push(vec![
-                "squelchd",
-                "auth",
-                "--export",
-                "--broker",
-                "https://auth.passband.email",
-            ]);
-            bad.push(vec![
-                "squelchd",
-                "auth",
-                "--import",
-                "--broker",
-                "https://auth.passband.email",
-            ]);
-        }
-        for argv in bad {
+            // So is --out.
+            vec!["squelchd", "auth", "--out", "cred.txt"],
+            vec!["squelchd", "auth", "--import", "--out", "cred.txt"],
+        ] {
             assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} was accepted");
+        }
+    }
+
+    /// `--export --out PATH` exists so the blob is never written through a shell
+    /// redirect, which takes the ambient umask (0644 on most hosts) for a file
+    /// that is a live refresh token.
+    #[cfg(unix)]
+    #[test]
+    fn the_exported_blob_lands_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (args, _) = parse_auth(&["squelchd", "auth", "--export", "--out", "cred.txt"]);
+        assert_eq!(args.out.as_deref(), Some(std::path::Path::new("cred.txt")));
+
+        let path = std::env::temp_dir().join(format!("squelch-export-{}.txt", std::process::id()));
+        let blob = encode_transfer(&CredentialTransfer::new(
+            "me@gmail.com".to_string(),
+            vec![TransferCredential {
+                kind: CredentialKind::Read,
+                token: StoredToken {
+                    access_token: "access".to_string(),
+                    refresh_token: Some("refresh".to_string()),
+                    expires_at: None,
+                },
+            }],
+        ))
+        .unwrap();
+
+        // Pre-create it world-readable: --out has to fix the mode, not inherit
+        // whatever was there.
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut bytes = blob.clone().into_bytes();
+        bytes.push(b'\n');
+        write_private(&path, &bytes).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+        // And what landed still imports exactly as pasted.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(decode_transfer(&written).unwrap().account, "me@gmail.com");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A TTY paste ends at the enter that follows it. Reading to EOF there would
+    /// need a Ctrl-D nobody expects, which is the prompt hanging.
+    #[test]
+    fn a_pasted_blob_ends_at_the_newline_and_a_piped_one_at_eof() {
+        let blob = "squelch-cred-v1.payload";
+        // What a terminal delivers: the line, the enter, and nothing more that
+        // this read may wait for.
+        assert_eq!(
+            read_blob_capped(format!("{blob}\n").as_bytes(), BlobRead::OneLine).unwrap(),
+            blob
+        );
+        // A second line is not part of the paste.
+        assert_eq!(
+            read_blob_capped(format!("{blob}\nextra\n").as_bytes(), BlobRead::OneLine).unwrap(),
+            blob
+        );
+        // A pipe has no prompt and no trailing newline to rely on.
+        assert_eq!(
+            read_blob_capped(blob.as_bytes(), BlobRead::ToEndOfInput).unwrap(),
+            blob
+        );
+
+        // Nothing at all is the mistake worth naming, either way.
+        for how in [BlobRead::OneLine, BlobRead::ToEndOfInput] {
+            let err = read_blob_capped("   \n".as_bytes(), how)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("nothing arrived on stdin"), "{how:?}: {err}");
+        }
+
+        // The cap holds for a wedged pipe and for a terminal that somehow
+        // delivers one enormous line.
+        let flood = "x".repeat(MAX_BLOB_BYTES + 10);
+        for how in [BlobRead::OneLine, BlobRead::ToEndOfInput] {
+            let err = read_blob_capped(flood.as_bytes(), how)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no credential blob is"), "{how:?}: {err}");
         }
     }
 
@@ -1193,6 +1674,33 @@ mod tests {
         // A subaddress or another domain IS a different mailbox.
         assert!(check_transfer_account("me@gmail.com", "me+x@gmail.com").is_err());
         assert!(check_transfer_account("me@gmail.com", "me@example.com").is_err());
+    }
+
+    /// The account inside a blob is a string whoever pasted it chose, and this
+    /// refusal prints it. Raw, an ESC in it clears the screen and a BEL retitles
+    /// the window, so it reaches the terminal as text or not at all.
+    #[test]
+    fn a_blob_cannot_paint_the_terminal_through_the_refusal() {
+        let hostile = "\u{1b}[2J\u{1b}]0;pwned\u{7}victim@gmail.com\u{202e}";
+        let err = check_transfer_account("me@gmail.com", hostile)
+            .unwrap_err()
+            .to_string();
+        for sneaky in ['\u{1b}', '\u{7}', '\u{202e}', '\n', '\r'] {
+            assert!(!err.contains(sneaky), "{sneaky:?} survived into: {err}");
+        }
+        // Disarmed, not dropped: what is left is still legible.
+        assert!(err.contains("victim@gmail.com"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+
+        // And length is theirs to choose unless it is bounded here too.
+        let err = check_transfer_account("me@gmail.com", &"a".repeat(100_000))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.len() < 1_000,
+            "unbounded blob text: {} chars",
+            err.len()
+        );
     }
 
     /// An access-token-only entry works for an hour and then fails in a way

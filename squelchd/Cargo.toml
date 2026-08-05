@@ -22,6 +22,10 @@ clap = { workspace = true }
 axum = { version = "0.8" }
 tokio-util = "0.7"
 dotenvy = "0.15"
+# One use: turning terminal echo off while a credential blob is pasted at the
+# `auth --import` prompt. The raw termios calls rather than a password-prompt
+# crate, because the prompt itself is three lines and already written.
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -68,13 +68,27 @@ redirect on our domain:
    instead of as a serde error, and it makes the string greppable in a support
    thread. The JSON is `{"version":1,"account":"<the mailbox Google reported>",
    "credentials":[{"kind":"read"|"write","token":<StoredToken>}]}` — one entry
-   per credential, so `--export --write` moves both slots in one paste. Import
-   refuses a blob whose `account` is not the daemon's configured `account_email`
-   (trimmed, case-insensitive), any entry with no `refresh_token` (an access
-   token alone dies in an hour, long after anyone would connect the failure back
-   to the paste), an empty credential list, and a repeated `kind`. base64url is
-   an encoding, not encryption: the blob is plaintext credential material and
-   nothing in this path pretends otherwise.
+   per credential, so `--export --write` moves both slots in one paste.
+
+   **Nothing in the blob is evidence about the blob.** It carries no signature,
+   so `account` and `kind` are claims by whoever pasted it. Import runs three
+   cheap local refusals first (an `account` that is not the daemon's configured
+   `account_email`, trimmed and case-insensitive; any entry with no
+   `refresh_token`, since an access token alone dies in an hour, long after
+   anyone would connect the failure back to the paste; an empty credential list
+   or a repeated `kind`), and then takes every remaining entry to Google BEFORE
+   it writes anything: a refresh against this host's OAuth client, `users.
+   getProfile` on the result held against `account_email`, and the granted
+   scopes held against what that entry's slot requires. That last one is what
+   stops a hand-edited `kind` from filing a modify+send token in the Read slot.
+   One failed entry stores none of them. base64url is an encoding, not
+   encryption: the blob is plaintext credential material and nothing in this
+   path pretends otherwise, which is exactly why what it says about itself
+   settles nothing.
+
+   **Writing the blob to a file.** `--export --out <path>` creates it mode 0600.
+   A `> cred.txt` redirect takes the ambient umask instead, so prefix that form
+   with `umask 077`.
 
    **Same OAuth client on both machines.** A refresh token is bound to the
    client that minted it and to the granted scopes, never to a host — that is
@@ -92,7 +106,11 @@ redirect on our domain:
    nothing else from a Desktop client): it names the *browser's* `127.0.0.1`.
    What reaches an exposed listener is at most an authorization code, inert
    without the PKCE verifier held in that process and checked against a per-run
-   `state` first — a real reduction, not zero, which is why it is opt-in.
+   `state` first — a real reduction, not zero, which is why it is opt-in. The
+   other half of that exposure is availability: strangers can also connect and
+   say nothing, so on this bind every connection has a read timeout, the wait
+   has a deadline, and a mismatched `state` is answered 400 and waited out
+   rather than ending the export.
 2. **The broker as an encrypted token courier (saves this crate).** The daemon
    generates an ephemeral X25519 keypair and prints a link carrying the session
    id; the exporting machine encrypts the token blob to that public key and

@@ -126,6 +126,18 @@ const REFRESH_SKEW_SECS: i64 = 60;
 // Shared refresh logic.
 // ---------------------------------------------------------------------------
 
+/// A refresh response: the fresh token, plus the scopes Google named on it.
+///
+/// The scopes ride alongside rather than inside [`StoredToken`], which is a
+/// storage shape and has never carried them. Exactly one caller needs them: the
+/// transfer verification, which has to prove a pasted token belongs in the slot
+/// the blob claims for it.
+pub struct RefreshedToken {
+    pub token: StoredToken,
+    /// `None` when the response named no scopes at all.
+    pub granted_scopes: Option<Vec<String>>,
+}
+
 /// Exchange a refresh token for a fresh access token at Google's token endpoint.
 /// Pure network op — persistence is the caller's job. Google usually omits a new
 /// refresh token on refresh, so the caller's is carried forward when absent.
@@ -133,6 +145,15 @@ pub fn refresh_stored_token(
     client: &OAuthClientConfig,
     refresh_token: &str,
 ) -> Result<StoredToken> {
+    Ok(refresh_stored_token_detailed(client, refresh_token)?.token)
+}
+
+/// [`refresh_stored_token`] plus the scopes Google reported. Same one round
+/// trip: the two differ only in how much of the answer is kept.
+pub fn refresh_stored_token_detailed(
+    client: &OAuthClientConfig,
+    refresh_token: &str,
+) -> Result<RefreshedToken> {
     use oauth2::basic::BasicClient;
     use oauth2::{AuthUrl, ClientId, ClientSecret, RefreshToken, TokenResponse, TokenUrl};
 
@@ -161,12 +182,18 @@ pub fn refresh_stored_token(
         .refresh_token()
         .map(|r| r.secret().to_string())
         .or_else(|| Some(refresh_token.to_string()));
+    let granted_scopes: Option<Vec<String>> = resp
+        .scopes()
+        .map(|granted| granted.iter().map(|s| s.to_string()).collect());
 
-    Ok(StoredToken::from_response(
-        resp.access_token().secret().to_string(),
-        new_refresh,
-        resp.expires_in(),
-    ))
+    Ok(RefreshedToken {
+        token: StoredToken::from_response(
+            resp.access_token().secret().to_string(),
+            new_refresh,
+            resp.expires_in(),
+        ),
+        granted_scopes,
+    })
 }
 
 /// The credential-error message for a failed refresh exchange. `invalid_grant` means
@@ -221,6 +248,24 @@ pub fn store_token(account_email: &str, kind: CredentialKind, token: &StoredToke
         .set_password(&token.to_json()?)
         .map_err(|e| CoreError::Credential(format!("writing keyring entry: {e}")))?;
     Ok(())
+}
+
+/// Remove an account's kind slot from the keyring. A slot that was not there is
+/// not an error: the caller wants it gone, and it is.
+///
+/// Exists for rollback. A multi-credential import that fails partway has to put
+/// the slots it already wrote back the way it found them, and "the way it found
+/// them" is sometimes empty.
+pub fn clear_token(account_email: &str, kind: CredentialKind) -> Result<()> {
+    let slot = kind.slot_key(account_email);
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &slot)
+        .map_err(|e| CoreError::Credential(format!("opening keyring entry: {e}")))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(CoreError::Credential(format!(
+            "removing keyring entry: {e}"
+        ))),
+    }
 }
 
 /// Read the raw stored token for an account's kind slot from the keyring.
@@ -360,7 +405,12 @@ impl CredentialsFile {
 }
 
 /// Write bytes to `path` creating it 0600 on unix.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// Public because it is the ONE writer for any file that carries credential
+/// material: the credentials file here, and the blob `squelchd auth --export
+/// --out` writes. A plain redirect would take the ambient umask, which is 0644
+/// on most hosts.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -535,6 +585,83 @@ pub fn store_token_backend(
         CredentialBackend::File => {
             store_token_file(credentials_path, account_email, kind, token)
         }
+    }
+}
+
+/// Persist several tokens as ONE unit: either every slot ends up holding its new
+/// token, or every slot is left the way it was found.
+///
+/// An import carries up to two credentials that were consented together, and a
+/// backend failure on the second one must not leave the Read slot from this
+/// paste next to the Write slot from a different one: the two-door split assumes
+/// both slots describe the same grant.
+///
+/// The file backend gets that for free, since both slots live in one file and
+/// one atomic write. The keyring has a slot per entry, so the prior contents are
+/// captured first and put back on failure.
+pub fn store_tokens_backend(
+    backend: CredentialBackend,
+    credentials_path: &Path,
+    account_email: &str,
+    entries: &[(CredentialKind, StoredToken)],
+) -> Result<()> {
+    match backend {
+        CredentialBackend::File => {
+            let mut file = CredentialsFile::read(credentials_path)?;
+            for (kind, token) in entries {
+                file.slots
+                    .insert(kind.slot_key(account_email), token.clone());
+            }
+            file.write(credentials_path)
+        }
+        CredentialBackend::Keyring => {
+            // What each slot held BEFORE this run, in the order they were
+            // written, so a failure can walk it back.
+            let mut written: Vec<(CredentialKind, Option<StoredToken>)> = Vec::new();
+            for (kind, token) in entries {
+                // An unreadable prior entry reads as absent, and rollback then
+                // clears the slot: either way nothing from this paste survives.
+                let prior = load_token(account_email, *kind).ok();
+                match store_token(account_email, *kind, token) {
+                    Ok(()) => written.push((*kind, prior)),
+                    Err(e) => {
+                        let undone = rollback_keyring(account_email, &written);
+                        return Err(match undone {
+                            Ok(()) => e,
+                            Err(names) => CoreError::Credential(format!(
+                                "{e}. The {names} credential(s) written earlier in this import \
+                                 could not be rolled back either, so those slots now hold the \
+                                 imported token while this one does not; re-run the import."
+                            )),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Put keyring slots back the way they were found, newest first. `Err` carries
+/// the slots that could NOT be restored, because the caller has to name them.
+fn rollback_keyring(
+    account_email: &str,
+    written: &[(CredentialKind, Option<StoredToken>)],
+) -> std::result::Result<(), String> {
+    let mut stuck: Vec<String> = Vec::new();
+    for (kind, prior) in written.iter().rev() {
+        let undo = match prior {
+            Some(token) => store_token(account_email, *kind, token),
+            None => clear_token(account_email, *kind),
+        };
+        if undo.is_err() {
+            stuck.push(format!("{kind:?}"));
+        }
+    }
+    if stuck.is_empty() {
+        Ok(())
+    } else {
+        Err(stuck.join(", "))
     }
 }
 
@@ -762,6 +889,76 @@ mod tests {
         assert_eq!(got_read.access_token, "READ-ONLY-TOKEN");
         assert_eq!(got_write.access_token, "WRITE-CAPABLE-TOKEN");
         assert_ne!(got_read.access_token, got_write.access_token);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An import carries credentials that were consented together, so the two
+    /// slots must never end up describing different consents.
+    #[test]
+    fn a_multi_credential_store_lands_whole_or_not_at_all() {
+        let path = tmp_path("allornothing");
+        let tok = |access: &str| StoredToken {
+            access_token: access.into(),
+            refresh_token: Some("r".into()),
+            expires_at: None,
+        };
+
+        // A slot from an earlier import, to prove a failed one leaves it alone.
+        store_token_file(&path, "you@x.com", CredentialKind::Read, &tok("old-read")).unwrap();
+
+        // The file backend writes once, so both slots arrive together.
+        store_tokens_backend(
+            CredentialBackend::File,
+            &path,
+            "you@x.com",
+            &[
+                (CredentialKind::Read, tok("new-read")),
+                (CredentialKind::Write, tok("new-write")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            load_token_file(&path, "you@x.com", CredentialKind::Read)
+                .unwrap()
+                .access_token,
+            "new-read"
+        );
+        assert_eq!(
+            load_token_file(&path, "you@x.com", CredentialKind::Write)
+                .unwrap()
+                .access_token,
+            "new-write"
+        );
+
+        // A directory sitting where the temp file goes fails the write with
+        // both slots still in hand, which is the case that must change nothing.
+        let blocked = path.with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let err = store_tokens_backend(
+            CredentialBackend::File,
+            &path,
+            "you@x.com",
+            &[
+                (CredentialKind::Read, tok("doomed-read")),
+                (CredentialKind::Write, tok("doomed-write")),
+            ],
+        );
+        assert!(err.is_err(), "the write should have failed");
+        assert_eq!(
+            load_token_file(&path, "you@x.com", CredentialKind::Read)
+                .unwrap()
+                .access_token,
+            "new-read",
+            "a failed store must not land any of its entries"
+        );
+        assert_eq!(
+            load_token_file(&path, "you@x.com", CredentialKind::Write)
+                .unwrap()
+                .access_token,
+            "new-write"
+        );
+
+        std::fs::remove_dir(&blocked).ok();
         std::fs::remove_file(&path).ok();
     }
 
