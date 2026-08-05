@@ -13,7 +13,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use squelch_broker::{BrokerState, Config, SESSION_TTL, router};
+use squelch_broker::{BrokerState, Config, MAX_SESSIONS_PER_CLIENT, SESSION_TTL, router};
 use tower::ServiceExt;
 
 const PUBLIC_URL: &str = "https://auth.passband.email";
@@ -21,11 +21,20 @@ const CALLBACK: &str = "https://auth.passband.email/callback";
 const CLAIM_TOKEN: &str = "sZmJ2QpVv1nUoGkYb3xLd8fRtWcE7hAy0iNqP4jTuM6";
 const CODE: &str = "4/0AeanS0b-DEADBEEF_the-authorization-code";
 
+/// The default posture: no trusted proxy, so every caller shares one identity
+/// and the per-client session cap is off.
 fn state() -> BrokerState {
+    state_with_hops(0)
+}
+
+/// A deployment that has told the broker how to identify a client, which is
+/// what switches the per-client session cap on.
+fn state_with_hops(trusted_proxy_hops: usize) -> BrokerState {
     BrokerState::new(Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         public_url: PUBLIC_URL.into(),
         callback_url: CALLBACK.into(),
+        trusted_proxy_hops,
     })
 }
 
@@ -36,6 +45,12 @@ fn app() -> axum::Router {
 /// A well-formed session id: 43 base64url characters, which is 32 bytes.
 fn sid(fill: char) -> String {
     std::iter::repeat_n(fill, 43).collect()
+}
+
+/// A distinct well-formed session id per `n`.
+fn sid_n(n: usize) -> String {
+    let tail = n.to_string();
+    format!("{}{tail}", "s".repeat(43 - tail.len()))
 }
 
 /// What the daemon registers: the hash, never the token.
@@ -68,6 +83,18 @@ fn post(uri: &str, body: &Value) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
+}
+
+/// The same, from a stated client address. Only read where the deployment has
+/// declared a trusted proxy hop.
+fn post_from(uri: &str, body: &Value, client: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", client)
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap()
 }
@@ -125,6 +152,10 @@ async fn the_whole_consent_flow_hands_the_code_over_exactly_once() {
         "{html}"
     );
     assert!(html.contains("cryptographically incapable of minting them"));
+    // The page states the grant in words rather than deferring to Google, and
+    // states the condition under which the reader should stop.
+    assert!(html.contains("moving messages to the trash"), "{html}");
+    assert!(html.contains("close this page"), "{html}");
 
     // Polling before consent completes says so, without spending the session.
     let claim = json!({ "session_id": id, "claim_token": CLAIM_TOKEN });
@@ -566,6 +597,259 @@ async fn a_callback_error_is_flattened_to_an_oauth_error_code() {
         body_json(resp).await,
         json!({ "status": "denied", "error": "invalid_request" })
     );
+}
+
+/// Registration is unauthenticated, so without a scope allowlist a stranger
+/// parks a link asking for anything Google will grant and we serve the page
+/// that asks a human to grant it, in our voice, on our domain.
+#[tokio::test]
+async fn a_consent_url_asking_for_a_scope_squelchd_never_requests_is_refused() {
+    let app = app();
+    let id = sid('k');
+    let modify = "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.modify";
+
+    for scope in [
+        // Full mailbox control, permanent deletion included.
+        "https%3A%2F%2Fmail.google.com%2F",
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive",
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.settings.basic",
+        // Smuggled in beside a legitimate one.
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly%20https%3A%2F%2Fmail.google.com%2F",
+        // Absent entirely.
+        "",
+    ] {
+        let mut body = registration(&id);
+        body["auth_url"] = json!(consent_url(&id).replace(modify, scope));
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/sessions", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{scope}");
+        // The refusal names the constraint, never the value.
+        let error = body_json(resp).await["error"].as_str().unwrap().to_string();
+        assert!(!error.contains("mail.google.com"), "{error}");
+    }
+
+    // Nothing registered, and the scopes squelchd does ask for still do.
+    for scope in [
+        modify,
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly",
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.modify%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.send",
+    ] {
+        let id = sid_n(scope.len());
+        let mut body = registration(&id);
+        body["auth_url"] = json!(consent_url(&id).replace(modify, scope));
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/sessions", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "{scope}");
+    }
+}
+
+/// Registration allocates and happens once per consent; polling happens three
+/// hundred times. On one budget, the route that allocates inherits the poller's
+/// headroom, and a flood of registrations takes the pollers down with it.
+#[tokio::test]
+async fn registration_runs_out_of_budget_without_touching_the_other_routes() {
+    let app = app();
+
+    // One live session for the other routes to work against, registered first
+    // so it is inside the budget.
+    let live = sid('m');
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/sessions", &registration(&live)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut refused = None;
+    for i in 0..200 {
+        let id = sid_n(i);
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/sessions", &registration(&id)))
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            refused = Some(i);
+            break;
+        }
+        assert_eq!(resp.status(), StatusCode::CREATED, "registration {i}");
+    }
+    let refused = refused.expect("registration is not bounded at all");
+    assert!(
+        refused < 60,
+        "registration shares the polling budget: {refused} got through"
+    );
+
+    // The daemon-facing poll, the human page, and Google's redirect are all
+    // still served: each has its own bucket.
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/claim",
+            &json!({ "session_id": live, "claim_token": CLAIM_TOKEN }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/link?s={live}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The one that matters most: a 429 here would throw away consent the user
+    // already granted at Google.
+    let resp = app
+        .oneshot(get(&format!("/callback?code={CODE}&state={live}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// One host must not be able to hold every slot in the table and 503 every real
+/// registration. The cap needs a real client address, which is exactly what
+/// `SQUELCH_BROKER_TRUSTED_PROXY_HOPS` provides.
+#[tokio::test]
+async fn one_client_cannot_hold_every_session_slot() {
+    let app = router(state_with_hops(1));
+    let hog = "203.0.113.9";
+
+    for i in 0..MAX_SESSIONS_PER_CLIENT {
+        let id = sid_n(i);
+        let resp = app
+            .clone()
+            .oneshot(post_from("/v1/sessions", &registration(&id), hog))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "session {i}");
+    }
+
+    let id = sid_n(MAX_SESSIONS_PER_CLIENT);
+    let resp = app
+        .clone()
+        .oneshot(post_from("/v1/sessions", &registration(&id), hog))
+        .await
+        .unwrap();
+    // 429, not 503: this client is holding them, and it says so rather than
+    // telling a daemon to wait for somebody else.
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error = body_json(resp).await["error"].as_str().unwrap().to_string();
+    assert!(error.contains("already open from this address"), "{error}");
+
+    // A different client is unaffected, which is the whole point.
+    let other = sid('n');
+    let resp = app
+        .oneshot(post_from(
+            "/v1/sessions",
+            &registration(&other),
+            "198.51.100.7",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// A caller can write whatever it likes into `X-Forwarded-For`; what it cannot
+/// do is make the broker read it when no proxy has been declared.
+#[tokio::test]
+async fn a_forwarded_header_mints_no_identity_by_default() {
+    let app = app();
+
+    // hops == 0, so all of these are one client and one budget: the sessions
+    // register (there is no per-client cap without a real client) and the
+    // registrations all charge the same bucket.
+    for (i, claimed) in ["1.1.1.1", "2.2.2.2", "3.3.3.3"].iter().enumerate() {
+        let id = sid_n(i);
+        let resp = app
+            .clone()
+            .oneshot(post_from("/v1/sessions", &registration(&id), claimed))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let mut budget = 0;
+    for i in 3..200 {
+        let id = sid_n(i);
+        let resp = app
+            .clone()
+            .oneshot(post_from(
+                "/v1/sessions",
+                &registration(&id),
+                &format!("10.0.0.{i}"),
+            ))
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        budget += 1;
+    }
+    assert!(
+        budget < 60,
+        "a fresh X-Forwarded-For bought {budget} more registrations"
+    );
+}
+
+/// The pages are self-contained and never framed, said to the browser and not
+/// only to the tests.
+#[tokio::test]
+async fn every_page_carries_the_content_security_headers() {
+    let app = app();
+    let id = sid('p');
+    app.clone()
+        .oneshot(post("/v1/sessions", &registration(&id)))
+        .await
+        .unwrap();
+
+    for uri in [
+        format!("/link?s={id}"),
+        format!("/link?s={}", sid('z')),
+        format!("/callback?code={CODE}&state={id}"),
+        format!("/callback?state={id}"),
+    ] {
+        let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+        let h = resp.headers();
+        assert_eq!(h[header::X_FRAME_OPTIONS], "DENY", "{uri}");
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert_eq!(
+            csp, "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+            "{uri}"
+        );
+        assert_eq!(h[header::REFERRER_POLICY], "no-referrer", "{uri}");
+    }
+}
+
+/// `scope` is checked, so the interstitial cannot be made to describe one grant
+/// while the link requests another.
+#[tokio::test]
+async fn the_page_describes_the_scope_the_link_actually_requests() {
+    let app = app();
+    let id = sid('q');
+    let mut body = registration(&id);
+    body["auth_url"] = json!(consent_url(&id).replace(
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.modify",
+        "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly"
+    ));
+    app.clone()
+        .oneshot(post("/v1/sessions", &body))
+        .await
+        .unwrap();
+
+    let html = body_text(app.oneshot(get(&format!("/link?s={id}"))).await.unwrap()).await;
+    assert!(html.contains("Read your Gmail"), "{html}");
+    assert!(!html.contains("Send mail as you"), "{html}");
+    // The description and the link agree because both come from the one URL.
+    assert!(html.contains("gmail.readonly"), "{html}");
+    assert!(!html.contains("gmail.modify"), "{html}");
 }
 
 #[tokio::test]

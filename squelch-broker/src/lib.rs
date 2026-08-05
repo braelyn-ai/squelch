@@ -19,7 +19,7 @@ mod state;
 pub mod validate;
 
 pub use config::{Config, ConfigError};
-pub use sessions::{SESSION_TTL, SessionKind, SessionStore};
+pub use sessions::{MAX_SESSIONS_PER_CLIENT, SESSION_TTL, SessionKind, SessionStore};
 pub use state::BrokerState;
 
 use axum::{
@@ -33,39 +33,58 @@ use axum::{
 ///
 /// Nothing here is authenticated: every stranger's self-hosted daemon is a
 /// legitimate client, so there is no credential anyone could be asked for. The
-/// defenses are strict validation, high-entropy identifiers, a capped session
-/// table, and per-IP rate limiting.
+/// defenses are strict validation of the registered consent URL (its scopes
+/// included), high-entropy identifiers, a session table capped globally and per
+/// client, and per-client rate limiting.
 ///
-/// The two daemon-facing JSON routes and the two human-facing pages are metered
-/// against SEPARATE buckets: browsers, prefetchers, and link scanners arrive on
-/// `/link` and `/callback`, and on one limiter that traffic would spend the
-/// budget a daemon needs to poll `/v1/claim`.
+/// EVERY route carries its own buckets, because a 429 costs a different thing
+/// on each: registration allocates and is rare, claim polling is frequent and
+/// cheap, `/link` is opened by browsers and link scanners, and `/callback`
+/// carries a consent the user has already granted and cannot grant twice. On
+/// one shared limiter the cheapest traffic sets the price for all of them.
 ///
-/// `/healthz` sits outside both layers so liveness answers while a client is
+/// `/healthz` sits outside every layer so liveness answers while a client is
 /// throttled.
 pub fn router(state: BrokerState) -> Router {
-    let daemon = Router::new()
+    // The largest legitimate body is a consent URL plus two short strings.
+    let register = Router::new()
         .route("/v1/sessions", post(handlers::register))
-        .route("/v1/claim", post(handlers::claim))
-        // The largest legitimate body is a consent URL plus two short strings.
         .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            ratelimit::limit_json,
+            ratelimit::limit_register,
         ))
         .with_state(state.clone());
 
-    let pages = Router::new()
+    let claim = Router::new()
+        .route("/v1/claim", post(handlers::claim))
+        .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_claim,
+        ))
+        .with_state(state.clone());
+
+    let link = Router::new()
         .route("/link", get(handlers::link))
-        .route("/callback", get(handlers::callback))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::limit_page,
+        ))
+        .with_state(state.clone());
+
+    let callback = Router::new()
+        .route("/callback", get(handlers::callback))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_callback,
         ))
         .with_state(state);
 
     Router::new()
         .route("/healthz", get(handlers::healthz))
-        .merge(daemon)
-        .merge(pages)
+        .merge(register)
+        .merge(claim)
+        .merge(link)
+        .merge(callback)
 }

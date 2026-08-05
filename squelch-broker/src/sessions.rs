@@ -9,6 +9,7 @@
 //! `squelchd auth`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,15 @@ pub const SESSION_TTL: Duration = Duration::from_secs(600);
 /// without this the only thing between a stranger and this process's memory is
 /// the rate limiter.
 pub const MAX_SESSIONS: usize = 4096;
+
+/// Ceiling on live sessions held by one client. A real daemon holds one, or two
+/// while `squelchd auth --write` runs the read and write flows back to back;
+/// this leaves room for a lab or a NAT and still means it takes 256 distinct
+/// clients to fill [`MAX_SESSIONS`], rather than one.
+///
+/// Enforced only where a client can be identified: see
+/// [`crate::Config::max_sessions_per_client`].
+pub const MAX_SESSIONS_PER_CLIENT: usize = 16;
 
 /// Who built the consent URL and who will claim the code. Only `SelfHost`
 /// exists today; the hosted signup flow (`docs/HOSTED.md`) adds a kind whose
@@ -59,6 +69,24 @@ pub enum RegisterError {
     Duplicate,
     /// The table is at [`MAX_SESSIONS`].
     Full,
+    /// This client already holds its share of the table. Separate from `Full`
+    /// because it is the client's own doing and says so: without it, one host
+    /// holding every slot answers 503 to everybody else's first consent.
+    ClientFull,
+}
+
+/// A registration, as the store takes it. A struct rather than a row of
+/// positional arguments, because two of them are opaque strings and swapping
+/// them would compile.
+pub struct NewSession {
+    pub session_id: String,
+    pub kind: SessionKind,
+    pub claim_token_hash: [u8; 32],
+    pub auth_url: String,
+    /// The client this registration came from, for the per-client cap. Behind a
+    /// proxy with no trusted-hops config this is the proxy for everyone, which
+    /// is why the cap is off in that case. NEVER LOGGED and never rendered.
+    pub owner: IpAddr,
 }
 
 /// The result of a callback trying to park an outcome.
@@ -88,6 +116,7 @@ struct Session {
     kind: SessionKind,
     claim_token_hash: [u8; 32],
     auth_url: String,
+    owner: IpAddr,
     parked: Parked,
     created_at: Instant,
 }
@@ -109,35 +138,47 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Register a session. Sweeps first, so an expired id is reusable and the
-    /// cap counts only live sessions.
+    /// Register a session. Sweeps first, so an expired id is reusable and both
+    /// caps count only live sessions.
+    ///
+    /// `per_client` is the ceiling on sessions already held by this
+    /// registration's owner, or `None` where clients cannot be told apart (see
+    /// [`crate::Config::max_sessions_per_client`]).
     ///
     /// The sweep is a full-map scan on every insert. That is affordable
     /// precisely because the map is capped at [`MAX_SESSIONS`] and this is the
     /// rate-limited path; the alternative, a sweep on a clock, would let a
-    /// burst of expired sessions hold the cap against live ones.
+    /// burst of expired sessions hold the cap against live ones. The per-client
+    /// count rides along on the same scan.
     pub fn register(
         &self,
-        session_id: String,
-        kind: SessionKind,
-        claim_token_hash: [u8; 32],
-        auth_url: String,
+        new: NewSession,
+        per_client: Option<usize>,
         now: Instant,
     ) -> Result<(), RegisterError> {
         let mut sessions = self.lock();
         sessions.retain(|_, s| !s.expired(now));
-        if sessions.contains_key(&session_id) {
+        if sessions.contains_key(&new.session_id) {
             return Err(RegisterError::Duplicate);
+        }
+        // Before the global cap: one host filling the table must hear that it
+        // is the one at fault, and must not be able to spend the last slot.
+        if let Some(limit) = per_client {
+            let held = sessions.values().filter(|s| s.owner == new.owner).count();
+            if held >= limit {
+                return Err(RegisterError::ClientFull);
+            }
         }
         if sessions.len() >= MAX_SESSIONS {
             return Err(RegisterError::Full);
         }
         sessions.insert(
-            session_id,
+            new.session_id,
             Session {
-                kind,
-                claim_token_hash,
-                auth_url,
+                kind: new.kind,
+                claim_token_hash: new.claim_token_hash,
+                auth_url: new.auth_url,
+                owner: new.owner,
                 parked: Parked::Pending,
                 created_at: now,
             },
@@ -260,22 +301,32 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 mod tests {
     use super::*;
 
+    use std::net::Ipv4Addr;
+
     const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth?x=1";
 
     fn hash(byte: u8) -> [u8; 32] {
         [byte; 32]
     }
 
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+    }
+
+    /// A registration from one client, with the token hash the tests own.
+    fn new_session(id: &str, owner: IpAddr) -> NewSession {
+        NewSession {
+            session_id: id.to_string(),
+            kind: SessionKind::SelfHost,
+            claim_token_hash: hash(1),
+            auth_url: AUTH_URL.to_string(),
+            owner,
+        }
+    }
+
     fn store_with(id: &str, now: Instant) -> SessionStore {
         let s = SessionStore::new();
-        s.register(
-            id.to_string(),
-            SessionKind::SelfHost,
-            hash(1),
-            AUTH_URL.to_string(),
-            now,
-        )
-        .unwrap();
+        s.register(new_session(id, ip(1)), None, now).unwrap();
         s
     }
 
@@ -297,10 +348,12 @@ mod tests {
         let s = store_with("a", t);
         assert_eq!(
             s.register(
-                "a".into(),
-                SessionKind::SelfHost,
-                hash(2),
-                "https://accounts.google.com/o/oauth2/v2/auth?evil=1".into(),
+                NewSession {
+                    claim_token_hash: hash(2),
+                    auth_url: "https://accounts.google.com/o/oauth2/v2/auth?evil=1".into(),
+                    ..new_session("a", ip(2))
+                },
+                None,
                 t,
             ),
             Err(RegisterError::Duplicate)
@@ -418,38 +471,82 @@ mod tests {
         let t = Instant::now();
         let s = SessionStore::new();
         for i in 0..MAX_SESSIONS {
-            s.register(
-                format!("s{i}"),
-                SessionKind::SelfHost,
-                hash(1),
-                AUTH_URL.into(),
-                t,
-            )
-            .unwrap();
+            s.register(new_session(&format!("s{i}"), ip(1)), None, t)
+                .unwrap();
         }
         assert_eq!(
-            s.register(
-                "one-too-many".into(),
-                SessionKind::SelfHost,
-                hash(1),
-                AUTH_URL.into(),
-                t,
-            ),
+            s.register(new_session("one-too-many", ip(1)), None, t),
             Err(RegisterError::Full)
         );
         // The sweep on insert is what reopens the table, so a full one recovers
         // on its own a TTL later without any operator action.
         assert!(
-            s.register(
-                "later".into(),
-                SessionKind::SelfHost,
-                hash(1),
-                AUTH_URL.into(),
-                t + SESSION_TTL,
-            )
-            .is_ok()
+            s.register(new_session("later", ip(1)), None, t + SESSION_TTL)
+                .is_ok()
         );
         assert_eq!(s.len(), 1);
+    }
+
+    /// One host must not be able to hold the whole table against everyone
+    /// else's first consent.
+    #[test]
+    fn caps_live_sessions_per_client() {
+        let t = Instant::now();
+        let s = SessionStore::new();
+        let cap = Some(3);
+
+        for i in 0..3 {
+            s.register(new_session(&format!("a{i}"), ip(1)), cap, t)
+                .unwrap();
+        }
+        assert_eq!(
+            s.register(new_session("a3", ip(1)), cap, t),
+            Err(RegisterError::ClientFull)
+        );
+        // Another client is untouched by the first one's exhaustion.
+        assert!(s.register(new_session("b0", ip(2)), cap, t).is_ok());
+
+        // A claimed session frees a slot immediately, and an expired one frees
+        // it on the next registration's sweep.
+        assert_eq!(
+            s.claim("a0", &hash(1), t),
+            ClaimOutcome::Pending,
+            "pending must not release the slot"
+        );
+        assert_eq!(
+            s.register(new_session("a3", ip(1)), cap, t),
+            Err(RegisterError::ClientFull)
+        );
+        assert!(
+            s.register(new_session("a3", ip(1)), cap, t + SESSION_TTL)
+                .is_ok()
+        );
+
+        // `None` is the deployment that cannot tell clients apart: no cap.
+        let s = SessionStore::new();
+        for i in 0..MAX_SESSIONS_PER_CLIENT + 5 {
+            s.register(new_session(&format!("c{i}"), ip(1)), None, t)
+                .unwrap();
+        }
+    }
+
+    /// The per-client refusal must land before the global one, so a host that
+    /// has already had its share cannot take the last slot from a stranger.
+    #[test]
+    fn a_client_at_its_ceiling_cannot_spend_the_last_global_slot() {
+        let t = Instant::now();
+        let s = SessionStore::new();
+        let cap = Some(2);
+        s.register(new_session("a0", ip(1)), cap, t).unwrap();
+        s.register(new_session("a1", ip(1)), cap, t).unwrap();
+        for i in 0..MAX_SESSIONS - 2 {
+            s.register(new_session(&format!("z{i}"), ip(9)), None, t)
+                .unwrap();
+        }
+        assert_eq!(
+            s.register(new_session("a2", ip(1)), cap, t),
+            Err(RegisterError::ClientFull)
+        );
     }
 
     #[test]
@@ -457,14 +554,7 @@ mod tests {
         let t = Instant::now();
         let s = store_with("old", t);
         let later = t + SESSION_TTL - Duration::from_secs(1);
-        s.register(
-            "new".into(),
-            SessionKind::SelfHost,
-            hash(1),
-            AUTH_URL.into(),
-            later,
-        )
-        .unwrap();
+        s.register(new_session("new", ip(1)), None, later).unwrap();
 
         assert_eq!(s.sweep(t), 0);
         assert_eq!(s.sweep(t + SESSION_TTL), 1);

@@ -289,6 +289,13 @@ The two share a posture and nothing else, and they must not share a service:
 # userinfo is a refusal to boot.
 SQUELCH_BROKER_PUBLIC_URL=https://auth.passband.email
 
+# Railway terminates TLS in front of this listener, so without this every daemon
+# in the world shares one rate-limit bucket (one of them can 429 all the rest)
+# and the per-client session cap has no client to count. `1` = one proxy: only
+# the rightmost X-Forwarded-For entry is read, and anything that does not
+# resolve falls back to the peer.
+SQUELCH_BROKER_TRUSTED_PROXY_HOPS=1
+
 # SQUELCH_BROKER_BIND is deliberately NOT set: the image entrypoint derives it
 # from Railway's injected PORT (0.0.0.0:$PORT), because the broker's own default
 # is loopback. Set it only to override that.
@@ -334,8 +341,10 @@ With `PORT` unset the entrypoint falls back to 8851. A plain-`http` public URL
 logs a one-line warning and is for local runs only: Google would deliver
 authorization codes to `/callback` in the clear.
 
-One operational property worth knowing before this is public: the rate limiters
-key on the TCP peer and never on `X-Forwarded-For`, which is caller-supplied, so
-behind Railway's edge every daemon in the world shares one bucket (600/min for
-the JSON routes, 300/min for the pages). Generous for the traffic a consent flow
-makes, and the number to revisit first if legitimate polling ever gets throttled.
+One operational property worth knowing before this is public: every route has
+its own bucket (`/v1/sessions` 30/min, `/v1/claim` 600/min, `/link` 300/min,
+`/callback` 1200/min), and they key on the TCP peer unless
+`SQUELCH_BROKER_TRUSTED_PROXY_HOPS` is set. Behind Railway's edge, unset means
+every daemon in the world shares each bucket and the per-client session cap (16
+live sessions) is inert, which is why the environment above sets it to `1`.
+Those are the numbers to revisit first if legitimate polling ever gets throttled.

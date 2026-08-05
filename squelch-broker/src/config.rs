@@ -8,9 +8,16 @@
 
 use std::net::SocketAddr;
 
+use crate::sessions::MAX_SESSIONS_PER_CLIENT;
+
 /// Loopback by design: TLS is terminated by a proxy in front of this listener,
 /// so binding a public interface would serve the broker in the clear.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8851";
+
+/// Ceiling on `SQUELCH_BROKER_TRUSTED_PROXY_HOPS`. No deployment stacks eight
+/// proxies; a larger number is a typo, and a typo here degrades silently to one
+/// shared bucket for the whole internet, so it is a refusal to boot instead.
+pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
 
 /// Why the broker refused to start.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +44,10 @@ pub struct Config {
     /// `public_url` + `/callback`, precomputed because every registration
     /// compares `redirect_uri` against it byte for byte.
     pub callback_url: String,
+    /// How many proxies the operator asserts are in front of this listener. `0`
+    /// trusts nothing and meters the TCP peer; `N` meters the Nth-from-the-right
+    /// `X-Forwarded-For` entry. See [`crate::ratelimit::client_ip`].
+    pub trusted_proxy_hops: usize,
 }
 
 /// Read a var, treating whitespace-only as unset.
@@ -66,11 +77,45 @@ impl Config {
         let public_url = canonical_public_url(&public_raw)?;
         let callback_url = format!("{public_url}/callback");
 
+        // Trusting a forwarded header is a claim about the deployment's own
+        // topology that only the operator can make, so it is opt-in and the
+        // default trusts nothing.
+        let trusted_proxy_hops = match var("SQUELCH_BROKER_TRUSTED_PROXY_HOPS") {
+            None => 0,
+            Some(v) => {
+                let hops: usize = v.parse().map_err(|e| {
+                    ConfigError::invalid(format!(
+                        "invalid SQUELCH_BROKER_TRUSTED_PROXY_HOPS `{v}`: {e}"
+                    ))
+                })?;
+                if hops > MAX_TRUSTED_PROXY_HOPS {
+                    return Err(ConfigError::invalid(format!(
+                        "SQUELCH_BROKER_TRUSTED_PROXY_HOPS `{hops}` exceeds {MAX_TRUSTED_PROXY_HOPS}; set it to the number of proxies you run in front of this listener (1 for a single TLS proxy)"
+                    )));
+                }
+                hops
+            }
+        };
+
         Ok(Self {
             bind,
             public_url,
             callback_url,
+            trusted_proxy_hops,
         })
+    }
+
+    /// The per-client ceiling on live sessions, or `None` when this deployment
+    /// cannot tell clients apart.
+    ///
+    /// With `trusted_proxy_hops == 0` every request behind a proxy carries the
+    /// proxy's address, so a per-client cap would be a cap on the whole
+    /// deployment: sixteen live consents worldwide, and the seventeenth real
+    /// daemon gets a 503. The cap therefore switches on exactly when the
+    /// operator has told us how to identify a client, which is the same
+    /// assertion that makes the rate limiter per-client.
+    pub fn max_sessions_per_client(&self) -> Option<usize> {
+        (self.trusted_proxy_hops > 0).then_some(MAX_SESSIONS_PER_CLIENT)
     }
 
     /// The `/link` URL for a session, which is what the daemon prints and the
@@ -185,6 +230,7 @@ mod tests {
             bind: DEFAULT_BIND.parse().unwrap(),
             public_url: canonical_public_url("https://auth.passband.email/").unwrap(),
             callback_url: String::new(),
+            trusted_proxy_hops: 0,
         };
         assert_eq!(
             format!("{}/callback", c.public_url),
@@ -200,7 +246,23 @@ mod tests {
             bind: DEFAULT_BIND.parse().unwrap(),
             public_url: "http://127.0.0.1:8851".into(),
             callback_url: "http://127.0.0.1:8851/callback".into(),
+            trusted_proxy_hops: 0,
         };
         assert!(c.is_insecure());
+    }
+
+    /// The per-client session cap is only meaningful once a client can be
+    /// identified; before that it would be a cap on the whole deployment.
+    #[test]
+    fn the_per_client_session_cap_follows_the_proxy_assertion() {
+        let mut c = Config {
+            bind: DEFAULT_BIND.parse().unwrap(),
+            public_url: "https://auth.passband.email".into(),
+            callback_url: "https://auth.passband.email/callback".into(),
+            trusted_proxy_hops: 0,
+        };
+        assert_eq!(c.max_sessions_per_client(), None);
+        c.trusted_proxy_hops = 1;
+        assert_eq!(c.max_sessions_per_client(), Some(MAX_SESSIONS_PER_CLIENT));
     }
 }

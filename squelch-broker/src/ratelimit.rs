@@ -1,43 +1,70 @@
 //! Per-client-IP token buckets over every route that does work: in-memory,
 //! per-process abuse dampening, not a quota system — a restart forgives
 //! everyone. With no authentication anywhere in this service (every stranger's
-//! daemon is a legitimate client), this and the session cap are the defense.
+//! daemon is a legitimate client), this and the session caps are the defense.
 //!
-//! The client IP is the TCP peer address, so behind the expected TLS proxy the
-//! whole deployment shares one bucket. `X-Forwarded-For` is deliberately NOT
-//! trusted: caller-supplied, it would mint unlimited fresh identities, and
-//! trusting it correctly needs a configured count of trusted hops. The rates
-//! below are therefore sized for a whole fleet's polling rather than one
-//! client's, and per-tenant limiting waits for a trusted-proxy config.
+//! The client IP is the TCP peer address by default, so behind the expected TLS
+//! proxy the whole deployment shares one bucket and "per-IP" means "per
+//! deployment". `X-Forwarded-For` is NOT trusted on its own: caller-supplied, it
+//! would mint unlimited fresh identities.
+//! `SQUELCH_BROKER_TRUSTED_PROXY_HOPS` is how an operator states how much of
+//! that header their own infrastructure wrote — see [`client_ip`] — and nothing
+//! left of that stated boundary is ever read. Setting it is what makes both the
+//! buckets here and the per-client session cap real.
 //!
-//! The human-facing GET routes are metered against a SEPARATE limiter for the
-//! same reason the relay meters its pixel separately: `/link` and `/callback`
-//! are opened by browsers, prefetchers, and link scanners, and on one limiter
-//! that traffic would spend the daemons' claim budget.
+//! Every route carries its OWN buckets, because a 429 costs a different thing
+//! on each one:
+//!
+//! - `/v1/sessions` is tight. A real client registers once per consent and then
+//!   polls; sharing a budget with the polling would give registration hundreds
+//!   of requests a minute of headroom it has no use for, and registration is
+//!   the route that allocates.
+//! - `/v1/claim` is generous: a daemon polls it for the whole time a human
+//!   takes to read a consent screen.
+//! - `/link` is metered like a page, because browsers prefetch and mail clients
+//!   scan links, and that traffic must not spend a daemon's claim budget.
+//! - `/callback` is the most generous of all. Refusing it destroys a consent the
+//!   user has ALREADY granted: Google will not redirect twice, and the recovery
+//!   is the whole flow again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
 
 use crate::state::BrokerState;
 
-/// Sustained rate, in requests per minute, per client IP, for `/v1/sessions`
-/// and `/v1/claim`. Generous because a daemon polls `/v1/claim` for the whole
-/// time a human takes to read a consent screen, and behind a proxy every
-/// daemon's polling lands in one bucket.
-pub const JSON_REQUESTS_PER_MINUTE: f64 = 600.0;
+/// Sustained rate, in requests per minute, per client IP, for `POST
+/// /v1/sessions`. A daemon registers ONCE per `squelchd auth` (twice for
+/// `--write`), so this is deliberately far below the polling rate: registration
+/// is the only route that allocates, and its legitimate traffic is a trickle.
+/// Under the default shared-bucket keying this is a whole deployment's fresh
+/// consents per minute, which is still many more than a self-hosted broker
+/// sees.
+pub const REGISTER_REQUESTS_PER_MINUTE: f64 = 30.0;
 
-/// The same, for `GET /link` and `GET /callback`. One human click each, but
-/// browsers prefetch and mail clients scan links.
+/// The same, for `POST /v1/claim`. Generous because a daemon polls every two
+/// seconds for the whole ten-minute consent window, and behind a proxy with no
+/// trusted-hops config every daemon's polling lands in one bucket.
+pub const CLAIM_REQUESTS_PER_MINUTE: f64 = 600.0;
+
+/// The same, for `GET /link`. One human click, but browsers prefetch and mail
+/// clients scan links.
 pub const PAGE_REQUESTS_PER_MINUTE: f64 = 300.0;
+
+/// The same, for `GET /callback`. The highest number here because it is the one
+/// route whose refusal costs a user something they cannot get back: the consent
+/// they just granted at Google. It is also the cheapest to serve (one map
+/// lookup into a table that is already capped) and it can do nothing at all
+/// without a live session id.
+pub const CALLBACK_REQUESTS_PER_MINUTE: f64 = 1200.0;
 
 /// Buckets idle longer than this are dropped on the next prune — two windows of
 /// slack, so a burst-then-pause client is not credited a full bucket early.
@@ -154,17 +181,60 @@ impl RateLimiter {
     }
 }
 
-/// Middleware: 429 once a client IP outruns [`JSON_REQUESTS_PER_MINUTE`] on the
-/// daemon-facing JSON routes.
-pub async fn limit_json(
+/// The client a request is attributed to, resolved once by [`gate`] and left in
+/// the request's extensions for the handler.
+///
+/// Registration needs the same identity the limiter used, and recomputing it
+/// there would be a second place for the two to disagree about who a client is.
+/// PRIVACY: an address is a client identifier, so this never reaches a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIp(pub IpAddr);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Every route that extracts this sits behind a rate-limit layer, which
+        // is what inserts it. The fallback keeps a router built without one
+        // from being a panic: it collapses to a single shared identity, which
+        // is the same posture as `hops == 0`.
+        Ok(parts
+            .extensions
+            .get::<ClientIp>()
+            .copied()
+            .unwrap_or(ClientIp(IpAddr::V4(Ipv4Addr::UNSPECIFIED))))
+    }
+}
+
+/// Middleware: 429 once a client outruns [`REGISTER_REQUESTS_PER_MINUTE`].
+pub async fn limit_register(
     State(state): State<BrokerState>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    gate(&state, BrokerState::check_json_rate, "json", req, next).await
+    gate(
+        &state,
+        BrokerState::check_register_rate,
+        "register",
+        req,
+        next,
+    )
+    .await
 }
 
-/// Middleware: the same for the human-facing pages, against their own buckets.
+/// Middleware: the same for `POST /v1/claim`, against its own buckets.
+pub async fn limit_claim(
+    State(state): State<BrokerState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, BrokerState::check_claim_rate, "claim", req, next).await
+}
+
+/// Middleware: the same for `GET /link`.
 pub async fn limit_page(
     State(state): State<BrokerState>,
     req: Request<Body>,
@@ -173,21 +243,92 @@ pub async fn limit_page(
     gate(&state, BrokerState::check_page_rate, "page", req, next).await
 }
 
+/// Middleware: the same for `GET /callback`, against the most generous buckets
+/// here — a refusal on this route loses a consent the user already granted.
+pub async fn limit_callback(
+    State(state): State<BrokerState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(
+        &state,
+        BrokerState::check_callback_rate,
+        "callback",
+        req,
+        next,
+    )
+    .await
+}
+
+/// Which identity a request is metered under.
+///
+/// `hops` is the operator's assertion of how many proxies sit in front of this
+/// listener (`SQUELCH_BROKER_TRUSTED_PROXY_HOPS`). Each one appends the address
+/// it saw to `X-Forwarded-For`, so the rightmost `hops` entries are the only
+/// ones written by infrastructure the operator controls, and the client is the
+/// `hops`-th from the right. Everything left of it arrived from the caller and
+/// is never read: a caller stuffing entries there shifts nothing.
+///
+/// Every failure — no header, fewer than `hops` entries, an entry that is not an
+/// address — falls back to `peer`, which is the shared bucket. That is closed:
+/// the worst case is metering that is too coarse, never an attacker choosing
+/// their own key. `hops == 0` is that fallback unconditionally.
+pub(crate) fn client_ip(headers: &HeaderMap, peer: IpAddr, hops: usize) -> IpAddr {
+    if hops == 0 {
+        return peer;
+    }
+    // Only the last `hops` entries can matter, so the header is never collected
+    // whole: a caller controls its length.
+    let mut tail: VecDeque<&str> = VecDeque::with_capacity(hops);
+    let entries = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    for e in entries {
+        if tail.len() == hops {
+            tail.pop_front();
+        }
+        tail.push_back(e);
+    }
+    if tail.len() < hops {
+        return peer;
+    }
+    tail.front().and_then(|e| parse_entry(e)).unwrap_or(peer)
+}
+
+/// Parse one `X-Forwarded-For` entry. A bare address is the norm, but proxies
+/// also write `ip:port` and the bracketed IPv6 form; an entry in any other
+/// shape (`unknown`, an obfuscated node name) is not something to meter.
+fn parse_entry(entry: &str) -> Option<IpAddr> {
+    entry
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| entry.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| entry.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+}
+
 async fn gate(
     state: &BrokerState,
     charge: fn(&BrokerState, IpAddr) -> bool,
     route: &'static str,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // `ConnectInfo` is absent when the router is driven directly as a `Service`
     // (tower `oneshot`); those callers share the unspecified address. Production
     // always serves with connect info attached.
-    let ip = req
+    let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ConnectInfo(a)| a.ip());
+    let ip = client_ip(req.headers(), peer, state.config().trusted_proxy_hops);
     if charge(state, ip) {
+        // The handler meters its own per-client limits against the same
+        // identity, rather than resolving one of its own.
+        req.extensions_mut().insert(ClientIp(ip));
         Ok(next.run(req).await)
     } else {
         // No client detail is logged beyond the fact that a limit was hit.
@@ -199,9 +340,136 @@ async fn gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+    }
+
+    const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+    /// One `X-Forwarded-For` per line, in the order a proxy chain would append
+    /// them.
+    fn headers(lines: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for l in lines {
+            h.append("x-forwarded-for", HeaderValue::from_str(l).unwrap());
+        }
+        h
+    }
+
+    fn addr(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The default must be exactly the old behaviour: the header is not read at
+    /// all, however well-formed it looks.
+    #[test]
+    fn hops_zero_meters_the_peer() {
+        assert_eq!(client_ip(&headers(&[]), PEER, 0), PEER);
+        assert_eq!(client_ip(&headers(&["203.0.113.9"]), PEER, 0), PEER);
+        assert_eq!(
+            client_ip(&headers(&["203.0.113.9, 198.51.100.7"]), PEER, 0),
+            PEER
+        );
+    }
+
+    #[test]
+    fn hops_one_meters_the_rightmost_entry() {
+        assert_eq!(
+            client_ip(&headers(&["203.0.113.9"]), PEER, 1),
+            addr("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(&headers(&["198.51.100.7, 203.0.113.9"]), PEER, 1),
+            addr("203.0.113.9")
+        );
+        // A chain may arrive split across several header lines rather than one
+        // comma list; order across them is the same order.
+        assert_eq!(
+            client_ip(&headers(&["198.51.100.7", "203.0.113.9"]), PEER, 1),
+            addr("203.0.113.9")
+        );
+    }
+
+    /// The whole point: what the caller writes is to the LEFT of what the proxy
+    /// appends, so no amount of it changes the key.
+    #[test]
+    fn stuffing_entries_on_the_left_mints_no_identity() {
+        let real = client_ip(&headers(&["203.0.113.9"]), PEER, 1);
+        for stuffed in [
+            "1.1.1.1, 203.0.113.9",
+            "2.2.2.2, 3.3.3.3, 203.0.113.9",
+            "not-an-ip, 203.0.113.9",
+            " , 203.0.113.9",
+        ] {
+            assert_eq!(client_ip(&headers(&[stuffed]), PEER, 1), real, "{stuffed}");
+        }
+        // Nor across separate lines.
+        assert_eq!(
+            client_ip(&headers(&["4.4.4.4", "5.5.5.5", "203.0.113.9"]), PEER, 1),
+            real
+        );
+    }
+
+    #[test]
+    fn two_hops_skip_the_inner_proxy() {
+        let h = headers(&["198.51.100.7, 203.0.113.9, 10.1.2.3"]);
+        assert_eq!(client_ip(&h, PEER, 2), addr("203.0.113.9"));
+        assert_eq!(client_ip(&h, PEER, 3), addr("198.51.100.7"));
+    }
+
+    /// Anything the header cannot answer is the shared bucket, never a
+    /// caller-chosen value.
+    #[test]
+    fn fails_closed_to_the_peer() {
+        // Missing entirely.
+        assert_eq!(client_ip(&headers(&[]), PEER, 1), PEER);
+        // Present but empty, or only separators.
+        assert_eq!(client_ip(&headers(&[" "]), PEER, 1), PEER);
+        assert_eq!(client_ip(&headers(&[" , "]), PEER, 1), PEER);
+        // Fewer entries than the operator claims hops: the entry that would be
+        // read is one the caller wrote.
+        assert_eq!(client_ip(&headers(&["203.0.113.9"]), PEER, 2), PEER);
+        assert_eq!(
+            client_ip(&headers(&["198.51.100.7, 203.0.113.9"]), PEER, 3),
+            PEER
+        );
+        // The trusted position holds something that is not an address.
+        assert_eq!(
+            client_ip(&headers(&["203.0.113.9, unknown"]), PEER, 1),
+            PEER
+        );
+        // Not even valid UTF-8, so the value never becomes a `&str`.
+        let mut h = HeaderMap::new();
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(client_ip(&h, PEER, 1), PEER);
+    }
+
+    /// Proxies that write a port, and the bracketed IPv6 form, still identify a
+    /// client — dropping to the shared bucket for those would be a silent
+    /// mis-metering on an otherwise correct deployment.
+    #[test]
+    fn accepts_the_port_and_bracketed_spellings() {
+        assert_eq!(
+            client_ip(&headers(&["203.0.113.9:4711"]), PEER, 1),
+            addr("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(&headers(&["[2001:db8::1]:4711"]), PEER, 1),
+            addr("2001:db8::1")
+        );
+        assert_eq!(
+            client_ip(&headers(&["[2001:db8::1]"]), PEER, 1),
+            addr("2001:db8::1")
+        );
+        assert_eq!(
+            client_ip(&headers(&["2001:db8::1"]), PEER, 1),
+            addr("2001:db8::1")
+        );
     }
 
     #[test]
@@ -238,14 +506,41 @@ mod tests {
     /// A daemon polls for the whole consent window; the limit must not cut it
     /// off before the session it is polling for has even expired.
     #[test]
-    fn the_json_rate_outlasts_a_full_consent_window() {
-        let mut l = RateLimiter::per_minute(JSON_REQUESTS_PER_MINUTE);
+    fn the_claim_rate_outlasts_a_full_consent_window() {
+        let mut l = RateLimiter::per_minute(CLAIM_REQUESTS_PER_MINUTE);
         let start = Instant::now();
         // One poll every two seconds for ten minutes.
         for i in 0..300u64 {
             let t = start + Duration::from_secs(i * 2);
             assert!(l.check(ip(1), t), "poll {i} was throttled");
         }
+    }
+
+    /// Registration and polling are not on one budget: a client registers once
+    /// and polls three hundred times, so a shared bucket would hand the route
+    /// that allocates hundreds of requests a minute of headroom.
+    #[test]
+    fn registration_is_metered_far_tighter_than_polling() {
+        assert!(REGISTER_REQUESTS_PER_MINUTE * 10.0 < CLAIM_REQUESTS_PER_MINUTE);
+
+        let mut l = RateLimiter::per_minute(REGISTER_REQUESTS_PER_MINUTE);
+        let t = Instant::now();
+        // Both registrations of a `squelchd auth --write` run, twice over, with
+        // room to spare.
+        for i in 0..4 {
+            assert!(l.check(ip(1), t), "registration {i} was throttled");
+        }
+        // And a flood is cut off well inside a claim budget.
+        let flooded = (0..REGISTER_REQUESTS_PER_MINUTE as u32 + 1).all(|_| l.check(ip(1), t));
+        assert!(!flooded, "registration must run out before the claim rate");
+    }
+
+    /// Google redirects once. A 429 here is a consent the user granted and will
+    /// have to grant again, so this bucket is the largest one.
+    #[test]
+    fn the_callback_bucket_is_the_most_forgiving() {
+        assert!(CALLBACK_REQUESTS_PER_MINUTE > PAGE_REQUESTS_PER_MINUTE);
+        assert!(CALLBACK_REQUESTS_PER_MINUTE >= CLAIM_REQUESTS_PER_MINUTE);
     }
 
     /// The map stays bounded against a client that never reuses an address —

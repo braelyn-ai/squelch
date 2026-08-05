@@ -24,7 +24,10 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::sessions::{ClaimOutcome, ParkOutcome, Parked, RegisterError, SESSION_TTL, SessionKind};
+use crate::ratelimit::ClientIp;
+use crate::sessions::{
+    ClaimOutcome, NewSession, ParkOutcome, Parked, RegisterError, SESSION_TTL, SessionKind,
+};
 use crate::state::BrokerState;
 use crate::validate;
 
@@ -96,6 +99,7 @@ struct RegisterRequest {
 /// PKCE verifier that never leaves the daemon.
 pub async fn register(
     State(state): State<BrokerState>,
+    ClientIp(owner): ClientIp,
     body: Bytes,
 ) -> Result<Response, BrokerError> {
     let req: RegisterRequest = parse_json(&body)?;
@@ -121,7 +125,13 @@ pub async fn register(
     // by the confidential web client and claimed by the control plane, and
     // arrives here as a second kind rather than a second table.
     let kind = SessionKind::SelfHost;
-    match state.register(req.session_id, kind, claim_token_hash, req.auth_url) {
+    match state.register(NewSession {
+        session_id: req.session_id,
+        kind,
+        claim_token_hash,
+        auth_url: req.auth_url,
+        owner,
+    }) {
         Ok(()) => {
             // PRIVACY: a kind and a count. Never the id, the hash, or the URL.
             tracing::info!(
@@ -146,6 +156,16 @@ pub async fn register(
             Err(BrokerError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the session table is full; retry shortly",
+            ))
+        }
+        // 429, not 503: this client is holding the sessions, and a daemon that
+        // reads "no room" would wait for someone else to stop. PRIVACY: the
+        // address is not logged, only that a client hit its ceiling.
+        Err(RegisterError::ClientFull) => {
+            tracing::warn!(sessions = state.live_sessions(), "client session cap hit");
+            Err(BrokerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many consent sessions are already open from this address; finish or abandon one and retry",
             ))
         }
     }
@@ -220,6 +240,19 @@ struct ClaimRequest {
     claim_token: String,
 }
 
+/// Whether `POST /v1/claim`, the polling daemon's door, serves this kind.
+///
+/// EXHAUSTIVE, with no wildcard arm, and that is the point: the hosted flow
+/// (`docs/HOSTED.md`) adds a kind whose code the control plane collects, not a
+/// poller holding a claim token. Adding that variant must fail to compile here
+/// rather than inherit this route's answer by default. A seam that is only ever
+/// written to is not a seam.
+fn claimable_by_polling(kind: SessionKind) -> bool {
+    match kind {
+        SessionKind::SelfHost => true,
+    }
+}
+
 /// `POST /v1/claim` — the daemon polling for its code.
 ///
 /// One successful claim empties the session; a second gets a 404. A wrong token
@@ -238,6 +271,17 @@ pub async fn claim(State(state): State<BrokerState>, body: Bytes) -> Result<Resp
         return Err(BrokerError::bad_request(format!(
             "claim_token must be 1..={MAX_CLAIM_TOKEN} bytes"
         )));
+    }
+
+    // A kind this route does not serve is answered exactly like a session that
+    // does not exist: "unknown" is already what an expired or claimed session
+    // gets, so this adds no way to ask whether an id is live.
+    if state
+        .session_kind(&req.session_id)
+        .is_some_and(|k| !claimable_by_polling(k))
+    {
+        tracing::info!("claim refused for an unclaimable session kind");
+        return Ok((StatusCode::NOT_FOUND, Json(json!({ "status": "unknown" }))).into_response());
     }
 
     let presented: [u8; 32] = Sha256::digest(req.claim_token.as_bytes()).into();
@@ -334,6 +378,14 @@ fn escape_html(s: &str) -> String {
     out
 }
 
+/// The Content-Security-Policy every page carries. `default-src 'none'` is the
+/// no-external-assets property stated to the browser rather than only to the
+/// tests: nothing to fetch, nothing to run, no origin to report to. The one
+/// allowance is the inline `<style>` below, and `frame-ancestors 'none'` (with
+/// the older `X-Frame-Options` beside it) keeps a consent decision from being
+/// framed inside somebody else's page.
+const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+
 /// The shell every page shares: no scripts, no external assets, no fonts to
 /// fetch. A consent interstitial that pulls in a third party is a consent
 /// interstitial a third party can watch.
@@ -358,7 +410,10 @@ body {{ margin: 0; padding: 3rem 1.25rem; background: #fbfaf8; color: #1a1a1a;
 main {{ max-width: 32rem; margin: 0 auto; }}
 h1 {{ font-size: 1.35rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 1rem; }}
 p {{ margin: 0 0 1rem; }}
+ul {{ margin: 0 0 1.25rem; padding-left: 1.2rem; }}
+li {{ margin: 0 0 0.5rem; }}
 .muted {{ color: #6b6b6b; font-size: 0.9rem; }}
+.stop {{ border-left: 3px solid #b3261e; padding: 0.1rem 0 0.1rem 0.85rem; }}
 code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em;
   background: #efece7; padding: 0.1em 0.35em; border-radius: 3px; }}
 a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1.15rem;
@@ -368,6 +423,7 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   .muted {{ color: #9a9a9a; }}
   code {{ background: #262626; }}
   a.button {{ background: #e8e6e3; color: #141414; }}
+  .stop {{ border-left-color: #f2b8b5; }}
 }}
 </style>
 </head>
@@ -383,30 +439,97 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
             // the click through to Google must not carry this URL as a referer.
             (header::CACHE_CONTROL, "no-store, no-cache"),
             (header::REFERRER_POLICY, "no-referrer"),
+            (header::CONTENT_SECURITY_POLICY, CSP),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         html,
     )
         .into_response()
 }
 
-/// The interstitial: what is being authorized, what this service cannot do, and
-/// one link onward to Google.
+/// Plain-English descriptions of the scopes a registration may ask for, keyed by
+/// the scope string. Registration refuses anything outside
+/// [`validate::ALLOWED_SCOPES`], so in practice every scope reaching this page
+/// has an entry here; the verbatim fallback below exists because a page that
+/// silently drops a permission it does not recognize is worse than one that
+/// shows a raw URL.
+const SCOPE_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        validate::GMAIL_READONLY_SCOPE,
+        "Read your Gmail: every message, every attachment, and your mail settings. Read only: nothing is sent, changed, or deleted.",
+    ),
+    (
+        validate::GMAIL_MODIFY_SCOPE,
+        "Read your Gmail and change it: labels, read and unread, archiving, and moving messages to the trash. Not permanent deletion.",
+    ),
+    (
+        validate::GMAIL_SEND_SCOPE,
+        "Send mail as you, from your address.",
+    ),
+];
+
+/// The requested permissions as a list, in the order the link asks for them.
+fn scope_list_html(auth_url: &str) -> String {
+    let scopes = validate::requested_scopes(auth_url);
+    if scopes.is_empty() {
+        // Registration requires a scope, so an empty list means the link is not
+        // what it should be. Saying nothing would read as "it wants nothing".
+        return "<ul><li>This link does not say what it wants. Do not continue.</li></ul>"
+            .to_string();
+    }
+    let mut out = String::from("<ul>");
+    for scope in scopes {
+        match SCOPE_DESCRIPTIONS.iter().find(|(s, _)| *s == scope) {
+            Some((_, description)) => {
+                out.push_str(&format!("<li>{}</li>", escape_html(description)));
+            }
+            // Shown, never dropped, and escaped like every other value here.
+            None => out.push_str(&format!(
+                "<li>A permission this page does not recognize: <code>{}</code></li>",
+                escape_html(&scope)
+            )),
+        }
+    }
+    out.push_str("</ul>");
+    out
+}
+
+/// The interstitial: a decision, not a doorway.
+///
+/// What this page may NOT say is who is asking. Registration is unauthenticated
+/// by design (every stranger's self-hosted daemon is a legitimate client), so
+/// the broker knows nothing about the daemon that parked this link, and
+/// "your own copy of squelchd" would be equally true of a stranger's. Vouching
+/// for it in our own voice on our own domain is exactly the credibility an
+/// attacker cannot forge and would be borrowing from us.
+///
+/// So: the consequence first, the requested permissions in plain English, and a
+/// stop condition the reader can check without trusting anything on the page.
 fn interstitial_page(auth_url: &str) -> Response {
     let minutes = ttl_minutes();
     page(
         StatusCode::OK,
-        "Authorize Passband",
+        "Approve access to your Google account?",
         &format!(
-            r#"<h1>Authorize Passband</h1>
-<p>Your own copy of <code>squelchd</code>, the Passband mail daemon, is asking for
-access to your Google account. Continue to Google to see exactly which
-permissions it wants, and to approve or refuse them.</p>
-<p>This broker never sees your password or your tokens, and it is
-cryptographically incapable of minting them: all it does is hold Google's
-one-time code for a few minutes so that your daemon, which alone holds the
-secret that makes the code usable, can collect it.</p>
-<p><a class="button" href="{href}" rel="noreferrer">Continue to Google</a></p>
+            r#"<h1>Approve access to your Google account?</h1>
+<p>Someone ran <code>squelchd auth</code> on a machine and sent this link here.
+This page cannot tell you who: anyone can park a link here, so it may not have
+been you.</p>
+<p><strong>If you continue and approve at Google, that machine can use your
+Google account until you take the access away again.</strong> Here is what it is
+asking for:</p>
+{scopes}
+<p class="stop"><strong>If you did not run <code>squelchd auth</code> yourself in
+the last few minutes, close this page.</strong> Nothing has been authorized yet,
+and closing the page leaves it that way.</p>
+<p><a class="button" href="{href}" rel="noreferrer">I ran this. Continue to Google</a></p>
+<p class="muted">This broker never sees your password or your tokens, and it is
+cryptographically incapable of minting them: it holds Google's one-time code for
+a few minutes so the machine that already has the matching secret can collect
+it. That bounds what we could do with your consent. It says nothing about who
+asked you for it.</p>
 <p class="muted">This link is good for {minutes} minutes and works once.</p>"#,
+            scopes = scope_list_html(auth_url),
             href = escape_html(auth_url)
         ),
     )
@@ -539,30 +662,113 @@ mod tests {
         assert_eq!(escape_html("plain text"), "plain text");
     }
 
-    /// The interstitial is the page a user reads before handing Google their
-    /// consent, so the promise it makes is load-bearing copy, not decoration.
-    #[tokio::test]
-    async fn the_interstitial_names_the_product_and_states_what_we_cannot_do() {
-        let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=c&state=s";
-        let html = render(interstitial_page(url)).await;
+    /// A consent URL with the scope `squelchd auth` sends.
+    fn read_consent_url() -> String {
+        format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=c&state=s&scope={}",
+            validate::GMAIL_READONLY_SCOPE
+        )
+    }
 
-        assert!(html.contains("Passband"));
-        assert!(html.contains("squelchd"));
-        assert!(html.contains("cryptographically incapable of minting them"));
+    /// The interstitial is the page a user reads before handing Google their
+    /// consent, so its copy is load-bearing, not decoration.
+    #[tokio::test]
+    async fn the_interstitial_leads_with_the_consequence_and_states_what_we_cannot_do() {
+        let html = render(interstitial_page(&read_consent_url())).await;
+
+        // The consequence comes before the reassurance, not after it.
+        let consequence = html.find("can use your\nGoogle account").unwrap();
+        let reassurance = html.find("cryptographically incapable").unwrap();
+        assert!(consequence < reassurance, "the reassurance led the page");
         assert!(html.contains("never sees your password or your tokens"));
         assert!(html.contains("10 minutes"));
 
+        // The stop condition, and the fact that we cannot say who is asking.
+        assert!(html.contains("If you did not run <code>squelchd auth</code> yourself in"));
+        assert!(html.contains("close this page"));
+        assert!(html.contains("it may not have"));
+
         // The link goes to the registered URL, with its separators escaped for
         // the attribute rather than left raw.
-        assert!(html.contains(
-            r#"href="https://accounts.google.com/o/oauth2/v2/auth?client_id=c&amp;state=s""#
-        ));
+        assert!(html.contains(&format!(
+            r#"href="{}""#,
+            read_consent_url().replace('&', "&amp;")
+        )));
 
         // Self-contained: nothing to fetch, nothing to run.
         assert!(!html.contains("<script"));
         assert!(!html.contains("http://"));
         assert!(!html.to_lowercase().contains("src="));
         assert!(!html.contains("stylesheet"));
+    }
+
+    /// The broker knows nothing about who registered a session, so it must not
+    /// tell the reader that their own daemon is asking.
+    #[tokio::test]
+    async fn the_interstitial_vouches_for_nobody() {
+        let html = render(interstitial_page(&read_consent_url())).await;
+        for vouching in [
+            "Your own copy",
+            "your own copy",
+            "your daemon",
+            "your machine",
+            "is asking for\naccess to your Google account",
+        ] {
+            assert!(!html.contains(vouching), "the page vouched: {vouching:?}");
+        }
+    }
+
+    /// A reader deciding whether to grant something has to be told what it is,
+    /// on this page, in words. "Continue to Google to see" is not that.
+    #[tokio::test]
+    async fn the_interstitial_spells_out_the_requested_scopes() {
+        let read = render(interstitial_page(&read_consent_url())).await;
+        assert!(read.contains("Read your Gmail: every message"));
+        assert!(!read.contains("Send mail as you"));
+
+        let write = render(interstitial_page(&format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=c&state=s&scope={}%20{}",
+            validate::GMAIL_MODIFY_SCOPE,
+            validate::GMAIL_SEND_SCOPE
+        )))
+        .await;
+        assert!(write.contains("moving messages to the trash"));
+        assert!(write.contains("Send mail as you"));
+        assert!(!write.contains("Read only"));
+
+        // An unrecognized scope is shown verbatim and escaped, never dropped:
+        // registration refuses these, so reaching the page at all means
+        // something is wrong and the reader is the one who should see it.
+        let odd = render(interstitial_page(
+            "https://accounts.google.com/o/oauth2/v2/auth?scope=https%3A%2F%2Fmail.google.com%2F%3Cb%3E",
+        ))
+        .await;
+        assert!(odd.contains("does not recognize"));
+        assert!(odd.contains("https://mail.google.com/&lt;b&gt;"));
+        assert!(!odd.contains("<b>"));
+
+        // A link that says nothing says so.
+        let none = render(interstitial_page(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=c",
+        ))
+        .await;
+        assert!(none.contains("does not say what it wants"));
+    }
+
+    /// House style: user-facing copy carries no em dashes.
+    #[tokio::test]
+    async fn no_page_uses_an_em_dash() {
+        for resp in [
+            interstitial_page(&read_consent_url()),
+            authorized_page(),
+            declined_page(),
+            already_used_page(),
+            expired_page(),
+            invalid_callback_page(),
+        ] {
+            let html = render(resp).await;
+            assert!(!html.contains('\u{2014}'), "em dash in page copy");
+        }
     }
 
     /// No page may render a code, and the terminal ones link nowhere.
@@ -582,18 +788,47 @@ mod tests {
         }
     }
 
+    /// The headers are the page's self-contained, unframeable property stated
+    /// to the browser instead of only to the tests above.
     #[test]
-    fn pages_are_uncacheable_and_leak_no_referer() {
-        let resp = interstitial_page("https://accounts.google.com/o/oauth2/v2/auth?x=1");
-        let h = resp.headers();
-        assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
-        assert!(
-            h[header::CACHE_CONTROL]
-                .to_str()
-                .unwrap()
-                .contains("no-store")
-        );
-        assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+    fn pages_are_uncacheable_unframeable_and_leak_no_referer() {
+        for resp in [
+            interstitial_page(&read_consent_url()),
+            authorized_page(),
+            expired_page(),
+            invalid_callback_page(),
+        ] {
+            let h = resp.headers();
+            assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
+            assert!(
+                h[header::CACHE_CONTROL]
+                    .to_str()
+                    .unwrap()
+                    .contains("no-store")
+            );
+            assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+            assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
+            let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            assert!(csp.contains("default-src 'none'"));
+            assert!(csp.contains("frame-ancestors 'none'"));
+            // The inline stylesheet is the only allowance; a script-src would
+            // undo the property the pages are built around.
+            assert!(csp.contains("style-src 'unsafe-inline'"));
+            assert!(!csp.contains("script-src"));
+        }
+    }
+
+    /// `/v1/claim` is the polling daemon's door. Every kind must state whether
+    /// it is served there, and the match is what makes a new kind a compile
+    /// error rather than a silent yes.
+    #[test]
+    fn every_session_kind_decides_whether_polling_may_claim_it() {
+        for kind in [SessionKind::SelfHost] {
+            let expected = match kind {
+                SessionKind::SelfHost => true,
+            };
+            assert_eq!(claimable_by_polling(kind), expected, "{}", kind.as_str());
+        }
     }
 
     /// The copy quotes the TTL; deriving it is what keeps the two in step.

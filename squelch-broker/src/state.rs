@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::ratelimit::{JSON_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE, RateLimiter};
+use crate::ratelimit::{
+    CALLBACK_REQUESTS_PER_MINUTE, CLAIM_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE,
+    REGISTER_REQUESTS_PER_MINUTE, RateLimiter,
+};
 use crate::sessions::{
-    ClaimOutcome, ParkOutcome, Parked, RegisterError, SessionKind, SessionStore,
+    ClaimOutcome, NewSession, ParkOutcome, Parked, RegisterError, SessionKind, SessionStore,
 };
 
 /// State threaded through the router and both rate-limit layers. Cheap to clone
@@ -19,14 +22,15 @@ pub struct BrokerState {
     inner: Arc<Inner>,
 }
 
+/// One limiter per route, never one shared: a 429 costs a different thing on
+/// each of them, so they cannot share a budget. See [`crate::ratelimit`].
 struct Inner {
     config: Config,
     sessions: SessionStore,
-    limiter: Mutex<RateLimiter>,
-    /// The human-facing pages get their OWN buckets: behind the expected proxy
-    /// both limiters see one address, and on a single limiter a link scanner
-    /// would spend the daemons' claim budget.
+    register_limiter: Mutex<RateLimiter>,
+    claim_limiter: Mutex<RateLimiter>,
     page_limiter: Mutex<RateLimiter>,
+    callback_limiter: Mutex<RateLimiter>,
 }
 
 impl BrokerState {
@@ -37,8 +41,10 @@ impl BrokerState {
             inner: Arc::new(Inner {
                 config,
                 sessions: SessionStore::new(),
-                limiter: Mutex::new(RateLimiter::per_minute(JSON_REQUESTS_PER_MINUTE)),
+                register_limiter: Mutex::new(RateLimiter::per_minute(REGISTER_REQUESTS_PER_MINUTE)),
+                claim_limiter: Mutex::new(RateLimiter::per_minute(CLAIM_REQUESTS_PER_MINUTE)),
                 page_limiter: Mutex::new(RateLimiter::per_minute(PAGE_REQUESTS_PER_MINUTE)),
+                callback_limiter: Mutex::new(RateLimiter::per_minute(CALLBACK_REQUESTS_PER_MINUTE)),
             }),
         }
     }
@@ -55,17 +61,14 @@ impl BrokerState {
         &self.inner.sessions
     }
 
-    /// Register a session against the current clock.
-    pub(crate) fn register(
-        &self,
-        session_id: String,
-        kind: SessionKind,
-        claim_token_hash: [u8; 32],
-        auth_url: String,
-    ) -> Result<(), RegisterError> {
-        self.inner
-            .sessions
-            .register(session_id, kind, claim_token_hash, auth_url, Instant::now())
+    /// Register a session against the current clock, under this deployment's
+    /// per-client ceiling.
+    pub(crate) fn register(&self, new: NewSession) -> Result<(), RegisterError> {
+        self.inner.sessions.register(
+            new,
+            self.inner.config.max_sessions_per_client(),
+            Instant::now(),
+        )
     }
 
     pub(crate) fn auth_url(&self, session_id: &str) -> Option<String> {
@@ -96,22 +99,36 @@ impl BrokerState {
         self.inner.sessions.len()
     }
 
-    /// Charge one JSON request against `ip`'s bucket. False means "over the
+    /// The session kind, for a handler deciding whether it serves that kind.
+    pub(crate) fn session_kind(&self, session_id: &str) -> Option<SessionKind> {
+        self.inner.sessions.kind(session_id, Instant::now())
+    }
+
+    /// Charge one registration against `ip`'s bucket. False means "over the
     /// limit". Poisoning is RECOVERED, not propagated: the guarded value is a
     /// token bucket with no invariant a panic could corrupt, and `.expect()`
     /// would brick every future request while `/healthz` kept answering 200.
-    pub(crate) fn check_json_rate(&self, ip: IpAddr) -> bool {
-        self.inner
-            .limiter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .check(ip, Instant::now())
+    pub(crate) fn check_register_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.register_limiter, ip)
+    }
+
+    /// Charge one claim poll against `ip`'s separate bucket.
+    pub(crate) fn check_claim_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.claim_limiter, ip)
     }
 
     /// Charge one page view against `ip`'s separate bucket.
     pub(crate) fn check_page_rate(&self, ip: IpAddr) -> bool {
-        self.inner
-            .page_limiter
+        self.charge(&self.inner.page_limiter, ip)
+    }
+
+    /// Charge one callback against `ip`'s separate bucket.
+    pub(crate) fn check_callback_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.callback_limiter, ip)
+    }
+
+    fn charge(&self, limiter: &Mutex<RateLimiter>, ip: IpAddr) -> bool {
+        limiter
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .check(ip, Instant::now())

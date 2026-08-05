@@ -34,6 +34,27 @@ const GOOGLE_HOST: &str = "accounts.google.com";
 /// The only path.
 const GOOGLE_AUTH_PATH: &str = "/o/oauth2/v2/auth";
 
+/// The scopes `squelchd` requests: `squelchd auth` asks for the first,
+/// `squelchd auth --write` for the other two, and nothing asks for anything
+/// else.
+///
+/// SOURCE OF TRUTH is squelch-core (`GMAIL_READONLY_SCOPE` and `WRITE_SCOPES`
+/// in `squelch-core/src/config.rs`); they are restated here rather than
+/// imported because the broker ships as its own image and must not pull the
+/// daemon's crate (rusqlite, keyring, fastembed, an embedding model) in to
+/// learn three strings. Self-hosters build their consent URL from those same
+/// constants, so an allowlist costs no legitimate client anything.
+pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
+pub const GMAIL_MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+pub const GMAIL_SEND_SCOPE: &str = "https://www.googleapis.com/auth/gmail.send";
+
+/// Every scope a registration may ask for. A consent URL requesting anything
+/// outside this set is refused: the broker renders the request as a link on its
+/// own domain, so without this a stranger can register
+/// `https://mail.google.com/` (full mailbox control, deletion included) and we
+/// will serve the page that asks a human to grant it.
+pub const ALLOWED_SCOPES: &[&str] = &[GMAIL_READONLY_SCOPE, GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE];
+
 /// Why a consent URL was refused. Each message is safe to hand back to the
 /// caller: it names the constraint, never the value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -68,11 +89,17 @@ pub enum AuthUrlError {
     CodeChallengeMethod,
     #[error("auth_url is missing a `client_id`")]
     ClientId,
+    #[error("auth_url is missing a `scope`")]
+    Scope,
+    #[error(
+        "auth_url `scope` must be a subset of the scopes squelchd requests (gmail.readonly, gmail.modify, gmail.send)"
+    )]
+    ScopeNotAllowed,
 }
 
 /// The query parameters this broker has an opinion about. Anything else Google
-/// accepts (`scope`, `access_type`, `prompt`, `login_hint`) rides along
-/// untouched: the daemon owns its own consent request.
+/// accepts (`access_type`, `prompt`, `login_hint`) rides along untouched: the
+/// daemon owns the rest of its own consent request.
 const CHECKED_PARAMS: &[&str] = &[
     "redirect_uri",
     "state",
@@ -80,6 +107,7 @@ const CHECKED_PARAMS: &[&str] = &[
     "code_challenge",
     "code_challenge_method",
     "client_id",
+    "scope",
 ];
 
 /// True when `s` is a well-formed session id.
@@ -177,7 +205,36 @@ pub fn auth_url(raw: &str, session_id: &str, callback_url: &str) -> Result<(), A
     if param("client_id").is_empty() {
         return Err(AuthUrlError::ClientId);
     }
+    // The scope is what the human is actually being asked to grant, and the
+    // interstitial spells it out on our domain. A URL with no scope authorizes
+    // nothing; a URL with a scope squelchd never asks for is a stranger's
+    // consent request wearing our page.
+    let scope = param("scope");
+    let mut requested = scope.split_whitespace().peekable();
+    if requested.peek().is_none() {
+        return Err(AuthUrlError::Scope);
+    }
+    if !requested.all(|s| ALLOWED_SCOPES.contains(&s)) {
+        return Err(AuthUrlError::ScopeNotAllowed);
+    }
     Ok(())
+}
+
+/// The scopes a registered consent URL asks for, in the order it lists them.
+///
+/// Re-parsed from the URL rather than stored beside it, so the page cannot
+/// describe one grant while the link requests another. Registration already
+/// refused everything outside [`ALLOWED_SCOPES`], but the caller escapes what
+/// it renders anyway: "this one was checked elsewhere" is how the exception
+/// becomes the rule.
+pub fn requested_scopes(auth_url: &str) -> Vec<String> {
+    let Ok(url) = Url::parse(auth_url) else {
+        return Vec::new();
+    };
+    url.query_pairs()
+        .find(|(k, _)| k == "scope")
+        .map(|(_, v)| v.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 fn is_base64url(b: u8) -> bool {
@@ -344,7 +401,7 @@ mod tests {
         // Segment normalization is the parser's job, and a normalized path that
         // lands on the endpoint IS the endpoint.
         let normalized = format!(
-            "https://accounts.google.com/o/oauth2/v3/../v2/auth?client_id=c&redirect_uri={CALLBACK}&response_type=code&state={SID}&code_challenge=x&code_challenge_method=S256"
+            "https://accounts.google.com/o/oauth2/v3/../v2/auth?client_id=c&redirect_uri={CALLBACK}&response_type=code&state={SID}&code_challenge=x&code_challenge_method=S256&scope={GMAIL_READONLY_SCOPE}"
         );
         assert_eq!(auth_url(&normalized, SID, CALLBACK), Ok(()));
     }
@@ -441,11 +498,82 @@ mod tests {
         p.push(("state", "something-else"));
         assert_eq!(check(&p), Err(AuthUrlError::DuplicateParam("state")));
 
+        // The scope is checked, so it may not repeat either: Google would union
+        // one reading of the pair and we would have rendered the other.
+        let mut p = good_params();
+        p.push(("scope", GMAIL_SEND_SCOPE));
+        assert_eq!(check(&p), Err(AuthUrlError::DuplicateParam("scope")));
+
         // Parameters the broker has no opinion about may repeat: they are the
         // daemon's business and Google's.
         let mut p = good_params();
-        p.push(("scope", "https://www.googleapis.com/auth/gmail.send"));
+        p.push(("login_hint", "someone@example.com"));
         assert_eq!(check(&p), Ok(()));
+    }
+
+    /// Without this, a stranger registers a consent URL asking for anything
+    /// Google will grant and the broker serves the page that asks for it.
+    #[test]
+    fn refuses_a_scope_squelchd_never_requests() {
+        for bad in [
+            // Full mailbox control, permanent deletion included.
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/gmail.settings.basic",
+            // A prefix of an allowed scope is not an allowed scope.
+            "https://www.googleapis.com/auth/gmail",
+            "https://www.googleapis.com/auth/gmail.readonly.evil",
+            // Nor is one that merely contains it.
+            "openid",
+            // One good scope does not carry a bad one in with it.
+            "https://www.googleapis.com/auth/gmail.readonly https://mail.google.com/",
+        ] {
+            assert_eq!(
+                check(&replacing("scope", bad)),
+                Err(AuthUrlError::ScopeNotAllowed),
+                "{bad:?}"
+            );
+        }
+
+        // Missing or empty authorizes nothing and renders as nothing.
+        assert_eq!(check(&without("scope")), Err(AuthUrlError::Scope));
+        assert_eq!(check(&replacing("scope", "")), Err(AuthUrlError::Scope));
+        assert_eq!(check(&replacing("scope", "   ")), Err(AuthUrlError::Scope));
+    }
+
+    /// Exactly what `squelchd auth` and `squelchd auth --write` send.
+    #[test]
+    fn accepts_the_scope_sets_squelchd_asks_for() {
+        for good in [
+            GMAIL_READONLY_SCOPE,
+            GMAIL_MODIFY_SCOPE,
+            GMAIL_SEND_SCOPE,
+            "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send",
+            // A `+`-encoded separator decodes to the same set.
+            "https://www.googleapis.com/auth/gmail.send  https://www.googleapis.com/auth/gmail.modify",
+        ] {
+            assert_eq!(check(&replacing("scope", good)), Ok(()), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn reads_back_the_scopes_the_page_will_render() {
+        let url = url_with(&good_params());
+        assert_eq!(requested_scopes(&url), vec![GMAIL_MODIFY_SCOPE.to_string()]);
+
+        let two = url_with(&replacing(
+            "scope",
+            "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send",
+        ));
+        assert_eq!(
+            requested_scopes(&two),
+            vec![GMAIL_MODIFY_SCOPE.to_string(), GMAIL_SEND_SCOPE.to_string()]
+        );
+
+        // Nothing to render is an empty list, never a panic.
+        assert!(requested_scopes(&url_with(&without("scope"))).is_empty());
+        assert!(requested_scopes("not a url").is_empty());
     }
 
     #[test]
