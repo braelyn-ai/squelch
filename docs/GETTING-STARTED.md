@@ -203,10 +203,10 @@ If Test fails, jump to troubleshooting below; the error text names the cause.
 
 ## 6. Optional extras
 
-**Write actions.** Archive, label, and send need a second, separately scoped
-credential that only the action handlers can load. Sync and triage never touch
-it. Mint it by exporting with `--write`, which runs two consent screens and
-carries both credentials in one blob:
+**Write actions.** Archive, label, and send need a second credential that only
+the human door's action handlers load. Sync and triage never touch it, and the
+agent door has no write tools at all. Mint it by exporting with `--write`, which
+runs two consent screens and carries both credentials in one blob:
 
 ```sh
 umask 077
