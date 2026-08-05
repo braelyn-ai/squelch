@@ -22,11 +22,13 @@ takes SIGTERM directly for graceful shutdown.
 
 ## Pulling the image
 
-The repo is private, so the package is too. On the box, log in once with a
-GitHub PAT that has `read:packages`:
+The package is public — `docker pull ghcr.io/braelyn-ai/squelchd:latest`
+works with no registry login. To build the same image from source instead
+(context must be the workspace root; the repo-root Dockerfile builds the
+relay, not the daemon):
 
 ```sh
-echo "$GITHUB_PAT" | docker login ghcr.io -u <github-username> --password-stdin
+docker build -f squelchd/Dockerfile -t squelchd .
 ```
 
 ## docker-compose.yml

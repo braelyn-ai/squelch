@@ -4,7 +4,7 @@ The "baddiebox" runbook. Target: a headless Linux VM on a tailnet. One process
 (`squelchd serve`) runs the Gmail sync loop AND serves both doors:
 
 - **Agent door** — MCP Streamable HTTP at `/mcp` (narrow, read-only, sealed-absent).
-- **Human door** — authenticated `/client/*` API for your desktop client.
+- **Human door** — authenticated `/client/*` API for your own clients (Passband on macOS).
 
 Both bind to loopback `127.0.0.1:8848` by default; `tailscale serve` fronts them
 so only your tailnet can reach the box. Everything here also runs on macOS for
@@ -17,7 +17,12 @@ GHCR — see [DOCKER.md](DOCKER.md) and skip §1/§2/§5 entirely.
 
 ## 1. Build
 
-On the box (native):
+On the box (native). Two prerequisites beyond rustup: a C/C++ toolchain
+(`apt install build-essential g++` — rusqlite compiles bundled SQLite, and
+`ort` links a static onnxruntime that needs `libstdc++`), and **glibc ≥ 2.38**
+(Debian 13 "trixie", Ubuntu 24.04+) — ort's prebuilt onnxruntime does not link
+against bookworm's 2.36, which is also why the published images are
+trixie-based.
 
 ```sh
 # Rust toolchain (edition 2024 => needs a recent stable).
@@ -64,7 +69,7 @@ Generate the human-door bearer token:
 
 ```sh
 API_TOKEN=$(openssl rand -hex 32)
-echo "$API_TOKEN"        # copy into your desktop client's config too
+echo "$API_TOKEN"        # copy into Passband's connection settings too
 ```
 
 Write `/etc/squelch/env` (root-owned, mode 0640, group `squelch`):
@@ -257,6 +262,15 @@ sync loop finish in-flight work and flush before exit.
 ---
 
 ## 8. The consent relay (`squelch-broker`) on Railway
+
+> **Do not deploy this for self-host** — Google's desktop-client redirect
+> policy makes the code-parking flow unusable for the client type self-host
+> requires ([docs/BROKER.md](../docs/BROKER.md) has the full status). Headless
+> consent is `squelchd auth --export` / `--import`; the encrypted-courier
+> successor is tracked in
+> [issue #15](https://github.com/braelyn-ai/squelch/issues/15). This section
+> stays as the operational reference for the hosted-tier callback, which is
+> where the crate lands next.
 
 Optional, and not part of the box above: this is the service that makes
 `squelchd auth --broker <url>` work, so §4's `ssh -L` tunnel stops being the only

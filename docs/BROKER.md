@@ -1,11 +1,16 @@
 # squelch-broker: the consent relay
 
-> **STATUS 2026-08-04: DO NOT DEPLOY for the self-host tier. The code-parking
-> flow below cannot be granted by Google.** The crate is built, hardened, and
-> tested; the flow it implements is the one flow Google will not authorize for
-> the client type self-host requires. Details in "The blocker" immediately
-> below, and the replacement design in "Where this goes instead". The hosted
-> tier's web-client callback is unaffected and is where this code lands next.
+> **STATUS 2026-08-04: DEPRECATED IN PLACE — DO NOT DEPLOY for the self-host
+> tier. The code-parking flow below cannot be granted by Google.** The crate is
+> built, hardened, and tested; the flow it implements is the one flow Google
+> will not authorize for the client type self-host requires. It is superseded
+> by `squelchd auth --export` / `--import` (shipped — see
+> [GETTING-STARTED.md](GETTING-STARTED.md) §3), with the encrypted token
+> courier that saves this crate tracked in
+> [issue #15](https://github.com/braelyn-ai/squelch/issues/15). Details in
+> "The blocker" immediately below, and the replacement design in "Where this
+> goes instead". The hosted tier's web-client callback is unaffected and is
+> where this code lands next.
 
 The broker was designed to fix headless consent UX (docker on a NAS, a VPS)
 without ever being trusted. It parks a Google OAuth authorization code for a few

@@ -33,18 +33,24 @@ squelchd ── sync ──> SQLite ──> triage (seal -> rules -> 2-stage LLM
 
 ### 2. Configure
 
-Create a `.env` in the repo root (it is gitignored):
+Create a `.env` in the repo root (it is gitignored). Generate the API token
+once, into the file — if you write the `$(...)` into `.env` itself, every
+`source` mints a fresh token and yesterday's clients all start seeing 401:
 
 ```sh
+cat > .env <<EOF
 SQUELCH_CLIENT_ID=<your client id>
 SQUELCH_CLIENT_SECRET=<your client secret>
 SQUELCH_ACCOUNT_EMAIL=you@gmail.com
-SQUELCH_API_TOKEN=$(openssl rand -hex 32)   # for the human door
+SQUELCH_API_TOKEN=$(openssl rand -hex 32)
+EOF
 ```
+
+`SQUELCH_API_TOKEN` is the password for the human door.
 
 Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`.
 
-To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key/provider; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be overridden at runtime (no restart) from the desktop app's Settings.
+To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key/provider; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be overridden at runtime (no restart) from Passband's Settings.
 
 ### 3. Authorize and run
 
@@ -75,8 +81,6 @@ Both machines must use the same `SQUELCH_CLIENT_ID` and `SQUELCH_CLIENT_SECRET`.
 
 If the laptop side is itself the published container image, run the export inside it with `-p 8847:8847` and add `--expose-consent-listener`: a listener on the container's own `127.0.0.1` is unreachable from your browser. That opens the port on every interface for the length of one consent, so it is opt-in.
 
-The other route moves the code instead of the token. `squelchd auth --broker <url>` prints one link to open on any device, and a consent relay parks Google's one-time code until your daemon collects it. The relay cannot turn that code into a token, because the PKCE verifier never leaves your machine. Run your own from `Dockerfile.broker` ([deploy/DEPLOY.md](deploy/DEPLOY.md) §8); the hosted one at `auth.passband.email` is not up yet.
-
 ### 4. Connect an agent
 
 Point any MCP client at the streamable HTTP endpoint:
@@ -106,18 +110,19 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 | [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) |
 | [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
 | [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
-| [`squelch-desktop`](squelch-desktop/README.md) | the Tauri desktop client over the human door |
-| `squelch-client-swift` | the native macOS client over the human door |
+| `squelch-httpauth` | shared bearer-auth primitives for the human door and the relay |
+| `passband` | Passband, the native macOS client over the human door |
 | [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
+| [`squelch-broker`](squelch-broker/README.md) | consent relay — built but not deployed; see [docs/BROKER.md](docs/BROKER.md) |
 
-Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md); the Docker path (prebuilt images on GHCR, env-var config only) is [`deploy/DOCKER.md`](deploy/DOCKER.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
+Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md); the Docker path (public prebuilt images on GHCR, env-var config only) is [`deploy/DOCKER.md`](deploy/DOCKER.md). The end-to-end NAS + Mac walkthrough is [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md). The client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
 
-## Building the macOS client
+## Building Passband (the macOS client)
 
-`squelch-client-swift` builds with `swiftc` directly — no Xcode needed for a local build.
+Passband lives in `passband/` and builds with `swiftc` directly — no Xcode needed for a local build.
 
 ```sh
-cd squelch-client-swift
+cd passband
 ./build.sh          # debug
 ./build.sh run      # build and launch
 ./build.sh release  # optimized
