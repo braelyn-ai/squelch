@@ -806,6 +806,9 @@ final class AppStore {
         // Seeded HERE rather than by the caller, so every way into a composer
         // starts at the account's default and none can forget to.
         next.includeTracker = trackingDefault
+        // The signature, below where typing starts. Only into an empty body — a
+        // caller arriving with content composed that content, not a signature.
+        if next.body.isEmpty { next.body = Prefs.shared.signatureSeed }
         compose = next
         DraftSaver.shared.noteOpened(.compose)
         Analytics.capture(
@@ -838,8 +841,10 @@ final class AppStore {
         // Must still be THE blank composer we opened: closed, replaced by a
         // reply, or typed into in the meantime all mean the draft has missed its
         // window, and overwriting live keystrokes is worse than not restoring.
+        // "Untouched" rather than empty: the composer opens holding the seeded
+        // signature, and a seed nobody typed must not block the restore.
         guard var next = compose, next.replyToMessageId == nil, next.draftId == nil,
-            next.to.isEmpty, next.subject.isEmpty, next.body.isEmpty
+            next.to.isEmpty, next.subject.isEmpty, Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.to = draft.to
         next.subject = draft.subject
@@ -860,7 +865,9 @@ final class AppStore {
     /// gets to throw away.
     func openInlineReply(replyTo messageId: Int) {
         guard inlineReply == nil else { return }
-        inlineReply = ComposeState(replyToMessageId: messageId, includeTracker: trackingDefault)
+        inlineReply = ComposeState(
+            replyToMessageId: messageId, body: Prefs.shared.signatureSeed,
+            includeTracker: trackingDefault)
         DraftSaver.shared.noteOpened(.inlineReply)
         // Both ways in (the reader's `r` and the list's hand-off) come through
         // here, so the restore is wired once.
@@ -874,8 +881,9 @@ final class AppStore {
         guard let rows = try? await APIClient.shared.listDrafts(),
             let draft = rows.first(where: { $0.reply_to_message_id == messageId })
         else { return }
+        // Untouched, not empty — the seeded signature must not block the restore.
         guard var next = inlineReply, next.replyToMessageId == messageId, next.draftId == nil,
-            next.body.isEmpty
+            Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.body = draft.body
         next.draftId = draft.id

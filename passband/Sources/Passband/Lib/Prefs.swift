@@ -79,6 +79,7 @@ final class Prefs {
         static let developerMode = "passband.pref.developerMode"
         static let theme = "passband.pref.theme"
         static let userName = "passband.name"
+        static let signature = "passband.pref.signature"
         static let assistantModel = "passband.assistant.model"
         static let telemetry = TelemetryLevel.prefKey
     }
@@ -102,6 +103,7 @@ final class Prefs {
         _telemetry =
             TelemetryLevel(rawValue: defaults.string(forKey: Key.telemetry) ?? "") ?? .full
         _userName = defaults.string(forKey: Key.userName) ?? ""
+        _signature = defaults.string(forKey: Key.signature) ?? ""
         _assistantModel =
             AssistantModel(rawValue: defaults.string(forKey: Key.assistantModel) ?? "")
             ?? .haiku
@@ -177,6 +179,32 @@ final class Prefs {
             _userName = newValue.trimmingCharacters(in: .whitespaces)
             defaults.set(_userName, forKey: Key.userName)
         }
+    }
+
+    /// The email signature, as markdown — same dialect as the compose body.
+    /// Stored raw (no trimming in the setter: it is bound to a live editor, and
+    /// normalizing under the caret would fight every trailing newline typed).
+    private var _signature: String
+    var signature: String {
+        get { _signature }
+        set {
+            _signature = newValue
+            defaults.set(newValue, forKey: Key.signature)
+        }
+    }
+
+    /// What a fresh compose body starts as: empty when no signature is stored,
+    /// otherwise the signature two newlines down, so typing starts above it.
+    var signatureSeed: String {
+        let sig = signature.trimmed
+        return sig.isEmpty ? "" : "\n\n" + sig
+    }
+
+    /// True while a compose body holds nothing the user typed: blank, or exactly
+    /// the seeded signature block. The draft machinery treats such a body as
+    /// empty — it must neither block a restore nor be worth saving as a draft.
+    func isBodyUntouched(_ body: String) -> Bool {
+        body.trimmed.isEmpty || body == signatureSeed
     }
 
     private var _assistantModel: AssistantModel

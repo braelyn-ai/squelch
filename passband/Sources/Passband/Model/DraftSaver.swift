@@ -124,9 +124,11 @@ final class DraftSaver {
     }
 
     private func save(_ slot: Slot, _ state: ComposeState) async {
+        // A body that is only the seeded signature counts as blank: saving it
+        // would mint a draft of nothing, and every later `c` would restore it.
         let blank =
             state.to.trimmed.isEmpty && state.subject.trimmed.isEmpty
-            && state.body.trimmed.isEmpty
+            && Prefs.shared.isBodyUntouched(state.body)
         if blank {
             // EMPTIED, not composed: a draft cleared back to nothing is discarded
             // rather than saved as a blank row that would restore as one. With no

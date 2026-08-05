@@ -303,7 +303,9 @@ struct ComposePane: View {
 
     private func toReview() {
         guard let compose = store.compose else { return }
-        guard !compose.body.trimmed.isEmpty else {
+        // Untouched covers the seeded signature: a signature under nothing is
+        // not a message, and review must not put it one Enter from going out.
+        guard !Prefs.shared.isBodyUntouched(compose.body) else {
             patch { $0.error = "body is empty" }
             return
         }

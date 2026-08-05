@@ -36,6 +36,9 @@ struct MarkdownTextView: NSViewRepresentable {
         view.autoresizingMask = [.width]
         view.textContainer?.widthTracksTextView = true
         view.rehighlight()
+        // A body can open non-empty (the seeded signature); the caret belongs
+        // at the top, above it, not after it where setString parks it.
+        view.setSelectedRange(NSRange(location: 0, length: 0))
 
         let scroll = NSScrollView()
         scroll.documentView = view
@@ -62,6 +65,10 @@ struct MarkdownTextView: NSViewRepresentable {
         if view.string != text {
             view.string = text
             view.rehighlight()
+            // Same rule as mount: an externally landed body (draft restore)
+            // starts reading — and typing — from the top.
+            view.setSelectedRange(NSRange(location: 0, length: 0))
+            view.scrollRangeToVisible(NSRange(location: 0, length: 0))
         }
     }
 

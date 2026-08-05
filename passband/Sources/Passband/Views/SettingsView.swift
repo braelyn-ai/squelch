@@ -26,6 +26,7 @@ struct SettingsView: View {
                             YouSection()
                         case .mail:
                             MailSection()
+                            SignatureSection()
                             ReadTrackingSection()
                         case .triage:
                             TriagePipelineSection()
@@ -410,6 +411,40 @@ private struct MailSection: View {
             }
             SettingsHint(
                 "Tracking pixels are removed either way, and images load with no referrer.")
+        }
+    }
+}
+
+/// The email signature, edited in the same live-markdown view the composers
+/// use, so what it looks like here is what it looks like in a draft. Saved on
+/// every keystroke (UserDefaults) — client-side, like the display name.
+private struct SignatureSection: View {
+    @Environment(Prefs.self) private var prefs
+
+    var body: some View {
+        @Bindable var prefs = prefs
+        SectionCard(label: "Signature") {
+            HStack(spacing: 6) {
+                Text("markdown, like the composer:")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaint)
+                Text("**bold**, *italic*, `code`, [links](url)")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+            }
+            MarkdownTextView(text: $prefs.signature)
+                .frame(height: 110)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Palette.canvas.opacity(0.65))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+            SettingsHint(
+                "Added under new messages and replies as you draft them. It is part of the body, so you can edit or delete it per email. Leave this empty for no signature."
+            )
         }
     }
 }

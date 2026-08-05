@@ -163,9 +163,15 @@ enum Markdown {
                 let double = i + 1 < n && ns.character(at: i + 1) == c
                 let markerLen = double ? 2 : 1
                 if let close = findDelimiter(ns, c, count: markerLen, from: i + markerLen),
-                    close > i + markerLen  // never an EMPTY emphasis (`****`)
+                    close > i + markerLen,  // never an EMPTY emphasis (`****`)
+                    // Underscores only at word boundaries: CommonMark (the wire's
+                    // renderer) refuses intraword `_`, so snake_case must not
+                    // read italic here and then go out literal.
+                    c != Ch.underscore
+                        || ((i == 0 || !isWord(ns.character(at: i - 1)))
+                            && (close + markerLen >= n || !isWord(ns.character(at: close + markerLen))))
                 {
-                    let full = NSRange(location: offset + i, length: close - i + 2 * markerLen)
+                    let full = NSRange(location: offset + i, length: close + markerLen - i)
                     spans.append(.init(range: full, kind: double ? .bold : .italic))
                     spans.append(
                         .init(range: NSRange(location: offset + i, length: markerLen), kind: .marker))
@@ -207,6 +213,13 @@ enum Markdown {
                 i += 1
             }
         }
+    }
+
+    /// Letter or digit, for the underscore word-boundary rule. UTF-16 unit —
+    /// good enough here: every boundary character that matters is BMP.
+    private static func isWord(_ u: UInt16) -> Bool {
+        guard let scalar = Unicode.Scalar(u) else { return false }
+        return CharacterSet.alphanumerics.contains(scalar)
     }
 
     private static func find(_ ns: NSString, _ char: UInt16, from: Int) -> Int? {

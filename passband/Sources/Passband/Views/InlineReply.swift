@@ -259,7 +259,8 @@ struct InlineReply: View {
     /// put a blank reply one keystroke away from going out.
     private func toReview() {
         guard let compose = store.inlineReply else { return }
-        guard !compose.body.trimmed.isEmpty else {
+        // Same seed rule as the pane: an untouched signature is an empty body.
+        guard !Prefs.shared.isBodyUntouched(compose.body) else {
             patch { $0.error = "body is empty" }
             return
         }
