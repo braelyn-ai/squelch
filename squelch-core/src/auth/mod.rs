@@ -718,6 +718,13 @@ fn bind_consent_listener(bind_addr: &str) -> Result<(TcpListener, String)> {
 /// over such remnants; stealing a port with a LIVE listener stays refused (that
 /// would be SO_REUSEPORT), so nothing about who can receive the redirect
 /// changes.
+///
+/// TODO(windows): that refusal holds on Unix only. Windows SO_REUSEADDR allows
+/// binding over a LIVE listener unless it set SO_EXCLUSIVEADDRUSE, so on that
+/// platform this flag is the hijack it refuses elsewhere. The crate compiles
+/// for Windows even though no flow ships there; before one does, gate this
+/// `set_reuse_address` behind `#[cfg(unix)]` (TIME_WAIT does not block a rebind
+/// on Windows, so the flag buys nothing there anyway).
 fn bind_reusable(bind_addr: &str) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Socket, Type};
 
