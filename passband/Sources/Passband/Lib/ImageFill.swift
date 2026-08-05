@@ -62,9 +62,8 @@ enum ImageFill {
             defer { i += 4 }
             let a = Int(px[i + 3])
             if a < 128 { continue }
-            // CGContext hands back PREMULTIPLIED bytes; the canvas this was
-            // ported from hands back straight ones. Undo it, or every pixel
-            // with partial alpha reads darker than it looks.
+            // CGContext hands back PREMULTIPLIED bytes. Undo that, or every
+            // pixel with partial alpha reads darker than it looks.
             let r = straighten(px[i], a)
             let g = straighten(px[i + 1], a)
             let b = straighten(px[i + 2], a)

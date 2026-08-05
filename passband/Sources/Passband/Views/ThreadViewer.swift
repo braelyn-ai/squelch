@@ -685,12 +685,10 @@ struct ThreadViewer: View {
 
 /// ONE container per message, and it is the web frame's own rounded clip.
 ///
-/// What used to be here: a `readerBackground` fill the exact color of the page
-/// beneath it, plus a bordered rounded rect, plus a drop shadow, wrapped around
-/// a frame that already clips itself round — three nested shapes carrying zero
-/// information, on every message, in a surface whose whole job is reading. Now
-/// messages are divided by a hairline and marked by a rule, and the mail is the
-/// only thing with edges.
+/// No fill, no border, no shadow: those are nested shapes carrying zero
+/// information around a frame that already clips itself round, paid on every
+/// message in a surface whose whole job is reading. Messages are divided by a
+/// hairline and marked by a rule, and the mail is the only thing with edges.
 private struct MessageCard: View {
     let message: ClientMessage
     let selected: Bool

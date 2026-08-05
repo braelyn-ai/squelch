@@ -68,18 +68,18 @@ extension View {
     /// Selection + hover for a list row: a tinted fill, ONE view identity, and
     /// no material anywhere.
     ///
-    /// THIS USED TO BE GLASS and it cost twice over. The branch was two view
-    /// identities, so flipping `selected` tore down and rebuilt the row's whole
-    /// subtree — `@State` reset, `.task` re-run, layout rebuilt. And glass on a
-    /// row means a `GlassEffectContainer` around the list to morph it, which
-    /// re-coordinates every descendant whenever ANY of them changes; a hovered
-    /// row changes, so a mouse sweep over a list paid a glass pass per event
-    /// even while nothing in the container was selected. At row size the
-    /// material bought nothing a tint doesn't: it was reading as a coloured
-    /// rectangle already.
+    /// NOT glass and NOT a branch, deliberately, because each costs the row
+    /// twice over. An `if selected` branch is two view identities, so flipping
+    /// `selected` tears down and rebuilds the row's whole subtree — `@State`
+    /// reset, `.task` re-run, layout rebuilt. And glass on a row means a
+    /// `GlassEffectContainer` around the list to morph it, which re-coordinates
+    /// every descendant whenever ANY of them changes; a hovered row changes, so
+    /// a mouse sweep over a list pays a glass pass per event even while nothing
+    /// in the container is selected. At row size the material buys nothing a
+    /// tint doesn't: it reads as a coloured rectangle anyway.
     ///
-    /// One identity also means these alphas interpolate, which the branch could
-    /// never do.
+    /// One identity also means these alphas interpolate, which a branch never
+    /// could.
     func selectionFill(
         _ selected: Bool,
         hovering: Bool = false,

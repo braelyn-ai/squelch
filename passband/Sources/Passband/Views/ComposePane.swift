@@ -7,11 +7,11 @@
 // This is the PANE composer: a right-hand working surface in MainShell's
 // layout, half the window wide — the page beside it shrinks and stays live,
 // because starting an email should not mean losing sight of the inbox that
-// prompted it. No scrim, no blur; Esc closes it like the side panels. Since
-// Wave 5 replies no longer route here — they open the reader's inline composer
-// (InlineReply), which runs the same ceremony against the same `ComposeSubmit`.
-// What is left to this one is the new-message path (`replyToMessageId == nil`),
-// plus the reply shape it still supports for any caller with no thread to open.
+// prompted it. No scrim, no blur; Esc closes it like the side panels. Replies
+// open the reader's inline composer (InlineReply), which runs the same ceremony
+// against the same `ComposeSubmit`; this pane owns the new-message path
+// (`replyToMessageId == nil`), plus the reply shape it still supports for any
+// caller with no thread to open.
 //
 // The body is markdown, styled LIVE with the markers kept visible (see
 // MarkdownTextView); the daemon renders the HTML half of what actually goes
