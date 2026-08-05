@@ -67,7 +67,13 @@ pub struct TriageResult {
 /// [`Stage1Config`]. Called by the sync engine in the same transaction that
 /// stores the (already non-sealed) message.
 pub fn stage1(msg: &NewMessage, is_known_contact: bool, rules: &[SenderRule]) -> Stage1Result {
-    stage1_with_config(msg, is_known_contact, rules, &Stage1Config::default(), Utc::now())
+    stage1_with_config(
+        msg,
+        is_known_contact,
+        rules,
+        &Stage1Config::default(),
+        Utc::now(),
+    )
 }
 
 /// [`stage1`] with an explicit config and `now` (injected for deterministic
@@ -95,8 +101,7 @@ pub fn stage1_with_config(
         // sender must NEVER land CONFIDENT PastDue — that is the scam vector (a
         // stranger screaming "past due" for $2.4M): cap at Deadline, mark
         // not-confident, moderate importance.
-        let surface_ruled = matched_rule
-            .is_some_and(|r| r.disposition == Disposition::Surface);
+        let surface_ruled = matched_rule.is_some_and(|r| r.disposition == Disposition::Surface);
         let trusted = is_known_contact || surface_ruled;
 
         // Sanity dampeners never raise a tier, only shave confidence. An explicit
@@ -151,7 +156,9 @@ pub fn stage1_with_config(
         } else if is_known_contact {
             reason.push_str("; trusted via known contact");
         } else {
-            reason.push_str("; bill-like from unknown sender (capped at Deadline, deferring to Stage-2)");
+            reason.push_str(
+                "; bill-like from unknown sender (capped at Deadline, deferring to Stage-2)",
+            );
         }
         if dampened && absurd_amount {
             reason.push_str("; absurd amount dampener");
@@ -187,8 +194,7 @@ pub fn stage1_with_config(
                  never past_due"
                     .to_string()
             } else {
-                "future-dated bill from untrusted (unknown, unruled) sender -> deadline"
-                    .to_string()
+                "future-dated bill from untrusted (unknown, unruled) sender -> deadline".to_string()
             }
         } else if dampened {
             if hit.past_due {
@@ -342,7 +348,11 @@ pub fn stage1_with_config(
     }
     // Cold sales: only for UNKNOWN senders (known contacts already handled).
     if rules::is_sales(subject, body) {
-        return noise(cfg, subject, "cold-outbound / sales language from unknown sender");
+        return noise(
+            cfg,
+            subject,
+            "cold-outbound / sales language from unknown sender",
+        );
     }
 
     // ---- Rung 6: FALL-THROUGH (the ambiguous middle) --------------------
@@ -375,7 +385,10 @@ fn noise(cfg: &Stage1Config, subject: &str, reason: &str) -> Stage1Result {
         matched_rule: None,
         confident: true,
         field_reasons: FieldReasons {
-            importance: Some(format!("{reason} -> noise importance {}", cfg.noise_importance)),
+            importance: Some(format!(
+                "{reason} -> noise importance {}",
+                cfg.noise_importance
+            )),
             deadline: None,
             tier: Some(format!("{reason} -> noise")),
         },
@@ -466,6 +479,7 @@ mod tests {
             is_sent: false,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         }
     }
 
@@ -547,7 +561,10 @@ mod tests {
         );
         let r = run(&m, true, &[]);
         assert_eq!(r.tier, Tier::PastDue, "known-sender past-due must scream");
-        assert!(r.confident, "known-sender past-due must be final, not Stage-2");
+        assert!(
+            r.confident,
+            "known-sender past-due must be final, not Stage-2"
+        );
         assert_eq!(r.importance, 95);
         let d = r.deadline.unwrap();
         assert!(d.past_due);
@@ -602,12 +619,22 @@ mod tests {
         );
         let rules = vec![rule(11, "*@sfmail.corpnet.com", Disposition::Surface, "")];
         let r = run(&m, false, &rules);
-        assert_eq!(r.tier, Tier::PastDue, "surface-ruled sender screams past-due");
+        assert_eq!(
+            r.tier,
+            Tier::PastDue,
+            "surface-ruled sender screams past-due"
+        );
         assert!(r.confident, "surface-ruled bill is final, not Stage-2");
         assert_eq!(r.importance, 95, "full bill importance for trusted sender");
         // Dampeners are BYPASSED: their notes must NOT appear.
-        assert!(!r.reason.contains("absurd amount"), "absurd dampener bypassed");
-        assert!(!r.reason.contains("screamy/scam"), "scammy dampener bypassed");
+        assert!(
+            !r.reason.contains("absurd amount"),
+            "absurd dampener bypassed"
+        );
+        assert!(
+            !r.reason.contains("screamy/scam"),
+            "scammy dampener bypassed"
+        );
         assert!(r.reason.contains("surface rule"), "names the trust source");
         // The bill rung wins over rung-2 rule tiering, so no matched_rule id here.
         assert_eq!(r.matched_rule, None);
@@ -658,7 +685,12 @@ mod tests {
             "Invoice past due",
             "Your invoice for $120.00 is past due.",
         );
-        let rules = vec![rule(13, "billing@myvendor.example", Disposition::Surface, "")];
+        let rules = vec![rule(
+            13,
+            "billing@myvendor.example",
+            Disposition::Surface,
+            "",
+        )];
         let r = run(&m, false, &rules);
         assert_eq!(r.tier, Tier::PastDue);
         assert!(r.confident);
@@ -884,10 +916,19 @@ mod tests {
         assert_eq!(r.tier, Tier::PastDue);
         let fr = &r.field_reasons;
         let dl = fr.deadline.as_deref().expect("deadline reason present");
-        assert!(dl.contains("past_due=true"), "deadline reason states past-due: {dl}");
-        assert!(dl.contains("bill signal"), "deadline reason names the matched signal: {dl}");
+        assert!(
+            dl.contains("past_due=true"),
+            "deadline reason states past-due: {dl}"
+        );
+        assert!(
+            dl.contains("bill signal"),
+            "deadline reason names the matched signal: {dl}"
+        );
         let tier = fr.tier.as_deref().unwrap();
-        assert!(tier.contains("past_due"), "tier reason states the stored tier: {tier}");
+        assert!(
+            tier.contains("past_due"),
+            "tier reason states the stored tier: {tier}"
+        );
         let imp = fr.importance.as_deref().unwrap();
         assert!(imp.contains("trusted bill"), "importance reason: {imp}");
     }
@@ -905,7 +946,10 @@ mod tests {
         assert_eq!(r.tier, Tier::Deadline);
         let tier = r.field_reasons.tier.as_deref().unwrap();
         assert!(tier.contains("capped at deadline"), "tier reason: {tier}");
-        assert!(!tier.contains("-> past_due"), "must not derive a discarded past_due: {tier}");
+        assert!(
+            !tier.contains("-> past_due"),
+            "must not derive a discarded past_due: {tier}"
+        );
     }
 
     #[test]

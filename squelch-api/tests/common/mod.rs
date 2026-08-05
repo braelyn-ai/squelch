@@ -66,7 +66,8 @@ pub fn json_request(method: &str, uri: &str, body: &Value, bearer: bool) -> Requ
     if bearer {
         b = b.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
     }
-    b.body(Body::from(serde_json::to_vec(body).unwrap())).unwrap()
+    b.body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
 }
 
 /// The authed form of [`json_request`].
@@ -99,5 +100,6 @@ pub fn msg(account_id: i64, gmail: &str, thread: &str, subject: &str, body: &str
         is_sent: false,
         list_unsubscribe: None,
         list_unsub_one_click: false,
+        auth_pass: None,
     }
 }

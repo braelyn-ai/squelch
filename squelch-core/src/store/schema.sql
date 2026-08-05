@@ -32,6 +32,17 @@ CREATE TABLE IF NOT EXISTS messages (
     -- 1 when the mail advertised RFC 8058 one-click unsubscribe
     -- (`List-Unsubscribe-Post: List-Unsubscribe=One-Click`).
     list_unsub_one_click INTEGER NOT NULL DEFAULT 0,
+    -- EMAIL-AUTHENTICATION VERDICT, read at ingest from the TOPMOST
+    -- `Authentication-Results` header (the one Gmail itself wrote): 1 = DMARC
+    -- passed or an aligned DKIM signature did, 0 = Gmail evaluated it and
+    -- neither held, NULL = never evaluated (no Gmail header, or the row was
+    -- ingested before this column existed).
+    --
+    -- NULL MUST READ AS "NO". Its only consumer is the human door's PERMISSIVE
+    -- known-sender tracking-pixel bypass, so absence of proof withholds the
+    -- bypass rather than granting it. Nothing is backfilled: any re-sync refills
+    -- the column through the message upsert.
+    auth_pass   INTEGER,
     UNIQUE(account_id, gmail_msg_id)
 );
 

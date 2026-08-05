@@ -79,6 +79,8 @@ mod tests {
             auth_token,
             apns_url_override: None,
             db_path: None,
+            trusted_proxy_hops: 0,
+            trusted_proxy_cidrs: None,
         })
         .unwrap();
         Router::new()

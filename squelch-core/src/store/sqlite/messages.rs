@@ -1,11 +1,11 @@
 //! Message ingest, thread views, attachments, deadlines, sync cursors
 //! and the sealed-mail reads.
 
-use super::*;
 use super::specialists::{
     auto_close_bill_for_receipt_conn, upsert_calendar_conn, upsert_receipt_conn,
     upsert_shipment_conn,
 };
+use super::*;
 
 /// Apply the unsubscribe VIOLATION bump for a just-stored inbound message, in
 /// the caller's transaction: an unresolved `unsubscribes` row for
@@ -63,8 +63,8 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
              subject, received_at, snippet, body, body_html, is_sent,
-             list_unsubscribe, list_unsub_one_click)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             list_unsubscribe, list_unsub_one_click, auth_pass)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
          ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
              thread_id=excluded.thread_id, from_addr=excluded.from_addr,
              from_name=excluded.from_name, subject=excluded.subject,
@@ -72,7 +72,8 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
              body=excluded.body, body_html=excluded.body_html,
              is_sent=MIN(messages.is_sent, excluded.is_sent),
              list_unsubscribe=excluded.list_unsubscribe,
-             list_unsub_one_click=excluded.list_unsub_one_click",
+             list_unsub_one_click=excluded.list_unsub_one_click,
+             auth_pass=excluded.auth_pass",
         params![
             msg.account_id,
             msg.gmail_msg_id,
@@ -87,6 +88,7 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.is_sent as i64,
             msg.list_unsubscribe,
             msg.list_unsub_one_click as i64,
+            msg.auth_pass.map(|p| p as i64),
         ],
     )?;
     let id: i64 = conn.query_row(
@@ -209,7 +211,10 @@ pub(super) fn rewrite_deadline_conn(
     message_id: i64,
     deadline: Option<&crate::triage::DeadlineHit>,
 ) -> Result<()> {
-    conn.execute("DELETE FROM deadlines WHERE message_id=?1", params![message_id])?;
+    conn.execute(
+        "DELETE FROM deadlines WHERE message_id=?1",
+        params![message_id],
+    )?;
     if let Some(d) = deadline {
         conn.execute(
             "INSERT INTO deadlines(account_id, message_id, kind, amount, currency,
@@ -335,7 +340,7 @@ impl SqliteStore {
         // just unhighlighted.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id=?1 AND m.thread_id=?2
@@ -353,14 +358,14 @@ impl SqliteStore {
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
-                    tier: r.get::<_, Option<String>>(6)?.as_deref().and_then(Tier::parse),
+                    tier: r
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(Tier::parse),
                     deadline: dt_opt(r, 7)?,
-                    attention_open: r
-                        .get::<_, Option<String>>(8)?
-                        .map(|s| s != "done"),
-                    one_line: r
-                        .get::<_, Option<String>>(9)?
-                        .filter(|s| !s.is_empty()),
+                    attention_open: r.get::<_, Option<String>>(8)?.map(|s| s != "done"),
+                    one_line: r.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
+                    auth_pass: r.get::<_, Option<bool>>(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -421,8 +426,8 @@ impl SqliteStore {
         let conn = self.lock()?;
         // SECURITY: exclude deadlines whose source message is sealed.
         // within_days = None means "all".
-        let cutoff = within_days
-            .map(|d| (Utc::now() + chrono::Duration::days(d as i64)).to_rfc3339());
+        let cutoff =
+            within_days.map(|d| (Utc::now() + chrono::Duration::days(d as i64)).to_rfc3339());
         let cutoff_ref: &dyn rusqlite::ToSql = match &cutoff {
             Some(s) => s,
             None => &"9999-12-31T23:59:59+00:00",
@@ -684,7 +689,11 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
-    pub(super) fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>> {
+    pub(super) fn sync_state(
+        &self,
+        account_id: AccountId,
+        mailbox: &str,
+    ) -> Result<Option<SyncState>> {
         let conn = self.lock()?;
         let row = conn
             .query_row(

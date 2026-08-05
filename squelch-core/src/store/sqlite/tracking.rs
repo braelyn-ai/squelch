@@ -10,6 +10,12 @@ use super::*;
 /// bound resets at every drain, so it does not bound what accumulates here.
 pub const MAX_OPENS_PER_TOKEN: usize = 50;
 
+/// How long after its send a tracker keeps collecting. A pixel URL lives in the
+/// recipient's mailbox for as long as the mail does, so without a window a
+/// years-old thread is still writing rows — and an open that far from the send
+/// says nothing about the send anyway.
+pub const TRACKER_RETENTION_SECS: i64 = 180 * 24 * 60 * 60;
+
 /// One `message_opens` row, columns in SELECT order.
 fn map_open(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageOpen> {
     Ok(MessageOpen {
@@ -51,6 +57,29 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
+    /// Drop a tracker and anything recorded against it. Used by the send path
+    /// when the mail never reached the wire, so the token stays out of
+    /// `send_trackers` rather than sitting there forever with a NULL
+    /// `message_id`.
+    pub fn delete_send_tracker(&self, account_id: AccountId, token: &str) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        // `message_opens` carries no account of its own, so the tracker row is
+        // what scopes this delete; it has to go second.
+        tx.execute(
+            "DELETE FROM message_opens WHERE token = ?1
+             AND EXISTS (SELECT 1 FROM send_trackers
+                         WHERE token = ?1 AND account_id = ?2)",
+            params![token, account_id],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM send_trackers WHERE token = ?1 AND account_id = ?2",
+            params![token, account_id],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
     pub(super) fn record_open(
         &self,
         account_id: AccountId,
@@ -60,18 +89,25 @@ impl SqliteStore {
         classification: &str,
     ) -> Result<bool> {
         let conn = self.lock()?;
-        // Two guards in one statement, so neither can interleave with a
+        // Three guards in one statement, so none can interleave with a
         // concurrent open of the same token. The tracker SELECT means an unknown
         // token inserts zero rows — the pixel route's answer is identical either
-        // way and unsolicited traffic never grows the table. The count means a
-        // token that IS ours is still not an unbounded write channel: anyone
-        // holding a live pixel URL (the recipient, a forward, a scanner) can
-        // refetch it forever, and past MAX_OPENS_PER_TOKEN there is no signal
-        // left to record.
+        // way and unsolicited traffic never grows the table. The age check
+        // retires a token the send has long outlived. The count means a token
+        // that IS ours is still not an unbounded write channel: anyone holding a
+        // live pixel URL (the recipient, a forward, a scanner) can refetch it
+        // forever, and past MAX_OPENS_PER_TOKEN there is no signal left to
+        // record.
+        //
+        // The window is measured against `opened_at`, which every caller takes
+        // from a server clock — the daemon's own for the direct pixel, the
+        // relay's for a drained row — so a slow drain expires by when the open
+        // happened, not by when it arrived.
         let n = conn.execute(
             "INSERT INTO message_opens(token, opened_at, user_agent, classification)
              SELECT ?1, ?3, ?4, ?5 FROM send_trackers
              WHERE token = ?1 AND account_id = ?2
+               AND ?3 - created_at < ?7
                AND (SELECT count(*) FROM message_opens WHERE token = ?1) < ?6",
             params![
                 token,
@@ -79,7 +115,8 @@ impl SqliteStore {
                 opened_at,
                 user_agent,
                 classification,
-                MAX_OPENS_PER_TOKEN as i64
+                MAX_OPENS_PER_TOKEN as i64,
+                TRACKER_RETENTION_SECS
             ],
         )?;
         Ok(n > 0)

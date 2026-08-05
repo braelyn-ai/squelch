@@ -250,6 +250,11 @@ pub struct ClientMessage {
     /// The stage-1 one-line summary — the highlight's tooltip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_line: Option<String>,
+    /// The stored `messages.auth_pass` (see [`NewMessage::auth_pass`]). NOT on
+    /// the wire: it exists so `get_thread` can gate the read-time `sender_known`
+    /// bit on it, and the client already receives that derived answer.
+    #[serde(default, skip_serializing)]
+    pub auth_pass: Option<bool>,
 }
 
 /// One attachment's metadata on the HUMAN DOOR. Carries NO bytes.
@@ -518,6 +523,13 @@ pub struct NewMessage {
     /// `true` when the mail advertised RFC 8058 one-click unsubscribe
     /// (`List-Unsubscribe-Post: List-Unsubscribe=One-Click`).
     pub list_unsub_one_click: bool,
+    /// Email-authentication verdict read at ingest from the TOPMOST
+    /// `Authentication-Results` header Gmail itself wrote: `Some(true)` when
+    /// DMARC passed or an aligned DKIM signature did, `Some(false)` when Gmail
+    /// evaluated it and neither held, `None` when nothing trustworthy was there
+    /// to evaluate. `None` is NEVER an assertion of pass — see
+    /// `sync::ingest::extract_auth_pass`.
+    pub auth_pass: Option<bool>,
 }
 
 /// One attachment extracted from a message's RFC822 at ingest — BOTH real
@@ -668,7 +680,10 @@ mod tests {
         };
         let v = serde_json::to_value(&tv).unwrap();
         let msg = &v["messages"][0];
-        assert!(msg.get("html").is_none(), "MCP thread view must not carry html");
+        assert!(
+            msg.get("html").is_none(),
+            "MCP thread view must not carry html"
+        );
         assert!(
             msg.get("attachments").is_none(),
             "MCP thread view must not carry attachments"
@@ -701,6 +716,7 @@ mod tests {
                     deadline: None,
                     attention_open: Some(true),
                     one_line: Some("bill is 12 days past due".into()),
+                    auth_pass: Some(true),
                 },
                 ClientMessage {
                     id: 2,
@@ -714,6 +730,7 @@ mod tests {
                     deadline: None,
                     attention_open: None,
                     one_line: None,
+                    auth_pass: None,
                 },
             ],
         };
@@ -722,15 +739,27 @@ mod tests {
         // Absent html serializes as JSON null (the client falls back to text).
         assert_eq!(v["messages"][1]["html"], serde_json::Value::Null);
         // Attachments always present; [] when none.
-        assert_eq!(v["messages"][0]["attachments"][0]["filename"], serde_json::json!("doc.pdf"));
-        assert_eq!(v["messages"][0]["attachments"][0]["downloadable"], serde_json::json!(true));
+        assert_eq!(
+            v["messages"][0]["attachments"][0]["filename"],
+            serde_json::json!("doc.pdf")
+        );
+        assert_eq!(
+            v["messages"][0]["attachments"][0]["downloadable"],
+            serde_json::json!(true)
+        );
         assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
         // Triage highlight fields: present when set, structurally ABSENT when
         // None (not null) — an old client's strict decoder never sees the keys.
         assert_eq!(v["messages"][0]["tier"], serde_json::json!("past_due"));
         assert_eq!(v["messages"][0]["attention_open"], serde_json::json!(true));
-        assert!(v["messages"][1].get("tier").is_none(), "None tier must not serialize");
+        assert!(
+            v["messages"][1].get("tier").is_none(),
+            "None tier must not serialize"
+        );
         assert!(v["messages"][1].get("attention_open").is_none());
+        // auth_pass is an internal gate for the human door's `sender_known`
+        // bit, never a wire field, even when it holds a verdict.
+        assert!(v["messages"][0].get("auth_pass").is_none());
     }
 
     fn base_update() -> Update {
@@ -756,7 +785,10 @@ mod tests {
     #[test]
     fn update_without_from_name_omits_the_key() {
         let v = serde_json::to_value(base_update()).unwrap();
-        assert!(v.get("from_name").is_none(), "None from_name must not serialize");
+        assert!(
+            v.get("from_name").is_none(),
+            "None from_name must not serialize"
+        );
 
         let named = Update {
             from_name: Some("Dollar Car Rental".into()),
@@ -788,9 +820,15 @@ mod tests {
         });
         let v = serde_json::to_value(&u).unwrap();
         let fr = &v["field_reasons"];
-        assert_eq!(fr["importance"], serde_json::json!("known contact + appears in Sent mail"));
+        assert_eq!(
+            fr["importance"],
+            serde_json::json!("known contact + appears in Sent mail")
+        );
         assert_eq!(fr["tier"], serde_json::json!("known contact -> signal"));
-        assert!(fr.get("deadline").is_none(), "absent deadline reason must be omitted, not null");
+        assert!(
+            fr.get("deadline").is_none(),
+            "absent deadline reason must be omitted, not null"
+        );
 
         // Round-trips back through Deserialize.
         let again: Update = serde_json::from_value(v).unwrap();

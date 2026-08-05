@@ -18,7 +18,7 @@ use chrono::{Duration, Utc};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 
@@ -269,6 +269,7 @@ fn seed_fake_data(store: &SqliteStore, account: AccountId) -> Result<()> {
             is_sent: false,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         })?;
         store.set_triage(
             id,

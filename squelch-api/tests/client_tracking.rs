@@ -18,15 +18,35 @@ use common::{Harness, authed, authed_json, body_json, harness, msg};
 const KNOWN: &str = "Ab3xQz7-_KnownTokenFixture000001";
 
 /// A stored sent message plus the tracker minted for it — the state a tracked
-/// send leaves behind once its echo has landed.
+/// send leaves behind once its echo has landed. `created_at` is the real clock
+/// because the pixel route stamps opens with the real clock, and a tracker only
+/// collects inside its retention window.
 fn tracked_send(store: &SqliteStore, acct: i64, token: &str) -> i64 {
     let id = store
-        .upsert_message(&msg(acct, "sent-1", "thread-77", "Re: Lunch?", "noon works"))
+        .upsert_message(&msg(
+            acct,
+            "sent-1",
+            "thread-77",
+            "Re: Lunch?",
+            "noon works",
+        ))
         .unwrap();
     store
-        .set_triage(id, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            id,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
-    store.insert_send_tracker(acct, token, Some(id), 1_000).unwrap();
+    store
+        .insert_send_tracker(acct, token, Some(id), chrono::Utc::now().timestamp())
+        .unwrap();
     id
 }
 
@@ -41,7 +61,12 @@ fn pixel_request(token: &str, user_agent: Option<&str>) -> Request<Body> {
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    resp.into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -58,8 +83,14 @@ async fn the_pixel_is_unauthenticated_and_records_a_known_token() {
     // No bearer was presented and it still served.
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/gif");
-    let cache = resp.headers()[header::CACHE_CONTROL].to_str().unwrap().to_string();
-    assert!(cache.contains("no-store"), "an intermediary caching this eats every later open");
+    let cache = resp.headers()[header::CACHE_CONTROL]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        cache.contains("no-store"),
+        "an intermediary caching this eats every later open"
+    );
     let gif = body_bytes(resp).await;
     assert_eq!(gif.len(), 43);
     assert!(gif.starts_with(b"GIF89a"));
@@ -81,17 +112,38 @@ async fn an_unknown_token_is_never_a_404_and_records_nothing() {
     });
     let message_id = store.search(acct, "noon", 10, 0).unwrap()[0].id;
 
-    let known = app.clone().oneshot(pixel_request(KNOWN, None)).await.unwrap();
+    let known = app
+        .clone()
+        .oneshot(pixel_request(KNOWN, None))
+        .await
+        .unwrap();
     let known_status = known.status();
     let known_headers = known.headers().clone();
     let known_body = body_bytes(known).await;
 
-    for token in ["nope000000000000000000000000000", "", "%2e%2e%2f", "tok-known-DIFFERENT-000000000000", &"z".repeat(4096)] {
-        let resp = app.clone().oneshot(pixel_request(token, None)).await.unwrap();
+    for token in [
+        "nope000000000000000000000000000",
+        "",
+        "%2e%2e%2f",
+        "tok-known-DIFFERENT-000000000000",
+        &"z".repeat(4096),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(pixel_request(token, None))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), known_status, "status leaked for {token:?}");
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()[header::CONTENT_TYPE], known_headers[header::CONTENT_TYPE]);
-        assert_eq!(body_bytes(resp).await, known_body, "body leaked for {token:?}");
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            known_headers[header::CONTENT_TYPE]
+        );
+        assert_eq!(
+            body_bytes(resp).await,
+            known_body,
+            "body leaked for {token:?}"
+        );
     }
 
     // Only the one real fetch was recorded.
@@ -122,8 +174,12 @@ async fn the_google_image_proxy_is_recorded_as_proxied() {
 async fn opens_endpoint_is_bearer_gated_and_ordered_oldest_first() {
     let Harness { app, store, acct } = harness(|store, acct| {
         let id = tracked_send(store, acct, KNOWN);
-        store.record_open(acct, KNOWN, 2_000, Some("Apple Mail/16.0"), "unknown").unwrap();
-        store.record_open(acct, KNOWN, 1_000, None, "proxied").unwrap();
+        store
+            .record_open(acct, KNOWN, 2_000, Some("Apple Mail/16.0"), "unknown")
+            .unwrap();
+        store
+            .record_open(acct, KNOWN, 1_000, None, "proxied")
+            .unwrap();
         assert!(id > 0);
     });
     let message_id = store.search(acct, "noon", 10, 0).unwrap()[0].id;
@@ -181,7 +237,10 @@ async fn tracking_config_defaults_off_and_reports_unconfigured() {
     assert_eq!(body_json(resp).await["default_enabled"], true);
 
     // It persists across requests.
-    let resp = app.oneshot(authed("GET", "/client/tracking-config")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/tracking-config"))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["default_enabled"], true);
 }
 
@@ -226,13 +285,21 @@ async fn tokens_that_cannot_be_ours_never_reach_the_store() {
     let message_id = store.search(acct, "noon", 10, 0).unwrap()[0].id;
 
     for token in [
-        "short",         // under the minimum
-        &"a".repeat(65),  // over the maximum
+        "short",                         // under the minimum
+        &"a".repeat(65),                 // over the maximum
         "tok.with.dots.000000000000000", // not url-safe base64
         "tok+with+plus+0000000000000000",
     ] {
-        let resp = app.clone().oneshot(pixel_request(token, None)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "still an image for {token:?}");
+        let resp = app
+            .clone()
+            .oneshot(pixel_request(token, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "still an image for {token:?}"
+        );
         assert_eq!(body_bytes(resp).await.len(), 43);
     }
 
@@ -247,6 +314,9 @@ async fn a_base_url_without_a_scheme_leaves_tracking_unconfigured() {
     let (state, _store, _acct) = common::state_with(|_, _| {});
     let app = router(state.with_tracking_base_url(Some("track.example.test".to_string())));
 
-    let resp = app.oneshot(authed("GET", "/client/tracking-config")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/tracking-config"))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["configured"], false);
 }

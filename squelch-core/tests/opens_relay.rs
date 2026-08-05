@@ -114,12 +114,25 @@ fn seeded() -> (Arc<SqliteStore>, i64, i64) {
             is_sent: true,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         })
         .unwrap();
     store
-        .set_triage(message_id, acct, 0, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            message_id,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
-    store.insert_send_tracker(acct, "tok-1", Some(message_id), 1_000).unwrap();
+    store
+        .insert_send_tracker(acct, "tok-1", Some(message_id), 1_000)
+        .unwrap();
     (store, acct, message_id)
 }
 
@@ -133,15 +146,15 @@ fn cursor(store: &SqliteStore, acct: i64) -> Option<i64> {
 /// Spawn the poller, wait for `want` to hold, then stop it. Fails the test if
 /// the poller does not reach the state within a few seconds or does not stop on
 /// the shutdown signal.
-async fn run_until(
-    poller: OpensPoller,
-    want: impl Fn() -> bool,
-) {
+async fn run_until(poller: OpensPoller, want: impl Fn() -> bool) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handle = tokio::spawn(async move { poller.run(shutdown_rx).await });
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !want() {
-        assert!(std::time::Instant::now() < deadline, "the poller never reached the expected state");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the poller never reached the expected state"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let _ = shutdown_tx.send(true);
@@ -160,7 +173,12 @@ async fn opens_are_collected_classified_and_notified_once_per_message() {
     let (store, acct, message_id) = seeded();
     *relay.rows.lock().unwrap() = vec![
         row(1, "tok-1", 1_100, "Apple Mail/16.0"),
-        row(2, "tok-1", 1_200, "Mozilla/5.0 (via ggpht.com GoogleImageProxy)"),
+        row(
+            2,
+            "tok-1",
+            1_200,
+            "Mozilla/5.0 (via ggpht.com GoogleImageProxy)",
+        ),
         // A token this daemon never minted: collected, recorded nowhere.
         row(3, "tok-stranger", 1_300, "curl/8"),
     ];
@@ -186,7 +204,10 @@ async fn opens_are_collected_classified_and_notified_once_per_message() {
     // The bearer went to the relay on every request, and the first poll started
     // at zero rather than skipping the backlog.
     let auth = relay.auth.lock().unwrap().clone();
-    assert!(auth.iter().all(|a| a.as_deref() == Some("Bearer relay-secret")));
+    assert!(
+        auth.iter()
+            .all(|a| a.as_deref() == Some("Bearer relay-secret"))
+    );
     assert_eq!(relay.cursors.lock().unwrap()[0], 0);
 }
 
@@ -265,7 +286,9 @@ async fn an_unlinked_tracker_records_the_open_without_an_event() {
     let (base, relay) = spawn_relay().await;
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let acct = store.ensure_account("me@example.com").unwrap();
-    store.insert_send_tracker(acct, "tok-unlinked", None, 1_000).unwrap();
+    store
+        .insert_send_tracker(acct, "tok-unlinked", None, 1_000)
+        .unwrap();
     *relay.rows.lock().unwrap() = vec![row(1, "tok-unlinked", 1_100, "Apple Mail/16.0")];
 
     let poller = OpensPoller::for_test(store.clone() as Arc<dyn Store>, acct, &base);
@@ -289,8 +312,13 @@ async fn an_unlinked_tracker_records_the_open_without_an_event() {
             is_sent: true,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         })
         .unwrap();
-    assert!(store.set_send_tracker_message(acct, "tok-unlinked", message_id).unwrap());
+    assert!(
+        store
+            .set_send_tracker_message(acct, "tok-unlinked", message_id)
+            .unwrap()
+    );
     assert_eq!(store.message_opens(acct, message_id).unwrap().len(), 1);
 }

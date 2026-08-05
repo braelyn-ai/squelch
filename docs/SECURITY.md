@@ -97,8 +97,10 @@ refuses it before the handler is reached).
   **No reserialization**: every non-`<img>` byte survives verbatim, because a DOM
   round-trip would rewrite markup ammonia already vetted.
 - **The strip is CONDITIONAL as of 2026-08-04.** `GET /client/thread/{id}` carries
-  a per-message `sender_known`, true iff `Store::is_known_contact` — a `contacts`
-  row with `sent_count > 0`, the same predicate Stage-1 uses. When it is true
+  a per-message `sender_known`, true iff BOTH halves hold: the sender is a
+  Sent-derived contact (`Store::is_known_contact` — a `contacts` row with
+  `sent_count > 0`, the same predicate Stage-1 uses) AND the message's stored
+  email-authentication verdict is a pass. When it is true
   `EmailWebView.Prepared.make` renders the unstripped body: someone the user
   writes to is allowed to learn they opened the mail. The bypass is scoped to
   `Trackers.strip` ALONE — `ImageProxy.rewrite`, the `squelch-img:` CSP, the
@@ -106,10 +108,45 @@ refuses it before the handler is reached).
   pixel still needs remote images on before it fetches. `allowTrackers` is part of
   `Prepared.cacheKey`, and `ImageWarmer` always prefetches the STRIPPED body so
   warming can never report an open the reader never made.
-  **Known limitation:** `sender_known` trusts the `From` header with no DKIM or
-  DMARC check, so a sender who knows one of the user's correspondents can spoof
-  their way past the strip (issue #10). The exposure is mostly the badge lending
-  false trust: with remote images on, any full-size image already leaks the open.
+- **The auth half of the gate** (closes issue #10 — the `From` header alone is
+  free text, so the contact half by itself let anyone who knows one of the user's
+  correspondents spoof their way past the strip).
+  `squelch-core/src/sync/ingest.rs:extract_auth_pass` computes the verdict once at
+  ingest into `messages.auth_pass`;
+  `squelch-api/src/handlers.rs:get_thread` ANDs it into `sender_known`. Gated
+  there and not inside `is_known_contact`, because that call also feeds triage's
+  known-contact importance floor, which must not move.
+  The verdict is read from the **TOPMOST** `Authentication-Results` header: Gmail
+  PREPENDS its own and does not strip copies the sender wrote, so every occurrence
+  below the first is attacker-controlled text. It counts only when the authserv-id
+  is `mx.google.com`, a Google-written header (`X-Google-Smtp-Source`, or a
+  `Received` handed off `by mx.google.com`) sits ABOVE it, and the POP marker
+  `X-Gmail-Fetch-Info` is absent. Every `pass` must bind to the RFC 5322 From
+  domain — `dmarc=pass` via an aligned `header.from=`, `dkim=pass` via an aligned
+  signing domain. Two `From` headers yield no verdict at all.
+  **NULL DENIES THE BYPASS.** Only `Some(true)` is a pass. `Some(false)` is "Gmail
+  evaluated it and neither method held"; `NULL` is "never evaluated" — no Gmail
+  header, an undecodable one, two `From` headers, or a row ingested before the
+  column existed. Absence of proof withholds a permissive feature.
+  **Nothing is backfilled.** `store/sqlite/migrate.rs` adds the column to an
+  existing `messages` table with every historical row left NULL; a re-sync refills
+  it through the message upsert.
+  **Residual risks, accepted:**
+  - The evidence is header SHAPE, not a signature — nothing in the bytes is
+    cryptographically bound to Google. On an ingestion path where Gmail prepends
+    nothing (POP with the marker somehow absent, or `users.messages.import`/
+    `insert` performed with the user's own credentials) a sender who writes both a
+    fake `Received: … by mx.google.com` and a fake verdict still gets through.
+    Closing it needs the Gmail API's own delivery metadata, which this parser
+    cannot see.
+  - **No public-suffix list.** Alignment is equality or a dot-suffixed child of
+    the signing domain, so a signature by a registry suffix such as `co.uk` would
+    align with `victim.co.uk`. Not attacker-reachable — it needs a DKIM key for
+    the suffix itself.
+  - `header.i=` alone is accepted when `header.d=` is absent (the form Gmail
+    usually emits), which DELEGATES the binding to Gmail enforcing RFC 6376 §3.5:
+    an `i=` domain must be `d=` or a subdomain of it. When both are present that
+    relationship is checked here instead of assumed.
 - `Lib/ImageProxy.swift:rewrite` rewrites every http(s) image reference — `<img
   src>`, `style="…"` `url()`, `<style>` block CSS — to
   `squelch-img://local/<hmac>?u=<encoded>`. `@import`/`@font-face` are skipped on
@@ -137,6 +174,15 @@ refuses it before the handler is reached).
   CSS-background gap `html.rs` used to document as a KNOWN TRADE-OFF.
 - Keep the signature check: without it a hand-written `url(squelch-img://…)` in a
   kept `<style>` fetches a tracker while the UI says the mail has no remote content.
+- `auth_pass` is three-valued and the comparison must stay `== Some(true)`. Any
+  rewrite that treats NULL as a pass — `!= Some(false)`, `unwrap_or(true)`, a
+  `NOT NULL DEFAULT 1` column, a backfill "so old mail isn't penalised" — silently
+  grants the bypass to every row that predates the column and to every message on
+  an ingestion path Gmail never stamped.
+- Read the verdict from the FIRST `Authentication-Results` header, never the last.
+  `Message::header_raw` resolves to the LAST occurrence — the forgeable one — and
+  `headers_raw()` DROPS non-UTF-8 headers, which would let an attacker hide the
+  genuine verdict and promote one they wrote.
 - **Stale comment, flagged:** `Lib/Trackers.swift`'s header still calls the CSP
   `img-src http:/https:/data:` — that predates `ImageProxy`; the live policy is
   `squelch-img: data:`. Its argument still holds (a host-agnostic CSP cannot tell

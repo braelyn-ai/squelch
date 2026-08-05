@@ -67,6 +67,7 @@ pub(super) fn triaged(account_id: AccountId, gmail: &str, thread: &str) -> Triag
             is_sent: false,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         },
         sensitivity: Sensitivity::Normal,
         sealed_kind: None,
@@ -118,6 +119,10 @@ impl TriagedBuilder {
     pub(super) fn list_unsubscribe(mut self, header: &str, one_click: bool) -> Self {
         self.msg.list_unsubscribe = Some(header.to_string());
         self.msg.list_unsub_one_click = one_click;
+        self
+    }
+    pub(super) fn auth_pass(mut self, auth_pass: Option<bool>) -> Self {
+        self.msg.auth_pass = auth_pass;
         self
     }
 
@@ -306,7 +311,10 @@ pub(super) fn apply_category(
         .unwrap();
 }
 
-pub(super) fn triage_extract_status(store: &SqliteStore, message_id: i64) -> (String, Option<String>, Option<String>) {
+pub(super) fn triage_extract_status(
+    store: &SqliteStore,
+    message_id: i64,
+) -> (String, Option<String>, Option<String>) {
     let conn = store.lock().unwrap();
     conn.query_row(
         "SELECT status, resolved_at, extractor_model_used FROM triage WHERE message_id=?1",
@@ -390,7 +398,11 @@ pub(super) fn receipt_from(
 }
 
 /// Read (status, resolved_at) straight off a triage row.
-pub(super) fn triage_status(store: &SqliteStore, acct: AccountId, id: i64) -> (String, Option<String>) {
+pub(super) fn triage_status(
+    store: &SqliteStore,
+    acct: AccountId,
+    id: i64,
+) -> (String, Option<String>) {
     let conn = store.lock().unwrap();
     conn.query_row(
         "SELECT status, resolved_at FROM triage WHERE account_id=?1 AND message_id=?2",
@@ -503,9 +515,7 @@ pub(super) fn embed_and_store(
 ) {
     let text = message_embed_text(subject, body, 2000);
     let v = embedder.embed(&text).unwrap();
-    store
-        .upsert_message_vector(acct, message_id, &v)
-        .unwrap();
+    store.upsert_message_vector(acct, message_id, &v).unwrap();
 }
 
 /// Count vectors present for a given message id (0 or 1). Used to assert a

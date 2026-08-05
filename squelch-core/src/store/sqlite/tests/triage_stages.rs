@@ -11,40 +11,25 @@ fn extract_queue_selects_banking_only_excludes_others_sealed_and_receipts() {
     let (store, acct) = store();
 
     // banking_statement + transaction_alert -> queued.
-    let stmt = triaged_row(
-        acct, "g-stmt", "t1", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let stmt = triaged_row(acct, "g-stmt", "t1", None, false, Sensitivity::Normal).ingest(&store);
     apply_category(&store, acct, stmt, "banking_statement", false);
-    let alert = triaged_row(
-        acct, "g-alert", "t2", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let alert = triaged_row(acct, "g-alert", "t2", None, false, Sensitivity::Normal).ingest(&store);
     apply_category(&store, acct, alert, "transaction_alert", false);
 
     // invoice + general -> NOT queued (no extractor).
     let inv = triaged_row(acct, "g-inv", "t3", None, false, Sensitivity::Normal)
         .category("invoice")
         .ingest(&store);
-    let genr = triaged_row(
-        acct, "g-gen", "t4", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let genr = triaged_row(acct, "g-gen", "t4", None, false, Sensitivity::Normal).ingest(&store);
     apply_category(&store, acct, genr, "general", false);
 
     // A sealed row: category stays NULL (stage1_apply is guarded), excluded.
-    let sealed = triaged_row(
-        acct, "g-seal", "t5", None, false, Sensitivity::Sealed,
-    )
-    .ingest(&store);
+    let sealed = triaged_row(acct, "g-seal", "t5", None, false, Sensitivity::Sealed).ingest(&store);
     apply_category(&store, acct, sealed, "banking_statement", false); // no-op on sealed
 
     // A banking-categorized message that ALSO produced a receipt: excluded
     // (a receipt and a banking row must never double-create).
-    let dual = triaged_row(
-        acct, "g-dual", "t6", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let dual = triaged_row(acct, "g-dual", "t6", None, false, Sensitivity::Normal).ingest(&store);
     apply_category(&store, acct, dual, "banking_statement", false);
     store
         .upsert_receipt(
@@ -52,7 +37,10 @@ fn extract_queue_selects_banking_only_excludes_others_sealed_and_receipts() {
             dual,
             "orders@shop.com",
             None,
-            &crate::triage::ReceiptInfo { amount: Some(5.0), currency: Some("USD".into()) },
+            &crate::triage::ReceiptInfo {
+                amount: Some(5.0),
+                currency: Some("USD".into()),
+            },
             Utc::now(),
         )
         .unwrap();
@@ -60,7 +48,11 @@ fn extract_queue_selects_banking_only_excludes_others_sealed_and_receipts() {
     let cats = ["banking_statement", "transaction_alert"];
     let q = store.extract_queue(acct, &cats, 20).unwrap();
     let ids: Vec<i64> = q.iter().map(|r| r.message_id).collect();
-    assert_eq!(q.len(), 2, "only the two banking rows without a receipt: {ids:?}");
+    assert_eq!(
+        q.len(),
+        2,
+        "only the two banking rows without a receipt: {ids:?}"
+    );
     assert!(ids.contains(&stmt));
     assert!(ids.contains(&alert));
     assert!(!ids.contains(&inv), "invoice has no extractor");
@@ -97,10 +89,7 @@ fn stage1_queue_selects_normal_unrefined_excludes_rule_and_sealed() {
     let (store, acct) = store();
 
     // Normal, non-rule row -> enters the Stage-1 LLM queue.
-    let normal = triaged_row(
-        acct, "g-n", "t-n", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
     // Explicit rule (confident) -> decided; NO Stage-1 model spend.
     triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
     // Sealed -> never queued for any LLM.
@@ -116,10 +105,7 @@ fn stage1_queue_selects_normal_unrefined_excludes_rule_and_sealed() {
 fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
     let (store, acct) = store();
 
-    let normal = triaged_row(
-        acct, "g-n", "t-n", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
     triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
     triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed).ingest(&store);
 
@@ -175,11 +161,11 @@ fn filtered_rule_row_goes_straight_to_stage2() {
     let (store, acct) = store();
     // A Filtered rule (matched_rule set, NOT confident) skips Stage-1 and
     // escalates directly to Stage-2 for want_text evaluation.
-    let id = triaged_row(
-        acct, "g-f", "t-f", Some(3), false, Sensitivity::Normal,
-    )
-    .ingest(&store);
-    assert!(store.stage1_queue(acct, 10).unwrap().is_empty(), "no Stage-1 spend");
+    let id = triaged_row(acct, "g-f", "t-f", Some(3), false, Sensitivity::Normal).ingest(&store);
+    assert!(
+        store.stage1_queue(acct, 10).unwrap().is_empty(),
+        "no Stage-1 spend"
+    );
     let s2 = store.stage2_queue(acct, 10).unwrap();
     assert_eq!(s2.len(), 1);
     assert_eq!(s2[0].message_id, id);
@@ -219,19 +205,18 @@ fn stage1_apply_confident_false_escalates_true_does_not() {
 fn stage1_mark_processed_preserves_needs_stage2_seed() {
     let (store, acct) = store();
     // Ambiguous seed (confident=false => needs_stage2 seed = 1).
-    let amb = triaged_row(
-        acct, "g-amb", "t-amb", None, false, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let amb = triaged_row(acct, "g-amb", "t-amb", None, false, Sensitivity::Normal).ingest(&store);
     // Confident seed (confident=true => needs_stage2 seed = 0).
-    let sure = triaged_row(
-        acct, "g-sure", "t-sure", None, true, Sensitivity::Normal,
-    )
-    .ingest(&store);
+    let sure =
+        triaged_row(acct, "g-sure", "t-sure", None, true, Sensitivity::Normal).ingest(&store);
 
     // Heuristic-only fallback stamps the marker but PRESERVES the seed.
-    store.stage1_mark_processed(acct, amb, HEURISTIC_ONLY).unwrap();
-    store.stage1_mark_processed(acct, sure, HEURISTIC_ONLY).unwrap();
+    store
+        .stage1_mark_processed(acct, amb, HEURISTIC_ONLY)
+        .unwrap();
+    store
+        .stage1_mark_processed(acct, sure, HEURISTIC_ONLY)
+        .unwrap();
 
     assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
     let s2 = store.stage2_queue(acct, 10).unwrap();
@@ -242,8 +227,12 @@ fn stage1_mark_processed_preserves_needs_stage2_seed() {
 #[test]
 fn stage1_usage_ledger_is_a_separate_category() {
     let (store, acct) = store();
-    store.stage1_bump_usage(acct, "2026-07-09", 100, 20).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-09", 500, 90).unwrap();
+    store
+        .stage1_bump_usage(acct, "2026-07-09", 100, 20)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-09", 500, 90)
+        .unwrap();
 
     let s1 = store.stage1_usage_since(acct, "2026-07-01").unwrap();
     assert_eq!(s1.calls, 1);
@@ -265,8 +254,12 @@ fn stage1_usage_ledger_is_a_separate_category() {
 #[test]
 fn list_usage_by_category_surfaces_extractors_nobody_named() {
     let (store, acct) = store();
-    store.stage1_bump_usage(acct, "2026-07-09", 100, 20).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-09", 500, 90).unwrap();
+    store
+        .stage1_bump_usage(acct, "2026-07-09", 100, 20)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-09", 500, 90)
+        .unwrap();
     // An extractor category, and a category invented right here: the point of
     // enumerating is that a ledger writer added LATER still reports, without
     // anyone editing the reader.
@@ -331,11 +324,20 @@ fn stage2_queue_surfaces_matched_rule_want_text() {
             Disposition::Filtered,
         )
         .unwrap();
-    let id = store.upsert_message(&triaged(acct, "g1", "t1").msg()).unwrap();
+    let id = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
     store
         .set_triage(
-            id, acct, 30, Tier::Noise, Sensitivity::Normal, None, "filtered",
-            "matched filtered rule", None,
+            id,
+            acct,
+            30,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "filtered",
+            "matched filtered rule",
+            None,
         )
         .unwrap();
     // Attach the matched rule id (set_triage leaves matched_rule_id NULL).
@@ -385,11 +387,20 @@ fn stage2_prompt_carries_only_the_matched_rules_want_text() {
     // A queued row whose Stage-1 match landed on rule #2 (bravo). We stamp
     // matched_rule_id exactly as Stage-1 would (it selects a single rule id).
     let matched_id = rule_ids[1];
-    let id = store.upsert_message(&triaged(acct, "g1", "t1").msg()).unwrap();
+    let id = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
     store
         .set_triage(
-            id, acct, 30, Tier::Noise, Sensitivity::Normal, None, "filtered",
-            "matched filtered rule", None,
+            id,
+            acct,
+            30,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "filtered",
+            "matched filtered rule",
+            None,
         )
         .unwrap();
     {
@@ -404,15 +415,27 @@ fn stage2_prompt_carries_only_the_matched_rules_want_text() {
     let rows = store.stage2_queue(acct, 10).unwrap();
     assert_eq!(rows.len(), 1);
     // Only the matched rule's want_text surfaces from the store.
-    assert_eq!(rows[0].rule_want_text.as_deref(), Some("WANT_BRAVO only invoices"));
+    assert_eq!(
+        rows[0].rule_want_text.as_deref(),
+        Some("WANT_BRAVO only invoices")
+    );
 
     // And the BUILT prompt contains exactly that one rule's text — none of
     // the other two rules leak in.
     let ctx = RowContext::from_queued(&rows[0], 4000);
     let prompt = build_user_message(&ctx);
-    assert!(prompt.contains("WANT_BRAVO only invoices"), "matched want must appear");
-    assert!(!prompt.contains("WANT_ALPHA"), "non-matched rule must not leak");
-    assert!(!prompt.contains("WANT_CHARLIE"), "non-matched rule must not leak");
+    assert!(
+        prompt.contains("WANT_BRAVO only invoices"),
+        "matched want must appear"
+    );
+    assert!(
+        !prompt.contains("WANT_ALPHA"),
+        "non-matched rule must not leak"
+    );
+    assert!(
+        !prompt.contains("WANT_CHARLIE"),
+        "non-matched rule must not leak"
+    );
     assert_eq!(
         prompt.matches("WANT_").count(),
         1,
@@ -420,18 +443,33 @@ fn stage2_prompt_carries_only_the_matched_rules_want_text() {
     );
 
     // NO-MATCH case: a row with matched_rule_id NULL carries zero rule text.
-    let id2 = store.upsert_message(&triaged(acct, "g2", "t2").msg()).unwrap();
+    let id2 = store
+        .upsert_message(&triaged(acct, "g2", "t2").msg())
+        .unwrap();
     store
         .set_triage(
-            id2, acct, 40, Tier::Noise, Sensitivity::Normal, None, "ambiguous",
-            "no rule matched", None,
+            id2,
+            acct,
+            40,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "ambiguous",
+            "no rule matched",
+            None,
         )
         .unwrap();
     let rows2 = store.stage2_queue(acct, 10).unwrap();
     let unmatched = rows2.iter().find(|r| r.message_id == id2).unwrap();
-    assert!(unmatched.rule_want_text.is_none(), "no rule => no want_text");
+    assert!(
+        unmatched.rule_want_text.is_none(),
+        "no rule => no want_text"
+    );
     let prompt2 = build_user_message(&RowContext::from_queued(unmatched, 4000));
-    assert!(!prompt2.contains("WANT_"), "unmatched row prompt has zero rule text");
+    assert!(
+        !prompt2.contains("WANT_"),
+        "unmatched row prompt has zero rule text"
+    );
     assert!(prompt2.contains("standing_instruction_for_this_sender: none"));
 }
 
@@ -441,17 +479,36 @@ fn stage2_budget_increment_and_exhaustion() {
     let day = "2026-07-09";
 
     assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 0);
-    assert_eq!(store.stage2_increment_budget(acct, "t-abc", day).unwrap(), 1);
-    assert_eq!(store.stage2_increment_budget(acct, "t-abc", day).unwrap(), 2);
+    assert_eq!(
+        store.stage2_increment_budget(acct, "t-abc", day).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.stage2_increment_budget(acct, "t-abc", day).unwrap(),
+        2
+    );
     assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 2);
 
     // A different thread and a different day are independent counters.
     assert_eq!(store.stage2_budget_used(acct, "t-other", day).unwrap(), 0);
-    assert_eq!(store.stage2_budget_used(acct, "t-abc", "2026-07-10").unwrap(), 0);
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "t-abc", "2026-07-10")
+            .unwrap(),
+        0
+    );
 
     // The global sentinel is a separate scope in the same table.
-    assert_eq!(store.stage2_increment_budget(acct, "__global__", day).unwrap(), 1);
-    assert_eq!(store.stage2_budget_used(acct, "__global__", day).unwrap(), 1);
+    assert_eq!(
+        store
+            .stage2_increment_budget(acct, "__global__", day)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.stage2_budget_used(acct, "__global__", day).unwrap(),
+        1
+    );
     // The per-thread counter is unaffected by the global increment.
     assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 2);
 }
@@ -508,7 +565,9 @@ fn one_sender_across_many_threads_capped_at_sender_daily_cap() {
         if used >= sender_daily_cap {
             continue; // sender capped: row stays queued, no call
         }
-        store.stage2_increment_budget(acct, sender_key, day).unwrap();
+        store
+            .stage2_increment_budget(acct, sender_key, day)
+            .unwrap();
         calls += 1;
     }
 
@@ -554,10 +613,18 @@ fn list_usage_returns_recent_days_newest_first() {
     // Empty ledger => no rows.
     assert!(store.list_usage(acct, 30).unwrap().is_empty());
 
-    store.stage2_bump_usage(acct, "2026-07-07", 100, 10).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-08", 200, 20).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-09", 300, 30).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-09", 100, 10).unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-07", 100, 10)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-08", 200, 20)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-09", 300, 30)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-09", 100, 10)
+        .unwrap();
 
     // Newest-first, sparse (only days with a row).
     let rows = store.list_usage(acct, 30).unwrap();
@@ -586,9 +653,15 @@ fn app_settings_get_set_roundtrip_and_scoping() {
 
     // Set, read back, and overwrite (upsert).
     store.set_app_setting(a, "k", "v1").unwrap();
-    assert_eq!(store.get_app_setting(a, "k").unwrap().as_deref(), Some("v1"));
+    assert_eq!(
+        store.get_app_setting(a, "k").unwrap().as_deref(),
+        Some("v1")
+    );
     store.set_app_setting(a, "k", "v2").unwrap();
-    assert_eq!(store.get_app_setting(a, "k").unwrap().as_deref(), Some("v2"));
+    assert_eq!(
+        store.get_app_setting(a, "k").unwrap().as_deref(),
+        Some("v2")
+    );
 
     // Per-account scoped: b's key is independent.
     assert!(store.get_app_setting(b, "k").unwrap().is_none());
@@ -597,25 +670,33 @@ fn app_settings_get_set_roundtrip_and_scoping() {
 #[test]
 fn stage2_cap_overrides_reads_and_precedence() {
     use crate::config::{
-        APP_SETTING_GLOBAL_DAILY_CAP, APP_SETTING_SENDER_DAILY_CAP,
-        APP_SETTING_THREAD_DAILY_CAP,
+        APP_SETTING_GLOBAL_DAILY_CAP, APP_SETTING_SENDER_DAILY_CAP, APP_SETTING_THREAD_DAILY_CAP,
     };
     let (store, acct) = store();
 
     // No rows => all None (caller falls back to config/env then default).
-    assert_eq!(store.stage2_cap_overrides(acct).unwrap(), Default::default());
+    assert_eq!(
+        store.stage2_cap_overrides(acct).unwrap(),
+        Default::default()
+    );
 
     // A set thread cap surfaces; the others stay None (so the effective cap
     // is the override where present, config/default elsewhere — precedence).
-    store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "5").unwrap();
+    store
+        .set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "5")
+        .unwrap();
     let o = store.stage2_cap_overrides(acct).unwrap();
     assert_eq!(o.thread_daily_cap, Some(5));
     assert_eq!(o.sender_daily_cap, None);
     assert_eq!(o.global_daily_cap, None);
 
     // Set the remaining two.
-    store.set_app_setting(acct, APP_SETTING_SENDER_DAILY_CAP, "9").unwrap();
-    store.set_app_setting(acct, APP_SETTING_GLOBAL_DAILY_CAP, "300").unwrap();
+    store
+        .set_app_setting(acct, APP_SETTING_SENDER_DAILY_CAP, "9")
+        .unwrap();
+    store
+        .set_app_setting(acct, APP_SETTING_GLOBAL_DAILY_CAP, "300")
+        .unwrap();
     let o = store.stage2_cap_overrides(acct).unwrap();
     assert_eq!(o.thread_daily_cap, Some(5));
     assert_eq!(o.sender_daily_cap, Some(9));
@@ -623,12 +704,27 @@ fn stage2_cap_overrides_reads_and_precedence() {
 
     // A malformed OR out-of-range stored value is ignored (treated as absent),
     // so a corrupt row can never remove the cap entirely.
-    store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "not-a-number").unwrap();
-    assert_eq!(store.stage2_cap_overrides(acct).unwrap().thread_daily_cap, None);
-    store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "0").unwrap();
-    assert_eq!(store.stage2_cap_overrides(acct).unwrap().thread_daily_cap, None);
-    store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "100001").unwrap();
-    assert_eq!(store.stage2_cap_overrides(acct).unwrap().thread_daily_cap, None);
+    store
+        .set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "not-a-number")
+        .unwrap();
+    assert_eq!(
+        store.stage2_cap_overrides(acct).unwrap().thread_daily_cap,
+        None
+    );
+    store
+        .set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "0")
+        .unwrap();
+    assert_eq!(
+        store.stage2_cap_overrides(acct).unwrap().thread_daily_cap,
+        None
+    );
+    store
+        .set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "100001")
+        .unwrap();
+    assert_eq!(
+        store.stage2_cap_overrides(acct).unwrap().thread_daily_cap,
+        None
+    );
 }
 
 #[test]
@@ -642,7 +738,9 @@ fn override_cap_binds_below_config_default() {
     let config_default_cap: u32 = 3; // Stage2Config default
 
     // Client lowers the per-thread cap to 1 at runtime.
-    store.set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "1").unwrap();
+    store
+        .set_app_setting(acct, APP_SETTING_THREAD_DAILY_CAP, "1")
+        .unwrap();
 
     // Effective cap = override (1), NOT the config default (3) — precedence.
     let overrides = store.stage2_cap_overrides(acct).unwrap();
@@ -659,7 +757,10 @@ fn override_cap_binds_below_config_default() {
         store.stage2_increment_budget(acct, thread, day).unwrap();
         calls += 1;
     }
-    assert_eq!(calls, 1, "override cap of 1 must bind below the config default of 3");
+    assert_eq!(
+        calls, 1,
+        "override cap of 1 must bind below the config default of 3"
+    );
 }
 
 #[test]
@@ -672,9 +773,15 @@ fn stage2_usage_since_sums_window_inclusively() {
         Stage2Usage::default()
     );
 
-    store.stage2_bump_usage(acct, "2026-07-05", 100, 10).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-08", 200, 20).unwrap();
-    store.stage2_bump_usage(acct, "2026-07-08", 300, 30).unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-05", 100, 10)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-08", 200, 20)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, "2026-07-08", 300, 30)
+        .unwrap();
 
     // since_day <= earliest => everything summed (2 days, 3 calls).
     let all = store.stage2_usage_since(acct, "2026-07-05").unwrap();
@@ -709,6 +816,7 @@ fn count_inbound_since_counts_only_received_in_window() {
             is_sent: sent,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         };
         store.upsert_message(&m).unwrap();
     };
@@ -738,13 +846,33 @@ fn stale_skip_marks_processed_without_budget() {
     stale.received_at = now - chrono::Duration::days(30);
     let stale_id = store.upsert_message(&stale).unwrap();
     store
-        .set_triage(stale_id, acct, 40, Tier::Noise, Sensitivity::Normal, None, "amb", "", None)
+        .set_triage(
+            stale_id,
+            acct,
+            40,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "amb",
+            "",
+            None,
+        )
         .unwrap();
     let mut fresh = triaged(acct, "g-fresh", "t-fresh").msg();
     fresh.received_at = now;
     let fresh_id = store.upsert_message(&fresh).unwrap();
     store
-        .set_triage(fresh_id, acct, 40, Tier::Noise, Sensitivity::Normal, None, "amb", "", None)
+        .set_triage(
+            fresh_id,
+            acct,
+            40,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "amb",
+            "",
+            None,
+        )
         .unwrap();
 
     // Apply the pass-loop decision: stale-skip old rows, keep fresh queued.
@@ -794,7 +922,15 @@ fn stage2_queue_carries_received_at() {
     let id = store.upsert_message(&m).unwrap();
     store
         .set_triage(
-            id, acct, 40, Tier::Noise, Sensitivity::Normal, None, "amb", "", None,
+            id,
+            acct,
+            40,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "amb",
+            "",
+            None,
         )
         .unwrap();
     let rows = store.stage2_queue(acct, 10).unwrap();
@@ -834,7 +970,10 @@ fn stage2_apply_updates_row_stamps_model_and_writes_deadline() {
         }),
         category: Some("invoice".into()),
     };
-    assert!(store.stage2_apply(&applied).unwrap(), "the guard matched the normal row");
+    assert!(
+        store.stage2_apply(&applied).unwrap(),
+        "the guard matched the normal row"
+    );
 
     // Row left the queue (model_used stamped).
     assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
@@ -877,10 +1016,16 @@ fn stage2_apply_never_touches_sealed_row() {
     };
     // TOCTOU report: the guard matched nothing and the caller must know —
     // a bare Ok would let a message sealed mid-pass emit an event anyway.
-    assert!(!store.stage2_apply(&applied).unwrap(), "sealed row: apply reports false");
+    assert!(
+        !store.stage2_apply(&applied).unwrap(),
+        "sealed row: apply reports false"
+    );
     // The sealed row's triage must be unchanged (guarded by sensitivity),
     // and the verdict's deadline must NOT have been written either.
-    assert!(store.deadlines(acct, Some(365)).unwrap().is_empty(), "no deadline row");
+    assert!(
+        store.deadlines(acct, Some(365)).unwrap().is_empty(),
+        "no deadline row"
+    );
     let conn = store.lock().unwrap();
     let (imp, model): (i64, Option<String>) = conn
         .query_row(
@@ -924,16 +1069,32 @@ fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
 
     // Sealed between queue and apply.
     store
-        .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            id,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
 
-    assert!(!store.stage1_apply(&applied).unwrap(), "sealed mid-pass: apply reports false");
-    assert!(store.deadlines(acct, Some(365)).unwrap().is_empty(), "no deadline row");
+    assert!(
+        !store.stage1_apply(&applied).unwrap(),
+        "sealed mid-pass: apply reports false"
+    );
+    assert!(
+        store.deadlines(acct, Some(365)).unwrap().is_empty(),
+        "no deadline row"
+    );
 
     // Control: the same apply on a live row reports true.
     let live = seed_triage_row(&store, acct, "g-live", "t2", Sensitivity::Normal);
     let mut ok = applied.clone();
     ok.message_id = live;
-    assert!(store.stage1_apply(&ok).unwrap(), "normal row: apply reports true");
+    assert!(
+        store.stage1_apply(&ok).unwrap(),
+        "normal row: apply reports true"
+    );
 }

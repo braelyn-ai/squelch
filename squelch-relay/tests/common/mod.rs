@@ -31,6 +31,10 @@ pub fn config(apns_url_override: Option<String>, auth_token: Option<String>) -> 
         // In-memory open buffer: it lives as long as the `RelayState` the test
         // holds, and never leaves a file behind.
         db_path: None,
+        // Trust nothing by default, as production does; the rate-limit tests
+        // raise it on their own copy.
+        trusted_proxy_hops: 0,
+        trusted_proxy_cidrs: None,
     }
 }
 
