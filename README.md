@@ -75,7 +75,9 @@ Both machines must use the same `SQUELCH_CLIENT_ID` and `SQUELCH_CLIENT_SECRET`.
 
 If the laptop side is itself the published container image, run the export inside it with `-p 8847:8847` and add `--expose-consent-listener`: a listener on the container's own `127.0.0.1` is unreachable from your browser. That opens the port on every interface for the length of one consent, so it is opt-in.
 
-The other route moves the code instead of the token. `squelchd auth --broker <url>` prints one link to open on any device, and a consent relay parks Google's one-time code until your daemon collects it. The relay cannot turn that code into a token, because the PKCE verifier never leaves your machine. Run your own from `Dockerfile.broker` ([deploy/DEPLOY.md](deploy/DEPLOY.md) §8); the hosted one at `auth.passband.email` is not up yet.
+There is a `--broker` flag that moves the code instead of the token, and it is a dead end you should not spend time on: Google only lets a Desktop-type OAuth client redirect to loopback, so a consent relay can never receive the code. `squelch-broker` is built and hardened but not deployable for this tier. [docs/BROKER.md](docs/BROKER.md) has the details and the replacement.
+
+New to all of this? [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) walks the whole thing end to end for a daemon in Docker on a NAS with the Passband client on a Mac, including how to point the client at it.
 
 ### 4. Connect an agent
 
@@ -106,18 +108,17 @@ cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 | [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) |
 | [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
 | [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
-| [`squelch-desktop`](squelch-desktop/README.md) | the Tauri desktop client over the human door |
-| `squelch-client-swift` | the native macOS client over the human door |
+| `passband` | Passband, the native macOS client over the human door |
 | [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
 
 Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md); the Docker path (prebuilt images on GHCR, env-var config only) is [`deploy/DOCKER.md`](deploy/DOCKER.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
 
 ## Building the macOS client
 
-`squelch-client-swift` builds with `swiftc` directly — no Xcode needed for a local build.
+Passband builds with `swiftc` directly — no Xcode needed for a local build.
 
 ```sh
-cd squelch-client-swift
+cd passband
 ./build.sh          # debug
 ./build.sh run      # build and launch
 ./build.sh release  # optimized
