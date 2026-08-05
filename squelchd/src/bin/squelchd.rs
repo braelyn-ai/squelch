@@ -289,14 +289,17 @@ fn mint_credential(
     let token = match args.broker.as_deref() {
         // The broker flow needs no listener, so no port and no tunnel; the
         // scope set, the slot it lands in, and the exchange are unchanged.
-        Some(broker) => run_broker_flow(client, broker, scopes)?,
+        // Both arms are handed `email`: the exchange refuses to return a token
+        // for any other mailbox, so a consent finished on the wrong Google
+        // account fails here instead of being stored under this one.
+        Some(broker) => run_broker_flow(client, email, broker, scopes)?,
         None => {
             let opts = AuthFlowOptions {
                 scopes,
                 headless: args.headless,
                 port: args.port,
             };
-            run_auth_flow(client, &opts)?
+            run_auth_flow(client, email, &opts)?
         }
     };
     store_token_backend(backend, creds_path, email, kind, &token)?;

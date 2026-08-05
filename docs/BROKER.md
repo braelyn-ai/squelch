@@ -100,6 +100,11 @@ All bodies JSON. No authentication on any route: every stranger's self-hosted
 daemon is a legitimate client. Defense is per-IP rate limiting, a global
 session cap, high-entropy identifiers, and holding nothing worth stealing.
 
+Every response body is a few hundred bytes, and the daemon reads at most
+**64 KiB** of one (declared length or not) before treating the answer as off
+contract and ending the flow. The hosts this feature exists for are NASes and
+Pis; an unbounded body is an OOM on them.
+
 ### `POST /v1/sessions`
 
 ```json
@@ -175,7 +180,17 @@ shared; only who built the URL and who claims differ.
 
 `squelchd auth --broker <url>` runs the flow above instead of the loopback
 listener; everything downstream (scope plan, credential kinds, storage
-backends) is unchanged. Client credentials remain env/config-driven
+backends) is unchanged.
+
+The exchange is guarded, and identically for both flows, because a code says
+nothing about who approved it: whichever Google session was signed in on the
+browser is the one that consented, and neither a loopback listener nor a broker
+can see that. Before a token is stored the daemon checks the granted scope set
+covers what it asked for (a partial consent is fatal, not a warning) and calls
+`users.getProfile` to confirm the mailbox behind the token is the configured
+`account_email`. A mismatch is refused by name and nothing is written.
+
+Client credentials remain env/config-driven
 (`SQUELCH_CLIENT_ID`/`SQUELCH_CLIENT_SECRET`); once Google verification
 clears, "embedded credentials" is the daemon image baking those env defaults
 in — no code change.

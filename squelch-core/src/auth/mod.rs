@@ -9,6 +9,11 @@
 //! browser can reach `127.0.0.1`. The two differ ONLY in where the code comes
 //! from: same client, same PKCE, same exchange, and the verifier that makes a
 //! code redeemable never leaves this process.
+//!
+//! Both flows end in the same GUARDED exchange: a code becomes a stored token
+//! only after Google confirms the grant covers the scopes that were asked for
+//! and names the configured account as the mailbox behind it. Neither a loopback
+//! listener nor a broker can tell whose Google session finished the screen.
 
 use crate::config::{GMAIL_READONLY_SCOPE, OAuthClientConfig, WRITE_SCOPES};
 use crate::credentials::{CredentialKind, StoredToken};
@@ -29,6 +34,14 @@ use url::Url;
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(crate) const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// The one Gmail call that names the mailbox behind an access token. Every scope
+/// set this module mints (`gmail.readonly`, `gmail.modify`) permits it.
+const GMAIL_PROFILE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
+
+/// Budget for the token exchange and the profile check that follows it. Both are
+/// one small round trip to Google.
+const EXCHANGE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fixed loopback port used in `--headless` mode so it can be SSH-forwarded.
 pub const DEFAULT_HEADLESS_PORT: u16 = 8847;
@@ -56,6 +69,13 @@ const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Ceiling on a broker-supplied string echoed into the terminal. The broker is a
 /// host the user named, not a host anyone vetted.
 const MAX_BROKER_DETAIL: usize = 200;
+
+/// Ceiling on any response body this module reads. Every answer in the broker
+/// contract and Gmail's profile answer are a few hundred bytes of JSON, so this
+/// is slack rather than a budget. It exists because `squelchd auth` runs on the
+/// NAS and Pi hosts the broker exists for, where an unbounded body streamed by a
+/// hostile or wedged host is the whole machine.
+const MAX_RESPONSE_BODY: usize = 64 * 1024;
 
 /// Which scope set (and therefore which credential kind) to authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,17 +188,27 @@ fn authorize_url(
     (url, csrf_token, pkce_verifier)
 }
 
-/// Redeem an authorization code. The verifier proves this process is the one
-/// that asked for the code, which is exactly why a parked code is inert to
-/// anyone else who sees it.
+/// Redeem an authorization code and prove the resulting token is the one that
+/// was asked for. The verifier proves this process is the one that asked for the
+/// code, which is exactly why a parked code is inert to anyone else who sees it.
+///
+/// The two checks after the exchange are the reason this is the ONLY path to a
+/// stored token. A code says nothing about who approved it: whichever Google
+/// session happened to be signed in on the browser is the one that consented,
+/// and neither a loopback listener nor a broker can see that. So the grant is
+/// held against what was requested, and the token is held against the configured
+/// account, before anything is persisted.
 fn exchange_code(
     oauth: &GoogleClient,
+    account_email: &str,
+    scopes: AuthScopes,
     code: String,
     pkce_verifier: PkceCodeVerifier,
 ) -> Result<StoredToken> {
     let http = oauth2::reqwest::blocking::ClientBuilder::new()
         // Never follow redirects: guards against SSRF on the token endpoint.
         .redirect(oauth2::reqwest::redirect::Policy::none())
+        .timeout(EXCHANGE_HTTP_TIMEOUT)
         .build()
         .map_err(map_oauth_err("building http client"))?;
 
@@ -188,6 +218,14 @@ fn exchange_code(
         .request(&http)
         .map_err(map_oauth_err("token exchange failed"))?;
 
+    let granted: Option<Vec<String>> = token
+        .scopes()
+        .map(|granted| granted.iter().map(|s| s.to_string()).collect());
+    check_scope_grant(scopes, granted.as_deref())?;
+
+    let mailbox = fetch_profile_email(&http, token.access_token().secret())?;
+    check_account_match(account_email, &mailbox)?;
+
     Ok(StoredToken::from_response(
         token.access_token().secret().to_string(),
         token.refresh_token().map(|r| r.secret().to_string()),
@@ -195,15 +233,155 @@ fn exchange_code(
     ))
 }
 
+/// Fail unless the grant covers every scope that was requested.
+///
+/// A partial consent is a hard error rather than a warning because it is
+/// invisible afterwards: a Write credential whose grant dropped `gmail.send`
+/// stores, loads, and refreshes exactly like a working one, and only fails at
+/// the first send, long after the consent screen is gone.
+///
+/// An ABSENT `scope` on the response means "identical to the request" (RFC 6749
+/// §5.1). That is taken at face value because the response comes off Google's
+/// pinned token endpoint over TLS with redirects refused, not off anything a
+/// third party can shape.
+fn check_scope_grant(requested: AuthScopes, granted: Option<&[String]>) -> Result<()> {
+    let Some(granted) = granted else {
+        return Ok(());
+    };
+    let missing: Vec<String> = requested
+        .scopes()
+        .into_iter()
+        .filter(|want| !granted.iter().any(|got| got == want))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CoreError::Credential(format!(
+        "the consent screen granted [{}], which does not cover [{}]; nothing was stored. \
+         Re-run `squelchd auth` and leave every permission on the Google screen checked.",
+        granted.join(", "),
+        missing.join(", ")
+    )))
+}
+
+/// Fail unless Google says the token opens the mailbox this daemon is configured
+/// for.
+///
+/// Without this, a consent finished on a DIFFERENT Google account still stores a
+/// token under `account_email`, and the sync loop then ingests a stranger's mail
+/// into the user's database and serves it to their own agent surfaces as their
+/// own. Case-insensitive and trimmed: Gmail addresses are ASCII and the config
+/// value is hand-typed.
+fn check_account_match(configured: &str, granted: &str) -> Result<()> {
+    if configured.trim().eq_ignore_ascii_case(granted.trim()) {
+        return Ok(());
+    }
+    Err(CoreError::Credential(format!(
+        "this consent authorized {granted}, but squelch is configured for {configured}; \
+         nothing was stored. Approve the screen while signed in as {configured} (or fix \
+         `account_email` in the config) and re-run `squelchd auth`."
+    )))
+}
+
+/// The one field of `users.getProfile` this module reads.
+#[derive(Deserialize)]
+struct GmailProfile {
+    #[serde(rename = "emailAddress")]
+    email_address: Option<String>,
+}
+
+/// Ask Gmail whose mailbox a fresh access token opens. This is the only source
+/// of truth for that: the exchange response names a token, never an account.
+fn fetch_profile_email(http: &reqwest::blocking::Client, access_token: &str) -> Result<String> {
+    // The token rides in the header and nowhere else; reqwest's own errors carry
+    // the URL, not the headers, so a failure here cannot print it.
+    let resp = http
+        .get(GMAIL_PROFILE_URL)
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|e| {
+            CoreError::Credential(format!(
+                "could not ask Google which account this consent authorized: {e}; \
+                 nothing was stored"
+            ))
+        })?;
+
+    let status = resp.status().as_u16();
+    let body = read_capped(resp, "Gmail's profile response")?;
+    if status != 200 {
+        return Err(CoreError::Credential(format!(
+            "Google answered {status} when asked which account this consent authorized, so the \
+             token could not be matched to the configured mailbox; nothing was stored. Re-run \
+             `squelchd auth`."
+        )));
+    }
+
+    let profile: GmailProfile = serde_json::from_slice(&body).map_err(|e| {
+        CoreError::Credential(format!(
+            "Google sent an unreadable profile response: {:?} error at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
+    profile
+        .email_address
+        .filter(|e| !e.trim().is_empty())
+        .ok_or_else(|| {
+            CoreError::Credential(
+                "Google's profile response named no account, so this token could not be matched \
+                 to the configured mailbox; nothing was stored."
+                    .to_string(),
+            )
+        })
+}
+
+/// Read a response body with a hard ceiling on it. A declared `Content-Length`
+/// is refused before a byte is read, and the read itself goes through `take` so
+/// that a chunked body which declares nothing is bounded too.
+fn read_capped(resp: reqwest::blocking::Response, what: &str) -> Result<Vec<u8>> {
+    let too_big = || {
+        CoreError::Credential(format!(
+            "{what} is larger than {MAX_RESPONSE_BODY} bytes, which nothing in this contract \
+             is; refusing to read it"
+        ))
+    };
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BODY as u64)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    // One byte past the ceiling: reading it is how an undeclared overrun shows up.
+    resp.take(MAX_RESPONSE_BODY as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| CoreError::Credential(format!("reading {what}: {e}")))?;
+    if body.len() > MAX_RESPONSE_BODY {
+        return Err(too_big());
+    }
+    Ok(body)
+}
+
 /// Run the interactive read-only flow with the defaults: ephemeral port, browser
 /// auto-open.
-pub fn run_installed_app_flow(client: &OAuthClientConfig) -> Result<StoredToken> {
-    run_auth_flow(client, &AuthFlowOptions::default())
+pub fn run_installed_app_flow(
+    client: &OAuthClientConfig,
+    account_email: &str,
+) -> Result<StoredToken> {
+    run_auth_flow(client, account_email, &AuthFlowOptions::default())
 }
 
 /// Run the interactive authorization flow and return the token. BLOCKS the calling
 /// thread until the browser redirect arrives.
-pub fn run_auth_flow(client: &OAuthClientConfig, opts: &AuthFlowOptions) -> Result<StoredToken> {
+///
+/// `account_email` is the account the caller intends to store this under, and
+/// the exchange refuses to hand back a token for any other mailbox.
+pub fn run_auth_flow(
+    client: &OAuthClientConfig,
+    account_email: &str,
+    opts: &AuthFlowOptions,
+) -> Result<StoredToken> {
     // Headless -> a FIXED port so it can be SSH-forwarded; otherwise ephemeral.
     let bind_addr = if opts.headless {
         format!("127.0.0.1:{}", opts.port)
@@ -249,7 +427,7 @@ pub fn run_auth_flow(client: &OAuthClientConfig, opts: &AuthFlowOptions) -> Resu
 
     let code = wait_for_code(&listener, csrf_token.secret())?;
 
-    exchange_code(&oauth, code, pkce_verifier)
+    exchange_code(&oauth, account_email, opts.scopes, code, pkce_verifier)
 }
 
 /// Run the consent flow through a broker (`docs/BROKER.md`) instead of a
@@ -261,6 +439,7 @@ pub fn run_auth_flow(client: &OAuthClientConfig, opts: &AuthFlowOptions) -> Resu
 /// without the PKCE verifier built here, which goes to Google and nowhere else.
 pub fn run_broker_flow(
     client: &OAuthClientConfig,
+    account_email: &str,
     broker_url: &str,
     scopes: AuthScopes,
 ) -> Result<StoredToken> {
@@ -296,7 +475,7 @@ pub fn run_broker_flow(
     println!("Waiting for consent (the code is collected here, never by the broker) ...");
 
     let code = poll_for_code(&http, &base, &session_id, &claim_token)?;
-    exchange_code(&oauth, code, pkce_verifier)
+    exchange_code(&oauth, account_email, scopes, code, pkce_verifier)
 }
 
 /// Canonicalize `--broker` the same way the broker canonicalizes its own public
@@ -415,8 +594,11 @@ fn register_session(
 
     let status = resp.status().as_u16();
     // Read only for the refusal reason. A 201 body carries `expires_in`, which
-    // this side does not need: the poll deadline is the contract's TTL.
-    let detail = resp.text().ok().and_then(|b| broker_detail(&b));
+    // this side does not need: the poll deadline is the contract's TTL. A body
+    // over the cap ends the flow whatever the status says, because a host that
+    // answers a registration with megabytes is not the contract's broker.
+    let body = read_capped(resp, "the consent broker's registration response")?;
+    let detail = broker_detail(&String::from_utf8_lossy(&body));
     let because = detail.map(|d| format!(" ({d})")).unwrap_or_default();
 
     match status {
@@ -489,7 +671,10 @@ fn poll_for_code(
         match http.post(&claim_url).json(&body).send() {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let payload = resp.bytes().unwrap_or_default();
+                // Not a setback to wait out: a dropped connection is weather, an
+                // oversized body is the other end not speaking the contract, and
+                // polling it again only streams the same flood.
+                let payload = read_capped(resp, "the consent broker's claim response")?;
                 match interpret_claim(status, &payload)? {
                     ClaimStep::Complete(code) => return Ok(code),
                     ClaimStep::Pending(refusal) => {
@@ -593,12 +778,18 @@ fn broker_detail(body: &str) -> Option<String> {
 }
 
 /// A broker-supplied string, made safe to print. It lands in a terminal, and the
-/// broker is a host the user named rather than one anyone vetted: control
-/// characters would be an escape sequence, not text, and the length is theirs to
-/// choose unless it is bounded here.
+/// broker is a host the user named rather than one anyone vetted.
+///
+/// ASCII graphic plus space is the entire alphabet of a contract-conformant
+/// message, and it is also the only alphabet that cannot rearrange the trusted
+/// literal text this detail is spliced into: control characters would be escape
+/// sequences rather than text, and bidi/format characters (`U+202E` and
+/// friends) would let the broker reverse the rendered line and compose advice
+/// nobody wrote out of our own words. Length is theirs to choose unless it is
+/// bounded here too.
 fn printable(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(MAX_BROKER_DETAIL)
         .collect()
 }
@@ -725,6 +916,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE};
 
     #[test]
     fn parses_code_and_state() {
@@ -999,6 +1191,164 @@ mod tests {
             let msg = claim_err(200, &body);
             assert!(!msg.contains(code), "the code leaked into: {msg}");
         }
+    }
+
+    /// Bidi and format characters never reach a terminal: they rearrange the
+    /// trusted literal text this detail is spliced into rather than adding to
+    /// it, which is a way to compose advice nobody wrote.
+    #[test]
+    fn printable_drops_bidi_and_format_characters() {
+        // RLO would render the rest of the line right-to-left.
+        assert_eq!(printable("safe\u{202e}gnorts"), "safegnorts");
+        for sneaky in [
+            "\u{202a}", "\u{202b}", "\u{202c}", "\u{202d}", "\u{202e}", "\u{200e}", "\u{200f}",
+            "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}", "\u{200b}", "\u{feff}", "\u{00a0}",
+        ] {
+            let out = printable(&format!("a{sneaky}b"));
+            assert_eq!(out, "ab", "{sneaky:?} survived as {out:?}");
+        }
+        // Everything a contract-conformant message is made of still survives.
+        assert_eq!(
+            printable("auth_url must use https (got `ftp://x`)"),
+            "auth_url must use https (got `ftp://x`)"
+        );
+    }
+
+    // --- the guarded exchange ----------------------------------------------
+    //
+    // The exchange itself talks to Google; the two judgements that decide
+    // whether its token may be stored are pure and asserted here.
+
+    #[test]
+    fn a_token_for_another_account_is_refused_and_names_both() {
+        let err = check_account_match("me@gmail.com", "someone.else@gmail.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("someone.else@gmail.com"), "{err}");
+        assert!(err.contains("me@gmail.com"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+    }
+
+    /// Google echoes the address in its own casing and the config value is
+    /// hand-typed, so neither case nor stray whitespace is a different mailbox.
+    #[test]
+    fn account_match_ignores_case_and_surrounding_space() {
+        assert!(check_account_match("me@gmail.com", "me@gmail.com").is_ok());
+        assert!(check_account_match("Me@Gmail.COM", "me@gmail.com").is_ok());
+        assert!(check_account_match("  me@gmail.com\n", "me@gmail.com ").is_ok());
+        // A subaddress or a different domain IS a different mailbox.
+        assert!(check_account_match("me@gmail.com", "me+x@gmail.com").is_err());
+        assert!(check_account_match("me@gmail.com", "me@example.com").is_err());
+        assert!(check_account_match("me@gmail.com", "").is_err());
+    }
+
+    /// A half-granted consent is invisible afterwards: the credential stores and
+    /// refreshes like any other and only fails at the first send.
+    #[test]
+    fn a_partial_grant_is_refused_and_names_what_is_missing() {
+        let granted = vec![GMAIL_MODIFY_SCOPE.to_string()];
+        let err = check_scope_grant(AuthScopes::Write, Some(&granted))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(GMAIL_SEND_SCOPE), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+
+        // Read is not a subset of nothing, and a Write grant is not a Read one.
+        assert!(check_scope_grant(AuthScopes::Read, Some(&[])).is_err());
+        assert!(check_scope_grant(AuthScopes::Read, Some(&granted)).is_err());
+    }
+
+    #[test]
+    fn a_grant_that_covers_the_request_passes_even_with_extras() {
+        let read = vec![GMAIL_READONLY_SCOPE.to_string()];
+        assert!(check_scope_grant(AuthScopes::Read, Some(&read)).is_ok());
+
+        // Google adds `openid`/`email`/`profile` of its own accord; coverage is
+        // one-directional.
+        let write: Vec<String> = WRITE_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .chain(["openid".to_string(), "email".to_string()])
+            .collect();
+        assert!(check_scope_grant(AuthScopes::Write, Some(&write)).is_ok());
+
+        // RFC 6749 §5.1: an absent `scope` means the grant matches the request.
+        assert!(check_scope_grant(AuthScopes::Write, None).is_ok());
+    }
+
+    /// The cap has to hold for a body that DECLARES its size and for one that
+    /// declares nothing, because the other end picks which.
+    #[test]
+    fn an_oversized_response_body_is_refused_declared_or_not() {
+        for declared in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let flood = vec![b'x'; MAX_RESPONSE_BODY * 2];
+                if declared {
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", flood.len());
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&flood);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = stream.write_all(format!("{:x}\r\n", flood.len()).as_bytes());
+                    let _ = stream.write_all(&flood);
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n");
+                }
+                let _ = stream.flush();
+            });
+
+            let http = broker_http().unwrap();
+            let resp = http
+                .post(format!("http://127.0.0.1:{port}/v1/claim"))
+                .send()
+                .unwrap();
+            let err = read_capped(resp, "the test body").unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to read it"),
+                "declared={declared}: {err}"
+            );
+            // The flood is never fully written once we hang up; that is the point.
+            let _ = server.join();
+        }
+    }
+
+    #[test]
+    fn a_response_body_under_the_cap_is_read_whole() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = stream.read(&mut scratch);
+            let body = r#"{"status":"pending"}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        });
+
+        let http = broker_http().unwrap();
+        let resp = http
+            .post(format!("http://127.0.0.1:{port}/v1/claim"))
+            .send()
+            .unwrap();
+        let body = read_capped(resp, "the test body").unwrap();
+        assert!(matches!(
+            interpret_claim(200, &body).unwrap(),
+            ClaimStep::Pending(None)
+        ));
+        let _ = server.join();
     }
 
     #[test]
