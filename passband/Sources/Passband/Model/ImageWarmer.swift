@@ -14,6 +14,11 @@ import Foundation
 final class ImageWarmer {
     static let shared = ImageWarmer()
 
+    /// Concurrent thread warms during the launch pass — the same width the
+    /// per-image fetches inside each thread use: wide enough to hide latency,
+    /// narrow enough not to saturate the link at launch.
+    private static let warmWidth = 4
+
     private var sitrepLanded = false
     private var zonesLanded = false
     private var started = false
@@ -44,11 +49,20 @@ final class ImageWarmer {
 
         guard Prefs.shared.loadRemoteImages else { return }
 
-        for update in store.sitrep.standing {
-            await warmThread(update.thread_id)
+        // Two bounded waves, not one: the newsletter wave must not start while
+        // the for-your-eyes wave is still running. Ids are deduped up front —
+        // ThreadPrefetch has no in-flight dedup, so two concurrent warms of
+        // one thread would each miss its cache and fetch the thread twice.
+        var seen = Set<String>()
+        let standing = store.sitrep.standing.map(\.thread_id)
+            .filter { seen.insert($0).inserted }
+        let newsletters = store.zones.newsletters.map(\.latestThreadId)
+            .filter { seen.insert($0).inserted }
+        await withBoundedTaskGroup(width: Self.warmWidth, over: standing) { threadId in
+            await self.warmThread(threadId)
         }
-        for newsletter in store.zones.newsletters {
-            await warmThread(newsletter.latestThreadId)
+        await withBoundedTaskGroup(width: Self.warmWidth, over: newsletters) { threadId in
+            await self.warmThread(threadId)
         }
     }
 
