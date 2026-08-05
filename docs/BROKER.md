@@ -85,8 +85,9 @@ relay. See `docs/HOSTED.md` for the two-client OAuth architecture.
    and the SHA-256 of the claim token — never the token itself.
 3. Daemon prints `https://auth.passband.email/link?s=<session_id>`. The user
    opens it on any device with a browser.
-4. `/link` shows a small interstitial (what is being authorized, and the
-   "incapable of minting" line) and forwards to Google consent.
+4. `/link` shows an interstitial: who could have sent this link (unknowable, and
+   it says so), what approving grants, the requested scopes in plain English, a
+   stop condition, and then the link onward to Google consent.
 5. Google redirects the auth code to `/callback`; the broker parks it in
    memory: one session, one code, first write wins, short TTL.
 6. Daemon polls `POST /v1/claim` with the claim token. One successful claim
@@ -97,8 +98,22 @@ relay. See `docs/HOSTED.md` for the two-client OAuth architecture.
 ## Wire contract (v1)
 
 All bodies JSON. No authentication on any route: every stranger's self-hosted
-daemon is a legitimate client. Defense is per-IP rate limiting, a global
-session cap, high-entropy identifiers, and holding nothing worth stealing.
+daemon is a legitimate client. Defense is per-client rate limiting, a global
+session cap plus a per-client one, high-entropy identifiers, and holding no
+token or credential. Not "nothing worth stealing": see the correction at the top
+of this document, since a stranger's registration is served in our voice on our
+domain, which is what the scope allowlist and the rewritten interstitial exist
+to bound.
+
+Each route has its own token bucket, because a 429 costs a different thing on
+each: `POST /v1/sessions` 30/min (it allocates, and a real client registers
+once), `POST /v1/claim` 600/min (a daemon polls it every 2s for ten minutes),
+`GET /link` 300/min, `GET /callback` 1200/min (refusing it destroys consent the
+user already granted, and Google does not redirect twice). "Client" is the TCP
+peer unless the deployment sets `SQUELCH_BROKER_TRUSTED_PROXY_HOPS`, which is
+also what enables the per-client live-session cap (16): behind a proxy with it
+unset, every client shares one identity and a per-client cap would be a cap on
+the whole deployment.
 
 Every response body is a few hundred bytes, and the daemon reads at most
 **64 KiB** of one (declared length or not) before treating the answer as off
@@ -118,17 +133,31 @@ domain: scheme `https`, host exactly `accounts.google.com`, path exactly
 `/o/oauth2/v2/auth`, and query params `redirect_uri` == this broker's own
 `/callback` URL, `state` == `session_id`, `response_type` == `code`,
 `code_challenge` present, `code_challenge_method` == `S256`, `client_id`
-present.
+present, and `scope` a non-empty **subset of the scopes squelchd requests**
+(`gmail.readonly`, `gmail.modify`, `gmail.send` — squelch-core's
+`GMAIL_READONLY_SCOPE` and `WRITE_SCOPES`). Without that last check a stranger
+registers a consent URL asking for anything Google will grant (full
+`https://mail.google.com/`) and the broker serves the page that asks a human to
+grant it. Every checked parameter, `scope` included, may appear only once.
 
 Responses: `201 {"expires_in": <secs>}` · `400` malformed/invalid ·
-`409` duplicate session id · `429` rate limited · `503` session table full.
+`409` duplicate session id · `429` rate limited, or this client already holds
+its ceiling of live sessions · `503` session table full.
 
 ### `GET /link?s=<session_id>`
 
-Human-facing interstitial HTML: names the product, states what is being
-authorized and what the broker cannot do, links to the parked `auth_url`.
-Unknown or expired session → `404` HTML telling the user to re-run
-`squelchd auth`. Self-contained page: no external assets, no scripts.
+Human-facing interstitial HTML. It **cannot** say who parked the link
+(registration is unauthenticated), so it does not: it says someone ran
+`squelchd auth` and sent this link here and that it may not have been the
+reader, leads with what approving grants, lists the requested scopes in plain
+English, gives the stop condition ("if you did not run `squelchd auth` yourself
+in the last few minutes, close this page"), and only then links to the parked
+`auth_url`. The "incapable of minting tokens" line sits below that, as a bound
+on the broker rather than as reassurance about who is asking. Unknown or expired
+session → `404` HTML telling the user to re-run `squelchd auth`. Self-contained
+page: no external assets, no scripts, `Content-Security-Policy: default-src
+'none'; style-src 'unsafe-inline'; frame-ancestors 'none'` and
+`X-Frame-Options: DENY`.
 
 ### `GET /callback?code=...&state=...` (or `error=...&state=...`)
 
@@ -163,7 +192,8 @@ registered hash. Responses, all `200` unless noted:
 - **TTL ~10 minutes** from registration, sessions and parked codes alike;
   expired sessions purge lazily on access plus a periodic sweep.
 - **Never logged:** session ids, claim tokens and hashes, auth codes, auth
-  URLs. Counts, statuses, and timings only.
+  URLs, and the client address a session was registered from (held only for the
+  per-client cap). Counts, statuses, and timings only.
 - **Constant-time** comparison for the claim token hash.
 - **One-time claim:** returning the code and deleting the session are atomic
   under one lock.
@@ -175,6 +205,11 @@ Sessions carry a `kind` (only `SelfHost` today). The hosted signup flow
 confidential web client and whose claim path is the control plane rather than
 a polling daemon — the store, TTL, validation, and callback machinery are
 shared; only who built the URL and who claims differ.
+
+The seam enforces itself now rather than when the second kind lands:
+`POST /v1/claim` decides what it serves with an exhaustive match on the kind and
+no catch-all arm, so adding a variant is a compile error at that decision point
+instead of a variant silently inheriting the polling path.
 
 ## Daemon side
 
