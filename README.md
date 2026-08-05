@@ -1,28 +1,62 @@
-# squelch
+<div align="center">
 
-A local-first email intelligence service. It reads your Gmail (read-only), decides what actually deserves attention, catches bills and deadlines, and exposes that intelligence over MCP so an agent you already run can surface it to you. Your agent never holds your Gmail credential and never gets raw access to your mailbox.
+# 🎚️ squelch
+
+**Local-first email intelligence for your AI agent.**
+
+squelch reads your Gmail (read-only), decides what actually deserves attention, catches bills and deadlines, and serves that intelligence over MCP to an agent you already run. Your agent never holds your Gmail credential and never gets raw access to your mailbox.
+
+[![release](https://github.com/braelyn-ai/squelch/actions/workflows/release.yml/badge.svg)](https://github.com/braelyn-ai/squelch/actions/workflows/release.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](Cargo.toml)
+[![container](https://img.shields.io/badge/ghcr.io-braelyn--ai%2Fsquelchd-2496ED.svg)](deploy/DOCKER.md)
+
+[Quickstart](#quickstart) ·
+[How it works](#how-it-works) ·
+[Agent door](#the-agent-door) ·
+[Passband](#passband-the-macos-client) ·
+[Security](#security-posture) ·
+[Docs](#docs)
+
+</div>
+
+---
 
 The name comes from the radio control that mutes everything below a signal threshold. Same idea here: noise stays below the squelch line, signal comes through.
 
+## Features
+
+|     |     |
+| --- | --- |
+| 🚪 **Two doors, one daemon** | Agents get `/mcp`: ranked reads, no send/archive/delete. Humans get `/client`: bearer-authed search, threads, rules, and gated actions. |
+| 🔐 **Sealed auth mail** | 2FA codes, password resets, and login alerts are sealed at ingest. They never reach an LLM, an MCP response, or a list endpoint. |
+| ⚖️ **Deterministic first, models second** | Seal detection, then your sender rules, then heuristics. LLMs only refine what determinism can't settle, under daily budget caps. |
+| 💬 **Natural-language sender rules** | "only tell me about school closures" is a rule. Your words are passed to the model verbatim, in either polarity. |
+| 📅 **Bills, deadlines, shipments** | Extracted during triage and queryable as first-class tools. |
+| 🖥️ **Native clients** | Passband, a native macOS app over the human door, plus a ratatui TUI for setup and debugging. |
+| 📬 **Opt-in read receipts** | Per-send open tracking whose records live in your daemon, not on shared infrastructure. |
+| 🐳 **Self-host in one compose file** | Prebuilt multi-arch images on GHCR. No Rust toolchain on the box. |
+
 ## How it works
 
-```
-Gmail (REST API, gmail.readonly OAuth)
-        |  polling via history.list
-        v
-squelchd ── sync ──> SQLite ──> triage (seal -> rules -> 2-stage LLM)
-        |
-        ├── /mcp      agent door: 7 read tools, no writes,
-        |             auth emails (2FA, resets) structurally absent
-        └── /client   human door: bearer-authed rich API for your
-                      own clients, holds the only write actions
+```mermaid
+flowchart LR
+    G["Gmail REST API<br/>(gmail.readonly)"] -->|history.list poll| D[squelchd]
+    D --> S[(SQLite)]
+    S --> T["triage<br/>seal ➜ rules ➜ 2-stage LLM"]
+    T --> M["/mcp<br/>agent door"]
+    T --> C["/client<br/>human door"]
+    M --> A["your agent"]
+    C --> P["Passband · TUI"]
 ```
 
-- **Sync**: polls Gmail every 45s with a read-only token. Sent mail seeds a "people I know" contact list, which is the strongest cheap triage signal.
-- **Triage**: deterministic first, models second. Seal detection runs before anything else — auth mail is sealed at ingest and never reaches any LLM. Your sender rules also decide deterministically: a squelch/surface rule settles that sender with zero model spend. Everything else is stored with heuristic seed values (the rules ladder: bills, known contacts, alerts, newsletters, cold sales), then refined within the sync cycle by a small Stage-1 model (default `claude-haiku-4-5`) that scores every one of those emails: importance, tier, deadline, one-liner, plus a per-property "why". Rows the small model isn't confident about — and filtered-rule mail whose natural-language `want_text` needs actual judgment — escalate to a more capable Stage-2 model (default `claude-sonnet-5`). A filtered rule's `want_text` is your own standing instruction for that sender, passed to Stage-2 verbatim and read in whichever polarity you wrote it: "only tell me about school closures" and "i don't care about the emails saying the new version is approved" both work. Each stage has its own daily budget caps (one global cap for Stage-1, which sees nearly everything; per-thread, per-sender, and global caps for Stage-2) and its own token/cost ledger; no API key or an exhausted budget just means rows keep their heuristic values.
-- **Two doors**: agents connect to `/mcp` and get ranked summaries. They cannot send, archive, delete, or see auth-related mail. Your own clients connect to `/client` with a bearer token and get search, threads, sender rules, the sitrep lifecycle, and gated actions (archive, label, send) backed by a separate write-scoped token that only the action handlers can load.
+- **Sync**: polls Gmail every 45s with a read-only token. Sent mail seeds a "people I know" contact list, the strongest cheap triage signal.
+- **Triage**: seal detection runs before anything else, so auth mail never reaches any LLM. Your squelch/surface rules settle senders with zero model spend. Everything else gets heuristic seed values (bills, known contacts, alerts, newsletters, cold sales), then a small Stage-1 model (default `claude-haiku-4-5`) scores importance, tier, deadline, and a one-liner with a per-property "why". Low-confidence rows and natural-language rules that need real judgment escalate to Stage-2 (default `claude-sonnet-5`). Each stage has its own daily budget caps and cost ledger; no API key or an exhausted budget just means rows keep their heuristic values.
+- **Two doors**: agents connect to `/mcp` and get ranked summaries, and they cannot send, archive, delete, or see auth-related mail. Your own clients connect to `/client` with a bearer token and get search, threads, sender rules, the sitrep lifecycle, and gated actions (archive, label, send) backed by a separate write-scoped credential that only the action handlers can load.
 
-## Getting started
+## Quickstart
+
+> 🐳 **Prefer Docker?** Prebuilt images live at `ghcr.io/braelyn-ai/squelchd` (amd64 + arm64). [`deploy/DOCKER.md`](deploy/DOCKER.md) is the compose-file-and-env-vars path, no toolchain needed. And [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) walks a full setup end to end: daemon in Docker on a NAS, Passband on a Mac.
 
 ### 1. Create a Google Cloud OAuth client
 
@@ -44,7 +78,7 @@ SQUELCH_API_TOKEN=$(openssl rand -hex 32)   # for the human door
 
 Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`.
 
-To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key/provider; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be overridden at runtime (no restart) from the desktop app's Settings.
+To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be changed at runtime (no restart) from Passband's Settings.
 
 ### 3. Authorize and run
 
@@ -55,9 +89,19 @@ cargo run --bin squelchd -- auth     # one-time browser consent, token lands in 
 cargo run --bin squelchd -- serve    # sync + both doors on one port
 ```
 
-On a headless box use `squelchd auth --headless` and forward the port: `ssh -L 8847:127.0.0.1:8847 yourbox`. Grant write scopes later with `squelchd auth --write` (only needed for archive/send actions) — that runs two consent flows, minting the write credential and re-minting the read one, so the two slots stay in sync.
+Write scopes are a separate, later opt-in: `squelchd auth --write` (only needed for archive/send actions). It runs two consent flows, minting the write credential and re-minting the read one, so the two slots stay in sync.
 
-Where no browser can reach the box's loopback at all (docker on a NAS, a VPS), consent runs on a machine that *does* have a browser and the resulting token moves to the daemon:
+<details>
+<summary><b>Headless box</b> (SSH port-forward)</summary>
+
+Use `squelchd auth --headless` and forward the consent port: `ssh -L 8847:127.0.0.1:8847 yourbox`.
+
+</details>
+
+<details>
+<summary><b>No browser can reach the box at all</b> (docker on a NAS, a VPS): export/import</summary>
+
+Consent runs on a machine that *does* have a browser, and the resulting token moves to the daemon:
 
 ```sh
 # on your laptop, where the browser is:
@@ -67,17 +111,17 @@ squelchd auth --export --out cred.txt          # add --write for both credential
 docker exec -i squelchd squelchd auth --import < cred.txt
 ```
 
-`--export` runs the normal consent flow and stores nothing. `--out` writes the one line it produces as mode 0600, which a `> cred.txt` redirect cannot do: that takes your umask, and the file is a live refresh token. (Without `--out` the line goes to stdout and everything else goes to stderr, so `umask 077; squelchd auth --export > cred.txt` also works.)
+`--export` runs the normal consent flow and stores nothing. `--out` writes the one line it produces as mode 0600, which a `> cred.txt` redirect cannot do: that takes your umask, and the file is a live refresh token. (Without `--out` the line goes to stdout and everything else to stderr, so `umask 077; squelchd auth --export > cred.txt` also works.)
 
-`--import` reads that line from stdin only (never an argument: arguments show up in `ps` and in shell history). Before it stores anything, it refreshes every credential in the blob against this host's OAuth client and asks Google which mailbox the result opens and what it is allowed to do. A blob is unsigned JSON, so the account and the read/write slot it names for itself are claims, not evidence; nothing lands unless Google agrees with both, and one bad entry stores none of them. Delete `cred.txt` once it is in.
+`--import` reads that line from stdin only (never an argument: arguments show up in `ps` and shell history). Before storing anything, it refreshes every credential in the blob against this host's OAuth client and asks Google which mailbox the result opens and what it is allowed to do. A blob is unsigned JSON, so the account and slot it names for itself are claims, not evidence; nothing lands unless Google agrees with both, and one bad entry stores none of them. Delete `cred.txt` once it is in.
 
 Both machines must use the same `SQUELCH_CLIENT_ID` and `SQUELCH_CLIENT_SECRET`. A refresh token is bound to the OAuth client that minted it, not to a host, so it travels fine between machines and not at all between clients.
 
 If the laptop side is itself the published container image, run the export inside it with `-p 8847:8847` and add `--expose-consent-listener`: a listener on the container's own `127.0.0.1` is unreachable from your browser. That opens the port on every interface for the length of one consent, so it is opt-in.
 
-There is a `--broker` flag that moves the code instead of the token, and it is a dead end you should not spend time on: Google only lets a Desktop-type OAuth client redirect to loopback, so a consent relay can never receive the code. `squelch-broker` is built and hardened but not deployable for this tier. [docs/BROKER.md](docs/BROKER.md) has the details and the replacement.
+There is a `--broker` flag that moves the code instead of the token, and it is a dead end you should not spend time on: Google only lets a Desktop-type OAuth client redirect to loopback, so a consent relay can never receive the code. [docs/BROKER.md](docs/BROKER.md) has the details and the replacement.
 
-New to all of this? [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) walks the whole thing end to end for a daemon in Docker on a NAS with the Passband client on a Mac, including how to point the client at it.
+</details>
 
 ### 4. Connect an agent
 
@@ -99,23 +143,25 @@ To reach it from another machine on a tailnet: `tailscale serve --bg 8848`, set 
 cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 ```
 
-## Workspace layout
+## The agent door
 
-| Component | What it is |
+Seven tools, no mailbox writes, sealed mail structurally absent:
+
+| Tool | What it returns |
 |---|---|
-| `squelch-core` | types, SQLite store, seal detection, two-stage triage (rules + LLM), Gmail sync, OAuth |
-| [`squelch-mcp`](squelch-mcp/README.md) | the agent door (rmcp server, stdio or HTTP) |
-| [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) |
-| [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
-| [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
-| `passband` | Passband, the native macOS client over the human door |
-| [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
+| `get_inbox_updates` | ranked updates since a timestamp, with importance and a one-line "why" |
+| `get_thread` | a full thread by id |
+| `search_mail` | full-text search over synced mail |
+| `get_deadlines` | upcoming deadlines extracted during triage |
+| `get_shipments` | package tracking status |
+| `set_sender_rule` | squelch/surface/filter a sender, natural-language `want_text` supported |
+| `list_sender_rules` | the current rule set |
 
-Deployment notes for a Linux server live in [`deploy/DEPLOY.md`](deploy/DEPLOY.md); the Docker path (prebuilt images on GHCR, env-var config only) is [`deploy/DOCKER.md`](deploy/DOCKER.md). The desktop client design lives in [`docs/UX-DIRECTIONS.md`](docs/UX-DIRECTIONS.md).
+Sender rules are the one thing an agent can write, and they only shape triage inside squelch's own database. Nothing an agent does can touch your actual mailbox.
 
-## Building the macOS client
+## Passband, the macOS client
 
-Passband builds with `swiftc` directly — no Xcode needed for a local build.
+Passband is the native macOS client over the human door: the sitrep, threaded reading, compose with live markdown that sends as proper multipart HTML, contacts autocomplete, per-send read-receipt opt-in, sender rule tuning, sealed-mail reveal with an audit trail, and budget/usage dashboards.
 
 ```sh
 cd passband
@@ -124,20 +170,28 @@ cd passband
 ./build.sh release  # optimized
 ```
 
+No Xcode needed for a local build, `swiftc` does the work.
+
+<details>
+<summary><b>Code signing notes</b> (why local builds want a Developer ID cert)</summary>
+
 Local builds sign with whatever `Developer ID Application` certificate is in the keychain, falling back to ad-hoc when there is none. That is deliberate and worth knowing about: keychain ACLs match on a bundle's *designated requirement*, and an ad-hoc signature's requirement is a hash of the build itself, so every recompile looks like a new app and re-prompts for access to the stored credentials. A Developer ID requirement is keyed to the team and stays constant across rebuilds. Local builds also get `get-task-allow` so a debugger can attach; it is injected into a throwaway copy of the entitlements and never reaches a release, which the notary service would reject for carrying it.
 
 `VERSION` holds the user-facing version; the build number is the git commit count, so it only ever increases. Override either with `MARKETING_VERSION=` / `BUILD_NUMBER=`.
 
-### Releases
+</details>
 
-`./build-release.sh` produces a bundle that opens by double-click on any Mac: Developer ID signature, hardened runtime, Apple notarization, stapled ticket. Ad-hoc builds from `build.sh` do not — Gatekeeper blocks them everywhere but the machine that built them.
+<details>
+<summary><b>Releases</b> (sign, notarize, staple)</summary>
+
+`./build-release.sh` produces a bundle that opens by double-click on any Mac: Developer ID signature, hardened runtime, Apple notarization, stapled ticket. Ad-hoc builds from `build.sh` do not, Gatekeeper blocks them everywhere but the machine that built them.
 
 ```sh
 ./build-release.sh              # sign, notarize, staple, package
 ./build-release.sh --no-notary  # sign only; fast, still Gatekeeper-warned
 ```
 
-It picks up whatever `Developer ID Application` certificate is in the keychain; set `SIGN_ID` to choose explicitly. Notarization needs an **app-specific password** (generated at [appleid.apple.com](https://appleid.apple.com) under Sign-In and Security — *not* your Apple ID password), stored once:
+It picks up whatever `Developer ID Application` certificate is in the keychain; set `SIGN_ID` to choose explicitly. Notarization needs an **app-specific password** (generated at [appleid.apple.com](https://appleid.apple.com) under Sign-In and Security, *not* your Apple ID password), stored once:
 
 ```sh
 xcrun notarytool store-credentials squelch-notary \
@@ -146,9 +200,41 @@ xcrun notarytool store-credentials squelch-notary \
 
 Override the profile name with `NOTARY_PROFILE=`. Apple's turnaround is typically 2–15 minutes; on rejection the script fetches and prints the reason.
 
+</details>
+
+## Workspace layout
+
+| Component | What it is |
+|---|---|
+| `squelch-core` | types, SQLite store, seal detection, two-stage triage (rules + LLM), Gmail sync, OAuth |
+| [`squelch-mcp`](squelch-mcp/README.md) | the agent door (rmcp server, stdio or HTTP) |
+| [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) |
+| `squelch-httpauth` | shared HTTP auth layer used by both doors |
+| [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
+| [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
+| `passband` | Passband, the native macOS client over the human door |
+| [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
+
 ## Security posture
 
 - The sync credential is scoped `gmail.readonly`. The write credential (`gmail.modify` + `gmail.send`) lives in a separate slot and is only reachable from the human door's action handlers, which require an explicit confirm flag, run an outbound secret scan on sends, and audit every attempt.
 - Auth emails (2FA codes, password resets, login alerts) are sealed at ingest and never appear in any MCP response, any LLM call, or any list endpoint. Revealing one takes an explicit authenticated request and writes an audit row.
 - Email content is treated as untrusted input everywhere. Tokens never appear in logs.
-- Read tracking on mail you send is off by default and opt-in per send; the record lives in your daemon, never on shared infrastructure. Self-hosted deployments serve the pixel themselves and need no relay — see [docs/TRACKING.md](docs/TRACKING.md).
+- Read tracking on mail you send is off by default and opt-in per send; the record lives in your daemon, never on shared infrastructure. Self-hosted deployments serve the pixel themselves and need no relay.
+
+The full model is in [docs/SECURITY.md](docs/SECURITY.md).
+
+## Docs
+
+| Doc | Covers |
+|---|---|
+| [GETTING-STARTED.md](docs/GETTING-STARTED.md) | end-to-end walkthrough: daemon in Docker on a NAS, Passband on a Mac |
+| [deploy/DOCKER.md](deploy/DOCKER.md) | prebuilt GHCR images, compose file, env-var config |
+| [deploy/DEPLOY.md](deploy/DEPLOY.md) | deployment notes for a Linux server |
+| [SECURITY.md](docs/SECURITY.md) | the threat model and the two-door design |
+| [TRACKING.md](docs/TRACKING.md) | opt-in read receipts, self-hosted pixel |
+| [BROKER.md](docs/BROKER.md) | why the consent broker is a dead end, and what replaced it |
+
+## License
+
+[MIT](LICENSE) © Braelyn Boynton
