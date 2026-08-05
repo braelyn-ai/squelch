@@ -24,6 +24,14 @@ async fn main() -> anyhow::Result<()> {
     let environment = config.apns_env.as_str();
     let overridden = config.apns_url_override.is_some();
     let ephemeral_buffer = config.db_path.is_none();
+    let trusted_proxy_hops = config.trusted_proxy_hops;
+    let default_allowlist = config.trusted_proxy_cidrs.is_none();
+    let trusted_peers = config
+        .proxy_allowlist()
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let state = RelayState::new(config)?;
     let app = router(state);
@@ -38,6 +46,25 @@ async fn main() -> anyhow::Result<()> {
         environment,
         "squelch-relay: serving"
     );
+    // Which identity the limiters meter is not visible from any response, so an
+    // operator has no other way to tell a per-client relay from one where every
+    // caller shares a bucket. Header VALUES are never logged, only the mode.
+    if trusted_proxy_hops == 0 {
+        tracing::info!(
+            "SQUELCH_RELAY_TRUSTED_PROXY_HOPS is unset: rate limits key on the TCP peer address, so behind a TLS proxy every client shares ONE bucket; set it to the number of proxies in front of this listener (1 for a single one) to meter real clients"
+        );
+    } else {
+        tracing::info!(
+            hops = trusted_proxy_hops,
+            peers = %trusted_peers,
+            "rate limits key on X-Forwarded-For, counting from the right, but ONLY for a request whose TCP peer is one of those addresses; every other peer is metered by its own address, as is a request whose header is shorter than the hop count. THIS LISTENER MUST NOT BE REACHABLE EXCEPT THROUGH THE DECLARED PROXIES: anything that can open a connection to it from a trusted address chooses its own rate-limit identity"
+        );
+        if default_allowlist {
+            tracing::info!(
+                "SQUELCH_RELAY_TRUSTED_PROXY_CIDRS is unset, so the trusted peers are the default loopback plus RFC1918/RFC4193 private ranges (the sidecar or private-network proxy case); set it if your proxy reaches this listener from a public address"
+            );
+        }
+    }
     if !authed {
         tracing::warn!(
             "SQUELCH_RELAY_ALLOW_ANONYMOUS is set; POST /v1/push is served WITHOUT authentication"

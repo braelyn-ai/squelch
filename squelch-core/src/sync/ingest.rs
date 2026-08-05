@@ -119,7 +119,10 @@ fn decode_entities(s: &str) -> String {
     }
     /// Invisible layout characters that must not survive as text.
     fn zero_width(c: char) -> bool {
-        matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{AD}' | '\u{FEFF}' | '\u{2060}')
+        matches!(
+            c,
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{AD}' | '\u{FEFF}' | '\u{2060}'
+        )
     }
 
     let mut out = String::with_capacity(s.len());
@@ -140,7 +143,14 @@ fn decode_entities(s: &str) -> String {
                     None => num.parse::<u32>().ok(),
                 };
                 let c = cp.and_then(char::from_u32)?;
-                Some((if zero_width(c) { String::new() } else { c.to_string() }, semi + 1))
+                Some((
+                    if zero_width(c) {
+                        String::new()
+                    } else {
+                        c.to_string()
+                    },
+                    semi + 1,
+                ))
             } else {
                 None
             }
@@ -202,8 +212,14 @@ pub fn is_robot_address(addr: &str) -> bool {
 
     // Domain first-label hints (e.g. leave.mcmap.chase.com, unsub.beehiiv.com).
     let first_label = domain.split('.').next().unwrap_or("");
-    const DOMAIN_ROBOT_LABELS: &[&str] =
-        &["unsub", "unsubscribe", "leave", "bounce", "optout", "opt-out"];
+    const DOMAIN_ROBOT_LABELS: &[&str] = &[
+        "unsub",
+        "unsubscribe",
+        "leave",
+        "bounce",
+        "optout",
+        "opt-out",
+    ];
     if DOMAIN_ROBOT_LABELS.contains(&first_label) {
         return true;
     }
@@ -309,19 +325,377 @@ pub fn extract_unsub_headers(msg: &mail_parser::Message) -> (Option<String>, boo
     let one_click = list_unsub.is_some()
         && msg
             .header_raw("List-Unsubscribe-Post")
-            .map(|v| v.to_ascii_lowercase().contains("list-unsubscribe=one-click"))
+            .map(|v| {
+                v.to_ascii_lowercase()
+                    .contains("list-unsubscribe=one-click")
+            })
             .unwrap_or(false);
     (list_unsub, one_click)
+}
+
+/// The ONLY authserv-id we trust. Gmail stamps its verdict with this id on
+/// delivery; a header carrying any other id is one the sender could have typed.
+const GMAIL_AUTHSERV_ID: &str = "mx.google.com";
+
+/// Written by Google's own infrastructure on the inbound SMTP path, above the
+/// verdict it stamps.
+const GOOGLE_SOURCE_HEADER: &str = "X-Google-Smtp-Source";
+
+/// Written ONLY on mail Gmail PULLED with POP ("Check mail from other
+/// accounts") — a path that runs no inbound authentication whatsoever, so
+/// whatever `Authentication-Results` the message carries is the sender's text.
+const GMAIL_POP_HEADER: &str = "X-Gmail-Fetch-Info";
+
+const AUTH_RESULTS_HEADER: &str = "Authentication-Results";
+
+/// Read the email-authentication verdict from the TOPMOST `Authentication-Results`
+/// header. `Some(true)` = DMARC passed and bound to the From domain, or DKIM
+/// passed with a signing domain aligned to it. `Some(false)` = Gmail evaluated
+/// it and neither held. `None` = nothing evaluable (no header, not Gmail's
+/// authserv-id, no corroboration that Gmail handled the message, unparseable) —
+/// never an assertion of pass.
+///
+/// TOPMOST, NOT LAST. Gmail PREPENDS its own `Authentication-Results` when it
+/// accepts inbound mail and does NOT strip copies the sender wrote, so every
+/// occurrence below the first is attacker-controlled text. `Message::header_raw`
+/// resolves a name to its LAST occurrence — exactly the forgeable one. Nor can
+/// this walk `headers_raw()`: that is a `filter_map` which DROPS any header
+/// whose raw bytes are not valid UTF-8, and Gmail's own header is not
+/// guaranteed decodable because it echoes the envelope sender verbatim — an
+/// attacker who puts a high byte there would see their genuine verdict skipped
+/// and a header they wrote lower down promoted to "topmost". So this walks
+/// `headers()` (EVERY header, document order), takes the first one NAMED
+/// `Authentication-Results`, and slices the raw bytes itself. An undecodable
+/// genuine verdict is absence of evidence, never licence to look further down.
+///
+/// TWO `From` HEADERS => `None`. That is malformed per RFC 5322, and here it is
+/// a live attack primitive: `Message::from` resolves to the LAST `From` while
+/// the verdict is read off the FIRST `Authentication-Results`, so a sender who
+/// authenticates genuinely as their own domain could staple a second `From`
+/// below it and have the verdict attributed to a domain they do not own.
+///
+/// CORROBORATION. `mx.google.com` in the authserv-id is just a string the
+/// sender can type; Gmail only runs inbound authentication on mail delivered to
+/// its SMTP edge, NOT on mail pulled via POP or placed by
+/// `users.messages.import`/`insert`. So a Google-written header must appear
+/// ABOVE the verdict in document order (an `X-Google-Smtp-Source`, or a
+/// `Received` whose `by` clause is `mx.google.com` — both are stamped by the
+/// same hop that stamps the verdict, above it), and the POP marker must be
+/// absent.
+///
+/// RESIDUAL GAP, precisely: this is header-shape evidence, not a signature.
+/// Nothing in the bytes is cryptographically bound to Google, so on an
+/// ingestion path where Gmail prepends nothing — POP with the marker somehow
+/// absent, or `messages.import`/`insert` performed with the user's own
+/// credentials — a sender who writes BOTH a fake `Received: ... by
+/// mx.google.com` and a fake verdict still gets through. Closing that needs
+/// out-of-band evidence this parser cannot see (the Gmail API's own delivery
+/// metadata), and the blast radius is bounded: the verdict only ever gates the
+/// tracking-pixel bypass for an already-known contact.
+pub fn extract_auth_pass(msg: &mail_parser::Message, from_addr: &str) -> Option<bool> {
+    let headers = msg.headers();
+    if headers
+        .iter()
+        .filter(|h| matches!(h.name, mail_parser::HeaderName::From))
+        .count()
+        > 1
+    {
+        return None;
+    }
+    if headers
+        .iter()
+        .any(|h| h.name.as_str().eq_ignore_ascii_case(GMAIL_POP_HEADER))
+    {
+        return None;
+    }
+    let at = headers
+        .iter()
+        .position(|h| h.name.as_str().eq_ignore_ascii_case(AUTH_RESULTS_HEADER))?;
+    if !headers[..at]
+        .iter()
+        .any(|h| google_wrote(h, &msg.raw_message))
+    {
+        return None;
+    }
+    let header = &headers[at];
+    let bytes = msg
+        .raw_message
+        .get(header.offset_start as usize..header.offset_end as usize)?;
+    auth_results_verdict(std::str::from_utf8(bytes).ok()?, from_addr)
+}
+
+/// Is this header one Google's inbound path wrote? Either the
+/// `X-Google-Smtp-Source` stamp, or a `Received` handed off `by mx.google.com`.
+/// The `by` clause is matched as a whole token so `by mx.google.com.evil.tld`
+/// cannot satisfy it. A header whose raw bytes are not UTF-8 corroborates
+/// nothing.
+fn google_wrote(header: &mail_parser::Header, raw_message: &[u8]) -> bool {
+    let name = header.name.as_str();
+    if name.eq_ignore_ascii_case(GOOGLE_SOURCE_HEADER) {
+        return true;
+    }
+    if !name.eq_ignore_ascii_case("Received") {
+        return false;
+    }
+    let Some(value) = raw_message
+        .get(header.offset_start as usize..header.offset_end as usize)
+        .and_then(|b| std::str::from_utf8(b).ok())
+    else {
+        return false;
+    };
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    tokens.windows(2).any(|w| {
+        w[0].eq_ignore_ascii_case("by")
+            && w[1]
+                .trim_end_matches([';', '.', ','])
+                .eq_ignore_ascii_case(GMAIL_AUTHSERV_ID)
+    })
+}
+
+/// Evaluate one raw `Authentication-Results` value (RFC 8601) against the
+/// RFC5322 From address. Pure, so the whole trust decision is testable on header
+/// text alone.
+///
+/// EVERY `pass` MUST BIND TO THE FROM DOMAIN. `dmarc=pass` counts only when its
+/// `header.from=` — the domain Gmail itself evaluated — aligns with the From
+/// domain checked here; a `dmarc=pass` with a missing or mismatched
+/// `header.from` is no evidence at all, because a sender who owns
+/// `attacker.tld` genuinely passes DMARC for `attacker.tld`.
+///
+/// ALIGNMENT POLICY, deliberately narrow and stated here because the code cannot
+/// show what was rejected: the domains must be EQUAL, or the From domain must be
+/// a dot-suffixed child of the signing domain (`d=example.com` aligns with
+/// `From: x@news.example.com`). The reverse — a signature from a SUBDOMAIN
+/// standing in for the parent — is rejected: on a multi-tenant suffix, a tenant
+/// who controls `evil.shared.example` could otherwise authenticate mail claiming
+/// `From: billing@shared.example`. No public-suffix list is consulted (residual:
+/// a signature by a registry suffix such as `co.uk` would align with
+/// `victim.co.uk`, which needs a DKIM key for the suffix itself and so is not
+/// attacker-reachable).
+pub fn auth_results_verdict(raw: &str, from_addr: &str) -> Option<bool> {
+    let from_domain = addr_domain(from_addr)?;
+    let fields = tokenize_auth_results(raw)?;
+    let mut fields = fields.iter();
+    // authserv-id, optionally followed by an RFC 8601 version number.
+    let authserv = fields.next()?.first()?;
+    if !authserv.eq_ignore_ascii_case(GMAIL_AUTHSERV_ID) {
+        return None;
+    }
+
+    let mut evaluated = false;
+    let mut verdict = false;
+    for field in fields {
+        let Some((method, result)) = field[0].split_once('=') else {
+            continue;
+        };
+        evaluated = true;
+        if !result.eq_ignore_ascii_case("pass") {
+            continue;
+        }
+        let props = || field[1..].iter().map(String::as_str);
+        if method.eq_ignore_ascii_case("dmarc") {
+            if let Some(evaluated_from) = dmarc_header_from(props())
+                && domains_aligned(&evaluated_from, &from_domain)
+            {
+                verdict = true;
+            }
+            continue;
+        }
+        if method.eq_ignore_ascii_case("dkim")
+            && let Some(signing) = dkim_signing_domain(props())
+            && domains_aligned(&signing, &from_domain)
+        {
+            verdict = true;
+        }
+    }
+    // A Gmail header that ran no method at all ("mx.google.com; none") is an
+    // absence of evidence, not a failure.
+    evaluated.then_some(verdict)
+}
+
+/// Split one `Authentication-Results` value into fields of tokens in ONE pass,
+/// tracking RFC 5322 comment nesting AND quoted-string state together: `;` ends
+/// a field and whitespace ends a token ONLY at comment depth 0 and outside
+/// quotes. Both guards are load-bearing — Gmail's SPF comment routinely carries
+/// `;` and `=`, and it echoes the envelope MAIL FROM verbatim into
+/// `smtp.mailfrom=`, so a sender using `<"x; dmarc=pass y"@attacker.tld>` would
+/// otherwise manufacture a field the caller reads as a real method result. A
+/// quoted string stays inside the token that carries it (quotes and all), so its
+/// contents can never become a token of their own; a comment is dropped but
+/// still breaks the token, so it can never glue two together. `None` for a
+/// malformed value — an unterminated comment or quoted string, where the rest of
+/// the field list would be silently discarded.
+fn tokenize_auth_results(raw: &str) -> Option<Vec<Vec<String>>> {
+    let mut fields: Vec<Vec<String>> = Vec::new();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if escaped {
+            escaped = false;
+            if quoted && depth == 0 {
+                token.push(c);
+            }
+            continue;
+        }
+        // A quoted string suspends BOTH scanners, comment included: Gmail echoes
+        // the envelope MAIL FROM a second time inside the SPF comment
+        // ("domain of <sender> designates …"), and an RFC 5321 quoted local-part
+        // may legally contain `)`. Letting that `)` close the comment would put
+        // the rest of the sender's own text back at depth 0, where a `;` starts
+        // a field the caller reads as a real method result. Inside a comment the
+        // characters are still discarded — only the delimiters are neutralized.
+        if quoted {
+            match c {
+                '\\' => escaped = true,
+                '"' => {
+                    quoted = false;
+                    if depth == 0 {
+                        token.push('"');
+                    }
+                }
+                _ => {
+                    if depth == 0 {
+                        token.push(c);
+                    }
+                }
+            }
+            continue;
+        }
+        if depth > 0 {
+            match c {
+                '\\' => escaped = true,
+                '"' => quoted = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                quoted = true;
+                token.push('"');
+            }
+            '(' | ')' | ';' | ' ' | '\t' | '\r' | '\n' => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                match c {
+                    '(' => depth += 1,
+                    ';' => fields.push(std::mem::take(&mut tokens)),
+                    _ => {}
+                }
+            }
+            _ => token.push(c),
+        }
+    }
+    if depth != 0 || quoted || escaped {
+        return None;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    fields.push(tokens);
+    fields.retain(|f| !f.is_empty());
+    Some(fields)
+}
+
+/// The domain a `dmarc=` result was evaluated against, from its `header.from=`
+/// property spec. Gmail writes the bare domain; an `addr-spec` form is tolerated
+/// by taking the part after the last `@`.
+fn dmarc_header_from<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<String> {
+    for token in tokens {
+        let Some((key, val)) = token.split_once('=') else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("header.from") {
+            continue;
+        }
+        let val = val.trim_matches('"');
+        let val = val.rsplit_once('@').map_or(val, |(_, d)| d);
+        return (!val.is_empty()).then(|| val.to_string());
+    }
+    None
+}
+
+/// The signing domain of one `dkim=` result, from its property specs.
+/// `header.d` is authoritative. When only the AUID `header.i=` is present (the
+/// form Gmail usually emits) it is accepted, which DELEGATES the binding to
+/// Gmail's enforcement of RFC 6376 §3.5: a verifier must reject a signature
+/// whose `i=` domain is neither `d=` nor a subdomain of it, so the signer cannot
+/// name a domain it does not sign for. When BOTH are present that relationship
+/// is checked here rather than assumed, and a violation yields no signing domain
+/// at all.
+fn dkim_signing_domain<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut d: Option<String> = None;
+    let mut i: Option<String> = None;
+    for token in tokens {
+        let Some((key, val)) = token.split_once('=') else {
+            continue;
+        };
+        let val = val.trim_matches('"');
+        if key.eq_ignore_ascii_case("header.d") && d.is_none() {
+            d = (!val.is_empty()).then(|| val.to_ascii_lowercase());
+        }
+        if key.eq_ignore_ascii_case("header.i") && i.is_none() {
+            i = val
+                .rsplit_once('@')
+                .map(|(_, dom)| dom)
+                .filter(|dom| !dom.is_empty())
+                .map(str::to_ascii_lowercase);
+        }
+    }
+    match (d, i) {
+        (Some(d), Some(i)) => (i == d || i.ends_with(&format!(".{d}"))).then_some(d),
+        (Some(d), None) => Some(d),
+        (None, i) => i,
+    }
+}
+
+/// The domain half of an addr-spec, lower-cased. `None` for an address with no
+/// `@` or an empty domain — which makes the whole verdict `None`.
+fn addr_domain(addr: &str) -> Option<String> {
+    let (_, domain) = addr.trim().rsplit_once('@')?;
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!domain.is_empty()).then_some(domain)
+}
+
+/// Alignment per the policy documented on [`auth_results_verdict`]: equal, or
+/// the From domain is a dot-suffixed child of `signing`. One direction only.
+fn domains_aligned(signing: &str, from_domain: &str) -> bool {
+    let signing = signing.trim().trim_end_matches('.').to_ascii_lowercase();
+    let from_domain = from_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if signing.is_empty() || from_domain.is_empty() {
+        return false;
+    }
+    signing == from_domain
+        || from_domain
+            .strip_suffix(&signing)
+            .is_some_and(|parent| parent.ends_with('.') && parent.len() > 1)
 }
 
 /// Derive a stable thread key from headers when the Gmail thread id is absent:
 /// the root References id, else In-Reply-To, else this message's own Message-ID.
 pub fn fallback_thread_id(msg: &mail_parser::Message) -> Option<String> {
     // The first References id is the thread root.
-    if let Some(first) = msg.references().as_text_list().and_then(|l| l.iter().next()) {
+    if let Some(first) = msg
+        .references()
+        .as_text_list()
+        .and_then(|l| l.iter().next())
+    {
         return Some(first.to_string());
     }
-    if let Some(irt) = msg.in_reply_to().as_text_list().and_then(|l| l.iter().next()) {
+    if let Some(irt) = msg
+        .in_reply_to()
+        .as_text_list()
+        .and_then(|l| l.iter().next())
+    {
         return Some(irt.to_string());
     }
     msg.message_id().map(|s| s.to_string())
@@ -387,8 +761,7 @@ pub fn extract_attachments(m: &mail_parser::Message) -> Vec<AttachmentInfo> {
         // Keep bytes only when this part is within the per-attachment cap AND
         // keeping it would not push the message's stored total over its cap.
         let within_per = size <= ATTACHMENT_CAP_BYTES;
-        let within_total =
-            stored_total.saturating_add(size) <= MESSAGE_ATTACHMENT_TOTAL_CAP_BYTES;
+        let within_total = stored_total.saturating_add(size) <= MESSAGE_ATTACHMENT_TOTAL_CAP_BYTES;
         let data = if within_per && within_total {
             stored_total += size;
             Some(bytes.to_vec())
@@ -421,7 +794,9 @@ pub fn ingest(
     // Recipient addresses (To + Cc) — only meaningful for Sent mail, where they
     // become contacts. Collected here while the parse is in hand.
     let mut recipients: Vec<String> = Vec::new();
-    if fetched.is_sent && let Some(m) = &parsed {
+    if fetched.is_sent
+        && let Some(m) = &parsed
+    {
         if let Some(to) = m.to() {
             collect_addrs(to, &mut recipients);
         }
@@ -443,88 +818,90 @@ pub fn ingest(
         body_html,
         list_unsubscribe,
         list_unsub_one_click,
+        auth_pass,
     ) = match &parsed {
-            Some(m) => {
-                let (fa, fname) = m.from().map(first_addr).unwrap_or_default();
-                let subject = m.subject().unwrap_or("").to_string();
-                let received = m
-                    .date()
-                    .and_then(|d| DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok())
-                    .map(|d| d.with_timezone(&Utc))
-                    .or(fetched.internal_date)
-                    .unwrap_or(now);
-                // Prefer a plain-text body; fall back to HTML flattened to text.
-                // This flattened `text` is the UNCHANGED path that feeds triage,
-                // FTS, and the agent door — it must not be affected by the HTML
-                // work below.
-                //
-                // IMPORTANT: for an alternative carrying ONLY an HTML part,
-                // mail-parser registers that part under `text_body` too, so
-                // `body_text(0)` would run MAIL-PARSER'S html-to-text — which
-                // glues adjacent block elements ("EPIC SteakTable for 4") and
-                // leaks `<script type=...>` content (JSON-LD blobs), wrecking
-                // every word-boundary regex and the LLM/FTS/embed text
-                // downstream. Check the actual part type and route real HTML
-                // through OUR flattener, exactly like the body_html capture
-                // below.
-                let text = match m.text_part(0) {
-                    Some(p) if !p.is_text_html() => {
-                        p.text_contents().unwrap_or_default().to_string()
-                    }
-                    _ => match m.html_part(0).and_then(|p| p.text_contents()) {
-                        Some(h) => html_to_text(h),
-                        None => String::new(),
-                    },
-                };
-                // Separately: capture the RENDERED HTML body (when present) and
-                // sanitize it server-side for the human door. `None` for
-                // plain-text-only mail (leaves body_html NULL). This never feeds
-                // triage/FTS/MCP — only GET /client/thread/{id}.
-                //
-                // IMPORTANT: mail-parser's `body_html(0)` SYNTHESIZES HTML from a
-                // text/plain part when no real HTML alternative exists (it wraps
-                // the text in <p> tags), and `html_body_count()` counts that
-                // synthetic entry. We must NOT store that — a genuinely
-                // plain-text-only email has to leave body_html NULL. So we check
-                // the actual part type (`is_text_html`) and only capture a REAL
-                // `text/html` MIME part.
-                let body_html = m
-                    .html_part(0)
-                    .filter(|p| p.is_text_html())
-                    .and_then(|_| m.body_html(0))
-                    .map(|c| sanitize_email_html(&c))
-                    .filter(|s| !s.trim().is_empty());
-                let thr = fetched
-                    .gmail_thread_id
-                    .clone()
-                    .or_else(|| fallback_thread_id(m));
-                let (list_unsub, one_click) = extract_unsub_headers(m);
-                (
-                    fa,
-                    fname,
-                    subject,
-                    received,
-                    thr,
-                    m.message_id().map(|s| s.to_string()),
-                    text,
-                    body_html,
-                    list_unsub,
-                    one_click,
-                )
-            }
-            None => (
-                String::new(),
-                None,
-                String::new(),
-                fetched.internal_date.unwrap_or(now),
-                fetched.gmail_thread_id.clone(),
-                None,
-                String::new(),
-                None,
-                None,
-                false,
-            ),
-        };
+        Some(m) => {
+            let (fa, fname) = m.from().map(first_addr).unwrap_or_default();
+            let subject = m.subject().unwrap_or("").to_string();
+            let received = m
+                .date()
+                .and_then(|d| DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok())
+                .map(|d| d.with_timezone(&Utc))
+                .or(fetched.internal_date)
+                .unwrap_or(now);
+            // Prefer a plain-text body; fall back to HTML flattened to text.
+            // This flattened `text` is the UNCHANGED path that feeds triage,
+            // FTS, and the agent door — it must not be affected by the HTML
+            // work below.
+            //
+            // IMPORTANT: for an alternative carrying ONLY an HTML part,
+            // mail-parser registers that part under `text_body` too, so
+            // `body_text(0)` would run MAIL-PARSER'S html-to-text — which
+            // glues adjacent block elements ("EPIC SteakTable for 4") and
+            // leaks `<script type=...>` content (JSON-LD blobs), wrecking
+            // every word-boundary regex and the LLM/FTS/embed text
+            // downstream. Check the actual part type and route real HTML
+            // through OUR flattener, exactly like the body_html capture
+            // below.
+            let text = match m.text_part(0) {
+                Some(p) if !p.is_text_html() => p.text_contents().unwrap_or_default().to_string(),
+                _ => match m.html_part(0).and_then(|p| p.text_contents()) {
+                    Some(h) => html_to_text(h),
+                    None => String::new(),
+                },
+            };
+            // Separately: capture the RENDERED HTML body (when present) and
+            // sanitize it server-side for the human door. `None` for
+            // plain-text-only mail (leaves body_html NULL). This never feeds
+            // triage/FTS/MCP — only GET /client/thread/{id}.
+            //
+            // IMPORTANT: mail-parser's `body_html(0)` SYNTHESIZES HTML from a
+            // text/plain part when no real HTML alternative exists (it wraps
+            // the text in <p> tags), and `html_body_count()` counts that
+            // synthetic entry. We must NOT store that — a genuinely
+            // plain-text-only email has to leave body_html NULL. So we check
+            // the actual part type (`is_text_html`) and only capture a REAL
+            // `text/html` MIME part.
+            let body_html = m
+                .html_part(0)
+                .filter(|p| p.is_text_html())
+                .and_then(|_| m.body_html(0))
+                .map(|c| sanitize_email_html(&c))
+                .filter(|s| !s.trim().is_empty());
+            let thr = fetched
+                .gmail_thread_id
+                .clone()
+                .or_else(|| fallback_thread_id(m));
+            let (list_unsub, one_click) = extract_unsub_headers(m);
+            let auth_pass = extract_auth_pass(m, &fa);
+            (
+                fa,
+                fname,
+                subject,
+                received,
+                thr,
+                m.message_id().map(|s| s.to_string()),
+                text,
+                body_html,
+                list_unsub,
+                one_click,
+                auth_pass,
+            )
+        }
+        None => (
+            String::new(),
+            None,
+            String::new(),
+            fetched.internal_date.unwrap_or(now),
+            fetched.gmail_thread_id.clone(),
+            None,
+            String::new(),
+            None,
+            None,
+            false,
+            None,
+        ),
+    };
 
     // A gmail_msg_id is required to key the row. Fall back to Message-ID, then a
     // hash of the raw bytes so nothing collides on an empty string.
@@ -541,10 +918,7 @@ pub fn ingest(
     // Attachments (real + cid-inline), capped. Extracted once here and moved into
     // whichever TriagedMessage return path fires. Present for sealed mail too —
     // storage is fine; the byte-serving endpoint guards sealed parents.
-    let attachments = parsed
-        .as_ref()
-        .map(extract_attachments)
-        .unwrap_or_default();
+    let attachments = parsed.as_ref().map(extract_attachments).unwrap_or_default();
 
     // A compact snippet for list views; body text drives triage.
     let snippet: String = text.chars().take(200).collect();
@@ -584,6 +958,7 @@ pub fn ingest(
         is_sent: fetched.is_sent,
         list_unsubscribe,
         list_unsub_one_click,
+        auth_pass,
     };
 
     // ---- SEAL DETECTION FIRST (security invariant) ----------------------
@@ -716,8 +1091,7 @@ pub fn ingest_with_rules(
     if triaged.sensitivity == Sensitivity::Sealed || fetched.is_sent || rules.is_empty() {
         return triaged;
     }
-    let is_known = triaged.matched_rule.is_none()
-        && triaged.reason.contains("known contact");
+    let is_known = triaged.matched_rule.is_none() && triaged.reason.contains("known contact");
     let result = stage1_with_config(&triaged.message, is_known, rules, cfg, now);
     triaged.importance = result.importance;
     triaged.tier = result.tier;
@@ -802,7 +1176,8 @@ mod tests {
     fn entity_decode_covers_numeric_named_and_zero_width() {
         // Preheader padding (&zwnj;) must vanish entirely, not survive as
         // literal "&zwnj;" tokens in the text fed to FTS/LLM/embeddings.
-        let t = html_to_text("<p>Hi&zwnj;&zwnj; there &#8212; it&#x2019;s 6&nbsp;pm &copy;2026</p>");
+        let t =
+            html_to_text("<p>Hi&zwnj;&zwnj; there &#8212; it&#x2019;s 6&nbsp;pm &copy;2026</p>");
         assert_eq!(t, "Hi there \u{2014} it\u{2019}s 6 pm \u{A9}2026");
         // Unknown entities and bare ampersands pass through literally.
         let t = html_to_text("<p>AT&T &customentity; a &amp; b</p>");
@@ -1027,7 +1402,10 @@ mod tests {
                    reminder\r\n";
         let f = raw(1, "g-self", eml, true);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert!(t.recipients.is_empty(), "self address must never be a contact");
+        assert!(
+            t.recipients.is_empty(),
+            "self address must never be a contact"
+        );
     }
 
     #[test]
@@ -1166,7 +1544,10 @@ mod tests {
         let f = raw(1, "g-otp-rcpt", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(t.receipt.is_none(), "sealed mail must never yield a receipt");
+        assert!(
+            t.receipt.is_none(),
+            "sealed mail must never yield a receipt"
+        );
     }
 
     #[test]
@@ -1198,7 +1579,10 @@ mod tests {
                    Check our calendar of sales events. Unsubscribe here.\r\n";
         let f = raw(1, "g-cal-news", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert!(t.calendar.is_none(), "topical calendar prose must not classify");
+        assert!(
+            t.calendar.is_none(),
+            "topical calendar prose must not classify"
+        );
     }
 
     #[test]
@@ -1214,7 +1598,10 @@ mod tests {
         let f = raw(1, "g-otp-cal", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(t.calendar.is_none(), "sealed mail must never yield a calendar update");
+        assert!(
+            t.calendar.is_none(),
+            "sealed mail must never yield a calendar update"
+        );
     }
 
     #[test]
@@ -1229,7 +1616,10 @@ mod tests {
         let f = raw(1, "g-otp2", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(t.shipment.is_none(), "sealed mail must never yield a shipment");
+        assert!(
+            t.shipment.is_none(),
+            "sealed mail must never yield a shipment"
+        );
     }
 
     #[test]
@@ -1246,10 +1636,16 @@ mod tests {
                    Great stuff this week.\r\n";
         let f = raw(1, "g-unsub", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        let lu = t.message.list_unsubscribe.expect("list-unsubscribe captured");
+        let lu = t
+            .message
+            .list_unsubscribe
+            .expect("list-unsubscribe captured");
         assert!(lu.contains("mailto:unsub@substack.com"));
         assert!(lu.contains("https://substack.com/u/9"));
-        assert!(t.message.list_unsub_one_click, "RFC 8058 one-click detected");
+        assert!(
+            t.message.list_unsub_one_click,
+            "RFC 8058 one-click detected"
+        );
     }
 
     #[test]
@@ -1264,7 +1660,10 @@ mod tests {
         let f = raw(1, "g-unsub2", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert!(t.message.list_unsubscribe.is_some());
-        assert!(!t.message.list_unsub_one_click, "no List-Unsubscribe-Post => not one-click");
+        assert!(
+            !t.message.list_unsub_one_click,
+            "no List-Unsubscribe-Post => not one-click"
+        );
     }
 
     #[test]
@@ -1278,6 +1677,489 @@ mod tests {
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert!(t.message.list_unsubscribe.is_none());
         assert!(!t.message.list_unsub_one_click);
+    }
+
+    // ---- email authentication (Authentication-Results) -------------------
+
+    /// A real-shaped Gmail verdict line, comments and all.
+    fn gmail_ar(body: &str) -> String {
+        format!("mx.google.com;\r\n       {body}")
+    }
+
+    #[test]
+    fn no_auth_results_header_is_unknown_not_a_pass() {
+        assert_eq!(auth_results_verdict("", "a@example.com"), None);
+        let eml = "From: Alice <alice@friends.com>\r\n\
+                   Subject: dinner\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   friday?\r\n";
+        let f = raw(1, "g-no-ar", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.auth_pass, None);
+    }
+
+    #[test]
+    fn dmarc_pass_is_a_pass() {
+        let ar = gmail_ar(
+            "dkim=pass header.i=@github.com header.s=pf2023 header.b=Qk9nZTE7;\r\n       \
+             spf=pass (google.com: domain of noreply@github.com designates 140.82.113.1 \
+             as permitted sender) smtp.mailfrom=noreply@github.com;\r\n       \
+             dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=github.com",
+        );
+        assert_eq!(
+            auth_results_verdict(&ar, "noreply@github.com"),
+            Some(true),
+            "dmarc=pass is the primary path"
+        );
+        // …and stands on its own even when DKIM is not aligned.
+        let ar = gmail_ar("dkim=pass header.i=@sendgrid.net; dmarc=pass header.from=shop.com");
+        assert_eq!(auth_results_verdict(&ar, "hi@shop.com"), Some(true));
+    }
+
+    #[test]
+    fn dkim_pass_needs_the_signing_domain_aligned_to_from() {
+        // Aligned exactly.
+        let ar = gmail_ar("dkim=pass header.i=@stripe.com header.s=s1; spf=pass");
+        assert_eq!(auth_results_verdict(&ar, "receipts@stripe.com"), Some(true));
+        // Aligned as a parent domain (From is a subdomain of d=).
+        let ar = gmail_ar("dkim=pass header.d=stripe.com header.s=s1");
+        assert_eq!(
+            auth_results_verdict(&ar, "receipts@mail.stripe.com"),
+            Some(true)
+        );
+        // MISALIGNED: a genuine signature from somebody else's domain is not a
+        // statement about this From header — the whole spoofing case.
+        let ar = gmail_ar("dkim=pass header.i=@evil-mailer.net header.s=s1; spf=pass");
+        assert_eq!(auth_results_verdict(&ar, "boss@stripe.com"), Some(false));
+        // A suffix that is not a LABEL boundary must not align.
+        let ar = gmail_ar("dkim=pass header.d=stripe.com");
+        assert_eq!(auth_results_verdict(&ar, "x@notstripe.com"), Some(false));
+        // header.d wins over header.i when both are present.
+        let ar = gmail_ar("dkim=pass header.i=@stripe.com header.d=evil.net");
+        assert_eq!(auth_results_verdict(&ar, "x@stripe.com"), Some(false));
+    }
+
+    #[test]
+    fn dkim_and_dmarc_failing_is_an_explicit_fail() {
+        let ar = gmail_ar(
+            "dkim=fail header.i=@paypal.com header.s=s1;\r\n       \
+             spf=softfail (google.com: domain of transitioning x@paypal.com does not \
+             designate 1.2.3.4 as permitted sender) smtp.mailfrom=x@paypal.com;\r\n       \
+             dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=paypal.com",
+        );
+        assert_eq!(auth_results_verdict(&ar, "service@paypal.com"), Some(false));
+    }
+
+    #[test]
+    fn a_foreign_authserv_id_is_unknown_because_the_sender_could_have_written_it() {
+        let ar = "evil.example.com; dkim=pass header.i=@bank.com; dmarc=pass header.from=bank.com";
+        assert_eq!(auth_results_verdict(ar, "alerts@bank.com"), None);
+        // Gmail's id with an RFC 8601 version number still counts.
+        let ar = "mx.google.com 1; dmarc=pass header.from=bank.com";
+        assert_eq!(auth_results_verdict(ar, "alerts@bank.com"), Some(true));
+        // A header that names no method ran nothing: unknown, not a failure.
+        assert_eq!(auth_results_verdict("mx.google.com; none", "a@b.com"), None);
+        // No From domain to align against => nothing to decide.
+        assert_eq!(
+            auth_results_verdict("mx.google.com; dmarc=pass", "alice"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_topmost_header_counts_so_a_forged_copy_below_cannot_win() {
+        // Gmail PREPENDS its own verdict and leaves the sender's copy in place.
+        // The forged one sits below and must be ignored entirely — note that
+        // `header_raw` would have returned exactly this one.
+        let eml = "Delivered-To: me@example.com\r\n\
+                   X-Google-Smtp-Source: AGHT+IF7q9Zx\r\n\
+                   Received: from mail-ed1-f41.google.com (mail-ed1-f41.google.com. \
+                   [209.85.208.41])\r\n\tby mx.google.com with SMTPS id abc123 for \
+                   <me@example.com>;\r\n\tMon, 07 Jul 2026 03:00:00 -0700 (PDT)\r\n\
+                   Authentication-Results: mx.google.com;\r\n\
+                   \tdkim=fail header.i=@friend.com header.s=s1;\r\n\
+                   \tspf=fail (google.com: domain of x does not designate 1.2.3.4 as \
+                   permitted sender) smtp.mailfrom=x@attacker.tld;\r\n\
+                   \tdmarc=fail (p=NONE) header.from=friend.com\r\n\
+                   From: Friend <pal@friend.com>\r\n\
+                   Subject: hey\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; \
+                   dmarc=pass header.from=friend.com\r\n\
+                   \r\n\
+                   check this out\r\n";
+        let f = raw(1, "g-forged", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(
+            t.message.auth_pass,
+            Some(false),
+            "the genuine topmost verdict wins over the forged copy below it"
+        );
+
+        // The mirror image: the genuine header passes, a forged failing copy
+        // below cannot revoke it.
+        let eml = eml
+            .replace("dkim=fail header.i=@friend.com header.s=s1", "dkim=pass header.i=@friend.com header.s=s1")
+            .replace("dmarc=fail (p=NONE) header.from=friend.com", "dmarc=pass (p=NONE) header.from=friend.com")
+            .replace(
+                "Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; dmarc=pass header.from=friend.com",
+                "Authentication-Results: mx.google.com; dkim=fail; dmarc=fail",
+            );
+        let f = raw(1, "g-forged2", &eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.auth_pass, Some(true));
+    }
+
+    #[test]
+    fn folding_and_comment_whitespace_do_not_change_the_verdict() {
+        // Folded across four lines with tabs, and an SPF comment carrying both
+        // ';' and '=' — which would shred a naive split on ';'.
+        let folded = "mx.google.com;\r\n\tdkim=pass\r\n\t header.i=@notify.example.com\r\n\
+                      \t header.s=20230601 header.b=AbC/dEf+;\r\n\
+                      \tspf=pass (google.com: domain of bounce+7=x@notify.example.com \
+                      designates 209.85.220.41 as permitted sender; relaxed) \
+                      smtp.mailfrom=\"bounce+7=x@notify.example.com\";\r\n\
+                      \tdmarc=fail (p=NONE sp=NONE dis=NONE) header.from=notify.example.com";
+        assert_eq!(
+            auth_results_verdict(folded, "hello@notify.example.com"),
+            Some(true),
+            "aligned dkim=pass survives folding and a ';'-bearing comment"
+        );
+        // A comment must never glue two tokens into one.
+        let ar = "mx.google.com; dkim=pass(ok)header.d=example.com";
+        assert_eq!(auth_results_verdict(ar, "x@example.com"), Some(true));
+        // An escaped paren inside a comment does not end it early.
+        let ar = "mx.google.com; dkim=pass (a \\) dmarc=pass) header.d=evil.net";
+        assert_eq!(auth_results_verdict(ar, "x@example.com"), Some(false));
+    }
+
+    /// The headers Google writes above its own verdict on real inbound mail.
+    const GOOGLE_PREAMBLE: &str = "Delivered-To: me@example.com\r\n\
+         X-Google-Smtp-Source: AGHT+IF7q9Zx\r\n\
+         Received: from mail-ed1-f41.google.com (mail-ed1-f41.google.com. \
+         [209.85.208.41])\r\n\tby mx.google.com with SMTPS id abc123 for \
+         <me@example.com>;\r\n\tMon, 07 Jul 2026 03:00:00 -0700 (PDT)\r\n";
+
+    /// Run the verdict exactly as [`ingest`] does — From address taken from the
+    /// same parse — so header-level attacks are exercised end to end.
+    fn auth_pass_of(bytes: &[u8]) -> Option<bool> {
+        let parsed = MessageParser::default().parse(bytes).expect("parses");
+        let (from, _) = parsed.from().map(first_addr).unwrap_or_default();
+        extract_auth_pass(&parsed, &from)
+    }
+
+    /// HIGH 1. Gmail echoes the envelope MAIL FROM verbatim into
+    /// `smtp.mailfrom=`, so a sender using
+    /// `MAIL FROM:<"x; dmarc=pass y"@attacker.tld>` puts a semicolon inside a
+    /// quoted string in Gmail's own GENUINE, CORRECT verdict. A splitter with no
+    /// quoted-string state reads the tail as a field and manufactures a
+    /// `dmarc=pass` nobody wrote.
+    #[test]
+    fn a_semicolon_inside_the_quoted_envelope_sender_cannot_manufacture_a_field() {
+        let ar = "mx.google.com;\r\n \
+                  dkim=fail header.i=@friend.com header.s=s1;\r\n \
+                  spf=pass (google.com: domain of \"x; dmarc=pass y\"@attacker.tld \
+                  designates 1.2.3.4 as permitted sender) \
+                  smtp.mailfrom=\"x; dmarc=pass y\"@attacker.tld;\r\n \
+                  dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=friend.com";
+        assert_eq!(
+            auth_results_verdict(ar, "pal@friend.com"),
+            Some(false),
+            "a quoted ';' is data, not a field separator"
+        );
+        // The same guard the other way round: an open paren inside a quoted
+        // string is a literal and must not start a comment that swallows the
+        // rest of the value.
+        let ar = "mx.google.com; spf=pass smtp.mailfrom=\"a(b\"@attacker.tld; \
+                  dkim=pass header.d=friend.com";
+        assert_eq!(auth_results_verdict(ar, "pal@friend.com"), Some(true));
+    }
+
+    /// The same echo, one layer deeper. Gmail writes the envelope sender TWICE:
+    /// once in `smtp.mailfrom=` and once inside the SPF comment ("domain of
+    /// <sender> designates …"). A quoted local-part may legally carry `)`, so a
+    /// comment scanner that ignores quotes lets the sender close the comment
+    /// early and drop the rest of their own text back at depth 0, where a `;`
+    /// starts a field. The attacker owns attacker.tld, so SPF genuinely passes
+    /// and Gmail's verdict is entirely correct — the forgery is in the parse.
+    #[test]
+    fn a_quoted_paren_inside_the_spf_comment_cannot_close_it() {
+        let payloads = [
+            "dmarc=pass header.from=bank.com",
+            "dkim=pass header.d=bank.com",
+            "dkim=pass header.i=@bank.com",
+        ];
+        for payload in payloads {
+            let sender = format!("\"x); {payload}; y(\"@attacker.tld");
+            let ar = format!(
+                "mx.google.com;\r\n \
+                 spf=pass (google.com: domain of {sender} designates 203.0.113.9 \
+                 as permitted sender) smtp.mailfrom={sender};\r\n \
+                 dmarc=fail (p=REJECT sp=REJECT dis=NONE) header.from=bank.com"
+            );
+            assert_ne!(
+                auth_results_verdict(&ar, "billing@bank.com"),
+                Some(true),
+                "comment-escape forged a pass for {payload}"
+            );
+        }
+        // Gmail's own escaping of a structural character stays readable, and a
+        // genuine verdict for the same domain still passes.
+        let ar = "mx.google.com;\r\n \
+                  spf=pass (google.com: domain of bob@bank.com designates \
+                  203.0.113.9 as permitted sender) smtp.mailfrom=bob@bank.com;\r\n \
+                  dmarc=pass (p=REJECT) header.from=bank.com";
+        assert_eq!(auth_results_verdict(ar, "billing@bank.com"), Some(true));
+    }
+
+    /// HIGH 2a. `dmarc=pass` is a statement about the domain in its own
+    /// `header.from=`. An attacker who owns `attacker.tld` passes DMARC there
+    /// GENUINELY; unbound, that verdict would be read as a pass for whatever
+    /// From header the message carries.
+    #[test]
+    fn dmarc_pass_must_be_bound_to_the_from_domain() {
+        let ar = "mx.google.com; dkim=pass header.i=@attacker.tld header.s=s1; \
+                  spf=pass smtp.mailfrom=bob@attacker.tld; \
+                  dmarc=pass (p=NONE) header.from=attacker.tld";
+        assert_eq!(
+            auth_results_verdict(ar, "pal@friend.com"),
+            Some(false),
+            "a genuine pass for the attacker's own domain says nothing about From"
+        );
+        assert_eq!(auth_results_verdict(ar, "bob@attacker.tld"), Some(true));
+        // A dmarc=pass carrying no header.from at all is no evidence.
+        let ar = "mx.google.com; dmarc=pass (p=NONE)";
+        assert_eq!(auth_results_verdict(ar, "pal@friend.com"), Some(false));
+    }
+
+    /// HIGH 2b. `Message::from` resolves to the LAST `From` while the verdict
+    /// comes from the FIRST `Authentication-Results`, so two From headers let a
+    /// sender who authenticates as their own domain have that verdict credited
+    /// to a domain they do not own.
+    #[test]
+    fn two_from_headers_make_the_verdict_unknown() {
+        let eml = format!(
+            "{GOOGLE_PREAMBLE}\
+             Authentication-Results: mx.google.com; dkim=pass header.i=@attacker.tld \
+             header.s=s1; spf=pass smtp.mailfrom=bob@attacker.tld; dmarc=pass (p=NONE) \
+             header.from=attacker.tld\r\n\
+             From: Evil <evil@attacker.tld>\r\n\
+             From: Pal <pal@friend.com>\r\n\
+             Subject: hey\r\n\
+             Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+             \r\n\
+             check this out\r\n"
+        );
+        assert_eq!(auth_pass_of(eml.as_bytes()), None);
+        let f = raw(1, "g-two-from", &eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.auth_pass, None);
+        // One From, same verdict: still no pass, because it is not bound to it.
+        let single = eml.replace("From: Evil <evil@attacker.tld>\r\n", "");
+        assert_eq!(auth_pass_of(single.as_bytes()), Some(false));
+    }
+
+    /// MEDIUM 3. `headers_raw()` is a `filter_map` that DROPS undecodable
+    /// headers, so an attacker who gets a high byte echoed into Gmail's own
+    /// verdict (the `smtp.mailfrom=` of HIGH 1) would see it skipped and their
+    /// own copy below promoted to "topmost".
+    #[test]
+    fn an_undecodable_topmost_verdict_is_unknown_not_a_look_further_down() {
+        let mut eml: Vec<u8> = GOOGLE_PREAMBLE.as_bytes().to_vec();
+        eml.extend_from_slice(
+            b"Authentication-Results: mx.google.com; dkim=fail header.i=@friend.com; \
+              spf=pass smtp.mailfrom=",
+        );
+        eml.push(0xff);
+        eml.extend_from_slice(
+            b"@attacker.tld; dmarc=fail (p=NONE) header.from=friend.com\r\n\
+              Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; \
+              dmarc=pass header.from=friend.com\r\n\
+              From: Pal <pal@friend.com>\r\n\
+              Subject: hey\r\n\
+              Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+              \r\n\
+              check this out\r\n",
+        );
+        assert_eq!(
+            auth_pass_of(&eml),
+            None,
+            "an unreadable genuine verdict is absence of evidence"
+        );
+    }
+
+    /// MEDIUM 4. `mx.google.com` as an authserv-id is just a string the sender
+    /// typed unless Google's own headers corroborate that Google handled the
+    /// message. Gmail runs no inbound authentication on POP-pulled mail or on
+    /// `users.messages.import`/`insert`.
+    #[test]
+    fn a_verdict_with_no_google_written_header_above_it_is_unknown() {
+        let ar = "Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; \
+                  dmarc=pass header.from=friend.com\r\n";
+        let tail = "From: Pal <pal@friend.com>\r\n\
+                    Subject: hey\r\n\
+                    Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                    \r\n\
+                    check this out\r\n";
+        // Imported/inserted: nothing above the verdict but the sender's own text.
+        let eml = format!("Delivered-To: me@example.com\r\n{ar}{tail}");
+        assert_eq!(auth_pass_of(eml.as_bytes()), None);
+        // A Received that was NOT handed off by mx.google.com corroborates
+        // nothing, and the `by` clause is matched as a whole token.
+        let eml =
+            format!("Received: from x (x) by mx.google.com.evil.tld with SMTP id 1\r\n{ar}{tail}");
+        assert_eq!(auth_pass_of(eml.as_bytes()), None);
+        // Either genuine Google header, above the verdict, corroborates it.
+        let eml = format!("X-Google-Smtp-Source: AGHT+IF7q9Zx\r\n{ar}{tail}");
+        assert_eq!(auth_pass_of(eml.as_bytes()), Some(true));
+        let eml = format!(
+            "Received: from mail-ed1-f41.google.com (mail-ed1-f41.google.com. \
+             [209.85.208.41]) by mx.google.com with SMTPS id abc123\r\n{ar}{tail}"
+        );
+        assert_eq!(auth_pass_of(eml.as_bytes()), Some(true));
+        // Below the verdict it corroborates nothing — the sender wrote both.
+        let eml = format!("{ar}X-Google-Smtp-Source: AGHT+IF7q9Zx\r\n{tail}");
+        assert_eq!(auth_pass_of(eml.as_bytes()), None);
+        // POP-pulled mail ran no inbound authentication at all.
+        let eml = format!(
+            "X-Gmail-Fetch-Info: me@other.com 5 pop.other.com 995 me\r\n{GOOGLE_PREAMBLE}{ar}{tail}"
+        );
+        assert_eq!(auth_pass_of(eml.as_bytes()), None);
+    }
+
+    /// LOW 1. Alignment consults no public-suffix list, so it accepts only the
+    /// parent->child direction: a signature from a SUBDOMAIN must not stand in
+    /// for its parent, which on a multi-tenant suffix is the reachable attack.
+    #[test]
+    fn alignment_accepts_only_the_parent_direction() {
+        let ar = gmail_ar("dkim=pass header.d=evil-tenant.shared.example");
+        assert_eq!(
+            auth_results_verdict(ar.as_str(), "billing@shared.example"),
+            Some(false),
+            "a tenant subdomain cannot authenticate its parent"
+        );
+        // The probes that must stay failures for pal@friend.com.
+        for signing in [
+            "evil-gmail.com",
+            "gmail.com.evil.com",
+            "notfriend.com",
+            "friend.com.attacker.tld",
+        ] {
+            let ar = gmail_ar(&format!("dkim=pass header.d={signing}"));
+            assert_eq!(
+                auth_results_verdict(&ar, "pal@friend.com"),
+                Some(false),
+                "must not align: {signing}"
+            );
+        }
+        // The kept direction: the From domain is a child of the signing domain.
+        let ar = gmail_ar("dkim=pass header.d=friend.com");
+        assert_eq!(auth_results_verdict(&ar, "pal@mail.friend.com"), Some(true));
+    }
+
+    /// LOW 2. `header.i` is the AUID the SIGNER chooses; accepting it alone
+    /// delegates to Gmail's RFC 6376 enforcement. When `header.d` is also
+    /// present that relationship is checked here instead of assumed.
+    #[test]
+    fn header_i_is_only_trusted_when_it_agrees_with_header_d() {
+        // i under d: fine, and d is what is used.
+        let ar = gmail_ar("dkim=pass header.i=@mail.friend.com header.d=friend.com");
+        assert_eq!(auth_results_verdict(&ar, "pal@friend.com"), Some(true));
+        // i outside d: the pair is incoherent, so neither is usable.
+        let ar = gmail_ar("dkim=pass header.i=@friend.com header.d=attacker.tld");
+        assert_eq!(auth_results_verdict(&ar, "pal@friend.com"), Some(false));
+        // i alone stays accepted (the form Gmail usually emits).
+        let ar = gmail_ar("dkim=pass header.i=@friend.com header.s=s1");
+        assert_eq!(auth_results_verdict(&ar, "pal@friend.com"), Some(true));
+    }
+
+    /// LOW 3. An unbalanced open paren used to run to end-of-value, silently
+    /// discarding every field after it.
+    #[test]
+    fn an_unterminated_comment_or_quote_is_malformed_not_truncated() {
+        let ar = "mx.google.com; dkim=fail (unclosed; dmarc=fail header.from=friend.com";
+        assert_eq!(auth_results_verdict(ar, "pal@friend.com"), None);
+        let ar = "mx.google.com; spf=pass smtp.mailfrom=\"unclosed@attacker.tld; \
+                  dmarc=fail header.from=friend.com";
+        assert_eq!(auth_results_verdict(ar, "pal@friend.com"), None);
+    }
+
+    /// Every confirmed bypass, in one place: NONE of them may ever produce
+    /// `Some(true)`, which is the only value that opens the tracking-pixel gate.
+    mod adversarial {
+        use super::*;
+
+        #[test]
+        fn no_confirmed_bypass_produces_a_pass() {
+            let victim = "pal@friend.com";
+            let headers = [
+                // HIGH 1: quoted ';' in the echoed envelope sender.
+                "mx.google.com;\r\n dkim=fail header.i=@friend.com header.s=s1;\r\n \
+                 spf=pass (google.com: domain of \"x; dmarc=pass y\"@attacker.tld \
+                 designates 1.2.3.4 as permitted sender) \
+                 smtp.mailfrom=\"x; dmarc=pass y\"@attacker.tld;\r\n \
+                 dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=friend.com",
+                // HIGH 2a: a genuine pass for a domain the attacker owns.
+                "mx.google.com; dkim=pass header.i=@attacker.tld header.s=s1; \
+                 spf=pass smtp.mailfrom=bob@attacker.tld; \
+                 dmarc=pass (p=NONE) header.from=attacker.tld",
+                // LOW 1: a subdomain signature standing in for its parent.
+                "mx.google.com; dkim=pass header.d=evil.friend.com.attacker.tld",
+                // LOW 2: an AUID naming a domain the signature does not cover.
+                "mx.google.com; dkim=pass header.i=@friend.com header.d=attacker.tld",
+                // LOW 3: an unbalanced paren hiding the fields that follow.
+                "mx.google.com; dkim=fail (unclosed; dmarc=pass header.from=friend.com",
+            ];
+            for ar in headers {
+                assert_ne!(
+                    auth_results_verdict(ar, victim),
+                    Some(true),
+                    "bypass produced a pass: {ar}"
+                );
+            }
+
+            let tail = "From: Pal <pal@friend.com>\r\n\
+                        Subject: hey\r\n\
+                        Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                        \r\n\
+                        check this out\r\n";
+            // HIGH 2b: two From headers over a genuine attacker-domain verdict.
+            let ar = "Authentication-Results: mx.google.com; dkim=pass \
+                      header.i=@attacker.tld header.s=s1; spf=pass \
+                      smtp.mailfrom=bob@attacker.tld; dmarc=pass (p=NONE) \
+                      header.from=attacker.tld\r\n";
+            let two_from = format!("{GOOGLE_PREAMBLE}{ar}From: Evil <evil@attacker.tld>\r\n{tail}");
+            // MEDIUM 4: a forged verdict with no Google header above it.
+            let uncorroborated = format!(
+                "Delivered-To: me@example.com\r\n\
+                 Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; \
+                 dmarc=pass header.from=friend.com\r\n{tail}"
+            );
+            for eml in [two_from, uncorroborated] {
+                assert_ne!(
+                    auth_pass_of(eml.as_bytes()),
+                    Some(true),
+                    "bypass produced a pass: {eml}"
+                );
+            }
+
+            // MEDIUM 3: an undecodable genuine verdict must not promote the
+            // forged copy below it.
+            let mut eml: Vec<u8> = GOOGLE_PREAMBLE.as_bytes().to_vec();
+            eml.extend_from_slice(
+                b"Authentication-Results: mx.google.com; dkim=fail header.i=@friend.com; \
+                  spf=pass smtp.mailfrom=",
+            );
+            eml.push(0xff);
+            eml.extend_from_slice(
+                b"@attacker.tld; dmarc=fail (p=NONE) header.from=friend.com\r\n\
+                  Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; \
+                  dmarc=pass header.from=friend.com\r\n",
+            );
+            eml.extend_from_slice(tail.as_bytes());
+            assert_ne!(auth_pass_of(&eml), Some(true));
+        }
     }
 
     #[test]
@@ -1354,7 +2236,10 @@ mod tests {
         // The oversized part keeps its metadata (real size) but drops its bytes.
         let big_att = a.iter().find(|x| x.filename == "big.bin").expect("big");
         assert_eq!(big_att.size_bytes, (11 * 1024 * 1024) as i64);
-        assert!(big_att.data.is_none(), "over-cap attachment stores no bytes");
+        assert!(
+            big_att.data.is_none(),
+            "over-cap attachment stores no bytes"
+        );
     }
 
     #[test]
@@ -1389,7 +2274,11 @@ mod tests {
         let f = raw(1, "g-sealed-att", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert_eq!(t.attachments.len(), 1, "sealed mail's attachment is still extracted for storage");
+        assert_eq!(
+            t.attachments.len(),
+            1,
+            "sealed mail's attachment is still extracted for storage"
+        );
         assert_eq!(t.attachments[0].filename, "statement.pdf");
     }
 
@@ -1424,7 +2313,10 @@ mod tests {
         let updates = store
             .attention_updates(acct, now - chrono::Duration::days(1), None, None, None)
             .unwrap();
-        assert!(updates.is_empty(), "sent mail never enters the attention bands");
+        assert!(
+            updates.is_empty(),
+            "sent mail never enters the attention bands"
+        );
         // Recipients still seed contacts.
         assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
 
@@ -1440,9 +2332,17 @@ mod tests {
             now,
         )
         .unwrap();
-        assert_eq!(again, Some(id), "idempotent on the UNIQUE(account, gmail id) upsert");
         assert_eq!(
-            store.thread_view_with_html(acct, "thread-77").unwrap().messages.len(),
+            again,
+            Some(id),
+            "idempotent on the UNIQUE(account, gmail id) upsert"
+        );
+        assert_eq!(
+            store
+                .thread_view_with_html(acct, "thread-77")
+                .unwrap()
+                .messages
+                .len(),
             1
         );
     }
@@ -1470,6 +2370,7 @@ mod tests {
                 is_sent: false,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
+                auth_pass: None,
             })
             .unwrap();
         store
@@ -1510,7 +2411,11 @@ mod tests {
         // parent alone rather than 404ing on a sealed member.
         assert!(store.sealed_messages(acct).unwrap().is_empty());
         let view = store.thread_view_with_html(acct, "thread-88").unwrap();
-        assert_eq!(view.messages.len(), 1, "only the parent; the echo was skipped");
+        assert_eq!(
+            view.messages.len(),
+            1,
+            "only the parent; the echo was skipped"
+        );
         // Contacts are not seeded either — the whole write was skipped.
         assert!(!store.is_known_contact(acct, "support@bank.com").unwrap());
     }

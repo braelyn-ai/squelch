@@ -3,14 +3,18 @@
 
 use super::super::*;
 use super::support::*;
-use crate::store::sqlite::tracking::MAX_OPENS_PER_TOKEN;
+use crate::store::sqlite::tracking::{MAX_OPENS_PER_TOKEN, TRACKER_RETENTION_SECS};
 
 /// A tracker + the sent message it points at, the shape every tracked send ends
 /// up in once its echo has landed.
 fn tracked(store: &SqliteStore, acct: AccountId, token: &str) -> i64 {
     let message_id = triaged(acct, "sent-1", "thread-77").seed(store);
     store.insert_send_tracker(acct, token, None, 1_000).unwrap();
-    assert!(store.set_send_tracker_message(acct, token, message_id).unwrap());
+    assert!(
+        store
+            .set_send_tracker_message(acct, token, message_id)
+            .unwrap()
+    );
     message_id
 }
 
@@ -21,13 +25,27 @@ fn tracker_and_opens_round_trip_through_the_join() {
 
     assert!(store.message_opens(acct, message_id).unwrap().is_empty());
 
-    assert!(store.record_open(acct, "tok-abc", 1_100, Some("Apple Mail/16.0"), "unknown").unwrap());
     assert!(
         store
-            .record_open(acct, "tok-abc", 1_050, Some("… GoogleImageProxy"), "proxied")
+            .record_open(acct, "tok-abc", 1_100, Some("Apple Mail/16.0"), "unknown")
             .unwrap()
     );
-    assert!(store.record_open(acct, "tok-abc", 1_200, None, "unknown").unwrap());
+    assert!(
+        store
+            .record_open(
+                acct,
+                "tok-abc",
+                1_050,
+                Some("… GoogleImageProxy"),
+                "proxied"
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .record_open(acct, "tok-abc", 1_200, None, "unknown")
+            .unwrap()
+    );
 
     let opens = store.message_opens(acct, message_id).unwrap();
     // Oldest first, regardless of insert order, and every column survives.
@@ -60,7 +78,11 @@ fn an_unknown_token_records_nothing() {
     let (store, acct) = store();
     let message_id = tracked(&store, acct, "tok-abc");
 
-    assert!(!store.record_open(acct, "tok-nope", 1_100, None, "unknown").unwrap());
+    assert!(
+        !store
+            .record_open(acct, "tok-nope", 1_100, None, "unknown")
+            .unwrap()
+    );
     assert!(!store.record_open(acct, "", 1_100, None, "unknown").unwrap());
     assert!(store.message_opens(acct, message_id).unwrap().is_empty());
 }
@@ -73,8 +95,16 @@ fn trackers_do_not_cross_accounts() {
     let theirs = store.ensure_account("other@example.com").unwrap();
     let message_id = tracked(&store, mine, "tok-abc");
 
-    assert!(!store.record_open(theirs, "tok-abc", 1_100, None, "unknown").unwrap());
-    assert!(!store.set_send_tracker_message(theirs, "tok-abc", 999).unwrap());
+    assert!(
+        !store
+            .record_open(theirs, "tok-abc", 1_100, None, "unknown")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .set_send_tracker_message(theirs, "tok-abc", 999)
+            .unwrap()
+    );
     assert!(store.tracked_message(theirs, "tok-abc").unwrap().is_none());
     assert!(store.message_opens(theirs, message_id).unwrap().is_empty());
 }
@@ -84,13 +114,23 @@ fn trackers_do_not_cross_accounts() {
 #[test]
 fn opens_survive_a_late_message_id_backfill() {
     let (store, acct) = store();
-    store.insert_send_tracker(acct, "tok-late", None, 1_000).unwrap();
-    assert!(store.record_open(acct, "tok-late", 1_100, None, "unknown").unwrap());
+    store
+        .insert_send_tracker(acct, "tok-late", None, 1_000)
+        .unwrap();
+    assert!(
+        store
+            .record_open(acct, "tok-late", 1_100, None, "unknown")
+            .unwrap()
+    );
     // Nothing to point a notification at yet.
     assert!(store.tracked_message(acct, "tok-late").unwrap().is_none());
 
     let message_id = triaged(acct, "sent-late", "thread-9").seed(&store);
-    assert!(store.set_send_tracker_message(acct, "tok-late", message_id).unwrap());
+    assert!(
+        store
+            .set_send_tracker_message(acct, "tok-late", message_id)
+            .unwrap()
+    );
 
     assert_eq!(store.message_opens(acct, message_id).unwrap().len(), 1);
     let tracked = store.tracked_message(acct, "tok-late").unwrap().unwrap();
@@ -105,11 +145,19 @@ fn each_tracker_reports_only_its_own_message() {
     let (store, acct) = store();
     let first = tracked(&store, acct, "tok-1");
     let second = triaged(acct, "sent-2", "thread-77").seed(&store);
-    store.insert_send_tracker(acct, "tok-2", Some(second), 2_000).unwrap();
+    store
+        .insert_send_tracker(acct, "tok-2", Some(second), 2_000)
+        .unwrap();
 
-    store.record_open(acct, "tok-1", 1_100, None, "unknown").unwrap();
-    store.record_open(acct, "tok-2", 2_100, None, "unknown").unwrap();
-    store.record_open(acct, "tok-2", 2_200, None, "unknown").unwrap();
+    store
+        .record_open(acct, "tok-1", 1_100, None, "unknown")
+        .unwrap();
+    store
+        .record_open(acct, "tok-2", 2_100, None, "unknown")
+        .unwrap();
+    store
+        .record_open(acct, "tok-2", 2_200, None, "unknown")
+        .unwrap();
 
     assert_eq!(store.message_opens(acct, first).unwrap().len(), 1);
     assert_eq!(store.message_opens(acct, second).unwrap().len(), 2);
@@ -124,7 +172,9 @@ fn one_token_stops_recording_at_the_cap() {
     let message_id = tracked(&store, acct, "tok-flood");
 
     for i in 0..(MAX_OPENS_PER_TOKEN as i64 + 25) {
-        store.record_open(acct, "tok-flood", 1_000 + i, None, "unknown").unwrap();
+        store
+            .record_open(acct, "tok-flood", 1_000 + i, None, "unknown")
+            .unwrap();
     }
 
     let opens = store.message_opens(acct, message_id).unwrap();
@@ -132,7 +182,11 @@ fn one_token_stops_recording_at_the_cap() {
     // The cap drops the tail, so the earliest opens — the ones that carry the
     // signal — are what survive.
     assert_eq!(opens[0].opened_at, 1_000);
-    assert!(!store.record_open(acct, "tok-flood", 9_999, None, "unknown").unwrap());
+    assert!(
+        !store
+            .record_open(acct, "tok-flood", 9_999, None, "unknown")
+            .unwrap()
+    );
 }
 
 /// The cap is per token, not per table: a busy tracker must not silence a
@@ -142,13 +196,123 @@ fn the_cap_does_not_leak_across_tokens() {
     let (store, acct) = store();
     let loud = tracked(&store, acct, "tok-loud");
     let quiet = triaged(acct, "sent-2", "thread-77").seed(&store);
-    store.insert_send_tracker(acct, "tok-quiet", Some(quiet), 2_000).unwrap();
+    store
+        .insert_send_tracker(acct, "tok-quiet", Some(quiet), 2_000)
+        .unwrap();
 
     for i in 0..(MAX_OPENS_PER_TOKEN as i64 + 5) {
-        store.record_open(acct, "tok-loud", 1_000 + i, None, "unknown").unwrap();
+        store
+            .record_open(acct, "tok-loud", 1_000 + i, None, "unknown")
+            .unwrap();
     }
-    assert!(store.record_open(acct, "tok-quiet", 2_000, None, "unknown").unwrap());
+    assert!(
+        store
+            .record_open(acct, "tok-quiet", 2_000, None, "unknown")
+            .unwrap()
+    );
 
-    assert_eq!(store.message_opens(acct, loud).unwrap().len(), MAX_OPENS_PER_TOKEN);
+    assert_eq!(
+        store.message_opens(acct, loud).unwrap().len(),
+        MAX_OPENS_PER_TOKEN
+    );
     assert_eq!(store.message_opens(acct, quiet).unwrap().len(), 1);
+}
+
+/// A pixel URL lives in the recipient's mailbox for as long as the mail does, so
+/// the tracker has to retire on its own: past the window the same fetch that
+/// recorded yesterday records nothing, while a recent send still collects.
+#[test]
+fn a_tracker_stops_collecting_past_the_retention_window() {
+    let (store, acct) = store();
+    let sent_at = 1_700_000_000;
+    let old = triaged(acct, "sent-old", "thread-1").seed(&store);
+    store
+        .insert_send_tracker(acct, "tok-old", Some(old), sent_at)
+        .unwrap();
+    let recent = triaged(acct, "sent-new", "thread-2").seed(&store);
+    store
+        .insert_send_tracker(acct, "tok-new", Some(recent), sent_at)
+        .unwrap();
+
+    let at = |offset: i64| sent_at + offset;
+    assert!(
+        store
+            .record_open(
+                acct,
+                "tok-old",
+                at(TRACKER_RETENTION_SECS - 1),
+                None,
+                "unknown"
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .record_open(acct, "tok-old", at(TRACKER_RETENTION_SECS), None, "unknown")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .record_open(
+                acct,
+                "tok-old",
+                at(TRACKER_RETENTION_SECS * 5),
+                None,
+                "unknown"
+            )
+            .unwrap()
+    );
+
+    // The window is per tracker, measured from ITS send.
+    assert!(
+        store
+            .record_open(acct, "tok-new", at(60), None, "unknown")
+            .unwrap()
+    );
+
+    assert_eq!(store.message_opens(acct, old).unwrap().len(), 1);
+    assert_eq!(store.message_opens(acct, recent).unwrap().len(), 1);
+}
+
+/// What the send path does when the mail never reached the wire: the token goes,
+/// and the tracker is a stranger from then on.
+#[test]
+fn deleting_a_tracker_takes_its_opens_with_it() {
+    let (store, acct) = store();
+    let message_id = tracked(&store, acct, "tok-gone");
+    assert!(
+        store
+            .record_open(acct, "tok-gone", 1_100, None, "unknown")
+            .unwrap()
+    );
+
+    assert!(store.delete_send_tracker(acct, "tok-gone").unwrap());
+    assert!(store.message_opens(acct, message_id).unwrap().is_empty());
+    assert!(store.tracked_message(acct, "tok-gone").unwrap().is_none());
+    assert!(
+        !store
+            .record_open(acct, "tok-gone", 1_200, None, "unknown")
+            .unwrap()
+    );
+    // Deleting what is already gone is not an error.
+    assert!(!store.delete_send_tracker(acct, "tok-gone").unwrap());
+}
+
+/// `message_opens` carries no account of its own, so the delete has to be scoped
+/// through the tracker — otherwise another account's token would take this
+/// account's opens with it.
+#[test]
+fn deleting_a_tracker_does_not_cross_accounts() {
+    let (store, mine) = store();
+    let theirs = store.ensure_account("other@example.com").unwrap();
+    let message_id = tracked(&store, mine, "tok-abc");
+    assert!(
+        store
+            .record_open(mine, "tok-abc", 1_100, None, "unknown")
+            .unwrap()
+    );
+
+    assert!(!store.delete_send_tracker(theirs, "tok-abc").unwrap());
+    assert_eq!(store.message_opens(mine, message_id).unwrap().len(), 1);
+    assert!(store.tracked_message(mine, "tok-abc").unwrap().is_some());
 }

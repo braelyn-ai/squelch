@@ -9,12 +9,7 @@ use super::*;
 /// Returns `true` ONLY on the call that actually adds the column, which is what
 /// lets a caller run a one-time backfill on the open that introduces it — never
 /// on a fresh DB (schema.sql already carries it) and never again after.
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> Result<bool> {
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
     let mut present = false;
@@ -29,7 +24,10 @@ fn add_column_if_missing(
     // An empty `table_info` means the table does not exist yet; skipping then
     // keeps this seam per-table independent for tests that build partial schemas.
     if any && !present {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
         return Ok(true);
     }
     Ok(false)
@@ -46,6 +44,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         "list_unsub_one_click",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // Email-authentication verdict. NULL on every pre-existing row and NOT
+    // backfilled: NULL is the safe reading (no tracking-pixel bypass), and a
+    // re-sync refills it through the message upsert.
+    add_column_if_missing(conn, "messages", "auth_pass", "INTEGER")?;
     // Per-property triage reasons (JSON object). NULL on pre-existing rows.
     add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
 

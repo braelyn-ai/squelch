@@ -45,7 +45,10 @@ fn ingest_message_persists_attachments_and_thread_view_carries_them() {
     assert!(atts[0].downloadable);
 
     // Bytes come back through attachment_bytes.
-    let got = store.attachment_bytes(acct, atts[0].id).unwrap().expect("bytes");
+    let got = store
+        .attachment_bytes(acct, atts[0].id)
+        .unwrap()
+        .expect("bytes");
     assert_eq!(got.0, "doc.pdf");
     assert_eq!(got.2.as_deref(), Some(&b"Hello"[..]));
 
@@ -53,7 +56,11 @@ fn ingest_message_persists_attachments_and_thread_view_carries_them() {
     let mid2 = store.ingest_message(&t).unwrap();
     assert_eq!(mid, mid2);
     let view2 = store.thread_view_with_html(acct, "t1").unwrap();
-    assert_eq!(view2.messages[0].attachments.len(), 1, "re-ingest must not duplicate");
+    assert_eq!(
+        view2.messages[0].attachments.len(),
+        1,
+        "re-ingest must not duplicate"
+    );
 }
 
 #[test]
@@ -91,9 +98,46 @@ fn double_attached_identical_file_cannot_kill_ingest() {
     let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
     assert_eq!(t.attachments.len(), 2, "both parts extracted");
     // The ingest MUST NOT error — identical duplicates collapse to one row.
-    store.ingest_message(&t).expect("duplicate attachments must not fail ingest");
+    store
+        .ingest_message(&t)
+        .expect("duplicate attachments must not fail ingest");
     let view = store.thread_view_with_html(acct, "t-dup").unwrap();
     assert_eq!(view.messages[0].attachments.len(), 1);
+}
+
+#[test]
+fn auth_pass_round_trips_through_the_thread_view_and_self_heals_on_re_upsert() {
+    let (store, acct) = store();
+    // Pinned so the view's received_at ordering is stable across the re-upsert.
+    let at = |n: i64| Utc::now() - chrono::Duration::minutes(10 - n);
+
+    // Pre-existing mail: never evaluated, so it rests at NULL.
+    triaged(acct, "g-null", "t-auth")
+        .received_at(at(1))
+        .upsert(&store);
+    // Evaluated mail, both verdicts.
+    triaged(acct, "g-pass", "t-auth")
+        .received_at(at(2))
+        .auth_pass(Some(true))
+        .upsert(&store);
+    triaged(acct, "g-fail", "t-auth")
+        .received_at(at(3))
+        .auth_pass(Some(false))
+        .upsert(&store);
+
+    let view = store.thread_view_with_html(acct, "t-auth").unwrap();
+    let got: Vec<Option<bool>> = view.messages.iter().map(|m| m.auth_pass).collect();
+    assert_eq!(got, vec![None, Some(true), Some(false)]);
+
+    // A re-sync of the NULL row refills the column through the upsert's DO
+    // UPDATE half — which is why no backfill is needed.
+    triaged(acct, "g-null", "t-auth")
+        .received_at(at(1))
+        .auth_pass(Some(true))
+        .upsert(&store);
+    let view = store.thread_view_with_html(acct, "t-auth").unwrap();
+    assert_eq!(view.messages.len(), 3, "re-upsert is still one row");
+    assert_eq!(view.messages[0].auth_pass, Some(true));
 }
 
 #[test]
@@ -106,7 +150,14 @@ fn attachment_bytes_guards_sealed_overcap_and_unknown() {
         .insert_attachment(acct, mid, "doc.pdf", "application/pdf", 5, Some(b"Hello"))
         .unwrap();
     let a_over = store
-        .insert_attachment(acct, mid, "big.bin", "application/octet-stream", 11_000_000, None)
+        .insert_attachment(
+            acct,
+            mid,
+            "big.bin",
+            "application/octet-stream",
+            11_000_000,
+            None,
+        )
         .unwrap();
 
     // Normal parent, bytes present.
@@ -114,7 +165,10 @@ fn attachment_bytes_guards_sealed_overcap_and_unknown() {
     assert_eq!(ok.2.as_deref(), Some(&b"Hello"[..]));
 
     // Over-cap: row resolves but data is None (endpoint -> 410).
-    let over = store.attachment_bytes(acct, a_over).unwrap().expect("metadata row exists");
+    let over = store
+        .attachment_bytes(acct, a_over)
+        .unwrap()
+        .expect("metadata row exists");
     assert!(over.2.is_none(), "over-cap attachment carries no bytes");
 
     // Unknown id -> None (endpoint -> 404).
@@ -122,9 +176,18 @@ fn attachment_bytes_guards_sealed_overcap_and_unknown() {
 
     // Sealed parent: attachment is stored, but attachment_bytes hides it
     // (returns None, indistinguishable from unknown -> 404).
-    let sid = triaged(acct, "g2", "t2").sealed(SealedKind::Otp).seed(&store);
+    let sid = triaged(acct, "g2", "t2")
+        .sealed(SealedKind::Otp)
+        .seed(&store);
     let sealed_att = store
-        .insert_attachment(acct, sid, "secret.pdf", "application/pdf", 6, Some(b"secret"))
+        .insert_attachment(
+            acct,
+            sid,
+            "secret.pdf",
+            "application/pdf",
+            6,
+            Some(b"secret"),
+        )
         .unwrap();
     assert!(
         store.attachment_bytes(acct, sealed_att).unwrap().is_none(),
@@ -151,16 +214,32 @@ fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
 
     // HUMAN DOOR: attention_updates carries the parsed field_reasons.
     let ups = store
-        .attention_updates(acct, Utc::now() - chrono::Duration::days(1), None, None, None)
+        .attention_updates(
+            acct,
+            Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == id).expect("row present");
-    let fr = u.update.field_reasons.as_ref().expect("field_reasons present");
-    assert_eq!(fr.importance.as_deref(), Some("known contact -> signal importance 72"));
+    let fr = u
+        .update
+        .field_reasons
+        .as_ref()
+        .expect("field_reasons present");
+    assert_eq!(
+        fr.importance.as_deref(),
+        Some("known contact -> signal importance 72")
+    );
     assert_eq!(fr.tier.as_deref(), Some("known contact -> signal"));
     assert!(fr.deadline.is_none());
     // And it serializes into the /client/updates JSON as an object.
     let v = serde_json::to_value(&u.update).unwrap();
-    assert_eq!(v["field_reasons"]["tier"], serde_json::json!("known contact -> signal"));
+    assert_eq!(
+        v["field_reasons"]["tier"],
+        serde_json::json!("known contact -> signal")
+    );
 
     // AGENT DOOR: ranked_updates (MCP) never carries field_reasons — the key
     // is absent from the serialized Update.
@@ -170,7 +249,10 @@ fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
     let r = ranked.iter().find(|u| u.id == id).expect("row present");
     assert!(r.field_reasons.is_none());
     let rv = serde_json::to_value(r).unwrap();
-    assert!(rv.get("field_reasons").is_none(), "MCP payload must omit field_reasons: {rv}");
+    assert!(
+        rv.get("field_reasons").is_none(),
+        "MCP payload must omit field_reasons: {rv}"
+    );
     // Same byte-absence discipline for the paperclip flag.
     assert!(r.has_attachments.is_none());
     assert!(
@@ -190,7 +272,13 @@ fn predating_triage_row_reads_back_as_none() {
         .reason("y")
         .seed(&store);
     let ups = store
-        .attention_updates(acct, Utc::now() - chrono::Duration::days(1), None, None, None)
+        .attention_updates(
+            acct,
+            Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == mid).unwrap();
     assert!(u.update.field_reasons.is_none());
@@ -236,7 +324,10 @@ fn thread_id_for_message_resolves_normal_and_hides_sealed() {
         .seed(&store);
 
     assert_eq!(
-        store.thread_id_for_message(acct, normal).unwrap().as_deref(),
+        store
+            .thread_id_for_message(acct, normal)
+            .unwrap()
+            .as_deref(),
         Some("t1")
     );
     assert_eq!(store.thread_id_for_message(acct, 999_999).unwrap(), None);
@@ -318,7 +409,11 @@ fn deadlines_exclude_sealed_source() {
         conn.execute(
             "INSERT INTO deadlines(account_id, message_id, kind, due_at, past_due, source)
              VALUES(?1,?2,'bill',?3,0,'regex')",
-            params![acct, mid, (Utc::now() + chrono::Duration::days(2)).to_rfc3339()],
+            params![
+                acct,
+                mid,
+                (Utc::now() + chrono::Duration::days(2)).to_rfc3339()
+            ],
         )
         .unwrap();
     }
@@ -401,7 +496,10 @@ fn reingest_preserves_llm_classification_but_refreshes_heuristic_rows() {
     triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
     let ups = store.ranked_updates(acct, since, None).unwrap();
     let ua = ups.iter().find(|u| u.id == a).expect("row A present");
-    assert_eq!(ua.importance, 88, "paid LLM importance preserved on re-ingest");
+    assert_eq!(
+        ua.importance, 88,
+        "paid LLM importance preserved on re-ingest"
+    );
     assert_eq!(ua.one_line, "LLM verdict", "paid LLM one_line preserved");
     assert_eq!(ua.tier, Tier::Signal, "paid LLM tier preserved");
 

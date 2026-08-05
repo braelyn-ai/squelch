@@ -510,6 +510,8 @@ mod tests {
             auth_token: None,
             apns_url_override: None,
             db_path: None,
+            trusted_proxy_hops: 0,
+            trusted_proxy_cidrs: None,
         };
         RelayState::new(config).unwrap()
     }

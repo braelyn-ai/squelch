@@ -445,16 +445,15 @@ impl SquelchServer {
 #[tool_handler]
 impl ServerHandler for SquelchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "squelch: local-first email intelligence. Read-only over your \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "squelch: local-first email intelligence. Read-only over your \
                  mailbox; the only writes are local sender rules. Use search_mail \
                  to find mail (summaries only) and get_thread to read a thread — \
                  pass a result's thread_id (get_thread also accepts a message id). \
                  get_deadlines lists bills due; get_shipments lists packages in \
                  transit. Auth/2FA/verification emails are never exposed through \
                  these tools.",
-            )
+        )
     }
 }
 
@@ -488,10 +487,21 @@ mod tests {
             is_sent: false,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         };
         let nid = store.upsert_message(&normal).unwrap();
         store
-            .set_triage(nid, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                nid,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         normal.gmail_msg_id = "g2".into();
         normal.thread_id = "t2".into();
@@ -531,7 +541,9 @@ mod tests {
         assert!(rows[0].surfaced_at.is_some());
 
         // Sealed row: still status='new', surfaced_at NULL (never stamped).
-        let stats = store.stats(acct).unwrap();
+        let stats = store
+            .stats(acct, chrono::Utc::now() - chrono::Duration::days(30))
+            .unwrap();
         assert_eq!(stats.sealed, 1);
     }
 
@@ -597,6 +609,7 @@ mod tests {
             is_sent: false,
             list_unsubscribe: None,
             list_unsub_one_click: false,
+            auth_pass: None,
         };
         let id = store.upsert_message(&msg).unwrap();
         store
@@ -611,7 +624,15 @@ mod tests {
     async fn search_mail_returns_summaries_and_excludes_sealed() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@localhost").unwrap();
-        seed_msg(&store, acct, "g1", "t1", "quarterly invoice from acme", Sensitivity::Normal, None);
+        seed_msg(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "quarterly invoice from acme",
+            Sensitivity::Normal,
+            None,
+        );
         // A sealed OTP that also matches the query token — must never surface.
         seed_msg(
             &store,
@@ -640,10 +661,18 @@ mod tests {
         let hit = &hits[0];
         assert_eq!(hit["thread_id"], "t1");
         assert_eq!(hit["relevance"], 1);
-        assert!(hit["sender"].as_str().unwrap().contains("alice@example.com"));
+        assert!(
+            hit["sender"]
+                .as_str()
+                .unwrap()
+                .contains("alice@example.com")
+        );
         // SUMMARY ONLY: the one_line is the subject; there is no `body` field.
         assert_eq!(hit["one_line"], "quarterly invoice from acme");
-        assert!(hit.get("body").is_none(), "search_mail must never emit a body");
+        assert!(
+            hit.get("body").is_none(),
+            "search_mail must never emit a body"
+        );
     }
 
     /// get_thread forgiveness: a MESSAGE id resolves to its thread; a sealed
@@ -652,21 +681,40 @@ mod tests {
     async fn get_thread_resolves_message_id_and_seals_indistinguishably() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@localhost").unwrap();
-        let mid = seed_msg(&store, acct, "g1", "t1", "hello there", Sensitivity::Normal, None);
-        let sealed_mid =
-            seed_msg(&store, acct, "g2", "t2", "code 123", Sensitivity::Sealed, Some(SealedKind::Otp));
+        let mid = seed_msg(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "hello there",
+            Sensitivity::Normal,
+            None,
+        );
+        let sealed_mid = seed_msg(
+            &store,
+            acct,
+            "g2",
+            "t2",
+            "code 123",
+            Sensitivity::Sealed,
+            Some(SealedKind::Otp),
+        );
 
         let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
 
         // Thread id works (path 1).
-        assert!(server
-            .get_thread(Parameters(GetThreadParams { id: "t1".into() }))
-            .await
-            .is_ok());
+        assert!(
+            server
+                .get_thread(Parameters(GetThreadParams { id: "t1".into() }))
+                .await
+                .is_ok()
+        );
 
         // Message id resolves to its thread (path 2, forgiveness).
         let by_msg = server
-            .get_thread(Parameters(GetThreadParams { id: mid.to_string() }))
+            .get_thread(Parameters(GetThreadParams {
+                id: mid.to_string(),
+            }))
             .await
             .unwrap();
         let text = by_msg.content[0].as_text().unwrap().text.as_str();
@@ -675,11 +723,15 @@ mod tests {
 
         // A SEALED message id and a nonexistent id both 404 identically.
         let sealed_err = server
-            .get_thread(Parameters(GetThreadParams { id: sealed_mid.to_string() }))
+            .get_thread(Parameters(GetThreadParams {
+                id: sealed_mid.to_string(),
+            }))
             .await
             .unwrap_err();
         let missing_err = server
-            .get_thread(Parameters(GetThreadParams { id: "999999".into() }))
+            .get_thread(Parameters(GetThreadParams {
+                id: "999999".into(),
+            }))
             .await
             .unwrap_err();
         assert_eq!(sealed_err.code, missing_err.code);
@@ -700,7 +752,15 @@ mod tests {
         use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@localhost").unwrap();
-        let mid = seed_msg(&store, acct, "g1", "t1", "shipped", Sensitivity::Normal, None);
+        let mid = seed_msg(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "shipped",
+            Sensitivity::Normal,
+            None,
+        );
         store
             .upsert_shipment(
                 acct,
@@ -734,7 +794,9 @@ mod tests {
 
         // Default: en-route only.
         let res = server
-            .get_shipments(Parameters(GetShipmentsParams { include_delivered: None }))
+            .get_shipments(Parameters(GetShipmentsParams {
+                include_delivered: None,
+            }))
             .await
             .unwrap();
         let text = res.content[0].as_text().unwrap().text.as_str();

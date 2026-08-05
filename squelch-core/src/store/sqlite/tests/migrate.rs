@@ -1,8 +1,8 @@
 //! Migration + init upgrade-path tests.
 
+use super::super::migrate::migrate;
 use super::super::*;
 use super::support::*;
-use super::super::migrate::migrate;
 use crate::types::Sensitivity;
 
 #[test]
@@ -26,6 +26,36 @@ fn migrate_adds_unsub_columns_to_a_preexisting_messages_table() {
         .unwrap();
     assert!(cols.iter().any(|c| c == "list_unsubscribe"));
     assert!(cols.iter().any(|c| c == "list_unsub_one_click"));
+}
+
+#[test]
+fn migrate_adds_auth_pass_null_to_a_preexisting_messages_table() {
+    // An install predating the email-authentication column. The migration adds
+    // it, and every historical row rests at NULL — no backfill, which is what
+    // makes pre-existing mail read as "no tracking-pixel bypass".
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, body TEXT);
+         INSERT INTO messages(id, account_id, gmail_msg_id, body) VALUES (1, 1, 'g1', 'old');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)").unwrap();
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "auth_pass"));
+    let existing: Option<i64> = conn
+        .query_row("SELECT auth_pass FROM messages WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(existing, None, "pre-existing mail is never backfilled");
 }
 
 #[test]
@@ -163,12 +193,18 @@ fn migrate_cleans_year_slipped_stage_deadlines() {
     assert_eq!(dl1, None);
     assert_eq!(tier1, "deadline");
     let n1: i64 = conn
-        .query_row("SELECT COUNT(*) FROM deadlines WHERE message_id=1", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM deadlines WHERE message_id=1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n1, 0);
     // Deterministic source ('subject'): untouched (explicit text is data).
     let dl2: Option<String> = conn
-        .query_row("SELECT deadline FROM triage WHERE message_id=2", [], |r| r.get(0))
+        .query_row("SELECT deadline FROM triage WHERE message_id=2", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(dl2.is_some(), "deterministic-source deadline must survive");
 }
@@ -200,10 +236,26 @@ fn migrate_backfill_keeps_only_processed_history_out_of_stage1() {
         )
         .unwrap()
     };
-    assert_eq!(get(1).0.as_deref(), Some("migrated"), "seen/finalized row out of Stage-1");
-    assert_eq!(get(2).0.as_deref(), Some("migrated"), "old stage-2 processed row out");
-    assert_eq!(get(3).0, None, "genuinely-new unprocessed row re-enters Stage-1");
-    assert_eq!(get(3).1, 0, "residual row's needs_stage2 rests at 0 (Stage-1 recomputes)");
+    assert_eq!(
+        get(1).0.as_deref(),
+        Some("migrated"),
+        "seen/finalized row out of Stage-1"
+    );
+    assert_eq!(
+        get(2).0.as_deref(),
+        Some("migrated"),
+        "old stage-2 processed row out"
+    );
+    assert_eq!(
+        get(3).0,
+        None,
+        "genuinely-new unprocessed row re-enters Stage-1"
+    );
+    assert_eq!(
+        get(3).1,
+        0,
+        "residual row's needs_stage2 rests at 0 (Stage-1 recomputes)"
+    );
 }
 
 // ---- categorize-then-extract: schema migration + extractor queue -------
@@ -228,7 +280,10 @@ fn migrate_adds_category_and_extractor_columns_to_preexisting_triage() {
         .unwrap()
         .collect::<std::result::Result<_, _>>()
         .unwrap();
-    assert!(cols.iter().any(|c| c == "category"), "category column added");
+    assert!(
+        cols.iter().any(|c| c == "category"),
+        "category column added"
+    );
     assert!(
         cols.iter().any(|c| c == "extractor_model_used"),
         "extractor_model_used column added"

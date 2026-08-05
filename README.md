@@ -81,6 +81,10 @@ Both machines must use the same `SQUELCH_CLIENT_ID` and `SQUELCH_CLIENT_SECRET`.
 
 If the laptop side is itself the published container image, run the export inside it with `-p 8847:8847` and add `--expose-consent-listener`: a listener on the container's own `127.0.0.1` is unreachable from your browser. That opens the port on every interface for the length of one consent, so it is opt-in.
 
+There is a `--broker` flag that moves the code instead of the token, and it is a dead end you should not spend time on: Google only lets a Desktop-type OAuth client redirect to loopback, so a consent relay can never receive the code. `squelch-broker` is built and hardened but not deployable for this tier. [docs/BROKER.md](docs/BROKER.md) has the details and the replacement.
+
+New to all of this? [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) walks the whole thing end to end for a daemon in Docker on a NAS with the Passband client on a Mac, including how to point the client at it.
+
 ### 4. Connect an agent
 
 Point any MCP client at the streamable HTTP endpoint:

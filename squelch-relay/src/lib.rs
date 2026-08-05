@@ -15,7 +15,7 @@ pub mod opens;
 pub mod ratelimit;
 mod state;
 
-pub use config::{Config, ConfigError, Environment};
+pub use config::{Cidr, Config, ConfigError, Environment};
 pub use jwt::{JwtError, JwtSigner};
 pub use opens::Open;
 pub use state::RelayState;

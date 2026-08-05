@@ -116,6 +116,28 @@ authentication is allowed but never *defaulted* into — a missing
 `SQUELCH_RELAY_AUTH_TOKEN` is a refusal to boot unless
 `SQUELCH_RELAY_ALLOW_ANONYMOUS=1` says the operator meant it.
 
+**Set `SQUELCH_RELAY_TRUSTED_PROXY_HOPS` when you deploy behind a TLS proxy**
+(`1` on Railway). Without it the rate limiters key on the TCP peer, which behind
+a proxy is the proxy: every client in the world then shares one bucket, and one
+of them can 429 all the rest. It is opt-in because `X-Forwarded-For` is
+caller-supplied — believing it wholesale would let anyone mint unlimited
+identities. The number is your assertion of how much of that header your own
+infrastructure appended: only the rightmost `N` entries are read, and a request
+whose header cannot supply the Nth from the right falls back to the peer (the
+shared bucket) rather than to anything the caller wrote.
+
+That claim is about traffic arriving **through** your proxies, so it is honoured
+only for a connection whose TCP peer is one of them:
+`SQUELCH_RELAY_TRUSTED_PROXY_CIDRS` is the list, and unset it defaults to
+loopback plus the RFC1918/RFC4193 private ranges — the sidecar and
+private-network cases. Any other peer is metered by its own address, header or
+no header. **With hops set, the listener must not be reachable except through the
+declared proxies**: anything that can connect from a trusted address picks its
+own rate-limit identity, one fresh bucket per request, which is both limiters
+gone. Widening `SQUELCH_RELAY_BIND` past the proxy is how that happens by
+accident. The binary logs which mode and which peers are active at startup, never
+a header value.
+
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `SQUELCH_RELAY_BIND` | no | `127.0.0.1:8850` | Listen address. Loopback by design — TLS is terminated by a proxy in front. |
@@ -128,6 +150,8 @@ authentication is allowed but never *defaulted* into — a missing
 | `SQUELCH_RELAY_AUTH_TOKEN` | yes* | — | Bearer required by `POST /v1/push` (constant-time compare). Minimum 32 characters. |
 | `SQUELCH_RELAY_ALLOW_ANONYMOUS` | no | `0` | `1` serves `POST /v1/push` open-but-rate-limited, and is the *only* way to omit the bearer. Setting both is an error. |
 | `SQUELCH_RELAY_DB_PATH` | no | — | SQLite file for the open buffer. Unset keeps it in memory: the binary warns at startup, and opens the daemon has not drained are lost on restart. |
+| `SQUELCH_RELAY_TRUSTED_PROXY_HOPS` | no | `0` | How many proxies you run in front of this listener. `0` trusts nothing and rate-limits on the TCP peer. `N` keys on the Nth-from-the-right `X-Forwarded-For` entry; `1` is the single-TLS-proxy case (Railway). Max 8. Setting it above `0` is a promise that **this listener is not reachable except through the declared proxies** — anything that can connect directly from a trusted address chooses its own rate-limit identity. |
+| `SQUELCH_RELAY_TRUSTED_PROXY_CIDRS` | no | loopback + RFC1918 + RFC4193 | Comma-separated CIDR blocks (or bare addresses) whose `X-Forwarded-For` is read at all; every other peer is metered by its own address. Only consulted when `SQUELCH_RELAY_TRUSTED_PROXY_HOPS` is above `0`, and setting it without one is an error. Naming a list replaces the default outright, so include loopback if you still want it. |
 | `SQUELCH_RELAY_LOG` | no | `info` | `tracing` env filter. |
 | `SQUELCH_RELAY_APNS_URL_OVERRIDE` | no | — | **Test only.** Points the relay at a mock APNs base URL instead of Apple. Never set in production; the binary logs a warning when it is. |
 
@@ -172,17 +196,25 @@ finished within the 30-second whole-batch budget reports `status: 0` with reason
 `timeout`. Only a malformed request gets a 4xx, and an over-budget client gets a
 `429` (120 requests/minute per client IP, in-memory and per-process; the limiter
 sits *inside* the auth layer, so unauthenticated junk cannot spend a real
-client's budget).
+client's budget). "Client IP" is the TCP peer unless
+`SQUELCH_RELAY_TRUSTED_PROXY_HOPS` says otherwise *and* the peer is one of the
+proxies named by `SQUELCH_RELAY_TRUSTED_PROXY_CIDRS`.
 
 `GET /t/{token}` → always `200` with a 42-byte transparent GIF,
 `Content-Type: image/gif`, `Cache-Control: no-store, no-cache`,
 `Pragma: no-cache`. No auth — the callers are mail clients — and metered against
 its own per-IP buckets (600/minute) so pixel traffic can never spend the
-daemon's push budget. The response is **byte-identical for every token**: valid,
+daemon's push budget. The limit stays generous on purpose: a mail provider that
+proxies images fetches all of its users' pixels from a few of its own addresses,
+and a 429 here is an open lost for good, since no mail client retries an image. The response is **byte-identical for every token**: valid,
 unknown, expired, or garbage. A token matching `^[A-Za-z0-9_-]{16,64}$` is
 buffered as `(token, opened_at, user_agent)` with the user agent truncated to
 512 bytes; anything else is served the same pixel and dropped. At most 50 rows
-are kept per token, and rows older than 90 days are swept.
+are kept per token, rows older than 90 days are swept, and the whole buffer is
+capped at 1,000,000 rows. That cap evicts from the tokens holding the *most* rows
+first, not the oldest rows globally: the relay cannot tell a minted token from an
+invented one, so newest-wins would let a flood of junk delete opens an offline
+daemon had not drained yet. Any eviction is logged with a count (never a token).
 
 `GET /v1/opens?cursor=N` — behind the same bearer as `/v1/push`:
 
@@ -272,10 +304,18 @@ deployed yet.
   the abuse surface is real, i.e. at distribution. *v1 ships both halves of the
   cheap answer: a static bearer (required by default, opt-out typed) plus a
   per-IP limiter mounted inside the auth layer. The limiter is in-memory and
-  keyed on the TCP peer, so behind the TLS proxy the whole deployment shares one
-  bucket — `X-Forwarded-For` is caller-supplied and trusting it would hand any
-  client unlimited identities. That shared bucket is exactly why auth is the
-  outer layer: unauthenticated floods must not spend it. The bucket map is
+  keyed on the TCP peer by default, so behind a TLS proxy the whole deployment
+  shares one bucket — `X-Forwarded-For` is caller-supplied and trusting it
+  wholesale would hand any client unlimited identities. Trust is therefore a
+  typed operator claim, `SQUELCH_RELAY_TRUSTED_PROXY_HOPS`: the rightmost N
+  entries are the ones your own proxies wrote, so the client is the Nth from the
+  right and anything further left is ignored. Unset, or a header too short to
+  reach that position, is the shared bucket. The claim binds to the peers it is
+  about — `SQUELCH_RELAY_TRUSTED_PROXY_CIDRS`, defaulting to loopback and the
+  private ranges — because a hop count says nothing about a connection that
+  never went through those proxies, and a listener reachable past them would
+  otherwise hand every direct caller a rate-limit identity of their own. That shared bucket is also why auth
+  is the outer layer: unauthenticated floods must not spend it. The bucket map is
   hard-capped and swept on a clock so address rotation cannot grow it without
   bound or turn the limiter itself into the bottleneck. Real per-tenant limiting
   waits for real tenants.*

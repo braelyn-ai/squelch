@@ -36,7 +36,10 @@ impl Harness {
     /// Append one event and return its id, through the real store so the
     /// attached notifier fires exactly as it does in the daemon.
     fn emit(&self, message_id: i64) -> i64 {
-        self.store.append_event(&event_for(self.acct, message_id)).unwrap().unwrap()
+        self.store
+            .append_event(&event_for(self.acct, message_id))
+            .unwrap()
+            .unwrap()
     }
 }
 
@@ -61,7 +64,9 @@ fn harness(seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
     let (event_tx, _) = broadcast::channel::<i64>(256);
     store.attach_event_notifier(event_tx.clone()).unwrap();
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
+    let state = state
+        .with_event_notifier(event_tx)
+        .with_shutdown(shutdown_rx);
     Harness {
         app: router(state),
         store,
@@ -170,7 +175,12 @@ impl Reader {
 async fn open(h: &Harness, uri: &str) -> Reader {
     let resp = h.app.clone().oneshot(authed("GET", uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.starts_with("text/event-stream"), "content-type was {ct}");
     Reader::new(resp)
 }
@@ -185,7 +195,11 @@ async fn events_stream_requires_bearer() {
         .body(Body::empty())
         .unwrap();
     let resp = h.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the feed is behind auth");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the feed is behind auth"
+    );
 
     let req = Request::builder()
         .uri("/client/events?after=0")
@@ -193,7 +207,11 @@ async fn events_stream_requires_bearer() {
         .body(Body::empty())
         .unwrap();
     let resp = h.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a wrong token is no token");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a wrong token is no token"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +261,12 @@ async fn event_by_id_round_trips() {
 #[tokio::test]
 async fn unknown_event_id_is_404() {
     let h = harness(|_, _| {});
-    let resp = h.app.clone().oneshot(authed("GET", "/client/events/999999")).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed("GET", "/client/events/999999"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -251,7 +274,11 @@ async fn unknown_event_id_is_404() {
 async fn another_accounts_event_is_404() {
     let h = harness(|_, _| {});
     let other = h.store.ensure_account("other@example.com").unwrap();
-    let theirs = h.store.append_event(&event_for(other, 42)).unwrap().unwrap();
+    let theirs = h
+        .store
+        .append_event(&event_for(other, 42))
+        .unwrap()
+        .unwrap();
 
     // Indistinguishable from a missing id: an event id is a guessable integer.
     let resp = h
@@ -400,7 +427,10 @@ async fn stream_ends_when_the_daemon_shuts_down() {
 
     h.shutdown.send(true).unwrap();
 
-    assert!(r.next_within(READ_TIMEOUT).await.is_none(), "no further frames");
+    assert!(
+        r.next_within(READ_TIMEOUT).await.is_none(),
+        "no further frames"
+    );
     assert!(r.ended, "the body must actually END, not just go quiet");
 }
 
@@ -414,5 +444,8 @@ async fn a_stream_opened_after_shutdown_ends_immediately() {
     // closes the stream instead of being missed until the next change.
     let mut r = open(&h, "/client/events?after=0").await;
     let _ = r.next_within(READ_TIMEOUT).await;
-    assert!(r.ended, "already-shutting-down means end, not a hung connection");
+    assert!(
+        r.ended,
+        "already-shutting-down means end, not a hung connection"
+    );
 }

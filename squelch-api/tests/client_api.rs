@@ -59,10 +59,26 @@ async fn search_excludes_sealed() {
     let Harness { app, .. } = harness(|store, acct| {
         // Normal message mentioning "verification"...
         let n = store
-            .upsert_message(&msg(acct, "g1", "t1", "Your account verification steps", "hello"))
+            .upsert_message(&msg(
+                acct,
+                "g1",
+                "t1",
+                "Your account verification steps",
+                "hello",
+            ))
             .unwrap();
         store
-            .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                n,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         // ...and a sealed OTP mentioning it too.
         let s = store
@@ -100,7 +116,9 @@ async fn search_excludes_sealed() {
 async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
     use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
     let Harness { app, store, acct } = harness(|store, acct| {
-        let mid = store.upsert_message(&msg(acct, "g1", "t1", "shipped", "b")).unwrap();
+        let mid = store
+            .upsert_message(&msg(acct, "g1", "t1", "shipped", "b"))
+            .unwrap();
         // One en-route (shipped) and one delivered.
         store
             .upsert_shipment(
@@ -111,7 +129,9 @@ async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
                     tracking_number: "1Z999AA10123456784".into(),
                     item_name: "Headphones".into(),
                     status: ShipmentStatus::Shipped,
-                    tracking_url: Some("https://www.ups.com/track?tracknum=1Z999AA10123456784".into()),
+                    tracking_url: Some(
+                        "https://www.ups.com/track?tracknum=1Z999AA10123456784".into(),
+                    ),
                 },
                 chrono::Utc::now(),
             )
@@ -152,15 +172,23 @@ async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
         .await
         .unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json.as_array().unwrap().len(), 2, "delivered included with flag");
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        2,
+        "delivered included with flag"
+    );
 }
 
 #[tokio::test]
 async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::ReceiptInfo;
     let Harness { app, .. } = harness(|store, acct| {
-        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "receipt a", "b")).unwrap();
-        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "receipt b", "b")).unwrap();
+        let m1 = store
+            .upsert_message(&msg(acct, "g1", "t1", "receipt a", "b"))
+            .unwrap();
+        let m2 = store
+            .upsert_message(&msg(acct, "g2", "t2", "receipt b", "b"))
+            .unwrap();
         // Older, then newer — expect newest-first ordering on read.
         store
             .upsert_receipt(
@@ -168,7 +196,10 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
                 m1,
                 "no-reply@baywheels.com",
                 Some("Bay Wheels"),
-                &ReceiptInfo { amount: Some(3.49), currency: Some("USD".into()) },
+                &ReceiptInfo {
+                    amount: Some(3.49),
+                    currency: Some("USD".into()),
+                },
                 chrono::Utc::now() - chrono::Duration::hours(2),
             )
             .unwrap();
@@ -178,7 +209,10 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
                 m2,
                 "orders@shop.com",
                 None,
-                &ReceiptInfo { amount: None, currency: None },
+                &ReceiptInfo {
+                    amount: None,
+                    currency: None,
+                },
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -193,7 +227,10 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Authed: rows, newest-first, with clean sender + null amount preserved.
-    let resp = app.oneshot(authed("GET", "/client/receipts")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/receipts"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let items = json.as_array().unwrap();
@@ -209,9 +246,21 @@ async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
 #[tokio::test]
 async fn retriage_route_exists_resets_and_audits() {
     let Harness { app, store, acct } = harness(|store, acct| {
-        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
         store
-            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         // An LLM-classified row, so there is something to reset.
         store
@@ -257,8 +306,12 @@ async fn retriage_route_exists_resets_and_audits() {
 async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::store::BankingApplied;
     let Harness { app, .. } = harness(|store, acct| {
-        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "statement", "b")).unwrap();
-        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "alert", "b")).unwrap();
+        let m1 = store
+            .upsert_message(&msg(acct, "g1", "t1", "statement", "b"))
+            .unwrap();
+        let m2 = store
+            .upsert_message(&msg(acct, "g2", "t2", "alert", "b"))
+            .unwrap();
         // Older statement, then newer alert -> expect newest-first ordering.
         store
             .banking_apply(&BankingApplied {
@@ -309,7 +362,10 @@ async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
     assert_eq!(items[0]["institution"], Value::Null);
     assert_eq!(items[0]["account_hint"], Value::Null);
     assert_eq!(items[0]["amount"], 42.10);
-    assert!(items[0].get("account_id").is_none(), "account_id off the wire");
+    assert!(
+        items[0].get("account_id").is_none(),
+        "account_id off the wire"
+    );
     // Then the statement.
     assert_eq!(items[1]["kind"], "statement");
     assert_eq!(items[1]["institution"], "Chase");
@@ -322,9 +378,15 @@ async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
 async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::{CalendarInfo, CalendarKind};
     let Harness { app, .. } = harness(|store, acct| {
-        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "invite", "b")).unwrap();
-        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "cancel", "b")).unwrap();
-        let m3 = store.upsert_message(&msg(acct, "g3", "t3", "old", "b")).unwrap();
+        let m1 = store
+            .upsert_message(&msg(acct, "g1", "t1", "invite", "b"))
+            .unwrap();
+        let m2 = store
+            .upsert_message(&msg(acct, "g2", "t2", "cancel", "b"))
+            .unwrap();
+        let m3 = store
+            .upsert_message(&msg(acct, "g3", "t3", "old", "b"))
+            .unwrap();
         // 2h old invite, 1h old cancellation, 30h old update (outside the
         // default 24h received_at window).
         store
@@ -377,13 +439,21 @@ async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Default 24h window: two rows, newest-RECEIVED first, exact wire shape.
-    let resp = app.clone().oneshot(authed("GET", "/client/calendar")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/calendar"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let items = json.as_array().unwrap();
     assert_eq!(items.len(), 2, "30h-old row outside the default 24h window");
     assert_eq!(items[0]["kind"], "cancellation", "newest-received first");
-    assert_eq!(items[0]["event_title"], Value::Null, "nullable fields serialize as null");
+    assert_eq!(
+        items[0]["event_title"],
+        Value::Null,
+        "nullable fields serialize as null"
+    );
     assert_eq!(items[0]["starts_at"], Value::Null);
     assert_eq!(items[0]["organizer"], Value::Null);
     assert_eq!(items[1]["kind"], "invite");
@@ -393,12 +463,19 @@ async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
     // Contract shape: exactly these keys (account_id deliberately absent).
     let keys: std::collections::BTreeSet<_> =
         items[0].as_object().unwrap().keys().cloned().collect();
-    let expect: std::collections::BTreeSet<String> =
-        ["id", "message_id", "thread_id", "kind", "event_title", "starts_at", "organizer",
-         "received_at"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+    let expect: std::collections::BTreeSet<String> = [
+        "id",
+        "message_id",
+        "thread_id",
+        "kind",
+        "event_title",
+        "starts_at",
+        "organizer",
+        "received_at",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     assert_eq!(keys, expect, "wire contract keys");
     assert!(items[0]["id"].is_i64());
     assert!(items[0]["message_id"].is_i64());
@@ -431,7 +508,11 @@ async fn calendar_returns_windowed_rows_newest_first_and_is_bearer_gated() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json.as_array().unwrap().len(), 3, "clamped to 168h, rows within remain");
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        3,
+        "clamped to 168h, rows within remain"
+    );
 }
 
 /// A garbage `mode` value is a 400.
@@ -442,7 +523,17 @@ async fn search_bad_mode_is_400() {
             .upsert_message(&msg(acct, "g1", "t1", "hello world", "body"))
             .unwrap();
         store
-            .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                n,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let resp = app
@@ -461,7 +552,17 @@ async fn search_semantic_without_vectors_falls_back_to_keyword() {
             .upsert_message(&msg(acct, "g1", "t1", "quarterly report attached", "body"))
             .unwrap();
         store
-            .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                n,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let resp = app
@@ -470,7 +571,10 @@ async fn search_semantic_without_vectors_falls_back_to_keyword() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["match_kind"], "keyword", "no vectors => keyword fallback");
+    assert_eq!(
+        json["match_kind"], "keyword",
+        "no vectors => keyword fallback"
+    );
     assert_eq!(json["items"].as_array().unwrap().len(), 1);
 }
 
@@ -490,12 +594,32 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
 
     // Normal message + its vector.
     let n = store
-        .upsert_message(&msg(acct, "g1", "t1", "acme invoice for services", "please pay"))
+        .upsert_message(&msg(
+            acct,
+            "g1",
+            "t1",
+            "acme invoice for services",
+            "please pay",
+        ))
         .unwrap();
     store
-        .set_triage(n, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            n,
+            acct,
+            60,
+            Tier::Signal,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
-    let v = store.embedder().unwrap().embed("acme invoice for services please pay").unwrap();
+    let v = store
+        .embedder()
+        .unwrap()
+        .embed("acme invoice for services please pay")
+        .unwrap();
     store.upsert_message_vector(acct, n, &v).unwrap();
 
     // Sealed OTP + (defensively) a leaked vector — must never surface.
@@ -503,9 +627,23 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
         .upsert_message(&msg(acct, "g2", "t2", "acme verification code", "123456"))
         .unwrap();
     store
-        .set_triage(s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None)
+        .set_triage(
+            s,
+            acct,
+            90,
+            Tier::Noise,
+            Sensitivity::Sealed,
+            Some(SealedKind::Otp),
+            "",
+            "",
+            None,
+        )
         .unwrap();
-    let sv = store.embedder().unwrap().embed("acme verification code 123456").unwrap();
+    let sv = store
+        .embedder()
+        .unwrap()
+        .embed("acme verification code 123456")
+        .unwrap();
     store.upsert_message_vector(acct, s, &sv).unwrap();
 
     let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
@@ -520,7 +658,10 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
     let json = body_json(resp).await;
     assert_eq!(json["match_kind"], "hybrid");
     let items = json["items"].as_array().unwrap();
-    assert!(items.iter().all(|i| i["thread_id"] != "t2"), "sealed never surfaces");
+    assert!(
+        items.iter().all(|i| i["thread_id"] != "t2"),
+        "sealed never surfaces"
+    );
     assert!(items.iter().any(|i| i["thread_id"] == "t1"));
 
     // Explicit semantic => runs semantic, sealed still absent.
@@ -531,7 +672,10 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
     let json = body_json(resp).await;
     assert_eq!(json["match_kind"], "semantic");
     let items = json["items"].as_array().unwrap();
-    assert!(items.iter().all(|i| i["thread_id"] != "t2"), "sealed never surfaces in semantic");
+    assert!(
+        items.iter().all(|i| i["thread_id"] != "t2"),
+        "sealed never surfaces in semantic"
+    );
 }
 
 #[tokio::test]
@@ -558,7 +702,10 @@ async fn reveal_writes_audit_and_returns_body() {
     let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
 
     let resp = app
-        .oneshot(authed("POST", &format!("/client/sealed/{sealed_id}/reveal")))
+        .oneshot(authed(
+            "POST",
+            &format!("/client/sealed/{sealed_id}/reveal"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -572,7 +719,10 @@ async fn reveal_writes_audit_and_returns_body() {
     let audit = store.list_audit(acct, 10).unwrap();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].action, "reveal_sealed");
-    assert_eq!(audit[0].target.as_deref(), Some(sealed_id.to_string().as_str()));
+    assert_eq!(
+        audit[0].target.as_deref(),
+        Some(sealed_id.to_string().as_str())
+    );
 }
 
 #[tokio::test]
@@ -601,7 +751,10 @@ async fn sealed_list_has_no_bodies() {
     let json = body_json(resp).await;
     let items = json.as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert!(items[0].get("body").is_none(), "no body field in sealed list");
+    assert!(
+        items[0].get("body").is_none(),
+        "no body field in sealed list"
+    );
     assert_eq!(items[0]["kind"], "otp");
 }
 
@@ -616,7 +769,17 @@ async fn pagination_cursor_round_trip() {
                 .upsert_message(&msg(acct, &g, &t, "update", "body"))
                 .unwrap();
             store
-                .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+                .set_triage(
+                    m,
+                    acct,
+                    80,
+                    Tier::Signal,
+                    Sensitivity::Normal,
+                    None,
+                    "",
+                    "",
+                    None,
+                )
                 .unwrap();
         }
     });
@@ -628,11 +791,17 @@ async fn pagination_cursor_round_trip() {
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["items"].as_array().unwrap().len(), 2);
-    let cursor = json["next_cursor"].as_str().expect("next_cursor present").to_string();
+    let cursor = json["next_cursor"]
+        .as_str()
+        .expect("next_cursor present")
+        .to_string();
 
     // Second page via the cursor.
     let resp2 = app
-        .oneshot(authed("GET", &format!("/client/updates?limit=2&cursor={cursor}")))
+        .oneshot(authed(
+            "GET",
+            &format!("/client/updates?limit=2&cursor={cursor}"),
+        ))
         .await
         .unwrap();
     let json2 = body_json(resp2).await;
@@ -678,7 +847,17 @@ async fn action_without_write_credential_is_403() {
             .upsert_message(&msg(acct, "g1", "t1", "hi", "body"))
             .unwrap();
         store
-            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let resp = app
@@ -713,7 +892,10 @@ async fn send_outbound_guard_blocks_and_audits() {
     let json = body_json(resp).await;
     let err = json["error"].as_str().unwrap();
     assert!(err.contains("otp_code"), "422 lists redacted match kinds");
-    assert!(!err.contains("483920"), "must NEVER echo the matched secret");
+    assert!(
+        !err.contains("483920"),
+        "must NEVER echo the matched secret"
+    );
 
     // A blocked send still audits.
     let audit = store.list_audit(acct, 10).unwrap();
@@ -744,12 +926,16 @@ async fn send_guard_override_passes_guard_then_403_no_creds() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.detail.as_deref() == Some("rejected:no_write_credential")));
     assert!(
         audit
             .iter()
-            .any(|a| a.detail.as_deref().is_some_and(|d| d.starts_with("guard_override:")))
+            .any(|a| a.detail.as_deref() == Some("rejected:no_write_credential"))
     );
+    assert!(audit.iter().any(|a| {
+        a.detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("guard_override:"))
+    }));
 }
 
 #[tokio::test]
@@ -868,7 +1054,17 @@ async fn archive_success_audits_ok_and_hits_gmail() {
             .upsert_message(&msg(acct, "gmail-abc", "t1", "hi", "body"))
             .unwrap();
         store
-            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let message_id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
@@ -939,10 +1135,26 @@ async fn reply_send_success_threads_and_audits_ok() {
     let (base, handle) = mock_gmail(2).await;
     let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let m = store
-            .upsert_message(&msg(acct, "gmail-parent", "thread-77", "Lunch?", "want lunch?"))
+            .upsert_message(&msg(
+                acct,
+                "gmail-parent",
+                "thread-77",
+                "Lunch?",
+                "want lunch?",
+            ))
             .unwrap();
         store
-            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let message_id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
@@ -963,7 +1175,10 @@ async fn reply_send_success_threads_and_audits_ok() {
 
     let reqs = handle.await.unwrap();
     assert_eq!(reqs.len(), 2);
-    assert!(reqs[0].starts_with("GET "), "first call reads parent headers");
+    assert!(
+        reqs[0].starts_with("GET "),
+        "first call reads parent headers"
+    );
     assert!(reqs[0].contains("/messages/gmail-parent"));
     assert!(reqs[1].contains("/messages/send"));
     // Threaded onto the parent's Gmail thread.
@@ -971,7 +1186,11 @@ async fn reply_send_success_threads_and_audits_ok() {
 
     // `mock_gmail` answers `{}`, so there is no sent id to echo back.
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
+    );
 }
 
 /// The RFC822 Gmail hands back for the echoed reply, base64url-encoded the way
@@ -993,7 +1212,10 @@ async fn reply_send_echoes_the_sent_message_into_the_thread() {
     // Three Gmail calls: parent headers, the send, then the echo's raw read-back.
     let (base, handle) = mock_gmail_seq(vec![
         (200, "{}".to_string()),
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-77\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-77\"}".to_string(),
+        ),
         (
             200,
             format!(
@@ -1006,10 +1228,26 @@ async fn reply_send_echoes_the_sent_message_into_the_thread() {
     .await;
     let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let m = store
-            .upsert_message(&msg(acct, "gmail-parent", "thread-77", "Lunch?", "want lunch?"))
+            .upsert_message(&msg(
+                acct,
+                "gmail-parent",
+                "thread-77",
+                "Lunch?",
+                "want lunch?",
+            ))
             .unwrap();
         store
-            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let message_id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
@@ -1035,7 +1273,10 @@ async fn reply_send_echoes_the_sent_message_into_the_thread() {
 
     let reqs = handle.await.unwrap();
     assert_eq!(reqs.len(), 3);
-    assert!(reqs[2].starts_with("GET "), "the echo reads the sent message back");
+    assert!(
+        reqs[2].starts_with("GET "),
+        "the echo reads the sent message back"
+    );
     assert!(reqs[2].contains("/messages/sent-1?format=raw"));
 
     // The thread view carries the reply immediately, no Sent poll needed.
@@ -1066,11 +1307,16 @@ async fn reply_send_echoes_the_sent_message_into_the_thread() {
     );
 
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
     assert!(
         audit
             .iter()
-            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some(&*format!("ok:{echo_id}"))),
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send.echo"
+                && a.detail.as_deref() == Some(&*format!("ok:{echo_id}"))),
         "the echo audits its local id"
     );
 }
@@ -1099,7 +1345,10 @@ async fn send_with_no_echoed_id_skips_the_echo_and_still_succeeds() {
     let json = body_json(resp).await;
     assert_eq!(json["status"], "sent");
     assert!(json["echo_message_id"].is_null());
-    assert!(json["thread_id"].is_null(), "no parent and no echoed thread");
+    assert!(
+        json["thread_id"].is_null(),
+        "no parent and no echoed thread"
+    );
     assert_eq!(handle.await.unwrap().len(), 1);
 
     let audit = store.list_audit(acct, 10).unwrap();
@@ -1114,7 +1363,10 @@ async fn send_with_no_echoed_id_skips_the_echo_and_still_succeeds() {
 async fn echo_fetch_failure_never_fails_the_send() {
     // The mail is away; a 500 on the read-back costs the local echo, nothing else.
     let (base, handle) = mock_gmail_seq(vec![
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string(),
+        ),
         (500, "{\"error\":\"backendError\"}".to_string()),
     ])
     .await;
@@ -1133,7 +1385,11 @@ async fn echo_fetch_failure_never_fails_the_send() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "a failed echo is not a failed send");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a failed echo is not a failed send"
+    );
     let json = body_json(resp).await;
     assert!(json["echo_message_id"].is_null());
     // A cold send still reports the thread Gmail created, so the client can open it.
@@ -1141,7 +1397,11 @@ async fn echo_fetch_failure_never_fails_the_send() {
     assert_eq!(handle.await.unwrap().len(), 2);
 
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
+    );
     assert!(
         audit
             .iter()
@@ -1171,7 +1431,10 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
     // counterparty's mail down with it. So: no echo, and the thread still opens.
     let (base, handle) = mock_gmail_seq(vec![
         (200, "{}".to_string()),
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-77\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-77\"}".to_string(),
+        ),
         (
             200,
             format!(
@@ -1184,10 +1447,26 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
     .await;
     let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let m = store
-            .upsert_message(&msg(acct, "gmail-parent", "thread-77", "Lunch?", "want lunch?"))
+            .upsert_message(&msg(
+                acct,
+                "gmail-parent",
+                "thread-77",
+                "Lunch?",
+                "want lunch?",
+            ))
             .unwrap();
         store
-            .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let message_id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
@@ -1205,10 +1484,17 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "a skipped echo is not a failed send");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a skipped echo is not a failed send"
+    );
     let json = body_json(resp).await;
     assert_eq!(json["status"], "sent");
-    assert!(json["echo_message_id"].is_null(), "the sealed copy is not echoed");
+    assert!(
+        json["echo_message_id"].is_null(),
+        "the sealed copy is not echoed"
+    );
     assert_eq!(handle.await.unwrap().len(), 3);
 
     // THE POINT: the thread the user was reading still opens, with the parent alone.
@@ -1224,7 +1510,11 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
     assert!(store.sealed_messages(acct).unwrap().is_empty());
 
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
+    );
     assert!(
         audit
             .iter()
@@ -1237,8 +1527,14 @@ async fn echo_of_an_empty_raw_read_never_ingests() {
     // A `format=raw` 200 with no `raw` field decodes to zero bytes, which would
     // ingest as a message with neither headers nor body. It is a failed fetch.
     let (base, handle) = mock_gmail_seq(vec![
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string(),
+        ),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string(),
+        ),
     ])
     .await;
     let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
@@ -1322,7 +1618,10 @@ fn pixel_token(mime: &str) -> String {
 async fn include_tracker_mints_a_pixel_the_store_can_resolve() {
     // Cold send: the send POST, then the echo's raw read-back.
     let (base, handle) = mock_gmail_seq(vec![
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string(),
+        ),
         (
             200,
             format!(
@@ -1370,7 +1669,9 @@ async fn include_tracker_mints_a_pixel_the_store_can_resolve() {
     // The tracker is REAL: an open against its token records, and the echo
     // backfill makes it readable per message.
     assert!(
-        store.record_open(acct, &token, 1_700, Some("Apple Mail/16.0"), "unknown").unwrap(),
+        store
+            .record_open(acct, &token, 1_700, Some("Apple Mail/16.0"), "unknown")
+            .unwrap(),
         "the minted token names a stored tracker"
     );
     let opens = store.message_opens(acct, echo_id).unwrap();
@@ -1385,7 +1686,9 @@ async fn include_tracker_mints_a_pixel_the_store_can_resolve() {
     );
     // The audit trail must never carry the capability itself.
     assert!(
-        !audit.iter().any(|a| a.detail.as_deref().is_some_and(|d| d.contains(&token))),
+        !audit
+            .iter()
+            .any(|a| a.detail.as_deref().is_some_and(|d| d.contains(&token))),
         "the token is never audited"
     );
 }
@@ -1393,7 +1696,10 @@ async fn include_tracker_mints_a_pixel_the_store_can_resolve() {
 #[tokio::test]
 async fn include_tracker_without_a_configured_base_url_sends_untracked() {
     let (base, handle) = mock_gmail_seq(vec![
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string(),
+        ),
         (200, "{}".to_string()),
     ])
     .await;
@@ -1434,10 +1740,67 @@ async fn include_tracker_without_a_configured_base_url_sends_untracked() {
     );
 }
 
+/// The tracker row is written BEFORE the send, so a token can never reach the
+/// wire unrecorded. The cost of that ordering is an orphan whenever the send
+/// fails — a row nothing will ever link to a message, still accepting opens for
+/// the life of the database. The failure path has to take it back.
+#[tokio::test]
+async fn a_failed_send_leaves_no_tracker_behind() {
+    let (base, handle) = mock_gmail_seq(vec![(500, "{\"error\":\"backend\"}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_tracking(base, Some(TRACK_BASE), |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "see you Tuesday",
+                "confirm": true,
+                "include_tracker": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success());
+
+    // The token that WAS minted, read back off the wire the recipient never saw.
+    let reqs = handle.await.unwrap();
+    let token = pixel_token(&sent_mime(&reqs[0]));
+    assert!(
+        !store
+            .record_open(
+                acct,
+                &token,
+                chrono::Utc::now().timestamp(),
+                None,
+                "unknown"
+            )
+            .unwrap(),
+        "the tracker outlived its failed send"
+    );
+
+    let audit = store.list_audit(acct, 20).unwrap();
+    let details = |action: &str| -> Vec<String> {
+        audit
+            .iter()
+            .filter(|a| a.action == action)
+            .filter_map(|a| a.detail.clone())
+            .collect()
+    };
+    assert!(details("send.tracker").contains(&"minted".to_string()));
+    assert!(details("send.tracker").contains(&"discarded".to_string()));
+    assert!(details("send").contains(&"failed:gmail".to_string()));
+}
+
 #[tokio::test]
 async fn a_send_that_does_not_ask_for_tracking_never_gets_a_pixel() {
     let (base, handle) = mock_gmail_seq(vec![
-        (200, "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string()),
+        (
+            200,
+            "{\"id\":\"sent-1\",\"threadId\":\"thread-new\"}".to_string(),
+        ),
         (200, "{}".to_string()),
     ])
     .await;
@@ -1483,7 +1846,17 @@ fn seed_one_signal(store: &SqliteStore, acct: i64, gmail: &str, thread: &str, su
         .upsert_message(&msg(acct, gmail, thread, subj, "body"))
         .unwrap();
     store
-        .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            m,
+            acct,
+            80,
+            Tier::Signal,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
     m
 }
@@ -1511,22 +1884,35 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
 
     // Stamped as a side effect of the fetch.
     let after = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, None, None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let first_stamp = after[0].surfaced_at.expect("surfaced_at now set");
     assert_eq!(after[0].status, AttentionStatus::Open);
 
     // Second fetch: surfaced_at is now present and unchanged (stamp-once).
-    let resp2 = app
-        .oneshot(authed("GET", "/client/updates"))
-        .await
-        .unwrap();
+    let resp2 = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
     let json2 = body_json(resp2).await;
     assert!(!json2["items"][0]["surfaced_at"].is_null());
     let after2 = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, None, None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+        )
         .unwrap();
-    assert_eq!(after2[0].surfaced_at, Some(first_stamp), "stamp did not move");
+    assert_eq!(
+        after2[0].surfaced_at,
+        Some(first_stamp),
+        "stamp did not move"
+    );
 }
 
 #[tokio::test]
@@ -1555,9 +1941,15 @@ async fn updates_carry_field_reasons_object() {
     // only the properties that carry a reason appear (deadline is absent here).
     let fr = &item["field_reasons"];
     assert!(fr.is_object(), "field_reasons must be an object: {item}");
-    assert_eq!(fr["importance"], Value::String("known contact -> signal importance 80".into()));
+    assert_eq!(
+        fr["importance"],
+        Value::String("known contact -> signal importance 80".into())
+    );
     assert_eq!(fr["tier"], Value::String("known contact -> signal".into()));
-    assert!(fr.get("deadline").is_none(), "absent deadline reason must be omitted, not null");
+    assert!(
+        fr.get("deadline").is_none(),
+        "absent deadline reason must be omitted, not null"
+    );
 }
 
 #[tokio::test]
@@ -1584,7 +1976,17 @@ async fn band_query_filters_server_side() {
             .upsert_message(&msg(acct, "g1", "t1", "PG&E past due", "pay"))
             .unwrap();
         store
-            .set_triage(bill, acct, 95, Tier::PastDue, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                bill,
+                acct,
+                95,
+                Tier::PastDue,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         seed_one_signal(store, acct, "g2", "t2", "hello");
     });
@@ -1636,14 +2038,24 @@ async fn dismiss_and_reopen_endpoint() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
     assert_eq!(done.len(), 1);
     assert!(done[0].resolved_at.is_some());
 
     // The dismiss is audited.
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.action == "set_status" && a.detail.as_deref() == Some("done")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "set_status" && a.detail.as_deref() == Some("done"))
+    );
 
     // Reopen -> open.
     let resp2 = app
@@ -1680,7 +2092,15 @@ async fn dismiss_sealed_message_is_404() {
             .unwrap();
         store
             .set_triage(
-                s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None,
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
             )
             .unwrap();
     });
@@ -1717,7 +2137,13 @@ async fn archive_success_resolves_target_to_done() {
 
     // RESOLUTION: the target row is now done + resolved_at set.
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].update.id, message_id);
@@ -1880,13 +2306,19 @@ async fn omitted_disposition_is_inferred_and_returned() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let created = body_json(resp).await;
-    assert_eq!(created["disposition"], "filtered", "the resolved disposition rides the response");
+    assert_eq!(
+        created["disposition"], "filtered",
+        "the resolved disposition rides the response"
+    );
     let rule_id = created["rule_id"].as_i64().unwrap();
 
     let rules = store.list_sender_rules(acct).unwrap();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].id, rule_id);
-    assert_eq!(rules[0].disposition, squelch_core::types::Disposition::Filtered);
+    assert_eq!(
+        rules[0].disposition,
+        squelch_core::types::Disposition::Filtered
+    );
     assert_eq!(rules[0].want_text, "i only care about the invoices");
 }
 
@@ -1942,7 +2374,10 @@ async fn only_an_absent_key_or_exact_auto_asks_for_inference() {
             "disposition {bad:?} must be a 400, not a silent inference"
         );
     }
-    assert!(store.list_sender_rules(acct).unwrap().is_empty(), "nothing stored");
+    assert!(
+        store.list_sender_rules(acct).unwrap().is_empty(),
+        "nothing stored"
+    );
 
     // The exact lowercase literal is the one spelling that infers.
     let resp = app
@@ -1978,7 +2413,11 @@ async fn a_configured_classifier_that_fails_still_saves_the_rule() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED, "inference never fails a save");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "inference never fails a save"
+    );
     assert_eq!(body_json(resp).await["disposition"], "filtered");
     assert_eq!(
         store.list_sender_rules(acct).unwrap()[0].disposition,
@@ -2045,7 +2484,10 @@ async fn rule_inference_spend_lands_in_its_own_ledger_category() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let days = row(&store).expect("the update path bills too");
-    assert_eq!(days[0].calls, 2, "create and update each bill their own call");
+    assert_eq!(
+        days[0].calls, 2,
+        "create and update each bill their own call"
+    );
     assert_eq!(days[0].input_tokens, 100);
     assert_eq!(days[0].output_tokens, 10);
 
@@ -2100,7 +2542,10 @@ async fn omitted_disposition_with_empty_want_is_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert!(store.list_sender_rules(acct).unwrap().is_empty(), "nothing stored");
+    assert!(
+        store.list_sender_rules(acct).unwrap().is_empty(),
+        "nothing stored"
+    );
 
     // Same on the edit path.
     let resp = app
@@ -2165,9 +2610,14 @@ async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
     // past that: sweep is permission, not authority.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = app_with_rule_inference("squelch", |store, acct| {
-        seeded
-            .borrow_mut()
-            .push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
+        seeded.borrow_mut().push(seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "spam@evil.com",
+            None,
+            false,
+        ));
     })
     .await;
     let spam_id = seeded.borrow()[0];
@@ -2186,14 +2636,24 @@ async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(body_json(resp).await["disposition"], "squelch", "the rule IS squelch");
+    assert_eq!(
+        body_json(resp).await["disposition"],
+        "squelch",
+        "the rule IS squelch"
+    );
     assert_eq!(
         store.list_sender_rules(acct).unwrap()[0].disposition,
         squelch_core::types::Disposition::Squelch
     );
 
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
     assert!(
         !done.iter().any(|u| u.update.id == spam_id),
@@ -2210,9 +2670,14 @@ async fn a_literal_auto_squelch_is_inferred_and_never_resolves_open_mail() {
     // between "auto" and the explicit-squelch mass-resolve gate.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = app_with_rule_inference("squelch", |store, acct| {
-        seeded
-            .borrow_mut()
-            .push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
+        seeded.borrow_mut().push(seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "spam@evil.com",
+            None,
+            false,
+        ));
     })
     .await;
     let spam_id = seeded.borrow()[0];
@@ -2232,14 +2697,24 @@ async fn a_literal_auto_squelch_is_inferred_and_never_resolves_open_mail() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(body_json(resp).await["disposition"], "squelch", "the rule IS squelch");
+    assert_eq!(
+        body_json(resp).await["disposition"],
+        "squelch",
+        "the rule IS squelch"
+    );
     assert_eq!(
         store.list_sender_rules(acct).unwrap()[0].disposition,
         squelch_core::types::Disposition::Squelch
     );
 
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
     assert!(
         !done.iter().any(|u| u.update.id == spam_id),
@@ -2347,8 +2822,12 @@ async fn stats_expose_stage2_usage_and_cost() {
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let Harness { app, .. } = harness(move |store, acct| {
         // 2 calls: 1_000_000 in, 200_000 out.
-        store.stage2_bump_usage(acct, &day, 600_000, 100_000).unwrap();
-        store.stage2_bump_usage(acct, &day, 400_000, 100_000).unwrap();
+        store
+            .stage2_bump_usage(acct, &day, 600_000, 100_000)
+            .unwrap();
+        store
+            .stage2_bump_usage(acct, &day, 400_000, 100_000)
+            .unwrap();
     });
 
     let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
@@ -2367,8 +2846,12 @@ async fn stats_expose_stage2_usage_and_cost() {
 async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // Newest-first daily rows, totals costed at the default 3.0 in / 15.0 out.
     let Harness { app, .. } = harness(|store, acct| {
-        store.stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000).unwrap();
-        store.stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000).unwrap();
+        store
+            .stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000)
+            .unwrap();
+        store
+            .stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000)
+            .unwrap();
     });
 
     let resp = app
@@ -2415,7 +2898,17 @@ async fn stats_expose_bands_and_last_surfaced_at() {
             .upsert_message(&msg(acct, "g1", "t1", "bill due", "pay"))
             .unwrap();
         store
-            .set_triage(bill, acct, 95, Tier::Deadline, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                bill,
+                acct,
+                95,
+                Tier::Deadline,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         seed_one_signal(store, acct, "g2", "t2", "hello");
     });
@@ -2454,13 +2947,33 @@ async fn thread_response_carries_html_field() {
         html_msg.body_html = Some("<p>Hello <strong>world</strong></p>".to_string());
         let h = store.upsert_message(&html_msg).unwrap();
         store
-            .set_triage(h, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                h,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
 
         let plain = msg(acct, "g-plain", "t-html", "Newsletter", "just text");
         let p = store.upsert_message(&plain).unwrap();
         store
-            .set_triage(p, acct, 55, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                p,
+                acct,
+                55,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
 
@@ -2501,7 +3014,17 @@ fn seed_unsub_msg(
     m.list_unsub_one_click = one_click;
     let id = store.upsert_message(&m).unwrap();
     store
-        .set_triage(id, acct, 10, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            id,
+            acct,
+            10,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
     id
 }
@@ -2523,7 +3046,11 @@ async fn unsubscribe_returns_first_http_url_and_records_and_audits() {
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
 
     let resp = app
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": mid }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2543,18 +3070,34 @@ async fn unsubscribe_returns_first_http_url_and_records_and_audits() {
     let audit = store.list_audit(acct, 10).unwrap();
     let row = audit.iter().find(|a| a.action == "unsubscribe").unwrap();
     assert_eq!(row.detail.as_deref(), Some("browser:news@sub.com"));
-    assert!(audit.iter().all(|a| a.detail.as_deref().map(|d| !d.contains("sub.com/u")).unwrap_or(true)));
+    assert!(audit.iter().all(|a| {
+        a.detail
+            .as_deref()
+            .map(|d| !d.contains("sub.com/u"))
+            .unwrap_or(true)
+    }));
 }
 
 #[tokio::test]
 async fn unsubscribe_browser_returns_url_and_does_not_fetch() {
     let Harness { app, store, acct } = harness(|store, acct| {
-        seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<https://sub.com/u/9>"), false);
+        seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "news@sub.com",
+            Some("<https://sub.com/u/9>"),
+            false,
+        );
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
 
     let resp = app
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": mid }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2570,20 +3113,40 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
     // Unsubscribing IS the disposition of that email: the triage row must not
     // stay open demanding a second act.
     let Harness { app, store, acct } = harness(|store, acct| {
-        seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<https://sub.com/u/9>"), false);
+        seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "news@sub.com",
+            Some("<https://sub.com/u/9>"),
+            false,
+        );
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
 
     let resp = app
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": mid }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
-    assert!(done.iter().any(|u| u.update.id == mid), "unsubscribed email is done");
+    assert!(
+        done.iter().any(|u| u.update.id == mid),
+        "unsubscribed email is done"
+    );
 }
 
 #[tokio::test]
@@ -2597,8 +3160,22 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
     // reads the from_addr, so the mix-up became visible immediately.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = harness(|store, acct| {
-        seeded.borrow_mut().push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
-        seeded.borrow_mut().push(seed_unsub_msg(store, acct, "g2", "friend@nice.com", None, false));
+        seeded.borrow_mut().push(seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "spam@evil.com",
+            None,
+            false,
+        ));
+        seeded.borrow_mut().push(seed_unsub_msg(
+            store,
+            acct,
+            "g2",
+            "friend@nice.com",
+            None,
+            false,
+        ));
     });
     let (spam_id, nice_id) = (seeded.borrow()[0], seeded.borrow()[1]);
 
@@ -2636,10 +3213,22 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
-    assert!(done.iter().any(|u| u.update.id == spam_id), "squelch-rule source is done");
-    assert!(!done.iter().any(|u| u.update.id == nice_id), "surface-rule source stays open");
+    assert!(
+        done.iter().any(|u| u.update.id == spam_id),
+        "squelch-rule source is done"
+    );
+    assert!(
+        !done.iter().any(|u| u.update.id == nice_id),
+        "surface-rule source stays open"
+    );
 }
 
 #[tokio::test]
@@ -2651,7 +3240,14 @@ async fn an_explicit_squelch_without_sweep_resolves_nothing() {
     // the rule is written and nothing else happens.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = harness(|store, acct| {
-        seeded.borrow_mut().push(seed_unsub_msg(store, acct, "g1", "spam@evil.com", None, false));
+        seeded.borrow_mut().push(seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "spam@evil.com",
+            None,
+            false,
+        ));
     });
     let spam_id = seeded.borrow()[0];
 
@@ -2676,7 +3272,13 @@ async fn an_explicit_squelch_without_sweep_resolves_nothing() {
     );
 
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
     assert!(
         !done.iter().any(|u| u.update.id == spam_id),
@@ -2687,12 +3289,28 @@ async fn an_explicit_squelch_without_sweep_resolves_nothing() {
 /// Seed one triaged message from `from` on its OWN thread. Distinct threads
 /// matter here: the bands collapse a thread to one representative row, so
 /// same-thread seeds would hide exactly the sibling a sweep is supposed to clear.
-fn seed_from_on_thread(store: &SqliteStore, acct: i64, gmail: &str, thread: &str, from: &str) -> i64 {
+fn seed_from_on_thread(
+    store: &SqliteStore,
+    acct: i64,
+    gmail: &str,
+    thread: &str,
+    from: &str,
+) -> i64 {
     let mut m = msg(acct, gmail, thread, "Newsletter", "body");
     m.from_addr = from.to_string();
     let id = store.upsert_message(&m).unwrap();
     store
-        .set_triage(id, acct, 10, Tier::Noise, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            id,
+            acct,
+            10,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
     id
 }
@@ -2706,10 +3324,34 @@ async fn sweep_resolves_by_sender_and_a_wildcard_resolves_only_the_source() {
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = harness(|store, acct| {
         let mut s = seeded.borrow_mut();
-        s.push(seed_from_on_thread(store, acct, "g1", "t1", "spam@evil.com"));
-        s.push(seed_from_on_thread(store, acct, "g2", "t2", "spam@evil.com"));
-        s.push(seed_from_on_thread(store, acct, "g3", "t3", "other@junk.com"));
-        s.push(seed_from_on_thread(store, acct, "g4", "t4", "someone@junk.com"));
+        s.push(seed_from_on_thread(
+            store,
+            acct,
+            "g1",
+            "t1",
+            "spam@evil.com",
+        ));
+        s.push(seed_from_on_thread(
+            store,
+            acct,
+            "g2",
+            "t2",
+            "spam@evil.com",
+        ));
+        s.push(seed_from_on_thread(
+            store,
+            acct,
+            "g3",
+            "t3",
+            "other@junk.com",
+        ));
+        s.push(seed_from_on_thread(
+            store,
+            acct,
+            "g4",
+            "t4",
+            "someone@junk.com",
+        ));
     });
     let (spam_a, spam_b, junk_src, junk_other) = {
         let s = seeded.borrow();
@@ -2751,10 +3393,19 @@ async fn sweep_resolves_by_sender_and_a_wildcard_resolves_only_the_source() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let done = store
-        .attention_updates(acct, chrono::Utc::now() - chrono::Duration::days(1), None, Some(AttentionStatus::Done), None)
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(AttentionStatus::Done),
+            None,
+        )
         .unwrap();
     let is_done = |id: i64| done.iter().any(|u| u.update.id == id);
-    assert!(is_done(spam_a) && is_done(spam_b), "every row from the swept sender is done");
+    assert!(
+        is_done(spam_a) && is_done(spam_b),
+        "every row from the swept sender is done"
+    );
     assert!(is_done(junk_src), "the wildcard's source message is done");
     assert!(!is_done(junk_other), "the rest of the domain is untouched");
 }
@@ -2764,16 +3415,31 @@ async fn unsubscribe_mailto_only_is_422() {
     // A mailto-only List-Unsubscribe has no http(s) link => 422; the server never
     // sends anything.
     let Harness { app, store, acct } = harness(|store, acct| {
-        seed_unsub_msg(store, acct, "g1", "news@sub.com", Some("<mailto:unsub@sub.com?subject=Bye>"), false);
+        seed_unsub_msg(
+            store,
+            acct,
+            "g1",
+            "news@sub.com",
+            Some("<mailto:unsub@sub.com?subject=Bye>"),
+            false,
+        );
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
 
     let resp = app
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": mid }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(store.list_unsubscribes(acct).unwrap().len(), 0, "no ledger row on 422");
+    assert_eq!(
+        store.list_unsubscribes(acct).unwrap().len(),
+        0,
+        "no ledger row on 422"
+    );
 }
 
 #[tokio::test]
@@ -2783,7 +3449,11 @@ async fn unsubscribe_no_info_is_422() {
     });
     let mid = store.search(acct, "Newsletter", 10, 0).unwrap()[0].id;
     let resp = app
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": mid })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": mid }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -2801,7 +3471,17 @@ async fn unsubscribe_unknown_and_sealed_are_404() {
             })
             .unwrap();
         store
-            .set_triage(s, acct, 90, Tier::Noise, Sensitivity::Sealed, Some(SealedKind::Otp), "", "", None)
+            .set_triage(
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
@@ -2809,14 +3489,22 @@ async fn unsubscribe_unknown_and_sealed_are_404() {
     // Sealed => 404 (indistinguishable from unknown).
     let resp = app
         .clone()
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": sealed_id })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": sealed_id }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // Unknown id => 404.
     let resp = app
-        .oneshot(authed_json("POST", "/client/unsubscribe", serde_json::json!({ "message_id": 999999 })))
+        .oneshot(authed_json(
+            "POST",
+            "/client/unsubscribe",
+            serde_json::json!({ "message_id": 999999 }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -2826,7 +3514,13 @@ async fn unsubscribe_unknown_and_sealed_are_404() {
 async fn list_unsubscribes_newest_first_and_bearer_gated() {
     let Harness { app, .. } = harness(|store, acct| {
         store
-            .upsert_unsubscribe(acct, "old@x.com", "browser", None, chrono::Utc::now() - chrono::Duration::hours(3))
+            .upsert_unsubscribe(
+                acct,
+                "old@x.com",
+                "browser",
+                None,
+                chrono::Utc::now() - chrono::Duration::hours(3),
+            )
             .unwrap();
         store
             .upsert_unsubscribe(acct, "new@x.com", "one_click", None, chrono::Utc::now())
@@ -2834,10 +3528,19 @@ async fn list_unsubscribes_newest_first_and_bearer_gated() {
     });
 
     // Bearer-gated.
-    let unauth = Request::builder().uri("/client/unsubscribes").body(Body::empty()).unwrap();
-    assert_eq!(app.clone().oneshot(unauth).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let unauth = Request::builder()
+        .uri("/client/unsubscribes")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauth).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
 
-    let resp = app.oneshot(authed("GET", "/client/unsubscribes")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/unsubscribes"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let items = json.as_array().unwrap();
@@ -2872,9 +3575,16 @@ async fn unsubscribe_resolution_sets_blocked_and_404s_unknown_and_400s_bad_value
     let json = body_json(resp).await;
     assert_eq!(json["sender"], "news@x.com");
     assert_eq!(json["resolution"], "blocked");
-    assert_eq!(store.list_unsubscribes(acct).unwrap()[0].resolution.as_deref(), Some("blocked"));
+    assert_eq!(
+        store.list_unsubscribes(acct).unwrap()[0]
+            .resolution
+            .as_deref(),
+        Some("blocked")
+    );
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(audit.iter().any(|a| a.action == "unsub_resolution" && a.detail.as_deref() == Some("news@x.com:blocked")));
+    assert!(audit.iter().any(
+        |a| a.action == "unsub_resolution" && a.detail.as_deref() == Some("news@x.com:blocked")
+    ));
 
     // Unknown sender => 404.
     let resp = app
@@ -3007,7 +3717,13 @@ async fn triage_config_post_rejects_out_of_range_stage1_cap() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(store.stage2_cap_overrides(acct).unwrap().stage1_global_daily_cap, None);
+    assert_eq!(
+        store
+            .stage2_cap_overrides(acct)
+            .unwrap()
+            .stage1_global_daily_cap,
+        None
+    );
 }
 
 #[tokio::test]
@@ -3111,14 +3827,22 @@ async fn triage_config_post_rejects_out_of_range_and_non_integer() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // Nothing was persisted by any rejected request.
-    assert_eq!(store.stage2_cap_overrides(acct).unwrap(), Default::default());
+    assert_eq!(
+        store.stage2_cap_overrides(acct).unwrap(),
+        Default::default()
+    );
 }
 
 // --- attachments ------------------------------------------------------------
 
 /// Collect a response body into raw bytes.
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    resp.into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
 }
 
 fn header_str(resp: &axum::response::Response, name: header::HeaderName) -> String {
@@ -3133,25 +3857,60 @@ fn header_str(resp: &axum::response::Response, name: header::HeaderName) -> Stri
 async fn thread_carries_attachment_metadata_and_empty_when_none() {
     let Harness { app, store, acct } = harness(|store, acct| {
         // Thread t1: one message with a stored pdf + an over-cap (NULL data) part.
-        let m1 = store.upsert_message(&msg(acct, "g1", "t1", "s1", "b1")).unwrap();
+        let m1 = store
+            .upsert_message(&msg(acct, "g1", "t1", "s1", "b1"))
+            .unwrap();
         store
-            .set_triage(m1, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m1,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         store
             .insert_attachment(acct, m1, "doc.pdf", "application/pdf", 5, Some(b"Hello"))
             .unwrap();
         store
-            .insert_attachment(acct, m1, "big.bin", "application/octet-stream", 11_000_000, None)
+            .insert_attachment(
+                acct,
+                m1,
+                "big.bin",
+                "application/octet-stream",
+                11_000_000,
+                None,
+            )
             .unwrap();
         // Thread t2: a message with NO attachments -> [] on the wire.
-        let m2 = store.upsert_message(&msg(acct, "g2", "t2", "s2", "b2")).unwrap();
+        let m2 = store
+            .upsert_message(&msg(acct, "g2", "t2", "s2", "b2"))
+            .unwrap();
         store
-            .set_triage(m2, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m2,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
     });
     let _ = (&store, acct);
 
-    let resp = app.clone().oneshot(authed("GET", "/client/thread/t1")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let atts = &json["messages"][0]["attachments"];
@@ -3164,7 +3923,10 @@ async fn thread_carries_attachment_metadata_and_empty_when_none() {
     assert_eq!(atts[1]["filename"], "big.bin");
     assert_eq!(atts[1]["downloadable"], false);
 
-    let resp = app.oneshot(authed("GET", "/client/thread/t2")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t2"))
+        .await
+        .unwrap();
     let json = body_json(resp).await;
     assert_eq!(
         json["messages"][0]["attachments"],
@@ -3179,17 +3941,33 @@ async fn attachment_bytes_headers_apply_render_safety_whitelist() {
     let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i64, &'static str)>::new()));
     let ids_seed = ids.clone();
     let Harness { app, .. } = harness(move |store, acct| {
-        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
         store
-            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         let mut v = ids_seed.lock().unwrap();
         v.push((
-            store.insert_attachment(acct, m, "doc.pdf", "application/pdf", 3, Some(b"pdf")).unwrap(),
+            store
+                .insert_attachment(acct, m, "doc.pdf", "application/pdf", 3, Some(b"pdf"))
+                .unwrap(),
             "pdf",
         ));
         v.push((
-            store.insert_attachment(acct, m, "pic.png", "image/png", 3, Some(b"png")).unwrap(),
+            store
+                .insert_attachment(acct, m, "pic.png", "image/png", 3, Some(b"png"))
+                .unwrap(),
             "png",
         ));
         v.push((
@@ -3207,7 +3985,14 @@ async fn attachment_bytes_headers_apply_render_safety_whitelist() {
         // Case/parameter tricks + the xml family: all must force octet-stream.
         v.push((
             store
-                .insert_attachment(acct, m, "shout.svg", "IMAGE/SVG+XML; charset=x", 3, Some(b"svg"))
+                .insert_attachment(
+                    acct,
+                    m,
+                    "shout.svg",
+                    "IMAGE/SVG+XML; charset=x",
+                    3,
+                    Some(b"svg"),
+                )
                 .unwrap(),
             "svg-shout",
         ));
@@ -3260,7 +4045,10 @@ async fn attachment_bytes_headers_apply_render_safety_whitelist() {
         }
         // Common security headers on every served attachment.
         assert_eq!(header_str(&resp, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
-        assert_eq!(header_str(&resp, header::CACHE_CONTROL), "private, max-age=3600");
+        assert_eq!(
+            header_str(&resp, header::CACHE_CONTROL),
+            "private, max-age=3600"
+        );
         assert!(
             header_str(&resp, header::CONTENT_DISPOSITION).starts_with("attachment;"),
             "must be an attachment disposition"
@@ -3275,9 +4063,21 @@ async fn attachment_filename_is_sanitized_in_disposition() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
     let Harness { app, .. } = harness(move |store, acct| {
-        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
         store
-            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         *id_seed.lock().unwrap() = store
             .insert_attachment(
@@ -3308,13 +4108,32 @@ async fn attachment_over_cap_is_410() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
     let Harness { app, .. } = harness(move |store, acct| {
-        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
         store
-            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         // Metadata only (data == None): over the ingest cap.
         *id_seed.lock().unwrap() = store
-            .insert_attachment(acct, m, "big.bin", "application/octet-stream", 11_000_000, None)
+            .insert_attachment(
+                acct,
+                m,
+                "big.bin",
+                "application/octet-stream",
+                11_000_000,
+                None,
+            )
             .unwrap();
     });
     let id = *id.lock().unwrap();
@@ -3330,7 +4149,9 @@ async fn attachment_on_sealed_parent_is_404() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
     let Harness { app, .. } = harness(move |store, acct| {
-        let m = store.upsert_message(&msg(acct, "g1", "t1", "code", "secret")).unwrap();
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "code", "secret"))
+            .unwrap();
         store
             .set_triage(
                 m,
@@ -3372,16 +4193,32 @@ async fn attachment_requires_bearer_auth() {
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "byte endpoint is behind auth");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "byte endpoint is behind auth"
+    );
 }
 
 #[tokio::test]
 async fn triage_feedback_round_trip_records_and_audits() {
     let mut mid = 0;
     let Harness { app, store, acct } = harness(|store, acct| {
-        let m = store.upsert_message(&msg(acct, "g1", "t1", "s", "b")).unwrap();
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
         store
-            .set_triage(m, acct, 60, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
             .unwrap();
         mid = m;
     });
@@ -3401,7 +4238,11 @@ async fn triage_feedback_round_trip_records_and_audits() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "route must be mounted and accept the correction");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "route must be mounted and accept the correction"
+    );
     let json = body_json(resp).await;
     assert_eq!(json["dimension"], "tier");
     assert_eq!(json["from_value"], "signal");
@@ -3452,24 +4293,48 @@ async fn triage_feedback_round_trip_records_and_audits() {
 /// Seed one ordinary (non-sealed) message and return its local id.
 fn seed_draft_parent(store: &SqliteStore, acct: i64) -> i64 {
     let m = store
-        .upsert_message(&msg(acct, "gmail-parent", "t-draft", "Lunch?", "want lunch?"))
+        .upsert_message(&msg(
+            acct,
+            "gmail-parent",
+            "t-draft",
+            "Lunch?",
+            "want lunch?",
+        ))
         .unwrap();
     store
-        .set_triage(m, acct, 80, Tier::Signal, Sensitivity::Normal, None, "", "", None)
+        .set_triage(
+            m,
+            acct,
+            80,
+            Tier::Signal,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
         .unwrap();
     m
 }
 
 /// PUT one draft and hand back its wire view.
 async fn put_draft(app: &axum::Router, body: Value) -> Value {
-    let resp = app.clone().oneshot(authed_json("PUT", "/client/drafts", body)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed_json("PUT", "/client/drafts", body))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     body_json(resp).await
 }
 
 /// The current draft list as a JSON array.
 async fn list_drafts(app: &axum::Router) -> Value {
-    let resp = app.clone().oneshot(authed("GET", "/client/drafts")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/drafts"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     body_json(resp).await
 }
@@ -3504,9 +4369,15 @@ async fn put_draft_creates_then_edits_the_same_key_in_place() {
         }),
     )
     .await;
-    assert_eq!(second["id"], first["id"], "an edit must not mint a new draft");
+    assert_eq!(
+        second["id"], first["id"],
+        "an edit must not mint a new draft"
+    );
     assert_eq!(second["body"], "sure, 1pm");
-    assert_eq!(second["created_at"], first["created_at"], "created_at survives an edit");
+    assert_eq!(
+        second["created_at"], first["created_at"],
+        "created_at survives an edit"
+    );
 
     let all = list_drafts(&app).await;
     assert_eq!(all.as_array().map(Vec::len), Some(1));
@@ -3516,8 +4387,14 @@ async fn put_draft_creates_then_edits_the_same_key_in_place() {
 async fn put_draft_defaults_missing_text_fields_and_keys_new_mail_on_null() {
     let Harness { app, .. } = harness(|_, _| {});
     let draft = put_draft(&app, serde_json::json!({ "to": "bob@example.com" })).await;
-    assert!(draft["reply_to_message_id"].is_null(), "no parent => the new-message slot");
-    assert_eq!(draft["subject"], "", "a missing text field stores empty, not 400");
+    assert!(
+        draft["reply_to_message_id"].is_null(),
+        "no parent => the new-message slot"
+    );
+    assert_eq!(
+        draft["subject"], "",
+        "a missing text field stores empty, not 400"
+    );
     assert_eq!(draft["body"], "");
 }
 
@@ -3555,9 +4432,16 @@ async fn put_draft_on_sealed_or_unknown_parent_is_404_and_stores_nothing() {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "parent {parent} must 404");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "parent {parent} must 404"
+        );
     }
-    assert!(store.list_drafts(acct).unwrap().is_empty(), "a 404 stores no draft");
+    assert!(
+        store.list_drafts(acct).unwrap().is_empty(),
+        "a 404 stores no draft"
+    );
     assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(0));
 }
 
@@ -3572,9 +4456,18 @@ async fn drafts_list_carries_the_to_field_name_on_the_wire() {
 
     let all = list_drafts(&app).await;
     assert_eq!(all.as_array().map(Vec::len), Some(1));
-    assert_eq!(all[0]["to"], "bob@example.com", "the column is to_addr; the wire says `to`");
-    assert!(all[0].get("to_addr").is_none(), "no store column name leaks");
-    assert!(all[0].get("account_id").is_none(), "no account id on the wire");
+    assert_eq!(
+        all[0]["to"], "bob@example.com",
+        "the column is to_addr; the wire says `to`"
+    );
+    assert!(
+        all[0].get("to_addr").is_none(),
+        "no store column name leaks"
+    );
+    assert!(
+        all[0].get("account_id").is_none(),
+        "no account id on the wire"
+    );
     assert_eq!(all[0]["subject"], "Hello");
     assert_eq!(all[0]["body"], "hi");
     // RFC3339 timestamps, same as every other wire view.
@@ -3585,7 +4478,11 @@ async fn drafts_list_carries_the_to_field_name_on_the_wire() {
 #[tokio::test]
 async fn delete_draft_then_deleting_it_again_is_404() {
     let Harness { app, .. } = harness(|_, _| {});
-    let draft = put_draft(&app, serde_json::json!({ "to": "bob@example.com", "body": "hi" })).await;
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "bob@example.com", "body": "hi" }),
+    )
+    .await;
     let id = draft["id"].as_i64().unwrap();
 
     let resp = app
@@ -3603,7 +4500,11 @@ async fn delete_draft_then_deleting_it_again_is_404() {
         .oneshot(authed("DELETE", &format!("/client/drafts/{id}")))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a second delete has nothing to remove");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a second delete has nothing to remove"
+    );
 }
 
 #[tokio::test]
@@ -3621,11 +4522,17 @@ async fn draft_reads_and_writes_are_no_store() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
 
     let resp = app.oneshot(authed("GET", "/client/drafts")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
 }
 
 #[tokio::test]
@@ -3633,15 +4540,26 @@ async fn draft_crud_writes_no_audit_rows() {
     // The audit log is the ledger of reveals and Gmail writes. A draft never
     // leaves the machine, so it must leave no trace there.
     let Harness { app, store, acct } = harness(|_, _| {});
-    let draft = put_draft(&app, serde_json::json!({ "to": "bob@example.com", "body": "hi" })).await;
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "bob@example.com", "body": "hi" }),
+    )
+    .await;
     let id = draft["id"].as_i64().unwrap();
-    put_draft(&app, serde_json::json!({ "to": "bob@example.com", "body": "hi again" })).await;
+    put_draft(
+        &app,
+        serde_json::json!({ "to": "bob@example.com", "body": "hi again" }),
+    )
+    .await;
     let _ = list_drafts(&app).await;
     app.oneshot(authed("DELETE", &format!("/client/drafts/{id}")))
         .await
         .unwrap();
 
-    assert!(store.list_audit(acct, 10).unwrap().is_empty(), "draft CRUD is not audited");
+    assert!(
+        store.list_audit(acct, 10).unwrap().is_empty(),
+        "draft CRUD is not audited"
+    );
 }
 
 #[tokio::test]
@@ -3686,7 +4604,11 @@ async fn successful_send_discards_the_draft_it_consumed() {
     // answers `{}`, so the echo has no id to fetch back and audits the skip.
     let audit = store.list_audit(acct, 10).unwrap();
     assert_eq!(audit.len(), 2);
-    assert!(audit.iter().any(|a| a.action == "send" && a.detail.as_deref() == Some("ok")));
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
+    );
     assert!(
         audit
             .iter()
@@ -3788,10 +4710,15 @@ async fn draft_routes_require_bearer_auth() {
 async fn thread_view_marks_sent_to_senders_known_and_strangers_not() {
     use squelch_core::store::ContactEntry;
     let Harness { app, .. } = harness(|store, acct| {
-        store.upsert_message(&msg(acct, "g1", "t1", "lunch?", "from a known contact")).unwrap();
+        // Both authenticated at ingest, so the split under test is purely the
+        // contact half.
+        let mut known = msg(acct, "g1", "t1", "lunch?", "from a known contact");
+        known.auth_pass = Some(true);
+        store.upsert_message(&known).unwrap();
         let mut stranger = msg(acct, "g2", "t1", "lunch?", "from a stranger");
         stranger.from_addr = "promo@nowhere.io".into();
         stranger.from_name = None;
+        stranger.auth_pass = Some(true);
         store.upsert_message(&stranger).unwrap();
         // Seeded through the Sent-derived contacts table — the same signal
         // triage's known-contact floor reads. Cased differently from the
@@ -3809,7 +4736,10 @@ async fn thread_view_marks_sent_to_senders_known_and_strangers_not() {
             .unwrap();
     });
 
-    let resp = app.oneshot(authed("GET", "/client/thread/t1")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let msgs = json["messages"].as_array().unwrap();
@@ -3832,7 +4762,9 @@ async fn thread_view_marks_sent_to_senders_known_and_strangers_not() {
 async fn thread_view_sender_known_needs_a_sent_message_not_merely_contact_row() {
     use squelch_core::store::ContactEntry;
     let Harness { app, .. } = harness(|store, acct| {
-        store.upsert_message(&msg(acct, "g1", "t1", "hi", "body")).unwrap();
+        store
+            .upsert_message(&msg(acct, "g1", "t1", "hi", "body"))
+            .unwrap();
         // sent_count 0: harvested but never actually written to. `is_known_contact`
         // requires sent_count > 0, and the read-time bit must not soften that.
         store
@@ -3848,7 +4780,71 @@ async fn thread_view_sender_known_needs_a_sent_message_not_merely_contact_row() 
             .unwrap();
     });
 
-    let resp = app.oneshot(authed("GET", "/client/thread/t1")).await.unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["messages"][0]["sender_known"], Value::Bool(false));
+}
+
+#[tokio::test]
+async fn thread_view_sender_known_needs_the_mail_to_pass_email_authentication() {
+    use squelch_core::store::ContactEntry;
+    // Three copies of the same known contact's address, differing only in the
+    // stored email-authentication verdict. A From header is free to write, so
+    // only the authenticated one may claim the reader's pixel bypass — and the
+    // NULL row (pre-existing mail, never re-synced) must read as "no".
+    let Harness { app, .. } = harness(|store, acct| {
+        for (label, auth_pass) in [
+            ("authenticated", Some(true)),
+            ("failed-auth", Some(false)),
+            ("never-evaluated", None),
+        ] {
+            let mut m = msg(acct, label, "t1", "hi", label);
+            m.auth_pass = auth_pass;
+            store.upsert_message(&m).unwrap();
+        }
+        store
+            .merge_harvested_contacts(
+                acct,
+                &[ContactEntry {
+                    addr: "alice@example.com".into(),
+                    display_name: None,
+                    sent_count: 3,
+                    last_sent_at: None,
+                }],
+            )
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let msgs = json["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    let known = |label: &str| -> Value {
+        msgs.iter()
+            .find(|m| m["content"] == label)
+            .unwrap_or_else(|| panic!("{label} missing from the thread"))["sender_known"]
+            .clone()
+    };
+    assert_eq!(known("authenticated"), Value::Bool(true));
+    assert_eq!(
+        known("failed-auth"),
+        Value::Bool(false),
+        "a known contact still needs an authentication pass"
+    );
+    assert_eq!(
+        known("never-evaluated"),
+        Value::Bool(false),
+        "NULL auth_pass grants no bypass"
+    );
+    // WIRE CONTRACT: sender_known stays a plain bool, and the verdict that
+    // gates it is not itself exposed.
+    assert!(msgs[0]["sender_known"].is_boolean());
+    assert!(msgs[0].get("auth_pass").is_none());
 }

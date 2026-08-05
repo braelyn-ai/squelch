@@ -23,6 +23,8 @@ fn config_reads_the_environment() {
         "SQUELCH_RELAY_ALLOW_ANONYMOUS",
         "SQUELCH_RELAY_APNS_URL_OVERRIDE",
         "SQUELCH_RELAY_DB_PATH",
+        "SQUELCH_RELAY_TRUSTED_PROXY_HOPS",
+        "SQUELCH_RELAY_TRUSTED_PROXY_CIDRS",
     ];
     fn clear() {
         for v in VARS {
@@ -92,6 +94,8 @@ fn config_reads_the_environment() {
     assert!(cfg.apns_url_override.is_none());
     // Unset means the open buffer lives in memory.
     assert!(cfg.db_path.is_none());
+    // Unset means no proxy is trusted: the limiters key on the TCP peer.
+    assert_eq!(cfg.trusted_proxy_hops, 0);
     // The key parses into a usable signer.
     RelayState::new(cfg).unwrap();
 
@@ -154,6 +158,63 @@ fn config_reads_the_environment() {
     set("SQUELCH_RELAY_APNS_KEY_PATH", "tests/does-not-exist.p8");
     assert!(Config::from_env().is_err());
     set("SQUELCH_RELAY_APNS_KEY_PATH", "tests/fixture_test_key.p8");
+
+    // Trusting a forwarded header is opt-in, and a value that could only be a
+    // typo is a refusal to boot rather than a silent fall back to one shared
+    // bucket for every client.
+    set("SQUELCH_RELAY_TRUSTED_PROXY_HOPS", "one");
+    assert!(Config::from_env().is_err());
+    set("SQUELCH_RELAY_TRUSTED_PROXY_HOPS", "-1");
+    assert!(Config::from_env().is_err());
+    set("SQUELCH_RELAY_TRUSTED_PROXY_HOPS", "99");
+    assert!(Config::from_env().is_err());
+    set("SQUELCH_RELAY_TRUSTED_PROXY_HOPS", " 1 ");
+    assert_eq!(Config::from_env().unwrap().trusted_proxy_hops, 1);
+    set("SQUELCH_RELAY_TRUSTED_PROXY_HOPS", "0");
+    assert_eq!(Config::from_env().unwrap().trusted_proxy_hops, 0);
+
+    // The hop count alone says nothing about who may send the header, so the
+    // peer allowlist is the other half of the claim: unset it defaults to the
+    // private ranges, and naming peers without declaring a hop count is a
+    // contradiction rather than a list that is never consulted.
+    let cfg = Config::from_env().unwrap();
+    assert!(cfg.trusted_proxy_cidrs.is_none());
+    assert!(
+        cfg.proxy_allowlist()
+            .iter()
+            .any(|c| c.contains("10.1.2.3".parse().unwrap()))
+    );
+    assert!(
+        !cfg.proxy_allowlist()
+            .iter()
+            .any(|c| c.contains("203.0.113.7".parse().unwrap()))
+    );
+    set("SQUELCH_RELAY_TRUSTED_PROXY_CIDRS", "203.0.113.7");
+    assert!(Config::from_env().is_err(), "an allowlist with no hops");
+    set("SQUELCH_RELAY_TRUSTED_PROXY_HOPS", "1");
+    set("SQUELCH_RELAY_TRUSTED_PROXY_CIDRS", "not-a-block");
+    assert!(Config::from_env().is_err());
+    set("SQUELCH_RELAY_TRUSTED_PROXY_CIDRS", " , ");
+    assert!(Config::from_env().is_err());
+    set(
+        "SQUELCH_RELAY_TRUSTED_PROXY_CIDRS",
+        " 203.0.113.0/24 , fd00::/8 ",
+    );
+    let cfg = Config::from_env().unwrap();
+    assert_eq!(cfg.proxy_allowlist().len(), 2);
+    assert!(
+        cfg.proxy_allowlist()
+            .iter()
+            .any(|c| c.contains("203.0.113.7".parse().unwrap()))
+    );
+    // The named list REPLACES the default: loopback is no longer a proxy.
+    assert!(
+        !cfg.proxy_allowlist()
+            .iter()
+            .any(|c| c.contains("127.0.0.1".parse().unwrap()))
+    );
+    unsafe { std::env::remove_var("SQUELCH_RELAY_TRUSTED_PROXY_CIDRS") };
+    unsafe { std::env::remove_var("SQUELCH_RELAY_TRUSTED_PROXY_HOPS") };
 
     // The open buffer opens (and creates) the configured file.
     let db = std::env::temp_dir().join(format!(
