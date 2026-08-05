@@ -92,7 +92,7 @@ fn receipt_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
     assert!(fresh.is_empty(), "auto-done receipt must not be in the New band");
 
     // 4. Bands counts agree: new == 0, standing == 0.
-    let stats = store.stats(acct).unwrap();
+    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
     assert_eq!(stats.bands.new, 0, "receipt excluded from new count");
     assert_eq!(stats.bands.standing, 0);
 }
@@ -146,7 +146,7 @@ fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
         .attention_updates(acct, since, None, None, Some(SitrepBand::New))
         .unwrap();
     assert!(fresh.is_empty(), "auto-done calendar update must not be in New");
-    let stats = store.stats(acct).unwrap();
+    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
     assert_eq!(stats.bands.new, 0);
     assert_eq!(stats.bands.standing, 0);
 }
@@ -217,7 +217,7 @@ fn receipt_matching_merchant_and_amount_closes_open_bill() {
     let (status, resolved_at) = triage_status(&store, acct, bill_id);
     assert_eq!(status, "done", "matched bill auto-closes");
     assert!(resolved_at.is_some(), "done stamps resolved_at");
-    assert_eq!(store.stats(acct).unwrap().bands.standing, 0);
+    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 0);
 
     // The WHY is on the audit trail, targeting the bill's message id.
     let audits = auto_close_audits(&store, acct);

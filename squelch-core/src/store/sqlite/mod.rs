@@ -19,10 +19,10 @@ mod migrate;
 mod rules;
 mod search;
 mod specialists;
-mod tracking;
-mod triage_stages;
 #[cfg(test)]
 mod tests;
+mod tracking;
+mod triage_stages;
 
 use self::migrate::migrate;
 
@@ -34,19 +34,18 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    TriageDebug,
-    AttachmentBytes, BankingApplied, ContactEntry, ExtractQueued, MarketingApplied, MarketingOffer,
-    Device, Draft, MessageOpen, MessageUnsub, MissingVector, NewAuditEntry, NewEvent,
-    SealedBody, SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
-    TrackedMessage, TriagedMessage,
+    AttachmentBytes, BankingApplied, ContactEntry, Device, Draft, ExtractQueued, MarketingApplied,
+    MarketingOffer, MessageOpen, MessageUnsub, MissingVector, NewAuditEntry, NewEvent, SealedBody,
+    SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides,
+    Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TrackedMessage, TriageDebug,
+    TriagedMessage,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
     Event, EventKind, NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity,
-    ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, Update,
-    UnsubscribeRecord,
+    ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord,
+    Update,
 };
 
 // schema.sql stays beside `store/mod.rs`; this file is `store/sqlite/mod.rs`.
@@ -74,9 +73,8 @@ fn register_vec_extension() {
                 *mut rusqlite::ffi::sqlite3,
                 *mut *mut std::os::raw::c_char,
                 *const rusqlite::ffi::sqlite3_api_routines,
-            ) -> std::os::raw::c_int = std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            );
+            ) -> std::os::raw::c_int =
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
             rusqlite::ffi::sqlite3_auto_extension(Some(init));
         }
     });
@@ -162,10 +160,7 @@ impl SqliteStore {
 
     /// The attached embedder, if any — a cheap `Arc` clone.
     pub fn embedder(&self) -> Option<std::sync::Arc<dyn crate::embed::Embedder>> {
-        self.embedder
-            .read()
-            .ok()
-            .and_then(|g| g.clone())
+        self.embedder.read().ok().and_then(|g| g.clone())
     }
 
     /// Attach the in-process broadcast that every successful
@@ -433,11 +428,7 @@ impl Store for SqliteStore {
         self.attachment_bytes(account_id, attachment_id)
     }
 
-    fn deadlines(
-        &self,
-        account_id: AccountId,
-        within_days: Option<u32>,
-    ) -> Result<Vec<Deadline>> {
+    fn deadlines(&self, account_id: AccountId, within_days: Option<u32>) -> Result<Vec<Deadline>> {
         self.deadlines(account_id, within_days)
     }
 
@@ -468,7 +459,14 @@ impl Store for SqliteStore {
         receipt: &crate::triage::ReceiptInfo,
         received_at: DateTime<Utc>,
     ) -> Result<i64> {
-        self.upsert_receipt(account_id, message_id, from_addr, from_name, receipt, received_at)
+        self.upsert_receipt(
+            account_id,
+            message_id,
+            from_addr,
+            from_name,
+            receipt,
+            received_at,
+        )
     }
 
     fn list_receipts(&self, account_id: AccountId, days: u32) -> Result<Vec<Receipt>> {
@@ -702,11 +700,7 @@ impl Store for SqliteStore {
         self.delete_device_by_token(account_id, token)
     }
 
-    fn triage_debug(
-        &self,
-        account_id: AccountId,
-        message_id: i64,
-    ) -> Result<Option<TriageDebug>> {
+    fn triage_debug(&self, account_id: AccountId, message_id: i64) -> Result<Option<TriageDebug>> {
         self.triage_debug(account_id, message_id)
     }
 
@@ -796,8 +790,8 @@ impl Store for SqliteStore {
         self.list_audit(account_id, limit)
     }
 
-    fn stats(&self, account_id: AccountId) -> Result<StoreStats> {
-        self.stats(account_id)
+    fn stats(&self, account_id: AccountId, bands_since: DateTime<Utc>) -> Result<StoreStats> {
+        self.stats(account_id, bands_since)
     }
 
     fn stage1_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage1Queued>> {
@@ -858,12 +852,7 @@ impl Store for SqliteStore {
         self.stage2_queue(account_id, limit)
     }
 
-    fn stage2_budget_used(
-        &self,
-        account_id: AccountId,
-        thread_id: &str,
-        day: &str,
-    ) -> Result<u32> {
+    fn stage2_budget_used(&self, account_id: AccountId, thread_id: &str, day: &str) -> Result<u32> {
         self.stage2_budget_used(account_id, thread_id, day)
     }
 

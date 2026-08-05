@@ -314,7 +314,17 @@ impl SqliteStore {
         Ok(n)
     }
 
-    pub(super) fn stats(&self, account_id: AccountId) -> Result<StoreStats> {
+    /// `bands_since` windows ONLY the band counts, mirroring the `since` the
+    /// list queries run under: standing's correspondence arms admit mail from
+    /// every contact the user has ever written to, so an unwindowed count
+    /// grows monotonically with corpus age and outruns the list it heads. The
+    /// inventory counts (tiers, total, sealed) stay all-time on purpose —
+    /// they describe the store, not the sitrep.
+    pub(super) fn stats(
+        &self,
+        account_id: AccountId,
+        bands_since: DateTime<Utc>,
+    ) -> Result<StoreStats> {
         let conn = self.lock()?;
 
         let mut tier_counts = std::collections::BTreeMap::new();
@@ -351,7 +361,9 @@ impl SqliteStore {
         // Sitrep band counts over non-sealed rows. These definitions MUST match
         // the `band` query on attention_updates, or header and list disagree —
         // including its one-row-per-thread collapse, hence DISTINCT thread keys
-        // (blank thread_id falls back to the message id, same as the list).
+        // (blank thread_id falls back to the message id, same as the list),
+        // and its received_at window, hence `bands_since` (the list's default
+        // min importance is 0, a no-op, so it is not mirrored here).
         // Standing is decided in the subquery, where the `m` join alias the
         // shared expression is written against is still in scope.
         let (standing, new_count, open_count): (i64, i64, i64) = conn.query_row(
@@ -366,9 +378,10 @@ impl SqliteStore {
                        FROM triage t
                        JOIN messages m ON m.id = t.message_id
                        WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
-                         AND m.is_sent = 0) t"
+                         AND m.is_sent = 0
+                         AND m.received_at >= ?2) t"
             ),
-            params![account_id],
+            params![account_id, bands_since.to_rfc3339()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
 

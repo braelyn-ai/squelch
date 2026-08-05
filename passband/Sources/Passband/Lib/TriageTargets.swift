@@ -69,7 +69,12 @@ struct TriageTarget: Identifiable, Hashable, Sendable {
     /// See CorrectionExit — the inverse of `lands`, for the band it leaves.
     var exit: CorrectionExit {
         switch (axis, value) {
-        case (.tier, "signal"), (.tier, "noise"): .standing
+        // A signal/noise correction does NOT exit standing: the band's
+        // correspondence arms are tier-independent, and nothing on the wire
+        // says which arm admitted a row. Optimistically removing one that
+        // stands on correspondence just makes it vanish and reappear a round
+        // trip later, so .stays is the only truthful mapping; a tier-arm row
+        // lingers one refresh instead.
         case (.sensitivity, "sealed"): .allBands
         default: .stays
         }

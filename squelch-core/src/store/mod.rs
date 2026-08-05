@@ -1037,8 +1037,10 @@ pub trait Store: Send + Sync {
     /// that exists for the account.
     fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>>;
 
-    /// Per-tier / sealed / sync-cursor summary counts for the account.
-    fn stats(&self, account_id: AccountId) -> Result<StoreStats>;
+    /// Per-tier / sealed / sync-cursor summary counts for the account. The
+    /// band counts are windowed to `bands_since` so they agree with the list
+    /// queries they head; the inventory counts are all-time.
+    fn stats(&self, account_id: AccountId, bands_since: DateTime<Utc>) -> Result<StoreStats>;
 
     // STAGE-2 additions, supporting the LLM triage pass in the sync loop. The
     // queue predicate is `model_used IS NULL AND sensitivity='normal'`, so sealed
