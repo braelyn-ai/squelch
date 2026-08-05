@@ -48,8 +48,12 @@ async fn get_usage(app: axum::Router) -> Value {
 #[tokio::test]
 async fn categories_include_ledger_writers_the_endpoint_never_heard_of() {
     let app = priced_harness(|store, acct| {
-        store.stage1_bump_usage(acct, "2026-07-09", 1_000, 100).unwrap();
-        store.stage2_bump_usage(acct, "2026-07-09", 2_000, 200).unwrap();
+        store
+            .stage1_bump_usage(acct, "2026-07-09", 1_000, 100)
+            .unwrap();
+        store
+            .stage2_bump_usage(acct, "2026-07-09", 2_000, 200)
+            .unwrap();
         store
             .extract_bump_usage(acct, "2026-07-09", "extract_banking", 4_000, 400)
             .unwrap();
@@ -66,12 +70,7 @@ async fn categories_include_ledger_writers_the_endpoint_never_heard_of() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec![
-            "extract_banking",
-            "extract_fictional",
-            "stage1",
-            "stage2"
-        ],
+        vec!["extract_banking", "extract_fictional", "stage1", "stage2"],
         "every ledger category reports, including one the endpoint cannot know about"
     );
 
@@ -101,7 +100,11 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
     .app;
 
     let body = get_usage(app).await;
-    let cost = |name: &str| body["categories"][name]["totals"]["est_cost_usd"].as_f64().unwrap();
+    let cost = |name: &str| {
+        body["categories"][name]["totals"]["est_cost_usd"]
+            .as_f64()
+            .unwrap()
+    };
 
     // Exactly 1 MTok each way, so the cost IS the price pair summed.
     assert!((cost("stage1") - (S1_IN + S1_OUT)).abs() < 1e-9);
@@ -121,7 +124,9 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
 #[tokio::test]
 async fn top_level_fields_stay_stage2_for_older_clients() {
     let app = priced_harness(|store, acct| {
-        store.stage1_bump_usage(acct, "2026-07-09", 1_000, 100).unwrap();
+        store
+            .stage1_bump_usage(acct, "2026-07-09", 1_000, 100)
+            .unwrap();
         store
             .stage2_bump_usage(acct, "2026-07-09", 1_000_000, 1_000_000)
             .unwrap();

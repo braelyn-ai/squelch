@@ -1,6 +1,5 @@
 //! Store tests, split by subject. `support` holds the shared fixtures.
 
-mod support;
 mod attention;
 mod audit;
 mod drafts;
@@ -11,5 +10,6 @@ mod migrate;
 mod rules;
 mod search;
 mod specialists;
+mod support;
 mod tracking;
 mod triage_stages;

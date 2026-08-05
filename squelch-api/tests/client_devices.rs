@@ -104,7 +104,12 @@ async fn register_then_unregister_round_trips() {
     assert_eq!(h.store.list_devices(h.acct).unwrap().len(), 2);
 
     // Unregister is 204 and actually removes the row.
-    let resp = h.app.clone().oneshot(unregister(DEV_A, true)).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(unregister(DEV_A, true))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let left = h.store.list_devices(h.acct).unwrap();
     assert_eq!(left.len(), 1);

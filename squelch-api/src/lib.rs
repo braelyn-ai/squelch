@@ -9,8 +9,8 @@ mod auth;
 mod devices;
 mod error;
 mod events;
-pub mod guard;
 pub mod gmail_write;
+pub mod guard;
 mod handlers;
 mod markdown;
 mod state;
@@ -25,8 +25,7 @@ pub use handlers::run_shred_pass;
 pub use state::{ApiState, StateError, attach_event_channel};
 
 use axum::{
-    Router,
-    middleware,
+    Router, middleware,
     routing::{delete, get, post, put},
 };
 
@@ -51,10 +50,7 @@ fn client_router(state: ApiState) -> Router {
         )
         .route("/client/refresh", post(handlers::refresh_now))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
-        .route(
-            "/client/attachments/{id}",
-            get(handlers::get_attachment),
-        )
+        .route("/client/attachments/{id}", get(handlers::get_attachment))
         .route("/client/shipments", get(handlers::get_shipments))
         .route("/client/receipts", get(handlers::get_receipts))
         .route("/client/banking", get(handlers::get_banking))
@@ -73,6 +69,12 @@ fn client_router(state: ApiState) -> Router {
             get(handlers::list_drafts).put(handlers::put_draft),
         )
         .route("/client/drafts/{id}", delete(handlers::delete_draft))
+        // The composer/signature preview: the send path's own markdown render,
+        // exposed so the client never grows a second, drifting renderer.
+        .route(
+            "/client/markdown/preview",
+            post(handlers::markdown_preview),
+        )
         // Recipient autocomplete over Sent-derived contacts. Human door only —
         // the agent door must never see who the user writes to.
         .route("/client/contacts", get(handlers::get_contacts))
