@@ -144,7 +144,8 @@ disabled and spawns nothing.
 
 ## 4. Headless OAuth (read AND write credentials)
 
-`squelchd auth` binds a FIXED loopback port and prints a consent URL; you forward
+`squelchd auth --headless` binds a FIXED loopback port and prints a consent URL
+(plain `auth` uses an ephemeral port and expects a local browser); you forward
 that port from your laptop over SSH and complete consent in your local browser.
 The daemon needs BOTH credentials, stored in SEPARATE slots:
 
@@ -156,6 +157,11 @@ The daemon needs BOTH credentials, stored in SEPARATE slots:
 (write first, then read), so renewing the action credential can never leave sync
 running on a stale read token. On a fresh box one `auth --write` run is enough;
 plain `auth` is the read-only path.
+
+No SSH access from the machine with the browser? `squelchd auth --export` on
+that machine and `--import` on the box move the credential over any copy-paste
+channel instead — the walkthrough is in
+[../docs/GETTING-STARTED.md](../docs/GETTING-STARTED.md) §3.
 
 Run each as the `squelch` user so tokens land in the service's credentials file.
 

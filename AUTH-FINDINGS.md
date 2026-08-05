@@ -104,6 +104,11 @@ transport resolution vs ambient env.
 
 ## D. Doc corrections (for the docs owner — not applied)
 
+> **APPLIED 2026-08-05** on the `dry-run` branch, alongside the onboarding
+> dry-run fixes (`ONBOARDING-FINDINGS.md`): items 4 and 5 were independently
+> found and fixed by that pass; 1, 2, 3, 6, 7, and 8 were applied from this
+> list. Line numbers below cite the pre-fix tree.
+
 Verified against code, each with the load-bearing citation:
 
 1. **README.md:78 recommends the broker as a live route.** docs/BROKER.md:3-8

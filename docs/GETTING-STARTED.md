@@ -49,6 +49,13 @@ When you consent later, Google will warn you that the app is not verified. That
 is expected for your own client, and you can continue past it. Verification is
 what removes the warning, and it is a per project review process.
 
+One consequence of **Testing** status is easy to miss and expensive to learn
+live: Google expires a Testing project's refresh tokens after **seven days**,
+so your daemon dies weekly with `invalid_grant` until you re-consent. The fix
+is one click and needs no verification review: on the OAuth consent screen
+page, publish the app to **In production**. The unverified-app warning stays,
+the weekly expiry goes away.
+
 ## 2. Put the daemon on the NAS
 
 Create a directory on the NAS with a `docker-compose.yml`:
@@ -246,6 +253,7 @@ no such restriction, which is why the client works without this.
 | `invalid_client` on refresh, or an import that says the blob was minted by a different OAuth client | The daemon and the exporting machine used different OAuth clients. Re export with the same client ID and secret. |
 | Import refuses and names two addresses | Google says the credential opens a different Gmail account than `SQUELCH_ACCOUNT_EMAIL`. Consent as the right account, or fix the variable. |
 | "Google hasn't verified this app" | Expected for your own OAuth client. Continue past it. |
+| `invalid_grant` roughly weekly | Your OAuth consent screen is still in **Testing**, which expires refresh tokens after 7 days. Publish it to **In production** (step 1), then re-run the auth flow once. |
 | Client connects but is empty | The first sync is still running. Watch `docker compose logs -f squelchd`. |
 
 ## Where things live

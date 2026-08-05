@@ -55,7 +55,7 @@ services:
     environment: *squelch-env
 
   # One-off OAuth consent runs (never started by `up`; see below). Host
-  # networking because `squelchd auth` binds 127.0.0.1:8847 by design — the
+  # networking because `squelchd auth --headless` binds 127.0.0.1:8847 — the
   # Google desktop-app flow requires a loopback redirect — and a published
   # port can't reach a loopback bind inside a container.
   auth:
@@ -82,7 +82,10 @@ SQUELCH_CLIENT_SECRET=<client secret>
 ## Headless OAuth (one-time, and on reauth)
 
 Same flow as bare-metal (DEPLOY.md §4), with the auth service standing in for
-the binary. From your laptop, forward the fixed port to the box:
+the binary. No SSH path to the box? `auth --export` on a machine with a browser
+plus `auth --import` on the box works over any copy-paste channel —
+[../docs/GETTING-STARTED.md](../docs/GETTING-STARTED.md) §3 walks it. With SSH,
+forward the fixed port from your laptop:
 
 ```sh
 ssh -L 8847:127.0.0.1:8847 box

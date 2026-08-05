@@ -84,8 +84,13 @@ redirect on our domain:
    or a repeated `kind`), and then takes every remaining entry to Google BEFORE
    it writes anything: a refresh against this host's OAuth client, `users.
    getProfile` on the result held against `account_email`, and the granted
-   scopes held against what that entry's slot requires. That last one is what
-   stops a hand-edited `kind` from filing a modify+send token in the Read slot.
+   scopes held against what that entry's slot requires. That last check is a
+   subset floor, not an exact match — Google unions grants across one project's
+   consents, so after an `--export --write` even the Read entry's refresh
+   reports the union — which means it stops a readonly token from landing in
+   the Write slot but cannot prove the reverse. The slot separation that
+   matters is enforced downstream: only the human door's action handlers can
+   load the Write slot.
    One failed entry stores none of them. base64url is an encoding, not
    encryption: the blob is plaintext credential material and nothing in this
    path pretends otherwise, which is exactly why what it says about itself
@@ -272,6 +277,9 @@ no catch-all arm, so adding a variant is a compile error at that decision point
 instead of a variant silently inheriting the polling path.
 
 ## Daemon side
+
+(As implemented; undeployable for self-host per the status banner at the top —
+`--import` is the shipping route.)
 
 `squelchd auth --broker <url>` runs the flow above instead of the loopback
 listener; everything downstream (scope plan, credential kinds, storage

@@ -48,7 +48,7 @@ EOF
 
 `SQUELCH_API_TOKEN` is the password for the human door.
 
-Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`.
+Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`, `SQUELCH_CRED_BACKEND` (`keyring` on macOS, `file` on Linux) and `SQUELCH_CREDENTIALS_PATH` (default `~/.config/squelch/credentials.json`) for the file backend.
 
 To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key/provider; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be overridden at runtime (no restart) from Passband's Settings.
 
@@ -57,7 +57,7 @@ To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`
 ```sh
 set -a; source .env; set +a
 
-cargo run --bin squelchd -- auth     # one-time browser consent, token lands in the OS keyring
+cargo run --bin squelchd -- auth     # one-time browser consent; token -> macOS keyring, mode-0600 JSON file on Linux
 cargo run --bin squelchd -- serve    # sync + both doors on one port
 ```
 
@@ -75,7 +75,7 @@ docker exec -i squelchd squelchd auth --import < cred.txt
 
 `--export` runs the normal consent flow and stores nothing. `--out` writes the one line it produces as mode 0600, which a `> cred.txt` redirect cannot do: that takes your umask, and the file is a live refresh token. (Without `--out` the line goes to stdout and everything else goes to stderr, so `umask 077; squelchd auth --export > cred.txt` also works.)
 
-`--import` reads that line from stdin only (never an argument: arguments show up in `ps` and in shell history). Before it stores anything, it refreshes every credential in the blob against this host's OAuth client and asks Google which mailbox the result opens and what it is allowed to do. A blob is unsigned JSON, so the account and the read/write slot it names for itself are claims, not evidence; nothing lands unless Google agrees with both, and one bad entry stores none of them. Delete `cred.txt` once it is in.
+`--import` reads that line from stdin only (never an argument: arguments show up in `ps` and in shell history). Before it stores anything, it refreshes every credential in the blob against this host's OAuth client, asks Google which mailbox the result opens, and checks the granted scopes cover what each entry's slot requires — a floor, not an exact match, because Google unions grants across one project's consents. A blob is unsigned JSON, so what it says about itself is a claim; a wrong mailbox or a token that cannot do its slot's job is refused, and one bad entry stores none of them. What keeps the two credentials apart is which code path may load each slot, not a capability difference in the tokens. Delete `cred.txt` once it is in.
 
 Both machines must use the same `SQUELCH_CLIENT_ID` and `SQUELCH_CLIENT_SECRET`. A refresh token is bound to the OAuth client that minted it, not to a host, so it travels fine between machines and not at all between clients.
 
@@ -156,7 +156,7 @@ Override the profile name with `NOTARY_PROFILE=`. Apple's turnaround is typicall
 
 ## Security posture
 
-- The sync credential is scoped `gmail.readonly`. The write credential (`gmail.modify` + `gmail.send`) lives in a separate slot and is only reachable from the human door's action handlers, which require an explicit confirm flag, run an outbound secret scan on sends, and audit every attempt.
+- The sync credential is requested as `gmail.readonly`, and what holds the line is structural: sync and triage can only load the Read slot, ever. The write credential (`gmail.modify` + `gmail.send`) lives in a separate slot that is only reachable from the human door's action handlers, which require an explicit confirm flag, run an outbound secret scan on sends, and audit every attempt. (Google unions granted scopes across one project's consents, so the token in the Read slot may *carry* more than readonly after `auth --write` — which door can load which slot is the enforcement, not the token's scope list.)
 - Auth emails (2FA codes, password resets, login alerts) are sealed at ingest and never appear in any MCP response, any LLM call, or any list endpoint. Revealing one takes an explicit authenticated request and writes an audit row.
 - Email content is treated as untrusted input everywhere. Tokens never appear in logs.
 - Read tracking on mail you send is off by default and opt-in per send; the record lives in your daemon, never on shared infrastructure. Self-hosted deployments serve the pixel themselves and need no relay — see [docs/TRACKING.md](docs/TRACKING.md).
