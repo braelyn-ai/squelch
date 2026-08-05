@@ -416,35 +416,90 @@ private struct MailSection: View {
 }
 
 /// The email signature, edited in the same live-markdown view the composers
-/// use, so what it looks like here is what it looks like in a draft. Saved on
-/// every keystroke (UserDefaults) — client-side, like the display name.
+/// use, beside a preview rendered by the DAEMON's send-path renderer — the
+/// same function that builds the HTML half of every outgoing email, so the
+/// right side is what the recipient gets, not a second interpretation. Saved
+/// on every keystroke (UserDefaults) — client-side, like the display name.
 private struct SignatureSection: View {
     @Environment(Prefs.self) private var prefs
+
+    @State private var previewHTML = ""
+    @State private var previewFailed = false
 
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Signature") {
-            HStack(spacing: 6) {
-                Text("markdown, like the composer:")
-                    .font(Typo.micro)
-                    .foregroundStyle(Palette.inkFaint)
-                Text("**bold**, *italic*, `code`, [links](url)")
-                    .font(Typo.micro)
-                    .foregroundStyle(Palette.inkFaintest)
+            HStack(alignment: .top, spacing: 14) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text("markdown, like the composer:")
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaint)
+                        Text("**bold**, *italic*, `code`, [links](url)")
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaintest)
+                    }
+                    MarkdownTextView(text: $prefs.signature)
+                        .frame(height: 140)
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(Palette.canvas.opacity(0.65))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+                }
+                .frame(maxWidth: .infinity)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("as the recipient sees it")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaint)
+                    previewPane
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            MarkdownTextView(text: $prefs.signature)
-                .frame(height: 110)
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Palette.canvas.opacity(0.65))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
             SettingsHint(
                 "Added under new messages and replies as you draft them. It is part of the body, so you can edit or delete it per email. Leave this empty for no signature."
             )
+        }
+        .task(id: prefs.signature) { await refreshPreview() }
+    }
+
+    @ViewBuilder private var previewPane: some View {
+        if prefs.signature.trimmed.isEmpty {
+            Text("nothing to preview yet")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+                .padding(.top, 4)
+        } else if previewFailed {
+            Text("preview unavailable — is the daemon up to date and reachable?")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+                .padding(.top, 4)
+        } else if !previewHTML.isEmpty {
+            EmailWebView(html: previewHTML)
+        }
+    }
+
+    /// One render per typing pause. `.task(id:)` cancels the previous run on
+    /// every keystroke, so the sleep is the debounce; only a request that was
+    /// still the newest when it finished may report failure.
+    private func refreshPreview() async {
+        let source = prefs.signature.trimmed
+        guard !source.isEmpty else {
+            previewHTML = ""
+            previewFailed = false
+            return
+        }
+        try? await Task.sleep(for: .milliseconds(350))
+        guard !Task.isCancelled else { return }
+        do {
+            previewHTML = try await APIClient.shared.markdownPreview(source)
+            previewFailed = false
+        } catch {
+            if !Task.isCancelled { previewFailed = true }
         }
     }
 }

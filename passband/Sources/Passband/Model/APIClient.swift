@@ -424,6 +424,19 @@ actor APIClient {
         try await post("/client/tracking-config", body: TrackingConfigBody(default_enabled: enabled))
     }
 
+    // MARK: - markdown preview
+
+    struct MarkdownPreviewBody: Codable, Sendable { var source: String }
+    struct MarkdownPreviewResult: Codable, Sendable { var html: String }
+
+    /// The daemon's own send-path markdown render, for previews. What comes
+    /// back is byte-for-byte the HTML half a send of `source` would carry.
+    func markdownPreview(_ source: String) async throws -> String {
+        let result: MarkdownPreviewResult = try await post(
+            "/client/markdown/preview", body: MarkdownPreviewBody(source: source))
+        return result.html
+    }
+
     // MARK: - drafts
 
     /// Every draft this account holds. At most one per reply target plus one
