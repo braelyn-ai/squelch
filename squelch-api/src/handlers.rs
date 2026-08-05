@@ -16,11 +16,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squelch_core::CoreError;
-use squelch_core::store::{ActionMessageRef, Draft, NewAuditEntry, SitrepBand, SqliteStore, Store};
+use squelch_core::store::{
+    ActionMessageRef, Draft, NewAuditEntry, SitrepBand, SqliteStore, Store,
+};
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
 use squelch_core::triage::rule_infer;
-use squelch_core::types::{AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis};
+use squelch_core::types::{
+    AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -236,9 +240,7 @@ pub async fn set_update_status(
     )
     .await;
 
-    Ok(Json(
-        json!({ "status": status.as_str(), "message_id": message_id }),
-    ))
+    Ok(Json(json!({ "status": status.as_str(), "message_id": message_id })))
 }
 
 // --- POST /client/refresh ---------------------------------------------------
@@ -326,16 +328,11 @@ pub async fn triage_debug(
 struct ThreadMessageView {
     #[serde(flatten)]
     message: squelch_core::types::ClientMessage,
-    /// `true` when this message's `from_addr` is a Sent-derived contact AND the
-    /// mail passed email authentication at ingest. The contact half is the SAME
-    /// `Store::is_known_contact` signal triage trusts, not a parallel notion.
-    /// The reader uses it to decide whether to strip tracking pixels: somebody
-    /// the user writes to is allowed to learn the mail was opened.
-    ///
-    /// The auth half is what stops a stranger from spoofing `From:` into the
-    /// bypass — a From header alone is free to write. It comes from the stored
-    /// `auth_pass`, so it needs a re-sync to change; the contact half is
-    /// computed per request, so a newly-written-to sender takes effect on the
+    /// `true` when this message's `from_addr` is a Sent-derived contact — the
+    /// SAME `Store::is_known_contact` signal triage trusts, not a parallel
+    /// notion. The reader uses it to decide whether to strip tracking pixels:
+    /// somebody the user writes to is allowed to learn the mail was opened.
+    /// Computed per request, so a newly-written-to sender takes effect on the
     /// next open with no re-ingest.
     sender_known: bool,
 }
@@ -362,7 +359,7 @@ pub async fn get_thread(
         let mut seen: HashMap<String, bool> = HashMap::new();
         let mut messages = Vec::with_capacity(view.messages.len());
         for message in view.messages {
-            let known = match seen.get(&message.from_addr.to_ascii_lowercase()) {
+            let sender_known = match seen.get(&message.from_addr.to_ascii_lowercase()) {
                 Some(known) => *known,
                 None => {
                     let known = store.is_known_contact(account_id, &message.from_addr)?;
@@ -370,13 +367,6 @@ pub async fn get_thread(
                     known
                 }
             };
-            // AND'd with the ingest-time email-authentication verdict, and
-            // gated HERE rather than inside `is_known_contact`: that call also
-            // feeds triage's known-contact importance floor at ingest, which
-            // must not move. A NULL `auth_pass` — mail never evaluated, or
-            // ingested before the column existed — reads as NO bypass, the safe
-            // default for a permissive feature, so nothing is backfilled.
-            let sender_known = known && message.auth_pass == Some(true);
             messages.push(ThreadMessageView {
                 message,
                 sender_known,
@@ -425,7 +415,9 @@ fn safe_content_type(mime: &str) -> String {
 fn sanitize_attachment_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '/' && *c != '\\' && *c != '"')
+        .filter(|c| {
+            c.is_ascii() && !c.is_ascii_control() && *c != '/' && *c != '\\' && *c != '"'
+        })
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
@@ -573,21 +565,13 @@ pub async fn search(
         SearchMode::Semantic => {
             let k = (limit + offset) as usize;
             let mut hits = store.semantic_search_hits(account_id, &term, k)?;
-            let dropped: Vec<_> = hits
-                .drain(..)
-                .skip(offset as usize)
-                .take(limit as usize)
-                .collect();
+            let dropped: Vec<_> = hits.drain(..).skip(offset as usize).take(limit as usize).collect();
             Ok(dropped)
         }
         SearchMode::Hybrid => {
             let k = (limit + offset) as usize;
             let mut hits = store.hybrid_search(account_id, &term, k)?;
-            let dropped: Vec<_> = hits
-                .drain(..)
-                .skip(offset as usize)
-                .take(limit as usize)
-                .collect();
+            let dropped: Vec<_> = hits.drain(..).skip(offset as usize).take(limit as usize).collect();
             Ok(dropped)
         }
     })
@@ -651,7 +635,9 @@ pub async fn get_receipts(
 /// exactly [`squelch_core::types::Banking`], newest-received first, with every
 /// extracted field nullable and `account_hint` only ever a masked last-4 tail.
 /// Sealed mail can never produce a banking row (structural, like receipts).
-pub async fn get_banking(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn get_banking(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
     query(&state, |store, account_id| store.list_banking(account_id)).await
 }
 
@@ -675,10 +661,7 @@ pub async fn get_marketing(
     State(state): State<ApiState>,
     Query(q): Query<MarketingQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let days = q
-        .days
-        .unwrap_or(DEFAULT_MARKETING_DAYS)
-        .clamp(1, MAX_MARKETING_DAYS);
+    let days = q.days.unwrap_or(DEFAULT_MARKETING_DAYS).clamp(1, MAX_MARKETING_DAYS);
     query(&state, move |store, account_id| {
         store.marketing_offers(account_id, days, MARKETING_LIMIT)
     })
@@ -719,7 +702,9 @@ pub async fn get_calendar(
 
 // --- GET/POST/DELETE /client/rules ------------------------------------------
 
-pub async fn list_rules(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn list_rules(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
     query(&state, |store, account_id| {
         store.list_sender_rules(account_id)
     })
@@ -757,7 +742,8 @@ pub struct CreateRuleBody {
 /// dispositions parse exactly, so this one does too.
 const DISPOSITION_AUTO: &str = "auto";
 
-const DISPOSITION_HINT: &str = "disposition must be surface, squelch, or filtered (or omitted, or \"auto\", \
+const DISPOSITION_HINT: &str =
+    "disposition must be surface, squelch, or filtered (or omitted, or \"auto\", \
      to infer it from want)";
 
 /// A rule write's disposition, plus WHO decided it. The flag is
@@ -946,13 +932,8 @@ pub async fn update_rule(
     let pattern = body.match_pattern.clone();
     let usage = resolved.usage;
     let updated = store_call(&state, move |store, account_id| {
-        let updated = store.update_sender_rule(
-            account_id,
-            id,
-            &body.match_pattern,
-            &body.want,
-            disposition,
-        )?;
+        let updated =
+            store.update_sender_rule(account_id, id, &body.match_pattern, &body.want, disposition)?;
         // Billed even when the id was bogus: the model call happened and was
         // paid for regardless of what the store did with the row.
         bill_rule_inference(store, account_id, usage);
@@ -1040,7 +1021,9 @@ fn no_store() -> HeaderMap {
     headers
 }
 
-pub async fn list_drafts(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn list_drafts(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
     let drafts = store_call(&state, |store, account_id| store.list_drafts(account_id)).await?;
     let items: Vec<DraftView> = drafts.into_iter().map(DraftView::from).collect();
     Ok((no_store(), Json(items)))
@@ -1166,7 +1149,9 @@ struct SealedMeta {
     received_at: DateTime<Utc>,
 }
 
-pub async fn list_sealed(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn list_sealed(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
     let sealed = store_call(&state, |store, account_id| {
         store.sealed_messages(account_id)
     })
@@ -1259,7 +1244,9 @@ pub async fn get_audit(
 
 // --- GET /client/stats -------------------------------------------------------
 
-pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn get_stats(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
     // UTC day key for today's Stage-2 usage row.
     let day = Utc::now().format("%Y-%m-%d").to_string();
     // Band counts run under the same default window as the lists they head.
@@ -1325,10 +1312,7 @@ pub async fn get_usage(
     State(state): State<ApiState>,
     Query(q): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let days = q
-        .days
-        .unwrap_or(DEFAULT_USAGE_DAYS)
-        .clamp(1, MAX_USAGE_DAYS);
+    let days = q.days.unwrap_or(DEFAULT_USAGE_DAYS).clamp(1, MAX_USAGE_DAYS);
     // EVERY category in the ledger, not a hand-written list: extractors each
     // write their own, so naming them here means every extractor added later
     // spends invisibly. `extract_banking` did exactly that for ten days.
@@ -1364,8 +1348,8 @@ pub async fn get_usage(
                 }
             })
             .collect();
-        let est_cost_usd =
-            (in_tok as f64 / 1_000_000.0) * price_in + (out_tok as f64 / 1_000_000.0) * price_out;
+        let est_cost_usd = (in_tok as f64 / 1_000_000.0) * price_in
+            + (out_tok as f64 / 1_000_000.0) * price_out;
         (
             out_rows,
             UsageTotals {
@@ -1479,15 +1463,9 @@ async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiEr
     .await?;
 
     // Effective cap = override if present, else the config/env-layer value.
-    let thread = overrides
-        .thread_daily_cap
-        .unwrap_or(state.stage2_thread_daily_cap);
-    let sender = overrides
-        .sender_daily_cap
-        .unwrap_or(state.stage2_sender_daily_cap);
-    let global = overrides
-        .global_daily_cap
-        .unwrap_or(state.stage2_global_daily_cap);
+    let thread = overrides.thread_daily_cap.unwrap_or(state.stage2_thread_daily_cap);
+    let sender = overrides.sender_daily_cap.unwrap_or(state.stage2_sender_daily_cap);
+    let global = overrides.global_daily_cap.unwrap_or(state.stage2_global_daily_cap);
     let stage1_global = overrides
         .stage1_global_daily_cap
         .unwrap_or(state.stage1_global_daily_cap);
@@ -1573,7 +1551,9 @@ pub async fn set_triage_config(
     // written, so a bad value persists nothing.
     let min = squelch_core::config::STAGE2_CAP_MIN as i64;
     let max = squelch_core::config::STAGE2_CAP_MAX as i64;
-    let bad = || ApiError::bad_request(format!("each cap must be an integer in {min}..={max}"));
+    let bad = || {
+        ApiError::bad_request(format!("each cap must be an integer in {min}..={max}"))
+    };
     let validate = |v: &serde_json::Value| -> Result<u32, ApiError> {
         // `as_i64` is `Some` only for a JSON integer (5.5 / "5" => None).
         let n = v.as_i64().ok_or_else(bad)?;
@@ -1586,22 +1566,13 @@ pub async fn set_triage_config(
 
     let mut updates: Vec<(&'static str, u32)> = Vec::new();
     if let Some(v) = &body.thread_daily_cap {
-        updates.push((
-            squelch_core::config::APP_SETTING_THREAD_DAILY_CAP,
-            validate(v)?,
-        ));
+        updates.push((squelch_core::config::APP_SETTING_THREAD_DAILY_CAP, validate(v)?));
     }
     if let Some(v) = &body.sender_daily_cap {
-        updates.push((
-            squelch_core::config::APP_SETTING_SENDER_DAILY_CAP,
-            validate(v)?,
-        ));
+        updates.push((squelch_core::config::APP_SETTING_SENDER_DAILY_CAP, validate(v)?));
     }
     if let Some(v) = &body.global_daily_cap {
-        updates.push((
-            squelch_core::config::APP_SETTING_GLOBAL_DAILY_CAP,
-            validate(v)?,
-        ));
+        updates.push((squelch_core::config::APP_SETTING_GLOBAL_DAILY_CAP, validate(v)?));
     }
     if let Some(v) = &body.stage1_global_daily_cap {
         updates.push((
@@ -1654,7 +1625,8 @@ pub async fn set_triage_config(
 const ACTION_ACTOR: &str = "client-api";
 
 /// The `confirm` contract message returned on a missing/false confirm.
-const CONFIRM_HINT: &str = "this action requires an explicit \"confirm\": true in the request body";
+const CONFIRM_HINT: &str =
+    "this action requires an explicit \"confirm\": true in the request body";
 
 /// Append an audit row, best-effort: a failed insert is swallowed so it cannot
 /// mask the action's own outcome.
@@ -1732,7 +1704,10 @@ fn write_error(e: &WriteError) -> ApiError {
 }
 
 /// Look up the (non-sealed) action target for a local message id.
-async fn resolve_target(state: &ApiState, message_id: i64) -> Result<ActionMessageRef, ApiError> {
+async fn resolve_target(
+    state: &ApiState,
+    message_id: i64,
+) -> Result<ActionMessageRef, ApiError> {
     store_call(state, move |store, account_id| {
         store.action_message_ref(account_id, message_id)
     })
@@ -1836,9 +1811,7 @@ pub async fn action_archive(
         |client, msg| async move { client.archive(&msg.gmail_msg_id).await },
     )
     .await?;
-    Ok(Json(
-        json!({ "status": "archived", "message_id": body.message_id }),
-    ))
+    Ok(Json(json!({ "status": "archived", "message_id": body.message_id })))
 }
 
 // --- POST /client/actions/label ---------------------------------------------
@@ -1876,15 +1849,11 @@ pub async fn action_label(
         // Labeling a message is not handling it; the attention row stands.
         OnSuccess::LeaveOpen,
         |client, msg| async move {
-            client
-                .modify(&msg.gmail_msg_id, &body.add, &body.remove)
-                .await
+            client.modify(&msg.gmail_msg_id, &body.add, &body.remove).await
         },
     )
     .await?;
-    Ok(Json(
-        json!({ "status": "labeled", "message_id": message_id }),
-    ))
+    Ok(Json(json!({ "status": "labeled", "message_id": message_id })))
 }
 
 // --- POST /client/actions/send ----------------------------------------------
@@ -2085,27 +2054,6 @@ async fn mint_tracker(
     Some((token, pixel_url))
 }
 
-/// Drop a tracker whose send never reached the wire.
-///
-/// The mint has to come first (see [`mint_tracker`]), so a send that fails after
-/// it leaves a row nothing will ever link to a message: its opens could never be
-/// read back, and it would sit in `send_trackers` for the life of the database.
-/// BEST-EFFORT — the token is already dead either way.
-///
-/// AUDIT: action `send.tracker`, detail `discarded` | `failed:discard`.
-async fn discard_tracker(state: &ApiState, token: &str, target: Option<String>) {
-    let token = token.to_string();
-    let detail = match store_call(state, move |store, account_id| {
-        store.delete_send_tracker(account_id, &token)
-    })
-    .await
-    {
-        Ok(_) => "discarded",
-        Err(_) => "failed:discard",
-    };
-    audit_action(state, "send.tracker", target, detail).await;
-}
-
 /// Point a send's tracker at the echoed local copy, which is what makes
 /// `GET /client/messages/{id}/opens` able to find it. BEST-EFFORT: the mail is
 /// away and the pixel already works, so a failure only leaves opens recorded
@@ -2242,9 +2190,6 @@ pub async fn action_send(
     let raw = match build_reply_rfc822(&parts) {
         Ok(r) => r,
         Err(e) => {
-            if let Some((token, _)) = &tracker {
-                discard_tracker(&state, token, target.clone()).await;
-            }
             audit_action(&state, "send", target, "rejected:compose").await;
             return Err(write_error(&e));
         }
@@ -2276,9 +2221,6 @@ pub async fn action_send(
             })))
         }
         Err(e) => {
-            if let Some((token, _)) = &tracker {
-                discard_tracker(&state, token, target.clone()).await;
-            }
             audit_action(&state, "send", target, "failed:gmail").await;
             Err(write_error(&e))
         }
@@ -2301,13 +2243,7 @@ async fn record_unsub(
 ) -> Result<(), ApiError> {
     let sender = sender.to_string();
     store_call(state, move |store, account_id| {
-        store.upsert_unsubscribe(
-            account_id,
-            &sender,
-            method,
-            Some(source_message_id),
-            Utc::now(),
-        )
+        store.upsert_unsubscribe(account_id, &sender, method, Some(source_message_id), Utc::now())
     })
     .await
 }
@@ -2361,9 +2297,7 @@ pub async fn unsubscribe(
             // asking them to stop and leaving their mail open would demand a
             // second act, once per thread they already sent.
             resolve_sender_done(&state, &sender).await;
-            Ok(Json(
-                json!({ "method": "browser", "sender": sender, "url": url }),
-            ))
+            Ok(Json(json!({ "method": "browser", "sender": sender, "url": url })))
         }
     }
 }
@@ -2780,10 +2714,7 @@ mod cursor_tests {
         assert_eq!(cursor::encode_offset(50), "b2ZmOjUw");
         assert_eq!(cursor::encode_offset(2), "b2ZmOjI");
         for off in [0u32, 1, 2, 50, 500, 12345, u32::MAX] {
-            assert_eq!(
-                cursor::decode_offset(&cursor::encode_offset(off)),
-                Some(off)
-            );
+            assert_eq!(cursor::decode_offset(&cursor::encode_offset(off)), Some(off));
         }
     }
 
