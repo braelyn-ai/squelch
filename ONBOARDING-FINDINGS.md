@@ -75,8 +75,12 @@ shows nothing, and `cred.txt` receives the consent URL, the progress text,
 *and* the blob interleaved — a file `--import` then refuses as damaged. The
 flag pair sabotages the redirect the same line depends on.
 
-Fix: drop `-t` (keep `-i`): streams stay separate, URL on the terminal, clean
-blob in the file. (Verified: see §12 test log.)
+Fix: drop `-t` (and `-i`, which nothing reads): streams stay separate, URL on
+the terminal, clean blob in the file. (Verified: see §12 test log.)
+
+Related, same step: "Your browser opens, you approve" — it does not. Inside a
+container `webbrowser::open` has no browser to reach; squelchd prints the URL
+with a "copy the URL above manually" note (verified). The doc now says so.
 
 ## 6. GETTING-STARTED's SSH fallback cannot work as written — [lie]
 

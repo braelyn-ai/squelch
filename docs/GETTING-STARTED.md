@@ -125,8 +125,9 @@ streams — with `-it` the redirect would swallow the consent URL into
 container, use `--export --out cred.txt` instead, which writes the file mode
 0600 itself.
 
-Your browser opens, you approve, and `cred.txt` ends up holding one line. Then
-on the NAS, from the compose directory:
+The container cannot open your browser itself, so it prints the consent URL
+(with a "copy the URL above manually" note) — open it, approve, and `cred.txt`
+ends up holding one line. Then on the NAS, from the compose directory:
 
 ```sh
 docker compose run --rm -T squelchd auth --import < cred.txt
