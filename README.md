@@ -57,7 +57,23 @@ cargo run --bin squelchd -- serve    # sync + both doors on one port
 
 On a headless box use `squelchd auth --headless` and forward the port: `ssh -L 8847:127.0.0.1:8847 yourbox`. Grant write scopes later with `squelchd auth --write` (only needed for archive/send actions) — that runs two consent flows, minting the write credential and re-minting the read one, so the two slots stay in sync.
 
-Where no browser can reach the box's loopback at all (docker on a NAS, a VPS), `squelchd auth --broker <url>` drops the tunnel: it prints one link to open on any device, and a consent relay parks Google's one-time code until your daemon collects it. The relay cannot turn that code into a token, because the PKCE verifier never leaves your machine. Run your own from `Dockerfile.broker` ([deploy/DEPLOY.md](deploy/DEPLOY.md) §8); the hosted one at `auth.passband.email` is not up yet.
+Where no browser can reach the box's loopback at all (docker on a NAS, a VPS), consent runs on a machine that *does* have a browser and the resulting token moves to the daemon:
+
+```sh
+# on your laptop, where the browser is:
+squelchd auth --export > cred.txt              # add --write for both credentials
+
+# on the daemon's host:
+docker exec -i squelchd squelchd auth --import < cred.txt
+```
+
+`--export` runs the normal consent flow, prints one line to stdout, and stores nothing; every word it says to you goes to stderr, so the redirect above is a clean file. `--import` reads that line from stdin only (never an argument: it is a live refresh token, and arguments show up in `ps` and in shell history), checks it was minted for the account the daemon is configured for, and files each credential in its own slot. Delete `cred.txt` once it is in.
+
+Both machines must use the same `SQUELCH_CLIENT_ID` and `SQUELCH_CLIENT_SECRET`. A refresh token is bound to the OAuth client that minted it, not to a host, so it travels fine between machines and not at all between clients.
+
+If the laptop side is itself the published container image, run the export inside it with `-p 8847:8847` and add `--expose-consent-listener`: a listener on the container's own `127.0.0.1` is unreachable from your browser. That opens the port on every interface for the length of one consent, so it is opt-in.
+
+The other route moves the code instead of the token. `squelchd auth --broker <url>` prints one link to open on any device, and a consent relay parks Google's one-time code until your daemon collects it. The relay cannot turn that code into a token, because the PKCE verifier never leaves your machine. Run your own from `Dockerfile.broker` ([deploy/DEPLOY.md](deploy/DEPLOY.md) §8); the hosted one at `auth.passband.email` is not up yet.
 
 ### 4. Connect an agent
 

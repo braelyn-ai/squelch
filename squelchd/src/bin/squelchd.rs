@@ -7,7 +7,9 @@
 
 use clap::{Args, Parser, Subcommand};
 use squelch_core::auth::{
-    AuthFlowOptions, AuthScopes, DEFAULT_HEADLESS_PORT, run_auth_flow, run_broker_flow,
+    AuthFlowOptions, AuthScopes, ConsentBind, CredentialTransfer, DEFAULT_HEADLESS_PORT,
+    TransferCredential, decode_transfer, encode_transfer, run_auth_flow, run_broker_flow,
+    run_export_flow,
 };
 use squelch_core::config::{Config, CredentialBackend, OAuthClientConfig, Stage2CapSources};
 use squelch_core::credentials::{
@@ -53,6 +55,11 @@ enum Command {
     /// `ssh -L 8847:127.0.0.1:8847 <host>`; both flows reuse that one port.
     /// `--broker <URL>` needs no port and no tunnel at all: consent lands on a
     /// relay that parks the code for this daemon to collect.
+    ///
+    /// HEADLESS WITHOUT A TUNNEL OR A RELAY: run `squelchd auth --export` on a
+    /// machine that has a browser and pipe the blob it prints into
+    /// `squelchd auth --import` on the daemon's host. Both machines must use the
+    /// same OAuth client_id/client_secret.
     Auth(AuthArgs),
     /// Run the sync loop only. No HTTP doors are served.
     Run,
@@ -81,7 +88,8 @@ struct AuthArgs {
     #[arg(long)]
     headless: bool,
 
-    /// Fixed loopback port for --headless (default 8847). Ignored otherwise.
+    /// Fixed port for --headless, and for --export --expose-consent-listener
+    /// (default 8847). Ignored otherwise.
     #[arg(long, default_value_t = DEFAULT_HEADLESS_PORT)]
     port: u16,
 
@@ -96,7 +104,50 @@ struct AuthArgs {
     #[arg(long, value_name = "URL", env = "SQUELCH_BROKER_URL",
           conflicts_with_all = ["headless", "port"])]
     broker: Option<String>,
+
+    /// Run consent HERE and print a credential blob on stdout; store nothing.
+    ///
+    /// For a daemon no browser can reach at all: run this on a laptop, then feed
+    /// the one line it prints to `squelchd auth --import` on the daemon's host.
+    /// Google delivers a code only to loopback on the machine running the
+    /// browser, so the TOKEN moves instead of the code. Needs no account_email
+    /// configured: it reports on stderr which mailbox Google named. All prose
+    /// goes to stderr, so `squelchd auth --export > cred.txt` is a clean file.
+    /// With --write the blob carries BOTH credentials. Replaces the loopback and
+    /// broker transports, so it conflicts with both.
+    #[arg(long, conflicts_with_all = ["headless", "broker", "import"])]
+    export: bool,
+
+    /// Store a credential blob read from STDIN, minted by `--export` elsewhere.
+    ///
+    /// Never argv: the blob is a live refresh token, and argv is visible in `ps`
+    /// and lands in shell history. The blob's mailbox must match this daemon's
+    /// configured account_email. What it carries decides what is stored, so this
+    /// conflicts with --write.
+    #[arg(long, conflicts_with_all = ["headless", "broker", "write", "export"])]
+    import: bool,
+
+    /// With --export: bind the consent listener to every interface instead of
+    /// loopback, on --port.
+    ///
+    /// For running the export INSIDE a container, where `docker run -p
+    /// 8847:8847` cannot reach a listener on the container's own 127.0.0.1.
+    /// EXPOSURE: for the length of one consent, anything that can route to this
+    /// host on that port can connect to the listener. What it could deliver is
+    /// an authorization code, which is useless without the PKCE verifier held in
+    /// this process and is checked against a per-run `state` first. Still a real
+    /// change in reach, which is why it is opt-in.
+    // `conflicts_with` is spelled out alongside `requires` because clap DROPS a
+    // requirement that conflicts with a flag already on the line: with
+    // `requires = "export"` alone, `--import --expose-consent-listener` parses.
+    #[arg(long, requires = "export", conflicts_with = "import")]
+    expose_consent_listener: bool,
 }
+
+/// Ceiling on a pasted credential blob. A real one is about a kilobyte; this is
+/// slack, and it exists so a redirected file or a wedged pipe cannot be read
+/// into memory without bound.
+const MAX_BLOB_BYTES: usize = 64 * 1024;
 
 fn other_err(msg: String) -> squelch_core::CoreError {
     squelch_core::CoreError::Other(anyhow::anyhow!(msg))
@@ -222,6 +273,13 @@ fn auth_plan(args: &AuthArgs) -> Vec<AuthScopes> {
 
 /// Run the OAuth consent flow(s) and persist tokens for the configured account.
 fn cmd_auth(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreError> {
+    if args.export {
+        return cmd_auth_export(config, args);
+    }
+    if args.import {
+        return cmd_auth_import(config);
+    }
+
     let client = config.oauth_client()?;
     let email = config.require_account_email()?;
     let backend = config.credential_backend;
@@ -302,13 +360,34 @@ fn mint_credential(
             run_auth_flow(client, email, &opts)?
         }
     };
-    store_token_backend(backend, creds_path, email, kind, &token)?;
+    store_and_announce(backend, creds_path, email, kind, &token)?;
+    if token.refresh_token.is_some() {
+        println!("A refresh token was captured; squelch can renew access automatically.");
+    } else {
+        println!(
+            "WARNING: no refresh token was returned. You may need to revoke prior access at \
+             https://myaccount.google.com/permissions and re-run `squelchd auth`."
+        );
+    }
+    Ok(())
+}
 
-    // Confirm persistence without ever printing the token material.
+/// Persist one token into its kind's slot and say where it landed, reading it
+/// back first so "stored" means stored. Never prints the token material.
+fn store_and_announce(
+    backend: CredentialBackend,
+    creds_path: &std::path::Path,
+    email: &str,
+    kind: squelch_core::credentials::CredentialKind,
+    token: &squelch_core::credentials::StoredToken,
+) -> Result<(), squelch_core::CoreError> {
+    store_token_backend(backend, creds_path, email, kind, token)?;
     let _ = load_token_backend(backend, creds_path, email, kind)?;
     match backend {
         CredentialBackend::Keyring => {
-            println!("\nStored {kind:?} credentials for {email} in the OS keyring (service \"squelch\").");
+            println!(
+                "\nStored {kind:?} credentials for {email} in the OS keyring (service \"squelch\")."
+            );
         }
         CredentialBackend::File => {
             println!(
@@ -317,13 +396,186 @@ fn mint_credential(
             );
         }
     }
-    if token.refresh_token.is_some() {
-        println!("A refresh token was captured; squelch can renew access automatically.");
+    Ok(())
+}
+
+/// `--export`: run consent on THIS machine and print a transfer blob, storing
+/// nothing.
+///
+/// No `account_email` is required or read: the exporting machine is whatever
+/// laptop has a browser, not the daemon's host, and the mailbox is whatever
+/// Google names on the consent screen. It is reported on stderr so the operator
+/// can see they approved as the account they meant to.
+fn cmd_auth_export(config: &Config, args: &AuthArgs) -> Result<(), squelch_core::CoreError> {
+    let client = config.oauth_client()?;
+    let bind = if args.expose_consent_listener {
+        ConsentBind::AllInterfaces { port: args.port }
     } else {
-        println!(
-            "WARNING: no refresh token was returned. You may need to revoke prior access at \
-             https://myaccount.google.com/permissions and re-run `squelchd auth`."
+        ConsentBind::Loopback
+    };
+
+    let plan = auth_plan(args);
+    let total = plan.len();
+    if total > 1 {
+        eprintln!(
+            "squelchd: --write exports BOTH credentials in one blob; {total} separate Google \
+             consent screens are coming, one per credential. Approve them as the SAME account."
         );
+    }
+
+    let mut account: Option<String> = None;
+    let mut credentials: Vec<TransferCredential> = Vec::new();
+    for (i, scopes) in plan.iter().copied().enumerate() {
+        eprintln!(
+            "\nsquelchd: authorizing {} credential ({}/{total})...",
+            scope_word(scopes),
+            i + 1
+        );
+        let (mailbox, token) = run_export_flow(&client, scopes, bind)?;
+
+        // A blob names ONE mailbox, and the importer stores every entry under
+        // it. Two consents finished as different Google accounts would file a
+        // stranger's token in this account's other slot.
+        if let Some(first) = &account
+            && !first.trim().eq_ignore_ascii_case(mailbox.trim())
+        {
+            return Err(squelch_core::CoreError::Credential(format!(
+                "the first consent authorized {first} but this one authorized {mailbox}; a \
+                 credential blob carries one account, so nothing was exported. Re-run \
+                 `squelchd auth --export --write` and approve both screens as the same account."
+            )));
+        }
+        // A blob without a refresh token buys one hour and then fails in a way
+        // nobody connects back to this paste, so it is refused where the fix is
+        // still obvious rather than on the daemon.
+        if token.refresh_token.is_none() {
+            return Err(squelch_core::CoreError::Credential(format!(
+                "Google returned no refresh token for the {} credential, so this blob would stop \
+                 working within the hour and nothing was exported. Revoke squelch at \
+                 https://myaccount.google.com/permissions and re-run `squelchd auth --export`.",
+                scope_word(scopes)
+            )));
+        }
+        account = Some(mailbox);
+        credentials.push(TransferCredential {
+            kind: scopes.kind(),
+            token,
+        });
+    }
+
+    let account = account.ok_or_else(|| other_err("no credential was authorized".to_string()))?;
+    let blob = encode_transfer(&CredentialTransfer::new(account.clone(), credentials))?;
+
+    // The ONE thing on stdout, so `--export > cred.txt` is a file that imports
+    // exactly as pasted.
+    println!("{blob}");
+
+    eprintln!("\nsquelchd: exported {total} credential(s) for {account}.");
+    eprintln!(
+        "squelchd: that line is a LIVE refresh token in plaintext. Import it, then delete it \
+         from the file, the clipboard, and anywhere you pasted it."
+    );
+    eprintln!("squelchd: import it on the daemon's host with, for example:");
+    eprintln!("    docker exec -i <container> squelchd auth --import < cred.txt");
+    eprintln!(
+        "squelchd: the importing host must use the SAME SQUELCH_CLIENT_ID and \
+         SQUELCH_CLIENT_SECRET, since a refresh token only works for the client that minted it."
+    );
+    Ok(())
+}
+
+/// `--import`: store a blob minted by `--export` on another machine.
+fn cmd_auth_import(config: &Config) -> Result<(), squelch_core::CoreError> {
+    let email = config.require_account_email()?;
+    let backend = config.credential_backend;
+    let creds_path = config.resolve_credentials_path();
+
+    let transfer = decode_transfer(&read_transfer_blob()?)?;
+    check_transfer_account(&email, &transfer.account)?;
+    // Every entry is judged before any is written: a blob half-stored leaves the
+    // two slots disagreeing about which consent they came from.
+    check_transfer_usable(&transfer)?;
+
+    println!(
+        "Importing {} credential(s) for {email} into the {backend:?} backend.",
+        transfer.credentials.len()
+    );
+    for cred in &transfer.credentials {
+        store_and_announce(backend, &creds_path, &email, cred.kind, &cred.token)?;
+    }
+    println!("\nsquelch can renew access automatically; the exported blob is no longer needed.");
+    Ok(())
+}
+
+/// Read the blob from STDIN.
+///
+/// Never argv: the blob is a live refresh token, and argv is world-readable in
+/// `ps` and lands in shell history. An interactive run gets a prompt rather than
+/// a process that looks hung.
+fn read_transfer_blob() -> Result<String, squelch_core::CoreError> {
+    use std::io::{IsTerminal, Read};
+
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("squelchd: paste the line from `squelchd auth --export`, then press enter:");
+    }
+    let mut buf = String::new();
+    // One byte past the ceiling: reading it is how an overrun shows up.
+    stdin
+        .lock()
+        .take(MAX_BLOB_BYTES as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|e| other_err(format!("reading the credential blob from stdin: {e}")))?;
+    if buf.len() > MAX_BLOB_BYTES {
+        return Err(other_err(format!(
+            "more than {MAX_BLOB_BYTES} bytes arrived on stdin, which no credential blob is; \
+             nothing was stored"
+        )));
+    }
+    let blob = buf.trim().to_string();
+    if blob.is_empty() {
+        return Err(other_err(
+            "nothing arrived on stdin, so there was no credential blob to import. Pipe one in: \
+             `squelchd auth --import < cred.txt`."
+                .to_string(),
+        ));
+    }
+    Ok(blob)
+}
+
+/// Fail unless the blob was minted for the mailbox this daemon is configured
+/// for.
+///
+/// Same rule as the consent-time check in squelch-core, for the same reason:
+/// storing a token under the wrong address makes the sync loop ingest a
+/// stranger's mail and serve it as this account's own. Trimmed and
+/// case-insensitive, because Gmail addresses are ASCII and both values are
+/// hand-typed somewhere.
+fn check_transfer_account(configured: &str, blob: &str) -> Result<(), squelch_core::CoreError> {
+    if configured.trim().eq_ignore_ascii_case(blob.trim()) {
+        return Ok(());
+    }
+    Err(squelch_core::CoreError::Credential(format!(
+        "this blob was exported for {blob}, but this daemon is configured for {configured}; \
+         nothing was stored. Export again while signed in as {configured}, or fix account_email \
+         in the config."
+    )))
+}
+
+/// Fail unless every entry carries a refresh token.
+///
+/// An access token alone works for about an hour and then fails on a refresh
+/// nobody will connect back to a paste from yesterday, so it is refused now.
+fn check_transfer_usable(transfer: &CredentialTransfer) -> Result<(), squelch_core::CoreError> {
+    for cred in &transfer.credentials {
+        if cred.token.refresh_token.is_none() {
+            return Err(squelch_core::CoreError::Credential(format!(
+                "the {:?} credential in this blob has no refresh token, so it would stop working \
+                 within the hour; nothing was stored. Re-run `squelchd auth --export` on the \
+                 machine with the browser.",
+                cred.kind
+            )));
+        }
     }
     Ok(())
 }
@@ -727,6 +979,20 @@ fn cmd_serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use squelch_core::credentials::{CredentialKind, StoredToken};
+
+    /// Every flag off, for tests that vary one at a time.
+    fn bare_auth_args() -> AuthArgs {
+        AuthArgs {
+            write: false,
+            headless: false,
+            port: DEFAULT_HEADLESS_PORT,
+            broker: None,
+            export: false,
+            import: false,
+            expose_consent_listener: false,
+        }
+    }
 
     /// `auth` parses: flags default off, and `--write`/`--headless --port` stick.
     #[test]
@@ -762,23 +1028,19 @@ mod tests {
     /// non-overlapping scopes.
     #[test]
     fn auth_plan_write_mints_both_credentials() {
-        use squelch_core::credentials::CredentialKind;
-
         let read_only = auth_plan(&AuthArgs {
             write: false,
-            headless: false,
-            port: DEFAULT_HEADLESS_PORT,
-            broker: None,
+            ..bare_auth_args()
         });
         assert_eq!(read_only, vec![AuthScopes::Read]);
 
         // The plan is the scope sets, not the transport: a broker run mints the
-        // same two credentials into the same two slots.
+        // same two credentials into the same two slots, and an export packs the
+        // same two into one blob.
         let both = auth_plan(&AuthArgs {
             write: true,
-            headless: false,
-            port: DEFAULT_HEADLESS_PORT,
             broker: Some("https://auth.passband.email".to_string()),
+            ..bare_auth_args()
         });
         assert_eq!(both, vec![AuthScopes::Write, AuthScopes::Read]);
         assert_eq!(both[0].kind(), CredentialKind::Write);
@@ -833,6 +1095,161 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} was accepted");
         }
+    }
+
+    /// `--export` and `--import` are transports of their own: each replaces the
+    /// loopback listener and the broker rather than decorating them, and asking
+    /// for two at once is a usage error rather than a silent pick.
+    #[test]
+    fn export_and_import_parse_and_exclude_the_other_transports() {
+        let cli = Cli::parse_from(["squelchd", "auth", "--export", "--write"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(args.export);
+                assert!(args.write, "one blob can carry both credentials");
+                assert!(!args.import);
+                assert!(!args.expose_consent_listener, "exposure is opt-in");
+            }
+            _ => panic!("expected auth subcommand"),
+        }
+
+        // The exposed listener needs a FIXED port, since that is what a
+        // published container port maps to.
+        let cli = Cli::parse_from([
+            "squelchd",
+            "auth",
+            "--export",
+            "--expose-consent-listener",
+            "--port",
+            "9100",
+        ]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(args.expose_consent_listener);
+                assert_eq!(args.port, 9100);
+            }
+            _ => panic!("expected auth subcommand"),
+        }
+
+        let cli = Cli::parse_from(["squelchd", "auth", "--import"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(args.import);
+                assert!(!args.export);
+            }
+            _ => panic!("expected auth subcommand"),
+        }
+
+        // `--broker` also reads SQUELCH_BROKER_URL, which counts as present for
+        // conflict purposes, so the broker pairs only mean anything with the
+        // environment quiet.
+        let broker_env_quiet = std::env::var_os("SQUELCH_BROKER_URL").is_none();
+        let mut bad: Vec<Vec<&str>> = vec![
+            vec!["squelchd", "auth", "--export", "--import"],
+            vec!["squelchd", "auth", "--export", "--headless"],
+            vec!["squelchd", "auth", "--import", "--headless"],
+            // The blob decides what it carries, so --write has nothing to say.
+            vec!["squelchd", "auth", "--import", "--write"],
+            // Exposure is a property of the export listener and nothing else.
+            vec!["squelchd", "auth", "--expose-consent-listener"],
+            vec!["squelchd", "auth", "--import", "--expose-consent-listener"],
+        ];
+        if broker_env_quiet {
+            bad.push(vec![
+                "squelchd",
+                "auth",
+                "--export",
+                "--broker",
+                "https://auth.passband.email",
+            ]);
+            bad.push(vec![
+                "squelchd",
+                "auth",
+                "--import",
+                "--broker",
+                "https://auth.passband.email",
+            ]);
+        }
+        for argv in bad {
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} was accepted");
+        }
+    }
+
+    /// A blob minted for another mailbox must be refused by name: storing it
+    /// would make the sync loop ingest a stranger's mail as this account's.
+    #[test]
+    fn an_imported_blob_for_another_account_is_refused_and_names_both() {
+        let err = check_transfer_account("me@gmail.com", "someone.else@gmail.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("someone.else@gmail.com"), "{err}");
+        assert!(err.contains("me@gmail.com"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+
+        // Google echoes its own casing and both values are hand-typed, so
+        // neither case nor stray whitespace is a different mailbox.
+        assert!(check_transfer_account("me@gmail.com", "me@gmail.com").is_ok());
+        assert!(check_transfer_account("Me@Gmail.COM", " me@gmail.com\n").is_ok());
+        // A subaddress or another domain IS a different mailbox.
+        assert!(check_transfer_account("me@gmail.com", "me+x@gmail.com").is_err());
+        assert!(check_transfer_account("me@gmail.com", "me@example.com").is_err());
+    }
+
+    /// An access-token-only entry works for an hour and then fails in a way
+    /// nobody connects back to the paste, so import refuses it up front.
+    #[test]
+    fn an_imported_blob_without_a_refresh_token_is_refused() {
+        let entry = |refresh: Option<&str>| TransferCredential {
+            kind: CredentialKind::Write,
+            token: StoredToken {
+                access_token: "access".to_string(),
+                refresh_token: refresh.map(|r| r.to_string()),
+                expires_at: None,
+            },
+        };
+
+        let usable =
+            CredentialTransfer::new("me@gmail.com".to_string(), vec![entry(Some("refresh"))]);
+        assert!(check_transfer_usable(&usable).is_ok());
+
+        let doomed = CredentialTransfer::new("me@gmail.com".to_string(), vec![entry(None)]);
+        let err = check_transfer_usable(&doomed).unwrap_err().to_string();
+        assert!(err.contains("no refresh token"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+
+        // Judged before ANY entry is written, so one bad credential cannot
+        // leave the two slots disagreeing about which consent they came from.
+        let mixed = CredentialTransfer::new(
+            "me@gmail.com".to_string(),
+            vec![entry(Some("refresh")), entry(None)],
+        );
+        assert!(check_transfer_usable(&mixed).is_err());
+    }
+
+    /// The daemon must read exactly what the exporter wrote, prefix included.
+    #[test]
+    fn a_blob_round_trips_from_export_to_import() {
+        let minted = CredentialTransfer::new(
+            "me@gmail.com".to_string(),
+            vec![TransferCredential {
+                kind: CredentialKind::Read,
+                token: StoredToken {
+                    access_token: "access".to_string(),
+                    refresh_token: Some("refresh".to_string()),
+                    expires_at: None,
+                },
+            }],
+        );
+        let blob = encode_transfer(&minted).unwrap();
+        // What a terminal paste actually delivers.
+        let landed = decode_transfer(&format!("{blob}\n")).unwrap();
+        assert!(check_transfer_account("me@gmail.com", &landed.account).is_ok());
+        assert!(check_transfer_usable(&landed).is_ok());
+        assert_eq!(landed.credentials[0].kind, CredentialKind::Read);
+        assert_eq!(
+            landed.credentials[0].token.refresh_token.as_deref(),
+            Some("refresh")
+        );
     }
 
     /// `serve` parses, with and without an explicit `--bind`.

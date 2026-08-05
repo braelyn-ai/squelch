@@ -56,6 +56,43 @@ redirect on our domain:
    daemon over stdin. This is rclone's `rclone authorize` pattern. Zero infra,
    zero new Google configuration, available today. The pasted blob is a live
    refresh token, so it is read from stdin and never from argv.
+
+   **Blob format (v1).** One line, no internal whitespace, because it has to
+   survive a copy-paste through a terminal, an SSH session, and a chat client:
+
+   ```
+   squelch-cred-v1.<base64url-unpadded JSON>
+   ```
+
+   The prefix is load-bearing twice: it lets a mis-paste be refused by name
+   instead of as a serde error, and it makes the string greppable in a support
+   thread. The JSON is `{"version":1,"account":"<the mailbox Google reported>",
+   "credentials":[{"kind":"read"|"write","token":<StoredToken>}]}` — one entry
+   per credential, so `--export --write` moves both slots in one paste. Import
+   refuses a blob whose `account` is not the daemon's configured `account_email`
+   (trimmed, case-insensitive), any entry with no `refresh_token` (an access
+   token alone dies in an hour, long after anyone would connect the failure back
+   to the paste), an empty credential list, and a repeated `kind`. base64url is
+   an encoding, not encryption: the blob is plaintext credential material and
+   nothing in this path pretends otherwise.
+
+   **Same OAuth client on both machines.** A refresh token is bound to the
+   client that minted it and to the granted scopes, never to a host — that is
+   the whole reason moving it works. It is also the constraint: the exporting
+   machine and the daemon must use the same `client_id`/`client_secret`, or
+   every refresh is `invalid_client`. Once the image bakes in verified
+   credentials this is automatic; anyone using their own Google credentials on
+   two machines hits it first.
+
+   **Exporting from inside a container.** The published image is the easiest way
+   to get the binary onto a laptop, but under `docker run -p 8847:8847` the
+   consent listener bound to the container's own `127.0.0.1` is unreachable.
+   `--export --expose-consent-listener` binds `0.0.0.0:<--port>` for the length
+   of one consent. The `redirect_uri` stays loopback either way (Google accepts
+   nothing else from a Desktop client): it names the *browser's* `127.0.0.1`.
+   What reaches an exposed listener is at most an authorization code, inert
+   without the PKCE verifier held in that process and checked against a per-run
+   `state` first — a real reduction, not zero, which is why it is opt-in.
 2. **The broker as an encrypted token courier (saves this crate).** The daemon
    generates an ephemeral X25519 keypair and prints a link carrying the session
    id; the exporting machine encrypts the token blob to that public key and

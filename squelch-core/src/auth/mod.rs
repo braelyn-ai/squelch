@@ -14,6 +14,16 @@
 //! only after Google confirms the grant covers the scopes that were asked for
 //! and names the configured account as the mailbox behind it. Neither a loopback
 //! listener nor a broker can tell whose Google session finished the screen.
+//!
+//! [`run_export_flow`] is the loopback flow run on a machine that has NO daemon
+//! config: it discovers the mailbox instead of verifying one, and hands back a
+//! token for [`transfer`] to carry to a headless host. See `docs/BROKER.md`.
+
+mod transfer;
+pub use transfer::{
+    CredentialTransfer, TRANSFER_PREFIX, TRANSFER_VERSION, TransferCredential, decode_transfer,
+    encode_transfer,
+};
 
 use crate::config::{GMAIL_READONLY_SCOPE, OAuthClientConfig, WRITE_SCOPES};
 use crate::credentials::{CredentialKind, StoredToken};
@@ -198,13 +208,18 @@ fn authorize_url(
 /// and neither a loopback listener nor a broker can see that. So the grant is
 /// held against what was requested, and the token is held against the configured
 /// account, before anything is persisted.
+///
+/// `expected_account` is `None` only on the export flow, which runs on a machine
+/// with no daemon config and therefore no account to compare against. The
+/// mailbox is DISCOVERED either way and returned alongside the token: `None`
+/// skips the comparison, it never skips asking Google who this is.
 fn exchange_code(
     oauth: &GoogleClient,
-    account_email: &str,
+    expected_account: Option<&str>,
     scopes: AuthScopes,
     code: String,
     pkce_verifier: PkceCodeVerifier,
-) -> Result<StoredToken> {
+) -> Result<(String, StoredToken)> {
     let http = oauth2::reqwest::blocking::ClientBuilder::new()
         // Never follow redirects: guards against SSRF on the token endpoint.
         .redirect(oauth2::reqwest::redirect::Policy::none())
@@ -224,12 +239,17 @@ fn exchange_code(
     check_scope_grant(scopes, granted.as_deref())?;
 
     let mailbox = fetch_profile_email(&http, token.access_token().secret())?;
-    check_account_match(account_email, &mailbox)?;
+    if let Some(expected) = expected_account {
+        check_account_match(expected, &mailbox)?;
+    }
 
-    Ok(StoredToken::from_response(
-        token.access_token().secret().to_string(),
-        token.refresh_token().map(|r| r.secret().to_string()),
-        token.expires_in(),
+    Ok((
+        mailbox,
+        StoredToken::from_response(
+            token.access_token().secret().to_string(),
+            token.refresh_token().map(|r| r.secret().to_string()),
+            token.expires_in(),
+        ),
     ))
 }
 
@@ -388,14 +408,11 @@ pub fn run_auth_flow(
     } else {
         "127.0.0.1:0".to_string()
     };
-    let listener = TcpListener::bind(&bind_addr).map_err(|e| {
-        CoreError::Credential(format!("binding loopback listener on {bind_addr}: {e}"))
-    })?;
+    let (listener, redirect_uri) = bind_consent_listener(&bind_addr)?;
     let port = listener
         .local_addr()
         .map_err(|e| CoreError::Credential(format!("reading listener addr: {e}")))?
         .port();
-    let redirect_uri = format!("http://127.0.0.1:{port}");
 
     let oauth = google_client(client, &redirect_uri)?;
     let (auth_url, csrf_token, pkce_verifier) =
@@ -427,7 +444,101 @@ pub fn run_auth_flow(
 
     let code = wait_for_code(&listener, csrf_token.secret())?;
 
-    exchange_code(&oauth, account_email, opts.scopes, code, pkce_verifier)
+    let (_mailbox, token) = exchange_code(
+        &oauth,
+        Some(account_email),
+        opts.scopes,
+        code,
+        pkce_verifier,
+    )?;
+    Ok(token)
+}
+
+/// Where the export flow's one-shot consent listener binds.
+///
+/// The `redirect_uri` is loopback either way: Google registers no other target
+/// for a Desktop client, and the browser that follows it resolves `127.0.0.1`
+/// on its own machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentBind {
+    /// `127.0.0.1` on an ephemeral port. Nothing off this machine can connect.
+    Loopback,
+    /// `0.0.0.0:port` — the opt-in for running the export inside a container.
+    ///
+    /// Under `docker run -p 8847:8847` a listener on `127.0.0.1` is unreachable,
+    /// because that loopback is the CONTAINER's; the published port only reaches
+    /// a process bound to every interface. EXPOSURE: for the length of one
+    /// consent, anything that can route to this host's `port` can connect to the
+    /// listener. What it could deliver there is an authorization code, which is
+    /// inert without the PKCE verifier held in this process and is checked
+    /// against a per-flow `state` before it is redeemed. That is a real
+    /// reduction, not zero, which is why this is opt-in and never the default.
+    AllInterfaces { port: u16 },
+}
+
+impl ConsentBind {
+    /// The `bind` address this choice means.
+    fn bind_addr(self) -> String {
+        match self {
+            ConsentBind::Loopback => "127.0.0.1:0".to_string(),
+            ConsentBind::AllInterfaces { port } => format!("0.0.0.0:{port}"),
+        }
+    }
+}
+
+/// Bind the one-shot consent listener and derive the `redirect_uri` for it.
+///
+/// The URI is ALWAYS `http://127.0.0.1:<port>` whatever the bind address is:
+/// that is the only shape Google accepts for a Desktop client, and it names the
+/// browser's own loopback rather than this process's.
+fn bind_consent_listener(bind_addr: &str) -> Result<(TcpListener, String)> {
+    let listener = TcpListener::bind(bind_addr).map_err(|e| {
+        CoreError::Credential(format!("binding loopback listener on {bind_addr}: {e}"))
+    })?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| CoreError::Credential(format!("reading listener addr: {e}")))?
+        .port();
+    Ok((listener, format!("http://127.0.0.1:{port}")))
+}
+
+/// Run consent on a machine that has a browser but NO daemon config, and return
+/// the mailbox Google named along with the token. Nothing is stored: the caller
+/// packs the token into a [`CredentialTransfer`] for a headless host.
+///
+/// Same client, same PKCE, same guarded exchange as [`run_auth_flow`]. The one
+/// difference is that there is no configured account to hold the token against,
+/// so the mailbox is reported for the operator to confirm instead.
+///
+/// Every line this prints goes to STDERR, because stdout is the blob.
+pub fn run_export_flow(
+    client: &OAuthClientConfig,
+    scopes: AuthScopes,
+    bind: ConsentBind,
+) -> Result<(String, StoredToken)> {
+    let (listener, redirect_uri) = bind_consent_listener(&bind.bind_addr())?;
+    let oauth = google_client(client, &redirect_uri)?;
+    let (auth_url, csrf_token, pkce_verifier) =
+        authorize_url(&oauth, scopes, CsrfToken::new_random());
+
+    eprintln!(
+        "\nOpen this URL in your browser to authorize squelch ({}):\n",
+        scopes.label()
+    );
+    eprintln!("{auth_url}\n");
+    if webbrowser::open(auth_url.as_str()).is_err() {
+        eprintln!("(could not auto-open a browser; copy the URL above manually)");
+    }
+    if let ConsentBind::AllInterfaces { port } = bind {
+        eprintln!(
+            "The consent listener is bound to every interface on port {port} until this one \
+             consent finishes, so open the URL from a browser that can reach it."
+        );
+    }
+    eprintln!("Waiting for the OAuth redirect on {redirect_uri} ...");
+
+    let code = wait_for_code(&listener, csrf_token.secret())?;
+    exchange_code(&oauth, None, scopes, code, pkce_verifier)
 }
 
 /// Run the consent flow through a broker (`docs/BROKER.md`) instead of a
@@ -475,7 +586,9 @@ pub fn run_broker_flow(
     println!("Waiting for consent (the code is collected here, never by the broker) ...");
 
     let code = poll_for_code(&http, &base, &session_id, &claim_token)?;
-    exchange_code(&oauth, account_email, scopes, code, pkce_verifier)
+    let (_mailbox, token) =
+        exchange_code(&oauth, Some(account_email), scopes, code, pkce_verifier)?;
+    Ok(token)
 }
 
 /// Canonicalize `--broker` the same way the broker canonicalizes its own public
@@ -936,6 +1049,22 @@ mod tests {
         assert!(constant_time_eq("token", "token"));
         assert!(!constant_time_eq("token", "toke"));
         assert!(!constant_time_eq("token", "tokel"));
+    }
+
+    /// The export listener is loopback unless the operator opts out, and the
+    /// redirect Google is handed stays loopback either way: it names the
+    /// BROWSER's `127.0.0.1`, not this process's bind address.
+    #[test]
+    fn the_export_listener_is_loopback_unless_asked_otherwise() {
+        assert_eq!(ConsentBind::Loopback.bind_addr(), "127.0.0.1:0");
+        assert_eq!(
+            ConsentBind::AllInterfaces { port: 8847 }.bind_addr(),
+            "0.0.0.0:8847"
+        );
+
+        let (listener, redirect_uri) = bind_consent_listener("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(redirect_uri, format!("http://127.0.0.1:{port}"));
     }
 
     // --- broker flow -------------------------------------------------------
