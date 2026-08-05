@@ -192,6 +192,31 @@ no-store`, like the reveal.
   transaction as the seal. `list_drafts` additionally filters a sealed parent
   (`NOT EXISTS` on `triage`, the same shape as `deadlines`) as a belt.
 
+**What enforces the split, and what token scope cannot.** The two-door split is
+enforced by three structural facts, none of which involve OAuth scope: the agent
+door exposes **no write tools at all**, the write credential is loaded **only** by
+human-door action handlers and never by sync or triage, and sealed rows are
+**absent** from every serving query.
+
+Scope is defense in depth on top of that, and it is worth being precise about how
+much it buys. Google unions grants **per Cloud project**: with incremental
+authorization a newly issued access token also covers every scope the user has
+previously granted the project, even when those grants were requested from a
+different client. So once a user has run `squelchd auth --write`, the token behind
+the *read* slot carries `gmail.modify` and `gmail.send` too, however narrow the
+request that minted it was. "The agent door holds a token that physically cannot
+send" is therefore **not a claim we get to make**.
+
+This is also why `judge_transfer_credential` holds an imported credential to a
+scope **floor** (does the grant cover what this slot needs?) rather than an exact
+match. An exact match would refuse the Read entry of every `--export --write`
+blob, because both entries legitimately report the union. Do not "tighten" it.
+
+Real token-level separation would require a **second Google Cloud project**, not
+merely a second OAuth client, since the union is per project. That doubles the
+verification and CASA burden for a property the structural enforcement above
+already provides. We are deliberately not doing it.
+
 **Do not break.** Seal detection stays the first thing that touches a parsed body —
 any pass moved above it is a pass that has read an OTP. Sealed *absence* is the
 agent-door contract: do not add a `sensitivity` field to agent-door types "so callers

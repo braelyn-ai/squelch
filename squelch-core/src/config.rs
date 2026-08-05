@@ -81,9 +81,22 @@ pub fn mcp_allowed_hosts() -> Vec<String> {
     hosts
 }
 
-/// The READ scope. This is all the sync daemon + triage ever request; the read
-/// credential is `gmail.readonly` and nothing else. Hard invariant, hence a
-/// `const`. See [`WRITE_SCOPES`] for the separate, opt-in action credential.
+/// The READ scope. This is all the sync daemon + triage ever REQUEST, and that
+/// much is a hard invariant, hence a `const`. See [`WRITE_SCOPES`] for the
+/// separate, opt-in action credential.
+///
+/// What Google ISSUES is a different question. Grants are unioned per Cloud
+/// project: with incremental authorization an access token also covers every
+/// scope the user has already granted the project, even when those grants came
+/// from a different client. So once a user has run `squelchd auth --write`, the
+/// token behind the read credential carries modify+send too, and is capable of
+/// more than readonly however narrow the request was.
+///
+/// The consequence, stated plainly: token scope is defense in depth here, not
+/// the thing that enforces the two-door split. What enforces it is that the
+/// agent door exposes no write tools, that [`WRITE_SCOPES`] credentials are
+/// loaded only by human-door action handlers, and that sealed rows are absent
+/// from every serving query. See `docs/SECURITY.md` §4.
 pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
 
 /// The WRITE scopes: requested ONLY by `squelchd auth --write`, loaded ONLY by

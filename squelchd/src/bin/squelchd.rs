@@ -702,21 +702,27 @@ fn cmd_auth_import(config: &Config) -> Result<(), squelch_core::CoreError> {
         "Checking {} credential(s) with Google before anything is stored...",
         transfer.credentials.len()
     );
+    // What gets STORED is what verification minted, not what was pasted. The
+    // refresh it already ran is the only part of a blob Google ever named, so
+    // keeping the blob's access token and expiry alongside it would persist two
+    // attacker-authored fields; an absent `expires_at` in particular reads as
+    // "never expires" and would pin a bearer string of the paster's choosing on
+    // every Gmail call.
+    let mut entries: Vec<(
+        squelch_core::credentials::CredentialKind,
+        squelch_core::credentials::StoredToken,
+    )> = Vec::new();
     for cred in &transfer.credentials {
-        verify_transfer_credential(&client, &email, cred.kind, &cred.token)?;
+        let verified = verify_transfer_credential(&client, &email, cred.kind, &cred.token)?;
         println!(
             "  {:?}: Google confirms this token opens {email} with the scopes the {:?} slot needs.",
             cred.kind, cred.kind
         );
+        entries.push((cred.kind, verified));
     }
 
-    // One unit: either both slots come from this blob or neither does, so the
+    // One unit: either both slots come from this import or neither does, so the
     // two doors can never end up describing different consents.
-    let entries: Vec<_> = transfer
-        .credentials
-        .iter()
-        .map(|c| (c.kind, c.token.clone()))
-        .collect();
     store_tokens_backend(backend, &creds_path, &email, &entries)?;
     for (kind, _) in &entries {
         let _ = load_token_backend(backend, &creds_path, &email, *kind)?;

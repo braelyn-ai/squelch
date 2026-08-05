@@ -168,8 +168,14 @@ pub fn refresh_stored_token_detailed(
                 .map_err(|e| CoreError::Credential(format!("bad token url: {e}")))?,
         );
 
+    // Same two properties the guarded exchange carries, and for the same
+    // reasons: redirects are REFUSED because this request holds the client
+    // secret and an open redirect on the token endpoint is SSRF, and the round
+    // trip is bounded by a stated budget rather than by whatever reqwest's
+    // default happens to be in some future version.
     let http = oauth2::reqwest::blocking::ClientBuilder::new()
         .redirect(oauth2::reqwest::redirect::Policy::none())
+        .timeout(crate::auth::EXCHANGE_HTTP_TIMEOUT)
         .build()
         .map_err(|e| CoreError::Credential(format!("building http client: {e}")))?;
 

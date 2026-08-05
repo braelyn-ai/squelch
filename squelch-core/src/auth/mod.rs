@@ -20,8 +20,9 @@
 //! token for [`transfer`] to carry to a headless host. See `docs/BROKER.md`.
 //!
 //! A blob arriving at the other end goes through [`verify_transfer_credential`],
-//! which asks Google the same two questions the exchange asks. Nothing in a blob
-//! is signed, so nothing a blob SAYS about itself is evidence.
+//! which asks Google the same two questions the exchange asks and hands back the
+//! token it minted doing so. Nothing in a blob is signed, so nothing a blob SAYS
+//! about itself is evidence and none of its bytes reach storage.
 
 mod transfer;
 pub use transfer::{
@@ -30,7 +31,7 @@ pub use transfer::{
 };
 
 use crate::config::{GMAIL_READONLY_SCOPE, OAuthClientConfig, WRITE_SCOPES};
-use crate::credentials::{CredentialKind, StoredToken};
+use crate::credentials::{CredentialKind, RefreshedToken, StoredToken};
 use crate::error::{CoreError, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -53,9 +54,9 @@ pub(crate) const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// set this module mints (`gmail.readonly`, `gmail.modify`) permits it.
 const GMAIL_PROFILE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 
-/// Budget for the token exchange and the profile check that follows it. Both are
-/// one small round trip to Google.
-const EXCHANGE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for the token exchange, the refresh, and the profile check that
+/// follows either. All three are one small round trip to Google.
+pub(crate) const EXCHANGE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fixed loopback port used in `--headless` mode so it can be SSH-forwarded.
 pub const DEFAULT_HEADLESS_PORT: u16 = 8847;
@@ -309,6 +310,11 @@ fn guarded_http() -> Result<reqwest::blocking::Client> {
 /// client fails HERE, at paste time, instead of as a mystery `invalid_client` on
 /// the first sync an hour later.
 ///
+/// Returns the token the caller must STORE, which is the refreshed one and never
+/// the blob's. See [`judge_transfer_credential`] for why that distinction is the
+/// difference between a verified credential and a verified refresh token sitting
+/// next to two attacker-authored fields.
+///
 /// Costs one refresh and one profile call per credential. Callers run the cheap
 /// local checks first.
 pub fn verify_transfer_credential(
@@ -316,7 +322,7 @@ pub fn verify_transfer_credential(
     expected_account: &str,
     kind: CredentialKind,
     token: &StoredToken,
-) -> Result<()> {
+) -> Result<StoredToken> {
     let refresh = token.refresh_token.as_deref().ok_or_else(|| {
         CoreError::Credential(format!(
             "the {kind:?} credential in this blob has no refresh token, so nothing about it can \
@@ -329,22 +335,31 @@ pub fn verify_transfer_credential(
     let http = guarded_http()?;
     let mailbox = fetch_profile_email(&http, &refreshed.token.access_token)?;
 
-    judge_transfer_credential(
-        expected_account,
-        kind,
-        &mailbox,
-        refreshed.granted_scopes.as_deref(),
-    )
+    judge_transfer_credential(expected_account, kind, &mailbox, refreshed, refresh)
 }
 
-/// What Google's answers mean for one blob entry. Pure, and separate from the
-/// two calls that collect them, so every refusal is exercised without a network.
+/// What Google's answers mean for one blob entry, and the token to store when
+/// they are good. Pure, and separate from the two calls that collect them, so
+/// every refusal is exercised without a network.
+///
+/// The token handed back is the REFRESHED one, so that NOTHING an attacker wrote
+/// survives into storage. A blob is unsigned, so its `access_token` and
+/// `expires_at` are the paster's strings, and only the refresh — which already
+/// happened — replaces both with bytes Google just named. Storing the blob's
+/// instead is not cosmetic: `expires_at` is `#[serde(default)]` and
+/// `StoredToken::is_expired` reads a missing expiry as NOT expired, so
+/// `validate_or_refresh` would never refresh it and the sync loop's one 401
+/// retry re-reads the same row. A blob-supplied bearer string would then be sent
+/// to Gmail on every call, forever, with nothing to make the daemon go get a
+/// real one.
 fn judge_transfer_credential(
     expected_account: &str,
     kind: CredentialKind,
     mailbox: &str,
-    granted: Option<&[String]>,
-) -> Result<()> {
+    refreshed: RefreshedToken,
+    blob_refresh: &str,
+) -> Result<StoredToken> {
+    let granted = refreshed.granted_scopes.as_deref();
     check_account_match(expected_account, mailbox).map_err(|_| {
         CoreError::Credential(format!(
             "Google says the {kind:?} credential in this blob opens {}, but this daemon is \
@@ -365,13 +380,31 @@ fn judge_transfer_credential(
              nothing was stored. Authorize this host directly with `squelchd auth` instead."
         )));
     };
+    // A FLOOR, not an exact match, and it has to stay one. Google unions grants
+    // per Cloud project: with incremental authorization a new access token also
+    // covers every scope the user previously granted the project, "even if the
+    // grants were requested from different clients". So for any user who has
+    // ever run `auth --write`, BOTH entries of an `--export --write` blob report
+    // modify+send, and refusing the Read entry for carrying write scopes would
+    // refuse every such import. Which slot a token may occupy is decided by what
+    // the slot NEEDS being covered; see docs/SECURITY.md §4 for what actually
+    // enforces the two-door split, since token scope cannot.
     check_scope_grant(AuthScopes::from(kind), Some(granted)).map_err(|e| {
         CoreError::Credential(format!(
             "the {kind:?} credential in this blob does not carry the scopes the {kind:?} slot \
              needs, so storing it there would put a token with the wrong reach behind that \
              door: {e}"
         ))
-    })
+    })?;
+
+    // Google does not reissue a refresh token on a refresh grant, so the one
+    // that was just proven live is carried forward rather than dropped: storing
+    // `None` would leave a credential that cannot renew itself.
+    let mut token = refreshed.token;
+    if token.refresh_token.is_none() {
+        token.refresh_token = Some(blob_refresh.to_string());
+    }
+    Ok(token)
 }
 
 /// The message for a refresh that failed during verification. `invalid_client`
@@ -1754,15 +1787,49 @@ mod tests {
         WRITE_SCOPES.iter().map(|s| s.to_string()).collect()
     }
 
+    /// What Google names on the refresh, and what the blob only claims. The
+    /// judgement must never confuse the two.
+    const FRESH_ACCESS: &str = "access-token-google-just-minted";
+    const BLOB_REFRESH: &str = "refresh-token-out-of-the-blob";
+
+    /// The refresh that already happened, shaped the way a real one is: a fresh
+    /// access token, an expiry Google chose, and NO new refresh token, since a
+    /// refresh grant does not reissue one.
+    fn refreshed(granted: Option<Vec<String>>) -> RefreshedToken {
+        RefreshedToken {
+            token: StoredToken::from_response(
+                FRESH_ACCESS.to_string(),
+                None,
+                Some(Duration::from_secs(3600)),
+            ),
+            granted_scopes: granted,
+        }
+    }
+
+    fn judge(
+        expected_account: &str,
+        kind: CredentialKind,
+        mailbox: &str,
+        granted: Option<Vec<String>>,
+    ) -> Result<StoredToken> {
+        judge_transfer_credential(
+            expected_account,
+            kind,
+            mailbox,
+            refreshed(granted),
+            BLOB_REFRESH,
+        )
+    }
+
     /// The blob's `account` field is a claim by whoever pasted it. Google's
     /// answer is the fact, and a disagreement refuses the whole import.
     #[test]
     fn a_blob_google_disagrees_with_is_refused_and_names_both() {
-        let err = judge_transfer_credential(
+        let err = judge(
             "victim@gmail.com",
             CredentialKind::Read,
             "attacker@gmail.com",
-            Some(&read_grant()),
+            Some(read_grant()),
         )
         .unwrap_err()
         .to_string();
@@ -1772,11 +1839,11 @@ mod tests {
         assert!(err.contains("not evidence"), "{err}");
 
         // The mailbox Google names is echoed, so it is disarmed first.
-        let err = judge_transfer_credential(
+        let err = judge(
             "victim@gmail.com",
             CredentialKind::Read,
             "a\u{1b}[2Jb@gmail.com",
-            Some(&read_grant()),
+            Some(read_grant()),
         )
         .unwrap_err()
         .to_string();
@@ -1788,11 +1855,11 @@ mod tests {
     /// to cover the slot rather than the other way round.
     #[test]
     fn a_write_token_cannot_be_filed_in_the_read_slot() {
-        let err = judge_transfer_credential(
+        let err = judge(
             "me@gmail.com",
             CredentialKind::Read,
             "me@gmail.com",
-            Some(&write_grant()),
+            Some(write_grant()),
         )
         .unwrap_err()
         .to_string();
@@ -1800,11 +1867,11 @@ mod tests {
         assert!(err.contains(GMAIL_READONLY_SCOPE), "{err}");
 
         // And the converse: a read token in the Write slot cannot send.
-        let err = judge_transfer_credential(
+        let err = judge(
             "me@gmail.com",
             CredentialKind::Write,
             "me@gmail.com",
-            Some(&read_grant()),
+            Some(read_grant()),
         )
         .unwrap_err()
         .to_string();
@@ -1812,23 +1879,92 @@ mod tests {
 
         // Each grant in its own slot is what a real export produces.
         assert!(
-            judge_transfer_credential(
+            judge(
                 "me@gmail.com",
                 CredentialKind::Read,
                 "ME@gmail.com",
-                Some(&read_grant())
+                Some(read_grant())
             )
             .is_ok()
         );
         assert!(
-            judge_transfer_credential(
+            judge(
                 "me@gmail.com",
                 CredentialKind::Write,
                 "me@gmail.com",
-                Some(&write_grant())
+                Some(write_grant())
             )
             .is_ok()
         );
+    }
+
+    /// REGRESSION GUARD, do not "tighten" this into an exact match. Google
+    /// unions grants per Cloud project, so once a user has run `auth --write`
+    /// BOTH entries of an `--export --write` blob report modify+send alongside
+    /// readonly. A Read slot that refused write scopes would refuse every one of
+    /// those imports. See `docs/SECURITY.md` §4.
+    #[test]
+    fn a_read_entry_carrying_the_projects_unioned_grant_is_accepted() {
+        let union: Vec<String> = read_grant().into_iter().chain(write_grant()).collect();
+        let stored = judge(
+            "me@gmail.com",
+            CredentialKind::Read,
+            "me@gmail.com",
+            Some(union),
+        )
+        .expect("a unioned grant is what Google issues after `auth --write`");
+        assert_eq!(stored.access_token, FRESH_ACCESS);
+    }
+
+    /// The verification exists so that NOTHING a blob authored reaches storage.
+    /// The refresh already ran, so its token is the one stored: a blob's own
+    /// `access_token` and `expires_at` were never named by Google, and an absent
+    /// expiry reads as "not expired" forever, which would pin a bearer string of
+    /// the paster's choosing on every Gmail call with no self-heal.
+    #[test]
+    fn the_stored_credential_is_the_refreshed_one_not_the_blobs() {
+        let stored = judge(
+            "me@gmail.com",
+            CredentialKind::Read,
+            "me@gmail.com",
+            Some(read_grant()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stored.access_token, FRESH_ACCESS,
+            "the blob's access token must not survive verification"
+        );
+        // A refresh grant returns no new refresh token, so the one just proven
+        // live carries forward; `None` would store a credential that cannot renew.
+        assert_eq!(stored.refresh_token.as_deref(), Some(BLOB_REFRESH));
+
+        let exp = stored.expires_at.expect("Google's expiry is kept");
+        let delta = (exp - chrono::Utc::now()).num_seconds();
+        assert!((3500..=3600).contains(&delta), "delta was {delta}");
+        assert!(
+            !stored.is_expired(chrono::Duration::seconds(60)),
+            "a token minted seconds ago is not due for refresh"
+        );
+
+        // When Google DOES reissue a refresh token, that one is stored instead.
+        let rotated = RefreshedToken {
+            token: StoredToken::from_response(
+                FRESH_ACCESS.to_string(),
+                Some("rotated-by-google".to_string()),
+                Some(Duration::from_secs(3600)),
+            ),
+            granted_scopes: Some(write_grant()),
+        };
+        let stored = judge_transfer_credential(
+            "me@gmail.com",
+            CredentialKind::Write,
+            "me@gmail.com",
+            rotated,
+            BLOB_REFRESH,
+        )
+        .unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rotated-by-google"));
     }
 
     /// On a refresh there is no request for an absent `scope` to mean "same as",
@@ -1836,10 +1972,9 @@ mod tests {
     /// word on which slot this belongs in.
     #[test]
     fn a_refresh_that_names_no_scopes_is_refused_rather_than_assumed() {
-        let err =
-            judge_transfer_credential("me@gmail.com", CredentialKind::Write, "me@gmail.com", None)
-                .unwrap_err()
-                .to_string();
+        let err = judge("me@gmail.com", CredentialKind::Write, "me@gmail.com", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no scopes"), "{err}");
         assert!(err.contains("nothing was stored"), "{err}");
     }
