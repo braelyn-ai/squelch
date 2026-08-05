@@ -264,6 +264,16 @@ enum LLMProxy {
     private static let streamSession = Sessions.ephemeral(timeout: streamTimeout)
     private static let streamTimeout: TimeInterval = 120
 
+    /// REFUSES EVERY REDIRECT, on both sessions. URLSession strips
+    /// `Authorization` across origins but carries custom headers — `x-api-key`
+    /// above all — verbatim through a hop, so a 302 from a compromised or
+    /// hijacked provider host would post the user's own BYOK key to whatever
+    /// host it named, and the user would see only "assistant request failed".
+    /// Neither provider legitimately 3xx's /v1/messages, so refusing costs
+    /// nothing: the 3xx surfaces to the caller as a non-200. Same empty
+    /// allow-list EventStream keeps on the token-bearing feed.
+    private static let pinned = SchemePinned(allow: [])
+
     /// Cap on a non-200 body we read to find the provider's error text. Past
     /// this the upstream is broken or hostile and there is nothing to quote.
     private static let maxErrorBytes = 64 * 1024
@@ -290,7 +300,7 @@ enum LLMProxy {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await session.data(for: req, delegate: Self.pinned)
         } catch {
             throw LLMError.transport
         }
@@ -330,7 +340,8 @@ enum LLMProxy {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
-                        (bytes, response) = try await streamSession.bytes(for: req)
+                        (bytes, response) = try await streamSession.bytes(
+                            for: req, delegate: Self.pinned)
                     } catch {
                         // Refused / DNS / TLS / inactivity. Never the error text:
                         // it can quote the request we just built.

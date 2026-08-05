@@ -250,6 +250,14 @@ struct ComposePane: View {
             // review, Enter fires without override — that call is the verdict.
             KeyBinding(declining: "Enter", inReview ? "send" : "review", allowInInput: true) {
                 guard let compose = store.compose else { return false }
+                // THE ASK BAR IS A MODAL ON TOP OF THIS PANE. KeyMonitor walks
+                // the sets newest-first and AskBar binds only Escape, so a
+                // Return typed into its field falls through to here — and in
+                // review that would SEND THE MAIL, the one irreversible thing
+                // this app does, instead of asking the question. The edit branch
+                // survives on the firstResponder check below; review has no such
+                // luck, so both decline while the bar is up.
+                guard !store.askBarOpen else { return false }
                 if compose.phase == .edit {
                     guard !bodyHasFocus else { return false }  // let it type a newline
                     toReview()
@@ -263,6 +271,9 @@ struct ComposePane: View {
             },
             // Explicit override, review phase only.
             KeyBinding(declining: "shift+Enter", "override guard and send", allowInInput: true) {
+                // Same trap as plain Enter, one notch worse: this one sends
+                // THROUGH the outbound guard.
+                guard !store.askBarOpen else { return false }
                 guard let compose = store.compose, compose.phase == .review,
                     !compose.guardKinds.isEmpty
                 else { return false }
