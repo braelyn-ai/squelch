@@ -1,12 +1,15 @@
-# passband — parity with `squelch-desktop`
+# Passband — the native macOS client
 
-A native macOS/SwiftUI rewrite of the Tauri + React client, targeting macOS 26
-so it can use **real Liquid Glass** rather than CSS that imitates it.
+Passband is a native macOS/SwiftUI app targeting macOS 26, so it can use
+**real Liquid Glass** rather than CSS that imitates it. It began as a rewrite
+of a Tauri + React desktop client (`squelch-desktop`, since retired and removed
+from the tree); this file records the design, the security posture, and the
+decisions that deliberately diverge from that predecessor.
 
-**Status: functional parity reached.** Every view, surface, keybinding and
-behavior below is implemented natively. The single remaining webview is the
-sanitized-HTML email body, which is the one place a webview is genuinely
-required. Open questions are recorded at the bottom.
+Every view, surface, keybinding and behavior below is implemented natively.
+The single remaining webview is the sanitized-HTML email body, which is the one
+place a webview is genuinely required. Open questions are recorded at the
+bottom.
 
 ---
 
@@ -28,9 +31,6 @@ checked in and produces the same bundle when `xcodebuild` is healthy:
 xcodegen generate
 xcodebuild -project Passband.xcodeproj -scheme Passband -destination 'platform=macOS' build
 ```
-
-Current state: **50 Swift source files, debug and release both build clean with
-zero warnings.**
 
 ---
 
@@ -90,7 +90,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 | Side panels (browse / search) | **done** | Conditional-mount so the modal context is never pinned |
 | Compose review ceremony | **done** | edit → review → guard verdict → explicit override |
 | Draft autosave + restore | **done** | Debounced `PUT /client/drafts` per composer slot, flushed on every exit, silent; `c` / ⌘N restores the new-message draft, `r` restores the reply's |
-| Read tracking | **done** (no desktop equivalent) | Per-send pixel toggle in both composers (edit phase; hidden when the daemon has no `[tracking] base_url`), stated again in review, Settings → Mail holds the persistent default; the reader marks a sent message "opened 2h ago", "(via proxy)" when the fetch was Gmail's image proxy |
+| Read tracking | **done** (new in Passband) | Per-send pixel toggle in both composers (edit phase; hidden when the daemon has no `[tracking] base_url`), stated again in review, Settings → Mail holds the persistent default; the reader marks a sent message "opened 2h ago", "(via proxy)" when the fetch was Gmail's image proxy |
 | Triage-fix palette (`v`) | **done** | Ranked, ambiguity shown not guessed |
 | ⌘K ask-your-inbox bar | **done** | BYOK agent loop w/ citations |
 | 2FA code modal | **done** | Auto-reveal, 30s countdown, copy pauses the timer |
@@ -107,8 +107,8 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 
 ## Keyboard
 
-The context system is ported 1:1 (`Keys/KeyDispatch.swift`), including the
-parts that are easy to get subtly wrong:
+The context system lives in `Keys/KeyDispatch.swift`. The parts that are easy
+to get subtly wrong:
 
 - **Context stack** — `list` / `sitrep` / `modal` / `thread` / `global`. The
   active context composes with `global`, so 1–5 nav and ⌘K keep firing from
@@ -168,9 +168,8 @@ the registry remains the authority on dispatch semantics.
 
 ## Backend contract
 
-Every `/client/*` route the desktop client used is implemented in
-`Model/APIClient.swift`, with `Model/WireTypes.swift` mirroring the serde output
-exactly. Routes: `updates`, `thread/{id}`, `search`, `stats`, `usage`,
+The `/client/*` surface is implemented in `Model/APIClient.swift`, with
+`Model/WireTypes.swift` mirroring the daemon's serde output exactly. Routes: `updates`, `thread/{id}`, `search`, `stats`, `usage`,
 `triage-config` (GET/POST), `audit`, `shipments`, `receipts`, `calendar`,
 `banking`, `marketing`, `triage-debug/{id}`, `attachments/{id}`, `rules`
 (GET/POST/DELETE), `unsubscribe`, `unsubscribes`, `unsubscribes/resolution`,
@@ -178,7 +177,7 @@ exactly. Routes: `updates`, `thread/{id}`, `search`, `stats`, `usage`,
 `refresh`, `retriage`, `shredder` (GET/POST), `shredder/run`, `triage-feedback`
 (GET/POST), `messages/{id}/opens`, `tracking-config` (GET/POST).
 
-Hardening carried over: 15s request timeout (30s for attachments), the token
+Hardening: 15s request timeout (30s for attachments), the token
 only ever in an `Authorization` header, and error messages that never echo the
 token or URL. Every wire enum decodes leniently, so a newer daemon adding a
 tier/kind value cannot break an older client's page decode.
@@ -187,19 +186,18 @@ tier/kind value cannot break an older client's page decode.
 
 ## Security posture
 
-**Credentials.** Keychain service `passband` with the same account slots
-(`server_url`, `api_token`, `assistant_api_key`) the Tauri shell used under
-`squelch-desktop`. The rename orphans credentials stored by pre-rename builds —
-one-time re-entry in Settings (squelch-desktop itself is retired).
+**Credentials.** Keychain service `passband`, account slots `server_url`,
+`api_token`, `assistant_api_key`. Credentials stored by the retired
+`squelch-desktop` client live under its old service name and are not migrated —
+a one-time re-entry in Settings.
 
 **The BYOK assistant key is unreachable from the view layer.**
 `AssistantKeyStore.read()` is `fileprivate` to `Keychain.swift`, and `LLMProxy`
 lives in that same file for exactly that reason. The key is never a parameter,
 never a return value, never in an error message, and never in a log — the view
 layer can only ask *whether* a key exists and *which provider* it routes to.
-This mirrors the Rust `llm_complete` proxy, where the secret likewise never
-crossed into JS. Provider is inferred from the key's real prefix, never from a
-caller-supplied value.
+Provider is inferred from the key's real prefix, never from a caller-supplied
+value.
 
 **Email HTML rendering** (`Views/EmailWebView.swift`) — five independent layers,
 each sufficient alone:
@@ -231,9 +229,10 @@ never lifted into the global store, never logged.
 
 ---
 
-## Deliberate differences from the web build
+## Deliberate differences from the retired web client
 
-These are improvements or native-platform equivalents, not gaps:
+Kept because each one is a decision, not a gap. "The web build" below is the
+retired Tauri + React client:
 
 1. **PDF preview is native PDFKit**, not an `<embed>` fed by a blob URL. No
    webview, no blob CSP grant.
@@ -277,17 +276,16 @@ These are improvements or native-platform equivalents, not gaps:
 
 ## Open questions
 
-1. **Keychain access prompt.** The app is ad-hoc signed (`codesign -s -`), so
-   its code identity differs from the Tauri app that created the keychain items
-   and macOS prompts before handing them over. Clicking "Always Allow" resolves
-   it for that build. **During development it re-prompts after every rebuild**,
-   because an ad-hoc signature's identity is derived from the binary itself and
-   the binary changes each time. A real signing identity removes this entirely;
-   that is a distribution decision, not a code one.
+1. **Keychain access prompt on ad-hoc builds.** `build.sh` signs with a
+   Developer ID identity when the keychain has one (`signing.sh`) and falls
+   back to ad-hoc otherwise. An ad-hoc signature's identity is derived from the
+   binary itself, so every rebuild is a new code identity and macOS re-prompts
+   for keychain access each time; a real identity has a stable designated
+   requirement and prompts once.
 
-   This surfaced a genuine bug, now fixed: the keychain read ran on the main
-   actor, so the prompt froze the whole UI until it was answered. All keychain
-   I/O (`SettingsStore.loadAsync` / `saveAsync`,
+   Chasing this surfaced a real bug, since fixed: the keychain read ran on the
+   main actor, so the prompt froze the whole UI until it was answered. All
+   keychain I/O (`SettingsStore.loadAsync` / `saveAsync`,
    `AssistantKeyStore.statusAsync`) now runs on a background executor and the
    app keeps painting while the panel is up.
 2. **OpenAI assistant keys** are accepted and stored, and `LLMProxy` routes them
