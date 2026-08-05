@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::config::{Config, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
-use crate::store::{ContactEntry, Store, SyncState};
+use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules, is_robot_address};
 use crate::triage::events;
 use crate::triage::extract::{self, banking, marketing};
@@ -275,6 +275,27 @@ enum CapKind {
     Sender,
     Global,
     Stage1Global,
+}
+
+/// The preamble every LLM pass shares: resolved credentials, runtime cap
+/// overrides, and the pass clock. `stale_cutoff` is deliberately the Stage-2
+/// max-age for every pass, so all stages age rows out together.
+struct PassSetup<'a> {
+    api_key: &'a str,
+    provider: Stage2Provider,
+    caps: Stage2CapOverrides,
+    /// UTC date key (`YYYY-MM-DD`) for the budget rows; one value per pass.
+    day: String,
+    stale_cutoff: DateTime<Utc>,
+}
+
+/// Outcome of a check-then-increment budget gate.
+enum BudgetGate {
+    Proceed,
+    /// Cap hit: every remaining row this cycle is blocked.
+    Exhausted,
+    /// Budget read or increment failed: skip this row, try the next.
+    SkipRow,
 }
 
 /// The last UTC day (`YYYY-MM-DD`) each cap kind's notice was emitted; re-armed
@@ -1082,6 +1103,81 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
+    /// Shared pass preamble; `None` when the LLM is disabled (no API key —
+    /// the notice was already emitted at startup). Caps are re-read at the
+    /// START of every pass so a client change via POST /client/triage-config
+    /// applies within a cycle, no restart. Precedence: override > config/env
+    /// > default.
+    fn pass_setup(&self) -> Option<PassSetup<'_>> {
+        let (api_key, provider) = self.stage2_key.as_ref()?;
+        let caps = self
+            .store
+            .stage2_cap_overrides(self.account_id)
+            .unwrap_or_default();
+        let now = Utc::now();
+        Some(PassSetup {
+            api_key,
+            provider: *provider,
+            caps,
+            day: now.format("%Y-%m-%d").to_string(),
+            stale_cutoff: now - ChronoDuration::days(self.config.stage2.max_age_days as i64),
+        })
+    }
+
+    /// Unwrap a pass's queue read; a read error logs once and yields an empty
+    /// queue, which the caller treats as "nothing to do".
+    fn read_queue<T>(res: Result<Vec<T>>, label: &str) -> Vec<T> {
+        match res {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("squelch: {label} queue read failed ({e}); skipping pass");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Check-then-increment the SHARED Stage-1 global daily budget (Stage-1
+    /// and the extractors bill the same counter). The increment lands BEFORE
+    /// the model call so an attempt counts even on error/retry — a retry storm
+    /// can never exceed the cap. Stage-2's three-scope gate stays inline in
+    /// [`Self::stage2_pass`]: it checks all three caps before incrementing any
+    /// of them, which a per-key check-then-increment helper would break.
+    fn gate_stage1_global_budget(
+        &self,
+        day: &str,
+        cap: u32,
+        label: &str,
+        tail: &str,
+    ) -> BudgetGate {
+        match self
+            .store
+            .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, day)
+        {
+            Ok(used) if used >= cap => {
+                if self.warn_once_per_day(CapKind::Stage1Global, day) {
+                    eprintln!(
+                        "squelch: stage-1 global daily budget exhausted \
+                         ({used}/{cap}); {tail} stay queued"
+                    );
+                }
+                return BudgetGate::Exhausted;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("squelch: {label} budget read failed ({e}); skipping row");
+                return BudgetGate::SkipRow;
+            }
+        }
+        if let Err(e) =
+            self.store
+                .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, day)
+        {
+            eprintln!("squelch: {label} budget increment failed ({e}); skipping row");
+            return BudgetGate::SkipRow;
+        }
+        BudgetGate::Proceed
+    }
+
     /// Run one Stage-1 LLM refine pass over rows still carrying their ingest
     /// heuristic seed (`stage1_model_used IS NULL`): sealed guard, GLOBAL
     /// Stage-1 budget with increment-before-call so retries can't exceed it,
@@ -1091,40 +1187,27 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// escalation. Budget exhaustion defers rows without loss; no failure
     /// crashes the sync loop. No-op when the LLM is disabled (no API key).
     async fn stage1_pass(&self) {
-        let Some((api_key, provider)) = self.stage2_key.as_ref() else {
-            return; // disabled; notice already emitted at startup
+        let Some(PassSetup {
+            api_key,
+            provider,
+            caps,
+            day,
+            stale_cutoff,
+        }) = self.pass_setup()
+        else {
+            return;
         };
-        let api_key = api_key.as_str();
-        let provider = *provider;
         let cfg = &self.config.stage1;
-
-        // Re-read the cap at the START of the pass so a client change via
-        // POST /client/triage-config applies within a cycle, no restart.
-        // Precedence: override > config/env > default.
-        let caps = self
-            .store
-            .stage2_cap_overrides(self.account_id)
-            .unwrap_or_default();
         let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued = match self
-            .store
-            .stage1_queue(self.account_id, cfg.batch_per_cycle)
-        {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("squelch: stage-1 queue read failed ({e}); skipping pass");
-                return;
-            }
-        };
+        let queued = Self::read_queue(
+            self.store.stage1_queue(self.account_id, cfg.batch_per_cycle),
+            "stage-1",
+        );
         if queued.is_empty() {
             return;
         }
 
-        let now = Utc::now();
-        let day = now.format("%Y-%m-%d").to_string();
-        // Deliberately the Stage-2 max-age, so both stages age out together.
-        let stale_cutoff = now - ChronoDuration::days(self.config.stage2.max_age_days as i64);
         let mut refined = 0usize;
         let mut fallback = 0usize;
         let mut stale_skipped = 0usize;
@@ -1152,33 +1235,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
             // GLOBAL budget check (Stage-1's ONLY scope). Once hit, every
             // remaining row this cycle stays queued, unstamped.
-            match self
-                .store
-                .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
-            {
-                Ok(used) if used >= global_daily_cap => {
-                    if self.warn_once_per_day(CapKind::Stage1Global, &day) {
-                        eprintln!(
-                            "squelch: stage-1 global daily budget exhausted \
-                             ({used}/{global_daily_cap}); remaining rows stay queued"
-                        );
-                    }
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("squelch: stage-1 global budget read failed ({e}); skipping row");
-                    continue;
-                }
-            }
-
-            // Increment BEFORE the call so the attempt counts even on error/retry.
-            if let Err(e) =
-                self.store
-                    .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
-            {
-                eprintln!("squelch: stage-1 global budget increment failed ({e}); skipping row");
-                continue;
+            match self.gate_stage1_global_budget(
+                &day,
+                global_daily_cap,
+                "stage-1 global",
+                "remaining rows",
+            ) {
+                BudgetGate::Exhausted => break,
+                BudgetGate::SkipRow => continue,
+                BudgetGate::Proceed => {}
             }
 
             let outcome = stage1_llm::classify(&self.http, api_key, cfg, provider, row).await;
@@ -1278,45 +1343,35 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// Budget exhaustion defers rows without loss; per-row failures are logged
     /// redacted and never crash the sync loop. No-op when there is no API key.
     async fn extract_pass(&self) {
-        let Some((api_key, provider)) = self.stage2_key.as_ref() else {
-            return; // disabled; notice already emitted at startup
-        };
-        let api_key = api_key.as_str();
-        let provider = *provider;
-        // Extractors run on the STAGE-1 (small) model and share its config + cap.
-        let cfg = &self.config.stage1;
-
         let categories = extract::extractable_categories();
         if categories.is_empty() {
             return;
         }
-
-        // Extract calls count against the SAME daily counter as Stage-1, runtime
-        // override included.
-        let caps = self
-            .store
-            .stage2_cap_overrides(self.account_id)
-            .unwrap_or_default();
+        let Some(PassSetup {
+            api_key,
+            provider,
+            caps,
+            day,
+            stale_cutoff,
+        }) = self.pass_setup()
+        else {
+            return;
+        };
+        // Extractors run on the STAGE-1 (small) model and share its config +
+        // cap: extract calls count against the SAME daily counter as Stage-1,
+        // runtime override included.
+        let cfg = &self.config.stage1;
         let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued =
-            match self
-                .store
-                .extract_queue(self.account_id, &categories, cfg.batch_per_cycle)
-            {
-                Ok(q) => q,
-                Err(e) => {
-                    eprintln!("squelch: extract queue read failed ({e}); skipping pass");
-                    return;
-                }
-            };
+        let queued = Self::read_queue(
+            self.store
+                .extract_queue(self.account_id, &categories, cfg.batch_per_cycle),
+            "extract",
+        );
         if queued.is_empty() {
             return;
         }
 
-        let now = Utc::now();
-        let day = now.format("%Y-%m-%d").to_string();
-        let stale_cutoff = now - ChronoDuration::days(self.config.stage2.max_age_days as i64);
         let mut extracted = 0usize;
         let mut skipped = 0usize;
         let mut in_tok = 0u64;
@@ -1356,31 +1411,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
             // SHARED Stage-1 global budget. Once hit, every remaining row this
             // cycle stays queued, unstamped.
-            match self
-                .store
-                .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
+            match self.gate_stage1_global_budget(&day, global_daily_cap, "extract", "extract rows")
             {
-                Ok(used) if used >= global_daily_cap => {
-                    if self.warn_once_per_day(CapKind::Stage1Global, &day) {
-                        eprintln!(
-                            "squelch: stage-1 global daily budget exhausted \
-                             ({used}/{global_daily_cap}); extract rows stay queued"
-                        );
-                    }
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("squelch: extract budget read failed ({e}); skipping row");
-                    continue;
-                }
-            }
-            if let Err(e) =
-                self.store
-                    .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, &day)
-            {
-                eprintln!("squelch: extract budget increment failed ({e}); skipping row");
-                continue;
+                BudgetGate::Exhausted => break,
+                BudgetGate::SkipRow => continue,
+                BudgetGate::Proceed => {}
             }
 
             // ROUTE BY CATEGORY: each specialist owns its own prompt, schema and
@@ -1501,42 +1536,29 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// per-row failure is logged redacted and never crashes the sync loop.
     /// No-op when Stage-2 is disabled (no API key).
     async fn stage2_pass(&self) {
-        let Some((api_key, provider)) = self.stage2_key.as_ref() else {
-            return; // disabled; notice already emitted at startup
+        let Some(PassSetup {
+            api_key,
+            provider,
+            caps,
+            day,
+            stale_cutoff,
+        }) = self.pass_setup()
+        else {
+            return;
         };
-        let api_key = api_key.as_str();
-        let provider = *provider;
         let cfg = &self.config.stage2;
-
-        // Re-read the three caps at the START of the pass so a client change via
-        // POST /client/triage-config applies within a cycle, no restart.
-        // Precedence: override > config/env > default.
-        let caps = self
-            .store
-            .stage2_cap_overrides(self.account_id)
-            .unwrap_or_default();
         let thread_daily_cap = caps.thread_daily_cap.unwrap_or(cfg.thread_daily_cap);
         let sender_daily_cap = caps.sender_daily_cap.unwrap_or(cfg.sender_daily_cap);
         let global_daily_cap = caps.global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued = match self
-            .store
-            .stage2_queue(self.account_id, cfg.batch_per_cycle)
-        {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("squelch: stage-2 queue read failed ({e}); skipping pass");
-                return;
-            }
-        };
+        let queued = Self::read_queue(
+            self.store.stage2_queue(self.account_id, cfg.batch_per_cycle),
+            "stage-2",
+        );
         if queued.is_empty() {
             return;
         }
 
-        // UTC date key for the budget rows; one value for the whole pass.
-        let now = Utc::now();
-        let day = now.format("%Y-%m-%d").to_string();
-        let stale_cutoff = now - ChronoDuration::days(cfg.max_age_days as i64);
         let mut processed = 0usize;
         let mut stale_skipped = 0usize;
         let mut in_tok = 0u64;
