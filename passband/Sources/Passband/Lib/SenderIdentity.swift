@@ -182,15 +182,13 @@ enum SenderID {
         let labels = host.split(separator: ".").map(String.init)
         guard labels.count >= 2 else { return nil }
 
-        // THE REGISTRABLE DOMAIN, not a whitelist of prefixes to peel.
-        //
-        // This used to strip a leading label only when it appeared in a list of
-        // mail-ish words — so `emails.dollar.com`, plural and therefore not on
-        // the list, kept its subdomain and named Dollar Car Rental "Emails",
-        // then asked an icon service about a host that has no icon. Taking the
-        // last two labels has no list to fall behind: every `<anything>.
-        // dollar.com` resolves to dollar.com, and the apex is also far likelier
-        // to actually serve a favicon than a bulk-mail subdomain is.
+        // THE REGISTRABLE DOMAIN, not a whitelist of prefixes to peel. A list
+        // of mail-ish words falls behind: `emails.dollar.com`, plural and
+        // therefore not on it, would keep its subdomain, name Dollar Car
+        // Rental "Emails", and ask an icon service about a host that has no
+        // icon. Taking the last two labels has no list to fall behind: every
+        // `<anything>.dollar.com` resolves to dollar.com, and the apex is also
+        // far likelier to actually serve a favicon than a bulk-mail subdomain.
         let lastTwo = labels.suffix(2).joined(separator: ".")
         if labels.count >= 3, compoundSuffixes.contains(lastTwo) {
             return labels.suffix(3).joined(separator: ".")

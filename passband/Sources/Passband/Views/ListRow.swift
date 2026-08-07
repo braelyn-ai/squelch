@@ -11,7 +11,7 @@
 // SELECTION IS ONE IDENTITY, DELIBERATELY — `selectionFill` is unconditional
 // (no `if selected` branch anywhere in here) precisely so its alphas
 // interpolate instead of tearing the row's subtree down; see selectionFill's
-// own doc in Design/Glass.swift for what that branch used to cost.
+// own doc in Design/Glass.swift for what a branch costs.
 
 import SwiftUI
 

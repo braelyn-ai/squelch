@@ -1,8 +1,8 @@
 // The two caching primitives every table in this app was hand-rolling.
 //
 // LRUMap is a bounded dictionary that evicts the least-recently-used entry
-// instead of flushing (several caches used to drop EVERYTHING at the cap, which
-// throws away the hot entries along with the cold ones) and instead of paying an
+// instead of flushing (dropping EVERYTHING at the cap throws away the hot
+// entries along with the cold ones) and instead of paying an
 // O(n) array scan per touch — recency is an intrusive linked list threaded
 // through the keys, so get/set/evict are all O(1) on the render path.
 //

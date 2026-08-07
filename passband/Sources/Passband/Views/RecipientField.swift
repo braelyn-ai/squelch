@@ -115,8 +115,8 @@ struct RecipientField<F: Hashable>: View {
         pills.append(addr)
     }
 
-    /// Write the parse back to the wire string. The fragment rides along raw —
-    /// exactly what the plain text field used to store mid-typing.
+    /// Write the parse back to the wire string. The fragment rides along raw,
+    /// so mid-typing the wire string is what a plain text field would hold.
     private func sync() {
         var parts = pills
         if !fragment.trimmed.isEmpty { parts.append(fragment.trimmed) }

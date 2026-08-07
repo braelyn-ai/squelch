@@ -418,12 +418,12 @@ struct SitrepView: View {
 /// returns. So a freshly triaged message sits here for about one poll and is
 /// then gone, having moved to wherever its tier belongs.
 ///
-/// That one-poll window is exactly why this is no longer a zone card. As a card
-/// it announced arriving mail as anonymous sender chips a beat BEFORE the same
-/// mail took its real place in For-your-eyes — the same item, twice, under a
+/// That one-poll window is exactly why this must not be a zone card. A card
+/// announces arriving mail as anonymous sender chips a beat BEFORE the same
+/// mail takes its real place in For-your-eyes — the same item, twice, under a
 /// name derived from its sending domain. It is a transient STATUS, not a
-/// destination, so it reads as one now: no count of things to go look at, no
-/// click target that vanishes while you reach for it.
+/// destination, so it reads as one: no count of things to go look at, no click
+/// target that vanishes while you reach for it.
 private struct IngestIndicator: View {
     @Environment(AppStore.self) private var store
 
