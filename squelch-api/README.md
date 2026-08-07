@@ -6,7 +6,7 @@ The **human door**: the bearer-authenticated `/client/*` axum router used by squ
 
 Reads: updates (banded standing/new/open), threads, hybrid search, stats, the triage usage ledger (`/client/usage`: per-day token/cost history for both LLM triage stages, with each stage's model id), the triage budget config (`/client/triage-config`: the effective per-stage daily caps, where each came from, and trailing-14d spend averages), shipments, receipts, sender rules, the audit log, and sealed-mail metadata with an explicit audited reveal.
 
-Writes (the only mutation surface in the system): status lifecycle, archive, label, and send. Every action requires an explicit `confirm` flag, uses the separate write-scoped Gmail credential (minted via `squelchd auth --write` — the sync credential stays read-only), and lands in the audit log. Sends pass through an outbound secret guard: a matched body yields a 422 listing redacted match kinds, and only an explicit `override_guard` resend goes out.
+Writes (the only mutation surface in the system): status lifecycle, archive, label, and send. Every action requires an explicit `confirm` flag, uses the separate write-slot Gmail credential (minted via `squelchd auth --write`; sync can only ever load the read slot), and lands in the audit log. Sends pass through an outbound secret guard: a matched body yields a 422 listing redacted match kinds, and only an explicit `override_guard` resend goes out.
 
 The triage budget caps are also tunable here at runtime: `POST /client/triage-config` persists overrides for the Stage-1 global cap and the three Stage-2 caps (thread/sender/global), which the sync engine re-reads at the start of each triage pass — no restart, and no Gmail credential involved.
 
