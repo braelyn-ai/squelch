@@ -409,7 +409,7 @@ enum AgentTools {
         guard validPattern(normalized) else {
             return failure(
                 "match_pattern must be one address (\"news@stripe.com\") or one domain "
-                    + "(\"*@stripe.com\"); a pattern matching every sender is not allowed",
+                    + "(\"*@stripe.com\"); the domain part takes no wildcards",
                 summary: "rule failed")
         }
         // CREATE-ONLY FROM THE AGENT PATH. `POST /client/rules` is an upsert, so
@@ -450,19 +450,21 @@ enum AgentTools {
 
     /// The shapes a triage rule may take: one address, or one domain.
     ///
-    /// `glob_match` reads `*` as "any run, including empty", so a bare `*` or
-    /// `*@*` matches every sender that will ever arrive — one sentence in
-    /// somebody else's email away from squelching the whole inbox, with no card
-    /// in the way. Checked HERE because the server only validates non-empty.
+    /// `glob_match` reads `*` as "any run, including empty", so a domain with a
+    /// wildcard in it is a catch-all in the making: not just `*@*` but `*@*.*`
+    /// — matched by every dotted domain, which is every sender that will ever
+    /// arrive — one sentence in somebody else's email away from squelching the
+    /// whole inbox, with no card in the way. So the domain takes NO wildcards
+    /// at all: a wildcard local part over a concrete domain is the widest rule
+    /// this path writes. Checked HERE because the server only validates
+    /// non-empty.
     private static func validPattern(_ pattern: String) -> Bool {
         let parts = pattern.split(separator: "@", omittingEmptySubsequences: false)
         guard parts.count == 2 else { return false }
         let local = parts[0]
         let domain = parts[1]
         guard !local.isEmpty, !domain.isEmpty else { return false }
-        // A wildcard local part is the normal domain rule; a wildcard DOMAIN is
-        // the catch-all, whatever it is paired with.
-        return domain.contains(where: { $0 != "*" })
+        return !domain.contains("*")
     }
 
     @MainActor
@@ -883,7 +885,7 @@ enum AgentTools {
                         type: "string",
                         description:
                             "One address (\"news@stripe.com\") or one domain "
-                            + "(\"*@stripe.com\"). A pattern matching every sender is refused."),
+                            + "(\"*@stripe.com\"). The domain part takes no wildcards."),
                     "want": .init(
                         type: "string",
                         description:
