@@ -154,6 +154,28 @@ pub fn refresh_stored_token_detailed(
     client: &OAuthClientConfig,
     refresh_token: &str,
 ) -> Result<RefreshedToken> {
+    refresh_stored_token_detailed_at(
+        client,
+        refresh_token,
+        crate::auth::GOOGLE_TOKEN_URL,
+        crate::auth::EXCHANGE_HTTP_TIMEOUT,
+    )
+}
+
+/// The refresh against an explicit endpoint and budget. `token_url` is a
+/// parameter only so the refusals downstream of a refresh can be exercised
+/// against a scripted socket; every caller in the daemon passes Google's.
+///
+/// The budget is NOT optional. This runs inside the sync loop's blocking
+/// refresh and inside `squelchd auth --import`, so a token endpoint that
+/// accepts the connection and then says nothing would wedge either of them for
+/// as long as it cared to hold it.
+pub(crate) fn refresh_stored_token_detailed_at(
+    client: &OAuthClientConfig,
+    refresh_token: &str,
+    token_url: &str,
+    timeout: Duration,
+) -> Result<RefreshedToken> {
     use oauth2::basic::BasicClient;
     use oauth2::{AuthUrl, ClientId, ClientSecret, RefreshToken, TokenResponse, TokenUrl};
 
@@ -164,7 +186,7 @@ pub fn refresh_stored_token_detailed(
                 .map_err(|e| CoreError::Credential(format!("bad auth url: {e}")))?,
         )
         .set_token_uri(
-            TokenUrl::new(crate::auth::GOOGLE_TOKEN_URL.to_string())
+            TokenUrl::new(token_url.to_string())
                 .map_err(|e| CoreError::Credential(format!("bad token url: {e}")))?,
         );
 
@@ -175,7 +197,7 @@ pub fn refresh_stored_token_detailed(
     // default happens to be in some future version.
     let http = oauth2::reqwest::blocking::ClientBuilder::new()
         .redirect(oauth2::reqwest::redirect::Policy::none())
-        .timeout(crate::auth::EXCHANGE_HTTP_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|e| CoreError::Credential(format!("building http client: {e}")))?;
 

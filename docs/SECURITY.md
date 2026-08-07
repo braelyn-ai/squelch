@@ -37,7 +37,7 @@ pinned to `noopener noreferrer`.
 **Invariant.** A body renders with no script execution, no network except the image
 proxy, no navigation, no cookies, nothing on disk.
 
-**Enforcement.** `squelch-client-swift/Sources/Squelch/Views/EmailWebView.swift` —
+**Enforcement.** `passband/Sources/Passband/Views/EmailWebView.swift` —
 five independent layers, each sufficient alone. Layer 1 is §1 above; the rest,
 numbered as the source comments number them:
 

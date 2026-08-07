@@ -34,6 +34,11 @@ sha2 = "0.10"
 # rather than a PRNG crate: a tracking token is minted once and must be
 # unguessable, so there is nothing to seed and nothing to reseed.
 getrandom = "0.3"
+# SO_REUSEADDR on the consent listener, which std::net cannot set before bind.
+# The fixed-port flows (`auth --write --headless`) bind the same port twice in
+# one run, and on Linux the first flow's connection in TIME_WAIT refuses the
+# second bind without it.
+socket2 = "0.6"
 fastembed = { workspace = true }
 sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }

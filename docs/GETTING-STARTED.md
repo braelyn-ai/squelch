@@ -19,10 +19,12 @@ You need:
 - A NAS or always-on machine that runs Docker, reachable from your Mac.
 - A Mac for the client.
 - The Gmail account you want triaged.
-- Access to the container image. **The repo is private, so the image is too.**
-  Either get added as a collaborator and use a GitHub token as below, or build
-  from source with `cargo build --release -p squelchd`. Sort this out first; it
-  is the most common place people get stuck at step 2.
+- The container image: `ghcr.io/braelyn-ai/squelchd` is public, so a plain
+  `docker pull` works with no registry login. Prefer building it yourself? From
+  a checkout of this repo: `docker build -f squelchd/Dockerfile -t squelchd .`
+  — note the `-f`: the Dockerfile at the repo *root* builds the APNs relay,
+  not the daemon. Budget 10–20 minutes for a cold source build, and swap the
+  `image:` line below for your local tag.
 - Optional: an Anthropic or OpenAI API key. Without one, triage still works, it
   just runs on heuristics instead of models.
 
@@ -47,14 +49,14 @@ When you consent later, Google will warn you that the app is not verified. That
 is expected for your own client, and you can continue past it. Verification is
 what removes the warning, and it is a per project review process.
 
+One consequence of **Testing** status is easy to miss and expensive to learn
+live: Google expires a Testing project's refresh tokens after **seven days**,
+so your daemon dies weekly with `invalid_grant` until you re-consent. The fix
+is one click and needs no verification review: on the OAuth consent screen
+page, publish the app to **In production**. The unverified-app warning stays,
+the weekly expiry goes away.
+
 ## 2. Put the daemon on the NAS
-
-If the image is private and you have access, log in once on the NAS with a
-GitHub token that has `read:packages`:
-
-```sh
-echo "$GITHUB_PAT" | docker login ghcr.io -u <github-username> --password-stdin
-```
 
 Create a directory on the NAS with a `docker-compose.yml`:
 
@@ -70,6 +72,8 @@ services:
       - squelch-data:/data
     environment:
       SQUELCH_API_TOKEN: ${SQUELCH_API_TOKEN:?set in .env}
+      # The Gmail account being triaged. CHANGE THIS: the credential import in
+      # step 3 checks the consented mailbox against it and refuses a mismatch.
       SQUELCH_ACCOUNT_EMAIL: you@gmail.com
       SQUELCH_CLIENT_ID: ${SQUELCH_CLIENT_ID:?set in .env}
       SQUELCH_CLIENT_SECRET: ${SQUELCH_CLIENT_SECRET:?set in .env}
@@ -112,20 +116,25 @@ On your Mac, with Docker installed:
 
 ```sh
 umask 077
-docker run --rm -it -p 8847:8847 \
+docker run --rm -p 8847:8847 \
   -e SQUELCH_CLIENT_ID=<client id> \
   -e SQUELCH_CLIENT_SECRET=<client secret> \
   ghcr.io/braelyn-ai/squelchd:latest \
   auth --export --expose-consent-listener > cred.txt
 ```
 
-The `umask 077` matters: the shell creates `cred.txt`, not squelchd, and the
-default umask would make it world readable. Running squelchd directly rather
-than in a container, use `--export --out cred.txt` instead, which writes the
-file mode 0600 itself.
+Two details in that command are load-bearing. The `umask 077`: the shell
+creates `cred.txt`, not squelchd, and the default umask would make it world
+readable. And no `-t`: squelchd writes the blob to stdout and everything
+human-facing (the consent URL included) to stderr, but a pty merges the two
+streams — with `-it` the redirect would swallow the consent URL into
+`cred.txt` and corrupt the blob. Running squelchd directly rather than in a
+container, use `--export --out cred.txt` instead, which writes the file mode
+0600 itself.
 
-Your browser opens, you approve, and `cred.txt` ends up holding one line. Then
-on the NAS, from the compose directory:
+The container cannot open your browser itself, so it prints the consent URL
+(with a "copy the URL above manually" note) — open it, approve, and `cred.txt`
+ends up holding one line. Then on the NAS, from the compose directory:
 
 ```sh
 docker compose run --rm -T squelchd auth --import < cred.txt
@@ -152,9 +161,13 @@ from your browser through Docker's port mapping. What can reach it in that
 window is at most a one time code that is useless without a secret held inside
 that container.
 
-Prefer to keep it on the NAS? If you can SSH there, the older route still works:
-`ssh -L 8847:127.0.0.1:8847 nas`, then `docker compose run --rm squelchd auth
---headless --port 8847`, and open the printed URL in your Mac browser.
+Prefer to keep it on the NAS? The consent listener binds loopback *inside* the
+container, so an SSH tunnel to the NAS cannot reach it through the compose
+service above — the working route is the dedicated `auth` service from
+[deploy/DOCKER.md](../deploy/DOCKER.md) (it uses `network_mode: host` for
+exactly this reason). Add that service to your compose file, then
+`ssh -L 8847:127.0.0.1:8847 nas`, run `docker compose run --rm auth`, and open
+the printed URL in your Mac browser.
 
 ## 4. Start it and check it is alive
 
@@ -206,11 +219,12 @@ If Test fails, jump to troubleshooting below; the error text names the cause.
 **Write actions.** Archive, label, and send need a second credential that only
 the human door's action handlers load. Sync and triage never touch it, and the
 agent door has no write tools at all. Mint it by exporting with `--write`, which
-runs two consent screens and carries both credentials in one blob:
+runs two consent screens and carries both credentials in one blob (again no
+`-t`, for the same stream-merging reason as step 3):
 
 ```sh
 umask 077
-docker run --rm -it -p 8847:8847 \
+docker run --rm -p 8847:8847 \
   -e SQUELCH_CLIENT_ID=<client id> -e SQUELCH_CLIENT_SECRET=<client secret> \
   ghcr.io/braelyn-ai/squelchd:latest \
   auth --export --write --expose-consent-listener > cred.txt
@@ -239,7 +253,7 @@ no such restriction, which is why the client works without this.
 | `invalid_client` on refresh, or an import that says the blob was minted by a different OAuth client | The daemon and the exporting machine used different OAuth clients. Re export with the same client ID and secret. |
 | Import refuses and names two addresses | Google says the credential opens a different Gmail account than `SQUELCH_ACCOUNT_EMAIL`. Consent as the right account, or fix the variable. |
 | "Google hasn't verified this app" | Expected for your own OAuth client. Continue past it. |
-| `denied: denied` pulling the image | No access to the private package. Log in to ghcr.io with a `read:packages` token, or build from source. |
+| `invalid_grant` roughly weekly | Your OAuth consent screen is still in **Testing**, which expires refresh tokens after 7 days. Publish it to **In production** (step 1), then re-run the auth flow once. |
 | Client connects but is empty | The first sync is still running. Watch `docker compose logs -f squelchd`. |
 
 ## Where things live

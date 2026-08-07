@@ -226,6 +226,22 @@ enum Transport {
     Loopback,
 }
 
+/// The broker URL this run actually has, and the one notion of "a broker is
+/// present" every decision here uses.
+///
+/// clap reports `SQUELCH_BROKER_URL=` as a VALUE, so an empty variable left in a
+/// compose file would otherwise make plain `auth` a `Broker("")` run that dies on
+/// a URL parse nobody asked for. Blank is how an environment says nothing. A
+/// `--broker ""` that was TYPED is a different statement and still fails in
+/// `broker_base`, where the operator can see what they typed.
+fn broker_url(args: &AuthArgs, sources: AuthFlagSources) -> Option<&str> {
+    let url = args.broker.as_deref()?;
+    if sources.broker == FlagSource::CommandLine {
+        return Some(url);
+    }
+    (!url.trim().is_empty()).then_some(url)
+}
+
 /// Pick the transport, and refuse only the combinations the operator actually
 /// asked for.
 ///
@@ -237,7 +253,8 @@ fn resolve_transport(
     args: &AuthArgs,
     sources: AuthFlagSources,
 ) -> Result<Transport, squelch_core::CoreError> {
-    let typed_broker = args.broker.is_some() && sources.broker == FlagSource::CommandLine;
+    let broker = broker_url(args, sources);
+    let typed_broker = broker.is_some() && sources.broker == FlagSource::CommandLine;
     let refuse = |other: &str| {
         Err(other_err(format!(
             "--broker and {other} are two different ways to run consent, and this run asked for \
@@ -257,7 +274,7 @@ fn resolve_transport(
         }
         return Ok(Transport::Import);
     }
-    match &args.broker {
+    match broker {
         Some(url) if typed_broker => {
             if args.headless {
                 return refuse("--headless");
@@ -265,7 +282,7 @@ fn resolve_transport(
             if sources.port == FlagSource::CommandLine {
                 return refuse("--port");
             }
-            Ok(Transport::Broker(url.clone()))
+            Ok(Transport::Broker(url.to_string()))
         }
         // Inherited from the environment: it is the transport only when nothing
         // on the command line names another one.
@@ -273,11 +290,34 @@ fn resolve_transport(
             if args.headless || sources.port == FlagSource::CommandLine {
                 Ok(Transport::Loopback)
             } else {
-                Ok(Transport::Broker(url.clone()))
+                Ok(Transport::Broker(url.to_string()))
             }
         }
         None => Ok(Transport::Loopback),
     }
+}
+
+/// Whether a `--port` typed on THIS command line will go unbound.
+///
+/// A fixed port is bound by `--headless`, which is what an SSH tunnel forwards,
+/// and by `--export --expose-consent-listener`, which is what a published
+/// container port maps to. Every other run takes an ephemeral port, so a typed
+/// `--port` there is a tunnel or a `-p` mapping that will never be connected to,
+/// and silence about it looks exactly like a port that was honored.
+///
+/// A typed port beside a TYPED `--broker` never reaches this: `resolve_transport`
+/// refuses that pair. Beside an AMBIENT one it resolves to `Loopback`, where the
+/// port is still ignored unless the run is headless.
+fn typed_port_is_ignored(args: &AuthArgs, transport: &Transport, sources: AuthFlagSources) -> bool {
+    if sources.port != FlagSource::CommandLine {
+        return false;
+    }
+    let bound = match transport {
+        Transport::Loopback => args.headless,
+        Transport::Export => args.expose_consent_listener,
+        Transport::Import | Transport::Broker(_) => false,
+    };
+    !bound
 }
 
 fn other_err(msg: String) -> squelch_core::CoreError {
@@ -416,10 +456,19 @@ fn cmd_auth(
     sources: AuthFlagSources,
 ) -> Result<(), squelch_core::CoreError> {
     let transport = resolve_transport(args, sources)?;
-    if args.broker.is_some() && !matches!(transport, Transport::Broker(_)) {
+    if broker_url(args, sources).is_some() && !matches!(transport, Transport::Broker(_)) {
         eprintln!(
             "squelchd: SQUELCH_BROKER_URL is set, but this run asked for another transport on \
              the command line, so the broker is not being used."
+        );
+    }
+    // Said once here, before the transport dispatch, so the export path is
+    // covered too and says it exactly once.
+    if typed_port_is_ignored(args, &transport, sources) {
+        eprintln!(
+            "squelchd: --port {} is ignored on this run; a fixed port is bound only by \
+             --headless, and by --export --expose-consent-listener.",
+            args.port
         );
     }
 
@@ -563,6 +612,27 @@ fn announce_stored(
     }
 }
 
+/// Fail unless both consents in one export named the same mailbox.
+///
+/// A blob names ONE mailbox, and the importer stores every entry under it. Two
+/// consents finished as different Google accounts would file a stranger's token
+/// in this account's other slot.
+///
+/// Both values are whatever Google's userinfo named, and this message reaches a
+/// terminal, so both are disarmed on the way in: raw, an `ESC` in one clears the
+/// screen and a `BEL` retitles the window.
+fn check_export_same_account(first: &str, mailbox: &str) -> Result<(), squelch_core::CoreError> {
+    if first.trim().eq_ignore_ascii_case(mailbox.trim()) {
+        return Ok(());
+    }
+    let (first, mailbox) = (printable(first), printable(mailbox));
+    Err(squelch_core::CoreError::Credential(format!(
+        "the first consent authorized {first} but this one authorized {mailbox}; a \
+         credential blob carries one account, so nothing was exported. Re-run \
+         `squelchd auth --export --write` and approve both screens as the same account."
+    )))
+}
+
 /// `--export`: run consent on THIS machine and print a transfer blob, storing
 /// nothing.
 ///
@@ -612,17 +682,8 @@ fn cmd_auth_export(config: &Config, args: &AuthArgs) -> Result<(), squelch_core:
         );
         let (mailbox, token) = run_export_flow(&client, expected_account, scopes, bind)?;
 
-        // A blob names ONE mailbox, and the importer stores every entry under
-        // it. Two consents finished as different Google accounts would file a
-        // stranger's token in this account's other slot.
-        if let Some(first) = &account
-            && !first.trim().eq_ignore_ascii_case(mailbox.trim())
-        {
-            return Err(squelch_core::CoreError::Credential(format!(
-                "the first consent authorized {first} but this one authorized {mailbox}; a \
-                 credential blob carries one account, so nothing was exported. Re-run \
-                 `squelchd auth --export --write` and approve both screens as the same account."
-            )));
+        if let Some(first) = &account {
+            check_export_same_account(first, &mailbox)?;
         }
         // A blob without a refresh token buys one hour and then fails in a way
         // nobody connects back to this paste, so it is refused where the fix is
@@ -1502,6 +1563,124 @@ mod tests {
         );
     }
 
+    /// `SQUELCH_BROKER_URL=` is how a leftover compose entry says nothing, and
+    /// clap hands it over as a value all the same.
+    ///
+    /// Taken as a URL it resolves to `Broker("")` and dies on a parse nobody
+    /// asked for: plain `squelchd auth` would stop working on any host that ever
+    /// had the variable in a file. Blank from the environment is no broker at
+    /// all, which is also what the "SQUELCH_BROKER_URL is set" note must decide.
+    #[test]
+    fn an_empty_ambient_broker_url_is_no_broker_at_all() {
+        for blank in ["", "   ", "\t\n"] {
+            let ambient = |extra: fn(&mut AuthArgs)| {
+                let mut args = bare_auth_args();
+                args.broker = Some(blank.to_string());
+                extra(&mut args);
+                args
+            };
+
+            let args = ambient(|_| {});
+            assert!(
+                broker_url(&args, ambient_sources()).is_none(),
+                "{blank:?} must not read as a broker, note included"
+            );
+            assert_eq!(
+                resolve_transport(&args, ambient_sources()).unwrap(),
+                Transport::Loopback,
+                "{blank:?}"
+            );
+
+            // And it refuses nothing, because there is nothing to conflict with.
+            for (args, want) in [
+                (ambient(|a| a.import = true), Transport::Import),
+                (ambient(|a| a.export = true), Transport::Export),
+                (ambient(|a| a.headless = true), Transport::Loopback),
+            ] {
+                assert_eq!(
+                    resolve_transport(&args, ambient_sources()).unwrap(),
+                    want,
+                    "{blank:?}"
+                );
+            }
+        }
+
+        // A `--broker ""` that was TYPED is a different statement: it stays a
+        // broker run here and fails later, where the operator typed it.
+        let (args, sources) = parse_auth(&["squelchd", "auth", "--broker", ""]);
+        assert_eq!(sources.broker, FlagSource::CommandLine);
+        assert_eq!(
+            resolve_transport(&args, sources).unwrap(),
+            Transport::Broker(String::new())
+        );
+    }
+
+    /// A `--port` the run will never bind is a tunnel or a `-p` mapping that
+    /// will never be connected to, and silence about it looks exactly like a
+    /// port that was honored.
+    #[test]
+    fn a_typed_port_nothing_will_bind_is_called_out() {
+        let ignored = |argv: &[&str]| {
+            let (args, sources) = parse_auth(argv);
+            let transport = resolve_transport(&args, sources).expect("resolves");
+            typed_port_is_ignored(&args, &transport, sources)
+        };
+
+        // Bound: the two runs that fix a port on purpose.
+        for argv in [
+            vec!["squelchd", "auth", "--headless", "--port", "9100"],
+            vec![
+                "squelchd",
+                "auth",
+                "--export",
+                "--expose-consent-listener",
+                "--port",
+                "9100",
+            ],
+        ] {
+            assert!(!ignored(&argv), "{argv:?}");
+        }
+
+        // Ignored: an ephemeral port is bound instead, whatever was typed.
+        for argv in [
+            vec!["squelchd", "auth", "--port", "9100"],
+            vec!["squelchd", "auth", "--export", "--port", "9100"],
+            vec!["squelchd", "auth", "--import", "--port", "9100"],
+        ] {
+            assert!(ignored(&argv), "{argv:?}");
+        }
+
+        // A port nobody typed is the default, and the default is never a
+        // promise the operator made.
+        for argv in [
+            vec!["squelchd", "auth"],
+            vec!["squelchd", "auth", "--headless"],
+            vec!["squelchd", "auth", "--export"],
+        ] {
+            assert!(!ignored(&argv), "{argv:?}");
+        }
+
+        // An ambient broker plus a typed port resolves to Loopback, which binds
+        // an ephemeral port unless the run is headless — so the warning belongs
+        // there too.
+        let mut args = bare_auth_args();
+        args.broker = Some(BROKER.to_string());
+        let typed_port = AuthFlagSources {
+            broker: FlagSource::Ambient,
+            port: FlagSource::CommandLine,
+        };
+        let transport = resolve_transport(&args, typed_port).unwrap();
+        assert_eq!(transport, Transport::Loopback);
+        assert!(typed_port_is_ignored(&args, &transport, typed_port));
+        args.headless = true;
+        assert!(!typed_port_is_ignored(&args, &transport, typed_port));
+
+        // A typed port beside a TYPED broker never gets this far.
+        let argv = ["squelchd", "auth", "--broker", BROKER, "--port", "9100"];
+        let (args, sources) = parse_auth(&argv);
+        assert!(resolve_transport(&args, sources).is_err());
+    }
+
     /// The parse itself must no longer refuse these pairs, or the runtime check
     /// above never gets a chance to make the distinction.
     #[test]
@@ -1707,6 +1886,44 @@ mod tests {
             "unbounded blob text: {} chars",
             err.len()
         );
+    }
+
+    /// Two consents in one export must have named the same mailbox, and the
+    /// refusal prints both. They come from Google's userinfo by way of whichever
+    /// session finished the consent, so they reach the terminal as text or not
+    /// at all.
+    #[test]
+    fn a_mismatched_export_names_both_mailboxes_without_painting_the_terminal() {
+        let hostile = "\u{1b}[2J\u{1b}]0;pwned\u{7}stranger@gmail.com\u{202e}";
+        for (first, mailbox) in [(hostile, "me@gmail.com"), ("me@gmail.com", hostile)] {
+            let err = check_export_same_account(first, mailbox)
+                .unwrap_err()
+                .to_string();
+            for sneaky in ['\u{1b}', '\u{7}', '\u{202e}', '\n', '\r'] {
+                assert!(!err.contains(sneaky), "{sneaky:?} survived into: {err}");
+            }
+            // Disarmed, not dropped: both mailboxes are still legible.
+            assert!(err.contains("stranger@gmail.com"), "{err}");
+            assert!(err.contains("me@gmail.com"), "{err}");
+            assert!(err.contains("nothing was exported"), "{err}");
+        }
+
+        // And length is theirs to choose unless it is bounded here too.
+        let err = check_export_same_account(&"a".repeat(100_000), "me@gmail.com")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.len() < 1_000,
+            "unbounded mailbox text: {} chars",
+            err.len()
+        );
+
+        // Google echoes its own casing and the consent screen adds no
+        // whitespace worth caring about; anything else IS a second account.
+        assert!(check_export_same_account("me@gmail.com", "me@gmail.com").is_ok());
+        assert!(check_export_same_account("Me@Gmail.COM", " me@gmail.com\n").is_ok());
+        assert!(check_export_same_account("me@gmail.com", "me+x@gmail.com").is_err());
+        assert!(check_export_same_account("me@gmail.com", "me@example.com").is_err());
     }
 
     /// An access-token-only entry works for an hour and then fails in a way

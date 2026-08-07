@@ -55,7 +55,8 @@ pub(crate) const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_PROFILE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 
 /// Budget for the token exchange, the refresh, and the profile check that
-/// follows either. All three are one small round trip to Google.
+/// follows either. All three are one small round trip to Google, and every
+/// path to a stored token is bounded by this same number.
 pub(crate) const EXCHANGE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fixed loopback port used in `--headless` mode so it can be SSH-forwarded.
@@ -250,7 +251,7 @@ fn exchange_code(
     code: String,
     pkce_verifier: PkceCodeVerifier,
 ) -> Result<(String, StoredToken)> {
-    let http = guarded_http()?;
+    let http = guarded_http(EXCHANGE_HTTP_TIMEOUT)?;
 
     let token = oauth
         .exchange_code(AuthorizationCode::new(code))
@@ -263,7 +264,7 @@ fn exchange_code(
         .map(|granted| granted.iter().map(|s| s.to_string()).collect());
     check_scope_grant(scopes, granted.as_deref())?;
 
-    let mailbox = fetch_profile_email(&http, token.access_token().secret())?;
+    let mailbox = fetch_profile_email(&http, GMAIL_PROFILE_URL, token.access_token().secret())?;
     if let Some(expected) = expected_account {
         check_account_match(expected, &mailbox)?;
     }
@@ -282,10 +283,10 @@ fn exchange_code(
 /// that both paths to a stored token carry the same two properties: redirects
 /// are REFUSED (an open redirect on the token endpoint is SSRF, and the request
 /// carries the client secret), and one round trip has a bounded life.
-fn guarded_http() -> Result<reqwest::blocking::Client> {
+fn guarded_http(timeout: Duration) -> Result<reqwest::blocking::Client> {
     oauth2::reqwest::blocking::ClientBuilder::new()
         .redirect(oauth2::reqwest::redirect::Policy::none())
-        .timeout(EXCHANGE_HTTP_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(map_oauth_err("building http client"))
 }
@@ -323,6 +324,29 @@ pub fn verify_transfer_credential(
     kind: CredentialKind,
     token: &StoredToken,
 ) -> Result<StoredToken> {
+    verify_transfer_credential_at(
+        client,
+        expected_account,
+        kind,
+        token,
+        GOOGLE_TOKEN_URL,
+        GMAIL_PROFILE_URL,
+        EXCHANGE_HTTP_TIMEOUT,
+    )
+}
+
+/// The verification against explicit endpoints and budget. The two URLs are
+/// parameters only so every refusal above can be exercised end to end against a
+/// scripted socket; the daemon reaches this through the pinned pair.
+pub(crate) fn verify_transfer_credential_at(
+    client: &OAuthClientConfig,
+    expected_account: &str,
+    kind: CredentialKind,
+    token: &StoredToken,
+    token_url: &str,
+    profile_url: &str,
+    timeout: Duration,
+) -> Result<StoredToken> {
     let refresh = token.refresh_token.as_deref().ok_or_else(|| {
         CoreError::Credential(format!(
             "the {kind:?} credential in this blob has no refresh token, so nothing about it can \
@@ -330,10 +354,11 @@ pub fn verify_transfer_credential(
         ))
     })?;
 
-    let refreshed = crate::credentials::refresh_stored_token_detailed(client, refresh)
-        .map_err(|e| transfer_client_error(kind, &e))?;
-    let http = guarded_http()?;
-    let mailbox = fetch_profile_email(&http, &refreshed.token.access_token)?;
+    let refreshed =
+        crate::credentials::refresh_stored_token_detailed_at(client, refresh, token_url, timeout)
+            .map_err(|e| transfer_client_error(kind, &e))?;
+    let http = guarded_http(timeout)?;
+    let mailbox = fetch_profile_email(&http, profile_url, &refreshed.token.access_token)?;
 
     judge_transfer_credential(expected_account, kind, &mailbox, refreshed, refresh)
 }
@@ -484,11 +509,15 @@ struct GmailProfile {
 
 /// Ask Gmail whose mailbox a fresh access token opens. This is the only source
 /// of truth for that: the exchange response names a token, never an account.
-fn fetch_profile_email(http: &reqwest::blocking::Client, access_token: &str) -> Result<String> {
+fn fetch_profile_email(
+    http: &reqwest::blocking::Client,
+    profile_url: &str,
+    access_token: &str,
+) -> Result<String> {
     // The token rides in the header and nowhere else; reqwest's own errors carry
     // the URL, not the headers, so a failure here cannot print it.
     let resp = http
-        .get(GMAIL_PROFILE_URL)
+        .get(profile_url)
         .bearer_auth(access_token)
         .send()
         .map_err(|e| {
@@ -701,7 +730,7 @@ enum StrangerPolicy {
 /// that is the only shape Google accepts for a Desktop client, and it names the
 /// browser's own loopback rather than this process's.
 fn bind_consent_listener(bind_addr: &str) -> Result<(TcpListener, String)> {
-    let listener = TcpListener::bind(bind_addr).map_err(|e| {
+    let listener = bind_reusable(bind_addr).map_err(|e| {
         CoreError::Credential(format!("binding loopback listener on {bind_addr}: {e}"))
     })?;
     let port = listener
@@ -709,6 +738,37 @@ fn bind_consent_listener(bind_addr: &str) -> Result<(TcpListener, String)> {
         .map_err(|e| CoreError::Credential(format!("reading listener addr: {e}")))?
         .port();
     Ok((listener, format!("http://127.0.0.1:{port}")))
+}
+
+/// `TcpListener::bind` with SO_REUSEADDR, which std cannot set before binding.
+///
+/// The fixed-port flows (`auth --write --headless`, `--export --write
+/// --expose-consent-listener`) bind the same port for each of two consents in
+/// one run, and the first consent leaves its accepted connection in TIME_WAIT:
+/// this listener answers the redirect and closes first. On Linux — the platform
+/// those flows exist for — a plain bind then refuses the second flow's port for
+/// a minute with "Address already in use". SO_REUSEADDR only permits binding
+/// over such remnants; stealing a port with a LIVE listener stays refused (that
+/// would be SO_REUSEPORT), so nothing about who can receive the redirect
+/// changes.
+///
+/// TODO(windows): that refusal holds on Unix only. Windows SO_REUSEADDR allows
+/// binding over a LIVE listener unless it set SO_EXCLUSIVEADDRUSE, so on that
+/// platform this flag is the hijack it refuses elsewhere. The crate compiles
+/// for Windows even though no flow ships there; before one does, gate this
+/// `set_reuse_address` behind `#[cfg(unix)]` (TIME_WAIT does not block a rebind
+/// on Windows, so the flag buys nothing there anyway).
+fn bind_reusable(bind_addr: &str) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(16)?;
+    Ok(socket.into())
 }
 
 /// Run consent on a machine that has a browser but NO daemon config, and return
@@ -745,7 +805,13 @@ pub fn run_export_flow(
     if webbrowser::open(auth_url.as_str()).is_err() {
         eprintln!("(could not auto-open a browser; copy the URL above manually)");
     }
-    if let ConsentBind::AllInterfaces { port } = bind {
+    if matches!(bind, ConsentBind::AllInterfaces { .. }) {
+        // The BOUND port, not the requested one: `--port 0` binds an ephemeral
+        // port, and the operator is about to publish this number.
+        let port = listener
+            .local_addr()
+            .map_err(|e| CoreError::Credential(format!("reading listener addr: {e}")))?
+            .port();
         eprintln!(
             "The consent listener is bound to every interface on port {port} until this one \
              consent finishes, so open the URL from a browser that can reach it."
@@ -2015,6 +2081,234 @@ mod tests {
         assert_eq!(AuthScopes::from(CredentialKind::Write), AuthScopes::Write);
     }
 
+    // --- the verification against a scripted Google -------------------------
+    //
+    // The `_at` seams exist for exactly these: the same refusals the daemon
+    // runs, end to end, with the two pinned URLs pointed at a socket this test
+    // scripts. Nothing here weakens the pinning — the public wrappers are the
+    // only other callers, and they pass the Google constants.
+
+    /// One scripted answer from a fake Google: raw bytes on one accepted
+    /// connection, after an optional pause.
+    struct ScriptedAnswer {
+        delay: Duration,
+        raw: String,
+    }
+
+    /// A JSON answer. The Content-Type matters: the oauth2 crate refuses to
+    /// parse a token response without it.
+    fn json_answer(status: &str, body: &str) -> ScriptedAnswer {
+        ScriptedAnswer {
+            delay: Duration::ZERO,
+            raw: format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        }
+    }
+
+    /// A token-endpoint success, with or without the `scope` field: a refresh
+    /// that names no scopes is one of the refusals under test.
+    fn token_answer(scope: Option<&str>) -> ScriptedAnswer {
+        let scope_field = scope
+            .map(|s| format!(r#","scope":"{s}""#))
+            .unwrap_or_default();
+        json_answer(
+            "200 OK",
+            &format!(
+                r#"{{"access_token":"fresh-access","token_type":"Bearer","expires_in":3600,"refresh_token":"fresh-refresh"{scope_field}}}"#
+            ),
+        )
+    }
+
+    /// Serve the answers in order, one connection each, on an ephemeral
+    /// loopback port. Every script says `Connection: close` so reqwest cannot
+    /// pool its way past the sequencing. The thread is left to finish on its
+    /// own, so a caller that times out early does not sit through a scripted
+    /// delay.
+    fn scripted_google(answers: Vec<ScriptedAnswer>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        );
+        std::thread::spawn(move || {
+            for answer in answers {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+                if !answer.delay.is_zero() {
+                    std::thread::sleep(answer.delay);
+                }
+                let _ = stream.write_all(answer.raw.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        base
+    }
+
+    /// The token a paste carries. The refresh token is the secret whose absence
+    /// from every error message these tests also assert.
+    fn pasted_token() -> StoredToken {
+        StoredToken {
+            access_token: "stale-access".to_string(),
+            refresh_token: Some("pasted-refresh-secret".to_string()),
+            expires_at: None,
+        }
+    }
+
+    /// Run the real verification against the scripted host.
+    fn verify_at(base: &str, expected: &str, kind: CredentialKind) -> Result<StoredToken> {
+        verify_transfer_credential_at(
+            &test_client(),
+            expected,
+            kind,
+            &pasted_token(),
+            &format!("{base}/token"),
+            &format!("{base}/profile"),
+            Duration::from_secs(5),
+        )
+    }
+
+    fn verify_err(base: &str, expected: &str, kind: CredentialKind) -> String {
+        match verify_at(base, expected, kind) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the verification should have refused"),
+        }
+    }
+
+    /// A token endpoint that accepts the connection and then says nothing must
+    /// cost the timeout, not forever: this refresh runs inside the sync loop's
+    /// blocking path and inside `auth --import`.
+    #[test]
+    fn a_hung_token_endpoint_cannot_wedge_a_refresh() {
+        let base = scripted_google(vec![ScriptedAnswer {
+            delay: Duration::from_secs(1),
+            raw: String::new(),
+        }]);
+        let started = Instant::now();
+        let err = crate::credentials::refresh_stored_token_detailed_at(
+            &test_client(),
+            "pasted-refresh-secret",
+            &format!("{base}/token"),
+            Duration::from_millis(200),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "the refresh outlived its budget: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("refresh failed"), "{err}");
+        assert!(!err.contains("pasted-refresh-secret"), "{err}");
+    }
+
+    /// `invalid_client` off the wire, not a hand-built string: the blob was
+    /// minted by a different OAuth client, and the refusal names the fix.
+    #[test]
+    fn a_blob_from_another_oauth_client_is_refused_at_the_wire() {
+        let base = scripted_google(vec![json_answer(
+            "401 Unauthorized",
+            r#"{"error":"invalid_client"}"#,
+        )]);
+        let err = verify_err(&base, "me@gmail.com", CredentialKind::Read);
+        assert!(err.contains("SQUELCH_CLIENT_ID"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+        assert!(!err.contains("pasted-refresh-secret"), "{err}");
+    }
+
+    /// A refresh that succeeds proves the client, not the mailbox: when the
+    /// profile names a stranger, the refusal must land before anything stores.
+    #[test]
+    fn a_verified_blob_that_opens_a_strangers_mailbox_is_refused() {
+        let base = scripted_google(vec![
+            token_answer(Some(GMAIL_READONLY_SCOPE)),
+            json_answer("200 OK", r#"{"emailAddress":"attacker@gmail.com"}"#),
+        ]);
+        let err = verify_err(&base, "victim@gmail.com", CredentialKind::Read);
+        assert!(err.contains("attacker@gmail.com"), "{err}");
+        assert!(err.contains("victim@gmail.com"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+    }
+
+    /// The wire shape of the fail-closed rule: a refresh whose answer names no
+    /// `scope` field at all leaves the slot unprovable.
+    #[test]
+    fn a_refresh_naming_no_scopes_is_refused_at_the_wire() {
+        let base = scripted_google(vec![
+            token_answer(None),
+            json_answer("200 OK", r#"{"emailAddress":"me@gmail.com"}"#),
+        ]);
+        let err = verify_err(&base, "me@gmail.com", CredentialKind::Read);
+        assert!(err.contains("no scopes"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+    }
+
+    /// A profile answer that declares more than the cap is refused before a
+    /// byte of it is read.
+    #[test]
+    fn an_oversized_profile_answer_is_refused() {
+        let base = scripted_google(vec![
+            token_answer(Some(GMAIL_READONLY_SCOPE)),
+            ScriptedAnswer {
+                delay: Duration::ZERO,
+                raw: format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    MAX_RESPONSE_BODY * 2
+                ),
+            },
+        ]);
+        let err = verify_err(&base, "me@gmail.com", CredentialKind::Read);
+        assert!(err.contains("refusing to read it"), "{err}");
+    }
+
+    /// A token endpoint that answers with something other than the contract is
+    /// an error, and the one secret in play stays out of it.
+    #[test]
+    fn garbage_from_the_token_endpoint_names_no_secrets() {
+        let base = scripted_google(vec![ScriptedAnswer {
+            delay: Duration::ZERO,
+            raw: "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 14\r\nConnection: close\r\n\r\n<html>no</html>".to_string(),
+        }]);
+        let err = verify_err(&base, "me@gmail.com", CredentialKind::Read);
+        assert!(err.contains("nothing was stored"), "{err}");
+        assert!(!err.contains("pasted-refresh-secret"), "{err}");
+    }
+
+    /// The happy path through the same seam, so the refusals above are known to
+    /// be refusals and not a broken harness.
+    #[test]
+    fn the_verification_passes_a_matching_credential() {
+        let base = scripted_google(vec![
+            token_answer(Some(GMAIL_READONLY_SCOPE)),
+            json_answer("200 OK", r#"{"emailAddress":"me@gmail.com"}"#),
+        ]);
+        let stored = verify_at(&base, "me@gmail.com", CredentialKind::Read).unwrap();
+        // The token to store is the one Google just named, wire to caller:
+        // nothing the paste carried survives.
+        assert_eq!(stored.access_token, "fresh-access");
+        assert_eq!(stored.refresh_token.as_deref(), Some("fresh-refresh"));
+        assert!(stored.expires_at.is_some());
+    }
+
+    /// Google unions grants per Cloud project: once write is granted anywhere,
+    /// a Read credential's refresh legitimately reports the union. The scope
+    /// check is a subset floor for exactly this reason, and an exact match here
+    /// would refuse the Read entry of every `--export --write` blob.
+    #[test]
+    fn a_read_slot_credential_carrying_the_union_grant_still_passes() {
+        let union = format!("{GMAIL_READONLY_SCOPE} {}", WRITE_SCOPES.join(" "));
+        let base = scripted_google(vec![
+            token_answer(Some(&union)),
+            json_answer("200 OK", r#"{"emailAddress":"me@gmail.com"}"#),
+        ]);
+        assert!(verify_at(&base, "me@gmail.com", CredentialKind::Read).is_ok());
+    }
+
     // --- the consent listener ----------------------------------------------
 
     /// One request to the listener, from a client that behaves like a browser.
@@ -2100,6 +2394,48 @@ mod tests {
         );
         let _ = done_tx.send(());
         let _ = squatter.join();
+    }
+
+    /// `auth --write --headless` binds the SAME fixed port for each of two
+    /// consents, and the first consent's connection is still in TIME_WAIT when
+    /// the second binds: this listener answers the redirect and closes first.
+    /// On Linux a plain bind refuses that port for a minute, which is the
+    /// second consent failing with "Address already in use" — SO_REUSEADDR on
+    /// the listener is what this asserts.
+    #[test]
+    fn a_fixed_port_survives_back_to_back_consents() {
+        use std::net::TcpStream;
+
+        let (listener, _) = bind_consent_listener("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = s.write_all(
+                b"GET /?code=the-code&state=our-state HTTP/1.1\r\nHost: x\r\n\r\n",
+            );
+            // A browser reads the answer, which is what leaves the SERVER side
+            // of this connection in TIME_WAIT once the listener closes first.
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink);
+        });
+        let code = wait_for_code(
+            &listener,
+            "our-state",
+            StrangerPolicy::Fatal,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(code, "the-code");
+        let _ = browser.join();
+        drop(listener);
+
+        // The same port again, immediately, exactly as the second consent does.
+        let rebound = bind_consent_listener(&format!("127.0.0.1:{port}"));
+        assert!(
+            rebound.is_ok(),
+            "the second consent could not bind: {}",
+            rebound.err().map(|e| e.to_string()).unwrap_or_default()
+        );
     }
 
     /// An empty deadline is the flow giving up, not a panic or a busy loop.

@@ -91,7 +91,10 @@ relay deploys next to the existing APNs relay (Railway).
 > the crate already implements it.
 
 Status: implemented in-repo as `squelch-broker` (2026-08-04) to the wire contract in
-`docs/BROKER.md`, deployment pending.
+`docs/BROKER.md`; NOT deployable for self-host (Google's desktop-client redirect
+wall — see the status banner in `docs/BROKER.md`). Self-host consent is
+`auth --export`/`--import`; the crate deploys later with the hosted web-client
+callback.
 
 ### One project, one verification
 
@@ -112,7 +115,9 @@ docker run -v squelch-data:/data -p 8848:8848 ghcr.io/<org>/squelch
 
 - Multi-arch image (linux/amd64 + linux/arm64 — the NAS/Pi crowd is exactly this
   audience), built and pushed from CI to GHCR.
-- First run with no credentials → prints the consent-relay URL. Config is already
+- First run with no credentials → points at `auth --export`/`--import` (the
+  consent-relay URL this bullet originally promised is dead for self-host; see
+  the correction above). Config is already
   env-var driven, SQLite lives in the volume, and the file credential backend
   (`squelch-core/src/credentials.rs`) already exists for headless hosts. This tier is
   mostly packaging plus the relay, not new architecture.
@@ -182,11 +187,12 @@ The actual path, in order:
 1. **Phase 0 — paper (start immediately, gates everything public):** homepage,
    privacy policy, data-handling doc, Google verification + CASA for the one project
    with both clients. Longest lead time, zero code.
-2. **Phase 1 — self-host as a product:** GHCR multi-arch image, consent relay in the
-   broker, first-run auth UX. Ships value to real users while verification grinds,
-   and de-risks the consent patterns hosted signup reuses. Status: the broker is
-   implemented in-repo as `squelch-broker` (2026-08-04) per `docs/BROKER.md`,
-   deployment pending.
+2. **Phase 1 — self-host as a product:** GHCR multi-arch image, `auth --export`/
+   `--import` consent, first-run auth UX. Ships value to real users while
+   verification grinds, and de-risks the consent patterns hosted signup reuses.
+   Status: the broker is implemented in-repo as `squelch-broker` (2026-08-04) per
+   `docs/BROKER.md` but blocked for this tier; it ships with the hosted callback
+   instead.
 3. **Phase 2 — hosted MVP:** `squelch-control`, systemd provisioning on the VPS,
    human-door issued tokens + `/mcp` bearer auth, web signup → app pairing,
    Litestream, invite codes.
