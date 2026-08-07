@@ -259,6 +259,7 @@ struct ShortcutsOverlay: View {
                 (["n"], "noise page (and back)"),
                 (["/"], "search"),
                 (["⌘K"], "ask your inbox"),
+                (["⌘⇧K"], "new ask chat"),
                 (["⌘,"], "settings"),
                 (["g"], "auth messages"),
                 (["T"], "rules"),

@@ -139,6 +139,16 @@ pub struct UpdatesQuery {
     band: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
+    /// READ WITHOUT SURFACING. Default false, so every existing client keeps the
+    /// stamping fetch it has always had. `true` is for a reader acting on the
+    /// user's behalf (the embedded agent answering "anything important today?"):
+    /// it sees the whole page, but shows the human only the few rows it decides
+    /// are worth raising. Stamping all of them would report rows as seen that
+    /// nobody ever saw, collapsing New into Open and emptying the band the user
+    /// reads. Whatever the agent does surface is stamped by the client's own
+    /// (non-peek) fetch of those rows.
+    #[serde(default)]
+    peek: bool,
 }
 
 pub async fn get_updates(
@@ -170,6 +180,7 @@ pub async fn get_updates(
         .since
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
     let min_importance = q.min_importance;
+    let peek = q.peek;
 
     let items = store_call(&state, move |store, account_id| {
         // attention_updates excludes sealed rows in SQL. status/band filter
@@ -188,8 +199,13 @@ pub async fn get_updates(
         // SEEN-LEDGER: the response carries the PRE-stamp surfaced_at, then this
         // exact set is stamped (surfaced_at=now if NULL, new->open). Sealed rows
         // cannot be in `page`, and mark_surfaced re-guards sensitivity anyway.
-        let ids: Vec<i64> = page.iter().map(|u| u.update.id).collect();
-        store.mark_surfaced(account_id, &ids)?;
+        // `peek` skips the stamp entirely: same rows, no ledger write, because
+        // returning a row to an agent is not the same event as showing it to
+        // the user. This is the ONLY thing peek changes.
+        if !peek {
+            let ids: Vec<i64> = page.iter().map(|u| u.update.id).collect();
+            store.mark_surfaced(account_id, &ids)?;
+        }
 
         Ok(page)
     })

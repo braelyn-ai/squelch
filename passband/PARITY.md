@@ -92,7 +92,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 | Draft autosave + restore | **done** | Debounced `PUT /client/drafts` per composer slot, flushed on every exit, silent; `c` / ⌘N restores the new-message draft, `r` restores the reply's |
 | Read tracking | **done** (new in Passband) | Per-send pixel toggle in both composers (edit phase; hidden when the daemon has no `[tracking] base_url`), stated again in review, Settings → Mail holds the persistent default; the reader marks a sent message "opened 2h ago", "(via proxy)" when the fetch was Gmail's image proxy |
 | Triage-fix palette (`v`) | **done** | Ranked, ambiguity shown not guessed |
-| ⌘K ask-your-inbox bar | **done** | BYOK agent loop w/ citations |
+| ⌘K ask-your-inbox bar | **done** | Persistent streaming agent: chat tray grows out of the bar (one `glassEffectID`), live tool chips, 12 tools, confirm cards for archive/label/send/unsubscribe (the tap is the `confirm: true`), citations, ⌘⇧K new chat. Transcript survives close until cleared |
 | 2FA code modal | **done** | Auto-reveal, 30s countdown, copy pauses the timer |
 | Shortcuts overlay | **done** | Grouped cheat-sheet |
 | Toast stack + undo | **done** | 5s undo, click or `u` |

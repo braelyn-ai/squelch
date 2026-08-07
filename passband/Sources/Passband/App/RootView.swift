@@ -198,6 +198,14 @@ struct MainShell: View {
             KeyBinding("k", "ask your inbox", meta: true, allowInInput: true) {
                 store.askBarOpen = true
             })
+        // ⌘⇧K starts over. Bound as the CAPITAL letter, which is how the
+        // registry spells shift for a letter key, and matched by the exact pass
+        // ahead of the lowercase ⌘K above.
+        bindings.append(
+            KeyBinding("K", "new ask chat", meta: true, allowInInput: true) {
+                store.assistant.clear()
+                store.askBarOpen = true
+            })
         // Global, not list-only: `/`, `\` and `?` must work on every surface,
         // including the sitrep the app lands on. All three stay input-guarded
         // (no allowInInput), so typing them into a field still types the

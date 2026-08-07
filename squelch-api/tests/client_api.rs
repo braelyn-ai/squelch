@@ -1916,6 +1916,50 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
 }
 
 #[tokio::test]
+async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+        seed_one_signal(store, acct, "g2", "t2", "there");
+    });
+    let window = || chrono::Utc::now() - chrono::Duration::days(1);
+
+    // peek=true: the agent reads on the user's behalf. Same page...
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?peek=true"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["items"].as_array().unwrap().len(), 2);
+
+    // ...and the ledger is untouched: nothing was actually shown to anyone.
+    let after_peek = store
+        .attention_updates(acct, window(), None, None, None)
+        .unwrap();
+    assert_eq!(after_peek.len(), 2);
+    for u in &after_peek {
+        assert!(u.surfaced_at.is_none(), "peek must not stamp surfaced_at");
+        assert_eq!(
+            u.status,
+            AttentionStatus::New,
+            "peek must not promote status"
+        );
+    }
+
+    // Control: the same request without peek stamps, so the skip is the param
+    // and not a broken fixture.
+    let resp2 = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let after_normal = store
+        .attention_updates(acct, window(), None, None, None)
+        .unwrap();
+    for u in &after_normal {
+        assert!(u.surfaced_at.is_some(), "normal fetch stamps surfaced_at");
+        assert_eq!(u.status, AttentionStatus::Open);
+    }
+}
+
+#[tokio::test]
 async fn updates_carry_field_reasons_object() {
     use squelch_core::types::FieldReasons;
     let Harness { app, .. } = harness(|store, acct| {

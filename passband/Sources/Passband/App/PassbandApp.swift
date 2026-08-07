@@ -103,6 +103,11 @@ struct PassbandCommands: Commands {
         CommandMenu("Inbox") {
             Button("Ask Your Inbox…") { store.askBarOpen = true }
                 .keyboardShortcut("k", modifiers: [.command])
+            Button("New Ask Chat") {
+                store.assistant.clear()
+                store.askBarOpen = true
+            }
+            .keyboardShortcut("k", modifiers: [.command, .shift])
             Button("Search…") { store.openSearch() }
                 .keyboardShortcut("f", modifiers: [.command])
             Divider()

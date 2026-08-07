@@ -190,7 +190,13 @@ actor APIClient {
 
     // MARK: - reads
 
-    func getUpdates(_ params: UpdatesParams = UpdatesParams()) async throws -> Page<AttentionUpdate> {
+    /// `peek: true` reads the same rows WITHOUT stamping the seen-ledger — for a
+    /// reader acting on the user's behalf (the embedded agent) that will surface
+    /// only some of what it fetched. Every UI fetch leaves it false, because the
+    /// UI showing a row IS the surfacing event.
+    func getUpdates(_ params: UpdatesParams = UpdatesParams(), peek: Bool = false) async throws
+        -> Page<AttentionUpdate>
+    {
         try await get(
             "/client/updates",
             query: [
@@ -201,6 +207,7 @@ actor APIClient {
                 "band": params.band?.rawValue,
                 "limit": params.limit.map(String.init),
                 "cursor": params.cursor,
+                "peek": peek ? "true" : nil,
             ])
     }
 

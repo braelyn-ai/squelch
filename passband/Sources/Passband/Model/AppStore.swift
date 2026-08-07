@@ -328,6 +328,11 @@ final class AppStore {
     var ruleEditor: RuleEditorRequest?
     var processModeOpen = false
     var askBarOpen = false
+    /// The ⌘K agent's conversation, HELD HERE rather than in AskBar: the modal
+    /// is conditionally mounted, so a view-owned session would be torn down —
+    /// mid-answer — every time the bar closed. Living in the store, the
+    /// transcript survives until the user asks for a new chat.
+    let assistant = AssistantSession()
     var shortcutsOpen = false
 
     // MARK: undo / toasts
