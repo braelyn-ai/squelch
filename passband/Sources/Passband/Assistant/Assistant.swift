@@ -12,8 +12,9 @@
 // closed — a half-arrived tool input is not an instruction.
 //
 // Two invariants worth stating out loud:
-//   * THE ASSISTANT TURN IS ECHOED BACK VERBATIM. tool_use blocks must round-trip
-//     byte-identical (hence JSONValue) or the provider rejects the next turn.
+//   * THE ASSISTANT TURN IS ECHOED BACK INTACT. tool_use inputs must round-trip
+//     with every field the provider sent — unknown ones included, hence
+//     JSONValue — or it rejects the next turn.
 //   * A GATED TOOL PARKS ON A REAL TAP. The daemon requires `confirm: true` on
 //     every mutating route; that flag is honest here only because a human
 //     answered a card first. It is never a default on this path.
@@ -118,65 +119,6 @@ enum Wire {
         /// accumulator can only read frames, so a body that forgot this would
         /// hand a whole JSON message to an SSE parser that drops it.
         var stream = true
-    }
-}
-
-/// A minimal JSON value, so tool inputs can round-trip verbatim: a tool_use
-/// block MUST be echoed back byte-identical or the provider rejects the turn.
-enum JSONValue: Codable, Sendable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case object([String: JSONValue])
-    case array([JSONValue])
-    case null
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() {
-            self = .null
-        } else if let v = try? c.decode(Bool.self) {
-            self = .bool(v)
-        } else if let v = try? c.decode(Double.self) {
-            self = .number(v)
-        } else if let v = try? c.decode(String.self) {
-            self = .string(v)
-        } else if let v = try? c.decode([String: JSONValue].self) {
-            self = .object(v)
-        } else if let v = try? c.decode([JSONValue].self) {
-            self = .array(v)
-        } else {
-            self = .null
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        switch self {
-        case .string(let v): try c.encode(v)
-        case .number(let v): try c.encode(v)
-        case .bool(let v): try c.encode(v)
-        case .object(let v): try c.encode(v)
-        case .array(let v): try c.encode(v)
-        case .null: try c.encodeNil()
-        }
-    }
-
-    var stringValue: String? {
-        if case .string(let s) = self { return s }
-        return nil
-    }
-    var intValue: Int? {
-        if case .number(let n) = self { return Int(n) }
-        return nil
-    }
-    var boolValue: Bool? {
-        if case .bool(let b) = self { return b }
-        return nil
-    }
-    var arrayValue: [JSONValue]? {
-        if case .array(let a) = self { return a }
-        return nil
     }
 }
 
@@ -863,16 +805,13 @@ struct AssistantUsage: Sendable, Equatable {
     var asks = 0
     var inputTokens = 0
     var outputTokens = 0
+    /// Dollars, summed ask by ask at THAT ask's model's rates. Stored rather
+    /// than derived because the token totals above span models: pricing them
+    /// after the fact at whichever model ran last would misprice every ask
+    /// that used the other one.
+    var estimatedCost = 0.0
     var lastModel: String?
     var lastAt: String?
-
-    /// Rough local cost estimate from the model's published rates.
-    var estimatedCost: Double {
-        let rates = AssistantModel(rawValue: lastModel ?? "")?.rates
-            ?? AssistantModel.haiku.rates
-        return Double(inputTokens) / 1_000_000 * rates.input
-            + Double(outputTokens) / 1_000_000 * rates.output
-    }
 }
 
 @MainActor
@@ -882,11 +821,20 @@ enum AssistantUsageLedger {
     static func read() -> AssistantUsage {
         let d = UserDefaults.standard
         guard let dict = d.dictionary(forKey: key) else { return AssistantUsage() }
+        let inputTokens = dict["inputTokens"] as? Int ?? 0
+        let outputTokens = dict["outputTokens"] as? Int ?? 0
+        let lastModel = dict["lastModel"] as? String
         return AssistantUsage(
             asks: dict["asks"] as? Int ?? 0,
-            inputTokens: dict["inputTokens"] as? Int ?? 0,
-            outputTokens: dict["outputTokens"] as? Int ?? 0,
-            lastModel: dict["lastModel"] as? String,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            // A tally written before cost was stored per-ask: price its totals
+            // at the last model's rates, once — what the old estimate did.
+            estimatedCost: dict["estimatedCost"] as? Double
+                ?? price(
+                    AssistantModel(rawValue: lastModel ?? "") ?? .haiku,
+                    inputTokens: inputTokens, outputTokens: outputTokens),
+            lastModel: lastModel,
             lastAt: dict["lastAt"] as? String)
     }
 
@@ -897,9 +845,19 @@ enum AssistantUsageLedger {
             "asks": current.asks + 1,
             "inputTokens": current.inputTokens + inputTokens,
             "outputTokens": current.outputTokens + outputTokens,
+            "estimatedCost": current.estimatedCost
+                + price(model, inputTokens: inputTokens, outputTokens: outputTokens),
             "lastModel": model.rawValue,
             "lastAt": ISO8601DateFormatter().string(from: Date()),
         ]
         UserDefaults.standard.set(next, forKey: key)
+    }
+
+    /// One ask's dollars at one model's published rates.
+    private static func price(
+        _ model: AssistantModel, inputTokens: Int, outputTokens: Int
+    ) -> Double {
+        Double(inputTokens) / 1_000_000 * model.rates.input
+            + Double(outputTokens) / 1_000_000 * model.rates.output
     }
 }

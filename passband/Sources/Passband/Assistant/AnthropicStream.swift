@@ -9,10 +9,10 @@
 //
 // The tool_use contract is why the accumulator exists. A tool call arrives as a
 // run of `input_json_delta` fragments that concatenate into one JSON object,
-// and the block it belongs to must be echoed back to the provider BYTE-
-// IDENTICAL or the next turn is rejected. So the fragments are joined and
-// parsed into `JSONValue` (Assistant.swift's round-trip type), never into
-// hand-rolled structs that would drop unknown fields on the way back out.
+// and the block it belongs to must be echoed back to the provider with its
+// input intact — unknown fields included — or the next turn is rejected. So the
+// fragments are joined and parsed into `JSONValue` (the round-trip type), never
+// into hand-rolled structs that would drop what they don't name.
 
 import Foundation
 
@@ -21,7 +21,7 @@ import Foundation
 /// One decoded thing that happened on the wire. Deliberately flat: the session
 /// above decides what a `textDelta` means for the UI, what a `toolUseComplete`
 /// means for the tool loop, and whether a `providerError` is fatal.
-enum AnthropicStreamEvent: Sendable {
+enum AnthropicStreamEvent: Sendable, Equatable {
     /// `message_start` — carries the prompt's token count for the ledger.
     case messageStart(inputTokens: Int)
     case textDelta(index: Int, text: String)
