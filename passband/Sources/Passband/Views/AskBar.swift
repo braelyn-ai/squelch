@@ -155,6 +155,15 @@ struct AskBar: View {
             // conversation scrolled to its beginning, with the card that is
             // holding submit hostage off the bottom of the pane.
             .defaultScrollAnchor(.bottom)
+            // The anchor alone is applied BEFORE the lazy rows finish sizing,
+            // so a reopened long conversation still lands short of the end.
+            // Re-pin after layout settles — same deferred-scroll trick the
+            // search panel's onAppear restore uses.
+            .onAppear {
+                Task { @MainActor in
+                    proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                }
+            }
             // A new row is a structural change worth following visibly.
             .onChange(of: session.transcript.count) { _, _ in
                 withAnimation(Motion.scrollFollow) {

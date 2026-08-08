@@ -812,7 +812,10 @@ final class AssistantSession {
             - SHOW: show_emails renders threads as clickable cards right in the chat.
               When the answer IS a set of emails ("show me...", "which emails...",
               "find the ones..."), show the cards and keep your prose to a line —
-              never re-describe each card in text.
+              never re-describe each card in text. Show eagerly and unprompted:
+              whenever your answer rests on specific emails, put their cards in
+              the chat alongside it. Never ask "would you like me to show that
+              email?" — showing is free and clickable, so just show it.
             - ACT: set_status, create_sender_rule, save_draft, archive_message,
               label_message, send_email, unsubscribe_sender.
 
