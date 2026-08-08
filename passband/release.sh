@@ -27,7 +27,7 @@ TAP_REPO="braelyn-ai/homebrew-tap"
 # A release is cut from committed history: the build number is the commit
 # count, so an uncommitted tree would mint a build number that a later commit
 # reuses — and CFBundleVersion must never repeat.
-if [ -n "$(git status --porcelain ..)" ]; then
+if [ -n "$(git status --porcelain --untracked-files=no ..)" ]; then
   echo "error: working tree not clean; commit or stash first" >&2
   exit 1
 fi
