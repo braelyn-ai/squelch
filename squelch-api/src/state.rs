@@ -16,10 +16,17 @@ use squelch_core::types::AccountId;
 pub struct ApiState {
     pub(crate) store: Arc<SqliteStore>,
     pub(crate) account_id: AccountId,
-    /// The static shared secret, non-empty by construction: both constructors
-    /// reject an empty token, so the auth layer never decides whether to serve
-    /// open.
-    pub(crate) token: Arc<str>,
+    /// The MASTER token from `SQUELCH_API_TOKEN`, checked before any issued
+    /// device token and first-class forever: it is the self-host operator's way
+    /// in when the store holds no usable credential, including the store whose
+    /// last device token was just revoked.
+    ///
+    /// `None` when the variable is unset or blank. That is NOT a refusal to
+    /// serve: the door comes up and every request 401s until
+    /// `squelchd token issue` or a pairing claim mints a device token. An
+    /// exported-but-empty variable must not become a credential the door would
+    /// accept, and must not keep the door shut either.
+    pub(crate) master_token: Option<Arc<str>>,
     /// The WRITE-bound credential store, present only when write credentials are
     /// configured. The ONLY handle to the write token in the process; handlers
     /// load it per-request and never retain it. `None` => actions return 403.
@@ -77,10 +84,19 @@ pub struct ApiState {
     /// minting: `None` means no send is ever tracked, whatever the client asks
     /// for, and `/client/tracking-config` reports `configured: false`.
     pub(crate) tracking_base_url: Option<Arc<str>>,
-    /// Slots for in-flight tracking-pixel writes. The pixel route is the one
-    /// unauthenticated thing that touches the store, so its share of the store
+    /// Slots for in-flight tracking-pixel writes. The pixel is one of the two
+    /// unauthenticated routes that touch the store, so its share of the store
     /// mutex is capped rather than left to whoever floods it.
     pub(crate) pixel_slots: Arc<tokio::sync::Semaphore>,
+    /// Slots for in-flight pairing claims — the OTHER unauthenticated route onto
+    /// the same store mutex, capped for the same reason. Bounded by waiting
+    /// rather than by refusing: a claim that failed fast because the daemon was
+    /// busy would be a response that differs from the uniform 401.
+    pub(crate) pair_slots: Arc<tokio::sync::Semaphore>,
+    /// Slots for in-flight DEVICE-token verifications. The master-token compare
+    /// is process-local and unbounded, but any `sqd_`-shaped guess from a caller
+    /// with no credential reaches the store, so that branch queues here.
+    pub(crate) device_auth_slots: Arc<tokio::sync::Semaphore>,
     /// The cheap-model handle behind rule-disposition inference: when a rule
     /// write omits `disposition`, the owner's `want` sentence is classified with
     /// this. `None` (no API key configured, and every test harness) means
@@ -111,38 +127,39 @@ pub fn attach_event_channel(
 }
 
 /// Why [`ApiState`] could not be constructed.
+///
+/// A MISSING BEARER IS NOT IN HERE ANY MORE. The door used to refuse to build
+/// without `SQUELCH_API_TOKEN`; it now serves and answers 401 until a credential
+/// exists, because pairing is how the first credential arrives and pairing needs
+/// a door to talk to. What is left is resolving the account, which is still a
+/// store operation and still fallible.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    /// `SQUELCH_API_TOKEN` was unset or empty: refuse to serve rather than serve
-    /// the human door open.
-    #[error(
-        "SQUELCH_API_TOKEN is unset or empty; squelch-api refuses to serve without a bearer token"
-    )]
-    MissingToken,
-
     #[error(transparent)]
     Core(#[from] squelch_core::CoreError),
 }
 
 impl ApiState {
-    /// Build state from an explicit store + account + token; an empty token is
-    /// [`StateError::MissingToken`].
+    /// Build state from an explicit store + account + master token.
+    ///
+    /// INFALLIBLE, and deliberately so: there is no configuration this can be
+    /// handed that should stop the human door coming up. A blank master token is
+    /// simply no master token (see [`ApiState::master_token`]).
     pub fn new(
         store: Arc<SqliteStore>,
         account_id: AccountId,
-        token: impl Into<String>,
-    ) -> Result<Self, StateError> {
-        let token = token.into();
-        if token.trim().is_empty() {
-            return Err(StateError::MissingToken);
-        }
+        master_token: impl Into<String>,
+    ) -> Self {
+        let master_token = master_token.into();
         // Default prices so /client/stats always has a cost basis; the bin
         // overrides them from the loaded config.
         let s2 = squelch_core::config::Stage2Config::default();
-        Ok(Self {
+        Self {
             store,
             account_id,
-            token: Arc::from(token.as_str()),
+            master_token: Some(master_token.trim())
+                .filter(|t| !t.is_empty())
+                .map(Arc::from),
             write_creds: None,
             write_api_base: None,
             stage2_price_in_per_mtok: s2.price_in_per_mtok,
@@ -167,8 +184,19 @@ impl ApiState {
             shutdown: None,
             tracking_base_url: None,
             pixel_slots: Arc::new(tokio::sync::Semaphore::new(crate::tracking::PIXEL_CONCURRENCY)),
+            pair_slots: Arc::new(tokio::sync::Semaphore::new(crate::pair::PAIR_CONCURRENCY)),
+            device_auth_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::auth::DEVICE_AUTH_CONCURRENCY,
+            )),
             rule_infer: None,
-        })
+        }
+    }
+
+    /// The master token, if one is configured. `None` means the door accepts
+    /// ONLY issued device tokens, which is the hosted posture and the resting
+    /// state of a self-host that has finished pairing.
+    pub(crate) fn master_token(&self) -> Option<&str> {
+        self.master_token.as_deref()
     }
 
     /// Share the sync loop's manual-refresh [`Notify`](tokio::sync::Notify).
@@ -233,6 +261,17 @@ impl ApiState {
     /// [`crate::tracking::PIXEL_CONCURRENCY`].
     pub(crate) fn pixel_slots(&self) -> &tokio::sync::Semaphore {
         &self.pixel_slots
+    }
+
+    /// Slots for concurrent pairing claims; see [`crate::pair::PAIR_CONCURRENCY`].
+    pub(crate) fn pair_slots(&self) -> &tokio::sync::Semaphore {
+        &self.pair_slots
+    }
+
+    /// Slots for concurrent device-token verifications; see
+    /// [`crate::auth::DEVICE_AUTH_CONCURRENCY`].
+    pub(crate) fn device_auth_slots(&self) -> &tokio::sync::Semaphore {
+        &self.device_auth_slots
     }
 
     /// Attach the cheap-model handle that infers a rule's disposition from the
@@ -364,15 +403,23 @@ impl ApiState {
         self.write_api_base.as_deref()
     }
 
-    /// Build state, resolving the account email to an id and reading the bearer
-    /// token from `SQUELCH_API_TOKEN`. Refuses to build if it is unset/empty.
+    /// Build state, resolving the account email to an id and reading the master
+    /// token from `SQUELCH_API_TOKEN`.
+    ///
+    /// An unset variable is a supported configuration, not an error: the door
+    /// serves, every request 401s, and the operator mints the first credential
+    /// with `squelchd token issue` or `squelchd pair`. Announcing that here
+    /// rather than leaving the operator to discover it as a wall of 401s.
     pub fn from_env(store: Arc<SqliteStore>, account_email: &str) -> Result<Self, StateError> {
         let token = std::env::var("SQUELCH_API_TOKEN").unwrap_or_default();
         if token.trim().is_empty() {
-            return Err(StateError::MissingToken);
+            eprintln!(
+                "squelch-api: SQUELCH_API_TOKEN is unset, so the human door accepts only issued \
+                 device tokens; run `squelchd pair` (or `squelchd token issue`) to mint one."
+            );
         }
         let account_id = store.ensure_account(account_email)?;
-        Self::new(store, account_id, token)
+        Ok(Self::new(store, account_id, token))
     }
 
     /// THE one way a binary turns a loaded [`Config`] into serving state:

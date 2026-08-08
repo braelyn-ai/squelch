@@ -27,3 +27,11 @@ run_suite anthropic-stream \
   Sources/Passband/Assistant/JSONValue.swift \
   Sources/Passband/Assistant/AnthropicStream.swift \
   Tests/AnthropicStreamTests.swift
+
+# Pairing pulls in Sessions.swift only because it builds its own URLSession
+# there; nothing in this suite makes a request. Same payoff as above: the code
+# normalizer and the deep-link parser are pure, so they test with no daemon.
+run_suite pairing \
+  Sources/Passband/Lib/Sessions.swift \
+  Sources/Passband/Model/Pairing.swift \
+  Tests/PairingTests.swift

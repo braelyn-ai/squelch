@@ -1,7 +1,7 @@
-//! squelch-api: the HUMAN DOOR — the authenticated `/client/*` API for the
-//! user's own client. Bearer auth on every route; the router refuses to serve
-//! without a token. Carries sealed METADATA and exactly one sealed body (audited
-//! before it is served, `no-store`), and is the only surface with write
+//! squelch-api: the HUMAN DOOR — the `/client/*` API for the user's own client.
+//! Bearer auth on every route but the pairing claim, which is how a device with
+//! no credential gets one. Carries sealed METADATA and exactly one sealed body
+//! (audited before it is served, `no-store`), and is the only surface with write
 //! capability. No token, secret, or message body is ever logged. See
 //! docs/SECURITY.md §4.
 
@@ -13,6 +13,7 @@ pub mod gmail_write;
 pub mod guard;
 mod handlers;
 mod markdown;
+mod pair;
 mod state;
 pub mod tracking;
 pub mod unsubscribe;
@@ -29,18 +30,27 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
-/// Build this crate's router: the bearer-authed `/client/*` tree, plus the ONE
-/// unauthenticated route — `GET /t/{token}`, the read-tracking pixel a
-/// recipient's mail client fetches. They are built separately and merged so the
-/// auth boundary is a line you can see: everything in [`client_router`] is
-/// behind the bearer, [`tracking::pixel_router`] holds exactly one route and
-/// nothing else is ever added to it.
+/// Build this crate's router: the bearer-authed `/client/*` tree, plus the TWO
+/// unauthenticated routes, each in its own single-route router so the auth
+/// boundary is a line you can see rather than a layer you have to trace:
+///
+/// - `GET /t/{token}` ([`tracking::pixel_router`]) — the read-tracking pixel,
+///   fetched by a recipient's mail client, which has no token and never will;
+/// - `POST /client/pair` ([`pair::pair_router`]) — the pairing claim, which is
+///   how a device with no credential gets its first one.
+///
+/// Nothing else is ever added to either. Everything in [`client_router`] is
+/// behind the bearer.
 pub fn router(state: ApiState) -> Router {
-    client_router(state.clone()).merge(tracking::pixel_router(state))
+    client_router(state.clone())
+        .merge(pair::pair_router(state.clone()))
+        .merge(tracking::pixel_router(state))
 }
 
-/// The `/client/*` router. Bearer auth is layered over every route in it;
-/// [`ApiState::from_env`] / [`ApiState::new`] refuse an empty token.
+/// The `/client/*` router. Bearer auth is layered over every route in it: the
+/// `SQUELCH_API_TOKEN` master token, or any device token the store has issued
+/// and not revoked. A daemon with neither still serves this tree; it just 401s
+/// everything until `squelchd token issue` or a pairing claim mints one.
 fn client_router(state: ApiState) -> Router {
     Router::new()
         .route("/client/updates", get(handlers::get_updates))

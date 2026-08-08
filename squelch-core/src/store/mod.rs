@@ -244,6 +244,78 @@ pub struct Device {
     pub last_registered_at: DateTime<Utc>,
 }
 
+/// One issued human-door device token, described WITHOUT its secret.
+///
+/// This is the shape both `token list` and the auth middleware get back: there
+/// is deliberately no field that could carry the plaintext or the stored hash,
+/// so no caller can print one by accident. See
+/// [`SqliteStore::verify_device_token`](sqlite::SqliteStore::verify_device_token).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceToken {
+    pub id: i64,
+    pub account_id: AccountId,
+    /// Operator/device-supplied label; never secret.
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    /// Last time this token authenticated a request, to within a minute — the
+    /// verify path throttles the write. `None` until first use.
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// Set once, forever. A tombstoned token can never authenticate again.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// A device token at the ONE moment its plaintext exists.
+///
+/// Returned by [`SqliteStore::issue_device_token`](sqlite::SqliteStore::issue_device_token)
+/// and by a successful pairing claim, and by then the store holds only the hash
+/// — so if the caller drops `token` without showing it, that credential is gone
+/// for good. No `Serialize`: the wire shapes are the API's own structs, which
+/// keeps a stray `.json()` on this type from being the leak.
+#[derive(Clone)]
+pub struct IssuedDeviceToken {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub name: String,
+    /// PLAINTEXT `sqd_…`. Never stored, never logged, shown exactly once.
+    pub token: String,
+}
+
+impl std::fmt::Debug for IssuedDeviceToken {
+    /// The plaintext is REDACTED. `{:?}` on a struct is how secrets reach logs
+    /// by accident, and this type exists precisely to carry one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedDeviceToken")
+            .field("id", &self.id)
+            .field("account_id", &self.account_id)
+            .field("name", &self.name)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A freshly minted pairing code, plaintext included, for the operator to read
+/// aloud or scan. Superseded by the next mint and by its own TTL.
+#[derive(Clone)]
+pub struct MintedPairingCode {
+    pub id: i64,
+    /// Display form, `XXXX-XXXX`. The claim normalizes, so the dashes are
+    /// cosmetic and callers may hand this string straight to a QR or deep link.
+    pub code: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for MintedPairingCode {
+    /// Redacted for the same reason as [`IssuedDeviceToken`]: a code is a
+    /// short-lived credential, and short-lived is not the same as harmless.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedPairingCode")
+            .field("id", &self.id)
+            .field("code", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// One observed open of a tracked outbound message.
 ///
 /// SERIALIZED SHAPE IS A WIRE CONTRACT — this is the element type of

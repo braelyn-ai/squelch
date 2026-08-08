@@ -60,7 +60,11 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub(super) fn shred_pending_count(&self, account_id: AccountId, cutoff: DateTime<Utc>) -> Result<i64> {
+    pub(super) fn shred_pending_count(
+        &self,
+        account_id: AccountId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<i64> {
         let conn = self.lock()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*)
@@ -127,8 +131,10 @@ impl SqliteStore {
     pub(super) fn list_audit(&self, account_id: AccountId, limit: u32) -> Result<Vec<AuditEntry>> {
         let conn = self.lock()?;
         // Enrich each row with the targeted message's sender/subject. `target` is
-        // TEXT and often non-numeric (rule patterns, senders); SQLite CASTs those
-        // to 0, which cannot match a real id, so the LEFT JOIN yields NULLs
+        // TEXT and often non-numeric (rule patterns, senders, and the
+        // `token:<id>` / `code:<id>` credential rows, which are namespaced
+        // precisely so they do not collide with a message id here); SQLite CASTs
+        // those to 0, which cannot match a real id, so the LEFT JOIN yields NULLs
         // instead of erroring. Sealed messages ARE joined (human door) — their
         // sender/subject already show on the Auth tab, and no CONTENT is selected.
         let mut stmt = conn.prepare(

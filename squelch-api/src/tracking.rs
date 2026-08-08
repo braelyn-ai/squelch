@@ -1,9 +1,10 @@
 //! Read tracking: the UNAUTHENTICATED pixel route, plus the human door's read
 //! and config sides.
 //!
-//! `GET /t/{token}` is the only route in this crate served WITHOUT a bearer, and
-//! it has to be — it is fetched by a stranger's mail client, which has no token
-//! and never will. It is therefore built to leak nothing:
+//! `GET /t/{token}` is one of the TWO routes in this crate served WITHOUT a
+//! bearer (the other is `POST /client/pair`, the pairing claim), and it has to
+//! be — it is fetched by a stranger's mail client, which has no token and never
+//! will. It is therefore built to leak nothing:
 //!
 //! - the response is byte-identical for a known token, an unknown token, a
 //!   malformed one, and a store that just failed. Always `200`, always the same
@@ -14,9 +15,12 @@
 //! - an unknown token appends nothing at all (the store's INSERT…SELECT gates on
 //!   an existing tracker), so unsolicited traffic cannot grow the table, and a
 //!   token that is ours still stops recording past the store's per-token cap;
-//! - it is the only unauthenticated route that touches the store, whose mutex
-//!   the whole daemon shares, so a flood is bounded by [`PIXEL_CONCURRENCY`] and
-//!   by rejecting non-token shapes before the store is reached.
+//! - it touches the store, whose mutex the whole daemon shares, without any
+//!   credential in front of it, so a flood is bounded by [`PIXEL_CONCURRENCY`]
+//!   and by rejecting non-token shapes before the store is reached. The pairing
+//!   claim carries the same bound for the same reason
+//!   ([`crate::pair::PAIR_CONCURRENCY`]), differing only in that it WAITS for a
+//!   slot instead of bailing out, because its answer must not vary with load.
 //!
 //! [`pixel_router`] is mounted OUTSIDE the bearer layer deliberately and is the
 //! only thing in that router; the `/client/*` tree and `/mcp` are untouched.

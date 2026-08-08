@@ -35,8 +35,11 @@ docker build -f squelchd/Dockerfile -t squelchd .
 
 ```yaml
 x-squelch-env: &squelch-env
-  # Bearer for every /client/* route: openssl rand -hex 32
-  SQUELCH_API_TOKEN: ${SQUELCH_API_TOKEN:?set in .env}
+  # OPTIONAL master bearer for every /client/* route: openssl rand -hex 32.
+  # Leave it out of .env and the door still serves, 401ing everything until a
+  # device pairs (see "Pairing a device" below). Set one if you want a key that
+  # survives revoking every paired device.
+  SQUELCH_API_TOKEN: ${SQUELCH_API_TOKEN:-}
   SQUELCH_ACCOUNT_EMAIL: you@gmail.com
   # Your GCP "Desktop app" OAuth client.
   SQUELCH_CLIENT_ID: ${SQUELCH_CLIENT_ID:?set in .env}
@@ -74,10 +77,30 @@ volumes:
 Secrets go in an `.env` file next to the compose file (mode 0600):
 
 ```ini
-SQUELCH_API_TOKEN=<openssl rand -hex 32>
+SQUELCH_API_TOKEN=<openssl rand -hex 32>   # optional; omit to pair instead
 SQUELCH_CLIENT_ID=<client id>
 SQUELCH_CLIENT_SECRET=<client secret>
 ```
+
+## Pairing a device
+
+With no `SQUELCH_API_TOKEN`, the human door comes up and 401s everything until a
+device has a token of its own. Mint a pairing code in the running container:
+
+```sh
+docker compose exec -u squelch squelchd squelchd pair
+```
+
+`-u squelch` matters: the daemon runs as that user, and a root-run command leaves
+root-owned files beside the database. The command prints an `XXXX-XXXX` code plus
+a `passband://pair?url=...&code=...` link; the app trades either for its own
+named token. `squelchd token list` and `squelchd token revoke <id>` (same `exec`
+prefix) manage them afterwards.
+
+The link names the address `serve` binds, so pass `--url` with whatever the
+device can actually reach when that is not this machine, and prefer an https
+front: over plain http to another host the code and the token it buys are
+readable in transit, which `pair` warns about.
 
 ## Headless OAuth (one-time, and on reauth)
 

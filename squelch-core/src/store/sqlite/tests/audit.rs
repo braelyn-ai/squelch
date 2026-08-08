@@ -59,10 +59,16 @@ fn list_audit_enriches_message_target_and_nulls_non_numeric() {
     assert_eq!(unsub.target_subject.as_deref(), Some("Weekly digest"));
 
     let rule = log.iter().find(|a| a.action == "rule.create").unwrap();
-    assert!(rule.target_sender.is_none(), "non-numeric target yields no enrichment");
+    assert!(
+        rule.target_sender.is_none(),
+        "non-numeric target yields no enrichment"
+    );
     assert!(rule.target_subject.is_none());
 
     let arch = log.iter().find(|a| a.action == "archive").unwrap();
-    assert!(arch.target_sender.is_none(), "unknown message id yields no enrichment");
+    assert!(
+        arch.target_sender.is_none(),
+        "unknown message id yields no enrichment"
+    );
     assert!(arch.target_subject.is_none());
 }

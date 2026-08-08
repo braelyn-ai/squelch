@@ -32,7 +32,7 @@ pub fn state_with(seed: impl FnOnce(&SqliteStore, i64)) -> (ApiState, Arc<Sqlite
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let acct = store.ensure_account("me@example.com").unwrap();
     seed(&store, acct);
-    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
+    let state = ApiState::new(store.clone(), acct, TOKEN);
     (state, store, acct)
 }
 

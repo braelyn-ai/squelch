@@ -4,7 +4,10 @@
 //! - `run`: sync-only loop, no HTTP.
 //! - `serve`: sync loop plus one axum server hosting the agent door (`/mcp`) and
 //!   the human door (`/client/*`).
+//! - `token`: issue / list / revoke the human door's per-device tokens.
+//! - `pair`: mint a short code a new device trades for one of those tokens.
 
+use chrono::Duration;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use squelch_core::auth::{
     AuthFlowOptions, AuthScopes, ConsentBind, CredentialTransfer, DEFAULT_HEADLESS_PORT,
@@ -18,9 +21,10 @@ use squelch_core::credentials::{
 };
 use squelch_core::embed::{Embedder, FastEmbedder};
 use squelch_core::store::SqliteStore;
+use squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS;
 use squelch_core::sync::SyncEngine;
 use squelch_core::types::AccountId;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -66,6 +70,58 @@ enum Command {
     /// Run the sync loop plus one HTTP server hosting both the agent door
     /// (`/mcp`) and the human door (`/client/*`).
     Serve(ServeArgs),
+    /// Issue, list and revoke the per-device tokens the human door accepts.
+    ///
+    /// One token per device means one revocation per device: losing a phone
+    /// costs that phone's row, not a rotation of the shared secret on every
+    /// client you own. `SQUELCH_API_TOKEN` keeps working alongside these and is
+    /// never deprecated.
+    Token(TokenArgs),
+    /// Mint a short pairing code (and a deep link) a new device can trade for
+    /// its own token.
+    ///
+    /// The device claims it at `POST /client/pair`, which is the one human-door
+    /// route served without a bearer, since the device has none yet. One code is
+    /// live per account at a time, it expires in minutes, and it is spent on
+    /// first use or after a handful of failed claims.
+    Pair(PairArgs),
+}
+
+#[derive(Args)]
+struct TokenArgs {
+    #[command(subcommand)]
+    command: TokenCommand,
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Mint a token and print it ONCE. squelchd stores only a hash and cannot
+    /// show it again; a lost token is re-issued, never recovered.
+    Issue {
+        /// The label this token carries in `token list`, so the row to revoke
+        /// later is the one you can recognize ("braelyn's iphone").
+        #[arg(long)]
+        name: String,
+    },
+    /// List every token this account has been issued, revoked ones included.
+    /// Prints no token material, not even hashes.
+    List,
+    /// Revoke a token by id. Effective on the very next request: the door reads
+    /// the row every time and caches nothing.
+    Revoke {
+        /// The id from `token list`.
+        id: i64,
+    },
+}
+
+#[derive(Args)]
+struct PairArgs {
+    /// The base URL the device should claim against, baked into the deep link.
+    /// Defaults to this daemon's loopback address, which is right when the
+    /// device is this machine; point it at whatever a phone can actually reach
+    /// (a `tailscale serve` hostname, say) when it is not.
+    #[arg(long)]
+    url: Option<String>,
 }
 
 #[derive(Args)]
@@ -419,6 +475,8 @@ fn main() -> ExitCode {
         Command::Auth(args) => cmd_auth(&config, args, flag_sources),
         Command::Run => run_daemon(config),
         Command::Serve(args) => cmd_serve(config, cap_sources, args),
+        Command::Token(args) => cmd_token(&config, args),
+        Command::Pair(args) => cmd_pair(&config, args),
     };
 
     match result {
@@ -976,6 +1034,262 @@ fn check_transfer_usable(transfer: &CredentialTransfer) -> Result<(), squelch_co
     Ok(())
 }
 
+// ---- per-device human-door tokens -----------------------------------------
+//
+// `token` and `pair` talk to the STORE directly, exactly as `auth` talks to the
+// credential backend directly: they are operator commands run at a shell, and
+// requiring a running daemon to mint the credential that lets you reach the
+// daemon would be a circle. These are the store's FIRST second-process writers,
+// which is why `SqliteStore::set_pragmas` puts every connection in WAL with a
+// busy timeout: a live `squelchd serve` on the same file is then not a conflict,
+// and each command holds the write lock for one transaction.
+//
+// NOTHING HERE PRINTS SECRET MATERIAL EXCEPT THE ONE LINE THAT IS SUPPOSED TO.
+// `token issue` prints its plaintext once, `pair` prints its code once, and
+// `token list` prints neither, not even the stored hashes.
+
+/// The URL scheme Passband registers for pairing deep links.
+const PAIR_LINK_SCHEME: &str = "passband://pair";
+
+/// Open the store and resolve the configured account, without a daemon.
+fn open_account_store(
+    config: &Config,
+) -> Result<(SqliteStore, AccountId), squelch_core::CoreError> {
+    let email = config.require_account_email()?;
+    let store = SqliteStore::open(&config.db_path)?;
+    let account_id = store.ensure_account(&email)?;
+    Ok((store, account_id))
+}
+
+/// Whether the human door has a master token configured. The VALUE is never
+/// read out; only its presence, which is the difference between an empty token
+/// list meaning "nothing can get in" and meaning "only the master key can".
+fn master_token_configured() -> bool {
+    std::env::var("SQUELCH_API_TOKEN").is_ok_and(|t| !t.trim().is_empty())
+}
+
+/// An RFC3339 stamp in UTC, seconds resolution: precise enough to correlate with
+/// a log line, short enough to sit in a column.
+fn stamp(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn cmd_token(config: &Config, args: &TokenArgs) -> Result<(), squelch_core::CoreError> {
+    let (store, account_id) = open_account_store(config)?;
+    match &args.command {
+        TokenCommand::Issue { name } => {
+            let issued = store.issue_device_token(account_id, name)?;
+            eprintln!(
+                "squelchd: issued device token {} for {:?}.",
+                issued.id, issued.name
+            );
+            // THE PLAINTEXT, ALONE ON STDOUT, so `squelchd token issue --name x
+            // > token.txt` is a file containing a token and nothing else.
+            // Everything a human reads goes to stderr, like `auth --export`.
+            println!("{}", issued.token);
+            eprintln!(
+                "squelchd: that is the ONLY time this token is shown. squelchd keeps a hash of it \
+                 and cannot print it again; a lost token is re-issued, never recovered. Revoke \
+                 this one with `squelchd token revoke {}`.",
+                issued.id
+            );
+            Ok(())
+        }
+        TokenCommand::List => {
+            let tokens = store.list_device_tokens(account_id)?;
+            if tokens.is_empty() {
+                println!("No device tokens have been issued.");
+                if master_token_configured() {
+                    eprintln!(
+                        "squelchd: the human door accepts SQUELCH_API_TOKEN only. \
+                         Run `squelchd pair` to give a device its own revocable token."
+                    );
+                } else {
+                    eprintln!(
+                        "squelchd: SQUELCH_API_TOKEN is unset too, so the human door currently \
+                         accepts nothing. Run `squelchd pair`, or \
+                         `squelchd token issue --name <name>`."
+                    );
+                }
+                return Ok(());
+            }
+            // Width from the data so a long device name does not wrap the
+            // columns after it; the store caps names, so this is bounded.
+            let width = tokens
+                .iter()
+                .map(|t| t.name.chars().count())
+                .max()
+                .unwrap_or(4)
+                .max(4);
+            println!(
+                "{:>5}  {:<width$}  {:<20}  {:<20}  STATUS",
+                "ID", "NAME", "CREATED", "LAST USED"
+            );
+            for t in &tokens {
+                println!(
+                    "{:>5}  {:<width$}  {:<20}  {:<20}  {}",
+                    t.id,
+                    t.name,
+                    stamp(t.created_at),
+                    t.last_used_at
+                        .map(stamp)
+                        .unwrap_or_else(|| "never".to_string()),
+                    match t.revoked_at {
+                        // Revoked rows are LISTED, not hidden: a revocation the
+                        // operator cannot see afterwards is not much of a control.
+                        Some(at) => format!("revoked {}", stamp(at)),
+                        None => "active".to_string(),
+                    }
+                );
+            }
+            Ok(())
+        }
+        TokenCommand::Revoke { id } => {
+            if store.revoke_device_token(account_id, *id)? {
+                println!("Revoked device token {id}.");
+                eprintln!(
+                    "squelchd: it stops working on the very next request; the door reads the row \
+                     every time and caches nothing."
+                );
+            } else {
+                // Unknown and already-revoked are one answer, which is also what
+                // the store returns: revoking twice is not a failure.
+                println!("No active device token {id} for this account.");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Percent-encode a value for a query string. Everything outside the unreserved
+/// set goes, so a base URL's `://`, its slashes, and any `&` in it land in the
+/// deep link as DATA rather than as structure the parser on the other side would
+/// read as the end of the parameter.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The base URL the pairing link names, trailing slashes trimmed.
+///
+/// Refused unless it is http(s): the link tells a device where to POST a live
+/// pairing code, and a typo that produced a `file:` or scheme-less value would
+/// be dropped by the app with nothing to explain it. Better to fail here, where
+/// the operator can see what they typed.
+///
+/// Without `--url` the link is built from `bind`, which the caller resolves the
+/// SAME way `serve` does. Naming the compiled-in default instead would hand an
+/// operator on a non-default port a link to a port nothing listens on, and the
+/// device would fail with nothing to explain it. A WILDCARD bind keeps its port
+/// and prints as loopback: `0.0.0.0` is not an address anything can POST to, and
+/// loopback is right whenever the device being paired is this machine.
+fn pair_base_url(args: &PairArgs, bind: SocketAddr) -> Result<String, squelch_core::CoreError> {
+    let raw = match args.url.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => u,
+        _ => {
+            let addr = if bind.ip().is_unspecified() {
+                let host = match bind.ip() {
+                    IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                };
+                SocketAddr::new(host, bind.port())
+            } else {
+                bind
+            };
+            // `SocketAddr`'s Display brackets an IPv6 literal, which is what a
+            // URL authority needs.
+            return Ok(format!("http://{addr}"));
+        }
+    };
+    let base = raw.trim_end_matches('/');
+    let lower = base.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(other_err(format!(
+            "--url must be an http(s) address the device can reach, for example \
+             http://{DEFAULT_BIND_ADDR}; got `{raw}`"
+        )));
+    }
+    Ok(base.to_string())
+}
+
+/// Whether a base URL would carry the code and the token it buys over the
+/// network in the clear: plain http to somewhere that is not this machine.
+///
+/// Loopback over http is fine — nothing leaves the box — so only the off-box
+/// case is worth shouting about.
+fn is_cleartext_offbox(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    // https is safe, and anything else was already refused by `pair_base_url`.
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // An IPv6 literal is bracketed, so the port has to come off after the
+    // closing bracket rather than at the first colon.
+    let host = match authority.split_once(']') {
+        Some((bracketed, _)) => bracketed.trim_start_matches('['),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    let loopback = host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    !loopback
+}
+
+fn cmd_pair(config: &Config, args: &PairArgs) -> Result<(), squelch_core::CoreError> {
+    // Before the store: a bad --url (or a bad SQUELCH_BIND behind the default)
+    // must not spend a code the operator then has to wait out or supersede.
+    let base = pair_base_url(args, resolve_bind(&ServeArgs { bind: None })?)?;
+    let (store, account_id) = open_account_store(config)?;
+
+    let minted = store.mint_pairing_code(account_id, Duration::seconds(PAIRING_TTL_SECS))?;
+
+    println!("Pairing code: {}", minted.code);
+    println!(
+        "Valid for {} minutes, until {}.",
+        PAIRING_TTL_SECS / 60,
+        stamp(minted.expires_at)
+    );
+    println!();
+    println!("On the device you are pairing, open this link:");
+    println!();
+    println!(
+        "  {PAIR_LINK_SCHEME}?url={}&code={}",
+        percent_encode(&base),
+        percent_encode(&minted.code)
+    );
+    println!();
+    println!("Or type the code into Passband, pointed at {base}");
+
+    if is_cleartext_offbox(&base) {
+        eprintln!(
+            "\nsquelchd: WARNING: {base} is plain http to another machine. The pairing code and \
+             the device token it mints would cross the network in the clear, readable by anything \
+             on the path, which is enough for a stranger to pair themselves. Put https in front \
+             (`tailscale serve` is the short version) and pass that address as --url."
+        );
+    }
+
+    eprintln!(
+        "\nsquelchd: that code is a credential. It is good for one device, it is spent the first \
+         time it is claimed, and a handful of wrong guesses burns it. Minting another supersedes \
+         this one."
+    );
+    if !master_token_configured() {
+        eprintln!(
+            "squelchd: SQUELCH_API_TOKEN is unset, so pairing is currently the only way into the \
+             human door on this daemon."
+        );
+    }
+    Ok(())
+}
+
 /// Sync-only loop with graceful Ctrl-C shutdown.
 fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
     // Fail fast on config problems before spinning up the runtime.
@@ -1171,10 +1485,13 @@ fn cmd_serve(
     // is visible from Passband, so the posture is stated here or nowhere.
     report_tracking_posture(&config);
 
-    // The human door refuses to build without SQUELCH_API_TOKEN. The shared
-    // config->state wiring also attaches the WRITE-bound credential store that
-    // enables the action endpoints; the sync engine below gets a separate
-    // READ-bound store and never sees this one.
+    // The human door SERVES WITH OR WITHOUT SQUELCH_API_TOKEN. Without it the
+    // door accepts only the per-device tokens in the store, and a daemon with
+    // neither still comes up 401ing everything: pairing is how the first
+    // credential arrives, and `POST /client/pair` needs a door to arrive at.
+    // The shared config->state wiring also attaches the WRITE-bound credential
+    // store that enables the action endpoints; the sync engine below gets a
+    // separate READ-bound store and never sees this one.
     let api_state = squelch_api::ApiState::from_config(store.clone(), &email, &config, cap_sources)
         .map_err(|e| other_err(format!("{e}")))?
         .with_refresh(refresh.clone())
@@ -1983,6 +2300,150 @@ mod tests {
         );
     }
 
+    /// The pairing link's `url` parameter carries a whole URL inside a query
+    /// value, so every character that means something to a query parser has to
+    /// come out the other side as data.
+    #[test]
+    fn a_base_url_survives_the_deep_link_intact() {
+        assert_eq!(
+            percent_encode("http://127.0.0.1:8848"),
+            "http%3A%2F%2F127.0.0.1%3A8848"
+        );
+        // An `&` or a `#` in the base would otherwise end the parameter early
+        // and hand the rest to whatever came next.
+        assert_eq!(percent_encode("a&b=c#d"), "a%26b%3Dc%23d");
+        // The code's own alphabet is unreserved, so it rides through unchanged
+        // and stays readable in the printed link.
+        assert_eq!(percent_encode("ABCD-EFGH"), "ABCD-EFGH");
+    }
+
+    /// `--url` decides where a device POSTs a live pairing code, so a value that
+    /// could not be one fails HERE, where the operator can see what they typed,
+    /// rather than silently in an app that drops the link.
+    #[test]
+    fn pair_url_defaults_to_loopback_and_refuses_non_http() {
+        let bind: SocketAddr = DEFAULT_BIND_ADDR.parse().unwrap();
+        let with = |url: Option<&str>| {
+            pair_base_url(
+                &PairArgs {
+                    url: url.map(str::to_string),
+                },
+                bind,
+            )
+        };
+
+        let default = format!("http://{DEFAULT_BIND_ADDR}");
+        assert_eq!(with(None).unwrap(), default);
+        // A blank or whitespace `--url` is an environment saying nothing, the
+        // same reading `auth` gives an empty `SQUELCH_BROKER_URL`.
+        assert_eq!(with(Some("")).unwrap(), default);
+        assert_eq!(with(Some("   ")).unwrap(), default);
+
+        // Trailing slashes go, so the claim path is never `//client/pair`.
+        assert_eq!(
+            with(Some("https://box.tail.ts.net//")).unwrap(),
+            "https://box.tail.ts.net"
+        );
+        assert_eq!(
+            with(Some("HTTPS://Box.example")).unwrap(),
+            "HTTPS://Box.example"
+        );
+
+        for bad in ["box.tail.ts.net", "file:///etc/passwd", "passband://pair"] {
+            assert!(with(Some(bad)).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// The default link follows the bind `serve` actually resolves, port and
+    /// all: an operator who moved the daemon off 8848 would otherwise print a
+    /// link to a port nothing is listening on.
+    #[test]
+    fn the_default_pair_url_follows_the_resolved_bind() {
+        let default_for = |bind: &str| {
+            pair_base_url(&PairArgs { url: None }, bind.parse().unwrap()).unwrap()
+        };
+
+        assert_eq!(default_for("127.0.0.1:9000"), "http://127.0.0.1:9000");
+        // A wildcard bind keeps the PORT and prints as loopback: `0.0.0.0` is
+        // not somewhere a device can POST.
+        assert_eq!(default_for("0.0.0.0:9000"), "http://127.0.0.1:9000");
+        assert_eq!(default_for("[::]:9000"), "http://[::1]:9000");
+        // A specific non-loopback bind is named as-is; the operator chose it.
+        assert_eq!(default_for("192.168.1.9:8848"), "http://192.168.1.9:8848");
+        // `--url` still wins over every one of those.
+        assert_eq!(
+            pair_base_url(
+                &PairArgs {
+                    url: Some("https://box.tail.ts.net".to_string())
+                },
+                "0.0.0.0:9000".parse().unwrap()
+            )
+            .unwrap(),
+            "https://box.tail.ts.net"
+        );
+    }
+
+    /// The pairing code and the token it buys ride this URL. Plain http off the
+    /// box means both are readable in transit, which is worth a warning; loopback
+    /// and https are not.
+    #[test]
+    fn cleartext_off_box_pairing_is_the_only_thing_warned_about() {
+        for quiet in [
+            "http://127.0.0.1:8848",
+            "http://localhost:8848",
+            "http://[::1]:8848",
+            "https://box.tail.ts.net",
+            "HTTPS://Box.example",
+        ] {
+            assert!(!is_cleartext_offbox(quiet), "{quiet} needs no warning");
+        }
+        for loud in [
+            "http://192.168.1.9:8848",
+            "http://nas.local:8848",
+            "http://[2001:db8::1]:8848",
+            "HTTP://Nas.Local",
+        ] {
+            assert!(is_cleartext_offbox(loud), "{loud} must be warned about");
+        }
+    }
+
+    /// The token subcommands parse the shapes the README documents.
+    #[test]
+    fn token_and_pair_subcommands_parse() {
+        match Cli::parse_from(["squelchd", "token", "issue", "--name", "my phone"]).command {
+            Command::Token(args) => match args.command {
+                TokenCommand::Issue { name } => assert_eq!(name, "my phone"),
+                _ => panic!("expected issue"),
+            },
+            _ => panic!("expected token subcommand"),
+        }
+        match Cli::parse_from(["squelchd", "token", "revoke", "7"]).command {
+            Command::Token(args) => match args.command {
+                TokenCommand::Revoke { id } => assert_eq!(id, 7),
+                _ => panic!("expected revoke"),
+            },
+            _ => panic!("expected token subcommand"),
+        }
+        assert!(matches!(
+            Cli::parse_from(["squelchd", "token", "list"]).command,
+            Command::Token(TokenArgs {
+                command: TokenCommand::List
+            })
+        ));
+        // A name is not optional: an unlabeled token is one nobody can pick out
+        // of `token list` to revoke.
+        assert!(Cli::try_parse_from(["squelchd", "token", "issue"]).is_err());
+
+        match Cli::parse_from(["squelchd", "pair"]).command {
+            Command::Pair(args) => assert!(args.url.is_none()),
+            _ => panic!("expected pair subcommand"),
+        }
+        match Cli::parse_from(["squelchd", "pair", "--url", "https://box.example"]).command {
+            Command::Pair(args) => assert_eq!(args.url.as_deref(), Some("https://box.example")),
+            _ => panic!("expected pair subcommand"),
+        }
+    }
+
     /// `serve` parses, with and without an explicit `--bind`.
     #[test]
     fn serve_subcommand_parses() {
@@ -2036,11 +2497,10 @@ mod tests {
 
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
         let account_id = store.ensure_account("me@localhost").expect("account");
-        let api_state = squelch_api::ApiState::new(store.clone(), account_id, "test-token")
-            .expect("api state");
+        let api_state = squelch_api::ApiState::new(store.clone(), account_id, "test-token");
         let cancel = CancellationToken::new();
-        let app = build_serve_router(store, "me@localhost", api_state, cancel)
-            .expect("router builds");
+        let app =
+            build_serve_router(store, "me@localhost", api_state, cancel).expect("router builds");
 
         let resp = app
             .clone()

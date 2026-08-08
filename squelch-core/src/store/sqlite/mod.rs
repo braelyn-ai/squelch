@@ -11,6 +11,7 @@
 mod attention;
 mod audit;
 mod contacts;
+pub mod device_tokens;
 mod drafts;
 mod events;
 mod feedback;
@@ -34,10 +35,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    AttachmentBytes, BankingApplied, ContactEntry, Device, Draft, ExtractQueued, MarketingApplied,
-    MarketingOffer, MessageOpen, MessageUnsub, MissingVector, NewAuditEntry, NewEvent, SealedBody,
-    SealedMessage, SearchFilter, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides,
+    AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, ExtractQueued,
+    IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
+    MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, SealedBody, SealedMessage,
+    SearchFilter, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides,
     Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TrackedMessage, TriageDebug,
     TriagedMessage,
 };
@@ -56,6 +57,12 @@ const SCHEMA: &str = include_str!("../schema.sql");
 /// (`FLOAT[384]`). The schema literal and this constant must move together;
 /// attaching an embedder asserts they match.
 pub const VEC_DIMS: usize = 384;
+
+/// How long a connection waits out another process's write lock before giving
+/// up. Generous next to the single transaction a `squelchd token`/`pair` command
+/// runs, and short enough that a genuinely wedged writer still surfaces as an
+/// error instead of a hang.
+const BUSY_TIMEOUT_MS: u64 = 5_000;
 
 static VEC_EXT_INIT: Once = Once::new();
 
@@ -114,7 +121,35 @@ impl SqliteStore {
         Self::init(conn)
     }
 
+    /// Put a fresh connection into the mode a SECOND PROCESS can share.
+    ///
+    /// `squelchd token issue`, `token revoke` and `pair` open this same file
+    /// while `squelchd serve` holds it, so the store has real multi-process
+    /// writers now, not just the daemon's one mutex:
+    ///
+    /// - WAL lets the CLI write while the daemon reads, instead of the rollback
+    ///   journal's whole-file lock turning every mint into `database is locked`;
+    /// - `busy_timeout` makes the two writers QUEUE for the few milliseconds a
+    ///   token transaction takes rather than fail instantly on contention.
+    ///
+    /// Run on every open: `busy_timeout` is per-connection, and `journal_mode` is
+    /// a persistent property of the FILE, so whichever process opens it first
+    /// converts it and the rest simply confirm. The result is read and discarded
+    /// because `:memory:` answers "memory" and there is nothing to assert there
+    /// (the file-backed case is asserted in the store tests).
+    ///
+    /// A failure PROPAGATES rather than being swallowed. The conversion needs the
+    /// file to itself, so it can lose to a process still holding the old mode
+    /// open, and a store that quietly stayed on the rollback journal would
+    /// reproduce the locking it is here to prevent with nothing to point at.
+    fn set_pragmas(conn: &Connection) -> Result<()> {
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        Ok(())
+    }
+
     fn init(conn: Connection) -> Result<Self> {
+        Self::set_pragmas(&conn)?;
         conn.execute_batch(SCHEMA)?;
         // SCHEMA is all `CREATE TABLE IF NOT EXISTS`, so a pre-existing DB never
         // picks up freshly-added columns from the CREATE — `migrate` adds them.

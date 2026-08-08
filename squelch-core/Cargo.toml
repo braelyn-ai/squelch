@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The shared constant-time compare, so the device-token verify path uses the
+# SAME primitive as both doors' bearer checks instead of a third copy. The
+# dependency runs core -> httpauth only; httpauth stays a leaf, so the relay
+# still links it without dragging the mail core in.
+squelch-httpauth = { path = "../squelch-httpauth" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

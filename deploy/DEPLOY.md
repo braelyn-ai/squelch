@@ -117,7 +117,7 @@ fallbacks and log a one-line deprecation note to stderr — migrate off them.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `SQUELCH_API_TOKEN` | yes (human door) | — | Bearer for every `/client/*` route; door refuses to serve without it. |
+| `SQUELCH_API_TOKEN` | no | — | Master bearer for every `/client/*` route. Optional since per-device tokens landed: unset, the door still serves and 401s everything until `squelchd pair` (or `squelchd token issue`) mints one. Keep one set if you want a way in that survives revoking every device. |
 | `SQUELCH_ACCOUNT_EMAIL` | yes | `me@localhost` | Canonical. Legacy alias: `SQUELCH_ACCOUNT`. |
 | `SQUELCH_DB_PATH` | no | `~/.local/share/squelch/squelch.db` | Canonical, identical default across all binaries. Legacy alias: `SQUELCH_DB`. |
 | `SQUELCH_MCP_ALLOWED_HOSTS` | yes behind a proxy | loopback only | Comma-separated extra Host values for the agent door's DNS-rebinding guard, additive to `localhost,127.0.0.1,::1`. Set to your `*.ts.net` name or `/mcp` returns 403. |

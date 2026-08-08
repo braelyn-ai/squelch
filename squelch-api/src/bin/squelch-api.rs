@@ -1,8 +1,13 @@
 //! Thin dev binary for the human door: opens the store, builds
-//! [`squelch_api::ApiState`] from the environment (refusing to start without
-//! `SQUELCH_API_TOKEN`), and serves `/client/*` on loopback — never a
-//! non-loopback interface, a reverse proxy is expected to front it. Also reads
-//! `SQUELCH_DB_PATH`, `SQUELCH_ACCOUNT_EMAIL` and `SQUELCH_API_HTTP`.
+//! [`squelch_api::ApiState`] from the environment, and serves `/client/*` on
+//! loopback — never a non-loopback interface, a reverse proxy is expected to
+//! front it. Also reads `SQUELCH_DB_PATH`, `SQUELCH_ACCOUNT_EMAIL` and
+//! `SQUELCH_API_HTTP`.
+//!
+//! `SQUELCH_API_TOKEN` is optional here, as it is in `squelchd serve`: without
+//! it the door still comes up and accepts issued device tokens only. This binary
+//! mints none — that is `squelchd token issue` / `squelchd pair`, which write to
+//! the same store.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,8 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let email = account_email();
     let (cfg, cap_sources) = Config::load_with_cap_sources();
     // The shared config->state wiring (prices, model labels, caps, Stage-1, and
-    // the write credential). Refuses to build (and thus serve) without
-    // SQUELCH_API_TOKEN.
+    // the write credential).
     let state = ApiState::from_config(store.clone(), &email, &cfg, cap_sources)?;
 
     // SSE plumbing. Nothing here appends events, but the shutdown signal is NOT

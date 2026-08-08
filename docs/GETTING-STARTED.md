@@ -71,7 +71,9 @@ services:
     volumes:
       - squelch-data:/data
     environment:
-      SQUELCH_API_TOKEN: ${SQUELCH_API_TOKEN:?set in .env}
+      # Optional. Unset, the human door serves and refuses everything until you
+      # pair a device (step 5); set, it is a master key that always works.
+      SQUELCH_API_TOKEN: ${SQUELCH_API_TOKEN:-}
       # The Gmail account being triaged. CHANGE THIS: the credential import in
       # step 3 checks the consented mailbox against it and refuses a mismatch.
       SQUELCH_ACCOUNT_EMAIL: you@gmail.com
@@ -89,14 +91,18 @@ volumes:
 And an `.env` beside it, mode 0600:
 
 ```ini
-SQUELCH_API_TOKEN=<paste the output of: openssl rand -hex 32>
+SQUELCH_API_TOKEN=<paste the output of: openssl rand -hex 32>   # optional, see below
 SQUELCH_CLIENT_ID=<client id from step 1>
 SQUELCH_CLIENT_SECRET=<client secret from step 1>
 ```
 
-`SQUELCH_API_TOKEN` is the password for the human door. It is the only thing
-standing between anything on your network and your mail, so generate it with
-`openssl rand -hex 32` rather than typing something.
+`SQUELCH_API_TOKEN` is a master password for the human door: one shared secret
+every client holds, which nothing can revoke on its own. It is optional now.
+Leave it out and the daemon still serves, refusing every request until you pair a
+device in step 5, which gives that device its own named token you can revoke by
+itself later. Keeping one set is still worth it as a way back in after revoking
+every device, and if you do, generate it with `openssl rand -hex 32` rather than
+typing something.
 
 **About that published port.** `"8848:8848"` puts the daemon on your LAN so the
 Mac client can reach it. The bearer token then travels over plain HTTP inside
@@ -207,7 +213,21 @@ Then in the app, open **Settings** and go to **Connection**:
 
 - **server url**: `http://<nas-ip>:8848`, or your tailnet HTTPS URL if you went
   that route. No trailing slash, and include the port.
-- **api token**: the `SQUELCH_API_TOKEN` value from your `.env`.
+- **api token**: the `SQUELCH_API_TOKEN` value from your `.env`, or a token of
+  this Mac's own. For the second, run this on the NAS:
+
+  ```sh
+  docker compose exec -u squelch squelchd squelchd pair
+  ```
+
+  (`-u squelch` matters: the daemon runs as that user, and a root-run command
+  would leave root-owned files beside the database.) It prints a
+  `passband://pair?url=...&code=...` link and an `XXXX-XXXX` code. Open the link
+  on the Mac, or type the code into the app. The code is good for one device,
+  expires in ten minutes, and a handful of wrong guesses burns it. What you get
+  back is a named token, listed by `squelchd token list` and revocable on its own
+  with `squelchd token revoke <id>`, which is the difference from the shared
+  master token above.
 - Click **Test**. A green "connected · saved" is the whole confirmation. Settings
   save when you click away from a field, so Test is a re check rather than a
   save button.
@@ -247,7 +267,7 @@ no such restriction, which is why the client works without this.
 
 | What you see | What it means |
 |---|---|
-| `401` from the client or curl | The token does not match. Compare the app's api token against `SQUELCH_API_TOKEN` in `.env`, and confirm the container restarted after you changed it. |
+| `401` from the client or curl | The token does not match, or there is no token to match. If you set `SQUELCH_API_TOKEN`, compare it against the app's api token and confirm the container restarted after you changed it. If you did not, the door accepts only paired devices: check `docker compose exec -u squelch squelchd squelchd token list`, and pair again if it is empty or you revoked the row you were using. |
 | Connection refused from the Mac | The port is not published to the LAN. Check for `"8848:8848"` rather than `"127.0.0.1:8848:8848"`, and that the NAS firewall allows it. |
 | `403` on `/mcp` but the client works | Expected until you set `SQUELCH_MCP_ALLOWED_HOSTS` to the hostname you are using. The human door does not do host checks. |
 | `invalid_client` on refresh, or an import that says the blob was minted by a different OAuth client | The daemon and the exporting machine used different OAuth clients. Re export with the same client ID and secret. |

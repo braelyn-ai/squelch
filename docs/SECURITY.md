@@ -216,10 +216,43 @@ queryable as normal mail — not even for an instant.
   sealed set (`thread_is_sealed`) and drops overlapping results; `get_thread` collapses
   a sealed thread and a nonexistent one into one `resource_not_found`, so existence
   cannot be inferred.
-- **Human door only.** `squelch-api` (`/client/*`, bearer auth, constant-time
-  compare, refuses to serve without a token) carries sealed **metadata** at
-  `/client/sealed` and exactly one body at `/client/sealed/{id}/reveal`, which
-  appends the audit row **before** returning and sets `Cache-Control: no-store`.
+- **Human door only.** `squelch-api` (`/client/*`, bearer auth) carries sealed
+  **metadata** at `/client/sealed` and exactly one body at
+  `/client/sealed/{id}/reveal`, which appends the audit row **before** returning
+  and sets `Cache-Control: no-store`.
+
+**Human-door credentials.** Two kinds, checked in this order by
+`squelch-api/src/auth.rs`:
+
+1. `SQUELCH_API_TOKEN`, the **optional** master token, compared in constant time.
+   Unset or blank is a supported configuration: the door still serves and 401s
+   everything until a device token exists. It is never deprecated, because it is
+   the way back in after revoking the last device.
+2. **Issued per-device tokens** (`sqd_…`, `squelch-core/src/store/sqlite/device_tokens.rs`),
+   minted by `squelchd token issue` or a pairing claim. Stored as a hex SHA-256
+   and verified by hashing what was presented, so the plaintext exists once. Named
+   and individually revocable, effective on the very next request because nothing
+   caches the lookup.
+
+**Two unauthenticated routes**, each on its own single-route router merged
+outside the bearer layer so the boundary is visible in `lib.rs`:
+
+- `GET /t/{token}` — the read-tracking pixel (§3). One response, always.
+- `POST /client/pair` — the pairing claim, which has to be unauthenticated: it is
+  how a device with no credential gets its first one. Every failure (wrong,
+  expired, already claimed, burned, malformed, store error) is one bare 401 with
+  no body. The code is ~40 bits, which is only defensible because it is one-shot,
+  expires in minutes, and **burns after 5 misses** — a miss is charged against the
+  live code, so guessing spends the user's code rather than being free. **No CORS
+  layer** on this router, unlike `/client/*`, so a random web page cannot read the
+  minted token out of a cross-origin response.
+
+Both touch the store mutex the whole daemon shares, so both are bounded
+(`PIXEL_CONCURRENCY` / `PAIR_CONCURRENCY`, 4 each); the device-token branch of the
+bearer check is bounded the same way, since any caller can push a `sqd_`-shaped
+guess into it. The pixel bails out when its slots are full (it can answer without
+the store); the claim **waits**, because an answer that varied with load would be
+a signal the uniform 401 exists to remove.
 
 **Local drafts (human-door-only table).** `drafts`
 (`squelch-core/src/store/sqlite/drafts.rs`, served only by `/client/drafts`) holds

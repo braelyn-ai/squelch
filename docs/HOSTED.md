@@ -142,14 +142,20 @@ everything else):
 - Routing: `<user>.passband.email` subdomains via Caddy + wildcard cert. Subdomains over
   path-prefixes for clean per-tenant cookie/CORS isolation forever.
 - Invite-code gate for launch. **No Stripe in the MVP** — billing is Phase 3.
-- Signup → native app handoff: finish signup, page shows a `passband://pair?token=…`
-  deep link / QR.
+- Signup → native app handoff: finish signup, page shows a
+  `passband://pair?url=…&code=…` deep link / QR. That is the shape `squelchd pair`
+  already prints: a short-lived pairing CODE plus the daemon's base URL, which the
+  app trades at `POST /client/pair` for its own device token. The token itself
+  never rides in a link.
 
 **Changes to existing code (all in service of hosted, all benefiting self-host too):**
 
 - **Human door auth graduates from one static env-var bearer to issued per-device
-  tokens with revocation.** This is the largest change to existing code in the plan
-  and a prerequisite for the pairing flow.
+  tokens with revocation.** SHIPPED. `SQUELCH_API_TOKEN` is now optional and checked
+  first; past it the door accepts `sqd_…` tokens minted by `squelchd token issue` or
+  by a pairing claim at `POST /client/pair`, each named, individually revocable, and
+  dead on the next request. The pairing flow this was a prerequisite for is shipped
+  with it (`squelchd pair`).
 - `/mcp` gets real bearer auth once internet-facing (today: localhost trust +
   allowed-hosts). Later, MCP-spec OAuth so claude.ai can connect natively — marquee
   feature: point Claude at your mailbox intelligence with no localhost anywhere.

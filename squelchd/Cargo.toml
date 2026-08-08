@@ -19,6 +19,9 @@ squelch-api = { path = "../squelch-api" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+# Timestamps in `token list` and the pairing TTL `token`/`pair` hand the store,
+# which speaks chrono. No formatting layer of its own, so this is the type.
+chrono = { workspace = true }
 axum = { version = "0.8" }
 tokio-util = "0.7"
 dotenvy = "0.15"

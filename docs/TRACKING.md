@@ -65,8 +65,9 @@ base_url = "https://track.yourdomain.example"
 
 Any tunnel works — Cloudflare Tunnel, Tailscale Funnel, a reverse proxy on a box
 you already run. `GET /t/{token}` is served unauthenticated by necessity: a
-stranger's mail client has no bearer token and never will. It is the only
-unauthenticated route on the daemon, and it is built to leak nothing — see
+stranger's mail client has no bearer token and never will. It is one of the two
+unauthenticated routes on the daemon (the other is the pairing claim,
+`POST /client/pair`), and it is built to leak nothing — see
 "What the pixel route does and does not do" below.
 
 **The trade-off, stated plainly:** mail clients do not retry a failed image
@@ -155,8 +156,9 @@ Both the daemon's and the relay's `GET /t/{token}` behave identically:
   characters) are rejected before the store is touched.
 - **Bounded.** Opens are capped per token on both sides, because a live pixel URL
   is a capability anyone holding it can refetch forever. The daemon additionally
-  caps how many pixel writes may be in flight, since this is the only
-  unauthenticated route that touches the store the whole daemon shares.
+  caps how many pixel writes may be in flight, since this route touches the store
+  the whole daemon shares with no credential in front of it. The pairing claim
+  carries the same cap for the same reason.
 
 Tokens are 192 bits of OS entropy and are never logged, audited, or sent to the
 client. **They do, however, ride as a URL path segment**, so whatever fronts your

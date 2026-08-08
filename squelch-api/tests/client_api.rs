@@ -46,12 +46,29 @@ async fn good_token_is_200() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// A blank master token no longer stops the door coming up — pairing needs a
+/// door to talk to — but it must not become a credential either. The door serves
+/// and refuses everything until a device token exists.
 #[tokio::test]
-async fn state_refuses_empty_token() {
+async fn an_empty_master_token_serves_and_refuses_everything() {
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let acct = store.ensure_account("me@example.com").unwrap();
-    assert!(ApiState::new(store.clone(), acct, "").is_err());
-    assert!(ApiState::new(store, acct, "   ").is_err());
+
+    for blank in ["", "   "] {
+        let app = router(ApiState::new(store.clone(), acct, blank));
+        for header_value in [None, Some("Bearer "), Some("Bearer    ")] {
+            let mut req = Request::builder().uri("/client/stats");
+            if let Some(h) = header_value {
+                req = req.header(header::AUTHORIZATION, h);
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{blank:?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1827,7 +1844,9 @@ async fn echo_of_an_empty_raw_read_never_ingests() {
     assert_eq!(handle.await.unwrap().len(), 2);
 
     // Nothing was written: no local message, sent or otherwise.
-    let stats = store.stats(acct, chrono::Utc::now() - chrono::Duration::days(30)).unwrap();
+    let stats = store
+        .stats(acct, chrono::Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(
         (stats.total, stats.sealed),
         (0, 0),

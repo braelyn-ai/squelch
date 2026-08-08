@@ -80,7 +80,12 @@ SQUELCH_API_TOKEN=$(openssl rand -hex 32)
 EOF
 ```
 
-`SQUELCH_API_TOKEN` is the password for the human door.
+`SQUELCH_API_TOKEN` is an optional master password for the human door. Without
+it the door still serves and 401s everything until a device has its own token:
+`squelchd pair` prints a short code (and a `passband://pair` link) that Passband
+trades for one, and `squelchd token list` / `squelchd token revoke <id>` manage
+them one device at a time. Keep a master token if you want a way in that survives
+revoking every device.
 
 Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`, `SQUELCH_CRED_BACKEND` (`keyring` on macOS, `file` on Linux) and `SQUELCH_CREDENTIALS_PATH` (default `~/.config/squelch/credentials.json`) for the file backend.
 

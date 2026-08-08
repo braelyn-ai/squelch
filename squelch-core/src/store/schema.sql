@@ -617,3 +617,82 @@ CREATE TABLE IF NOT EXISTS message_opens (
 
 -- The read pattern is exactly "every open for this token".
 CREATE INDEX IF NOT EXISTS idx_message_opens_token ON message_opens(token);
+
+-- PER-DEVICE HUMAN-DOOR TOKENS. One row per credential the human door will
+-- accept, issued by `squelchd token issue` or by a successful pairing claim.
+-- This is what lets the door say "this phone, revoked" instead of "rotate the
+-- one shared secret and re-key every client".
+--
+-- SQUELCH_API_TOKEN is NOT represented here and never will be: the env var stays
+-- the self-host master key, checked first and independently, so a store that has
+-- lost every row still has an operator way in.
+--
+-- `token_hash` is the lowercase hex SHA-256 of the FULL presented token, prefix
+-- included. THE PLAINTEXT IS NEVER STORED — it exists once, at mint, on its way
+-- to the operator's terminal or the pairing response. UNIQUE both dedupes the
+-- (astronomically unlikely) collision and gives the per-request point lookup its
+-- index; verification is a lookup by hash, so there is no scan to time.
+--
+-- `revoked_at` is a TOMBSTONE, not a delete: revocation must be visible in
+-- `token list` after the fact, and reusing an id would be a footgun for anything
+-- that recorded one. A row with `revoked_at` set can never authenticate again.
+--
+-- `last_used_at` is liveness only, written at most once a minute per token (see
+-- `verify_device_token`) so an SSE-driven client cannot turn every request into
+-- a write.
+CREATE TABLE IF NOT EXISTS device_tokens (
+    id           INTEGER PRIMARY KEY,
+    account_id   INTEGER NOT NULL,   -- -> accounts.id
+    token_hash   TEXT NOT NULL UNIQUE,
+    -- Operator/device-supplied label, trimmed and length-capped by the store.
+    -- Never secret, and the only thing `token list` prints besides timestamps.
+    name         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at   TEXT
+);
+
+-- `token list` reads exactly "every token for my account".
+CREATE INDEX IF NOT EXISTS idx_device_tokens_account ON device_tokens(account_id);
+
+-- PAIRING CODES. The short-lived, human-transcribable bridge from a paired
+-- device to a device token: `squelchd pair` mints one, the app presents it to
+-- POST /client/pair, and the claim trades it for a token.
+--
+-- ONE ACTIVE CODE PER ACCOUNT, enforced by the mint deleting every prior row for
+-- the account. A code is worth ~40 bits, which is only safe because it is
+-- single-use, expires in minutes, and burns after a handful of misses — so
+-- letting several accumulate would multiply the guessing surface for no gain.
+-- That also bounds the table at one row per account, which is why there is no
+-- index on `code_hash`: the claim's lookup has nothing to scan.
+--
+-- `code_hash` follows the same discipline as `device_tokens.token_hash`
+-- (lowercase hex SHA-256 of the normalized code); the plaintext is never stored.
+-- NOT UNIQUE, deliberately: uniqueness would be a cross-account oracle at mint.
+--
+-- `failed_attempts` counts misses against the live code, not against a caller
+-- (the claim is unauthenticated and has no caller identity). At the cap the row
+-- is DELETED, which is why burn, expiry and a wrong code are one answer: the
+-- claim finds no active row in all three cases and cannot tell them apart.
+--
+-- `claimed_at` is the one-shot marker. It is a stamp rather than a delete so a
+-- replay of a just-used code takes the same "no active row" path as everything
+-- else, and the successful pairing stays visible until the next mint.
+-- `id` is AUTOINCREMENT, which almost nothing here is, and the audit log is why.
+-- The mint SUPERSEDES by DELETE, so a plain INTEGER PRIMARY KEY recycles the
+-- rowid and two consecutive pairing windows both audit as `code:1` — mint, claim
+-- and burn rows from different windows become impossible to tell apart. A
+-- monotonic id costs one extra row in `sqlite_sequence` on a table that holds at
+-- most one row, and buys an unambiguous ledger.
+CREATE TABLE IF NOT EXISTS pairing_codes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL,   -- -> accounts.id
+    code_hash       TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    claimed_at      TEXT,
+    created_at      TEXT NOT NULL
+);
+
+-- The mint's supersede reads exactly "every code for my account".
+CREATE INDEX IF NOT EXISTS idx_pairing_codes_account ON pairing_codes(account_id);
