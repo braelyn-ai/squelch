@@ -26,8 +26,9 @@ TAP_REPO="braelyn-ai/homebrew-tap"
 # ------------------------------------------------------------- preflight ---
 # A release is cut from committed history: the build number is the commit
 # count, so an uncommitted tree would mint a build number that a later commit
-# reuses — and CFBundleVersion must never repeat.
-if [ -n "$(git status --porcelain --untracked-files=no ..)" ]; then
+# reuses — and CFBundleVersion must never repeat. A dry run publishes
+# nothing, so it may rehearse from a dirty tree.
+if [ "$DRY" = 0 ] && [ -n "$(git status --porcelain --untracked-files=no ..)" ]; then
   echo "error: working tree not clean; commit or stash first" >&2
   exit 1
 fi
