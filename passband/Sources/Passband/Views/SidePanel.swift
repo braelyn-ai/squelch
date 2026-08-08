@@ -135,16 +135,17 @@ struct SearchView: View {
                         proxy.scrollTo(hit.id, anchor: .center)
                     }
                 }
-                // Reopening restores the selection, so restore the scroll too —
-                // an index you have to hunt for isn't preserved.
-                .onAppear {
-                    guard let hit = store.search.hits[safe: store.search.index] else { return }
-                    Task { @MainActor in proxy.scrollTo(hit.id, anchor: .center) }
-                }
             }
         }
         .keyBindings(.modal, bindings)
         .onAppear { focused = true }
+        // The reader steals focus while it is up. When it closes and this
+        // panel is the surface again, typing must just work — without this the
+        // arrows still move the selection but the keyboard is otherwise dead
+        // until a mouse click, which reads as the panel being broken.
+        .onChange(of: store.threadId) { _, threadId in
+            if threadId == nil { focused = true }
+        }
         // The remembered query lands selected, so `/` serves both callers: arrow
         // down into the old results, or type to replace it.
         .onChange(of: focused) { _, on in
@@ -161,14 +162,16 @@ struct SearchView: View {
             KeyBinding("ArrowDown", "next hit", allowInInput: true) { move(1) },
             KeyBinding("ArrowUp", "prev hit", allowInInput: true) { move(-1) },
             // Enter is two verbs: a row armed opens it, the bare bar expands
-            // the panel into fullscreen previews.
+            // the panel into fullscreen previews. Expanding is UNCONDITIONAL —
+            // gating it on results landing would make Enter-right-after-typing
+            // (inside the debounce window) silently do nothing.
             KeyBinding(
                 "Enter", store.search.index >= 0 ? "open thread" : "expand previews",
                 allowInInput: true
             ) {
                 if store.search.index >= 0 {
                     open()
-                } else if !store.search.hits.isEmpty {
+                } else {
                     store.search.expanded = true
                 }
             },
@@ -186,9 +189,8 @@ struct SearchView: View {
 
     private func open() {
         guard let hit = store.search.hits[safe: store.search.index] else { return }
-        // Collapse first: the reader insets by the strip, and a fullscreen
-        // panel behind it would peek through as a sliced-off row edge.
-        store.search.expanded = false
+        // openThread itself collapses `expanded` — every path into the reader
+        // must, so the collapse lives there rather than here.
         store.openThread(hit.thread_id)
     }
 

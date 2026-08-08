@@ -288,6 +288,13 @@ final class AppStore {
     var settings: ConnectionSettings?
     var connError: String?
 
+    /// A `passband://pair` link waiting to be acted on. ConnectView is its only
+    /// consumer and clears it as it applies it — which is also what makes an
+    /// already-connected install ignore pair links: the Connect gate is not
+    /// mounted, so nothing reads this, and pairing never silently swaps the
+    /// device identity this install already holds.
+    var pairLink: PairLink?
+
     // MARK: sitrep slice
     var sitrep = SitrepData()
     var lastRefresh: Date?
@@ -371,6 +378,10 @@ final class AppStore {
                 settings = stored
                 connStatus = .connected
                 connError = nil
+                // A link that arrived during boot (the app was LAUNCHED by one)
+                // races the keychain read. This install already has an identity,
+                // so the link loses.
+                pairLink = nil
             } else {
                 connStatus = .disconnected
             }
@@ -378,6 +389,14 @@ final class AppStore {
             connStatus = .disconnected
             connError = "settings load failed"
         }
+    }
+
+    /// Take a `passband://` URL the OS handed us. Parked for the Connect gate to
+    /// pick up rather than acted on here: an install that is already connected
+    /// must not re-pair, and the gate not being on screen is exactly that check.
+    func receivePairLink(_ url: URL) {
+        guard connStatus != .connected, let link = PairLink(url) else { return }
+        pairLink = link
     }
 
     /// Test a candidate URL+token via /client/stats; on success persist + connect.
@@ -573,6 +592,11 @@ final class AppStore {
             ])
         self.threadId = threadId
         self.threadQueue = queue
+        // HERE, not in the search panel's open path: the reader can be opened
+        // from anywhere (ask-bar cards, citations) while fullscreen search sits
+        // underneath, and it insets by only the STRIP — a still-expanded panel
+        // would peek out as a sliced-off edge behind it.
+        search.expanded = false
         // Both cleared unconditionally: moving to ANOTHER thread (h/l, done+next)
         // must not carry the previous one's draft or its pending reply request
         // into a thread they do not belong to. The draft is SAVED on the way out
@@ -812,6 +836,10 @@ final class AppStore {
         // Always reopen as the strip: resuming the query is a convenience,
         // resuming a fullscreen takeover is a mode trap.
         search.expanded = false
+        // And always reopen DISARMED. The hits and query persist, but a row
+        // armed in some earlier session would silently repurpose bar-Enter
+        // from "expand results" to "open that stale row".
+        search.index = -1
         sideView = .search
     }
 
