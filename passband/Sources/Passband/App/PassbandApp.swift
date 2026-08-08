@@ -24,6 +24,10 @@ struct PassbandApp: App {
                 .background(WindowBackdrop().ignoresSafeArea())
                 .background(WindowConfigurator())
                 .onAppear { KeyMonitor.shared.install() }
+                // passband://pair links. Parked on the store rather than acted
+                // on here: only the Connect gate can pair, and an install that
+                // already has an identity must not re-pair over it.
+                .onOpenURL { store.receivePairLink($0) }
         }
         .defaultSize(width: 1320, height: 880)
         .windowStyle(.hiddenTitleBar)
@@ -66,8 +70,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct PassbandCommands: Commands {
     let store: AppStore
     let prefs: Prefs
+    @ObservedObject private var updater = Updater.shared
 
     var body: some Commands {
+        // Directly under "About Passband", where every Mac app keeps it.
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { updater.check() }
+                .disabled(!updater.canCheck)
+        }
+
         // ⌘N composes from ANYWHERE, including the surfaces where the bare `c` is
         // deliberately out of reach (inside a modal, or with a text field focused).
         CommandGroup(replacing: .newItem) {

@@ -24,6 +24,11 @@ APP="build/Passband.app"
 SRC_DIR="Sources/Passband"
 RES_DIR="$SRC_DIR/Resources"
 
+# Vendored prebuilt Sparkle (no package resolution in this build; see
+# vendor/fetch-sparkle.sh). Fetched on demand so a fresh clone just builds.
+SPARKLE_DIR="vendor/Sparkle"
+./vendor/fetch-sparkle.sh
+
 # Versioning. ./VERSION is the single source of truth for the user-facing
 # version; keep project.yml's MARKETING_VERSION in step with it. The build
 # number is the commit count, which is monotonic across the whole history —
@@ -43,6 +48,9 @@ SWIFT_FLAGS=(
   -framework UniformTypeIdentifiers
   -framework PDFKit
   -framework UserNotifications
+  -F "$SPARKLE_DIR"
+  -framework Sparkle
+  -Xlinker -rpath -Xlinker @executable_path/../Frameworks
 )
 
 case "$MODE" in
@@ -93,6 +101,11 @@ fi
 
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# Embed Sparkle. ditto (not cp) so the framework's symlink structure survives —
+# codesign rejects a framework whose Versions/Current is a real directory.
+mkdir -p "$APP/Contents/Frameworks"
+ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+
 # Sign with the Developer ID when the machine has one, ad-hoc otherwise.
 #
 # This is what stops the keychain re-prompting on every dev build. Keychain
@@ -126,6 +139,18 @@ else
 fi
 
 echo "==> signing as $SIGN_ID$SIGN_NOTE"
+# Sparkle's nested executables first, inside-out: the hardened runtime enforces
+# library validation, so a release app may only load code signed by its own
+# team — Sparkle's upstream signature does not qualify. The Downloader XPC
+# keeps its sandbox entitlements via --preserve-metadata.
+SPARKLE_B="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
+codesign "${CODESIGN_FLAGS[@]}" --sign "$SIGN_ID" \
+  --preserve-metadata=entitlements "$SPARKLE_B/XPCServices/Downloader.xpc"
+codesign "${CODESIGN_FLAGS[@]}" --sign "$SIGN_ID" "$SPARKLE_B/XPCServices/Installer.xpc"
+codesign "${CODESIGN_FLAGS[@]}" --sign "$SIGN_ID" "$SPARKLE_B/Autoupdate"
+codesign "${CODESIGN_FLAGS[@]}" --sign "$SIGN_ID" "$SPARKLE_B/Updater.app"
+codesign "${CODESIGN_FLAGS[@]}" --sign "$SIGN_ID" \
+  "$APP/Contents/Frameworks/Sparkle.framework"
 codesign "${CODESIGN_FLAGS[@]}" --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP"
 
 echo "==> built $APP"

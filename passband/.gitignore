@@ -1,4 +1,9 @@
 build/
+# Vendored prebuilt Sparkle (fetched by vendor/fetch-sparkle.sh, checksum-pinned).
+vendor/Sparkle/
+vendor/*.tar.xz
+# Shipped-version archives, the appcast generator's working set (make-appcast.sh).
+releases/
 *.xcodeproj/xcuserdata/
 *.xcodeproj/project.xcworkspace/xcuserdata/
 .DS_Store
