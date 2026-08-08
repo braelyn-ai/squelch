@@ -238,8 +238,8 @@ struct EmailsView: View {
             KeyBinding("T", "rules") { store.setView(.rules) },
             KeyBinding("A", "audit log") { store.setView(.audit) },
             KeyBinding("g", "auth messages") { store.setView(.auth) },
-            KeyBinding("u", "undo") { Task { await store.fireUndo() } },
-            // `\` (theme) and `?` (help) are global bindings, not listed here.
+            // `u` (undo), `\` (theme) and `?` (help) are global bindings, not
+            // listed here.
         ]
     }
 

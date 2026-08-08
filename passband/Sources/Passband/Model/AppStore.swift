@@ -974,6 +974,9 @@ final class AppStore {
             resolvedIds.remove(entry.messageId)
             pushToast("undone: \(entry.label)", .info)
             Analytics.capture("undo_fired", ["kind": String(describing: entry.kind)])
+            // The bands dropped the row optimistically and the next poll is up
+            // to 10s out — pull now, or the undo reads as broken on the sitrep.
+            await SitrepPoller.shared.pull()
         } catch {
             pushToast("undo failed: \(entry.label)", .error)
         }

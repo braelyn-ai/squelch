@@ -212,6 +212,16 @@ struct MainShell: View {
         // character.
         bindings.append(
             KeyBinding("/", "search") { store.openSearch() })
+        // Undo is global because the toasts are: an action fired from any
+        // surface parks its undo in the ActionLayer, which advertises `u`
+        // everywhere. Declining, so with nothing pending the key stays free
+        // for surface bindings (the thread viewer's `u` = unsubscribe).
+        bindings.append(
+            KeyBinding(declining: "u", "undo last action") {
+                guard !store.undos.isEmpty else { return false }
+                Task { await store.fireUndo() }
+                return true
+            })
         bindings.append(
             KeyBinding("\\", "toggle light/dark theme") { Prefs.shared.flipTheme() })
         bindings.append(
