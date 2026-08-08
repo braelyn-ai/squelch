@@ -178,14 +178,25 @@ enum AssistantKeyStore {
         key.hasPrefix("sk-ant-") ? .anthropic : .openai
     }
 
+    /// No provider's key ever contains whitespace, but a pasted one can — a
+    /// terminal that soft-wrapped the key embeds a newline mid-string, edge
+    /// trimming misses it, and URLSession then silently DROPS the whole
+    /// `x-api-key` header rather than send an invalid value. The provider's
+    /// answer ("x-api-key header is required") says nothing about why. So
+    /// whitespace is stripped wholesale, on the way in AND out — out too, so a
+    /// key stored before this rule heals at first use instead of demanding a
+    /// re-paste.
+    private static func sanitized(_ key: String) -> String {
+        key.filter { !$0.isWhitespace }
+    }
+
     /// The one function allowed to see the secret. `fileprivate` on purpose:
     /// nothing outside this file — the view layer especially — can obtain the
     /// key.
     fileprivate static func read() -> String? {
-        guard let k = try? Keychain.read(account: accountAssistantKey), !k.isEmpty else {
-            return nil
-        }
-        return k
+        guard let k = try? Keychain.read(account: accountAssistantKey) else { return nil }
+        let key = sanitized(k)
+        return key.isEmpty ? nil : key
     }
 
     static func status() -> AssistantKeyStatus {
@@ -208,7 +219,7 @@ enum AssistantKeyStore {
 
     /// Store the user's assistant key. Never logged, never echoed.
     static func set(_ key: String) throws {
-        try Keychain.write(account: accountAssistantKey, value: key)
+        try Keychain.write(account: accountAssistantKey, value: sanitized(key))
     }
 
     /// Forget the stored assistant key.
