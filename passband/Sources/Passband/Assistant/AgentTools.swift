@@ -42,6 +42,7 @@ enum AgentTools {
         case getUpdates = "get_updates"
         case getRecords = "get_records"
         case searchContacts = "search_contacts"
+        case showEmails = "show_emails"
         case setStatus = "set_status"
         case createSenderRule = "create_sender_rule"
         case saveDraft = "save_draft"
@@ -59,6 +60,7 @@ enum AgentTools {
             case .getUpdates: "tray"
             case .getRecords: "shippingbox"
             case .searchContacts: "person.crop.circle"
+            case .showEmails: "mail.stack"
             case .setStatus: "checkmark.circle"
             case .createSenderRule: "line.3.horizontal.decrease.circle"
             case .saveDraft: "doc"
@@ -76,12 +78,13 @@ enum AgentTools {
 
     // MARK: - dispatch
 
-    /// Execute one tool call. `cite` collects sources as they are seen; `gate`
-    /// is the confirm ceremony for the four tools that touch the mailbox.
+    /// Execute one tool call. `cite` collects sources as they are seen; `show`
+    /// hands the session email cards to put in the transcript; `gate` is the
+    /// confirm ceremony for the four tools that touch the mailbox.
     @MainActor
     static func run(
         name: String, input: [String: JSONValue], gate: ActionGate,
-        cite: (ToolCitation) -> Void
+        cite: (ToolCitation) -> Void, show: ([EmailCard]) -> Void
     ) async -> ToolOutcome {
         guard let tool = Tool(rawValue: name) else {
             return failure("unknown tool \(name)", summary: "unknown tool")
@@ -93,6 +96,7 @@ enum AgentTools {
             case .getUpdates: return try await getUpdates(input, cite: cite)
             case .getRecords: return try await getRecords(input)
             case .searchContacts: return try await searchContacts(input)
+            case .showEmails: return await showEmails(input, show: show)
             case .setStatus: return try await setStatus(input)
             case .createSenderRule: return try await createSenderRule(input)
             case .saveDraft: return try await saveDraft(input)
@@ -281,6 +285,74 @@ enum AgentTools {
             ])
         }
         return ok(["updates": rows], summary: "checked the attention list")
+    }
+
+    /// How many cards one show_emails call may put on screen. Past this the
+    /// tray is a list view, which is what the Emails page is for.
+    private static let showCap = 8
+
+    /// Put email threads in the transcript as clickable cards. EVERY field on a
+    /// card is re-read from the daemon here: the model only picks WHICH threads
+    /// to show, never what the cards say — a thread_id it invented (or lifted
+    /// out of an injected message) simply fails to resolve and is reported
+    /// back as unavailable instead of rendering whatever it claimed.
+    ///
+    /// Never throws: a batch where some ids resolve should still show those,
+    /// so per-id failures collect instead of aborting the call.
+    @MainActor
+    private static func showEmails(
+        _ input: [String: JSONValue], show: ([EmailCard]) -> Void
+    ) async -> ToolOutcome {
+        let ids = strings(input, "thread_ids")
+        guard !ids.isEmpty else {
+            return failure(
+                "missing thread_ids — pass thread_ids from an earlier search or updates result",
+                summary: "nothing to show")
+        }
+        var seen = Set<String>()
+        let unique = ids.filter { seen.insert($0).inserted }
+        var cards: [EmailCard] = []
+        var unavailable: [String] = []
+        for id in unique.prefix(showCap) {
+            do {
+                let view = try await APIClient.shared.getThread(id)
+                // messages[0] is the NEWEST (the reader's j/k order) — the card
+                // previews where the thread currently stands.
+                guard let latest = view.messages.first else {
+                    unavailable.append(id)
+                    continue
+                }
+                cards.append(
+                    EmailCard(
+                        threadId: view.thread_id,
+                        subject: view.subject.isEmpty ? "(no subject)" : view.subject,
+                        sender: latest.from_name ?? latest.from_addr,
+                        date: latest.received_at,
+                        snippet: snippet(latest.content)))
+            } catch {
+                unavailable.append(id)
+            }
+        }
+        guard !cards.isEmpty else {
+            return failure(
+                "none of those thread_ids resolved — use thread_ids exactly as an earlier "
+                    + "result returned them",
+                summary: "nothing to show")
+        }
+        show(cards)
+        return ok(
+            row([
+                "shown": cards.count,
+                "unavailable": unavailable.isEmpty ? nil : unavailable,
+                "note": unique.count > showCap ? "capped at \(showCap) cards" : nil,
+            ]),
+            summary: cards.count == 1 ? "showed 1 email" : "showed \(cards.count) emails")
+    }
+
+    /// A card-sized preview off the top of a message body.
+    private static func snippet(_ text: String, limit: Int = 180) -> String {
+        let flat = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return flat.count <= limit ? flat : String(flat.prefix(limit)) + "…"
     }
 
     @MainActor
@@ -851,6 +923,26 @@ enum AgentTools {
                         type: "string", description: "A name or address fragment.")
                 ],
                 required: ["query"])),
+
+        Wire.ToolDef(
+            name: Tool.showEmails.rawValue,
+            description: """
+                Show email threads to the user as clickable cards right in the chat. \
+                Use it whenever the answer IS a set of emails — "show me", "which \
+                emails", "find the ones" — after locating them with search_mail or \
+                get_updates. Pass thread_ids from those results, in the order to \
+                show them (max 8). The app renders each card from its own data, so \
+                don't also describe the emails in text; one line of framing is \
+                plenty. Purely visual: it changes nothing and reads nothing new.
+                """,
+            input_schema: .init(
+                properties: [
+                    "thread_ids": .init(
+                        type: "array",
+                        description: "thread_ids from earlier results, in display order.",
+                        items: .init())
+                ],
+                required: ["thread_ids"])),
 
         Wire.ToolDef(
             name: Tool.setStatus.rawValue,

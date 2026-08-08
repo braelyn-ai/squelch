@@ -133,6 +133,19 @@ struct ToolCitation: Identifiable, Sendable, Hashable {
     var id: String { threadId }
 }
 
+/// One email the assistant chose to SHOW — a clickable card in the transcript,
+/// richer than a citation. Every field comes from the daemon (the show_emails
+/// dispatcher re-reads each thread), never from the model's own description:
+/// a card the user will click on has the same honesty bar as a confirm card.
+struct EmailCard: Identifiable, Sendable, Hashable {
+    var threadId: String
+    var subject: String
+    var sender: String
+    var date: String
+    var snippet: String
+    var id: String { threadId }
+}
+
 struct AssistantError: Error, LocalizedError {
     var message: String
     var errorDescription: String? { message }
@@ -145,7 +158,7 @@ struct AssistantError: Error, LocalizedError {
 /// "flip this chip's state": both are one in-place field write here, where an
 /// enum would rebuild (and re-copy) the payload on every token.
 struct ChatItem: Identifiable, Sendable {
-    enum Kind: Sendable { case user, assistant, tool, action, error, citations }
+    enum Kind: Sendable { case user, assistant, tool, action, error, citations, emails }
 
     /// Monotonic per session, so a row keeps its identity while its text grows.
     let id: Int
@@ -155,6 +168,7 @@ struct ChatItem: Identifiable, Sendable {
     var tool: ToolActivity? = nil
     var action: PendingAction? = nil
     var citations: [ToolCitation] = []
+    var emails: [EmailCard] = []
 }
 
 /// A tool the model called, as the tray shows it.
@@ -248,6 +262,10 @@ final class AssistantSession {
     private var cites: [String: ToolCitation] = [:]
     private var citeOrder: [String] = []
     private var readIds: [String] = []
+    /// Threads already SHOWN as cards this answer. Excluded from the citation
+    /// row: a card the user can click is its own source line, and repeating it
+    /// under "sources" would say the same thing twice.
+    private var shownIds: Set<String> = []
 
     /// Parked confirmations, by action id. A continuation in here is a
     /// suspended tool call: it MUST be resumed before it can be dropped.
@@ -316,6 +334,7 @@ final class AssistantSession {
         cites.removeAll()
         citeOrder.removeAll()
         readIds.removeAll()
+        shownIds.removeAll()
         streamTick = 0
     }
 
@@ -358,6 +377,7 @@ final class AssistantSession {
         cites.removeAll()
         citeOrder.removeAll()
         readIds.removeAll()
+        shownIds.removeAll()
 
         // Declared before the first failure exit so every ending can report what
         // the run actually spent — a failed ask still costs the user money.
@@ -609,6 +629,11 @@ final class AssistantSession {
                 guard let self, self.alive(gen) else { return }
                 if self.cites[citation.threadId] == nil { self.citeOrder.append(citation.threadId) }
                 self.cites[citation.threadId] = citation
+            },
+            show: { [weak self] cards in
+                guard let self, self.alive(gen), !cards.isEmpty else { return }
+                self.shownIds.formUnion(cards.map(\.threadId))
+                self.append(.emails, emails: cards)
             })
         let answer = Wire.RequestBlock.toolResult(
             toolUseId: call.id, content: outcome.content, isError: outcome.isError)
@@ -689,11 +714,14 @@ final class AssistantSession {
     }
 
     /// Threads surfaced by search vs. actually opened: cite the opened ones
-    /// when the model drilled in, else the top hits it saw.
+    /// when the model drilled in, else the top hits it saw. Threads already
+    /// shown as cards are skipped either way — see `shownIds`.
     private func pickCitations() -> [ToolCitation] {
-        let opened = readIds.compactMap { cites[$0] }
+        let opened = readIds.compactMap { cites[$0] }.filter { !shownIds.contains($0.threadId) }
         if !opened.isEmpty { return Array(opened.prefix(5)) }
-        return Array(citeOrder.compactMap { cites[$0] }.prefix(5))
+        return Array(
+            citeOrder.compactMap { cites[$0] }
+                .filter { !shownIds.contains($0.threadId) }.prefix(5))
     }
 
     // MARK: - transcript mutation
@@ -701,13 +729,14 @@ final class AssistantSession {
     @discardableResult
     private func append(
         _ kind: ChatItem.Kind, text: String = "", tool: ToolActivity? = nil,
-        action: PendingAction? = nil, citations: [ToolCitation] = []
+        action: PendingAction? = nil, citations: [ToolCitation] = [],
+        emails: [EmailCard] = []
     ) -> Int {
         nextItemId += 1
         transcript.append(
             ChatItem(
                 id: nextItemId, kind: kind, text: text, tool: tool, action: action,
-                citations: citations))
+                citations: citations, emails: emails))
         return nextItemId
     }
 
@@ -780,6 +809,10 @@ final class AssistantSession {
               attention list), get_records (shipments, receipts, calendar, banking,
               marketing offers). search_contacts finds people the user writes to.
             - READ: get_thread, for when a snippet isn't enough.
+            - SHOW: show_emails renders threads as clickable cards right in the chat.
+              When the answer IS a set of emails ("show me...", "which emails...",
+              "find the ones..."), show the cards and keep your prose to a line —
+              never re-describe each card in text.
             - ACT: set_status, create_sender_rule, save_draft, archive_message,
               label_message, send_email, unsubscribe_sender.
 

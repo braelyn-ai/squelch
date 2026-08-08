@@ -7,6 +7,9 @@
 // glassEffectID inside a GlassEffectContainer, so asking makes the bar grow a
 // chat log out of its own bottom edge instead of a second panel appearing
 // beneath a first. That is why everything below lives inside the same VStack.
+// Once a conversation exists the input row sits at the BOTTOM, under the log —
+// where a chat's composer belongs — and the log grows between it and the
+// header.
 //
 // The rows are TINTS, never glass: a glass row means a container that
 // re-coordinates every descendant on any change, and this list changes on every
@@ -35,11 +38,12 @@ struct AskBar: View {
             GlassEffectContainer(spacing: 10) {
                 VStack(alignment: .leading, spacing: 0) {
                     header
-                    inputRow
                     if !session.transcript.isEmpty {
                         Divider().overlay(Palette.hairline)
                         tray
+                        Divider().overlay(Palette.hairline)
                     }
+                    inputRow
                 }
                 .frame(width: 620)
                 .passbandGlass(
@@ -113,6 +117,9 @@ struct AskBar: View {
                 .foregroundStyle(canSubmit ? Palette.accent : Palette.inkFaintest)
         }
         .padding(.horizontal, 16)
+        // With a log above, the divider replaces the header as the top
+        // neighbor and the row needs its own breathing room.
+        .padding(.top, session.transcript.isEmpty ? 0 : 12)
         .padding(.bottom, 13)
     }
 
@@ -208,6 +215,8 @@ struct AskBar: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .citations:
             citations(item.citations)
+        case .emails:
+            emailCards(item.emails)
         }
     }
 
@@ -390,6 +399,56 @@ struct AskBar: View {
                 body: action.body ?? ""))
         session.resolve(action.id, .editedInComposer)
         onClose()
+    }
+
+    // MARK: - shown emails
+
+    /// The show_emails cards: the agent's answer AS emails. Same click contract
+    /// as a citation — open the thread, close the bar — but rendered like list
+    /// rows, because they are the result rather than a footnote.
+    private func emailCards(_ cards: [EmailCard]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(cards) { card in
+                Button {
+                    store.openThread(card.threadId)
+                    onClose()
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 7) {
+                            Avatar(sender: card.sender, size: 18)
+                            Text(card.sender)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Palette.ink)
+                                .lineLimit(1)
+                            Spacer(minLength: 6)
+                            Text(Fmt.dateTime(card.date))
+                                .font(Typo.num(10))
+                                .foregroundStyle(Palette.inkFaintest)
+                        }
+                        Text(card.subject)
+                            .font(Typo.rowSub)
+                            .foregroundStyle(Palette.inkDim)
+                            .lineLimit(1)
+                        if !card.snippet.isEmpty {
+                            Text(card.snippet)
+                                .font(Typo.micro)
+                                .foregroundStyle(Palette.inkFaintest)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Palette.hairline.opacity(0.35))
+                )
+                .help("Open this thread")
+            }
+        }
     }
 
     // MARK: - citations
