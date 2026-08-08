@@ -145,6 +145,10 @@ struct SearchSession: Sendable, Equatable {
     /// skips the round-trip. nil = what is on screen is not authoritative (never
     /// fetched, or the last fetch failed), so reopening retries.
     var fetchedQuery: String?
+    /// Cursor for the page AFTER the ones in `hits`. nil = the server has no
+    /// more (or nothing authoritative is on screen). Parked here with the rest
+    /// so reopening resumes mid-scroll instead of dropping back to page one.
+    var nextCursor: String?
 }
 
 // MARK: - connection
@@ -826,12 +830,23 @@ final class AppStore {
     func openSide(_ view: SideView) { sideView = view }
     func closeSide() { sideView = .none }
 
-    /// Open search. By default it RESUMES the last one; `seed` forces a fresh term
-    /// (nothing does yet, but a "search this sender" affordance would).
+    /// Open search. By default it RESUMES the last one; `seed` forces a fresh
+    /// term (`f` on a row or in the reader, seeding `from:<address>`).
     func openSearch(seed: String? = nil) {
-        if let seed {
+        // A seed matching what is ALREADY fetched keeps the session: the hits
+        // on screen are authoritative for exactly that term, and nilling
+        // `fetchedQuery` here would not refetch anyway (the panel's task is
+        // keyed on `query`, which does not change) — it would just blank the
+        // highlights and kill the cursor under live results.
+        if let seed, seed != search.fetchedQuery {
             search.query = seed
+            // Nil BOTH: the fetched term is what gates the refetch, and a cursor
+            // from the old term would page a search that is no longer on screen.
             search.fetchedQuery = nil
+            search.nextCursor = nil
+        } else if let seed {
+            // Restore the field text in case the bar was edited since the fetch.
+            search.query = seed
         }
         // Always reopen as the strip: resuming the query is a convenience,
         // resuming a fullscreen takeover is a mode trap.

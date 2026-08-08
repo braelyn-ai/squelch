@@ -232,6 +232,13 @@ struct EmailsView: View {
                 guard actionable, let u = selected else { return }
                 Actions.reply(u, queue: rows)
             },
+            // `sender` IS the address on this wire type (see AttentionUpdate's
+            // SenderStringConvertible note) — the display name would search the
+            // body text of unrelated mail.
+            KeyBinding("f", "search this sender") {
+                guard actionable, let u = selected else { return }
+                store.openSearch(seed: "from:\(u.sender)")
+            },
             KeyBinding("e", "done") { resolveSelected() },
             KeyBinding("d", "done") { resolveSelected() },
             KeyBinding("a", "browse all") { store.openSide(.browse) },

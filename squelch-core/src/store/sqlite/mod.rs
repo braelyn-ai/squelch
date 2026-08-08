@@ -36,7 +36,8 @@ use crate::error::{CoreError, Result};
 use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, Draft, ExtractQueued, MarketingApplied,
     MarketingOffer, MessageOpen, MessageUnsub, MissingVector, NewAuditEntry, NewEvent, SealedBody,
-    SealedMessage, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides,
+    SealedMessage, SearchFilter, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
+    Stage2CapOverrides,
     Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TrackedMessage, TriageDebug,
     TriagedMessage,
 };
@@ -625,6 +626,17 @@ impl Store for SqliteStore {
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
         self.search(account_id, query, limit, offset)
+    }
+
+    fn search_filtered(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_filtered(account_id, text, filter, limit, offset)
     }
 
     fn attention_updates(

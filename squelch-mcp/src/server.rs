@@ -409,10 +409,11 @@ impl SquelchServer {
 
         // hybrid_search excludes sealed rows in BOTH the keyword and vector legs
         // (and never embedded sealed mail in the first place). Degrades to
-        // keyword-only when no embedder is attached.
-        let hits = self
+        // keyword-only when no embedder is attached. No operator filter and no
+        // window-fullness on this door: the agent asks for top-k, not pages.
+        let (hits, _window_full) = self
             .store
-            .hybrid_search(self.account_id, query, k)
+            .hybrid_search(self.account_id, query, &Default::default(), k)
             .map_err(Self::map_err)?;
 
         // Defense in depth: drop any hit whose thread overlaps a sealed thread,

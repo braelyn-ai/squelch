@@ -16,7 +16,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squelch_core::CoreError;
-use squelch_core::store::{ActionMessageRef, Draft, NewAuditEntry, SitrepBand, SqliteStore, Store};
+use squelch_core::store::{
+    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SitrepBand, SqliteStore, Store,
+};
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
 use squelch_core::triage::rule_infer;
@@ -503,6 +505,9 @@ pub async fn get_attachment(
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
+    /// The raw query, operators included (`invoice from:jane after:2026-01-01`).
+    /// Parsed exactly once, here, then threaded into the store as
+    /// `(text, filter)`.
     q: String,
     limit: Option<u32>,
     cursor: Option<String>,
@@ -548,12 +553,40 @@ struct SearchPage<T> {
     next_cursor: Option<String>,
 }
 
+/// The recall window semantic/hybrid rank before the page is cut out of it.
+///
+/// With no filter it is exactly the page. With one, the filter is applied
+/// POST-HOC to hydrated hits (KNN and RRF cannot carry a `from:`/date
+/// predicate), so we over-fetch to leave room for the rows it drops.
+/// APPROXIMATION: a heavily-filtered query can still under-fill a page — the
+/// matching mail may sit below the window entirely.
+///
+/// `saturating_add` because the offset comes off the wire (a crafted cursor
+/// must not overflow), and BOTH branches cap: past `MAX_RECALL_K` the fused
+/// ranking is noise anyway, and an uncapped `k` would hand sqlite-vec a
+/// KNN the size of the cursor.
+fn recall_k(limit: u32, offset: u32, filter: &SearchFilter) -> usize {
+    const MAX_RECALL_K: usize = 600;
+    let page = (limit as usize).saturating_add(offset as usize);
+    if filter.is_empty() {
+        page.min(MAX_RECALL_K)
+    } else {
+        page.saturating_mul(3).min(MAX_RECALL_K)
+    }
+}
+
 pub async fn search(
     State(state): State<ApiState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let term = query.q.trim().to_string();
-    if term.is_empty() {
+    if query.q.trim().is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
+    // ONE parse for every leg below: operators come out as a `SearchFilter`,
+    // what is left is the text to rank on.
+    let (term, filter) = squelch_core::store::parse_search_query(query.q.trim());
+    let term = term.trim().to_string();
+    if term.is_empty() && filter.is_empty() {
         return Err(ApiError::bad_request("q must not be empty"));
     }
     let (limit, offset) = paginate(query.limit, query.cursor.as_deref())?;
@@ -576,40 +609,64 @@ pub async fn search(
     };
 
     // Semantic/hybrid asked for without a vector index degrade to keyword rather
-    // than erroring — but the response reports the kind actually run.
-    let effective = match mode {
-        SearchMode::Semantic | SearchMode::Hybrid if !have_vectors => SearchMode::Keyword,
-        other => other,
+    // than erroring — but the response reports the kind actually run. A query
+    // that is nothing BUT operators has no text to rank, so every mode collapses
+    // to the keyword leg's filter-only listing.
+    let effective = if term.is_empty() {
+        SearchMode::Keyword
+    } else {
+        match mode {
+            SearchMode::Semantic | SearchMode::Hybrid if !have_vectors => SearchMode::Keyword,
+            other => other,
+        }
     };
 
-    // Keyword paginates in SQL; semantic/hybrid rank a top-k window and offset
-    // the fused slice. EVERY leg excludes sealed rows in SQL.
-    let items = store_call(&state, move |store, account_id| match effective {
-        SearchMode::Keyword => store.search(account_id, &term, limit, offset),
+    let k = recall_k(limit, offset, &filter);
+
+    // Keyword paginates and filters in SQL; semantic/hybrid rank a top-k window,
+    // filter the hydrated hits, and offset the fused slice. EVERY leg excludes
+    // sealed rows in SQL. The bool is the recall legs' WINDOW FULL signal (see
+    // below); the keyword leg paginates exactly, so it never needs one.
+    let (items, window_full) = store_call(&state, move |store, account_id| match effective {
+        SearchMode::Keyword => store
+            .search_filtered(account_id, &term, &filter, limit, offset)
+            .map(|hits| (hits, false)),
         SearchMode::Semantic => {
-            let k = (limit + offset) as usize;
-            let mut hits = store.semantic_search_hits(account_id, &term, k)?;
-            let dropped: Vec<_> = hits
+            let (mut hits, window_full) =
+                store.semantic_search_hits(account_id, &term, &filter, k)?;
+            let page: Vec<_> = hits
                 .drain(..)
                 .skip(offset as usize)
                 .take(limit as usize)
                 .collect();
-            Ok(dropped)
+            Ok((page, window_full))
         }
         SearchMode::Hybrid => {
-            let k = (limit + offset) as usize;
-            let mut hits = store.hybrid_search(account_id, &term, k)?;
-            let dropped: Vec<_> = hits
+            let (mut hits, window_full) = store.hybrid_search(account_id, &term, &filter, k)?;
+            let page: Vec<_> = hits
                 .drain(..)
                 .skip(offset as usize)
                 .take(limit as usize)
                 .collect();
-            Ok(dropped)
+            Ok((page, window_full))
         }
     })
     .await?;
 
-    let next = next_cursor(items.len(), limit, offset);
+    // A full page always advances by `limit`. A SHORT page normally means the
+    // results are exhausted — except on a filtered recall leg, where the filter
+    // may have thinned a FULL candidate window: there the walk continues,
+    // advancing by what was actually served (the offset indexes the filtered
+    // sequence, and ranking is deterministic). A short page that served
+    // NOTHING ends the walk even window-full: the same offset would rebuild
+    // the same window and hand the client the same empty page forever.
+    let next = match next_cursor(items.len(), limit, offset) {
+        Some(cursor) => Some(cursor),
+        None if window_full && !items.is_empty() => {
+            Some(cursor::encode_offset(offset + items.len() as u32))
+        }
+        None => None,
+    };
     Ok(Json(SearchPage {
         items,
         match_kind: effective.as_str(),

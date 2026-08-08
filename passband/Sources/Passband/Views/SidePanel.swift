@@ -69,12 +69,16 @@ struct SidePanel: View {
 /// Search: debounced GET /client/search, j/k selection, click or Enter opens a
 /// hit in the reader beside the results. Enter with NO row armed (index -1)
 /// instead expands the panel fullscreen with larger previews — ArrowDown arms
-/// a row, so bar-Enter and row-Enter are different verbs. Every durable piece
-/// of state lives in `store.search`; only `loading`, which dies with the
-/// panel, is local.
+/// a row, so bar-Enter and row-Enter are different verbs. Pages in as you reach
+/// the bottom row — there is no "more" button, the strip is too narrow to spend
+/// one. Every durable piece of state lives in `store.search`; only the two
+/// in-flight flags, which die with the panel, are local.
 struct SearchView: View {
     @Environment(AppStore.self) private var store
     @State private var loading = false
+    /// A page append is in flight. SEPARATE from `loading`: that one blanks the
+    /// list behind "searching…", and an append must leave the read hits alone.
+    @State private var loadingMore = false
     @FocusState private var focused: Bool
 
     /// The terms the on-screen hits were actually fetched for — the live query
@@ -120,7 +124,18 @@ struct SearchView: View {
                                 open()
                             }
                             .id(hit.id)
+                            // Reaching the last row IS the request for the next
+                            // page. On the row rather than a footer sentinel so
+                            // it fires in both the strip and fullscreen, where
+                            // the column widths (and so the row counts) differ.
+                            .onAppear {
+                                guard hit.id == store.search.hits.last?.id else { return }
+                                Task { await loadMore() }
+                            }
                         }
+                        // Rows just stopping is indistinguishable from the end
+                        // of the results, so the append announces itself.
+                        if loadingMore { BandNote("loading more…") }
                     }
                     // Fullscreen keeps a reading-width column: match text in
                     // window-wide rows is a treadmill for the eyes.
@@ -200,6 +215,7 @@ struct SearchView: View {
             store.search.hits = []
             store.search.error = nil
             store.search.fetchedQuery = nil
+            store.search.nextCursor = nil
             loading = false
             return
         }
@@ -209,22 +225,78 @@ struct SearchView: View {
         loading = true
         // Debounce: a fresh keystroke cancels this task before the request.
         try? await Task.sleep(for: .milliseconds(220))
-        guard !Task.isCancelled else { return }
+        // A cancelled exit MUST clear the flag: the replacing task can
+        // early-return on `term == fetchedQuery` without ever touching it
+        // (backspace inside the debounce window), and a stuck `loading` both
+        // pins the "searching…" note and gates loadMore forever.
+        guard !Task.isCancelled else {
+            loading = false
+            return
+        }
         do {
             let page = try await APIClient.shared.search(term, limit: 50)
             store.search.hits = page.items
+            store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
             // "show me more", not "open whatever floated to the top".
             store.search.index = -1
             store.search.error = nil
             store.search.fetchedQuery = term
+            // Warm the head of the page only. Search rows are read and chosen
+            // from, not swept, so the rest can wait for a real click — and the
+            // whole 50 would be a stampede for one open.
+            for hit in page.items.prefix(5) {
+                ThreadPrefetch.shared.prefetch(hit.thread_id)
+            }
         } catch {
+            // Cancellation surfaces here too (URLError.cancelled mid-request):
+            // that is a superseded task, not a failure, and writing an error
+            // would stamp the NEW search's state with the old one's obituary.
+            guard !Task.isCancelled else {
+                loading = false
+                return
+            }
             store.search.error = errText(error, "search failed")
             // Leave `fetchedQuery` nil so reopening RETRIES rather than
             // resurrecting a stale error over stale hits.
             store.search.fetchedQuery = nil
+            // And drop the cursor with it: it belongs to a page set this view
+            // is no longer showing.
+            store.search.nextCursor = nil
         }
         loading = false
+    }
+
+    /// Append the page after the one on screen. Cursors are only meaningful
+    /// beside the term they were issued for, so this refuses to run while the
+    /// bar is mid-edit (`term != fetchedQuery`) and re-checks after the await —
+    /// a query that turned over in flight would otherwise splice two different
+    /// searches into one list.
+    private func loadMore() async {
+        guard !loading, !loadingMore, let cursor = store.search.nextCursor else { return }
+        let term = store.search.query.trimmed
+        guard !term.isEmpty, term == store.search.fetchedQuery else { return }
+        loadingMore = true
+        defer { loadingMore = false }
+        do {
+            let page = try await APIClient.shared.search(term, limit: 50, cursor: cursor)
+            guard term == store.search.fetchedQuery, store.search.nextCursor == cursor else {
+                return
+            }
+            // Deduped because the cursor is an OFFSET: mail arriving between
+            // two pages shifts the window, and a repeated id is a normal
+            // outcome rather than a server bug. Two rows with one id would also
+            // break the ForEach.
+            var seen = Set(store.search.hits.map(\.id))
+            for hit in page.items where seen.insert(hit.id).inserted {
+                store.search.hits.append(hit)
+            }
+            store.search.nextCursor = page.next_cursor
+        } catch {
+            // Keep the cursor and stay silent: the hits already read are worth
+            // more than an error line, and scrolling the last row back into
+            // view retries. The bar reports failures for the search itself.
+        }
     }
 }
 

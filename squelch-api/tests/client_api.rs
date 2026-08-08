@@ -646,7 +646,7 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
         .unwrap();
     store.upsert_message_vector(acct, s, &sv).unwrap();
 
-    let state = ApiState::new(store.clone(), acct, TOKEN).unwrap();
+    let state = ApiState::new(store.clone(), acct, TOKEN);
     let app = router(state);
 
     // Default (no mode) => hybrid; sealed absent.
@@ -676,6 +676,275 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
         items.iter().all(|i| i["thread_id"] != "t2"),
         "sealed never surfaces in semantic"
     );
+}
+
+// --- search: match-window snippets and query operators ----------------------
+
+/// A body whose only occurrence of "pangolin" sits well past anything the
+/// stored head-of-message snippet would ever cover.
+const DEEP_BODY: &str = "Thanks for subscribing to the weekly digest. This week \
+    we cover garden tools, the spring planting calendar, a reader letter about \
+    compost, and our usual roundup of local events. Finally, a note on the \
+    pangolin conservation fundraiser at the community hall.";
+
+/// Midday UTC on the given day, so a `after:`/`before:` bound at midnight lands
+/// unambiguously on one side of it.
+fn at(y: i32, m: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .with_ymd_and_hms(y, m, d, 12, 0, 0)
+        .single()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn search_snippet_is_the_body_match_window() {
+    let Harness { app, .. } = harness(|store, acct| {
+        let mut m = msg(acct, "g1", "t1", "weekly digest", DEEP_BODY);
+        m.snippet = "Thanks for subscribing to the weekly digest.".into();
+        let id = store.upsert_message(&m).unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                40,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=pangolin"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let snippet = items[0]["snippet"].as_str().unwrap();
+    assert!(
+        snippet.contains("pangolin"),
+        "a body-deep hit must show the matched term, got {snippet:?}"
+    );
+    assert!(
+        !snippet.starts_with("Thanks for subscribing"),
+        "not the stored intro paragraph"
+    );
+}
+
+/// Two dated invoices from Jane, one from Bob, one sealed and one sent — the
+/// corpus every operator test below filters over.
+fn seed_operator_corpus(store: &SqliteStore, acct: i64) {
+    // The shared fixture is from Alice; these four are from Jane, so `from:jane`
+    // means something.
+    let from_jane = |m: &mut squelch_core::types::NewMessage| {
+        m.from_addr = "jane@example.com".into();
+        m.from_name = Some("Jane Doe".into());
+    };
+
+    let mut jan = msg(acct, "g-jan", "t-jan", "invoice january", "january invoice");
+    from_jane(&mut jan);
+    jan.received_at = at(2026, 1, 15);
+    let mut feb = msg(
+        acct,
+        "g-feb",
+        "t-feb",
+        "invoice february",
+        "february invoice",
+    );
+    from_jane(&mut feb);
+    feb.received_at = at(2026, 2, 15);
+
+    let mut bob = msg(acct, "g-bob", "t-bob", "invoice from bob", "bob's invoice");
+    bob.from_addr = "bob@other.test".into();
+    bob.from_name = Some("Bob".into());
+    bob.received_at = at(2026, 2, 20);
+
+    for m in [&jan, &feb, &bob] {
+        let id = store.upsert_message(m).unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                50,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    }
+
+    // Sealed: same sender, same word, must never appear on any leg.
+    let mut sealed = msg(
+        acct,
+        "g-seal",
+        "t-seal",
+        "invoice code inside",
+        "code 123456",
+    );
+    from_jane(&mut sealed);
+    sealed.received_at = at(2026, 2, 16);
+    let sid = store.upsert_message(&sealed).unwrap();
+    store
+        .set_triage(
+            sid,
+            acct,
+            90,
+            Tier::Noise,
+            Sensitivity::Sealed,
+            Some(SealedKind::Otp),
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+
+    // Sent: search is the human door's INBOX view, so this stays out too.
+    let mut sent = msg(
+        acct,
+        "g-sent",
+        "t-sent",
+        "re: invoice",
+        "sending the invoice back",
+    );
+    from_jane(&mut sent);
+    sent.is_sent = true;
+    sent.received_at = at(2026, 2, 17);
+    store.upsert_message(&sent).unwrap();
+}
+
+#[tokio::test]
+async fn search_operators_filter_by_sender_and_date() {
+    let Harness { app, .. } = harness(seed_operator_corpus);
+
+    let threads = |json: &Value| -> Vec<String> {
+        json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["thread_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // from: matches the address or the display name; the sealed row carrying the
+    // same sender and the same word stays absent.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=invoice%20from:jane"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "keyword");
+    let t = threads(&json);
+    assert_eq!(t.len(), 2, "jane's two received invoices: {t:?}");
+    assert!(!t.contains(&"t-seal".to_string()), "sealed stays absent");
+    assert!(!t.contains(&"t-sent".to_string()), "sent stays excluded");
+
+    // after: is inclusive at midnight UTC of the named day.
+    let json = body_json(
+        app.clone()
+            .oneshot(authed("GET", "/client/search?q=invoice%20after:2026-02-01"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let t = threads(&json);
+    assert_eq!(t.len(), 2, "february onward: {t:?}");
+    assert!(!t.contains(&"t-jan".to_string()));
+
+    // before: is exclusive at midnight UTC of the named day.
+    let json = body_json(
+        app.clone()
+            .oneshot(authed(
+                "GET",
+                "/client/search?q=invoice%20before:2026-02-16",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    // Keyword hits come back in FTS rank order, so assert the SET, not the order.
+    let t = threads(&json);
+    assert_eq!(t.len(), 2, "january and february only: {t:?}");
+    assert!(!t.contains(&"t-bob".to_string()), "bob is past the bound");
+
+    // All three together narrow to exactly one message.
+    let json = body_json(
+        app.clone()
+            .oneshot(authed(
+                "GET",
+                "/client/search?q=invoice%20from:jane%20after:2026-02-01%20before:2026-03-01",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(threads(&json), vec!["t-feb".to_string()]);
+
+    // An unparseable date is not an operator: the token stays in the search
+    // text, and the request still succeeds.
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=invoice%20after:soon"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn search_with_only_operators_lists_and_keeps_exclusions() {
+    let Harness { app, .. } = harness(seed_operator_corpus);
+
+    // No words left after parsing => a plain newest-first listing, no FTS MATCH,
+    // reported as the keyword kind.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=from:jane"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "keyword");
+    let t: Vec<&str> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["thread_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(t, vec!["t-feb", "t-jan"], "newest first");
+    assert!(!t.contains(&"t-seal"), "sealed absent from the listing");
+    assert!(!t.contains(&"t-sent"), "sent absent from the listing");
+
+    // A date-only listing spans every non-sealed, non-sent row.
+    let json = body_json(
+        app.clone()
+            .oneshot(authed("GET", "/client/search?q=after:2026-01-01"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let t: Vec<&str> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["thread_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(t, vec!["t-bob", "t-feb", "t-jan"]);
+
+    // Operators that constrain nothing leave nothing to search: still a 400.
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=from:"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

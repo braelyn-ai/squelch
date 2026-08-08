@@ -234,6 +234,7 @@ struct ShortcutsOverlay: View {
                 (["e", "d"], "mark done"),
                 (["v"], "fix a wrong triage verdict"),
                 (["t"], "tune sender rule"),
+                (["f"], "search this sender"),
                 (["p"], "process mode"),
                 (["u"], "undo last action"),
             ]),
@@ -247,6 +248,7 @@ struct ShortcutsOverlay: View {
                 (["e", "d"], "done + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),
+                (["f"], "search this sender"),
                 (["Esc"], "back"),
             ]),
         Group(

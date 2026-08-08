@@ -4,8 +4,10 @@
 //! its `Connection` in a `Mutex`; async callers wrap calls in
 //! `tokio::task::spawn_blocking`.
 
+pub mod search_query;
 pub mod sqlite;
 
+pub use search_query::{SearchFilter, parse_search_query};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
@@ -842,6 +844,23 @@ pub trait Store: Send + Sync {
         &self,
         account_id: AccountId,
         query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>>;
+
+    /// [`Store::search`] with the operator half of the query applied ([`from:`,
+    /// `after:`, `before:`](search_query)). `text` is the already-parsed search
+    /// text — this method never sees a raw query string, so the operators are
+    /// parsed exactly once, at the door.
+    ///
+    /// When `text` is empty and `filter` is not, this is a FILTER-ONLY LISTING:
+    /// newest-first over `messages` with no FTS MATCH at all. Both shapes keep
+    /// `search`'s guarantees — sealed rows excluded, sent mail excluded.
+    fn search_filtered(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>>;
