@@ -1,6 +1,15 @@
 # Releasing Passband
 
-Manual for now; the CI job comes later. Prerequisites on the release machine:
+One command: bump `VERSION` (and its project.yml mirror), commit, then
+
+```sh
+./release.sh        # or --dry to rehearse without publishing
+```
+
+It runs the steps below, publishes the GitHub release under `passband-v*`,
+pushes the appcast, and bumps the Homebrew cask in braelyn-ai/homebrew-tap.
+The rest of this file is what the script does, for when a step needs doing
+by hand. Prerequisites on the release machine:
 the Developer ID certificate, the `passband-notary` notarytool profile
 (see build-release.sh), and the Sparkle EdDSA private key in the login
 keychain (created by `vendor/Sparkle/bin/generate_keys`; back it up with

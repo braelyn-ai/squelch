@@ -1,5 +1,20 @@
 // Static pages are plain HTML files, not React routes: legal pages must be
 // readable by crawlers and reviewers without executing the bundle.
+// Newest released version, read once from the appcast baked into this image
+// (generate_appcast writes newest-first; a release redeploys the site).
+let cachedLatest: string | null | undefined;
+function latestVersion(): string | null {
+  if (cachedLatest === undefined) {
+    let xml = "";
+    try {
+      xml = require("fs").readFileSync("appcast.xml", "utf8");
+    } catch {}
+    cachedLatest =
+      xml.match(/<sparkle:shortVersionString>(\d+\.\d+\.\d+)</)?.[1] ?? null;
+  }
+  return cachedLatest;
+}
+
 const pages: Record<string, string> = {
   "/main.js": "dist/main.js",
   "/privacy": "privacy.html",
@@ -15,6 +30,18 @@ const server = Bun.serve({
     const file = pages[path];
     if (file) {
       return new Response(Bun.file(file));
+    }
+    // The homepage's download button. The appcast in this image is the truth
+    // about what shipped last (newest entry first), so redirect through the
+    // versioned URL below; with no releases yet, fall back to the releases page.
+    if (path === "/download" || path === "/download/latest") {
+      const version = latestVersion();
+      return Response.redirect(
+        version
+          ? `/download/Passband-${version}.zip`
+          : "https://github.com/braelyn-ai/squelch/releases",
+        302,
+      );
     }
     // Stable download URLs the appcast can use as its enclosure prefix:
     // /download/Passband-1.2.3.zip redirects to that version's GitHub release
