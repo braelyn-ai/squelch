@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Privacy Policy · Passband</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 3rem 1.25rem 5rem;
+        line-height: 1.65;
+        color: #1a1a1a;
+      }
+      h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+      h2 { font-size: 1.15rem; margin-top: 2.2rem; }
+      .meta { color: #777; font-size: 0.9rem; margin-top: 0; }
+      a { color: #3556c9; }
+      nav { margin-bottom: 2rem; font-size: 0.9rem; }
+      ul { padding-left: 1.3rem; }
+      li { margin: 0.3rem 0; }
+    </style>
+  </head>
+  <body>
+    <nav><a href="/">← Passband</a></nav>
+    <h1>Privacy Policy</h1>
+    <p class="meta">Effective August 7, 2026</p>
+
+    <p>
+      Passband is a Mac email client, and squelchd is the self-hosted daemon
+      behind it. You run both on hardware you control. This policy explains
+      what data the software touches, where that data lives, and what, if
+      anything, ever reaches infrastructure we operate.
+    </p>
+    <p>
+      The short version: your mail is synced, analyzed, and stored on your own
+      machine. We do not run servers that receive, store, or can access your
+      email or your Google credentials.
+    </p>
+
+    <h2>Google user data</h2>
+    <p>
+      Passband accesses Gmail through Google APIs, with your consent, using
+      OAuth. It requests:
+    </p>
+    <ul>
+      <li>
+        <strong>Read access</strong> (<code>gmail.readonly</code>) to sync
+        your messages so the daemon can triage them.
+      </li>
+      <li>
+        <strong>Optional write access</strong> (<code>gmail.modify</code>,
+        <code>gmail.send</code>), granted separately and only if you enable
+        it, so you can archive, label, and send mail from Passband. Every
+        write action is user-initiated, requires explicit confirmation, and
+        is recorded in a local audit log.
+      </li>
+    </ul>
+    <p>
+      Message content and metadata are stored in a local SQLite database on
+      your machine. OAuth tokens are stored in your operating system keychain
+      or a local credentials file you designate. Neither ever transits or
+      rests on our infrastructure.
+    </p>
+
+    <h2>Limited Use disclosure</h2>
+    <p>
+      Passband's use and transfer to any other app of information received
+      from Google APIs will adhere to the
+      <a href="https://developers.google.com/terms/api-services-user-data-policy">Google
+      API Services User Data Policy</a>, including the Limited Use
+      requirements. In particular:
+    </p>
+    <ul>
+      <li>Google user data is used only to provide and improve the user-facing features of Passband: triaging, displaying, and acting on your mail at your direction.</li>
+      <li>It is never sold, never used for advertising, and never transferred to third parties except as described below at your direction.</li>
+      <li>No human reads it except with your explicit consent, or where required for security or legal compliance.</li>
+      <li>Google user data is never used to develop, improve, or train generalized or non-personalized artificial intelligence or machine learning models.</li>
+    </ul>
+
+    <h2>Optional AI processing, with your own keys</h2>
+    <p>
+      Two features can send message content to a large language model
+      provider, and both are off until you supply your own API key:
+    </p>
+    <ul>
+      <li>
+        <strong>LLM triage.</strong> If you configure an Anthropic or OpenAI
+        API key, the daemon sends message excerpts to that provider, under
+        your own account and their terms, to score importance and extract
+        deadlines and summaries. Without a key, triage runs on local
+        heuristics only. Security-sensitive mail (verification codes,
+        password resets, and similar) is detected deterministically before
+        any model is consulted and is never sent to a model.
+      </li>
+      <li>
+        <strong>The assistant.</strong> Passband's built-in assistant uses
+        your own Anthropic API key. Content it reads on your behalf goes to
+        Anthropic under your account.
+      </li>
+    </ul>
+    <p>
+      In both cases you choose the provider, you hold the key, and you can
+      remove it at any time. We are not a party to that data flow.
+    </p>
+
+    <h2>Infrastructure we do operate</h2>
+    <p>
+      Two small services run on our infrastructure. Both are designed to see
+      timing and opaque identifiers, never content:
+    </p>
+    <ul>
+      <li>
+        <strong>Push relay.</strong> To deliver notifications, your daemon
+        sends the relay device tokens, opaque event identifiers, and
+        optional collapse identifiers. The relay forwards to Apple and
+        retains nothing. It cannot see message content, senders, or
+        subjects.
+      </li>
+      <li>
+        <strong>Read receipts (opt-in).</strong> If you enable open
+        tracking on mail you send, the relay briefly buffers an opaque
+        token, a timestamp, and a user agent string until your daemon
+        collects them. Only your daemon can map a token back to a message.
+        Collected entries are deleted from the relay.
+      </li>
+    </ul>
+    <p>
+      Relay logs contain request timing and status codes only. Device
+      tokens, open tokens, and payloads are never logged.
+    </p>
+
+    <h2>App telemetry</h2>
+    <p>
+      The Passband app reports anonymous usage events (for example, "an email
+      was archived") to help us understand which features are used. Event
+      names and values come from a fixed allowlist enforced in code; message
+      content, subjects, senders, labels, and search queries are structurally
+      unable to leave the app through this channel. You can reduce or disable
+      telemetry in Settings under Privacy.
+    </p>
+
+    <h2>Retention and deletion</h2>
+    <p>
+      Your data is retained on your machine for as long as you keep it. To
+      delete everything: delete the local database and credentials files (or
+      keychain entries), and revoke Passband's access at
+      <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.
+      Because we hold no copy of your mail or tokens, there is nothing for us
+      to delete on our side; relay buffers are transient and deleted on
+      collection.
+    </p>
+
+    <h2>Security</h2>
+    <p>
+      The read credential and the write credential are held in separate
+      slots, and the sync pipeline is structurally unable to load the write
+      slot. Agent-facing interfaces are read-only and never expose
+      security-sensitive mail. The daemon binds to loopback by default. The
+      full threat model is documented in
+      <a href="https://github.com/braelyn-ai/squelch/blob/main/docs/SECURITY.md">SECURITY.md</a>.
+    </p>
+
+    <h2>Children</h2>
+    <p>Passband is not directed to children under 13 and we do not knowingly collect data from them.</p>
+
+    <h2>Changes</h2>
+    <p>
+      Changes to this policy will be posted on this page with an updated
+      effective date.
+    </p>
+
+    <h2>Contact</h2>
+    <p>
+      Questions about privacy: email
+      <a href="mailto:bboynton97@gmail.com">bboynton97@gmail.com</a> or open
+      an issue at
+      <a href="https://github.com/braelyn-ai/squelch">github.com/braelyn-ai/squelch</a>.
+    </p>
+  </body>
+</html>

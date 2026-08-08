@@ -24,9 +24,17 @@ export function App() {
   return (
     <main style={styles.page}>
       <h1 style={styles.title}>Passband</h1>
-      <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
-        GitHub
-      </a>
+      <nav style={{ display: "flex", gap: "1.25rem" }}>
+        <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
+          GitHub
+        </a>
+        <a style={styles.link} href="/privacy">
+          Privacy
+        </a>
+        <a style={styles.link} href="/terms">
+          Terms
+        </a>
+      </nav>
     </main>
   );
 }
