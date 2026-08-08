@@ -116,8 +116,8 @@ struct MainShell: View {
             // Email viewer — above the side panels, below the action layer so
             // compose/undo/palette stay on top. It fills the window EXCEPT an
             // open side panel's strip: opening a hit from search must leave the
-            // results visible beside the email. Esc closes the reader, a second
-            // Esc the panel.
+            // results visible beside the email. Esc sheds the panel first (the
+            // email stays), a second Esc closes the reader.
             if let threadId = store.threadId {
                 HStack(spacing: 0) {
                     // THE RAIL STAYS: the reader insets past it instead of

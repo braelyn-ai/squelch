@@ -10,6 +10,12 @@ import SwiftUI
 struct SidePanel: View {
     @Environment(AppStore.self) private var store
 
+    /// Fullscreen search takeover (Enter in the bar). Only search expands;
+    /// browse is always the strip.
+    private var expanded: Bool {
+        store.sideView == .search && store.search.expanded
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             Spacer(minLength: 0)
@@ -37,14 +43,23 @@ struct SidePanel: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            .frame(width: sidePanelWidth)
-            .frame(maxHeight: .infinity)
+            .frame(width: expanded ? nil : sidePanelWidth)
+            .frame(maxWidth: expanded ? .infinity : nil, maxHeight: .infinity)
             .passbandGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.24), radius: 40, x: -14)
         }
+        .animation(.smooth(duration: 0.22), value: expanded)
         .keyContext(.modal)
+        // Esc unwinds one layer at a time: fullscreen search collapses back to
+        // the strip first, a second Esc closes the panel.
         .keyBindings(.modal, [
-            KeyBinding("Escape", "back") { store.closeSide() }
+            KeyBinding("Escape", "back") {
+                if expanded {
+                    store.search.expanded = false
+                } else {
+                    store.closeSide()
+                }
+            }
         ])
     }
 }
@@ -52,15 +67,26 @@ struct SidePanel: View {
 // MARK: - search
 
 /// Search: debounced GET /client/search, j/k selection, click or Enter opens a
-/// hit in the reader beside the results. Every durable piece of state lives in
-/// `store.search`; only `loading`, which dies with the panel, is local.
+/// hit in the reader beside the results. Enter with NO row armed (index -1)
+/// instead expands the panel fullscreen with larger previews — ArrowDown arms
+/// a row, so bar-Enter and row-Enter are different verbs. Every durable piece
+/// of state lives in `store.search`; only `loading`, which dies with the
+/// panel, is local.
 struct SearchView: View {
     @Environment(AppStore.self) private var store
     @State private var loading = false
     @FocusState private var focused: Bool
 
+    /// The terms the on-screen hits were actually fetched for — the live query
+    /// can be mid-edit, and highlighting it would mark text the server never
+    /// matched.
+    private var terms: [String] {
+        (store.search.fetchedQuery ?? "").split(separator: " ").map(String.init)
+    }
+
     var body: some View {
         @Bindable var store = store
+        let expanded = store.search.expanded
 
         VStack(alignment: .leading, spacing: 0) {
             Field(label: "") {
@@ -82,18 +108,25 @@ struct SearchView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 6) {
+                    LazyVStack(spacing: expanded ? 10 : 6) {
                         ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
                             // One click opens: the reader sits beside this list,
                             // so opening a hit costs the results nothing.
-                            HitRow(hit: hit, selected: i == store.search.index) {
+                            HitRow(
+                                hit: hit, terms: terms, selected: i == store.search.index,
+                                expanded: expanded
+                            ) {
                                 store.search.index = i
-                                store.openThread(hit.thread_id)
+                                open()
                             }
                             .id(hit.id)
                         }
                     }
-                    .padding(.horizontal, 14)
+                    // Fullscreen keeps a reading-width column: match text in
+                    // window-wide rows is a treadmill for the eyes.
+                    .frame(maxWidth: expanded ? 780 : .infinity)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, expanded ? 24 : 14)
                     .padding(.bottom, 14)
                 }
                 .onChange(of: store.search.index) { _, i in
@@ -127,22 +160,36 @@ struct SearchView: View {
         [
             KeyBinding("ArrowDown", "next hit", allowInInput: true) { move(1) },
             KeyBinding("ArrowUp", "prev hit", allowInInput: true) { move(-1) },
-            KeyBinding("Enter", "open thread", allowInInput: true) { open() },
+            // Enter is two verbs: a row armed opens it, the bare bar expands
+            // the panel into fullscreen previews.
+            KeyBinding(
+                "Enter", store.search.index >= 0 ? "open thread" : "expand previews",
+                allowInInput: true
+            ) {
+                if store.search.index >= 0 {
+                    open()
+                } else if !store.search.hits.isEmpty {
+                    store.search.expanded = true
+                }
+            },
             // j/k also work when focus is not in the input.
             KeyBinding("j", "next hit") { move(1) },
             KeyBinding("k", "prev hit") { move(-1) },
         ]
     }
 
+    /// Floor -1, not 0: ArrowUp from the top row disarms back to the bar.
     private func move(_ delta: Int) {
         store.search.index = max(
-            0, min(store.search.hits.count - 1, store.search.index + delta))
+            -1, min(store.search.hits.count - 1, store.search.index + delta))
     }
 
     private func open() {
-        if let hit = store.search.hits[safe: store.search.index] {
-            store.openThread(hit.thread_id)
-        }
+        guard let hit = store.search.hits[safe: store.search.index] else { return }
+        // Collapse first: the reader insets by the strip, and a fullscreen
+        // panel behind it would peek through as a sliced-off row edge.
+        store.search.expanded = false
+        store.openThread(hit.thread_id)
     }
 
     private func runSearch() async {
@@ -164,7 +211,9 @@ struct SearchView: View {
         do {
             let page = try await APIClient.shared.search(term, limit: 50)
             store.search.hits = page.items
-            store.search.index = 0
+            // Fresh results land un-armed: Enter straight from the bar means
+            // "show me more", not "open whatever floated to the top".
+            store.search.index = -1
             store.search.error = nil
             store.search.fetchedQuery = term
         } catch {
@@ -179,33 +228,36 @@ struct SearchView: View {
 
 private struct HitRow: View {
     let hit: SearchHit
+    let terms: [String]
     let selected: Bool
+    let expanded: Bool
     let onOpen: () -> Void
 
     var body: some View {
         Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: expanded ? 5 : 3) {
                 HStack {
-                    Text(hit.from_name ?? hit.from_addr)
-                        .font(.system(size: 11, weight: .semibold))
+                    Text(highlight(hit.from_name ?? hit.from_addr))
+                        .font(.system(size: expanded ? 13 : 11, weight: .semibold))
                         .foregroundStyle(Palette.ink)
                         .lineLimit(1)
                     Spacer(minLength: 6)
                     Text(Fmt.dateTime(hit.received_at))
-                        .font(Typo.num(10))
+                        .font(Typo.num(expanded ? 11 : 10))
                         .foregroundStyle(Palette.inkFaintest)
                 }
-                Text(hit.subject)
-                    .font(Typo.rowSub)
+                Text(highlight(hit.subject))
+                    .font(expanded ? .system(size: 13) : Typo.rowSub)
                     .foregroundStyle(Palette.inkDim)
-                    .lineLimit(1)
-                Text(hit.snippet)
-                    .font(Typo.micro)
+                    .lineLimit(expanded ? 2 : 1)
+                    .multilineTextAlignment(.leading)
+                Text(highlight(hit.snippet))
+                    .font(expanded ? .system(size: 12) : Typo.micro)
                     .foregroundStyle(Palette.inkFaintest)
-                    .lineLimit(2)
+                    .lineLimit(expanded ? 6 : 2)
                     .multilineTextAlignment(.leading)
             }
-            .padding(10)
+            .padding(expanded ? 16 : 10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
@@ -214,6 +266,24 @@ private struct HitRow: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(selected ? Palette.accentSoft : Palette.hairline.opacity(0.35))
         )
+    }
+
+    /// Paint every case-insensitive occurrence of each query term. Best effort
+    /// by design: the stored snippet is the message HEAD, so a body-deep match
+    /// can produce a legitimately unpainted row.
+    private func highlight(_ text: String) -> AttributedString {
+        var attr = AttributedString(text)
+        for term in terms {
+            var from = attr.startIndex
+            while from < attr.endIndex,
+                let range = attr[from...].range(of: term, options: .caseInsensitive)
+            {
+                attr[range].backgroundColor = Palette.accentSoft
+                attr[range].foregroundColor = Palette.accentInk
+                from = range.upperBound
+            }
+        }
+        return attr
     }
 }
 

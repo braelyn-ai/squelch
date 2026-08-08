@@ -420,7 +420,16 @@ struct ThreadViewer: View {
         [
             // allowInInput matters: a search input underneath may still hold
             // focus (if our focus-steal loses the race).
-            KeyBinding("Escape", "back", allowInInput: true) { store.closeThread() },
+            // With a side panel open beside the reader, Esc sheds the PANEL and
+            // keeps reading — the email is what you chose, the results are what
+            // you came through. A second Esc closes the reader.
+            KeyBinding("Escape", "back", allowInInput: true) {
+                if store.sideView.isOpen {
+                    store.closeSide()
+                } else {
+                    store.closeThread()
+                }
+            },
             // ⌘[ = back, same as Esc — the viewer is a page you navigated into.
             KeyBinding("[", "back", meta: true) { store.closeThread() },
             KeyBinding("h", "prev email") { stepQueue(-1) },

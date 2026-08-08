@@ -89,7 +89,8 @@ enum MailMode: String, Sendable, Hashable, CaseIterable {
 
 /// The side panels. The thread drill-in is NOT one — it is the fullscreen viewer,
 /// layered ABOVE these, so opening a thread from search keeps the panel mounted
-/// underneath and Esc returns to it.
+/// beside it. Esc from the reader sheds the panel first (the email stays up);
+/// the next Esc closes the reader.
 enum SideView: Equatable, Sendable {
     case none
     case browse
@@ -133,7 +134,12 @@ struct SitrepZoneCache: Sendable {
 struct SearchSession: Sendable, Equatable {
     var query = ""
     var hits: [SearchHit] = []
-    var index = 0
+    /// The armed row. -1 = nothing armed, focus semantically in the bar: Enter
+    /// expands the panel instead of opening a hit. ArrowDown arms row 0.
+    var index = -1
+    /// Fullscreen results with larger previews (Enter in the bar). Collapses
+    /// when a hit opens so the results stay in the strip beside the reader.
+    var expanded = false
     var error: String?
     /// The term `hits` actually came from, so reopening on an unchanged query
     /// skips the round-trip. nil = what is on screen is not authoritative (never
@@ -803,6 +809,9 @@ final class AppStore {
             search.query = seed
             search.fetchedQuery = nil
         }
+        // Always reopen as the strip: resuming the query is a convenience,
+        // resuming a fullscreen takeover is a mode trap.
+        search.expanded = false
         sideView = .search
     }
 
