@@ -9,3 +9,7 @@ scripts/rules.backup.json
 .atuin/
 *.tsbuildinfo
 cred.txt
+
+# Signing material must never land in git: Sparkle EdDSA key and Developer ID bundle.
+sparkle-key.txt
+passband/Certificates.p12
