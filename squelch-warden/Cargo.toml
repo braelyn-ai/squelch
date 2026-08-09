@@ -1,0 +1,40 @@
+[package]
+name = "squelch-warden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_warden"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squelch-warden"
+path = "src/bin/squelch-warden.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `created_at` stamps in the state file, RFC3339 like every other timestamp in
+# the repo.
+chrono = { workspace = true }
+# Full-feature axum on the same 0.8 line the rest of the workspace pins.
+axum = { version = "0.8" }
+# Constant-time bearer compare + `Authorization` parse, shared byte-for-byte
+# with the two doors and the relay so a fix to any of them lands in one place.
+squelch-httpauth = { path = "../squelch-httpauth" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Deliberately NOT a dependency: squelch-core. The warden allocates ports,
+# writes files, and drives systemd; it never opens a mailbox store, never parses
+# a token, and never decrypts anything. Linking the core would pull rusqlite,
+# keyring, an ONNX runtime and an embedding model onto the box's provisioner for
+# no reason, and would put mail code in a process that has no business with it.
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

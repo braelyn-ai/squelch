@@ -15,6 +15,10 @@ COPY squelch-mcp ./squelch-mcp
 COPY squelch-tui ./squelch-tui
 COPY squelch-api ./squelch-api
 COPY squelch-broker ./squelch-broker
+# Hosted control plane + VPS provisioner. Neither ships in THIS image, but both
+# are workspace members and cargo refuses to resolve the workspace without them.
+COPY squelch-control ./squelch-control
+COPY squelch-warden ./squelch-warden
 COPY squelchd ./squelchd
 COPY squelch-relay ./squelch-relay
 

@@ -1,0 +1,64 @@
+# Builds squelch-control — the Passband hosted signup control plane. It is the
+# third piece of squelch that runs on shared/public infrastructure: its own
+# Railway service at signup.<base domain>, separate from the APNs relay (root
+# Dockerfile) and the consent broker (Dockerfile.broker). Railway selects this
+# one per-service with RAILWAY_DOCKERFILE_PATH.
+#
+# The build context must be the workspace root: squelch-control is a workspace
+# member and cargo needs the root manifest + lockfile to resolve it.
+#
+# TRIXIE, not bookworm, and not by preference: squelch-control links
+# squelch-core (for StoredToken and the scope constants), which links fastembed
+# -> ort, whose prebuilt static onnxruntime needs glibc >= 2.38. Bookworm's 2.36
+# cannot link it. The same constraint the squelchd image documents.
+
+FROM rust:1-slim-trixie AS builder
+WORKDIR /build
+
+# ort links -lstdc++ and rust:slim ships gcc without g++.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY squelch-core ./squelch-core
+COPY squelch-httpauth ./squelch-httpauth
+COPY squelch-mcp ./squelch-mcp
+COPY squelch-tui ./squelch-tui
+COPY squelch-api ./squelch-api
+COPY squelch-relay ./squelch-relay
+COPY squelch-broker ./squelch-broker
+COPY squelch-control ./squelch-control
+COPY squelch-warden ./squelch-warden
+COPY squelchd ./squelchd
+
+RUN cargo build --release --locked -p squelch-control
+
+FROM debian:trixie-slim
+# rustls everywhere, so the only runtime need is the CA roots for Google's
+# token and Gmail endpoints and for the warden's TLS. Trixie to match the
+# builder's glibc.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --no-create-home control
+
+COPY --from=builder /build/target/release/squelch-control /usr/local/bin/squelch-control
+
+# The control store (tenants + invite hashes) lives on the one mount. There is
+# no token and no ciphertext in it: a stolen volume yields a list of labels and
+# a set of SHA-256 hashes. Owned here for the no-volume case; a mounted volume
+# arrives root-owned and overlays this, which the entrypoint fixes before
+# dropping privileges.
+RUN mkdir -p /data && chown control:control /data
+
+ENV SQUELCH_CONTROL_DB_PATH=/data/control.sqlite3
+
+COPY squelch-control/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Deliberately still root at this point: the entrypoint chowns the mounted
+# volume and then execs the control plane as `control` via setpriv. The server
+# itself never runs privileged.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["serve"]

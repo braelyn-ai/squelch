@@ -1,0 +1,70 @@
+[package]
+name = "squelch-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squelch-control"
+path = "src/bin/squelch-control.rs"
+
+[dependencies]
+# StoredToken (the exact JSON shape the daemon's file backend reads) and the
+# readonly scope constant. Reusing them is the point: the ciphertext this crate
+# writes is opened by squelch-core on the other side, so the shape must come
+# from one place, and "the daemon only ever requests gmail.readonly" must be one
+# constant rather than a string retyped in a second crate.
+squelch-core = { path = "../squelch-core" }
+# Constant-time compare for the bearer we present to the warden and for every
+# secret comparison here. Same primitive as both doors.
+squelch-httpauth = { path = "../squelch-httpauth" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+# The warden client is a trait so tests can stand one up without a VPS, and so
+# a second provisioning backend slots in without touching the handlers.
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+# Full-feature axum on the same 0.8 line the rest of the workspace pins.
+axum = { version = "0.8" }
+tower = "0.5"
+# The confidential-client code exchange. The blocking twin of this lives in
+# squelch-core's `auth` module for `squelchd auth`; a web service cannot block a
+# runtime thread on it, so this crate drives the SAME crate asynchronously
+# rather than hand-rolling a token POST and a response parse.
+oauth2 = { workspace = true }
+reqwest = { workspace = true }
+# The control store: tenants and invite codes. `bundled` (workspace default)
+# links SQLite itself, so the Railway image needs no system libsqlite.
+rusqlite = { workspace = true }
+url = { workspace = true }
+clap = { workspace = true }
+# Sealing the tenant's token to the VPS's age recipient. This crate holds the
+# RECIPIENT (a public key) and never an identity: encrypting is all it can do.
+age = { workspace = true }
+# Invite-code hashes at rest, the PKCE S256 challenge, and the cookie MAC.
+sha2 = "0.10"
+hmac = "0.12"
+# Label validation against the contract's literal regex.
+regex = { workspace = true }
+# OS entropy for session ids, CSRF state, PKCE verifiers, and invite codes.
+# The raw syscall wrapper, like squelch-core: nothing here is seeded or reseeded.
+getrandom = "0.3"
+base64 = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# The signup flow is tested end to end against a MOCK Google and a MOCK warden
+# bound on ephemeral loopback ports, the way squelch-core tests the APNs relay:
+# "the warden receives armor, never a refresh token" is only a real guarantee if
+# it is asserted on the wire.
+axum = { version = "0.8" }

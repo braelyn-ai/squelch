@@ -1,0 +1,50 @@
+# systemd unit for squelch-warden, the hosted tenant provisioner.
+#
+# Install: copy to /etc/systemd/system/warden.service, then
+#   systemctl daemon-reload && systemctl enable --now warden
+# See SETUP.md.
+[Unit]
+Description=squelch-warden (hosted tenant provisioner)
+Documentation=https://github.com/braelyn-ai/squelch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/squelch-warden
+Restart=on-failure
+RestartSec=5
+
+# ROOT, deliberately and narrowly. The warden's whole job is the set of things
+# an unprivileged user cannot do: enable systemd units, write /etc/squelch and
+# /etc/caddy, chown a tenant's data dir to the squelch user. The compensating
+# controls are the bearer token (32+ characters, checked at startup), the
+# loopback bind, and the fact that it drops to the tenant user with setpriv
+# before touching a tenant's SQLite file.
+User=root
+
+# SQUELCH_WARDEN_TOKEN lives here, not in this unit file: a unit file's contents
+# are readable by anyone who can run `systemctl show`.
+EnvironmentFile=/etc/squelch/warden.env
+
+# --- Hardening ---
+# Dropping privilege is still allowed (setpriv lowers, never raises); what this
+# blocks is a setuid binary raising them again.
+NoNewPrivileges=true
+ProtectSystem=strict
+# Exactly the four trees it writes:
+#   /var/lib/squelch      state file + tenant data dirs
+#   /etc/squelch          tenant env files
+#   /etc/caddy/tenants    tenant site files
+#   /etc/systemd/system   the enable symlinks `systemctl enable` creates
+ReadWritePaths=/var/lib/squelch /etc/squelch /etc/caddy/tenants /etc/systemd/system
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

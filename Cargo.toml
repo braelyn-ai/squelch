@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["squelch-core", "squelch-httpauth", "squelch-mcp", "squelch-tui", "squelch-api", "squelch-relay", "squelch-broker", "squelchd"]
+members = ["squelch-core", "squelch-httpauth", "squelch-mcp", "squelch-tui", "squelch-api", "squelch-relay", "squelch-broker", "squelch-control", "squelch-warden", "squelchd"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,15 @@ regex = "1"
 async-trait = "0.1"
 oauth2 = { version = "5", features = ["reqwest", "reqwest-blocking", "rustls-tls"], default-features = false }
 keyring = "4"
+# age (the rage crate) for encryption-at-rest of the file credential backend on
+# HOSTED boxes: the control plane seals a tenant's token blob to this box's
+# recipient before it ever touches a disk we operate, and only the daemon — handed
+# the identity file by systemd — can open it. Self-host never sets the env var and
+# never encrypts. default-features is off deliberately: the defaults are empty, and
+# of the opt-ins we want only `armor`, because the ciphertext travels to the box as
+# text inside a JSON body. No `cli-common` (pinentry/rpassword), no `ssh`, no
+# `plugin` — none of that surface belongs in a daemon.
+age = { version = "0.12", default-features = false, features = ["armor"] }
 # `env` so `squelchd auth --broker` can be set once in a container's environment
 # (SQUELCH_BROKER_URL) instead of on every invocation.
 clap = { version = "4", features = ["derive", "env"] }

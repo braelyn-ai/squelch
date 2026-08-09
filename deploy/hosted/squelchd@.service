@@ -1,0 +1,59 @@
+# systemd TEMPLATE unit: one squelchd instance per hosted tenant.
+#
+#   systemctl enable --now squelchd@alice
+#
+# `%i` is the tenant label, which is also the subdomain, the data-dir name, and
+# the env-file name. squelch-warden renders the env file and then enables the
+# instance; it never writes this file, so an edit here applies to every tenant
+# on the next restart.
+#
+# Install: copy to /etc/systemd/system/squelchd@.service, then
+#   systemctl daemon-reload
+# See SETUP.md for the whole box.
+[Unit]
+Description=squelchd for hosted tenant %i
+Documentation=https://github.com/braelyn-ai/squelch
+After=network-online.target
+Wants=network-online.target
+
+# The env file carries the bind port, the account, and the credential paths.
+# Starting without it would launch a daemon on compiled-in defaults, pointed at
+# nothing, and Caddy would route a tenant's subdomain to it. Refuse instead.
+AssertPathExists=/etc/squelch/tenants/%i.env
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/squelchd serve
+Restart=on-failure
+RestartSec=5
+
+# One unprivileged service account for every tenant daemon (see SETUP.md for
+# what that does and does not isolate).
+User=squelch
+Group=squelch
+
+# Everything tenant-specific: SQUELCH_BIND, SQUELCH_ACCOUNT_EMAIL,
+# SQUELCH_DB_PATH, SQUELCH_CRED_BACKEND=file, SQUELCH_CREDENTIALS_PATH,
+# SQUELCH_CRED_AGE_IDENTITY, HOME. Rendered by squelch-warden at provision time.
+EnvironmentFile=/etc/squelch/tenants/%i.env
+
+# --- Hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+# The ONLY writable path: this tenant's own directory. A daemon that wandered
+# into another tenant's data dir would fail on the write rather than succeed.
+ReadWritePaths=/var/lib/squelch/tenants/%i
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Loopback only (SQUELCH_BIND in the env file); Caddy is the only thing that
+# reaches it. IPAddressAllow is not set here because the daemon makes outbound
+# calls to Google and to Anthropic.
+
+[Install]
+WantedBy=multi-user.target
