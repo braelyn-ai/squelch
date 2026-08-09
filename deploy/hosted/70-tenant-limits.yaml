@@ -1,0 +1,83 @@
+# What one tenant may take, and what all tenants together may take.
+#
+# SIZE THESE TO YOUR BOX BEFORE APPLYING. The numbers below assume the floor in
+# SETUP.md (2 vCPU, 4 GB) and are deliberately conservative; see "Sizing" there.
+#
+# The warden already puts requests and limits on both containers of every tenant
+# pod, so nothing here is what bounds a tenant the warden created. These two
+# objects are the layer under that:
+#
+#   - the LimitRange gives a DEFAULT to anything that lands in this namespace
+#     without bounds of its own (a debug pod, a stuck job, a workload created
+#     with a stolen warden token) and refuses anything asking for more than one
+#     tenant's worth;
+#   - the ResourceQuota bounds the namespace in aggregate, which is the only
+#     thing that stops N tenants from oversubscribing a single-node box into
+#     eviction. It is also the admission control on tenant COUNT: past the
+#     quota, provisioning fails at the API server with a clear reason instead of
+#     succeeding into a box that cannot run what it accepted.
+#
+# A tenant refused by the quota shows up as a provision that times out waiting
+# for a pod (`500 not_ready`), with the reason in
+# `kubectl -n tenants describe replicaset`. That is the signal to add capacity
+# or raise these numbers, in that order.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-defaults
+  namespace: tenants
+spec:
+  limits:
+    - type: Container
+      # What a container gets when it asks for nothing. Matches the warden's
+      # own defaults, so a tenant pod is unaffected by this file.
+      default:
+        cpu: 1000m
+        memory: 1Gi
+        ephemeral-storage: 1Gi
+      defaultRequest:
+        cpu: 100m
+        memory: 256Mi
+        ephemeral-storage: 256Mi
+      # The ceiling nothing in this namespace may exceed. One tenant is not
+      # allowed to ask for the whole box.
+      max:
+        cpu: 2000m
+        memory: 2Gi
+        ephemeral-storage: 2Gi
+      # A floor, so a pod cannot request effectively nothing and then be
+      # scheduled onto a box with nothing left.
+      min:
+        cpu: 10m
+        memory: 16Mi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 50Gi
+      min:
+        storage: 1Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenants
+  namespace: tenants
+spec:
+  hard:
+    # Requests are what the scheduler reserves, so this is the real capacity
+    # number: at the shipped 100m/256Mi per tenant, this is about 20 tenants.
+    requests.cpu: "2"
+    requests.memory: 5Gi
+    requests.ephemeral-storage: 5Gi
+    # Limits may oversubscribe, because tenants are idle most of the time and a
+    # sync burst is short. Do not raise this ratio much past 4x on one node.
+    limits.cpu: "8"
+    limits.memory: 20Gi
+    limits.ephemeral-storage: 20Gi
+    # The mail. Local-path storage is the box's disk, and a claim that cannot
+    # bind is a tenant that never comes up.
+    requests.storage: 200Gi
+    persistentvolumeclaims: "25"
+    # A blunt ceiling on how much can exist here at all. One tenant is one pod,
+    # so this is also the tenant count.
+    pods: "25"
+    count/secrets: "60"

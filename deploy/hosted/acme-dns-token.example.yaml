@@ -1,0 +1,27 @@
+# The DNS provider credential cert-manager solves DNS-01 with.
+#
+# DO NOT apply this file as it stands, and do not commit a filled-in copy. A
+# token with edit rights on your zone in a git repository is a token somebody
+# else can point at your zone. Create it from the command line so the value
+# never reaches a file:
+#
+#     kubectl -n cert-manager create secret generic acme-dns-token \
+#       --from-literal=api-token="<the token>"
+#
+# Cloudflare wants an API TOKEN (not a global key) scoped to Zone:DNS:Edit on
+# this zone alone. Every other provider is the same shape with a different key
+# name; match whatever `40-wildcard-certificate.yaml`'s solver block references.
+#
+# This file exists to document the shape, and as the fallback for a GitOps setup
+# where the value comes from a sealed-secrets or SOPS pipeline.
+#
+# Rotating it: replace the Secret. cert-manager picks the new value up on its
+# next renewal attempt; nothing already issued is affected.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: acme-dns-token
+  namespace: cert-manager
+type: Opaque
+stringData:
+  api-token: REPLACE_ME_WITH_A_ZONE_SCOPED_DNS_EDIT_TOKEN

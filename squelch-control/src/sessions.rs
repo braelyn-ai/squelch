@@ -23,6 +23,25 @@ use std::time::{Duration, Instant};
 /// consent screen. Matches [`crate::cookie::COOKIE_TTL_SECS`].
 pub const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// The only form of a session id allowed to touch the control store: lowercase
+/// hex SHA-256.
+///
+/// The invite reservation has to name the session holding it, and the store's
+/// standing rule is that it keeps hashes rather than credentials. Equality is
+/// all a reservation ever asks of this value, so the preimage never needs to
+/// leave memory.
+pub fn fingerprint(sid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    Sha256::digest(sid.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut out, b| {
+            // Writing to a String cannot fail.
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
 /// Hard ceiling on live sessions. Signup is rate limited per client, but the
 /// table must be bounded by something that does not depend on the limiter's
 /// identity model being right: past this, new signups are refused with a "try
@@ -172,6 +191,18 @@ mod tests {
         let later = now + SESSION_TTL + Duration::from_secs(1);
         assert_eq!(s.sweep(later), 1);
         assert_eq!(s.len(), 1);
+    }
+
+    /// The fingerprint is stable, distinct per session, and not the id itself:
+    /// what the control store holds must not be usable as a session id.
+    #[test]
+    fn a_session_fingerprint_hides_its_id() {
+        let a = fingerprint("a-session-id");
+        assert_eq!(a, fingerprint("a-session-id"));
+        assert_ne!(a, fingerprint("another-session-id"));
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!a.contains("a-session-id"));
     }
 
     #[test]

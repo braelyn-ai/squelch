@@ -1,17 +1,38 @@
-//! Test doubles for the two host traits, plus the fixtures every test module
-//! builds on.
+//! The test double for [`crate::cluster::Cluster`], plus the fixtures every
+//! test module builds on.
 //!
-//! Compiled only under `cfg(test)`: a provisioner that shipped a fake
-//! filesystem in its release binary would be one refactor away from using it.
-//! Unit tests must not require systemd, a Caddy, a squelchd, or root, so every
-//! test in this crate runs against these.
+//! Compiled only under `cfg(test)`: a provisioner that shipped a fake cluster
+//! in its release binary would be one refactor away from using it. Nothing in
+//! this crate's suite needs a kube-apiserver, a kubeconfig, a container
+//! runtime, or a network, and this file is why.
+//!
+//! [`MockCluster`] imitates the two API-server behaviours the warden actually
+//! depends on, rather than pretending to be Kubernetes:
+//!
+//! - `stringData` on a Secret is stored as `data`. A mock that echoed
+//!   `stringData` back would let a reader that looks at the wrong field pass
+//!   here and find nothing on a real cluster.
+//! - a Deployment that has been applied reports a ready replica, unless the
+//!   test says otherwise. That is what makes `pending` / `active` / `failed`
+//!   testable without a scheduler.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::config::{Config, DEFAULT_BIND, DEFAULT_PORT_BASE};
-use crate::host::{Cmd, CmdOutput, CommandRunner, Fs, HostError};
+use async_trait::async_trait;
+use k8s_openapi::ByteString;
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
+use k8s_openapi::api::core::v1::Secret;
+
+use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object};
+use crate::config::{
+    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST, DEFAULT_EPHEMERAL_LIMIT,
+    DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS, DEFAULT_INGRESS_NAMESPACE,
+    DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_OAUTH_SECRET_NAME,
+    DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS, DEFAULT_STORAGE_SIZE,
+    DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
+};
 use crate::provision::Warden;
 
 /// The bearer every test presents.
@@ -23,34 +44,48 @@ pub fn test_config() -> Config {
         bind: DEFAULT_BIND.parse().unwrap(),
         token: TEST_TOKEN.to_string(),
         base_domain: "passband.email".to_string(),
-        state_dir: PathBuf::from("/var/lib/squelch/warden"),
-        tenants_dir: PathBuf::from("/var/lib/squelch/tenants"),
-        env_dir: PathBuf::from("/etc/squelch/tenants"),
-        caddy_dir: PathBuf::from("/etc/caddy/tenants"),
-        squelchd_bin: PathBuf::from("/usr/local/bin/squelchd"),
-        setpriv_bin: PathBuf::from("/usr/bin/setpriv"),
-        systemctl_bin: PathBuf::from("/usr/bin/systemctl"),
-        chown_bin: PathBuf::from("/usr/bin/chown"),
-        age_identity: PathBuf::from("/etc/squelch/age/identity.txt"),
-        tenant_user: "squelch".to_string(),
-        caddy_unit: "caddy".to_string(),
-        port_base: DEFAULT_PORT_BASE,
+        image: "ghcr.io/braelyn-ai/squelchd:v0.4.0".to_string(),
+        namespace: DEFAULT_TENANT_NAMESPACE.to_string(),
+        ingress_namespace: DEFAULT_INGRESS_NAMESPACE.to_string(),
+        ingress_pod_label: ("app.kubernetes.io/name".to_string(), "traefik".to_string()),
+        ingress_class: DEFAULT_INGRESS_CLASS.to_string(),
+        tls_secret: DEFAULT_TLS_SECRET.to_string(),
+        oauth_secret_name: DEFAULT_OAUTH_SECRET_NAME.to_string(),
+        storage_class: DEFAULT_STORAGE_CLASS.to_string(),
+        storage_size: DEFAULT_STORAGE_SIZE.to_string(),
+        daemon_resources: Resources {
+            cpu_request: DEFAULT_CPU_REQUEST.to_string(),
+            cpu_limit: DEFAULT_CPU_LIMIT.to_string(),
+            memory_request: DEFAULT_MEMORY_REQUEST.to_string(),
+            memory_limit: DEFAULT_MEMORY_LIMIT.to_string(),
+            ephemeral_request: DEFAULT_EPHEMERAL_REQUEST.to_string(),
+            ephemeral_limit: DEFAULT_EPHEMERAL_LIMIT.to_string(),
+        },
+        tmp_size: DEFAULT_TMP_SIZE.to_string(),
+        pull_secret: None,
+        user_namespaces: true,
+        model_pvc: None,
+        node_cidr: None,
+        run_as: DEFAULT_RUN_AS,
+        ready_timeout: Duration::from_secs(1),
+        pending_ttl: Duration::from_secs(DEFAULT_PENDING_TTL_SECS),
+        trusted_proxy_hops: 0,
     }
 }
 
 /// An age-armored body of the shape the control plane sends. Not real
-/// ciphertext — the warden never decrypts, so nothing in these tests needs it
-/// to be.
+/// ciphertext: the warden never decrypts, so nothing in these tests needs it to
+/// be.
 pub fn armored(marker: &str) -> String {
     format!(
         "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3Yx{marker}\n-----END AGE ENCRYPTED FILE-----\n"
     )
 }
 
-/// Exactly what `squelchd pair --url ...` prints on stdout today (see
-/// `squelchd/src/bin/squelchd.rs::cmd_pair`). The parser is held to this, so
-/// when the daemon's output changes this string is the thing to change first
-/// and watch fail.
+/// Exactly what `squelchd pair --url ...` prints today, captured from
+/// `squelchd/src/bin/squelchd.rs::cmd_pair`. The parser is held to this string,
+/// so when the daemon's output changes this is the thing to change first and
+/// watch fail.
 pub fn pair_stdout(code: &str, url: &str) -> String {
     format!(
         "Pairing code: {code}\n\
@@ -66,235 +101,275 @@ pub fn pair_stdout(code: &str, url: &str) -> String {
 }
 
 #[derive(Default)]
-struct MockFsInner {
-    files: BTreeMap<PathBuf, (Vec<u8>, u32)>,
-    dirs: BTreeMap<PathBuf, u32>,
-    busy_ports: BTreeSet<u16>,
-    /// Any write whose path contains one of these substrings fails.
-    fail_writes: Vec<String>,
+struct MockInner {
+    /// Everything that currently exists, keyed the way the API server keys it.
+    objects: BTreeMap<(Kind, String), Object>,
+    /// Every apply and create, in order.
+    applied: Vec<(Kind, String)>,
+    /// Every delete, in order.
+    deleted: Vec<(Kind, String)>,
+    execs: Vec<(String, Vec<String>)>,
+    exec_stdout: String,
+    exec_ok: bool,
+    /// Whether an applied Deployment comes up.
+    ready: bool,
+    /// Whether reads answer at all.
+    reads_ok: bool,
+    /// Whether the next `create` loses a race with a concurrent one.
+    create_loses_race: bool,
 }
 
-/// An in-memory filesystem that remembers modes.
-#[derive(Default)]
-pub struct MockFs {
-    inner: Mutex<MockFsInner>,
+/// A cluster that records instead of connecting.
+pub struct MockCluster {
+    inner: Mutex<MockInner>,
 }
 
-impl MockFs {
+impl Default for MockCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockCluster {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(MockInner {
+                exec_stdout: pair_stdout("ABCD-1234", "https://alice.passband.email"),
+                exec_ok: true,
+                ready: true,
+                reads_ok: true,
+                ..Default::default()
+            }),
+        }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, MockFsInner> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, MockInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Make `port` look occupied by something outside the warden's bookkeeping.
-    pub fn occupy_port(&self, port: u16) {
-        self.lock().busy_ports.insert(port);
+    /// Pods stop coming up. A Deployment already stored keeps whatever status
+    /// it was last applied with, exactly as a real one would: a Deployment's
+    /// status changes when the cluster changes it, not when a flag flips.
+    pub fn never_ready(&self) {
+        self.lock().ready = false;
     }
 
-    /// Make every write to a path containing `needle` fail.
-    pub fn fail_writes_containing(&self, needle: &str) {
-        self.lock().fail_writes.push(needle.to_string());
+    /// The cluster recovers. The next apply of a Deployment records a ready
+    /// replica; one applied while it was broken still reads as not ready until
+    /// something applies it again, which is what makes the retry path testable.
+    pub fn becomes_ready(&self) {
+        self.lock().ready = true;
     }
 
-    /// The bytes and mode at `path`, if anything is there.
-    pub fn file(&self, path: &Path) -> Option<(Vec<u8>, u32)> {
-        self.lock().files.get(path).cloned()
+    /// Every read fails, as a partitioned API server would.
+    pub fn break_reads(&self) {
+        self.lock().reads_ok = false;
     }
 
-    /// The file at `path` as a string.
-    pub fn text(&self, path: &Path) -> Option<String> {
-        self.file(path)
-            .map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned())
+    /// The next `create` loses a race, the way a second signup for one label
+    /// does: the read said the name was free and the write says it is not.
+    /// The only way to reach that path, since the mock is otherwise serialized.
+    pub fn create_loses_race(&self) {
+        self.lock().create_loses_race = true;
     }
 
-    /// The mode a directory was created with.
-    pub fn dir_mode(&self, path: &Path) -> Option<u32> {
-        self.lock().dirs.get(path).copied()
+    /// What the next `squelchd pair` prints.
+    pub fn exec_prints(&self, stdout: &str) {
+        let mut inner = self.lock();
+        inner.exec_stdout = stdout.to_string();
+        inner.exec_ok = true;
     }
 
-    /// Every path that currently holds bytes, for "nothing was left behind"
-    /// assertions.
-    pub fn paths(&self) -> Vec<PathBuf> {
-        self.lock().files.keys().cloned().collect()
+    /// The next exec exits non-zero.
+    pub fn exec_fails(&self) {
+        self.lock().exec_ok = false;
+    }
+
+    /// Every apply and create, in order, as `(kind, name)`.
+    pub fn applied(&self) -> Vec<(Kind, String)> {
+        self.lock().applied.clone()
+    }
+
+    /// Just the names, for the phase-one assertions.
+    pub fn applied_names(&self) -> Vec<String> {
+        self.lock()
+            .applied
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    /// Every delete, in order.
+    pub fn deleted(&self) -> Vec<(Kind, String)> {
+        self.lock().deleted.clone()
+    }
+
+    /// The typed object currently stored under `(kind, name)`.
+    pub fn object(&self, kind: Kind, name: &str) -> Option<Object> {
+        self.lock().objects.get(&(kind, name.to_string())).cloned()
+    }
+
+    pub fn exists(&self, kind: Kind, name: &str) -> bool {
+        self.object(kind, name).is_some()
+    }
+
+    /// The stored Secret, with `data` populated the way the API server would.
+    pub fn secret(&self, name: &str) -> Option<Secret> {
+        match self.object(Kind::Secret, name) {
+            Some(Object::Secret(secret)) => Some(*secret),
+            _ => None,
+        }
+    }
+
+    /// The last `(pod, argv)` an exec ran with.
+    pub fn last_exec(&self) -> Option<(String, Vec<String>)> {
+        self.lock().execs.last().cloned()
+    }
+
+    fn store(&self, object: Object) {
+        let mut inner = self.lock();
+        let key = (object.kind(), object.name().to_string());
+        let ready = inner.ready;
+        inner.applied.push(key.clone());
+        inner.objects.insert(key, persist(object, ready));
     }
 }
 
-impl Fs for MockFs {
-    fn create_dir(&self, path: &Path, mode: u32) -> Result<(), HostError> {
-        self.lock().dirs.insert(path.to_path_buf(), mode);
-        Ok(())
-    }
-
-    fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<(), HostError> {
-        let mut inner = self.lock();
-        let display = path.to_string_lossy().into_owned();
-        if inner.fail_writes.iter().any(|n| display.contains(n)) {
-            return Err(HostError::Io {
-                op: "writing",
-                path: path.to_path_buf(),
-                source: std::io::Error::other("mock write failure"),
+/// Imitate the API server: `stringData` is folded into `data`, and an applied
+/// Deployment gets the status a running one would have.
+fn persist(object: Object, ready: bool) -> Object {
+    match object {
+        Object::Secret(mut secret) => {
+            if let Some(string_data) = secret.string_data.take() {
+                let data = secret.data.get_or_insert_with(BTreeMap::new);
+                for (key, value) in string_data {
+                    data.insert(key, ByteString(value.into_bytes()));
+                }
+            }
+            Object::Secret(secret)
+        }
+        Object::Deployment(mut deployment) => {
+            deployment.status = Some(DeploymentStatus {
+                ready_replicas: Some(i32::from(ready)),
+                ..Default::default()
             });
+            Object::Deployment(deployment)
         }
-        inner
-            .files
-            .insert(path.to_path_buf(), (bytes.to_vec(), mode));
+        other => other,
+    }
+}
+
+#[async_trait]
+impl Cluster for MockCluster {
+    async fn apply(&self, object: Object) -> Result<(), ClusterError> {
+        self.store(object);
         Ok(())
     }
 
-    fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>, HostError> {
-        Ok(self.lock().files.get(path).map(|(b, _)| b.clone()))
-    }
-
-    fn remove_file(&self, path: &Path) -> Result<(), HostError> {
-        self.lock().files.remove(path);
+    async fn create(&self, object: Object) -> Result<(), ClusterError> {
+        if self.lock().create_loses_race || self.exists(object.kind(), object.name()) {
+            return Err(ClusterError::AlreadyExists);
+        }
+        self.store(object);
         Ok(())
     }
 
-    fn remove_dir_all(&self, path: &Path) -> Result<(), HostError> {
+    async fn get_secret(&self, name: &str) -> Result<Option<Secret>, ClusterError> {
+        if !self.lock().reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        Ok(self.secret(name))
+    }
+
+    async fn list_secrets(&self, selector: &str) -> Result<Vec<Secret>, ClusterError> {
+        if !self.lock().reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        // The API server matches labels; so does this, on the one selector the
+        // warden ever sends.
+        let (key, value) = selector.split_once('=').ok_or(ClusterError::NoPod)?;
+        Ok(self
+            .lock()
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                Object::Secret(secret) => Some(secret.as_ref().clone()),
+                _ => None,
+            })
+            .filter(|secret| {
+                secret
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(key))
+                    .is_some_and(|v| v == value)
+            })
+            .collect())
+    }
+
+    async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError> {
+        if !self.lock().reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        Ok(match self.object(Kind::Deployment, name) {
+            Some(Object::Deployment(deployment)) => Some(*deployment),
+            _ => None,
+        })
+    }
+
+    async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
         let mut inner = self.lock();
-        inner.dirs.retain(|p, _| !p.starts_with(path));
-        inner.files.retain(|p, _| !p.starts_with(path));
+        inner.deleted.push((kind, name.to_string()));
+        inner.objects.remove(&(kind, name.to_string()));
         Ok(())
     }
 
-    fn exists(&self, path: &Path) -> bool {
-        let inner = self.lock();
-        inner.files.contains_key(path) || inner.dirs.contains_key(path)
+    async fn ready_pod(&self, selector: &str, within: Duration) -> Result<String, ClusterError> {
+        if !self.lock().ready {
+            return Err(ClusterError::Timeout(within));
+        }
+        // The name a ReplicaSet would have given it, derived from the selector
+        // so a test can tell one tenant's pod from another's.
+        let instance = selector
+            .split(',')
+            .find_map(|part| part.strip_prefix("app.kubernetes.io/instance="))
+            .ok_or(ClusterError::NoPod)?;
+        Ok(format!("{instance}-abc123"))
     }
 
-    fn port_free(&self, port: u16) -> bool {
-        !self.lock().busy_ports.contains(&port)
-    }
-}
-
-#[derive(Default)]
-struct MockRunnerInner {
-    calls: Vec<Cmd>,
-    /// First matching substring wins, so a test can script the pair exec
-    /// without naming its whole command line.
-    scripted: Vec<(String, CmdOutput)>,
-    /// Commands containing one of these exit non-zero.
-    fail: Vec<String>,
-    /// Commands containing one of these fail to spawn at all.
-    unspawnable: Vec<String>,
-}
-
-/// A command runner that records instead of running.
-#[derive(Default)]
-pub struct MockRunner {
-    inner: Mutex<MockRunnerInner>,
-}
-
-impl MockRunner {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, MockRunnerInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Answer any command containing `needle` with `out`.
-    pub fn script(&self, needle: &str, out: CmdOutput) {
-        self.lock().scripted.push((needle.to_string(), out));
-    }
-
-    /// Script the pair exec with the daemon's real output shape.
-    pub fn script_pair(&self, code: &str, url: &str) {
-        self.script("squelchd pair", CmdOutput::success(pair_stdout(code, url)));
-    }
-
-    /// Make any command containing `needle` exit 1.
-    pub fn fail_on(&self, needle: &str) {
-        self.lock().fail.push(needle.to_string());
-    }
-
-    /// Stop failing anything: for a test that breaks the box, watches the
-    /// unwind, and then wants to prove the tenant can be provisioned again.
-    pub fn clear_failures(&self) {
+    async fn exec(&self, pod: &str, argv: &[String]) -> Result<ExecOutput, ClusterError> {
         let mut inner = self.lock();
-        inner.fail.clear();
-        inner.unspawnable.clear();
-    }
-
-    /// Make any command containing `needle` fail to spawn.
-    pub fn unspawnable(&self, needle: &str) {
-        self.lock().unspawnable.push(needle.to_string());
-    }
-
-    /// Every command run so far, as `program arg arg`.
-    pub fn calls(&self) -> Vec<String> {
-        self.lock().calls.iter().map(Cmd::display).collect()
-    }
-
-    /// The full recorded commands, for a test that needs to see the child
-    /// environment the provisioner built.
-    pub fn raw_calls(&self) -> Vec<Cmd> {
-        self.lock().calls.clone()
+        inner.execs.push((pod.to_string(), argv.to_vec()));
+        Ok(ExecOutput {
+            stdout: inner.exec_stdout.clone(),
+            stderr: String::new(),
+            ok: inner.exec_ok,
+        })
     }
 }
 
-impl CommandRunner for MockRunner {
-    fn run(&self, cmd: &Cmd) -> Result<CmdOutput, HostError> {
-        let mut inner = self.lock();
-        let display = cmd.display();
-        inner.calls.push(cmd.clone());
-        if inner.unspawnable.iter().any(|n| display.contains(n)) {
-            return Err(HostError::Spawn {
-                program: cmd.program.clone(),
-                source: std::io::Error::other("mock spawn failure"),
-            });
-        }
-        if inner.fail.iter().any(|n| display.contains(n)) {
-            return Ok(CmdOutput {
-                code: Some(1),
-                stdout: String::new(),
-                stderr: "mock failure".to_string(),
-            });
-        }
-        // Newest script wins, so a test can re-script a command it already
-        // scripted (a second pairing, say) without clearing the first.
-        if let Some((_, out)) = inner.scripted.iter().rev().find(|(n, _)| display.contains(n)) {
-            return Ok(out.clone());
-        }
-        Ok(CmdOutput::success(""))
-    }
-}
-
-/// A warden wired to mocks, with the mocks kept for assertions.
+/// A warden wired to a mock cluster, with the mock kept for assertions.
 pub struct Harness {
     pub warden: Arc<Warden>,
-    pub fs: Arc<MockFs>,
-    pub runner: Arc<MockRunner>,
+    pub cluster: Arc<MockCluster>,
     pub config: Arc<Config>,
 }
 
 impl Harness {
-    /// A harness whose pair exec answers with `code`.
     pub fn new() -> Self {
         Self::with_config(test_config())
     }
 
     pub fn with_config(config: Config) -> Self {
-        let fs = Arc::new(MockFs::new());
-        let runner = Arc::new(MockRunner::new());
-        runner.script_pair("ABCD-1234", "https://alice.passband.email");
-        // A box where everything provisioned is running, which is what a test
-        // that is not about systemd wants to assume.
-        runner.script("is-active", CmdOutput::success("active\n"));
+        let cluster = Arc::new(MockCluster::new());
         let config = Arc::new(config);
         let warden = Arc::new(Warden::new(
             config.clone(),
-            fs.clone() as Arc<dyn Fs>,
-            runner.clone() as Arc<dyn CommandRunner>,
+            cluster.clone() as Arc<dyn Cluster>,
         ));
         Self {
             warden,
-            fs,
-            runner,
+            cluster,
             config,
         }
     }

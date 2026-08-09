@@ -9,16 +9,20 @@
 //! one short statement.
 //!
 //! WHAT IS NOT IN THIS SCHEMA IS THE POINT: no tokens, no ciphertext, no
-//! authorization codes, no invite plaintext. The refresh token this service
+//! authorization codes, no invite plaintext, and no session ids (the invite
+//! reservation names its holder by fingerprint, which is all equality needs).
+//! The refresh token this service
 //! handles lives in memory for the length of one request and leaves as age
-//! armor addressed to the VPS. There is nothing at rest on Railway that opens a
+//! armor addressed to one tenant. There is nothing at rest on Railway that opens a
 //! mailbox.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::invites::DEFAULT_TTL_DAYS;
 
 /// How long a connection waits out another writer before giving up. There is
 /// exactly one process on this file, so this only ever covers the store's own
@@ -45,13 +49,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_active_email
     ON tenants(account_email) WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS invite_codes (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    code_hash     TEXT NOT NULL UNIQUE,
-    created_at    TEXT NOT NULL,
-    used_at       TEXT,
-    used_by_label TEXT
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_hash      TEXT NOT NULL UNIQUE,
+    created_at     TEXT NOT NULL,
+    -- When the code stops being usable, whether or not anyone spent it.
+    expires_at     TEXT,
+    used_at        TEXT,
+    used_by_label  TEXT,
+    -- The signup session currently holding this code, by fingerprint, and until
+    -- when. A live reservation makes the code unavailable to every other
+    -- session; it self-releases when `reserved_until` passes.
+    reserved_by    TEXT,
+    reserved_until TEXT
 );
 ";
+
+/// Columns added to `invite_codes` after the first deployment, with the type
+/// each is declared with. A store opened from an older file gets them here
+/// rather than needing a migration tool: `CREATE TABLE IF NOT EXISTS` above
+/// leaves an existing table exactly as it found it.
+const ADDED_COLUMNS: [(&str, &str); 3] = [
+    ("expires_at", "TEXT"),
+    ("reserved_by", "TEXT"),
+    ("reserved_until", "TEXT"),
+];
 
 /// Store errors. `Sqlite` carries rusqlite's message, which never contains a
 /// code or a token: the only values bound into these statements are hashes,
@@ -81,6 +102,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct InviteRow {
     pub id: i64,
     pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
     pub used_at: Option<DateTime<Utc>>,
     pub used_by_label: Option<String>,
 }
@@ -121,6 +143,7 @@ impl ControlStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -135,40 +158,113 @@ impl ControlStore {
 
     // ---- invite codes ----------------------------------------------------
 
-    /// Record a freshly minted code by hash. The plaintext never comes here.
-    pub fn insert_invite(&self, code_hash: &str) -> Result<i64> {
+    /// Record a freshly minted code by hash, with the moment it stops working.
+    /// The plaintext never comes here.
+    pub fn insert_invite(&self, code_hash: &str, expires_at: DateTime<Utc>) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO invite_codes(code_hash, created_at) VALUES(?1, ?2)",
-            params![code_hash, Utc::now().to_rfc3339()],
+            "INSERT INTO invite_codes(code_hash, created_at, expires_at) VALUES(?1, ?2, ?3)",
+            params![code_hash, stamp(Utc::now()), stamp(expires_at)],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    /// The id of an UNSPENT code with this hash, or `None`.
+    /// The id of an AVAILABLE code with this hash, or `None`.
     ///
-    /// One answer for every failure: no such code, already used, and revoked
-    /// are indistinguishable here by construction, so the route above cannot
-    /// become an oracle that tells a guesser which of those they hit.
-    pub fn find_unused_invite(&self, code_hash: &str) -> Result<Option<i64>> {
+    /// Available means: not spent, not expired, and not held by another
+    /// session's live reservation. One answer for every failure, so the route
+    /// above cannot become an oracle that tells a guesser which of those they
+    /// hit.
+    ///
+    /// This is a GATE, not a claim: it spends nothing, and it exists so a
+    /// nonsense code costs a point lookup instead of a round trip to the
+    /// warden. [`Self::reserve_invite`] re-checks all three conditions in the
+    /// statement that actually takes the code.
+    pub fn find_available_invite(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
         Ok(self
             .lock()
             .query_row(
-                "SELECT id FROM invite_codes WHERE code_hash = ?1 AND used_at IS NULL",
-                params![code_hash],
+                "SELECT id FROM invite_codes
+                  WHERE code_hash = ?1
+                    AND used_at IS NULL
+                    AND (expires_at IS NULL OR expires_at > ?2)
+                    AND (reserved_until IS NULL OR reserved_until <= ?2)",
+                params![code_hash, stamp(now)],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?)
     }
 
-    /// Spend a code, atomically. The `used_at IS NULL` predicate is the
-    /// single-use guarantee: two requests that both passed
-    /// [`Self::find_unused_invite`] race here, and exactly one updates a row.
-    pub fn consume_invite(&self, id: i64, label: &str) -> Result<()> {
+    /// Hold an available code for one signup session until `until`, atomically.
+    ///
+    /// THE CHECK AND THE HOLD ARE ONE STATEMENT, and that is the whole point: a
+    /// code is checked when the form is posted and spent only when provisioning
+    /// has succeeded, minutes later at Google's callback. Without a hold taken
+    /// in the same breath as the check, one code posted from N tabs passes N
+    /// checks and provisions N tenants, and only the last consume loses.
+    ///
+    /// `holder` identifies the session, so nobody else can release or spend what
+    /// this session is holding. The hold self-releases once `until` passes,
+    /// which is what stops an abandoned signup from burning a code.
+    pub fn reserve_invite(
+        &self,
+        code_hash: &str,
+        holder: &str,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "UPDATE invite_codes SET reserved_by = ?2, reserved_until = ?3
+                  WHERE code_hash = ?1
+                    AND used_at IS NULL
+                    AND (expires_at IS NULL OR expires_at > ?4)
+                    AND (reserved_until IS NULL OR reserved_until <= ?4)
+                RETURNING id",
+                params![code_hash, holder, stamp(until), stamp(now)],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Hand back a held code without spending it, so the person holding it can
+    /// start again immediately rather than waiting out the reservation.
+    ///
+    /// Only the holder can release: a reservation that has already expired and
+    /// been taken by somebody else must not be torn out from under them by a
+    /// late failure path. Returns whether this holder was still the one holding
+    /// it.
+    pub fn release_invite(&self, id: i64, holder: &str) -> Result<bool> {
         let changed = self.lock().execute(
-            "UPDATE invite_codes SET used_at = ?1, used_by_label = ?2
-             WHERE id = ?3 AND used_at IS NULL",
-            params![Utc::now().to_rfc3339(), label, id],
+            "UPDATE invite_codes SET reserved_by = NULL, reserved_until = NULL
+             WHERE id = ?1 AND reserved_by = ?2 AND used_at IS NULL",
+            params![id, holder],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Spend a code the caller is holding, atomically.
+    ///
+    /// `used_at IS NULL` is the single-use guarantee and `reserved_by = holder`
+    /// is the reservation one: a session may only spend the code it took, so a
+    /// consume cannot succeed for a signup that never held it.
+    ///
+    /// Deliberately NOT checking `reserved_until`: the hold is taken for the
+    /// session's lifetime and provisioning finishes at the far end of it, so a
+    /// consume that arrives a moment late still spends the code it holds. The
+    /// only thing that can take it away is another session reserving it after
+    /// the hold lapsed.
+    pub fn consume_invite(&self, id: i64, label: &str, holder: &str) -> Result<()> {
+        let changed = self.lock().execute(
+            "UPDATE invite_codes
+                SET used_at = ?1, used_by_label = ?2, reserved_by = NULL, reserved_until = NULL
+              WHERE id = ?3 AND used_at IS NULL AND reserved_by = ?4",
+            params![stamp(Utc::now()), label, id, holder],
         )?;
         if changed == 1 {
             Ok(())
@@ -181,14 +277,16 @@ impl ControlStore {
     pub fn list_invites(&self) -> Result<Vec<InviteRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, created_at, used_at, used_by_label FROM invite_codes ORDER BY id DESC",
+            "SELECT id, created_at, expires_at, used_at, used_by_label
+               FROM invite_codes ORDER BY id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(InviteRow {
                 id: r.get(0)?,
                 created_at: parse_ts(r.get::<_, String>(1)?),
-                used_at: r.get::<_, Option<String>>(2)?.map(parse_ts),
-                used_by_label: r.get(3)?,
+                expires_at: r.get::<_, Option<String>>(2)?.map(parse_ts),
+                used_at: r.get::<_, Option<String>>(3)?.map(parse_ts),
+                used_by_label: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -251,7 +349,7 @@ impl ControlStore {
         let res = conn.execute(
             "INSERT INTO tenants(label, account_email, status, created_at)
              VALUES(?1, ?2, ?3, ?4)",
-            params![label, email, STATUS_ACTIVE, Utc::now().to_rfc3339()],
+            params![label, email, STATUS_ACTIVE, stamp(Utc::now())],
         );
         match res {
             Ok(_) => Ok(()),
@@ -292,11 +390,75 @@ impl ControlStore {
     }
 }
 
+/// Bring an older store's `invite_codes` up to the schema above.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it found it,
+/// so a file written before expiry and reservations existed needs its new
+/// columns added by hand. Adding a column is the only migration shape this
+/// schema has ever needed; anything bigger would want a real tool.
+fn migrate(conn: &Connection) -> Result<()> {
+    let existing: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(invite_codes)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        names.collect::<rusqlite::Result<_>>()?
+    };
+    for (name, ty) in ADDED_COLUMNS {
+        if !existing.contains(name) {
+            // The name and type are this file's own constants, never input.
+            conn.execute(
+                &format!("ALTER TABLE invite_codes ADD COLUMN {name} {ty}"),
+                [],
+            )?;
+        }
+    }
+    backfill_expiry(conn)
+}
+
+/// Give every outstanding code minted before expiry existed one, counted from
+/// when it was issued.
+///
+/// Backfilled rather than left NULL because a code with no expiry is exactly the
+/// thing expiry was added to stop: one that sits in a stolen table of hashes for
+/// as long as the attacker needs. Done in Rust rather than SQL so the stamp
+/// written here has the same shape as every other stamp in the column, which the
+/// availability checks compare as strings.
+///
+/// A row whose `created_at` will not parse is corrupt, and [`parse_ts`] dates it
+/// to the epoch, so it expires immediately. That is the conservative direction:
+/// a code nobody can account for stops working.
+fn backfill_expiry(conn: &Connection) -> Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at FROM invite_codes
+              WHERE expires_at IS NULL AND used_at IS NULL",
+        )?;
+        let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        it.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, created_at) in rows {
+        let expires = parse_ts(created_at) + chrono::Duration::days(DEFAULT_TTL_DAYS);
+        conn.execute(
+            "UPDATE invite_codes SET expires_at = ?1 WHERE id = ?2",
+            params![stamp(expires), id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Gmail addresses are compared case-insensitively, so the column stores one
 /// spelling. Without this the "one mailbox, one daemon" index is defeated by
 /// capitalizing a letter.
 fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+/// The one shape a timestamp is written in: RFC3339, UTC, milliseconds, `Z`.
+/// FIXED WIDTH ON PURPOSE. `expires_at` and `reserved_until` are compared
+/// against a bound `now` by SQLite, which compares TEXT byte by byte, so two
+/// spellings of the same instant would order wrongly and a live code would read
+/// as expired.
+fn stamp(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// A stored RFC3339 stamp. These are written by this crate a line above, so a
@@ -317,20 +479,163 @@ mod tests {
         ControlStore::open_in_memory().unwrap()
     }
 
+    /// `now`, truncated to the precision the column stores, so a test can
+    /// compare a stamp it wrote against one it read back.
+    fn now() -> DateTime<Utc> {
+        parse_ts(stamp(Utc::now()))
+    }
+
+    fn days(n: i64) -> chrono::Duration {
+        chrono::Duration::days(n)
+    }
+
+    /// Mint, store, and hold a code the way one signup does.
+    fn held(s: &ControlStore, holder: &str) -> (String, i64) {
+        let m = invites::mint().unwrap();
+        let now = now();
+        s.insert_invite(&m.code_hash, now + days(DEFAULT_TTL_DAYS))
+            .unwrap();
+        let id = s
+            .reserve_invite(&m.code_hash, holder, now, now + days(1))
+            .unwrap()
+            .expect("a fresh code is available");
+        (m.code_hash, id)
+    }
+
+    /// What the reservation columns say about a row, for the assertions that
+    /// care that a hold was actually cleared rather than merely ignored.
+    fn reservation(s: &ControlStore, id: i64) -> (Option<String>, Option<String>) {
+        s.lock()
+            .query_row(
+                "SELECT reserved_by, reserved_until FROM invite_codes WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn an_invite_is_spent_exactly_once() {
         let s = store();
-        let m = invites::mint().unwrap();
-        let id = s.insert_invite(&m.code_hash).unwrap();
+        let (code_hash, id) = held(&s, "session-a");
 
-        assert_eq!(s.find_unused_invite(&m.code_hash).unwrap(), Some(id));
-        s.consume_invite(id, "ada").unwrap();
+        s.consume_invite(id, "ada", "session-a").unwrap();
         // Both the lookup and a second consume refuse.
-        assert_eq!(s.find_unused_invite(&m.code_hash).unwrap(), None);
+        assert_eq!(s.find_available_invite(&code_hash, now()).unwrap(), None);
         assert!(matches!(
-            s.consume_invite(id, "grace"),
+            s.consume_invite(id, "grace", "session-a"),
             Err(StoreError::InviteUnavailable)
         ));
+    }
+
+    /// THE RACE F1 IS ABOUT: one code, two tabs. The second session is refused
+    /// at the door instead of walking on to provision a second tenant with a
+    /// code that only the first will manage to spend.
+    #[test]
+    fn a_held_code_is_unavailable_to_every_other_session() {
+        let s = store();
+        let (code_hash, id) = held(&s, "session-a");
+        let now = now();
+
+        assert_eq!(
+            s.reserve_invite(&code_hash, "session-b", now, now + days(1))
+                .unwrap(),
+            None,
+            "a second session cannot take a held code"
+        );
+        assert_eq!(
+            s.find_available_invite(&code_hash, now).unwrap(),
+            None,
+            "and the gate says so too"
+        );
+        // The holder still has it: nothing about the refusal moved the hold.
+        let (by, _) = reservation(&s, id);
+        assert_eq!(by.as_deref(), Some("session-a"));
+    }
+
+    /// A signup abandoned at Google costs the code nothing beyond the session's
+    /// own lifetime: the hold lapses and the next attempt takes it.
+    #[test]
+    fn a_lapsed_hold_frees_the_code() {
+        let s = store();
+        let (code_hash, id) = held(&s, "session-a");
+        let later = now() + days(2);
+
+        assert_eq!(
+            s.find_available_invite(&code_hash, later).unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            s.reserve_invite(&code_hash, "session-b", later, later + days(1))
+                .unwrap(),
+            Some(id)
+        );
+        // ...and the session that lost it can no longer spend or release it.
+        assert!(matches!(
+            s.consume_invite(id, "ada", "session-a"),
+            Err(StoreError::InviteUnavailable)
+        ));
+        assert!(!s.release_invite(id, "session-a").unwrap());
+    }
+
+    /// A signup that fails hands the code back, so the same person can start
+    /// again immediately rather than waiting out their own reservation.
+    #[test]
+    fn releasing_frees_the_code_immediately() {
+        let s = store();
+        let (code_hash, id) = held(&s, "session-a");
+        let now = now();
+
+        assert!(s.release_invite(id, "session-a").unwrap());
+        assert_eq!((None, None), reservation(&s, id));
+        assert_eq!(s.find_available_invite(&code_hash, now).unwrap(), Some(id));
+        assert_eq!(
+            s.reserve_invite(&code_hash, "session-b", now, now + days(1))
+                .unwrap(),
+            Some(id)
+        );
+        // Releasing twice is not an error, it is simply not this session's to
+        // release any more.
+        assert!(!s.release_invite(id, "session-a").unwrap());
+    }
+
+    /// THE INVARIANT F1 BUYS: whoever holds the code can always spend it, so a
+    /// consume after a successful provision cannot fail. Only the holder can.
+    #[test]
+    fn the_holder_and_only_the_holder_can_spend() {
+        let s = store();
+        let (_, id) = held(&s, "session-a");
+
+        assert!(matches!(
+            s.consume_invite(id, "grace", "session-b"),
+            Err(StoreError::InviteUnavailable)
+        ));
+        s.consume_invite(id, "ada", "session-a")
+            .expect("the holder always wins");
+        // Spending clears the hold: nothing is left pointing at a finished
+        // session.
+        assert_eq!((None, None), reservation(&s, id));
+        let rows = s.list_invites().unwrap();
+        assert_eq!(rows[0].used_by_label.as_deref(), Some("ada"));
+    }
+
+    /// An expired code is refused exactly the way an unknown one is, and it can
+    /// no longer be held.
+    #[test]
+    fn an_expired_code_is_simply_unavailable() {
+        let s = store();
+        let m = invites::mint().unwrap();
+        let now = now();
+        let id = s.insert_invite(&m.code_hash, now + days(30)).unwrap();
+
+        assert_eq!(s.find_available_invite(&m.code_hash, now).unwrap(), Some(id));
+        let after = now + days(31);
+        assert_eq!(s.find_available_invite(&m.code_hash, after).unwrap(), None);
+        assert_eq!(
+            s.reserve_invite(&m.code_hash, "session-a", after, after + days(1))
+                .unwrap(),
+            None
+        );
     }
 
     /// The plaintext must never reach the file. Read the whole table back as
@@ -339,7 +644,7 @@ mod tests {
     fn only_the_hash_is_at_rest() {
         let s = store();
         let m = invites::mint().unwrap();
-        s.insert_invite(&m.code_hash).unwrap();
+        s.insert_invite(&m.code_hash, now() + days(30)).unwrap();
 
         let conn = s.lock();
         let mut stmt = conn.prepare("SELECT code_hash FROM invite_codes").unwrap();
@@ -357,9 +662,10 @@ mod tests {
     fn a_wrong_or_unknown_code_is_simply_absent() {
         let s = store();
         let m = invites::mint().unwrap();
-        s.insert_invite(&m.code_hash).unwrap();
+        s.insert_invite(&m.code_hash, now() + days(30)).unwrap();
         assert_eq!(
-            s.find_unused_invite(&invites::hash("ZZZZ-ZZZZ")).unwrap(),
+            s.find_available_invite(&invites::hash("ZZZZ-ZZZZ-ZZZZ-ZZZZ"), now())
+                .unwrap(),
             None
         );
     }
@@ -367,11 +673,9 @@ mod tests {
     #[test]
     fn revoking_removes_only_unspent_codes() {
         let s = store();
-        let a = invites::mint().unwrap();
-        let b = invites::mint().unwrap();
-        let id_a = s.insert_invite(&a.code_hash).unwrap();
-        let id_b = s.insert_invite(&b.code_hash).unwrap();
-        s.consume_invite(id_b, "ada").unwrap();
+        let (_, id_a) = held(&s, "session-a");
+        let (_, id_b) = held(&s, "session-b");
+        s.consume_invite(id_b, "ada", "session-b").unwrap();
 
         assert!(s.revoke_invite(id_a).unwrap());
         assert!(!s.revoke_invite(id_a).unwrap(), "already gone");
@@ -380,6 +684,51 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, id_b);
         assert_eq!(rows[0].used_by_label.as_deref(), Some("ada"));
+    }
+
+    /// A file written before expiry and reservations existed opens, gains the
+    /// columns, and keeps the codes already in people's inboxes working until
+    /// thirty days after they were ISSUED.
+    #[test]
+    fn an_older_store_is_migrated_and_its_codes_dated_from_issue() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invite_codes (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 code_hash     TEXT NOT NULL UNIQUE,
+                 created_at    TEXT NOT NULL,
+                 used_at       TEXT,
+                 used_by_label TEXT
+             );",
+        )
+        .unwrap();
+        // An 8-character code, minted 29 days ago, exactly as the old CLI
+        // stored it.
+        let old = invites::hash("ABCD-EFGH");
+        let issued = parse_ts(stamp(Utc::now() - days(29)));
+        conn.execute(
+            "INSERT INTO invite_codes(code_hash, created_at) VALUES(?1, ?2)",
+            params![old, stamp(issued)],
+        )
+        .unwrap();
+
+        let s = ControlStore::init(conn).unwrap();
+        let row = s.list_invites().unwrap().remove(0);
+        assert_eq!(
+            row.expires_at,
+            Some(issued + days(DEFAULT_TTL_DAYS)),
+            "dated from issue, not from the migration"
+        );
+        assert!(
+            s.find_available_invite(&old, now()).unwrap().is_some(),
+            "an already-issued code keeps working"
+        );
+        assert!(
+            s.find_available_invite(&old, now() + days(2))
+                .unwrap()
+                .is_none(),
+            "...until the backfilled expiry passes"
+        );
     }
 
     #[test]

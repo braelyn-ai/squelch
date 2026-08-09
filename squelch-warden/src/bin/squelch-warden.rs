@@ -1,19 +1,28 @@
 //! The warden binary: validate config from the environment, refuse to start on
-//! any bad value, make sure the state directory exists, serve the router.
+//! any bad value, connect to the cluster with the pod's own ServiceAccount, and
+//! serve the router.
 //!
-//! The bind default is loopback and stays loopback: Caddy fronts this at
-//! `warden.<base domain>` with TLS, and a warden listening on a public
-//! interface would be a root-equivalent API in the clear.
+//! It binds all interfaces because it is a pod: a ClusterIP Service in front, a
+//! NetworkPolicy around it, and its own Ingress at `warden.<base domain>` with
+//! TLS terminated there. Loopback inside a pod would just make the Service
+//! answer nothing.
 //!
 //! Env table: `README.md`. Runbook: `deploy/hosted/SETUP.md`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use squelch_warden::host::{CommandRunner, Fs, RealCommandRunner, RealFs};
-use squelch_warden::{Config, Warden, WardenState, router};
+use squelch_warden::{Cluster, Config, KubeCluster, Warden, WardenState, router};
 use tracing_subscriber::EnvFilter;
 
-/// Ctrl-C, or the SIGTERM systemd stops us with.
+/// How often the pending sweep runs: four times per TTL, so an abandoned signup
+/// is collected within a quarter of one, bounded so a short TTL does not spin
+/// and a long one still gets a daily pass.
+fn sweep_interval(pending_ttl: Duration) -> Duration {
+    (pending_ttl / 4).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60))
+}
+
+/// Ctrl-C, or the SIGTERM the kubelet stops us with.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -26,8 +35,8 @@ async fn shutdown_signal() {
                 }
             }
             // Losing the handler costs a slower stop, never correctness: the
-            // state file is written atomically and a provision in flight holds
-            // no lock anything else needs.
+            // warden holds no state of its own, and a provision in flight is
+            // either finished at the API server or was never applied.
             Err(e) => {
                 tracing::warn!(error = %e, "no SIGTERM handler; stopping on ctrl-c only");
                 let _ = tokio::signal::ctrl_c().await;
@@ -44,40 +53,78 @@ async fn shutdown_signal() {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_env("SQUELCH_WARDEN_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_env("SQUELCH_WARDEN_LOG")
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
     let config = Config::from_env().map_err(|e| anyhow::anyhow!("squelch-warden: {e}"))?;
     let bind = config.bind;
     let base_domain = config.base_domain.clone();
-    let port_base = config.port_base;
+    let namespace = config.namespace.clone();
+    let user_namespaces = config.user_namespaces;
 
+    // Fail at startup rather than on the first signup: a warden that cannot
+    // reach the API server is a warden that can do nothing at all, and the
+    // operator should hear about that while they are still looking at a
+    // terminal.
+    let cluster = KubeCluster::connect(namespace.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("squelch-warden: cannot reach the Kubernetes API ({e})"))?;
+
+    let pending_ttl = config.pending_ttl;
     let warden = Arc::new(Warden::new(
         Arc::new(config),
-        Arc::new(RealFs) as Arc<dyn Fs>,
-        Arc::new(RealCommandRunner) as Arc<dyn CommandRunner>,
+        Arc::new(cluster) as Arc<dyn Cluster>,
     ));
-    // Fail at startup rather than on the first signup: a state dir the warden
-    // cannot create is a warden that cannot remember anything, and the operator
-    // should hear about that while they are still looking at the terminal.
-    warden
-        .ensure_state_dir()
-        .map_err(|e| anyhow::anyhow!("squelch-warden: state dir is not usable ({e})"))?;
+    let app = router(WardenState::new(warden.clone()));
 
-    let app = router(WardenState::new(warden));
+    // The one background job this service has. A signup that reached phase one
+    // and never came back parks an identity Secret nothing will ever open and
+    // holds a public subdomain against everyone else, and the control plane
+    // cannot see it to ask. Detached rather than joined: the process's job is
+    // to serve, and a sweep that fails is a sweep that runs again shortly.
+    let sweeper = warden.clone();
+    let interval = sweep_interval(pending_ttl);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately; skip it so a restart loop cannot
+        // turn into a sweep loop.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match sweeper.sweep_pending().await {
+                Ok(0) => {}
+                Ok(collected) => tracing::info!(collected, "swept abandoned pending tenants"),
+                // Already logged with its machine reason inside the sweep.
+                Err(_) => {}
+            }
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr().unwrap_or(bind);
     // One startup line. The token is not in it, and never is.
-    tracing::info!(%bound, %base_domain, port_base, "squelch-warden: serving");
-    if !bound.ip().is_loopback() {
+    tracing::info!(
+        %bound,
+        %base_domain,
+        %namespace,
+        user_namespaces,
+        "squelch-warden: serving"
+    );
+    if !user_namespaces {
         tracing::warn!(
-            "SQUELCH_WARDEN_BIND is not loopback. This API creates systemd units; put TLS and a proxy in front of it or bind 127.0.0.1"
+            "SQUELCH_WARDEN_USER_NAMESPACES is off: tenant pods will share the node's user namespace, so uid isolation is the only boundary left between them"
         );
     }
 
-    axum::serve(listener, app)
+    // ConnectInfo is what feeds the per-IP rate limiter its peer address; a bare
+    // `serve(listener, app)` never inserts it and every client would fold into
+    // the 0.0.0.0 fallback bucket, turning the limiter into a global one.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(async {
             shutdown_signal().await;
             tracing::info!("squelch-warden: shutting down");

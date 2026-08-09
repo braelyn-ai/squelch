@@ -1,0 +1,91 @@
+# The warden's identity in the cluster, and the exact list of things it may do.
+#
+# A Role, bound into `tenants`. Not a ClusterRole, not cluster-admin, and not a
+# second Role in `warden`: the provisioner has no permission to read its own
+# Secret, restart itself, or look at anything outside the tenant namespace. If
+# somebody gets the warden's bearer token, this list is the blast radius.
+#
+# Every rule is a verb `squelch-warden/src/cluster.rs` actually calls, per
+# resource, and nothing else. Server-side apply needs `create` as well as
+# `patch`, because an apply that has to create the object is authorized as both.
+#
+# What is deliberately absent, and the absence is load-bearing:
+#
+#   - `delete` on persistentvolumeclaims. The mail. `DELETE /v1/tenants/{label}`
+#     takes the workload down; the volume stays, and nothing the control plane
+#     can call removes it. Destroying a tenant for real is an operator with
+#     kubectl.
+#   - `list` on pods with anything but a selector, `get` on secrets outside this
+#     namespace, and every verb on every kind not named here.
+#
+# What is present and was not in the first cut: `delete` and `list` on secrets.
+# The pending sweep needs both, because an abandoned signup parks an identity
+# Secret that nothing will ever open and that holds a public subdomain against
+# everyone else, and the control plane cannot see it to ask about it. Being
+# honest about the cost: this Role can now delete any Secret in `tenants`, so
+# the "the service that writes a tenant's key cannot lose it" claim is now a
+# claim about the CODE (which deletes only an identity Secret, only while that
+# tenant is pending, only past the TTL, and never a credential Secret) rather
+# than about RBAC. Credential Secrets and volumes are still beyond it entirely.
+#
+# The other half of the bound on this token is Pod Security Admission on the
+# `tenants` namespace (see 00-namespaces.yaml). Holding it lets you create a
+# workload here; PSA decides what KIND of workload, and at `restricted` that is
+# a non-root pod with no capabilities, no host namespaces and no host paths. A
+# stolen token is a tenant-shaped pod, not a node escape.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: squelch-warden
+  namespace: warden
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: squelch-warden
+  namespace: tenants
+rules:
+  # Identity and credential Secrets. `get` for the status derivation, `list` for
+  # the pending sweep, `create`/`patch` for the two writes, `delete` for the
+  # sweep alone: see the header.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  # The tenant's data volume. Applied, never read back and never deleted.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "patch", "delete"]
+  # Read only, and by label selector. The warden never creates a pod directly;
+  # the Deployment does. This is the readiness wait during a provision.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  # `squelchd pair`, run inside the tenant's own pod. This is the one verb here
+  # that can reach a tenant's data, and it is why the warden's token matters.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # `get` for the status derivation (a ready replica is what `active` means).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: squelch-warden
+  namespace: tenants
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: squelch-warden
+subjects:
+  - kind: ServiceAccount
+    name: squelch-warden
+    namespace: warden

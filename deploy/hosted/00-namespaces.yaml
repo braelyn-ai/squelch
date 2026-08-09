@@ -1,0 +1,41 @@
+# The two namespaces hosted Passband uses, and nothing else in the cluster.
+#
+# `warden` holds one Deployment: the provisioner. `tenants` holds everything
+# per-tenant. They are separate so the warden's RBAC can be a Role bound into
+# `tenants` while the warden itself lives somewhere that Role does not reach:
+# the warden can create a tenant's Secret and cannot touch its own.
+#
+# Kubernetes labels every namespace with `kubernetes.io/metadata.name`
+# automatically, which is what the per-tenant NetworkPolicies select on.
+#
+# The labels that ARE here are Pod Security Admission, on `tenants`, at
+# `restricted`. That is the strictest of the three built-in levels: non-root,
+# no privilege escalation, all capabilities dropped, a seccomp profile, no host
+# namespaces or host paths, and only the safe volume types. Every field it
+# demands is already set on every object the warden builds, with tests
+# asserting each one, so this changes nothing about a tenant pod. What it
+# changes is what happens to a pod the warden did NOT build: a debug pod, a
+# stuck job, or a workload created with a stolen warden token. `enforce` refuses
+# it at admission, which is the bound on what that token is worth. `audit` and
+# `warn` are set to the same level so a refusal shows up in the audit log and in
+# kubectl's output rather than only as a rejected create.
+#
+# The `warden` namespace is deliberately NOT labelled: its own pod is the one
+# that carries an API token, and it is installed by an operator with kubectl,
+# not by an API call anyone else can make.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: warden
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenants
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

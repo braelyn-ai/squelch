@@ -13,10 +13,11 @@ name = "squelch-control"
 path = "src/bin/squelch-control.rs"
 
 [dependencies]
-# StoredToken (the exact JSON shape the daemon's file backend reads) and the
+# StoredToken, the credentials-file plaintext + sealing helpers, and the
 # readonly scope constant. Reusing them is the point: the ciphertext this crate
-# writes is opened by squelch-core on the other side, so the shape must come
-# from one place, and "the daemon only ever requests gmail.readonly" must be one
+# writes is opened by squelch-core on the other side, so the SHAPE must come
+# from one place (a bare StoredToken decrypts into an empty slot map and fails
+# days later), and "the daemon only ever requests gmail.readonly" must be one
 # constant rather than a string retyped in a second crate.
 squelch-core = { path = "../squelch-core" }
 # Constant-time compare for the bearer we present to the warden and for every
@@ -45,8 +46,9 @@ reqwest = { workspace = true }
 rusqlite = { workspace = true }
 url = { workspace = true }
 clap = { workspace = true }
-# Sealing the tenant's token to the VPS's age recipient. This crate holds the
-# RECIPIENT (a public key) and never an identity: encrypting is all it can do.
+# Shape-checking the per-tenant age recipient the warden answers with (the
+# encryption itself is squelch-core's). This crate only ever sees RECIPIENTS,
+# which are public keys: encrypting is all it can do.
 age = { workspace = true }
 # Invite-code hashes at rest, the PKCE S256 challenge, and the cookie MAC.
 sha2 = "0.10"

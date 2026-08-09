@@ -5,16 +5,35 @@
 //!
 //! 1. `POST /signup` validates everything that can be validated BEFORE a human
 //!    is sent to Google: the invite, the label, and whether the label is free
-//!    on the box. A user who has already approved a Google consent screen and
-//!    is then told their address was taken has spent something they cannot get
-//!    back.
-//! 2. Nothing is spent at that point either. The invite is checked, not
+//!    in the cluster. A user who has already approved a Google consent screen
+//!    and is then told their address was taken has spent something they cannot
+//!    get back.
+//! 2. Nothing is spent at that point either. The invite is RESERVED, not
 //!    consumed; the tenant is not created. A signup abandoned at Google leaves
-//!    no trace but an expired session.
+//!    no trace but an expired session and a reservation that lapses with it.
 //! 3. `GET /oauth/callback` is where the irreversible things happen, in this
-//!    order: exchange, seal, provision, record, consume the invite. The invite
-//!    is spent LAST so that a provisioning failure leaves the user able to try
-//!    again with the code they were given.
+//!    order: exchange, CREATE the tenant (learning its recipient), seal to that
+//!    recipient, INSTALL the credential, record, consume the invite. The invite
+//!    is spent LAST so that a failure anywhere above leaves the user able to try
+//!    again with the code they were given, and every one of those failures hands
+//!    the reservation back so the retry does not have to wait it out.
+//!
+//! THE RESERVATION IS WHAT MAKES "ONE CODE, ONE TENANT" TRUE. Checking the code
+//! at step 1 and spending it at step 3 leaves minutes in between, and one code
+//! posted from N tabs used to pass N checks and provision N tenants, with only
+//! the last consume losing. The hold is taken in the same statement that checks
+//! availability, so the second tab is refused at the door; it names the session
+//! holding it, so only that session can spend or release it; and it expires with
+//! the session, so an abandoned signup costs the code nothing.
+//!
+//! PROVISIONING IS TWO CALLS under wire v2, and the gap between them is a state
+//! a user can land in: the warden has minted this tenant's age identity and is
+//! holding it `pending`, and the credential never arrived. That is retriable
+//! rather than broken, so the page says so, the invite stays unspent, and a
+//! retry with the SAME address and the SAME Google account walks back through
+//! call 1 to the SAME recipient. `POST /signup` therefore lets a pending label
+//! through its availability check; the warden is the thing that decides whether
+//! the mailbox coming back is the one that reserved it.
 //!
 //! PRIVACY, again because this is the file where it would slip: the invite
 //! code, its hash, the authorization code, `state`, the PKCE verifier, the
@@ -40,7 +59,7 @@ use crate::labels;
 use crate::oauth::{self, GoogleEndpoints};
 use crate::pages;
 use crate::seal;
-use crate::sessions::InsertError;
+use crate::sessions::{self, InsertError};
 use crate::state::ControlState;
 use crate::store::StoreError;
 use crate::warden::WardenError;
@@ -50,7 +69,7 @@ use crate::warden::WardenError;
 pub const MAX_BODY: usize = 8 * 1024;
 
 /// Ceiling on either submitted field before it is even normalized. A label is
-/// at most 30 characters and a code is 9; this is slack, and it exists so that
+/// at most 30 characters and a code is 19; this is slack, and it exists so that
 /// a megabyte of "label" is not run through Unicode case folding.
 const MAX_FIELD: usize = 128;
 
@@ -63,8 +82,9 @@ const MAX_CODE: usize = 512;
 const RANDOM_BYTES: usize = 32;
 
 /// What every invite failure says. ONE message for "no such code", "already
-/// used", "revoked", and "not even shaped like a code", because anything that
-/// tells those apart is an oracle for a 40-bit secret.
+/// used", "expired", "held by another signup", "revoked", and "not even shaped
+/// like a code", because anything that tells those apart is an oracle for the
+/// code space.
 const INVITE_REFUSED: &str = "That invite code is not usable. Check it and try again.";
 
 /// What a claimed label says, whichever authority reported it. Both this
@@ -103,23 +123,32 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         Err(e) => return reject(&e.message(), &raw_label),
     };
 
-    // The invite is CHECKED here and consumed only after provisioning. Both
-    // failures below produce the identical message.
+    // The invite is GATED here and held below, once the address is known to be
+    // free. Nothing is spent either way, and every failure produces the
+    // identical message.
+    //
+    // Gate first, hold later, so a signup refused for its ADDRESS does not leave
+    // a hold on a perfectly good code; and gate at all, so a nonsense code costs
+    // a point lookup rather than a round trip to the warden.
     if !invites::is_plausible(&raw_invite) {
         return reject(INVITE_REFUSED, &label);
     }
-    let invite_id = match state.store().find_unused_invite(&invites::hash(&raw_invite)) {
-        Ok(Some(id)) => id,
+    let code_hash = invites::hash(&raw_invite);
+    match state
+        .store()
+        .find_available_invite(&code_hash, chrono::Utc::now())
+    {
+        Ok(Some(_)) => {}
         Ok(None) => return reject(INVITE_REFUSED, &label),
         Err(e) => {
             tracing::error!(error = %e, "invite lookup failed");
             return reject("Something went wrong on our side. Please try again.", &label);
         }
-    };
+    }
 
     // Two authorities on whether a label is free, and both are asked: this
     // control plane's own record, and the warden, which is the one that knows
-    // what actually exists on the box.
+    // what actually exists in the cluster.
     match state.store().label_exists(&label) {
         Ok(true) => return reject(LABEL_TAKEN, ""),
         Ok(false) => {}
@@ -130,6 +159,13 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     }
     match state.warden().status(&label).await {
         Ok(None) => {}
+        // A PENDING tenant is a half-finished signup, and this is how its owner
+        // gets to finish it: the label is let through here and the warden
+        // decides at call 1 whether the Google account coming back is the one
+        // that reserved it. A stranger who guesses a pending label spends a
+        // consent and gets "already taken"; they cannot take it, and their
+        // invite is not spent either.
+        Ok(Some(s)) if s.is_pending() => {}
         Ok(Some(_)) => return reject(LABEL_TAKEN, ""),
         Err(e) => {
             // PRIVACY: the warden error type, never the bearer or the URL.
@@ -157,6 +193,26 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         }
     };
 
+    // THE HOLD. Atomic with the availability check it repeats, and the last
+    // thing that can refuse this signup for its invite code: from here the user
+    // is going to Google.
+    let holder = sessions::fingerprint(&sid);
+    let now = chrono::Utc::now();
+    let reserved_until = now + reservation_window();
+    let invite_id = match state
+        .store()
+        .reserve_invite(&code_hash, &holder, now, reserved_until)
+    {
+        Ok(Some(id)) => id,
+        // Lost the race with another tab, or the code went away between the
+        // gate above and here. Same message as every other invite failure.
+        Ok(None) => return reject(INVITE_REFUSED, &label),
+        Err(e) => {
+            tracing::error!(error = %e, "reserving the invite failed");
+            return reject("Something went wrong on our side. Please try again.", &label);
+        }
+    };
+
     // The guard is taken and dropped by this ONE statement. Holding it across
     // the `if` below would deadlock the moment the arm asked for the session
     // count, because a std `Mutex` is not reentrant.
@@ -170,6 +226,9 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     );
     if let Err(InsertError::Full) = inserted {
         tracing::warn!(sessions = state.live_sessions(), "signup session table full");
+        // The session that would have held this code does not exist, so the
+        // hold is handed back rather than left to lapse on its own.
+        release_invite(&state, invite_id, &holder);
         return reject(
             "Too many signups are in flight right now. Please try again in a few minutes.",
             &label,
@@ -244,10 +303,21 @@ pub async fn oauth_callback(
     // anything below can want it again.
     let session = state.sessions().take(&claim.sid, Instant::now());
     let Some(session) = session else {
+        // Nothing to hand back: an expired session's hold expired with it, and a
+        // replay is finding a session that already spent or released its code.
         return done(refused_session());
     };
+
+    // From here the session is gone but its invite is still held, so every exit
+    // hands the code back. The holder is recomputed from the session id the
+    // cookie carried, which `take` has just proved names a live session.
+    let holder = sessions::fingerprint(&claim.sid);
+    let invite_id = session.invite_id;
+    let release = || release_invite(&state, invite_id, &holder);
+
     if !squelch_httpauth::ct_eq(returned_state.as_bytes(), session.state.as_bytes()) {
         tracing::warn!("callback state mismatch");
+        release();
         return done(refused_session());
     }
     // The cookie and the server-side session must agree. The session is the
@@ -255,14 +325,15 @@ pub async fn oauth_callback(
     // session, which is the one forgery a valid MAC cannot rule out on its own.
     if claim.label != session.label || claim.invite != session.invite_id {
         tracing::warn!("callback cookie does not match its session");
+        release();
         return done(refused_session());
     }
     let Some(code) = code.filter(|c| is_code(c)) else {
+        release();
         return done(refused_session());
     };
 
     let label = session.label;
-    let invite_id = session.invite_id;
 
     // ---- from here on, the irreversible half ----
 
@@ -272,6 +343,7 @@ pub async fn oauth_callback(
             // The error type only. Its `Display` is written to carry no code,
             // no secret, and no provider body.
             tracing::warn!(error = %e, label = %label, "token exchange failed");
+            release();
             return done(pages::problem(
                 StatusCode::BAD_GATEWAY,
                 "Google did not complete the sign in",
@@ -285,6 +357,7 @@ pub async fn oauth_callback(
     match state.store().active_tenant_for_email(&grant.account_email) {
         Ok(Some(existing)) => {
             tracing::info!(label = %existing, "signup refused: mailbox already has a tenant");
+            release();
             return done(pages::problem(
                 StatusCode::CONFLICT,
                 "That Google account already has a mailbox",
@@ -294,28 +367,19 @@ pub async fn oauth_callback(
         Ok(None) => {}
         Err(e) => {
             tracing::error!(error = %e, "tenant lookup failed");
+            release();
             return done(internal_problem());
         }
     }
 
-    // The ONE moment a plaintext refresh token exists on this machine ends
-    // here. From this line on there is only ciphertext.
-    let ciphertext = match seal::seal_token(state.recipient(), &grant.token) {
+    // CALL 1. The warden mints this tenant's age identity, keeps it, and hands
+    // back only the public half. Nothing is encrypted yet and no credential
+    // exists on the far side: what this creates is a reservation, tied to this
+    // mailbox, that only this mailbox can complete.
+    let created = match state.warden().create_tenant(&label, &grant.account_email).await {
         Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "sealing the credential failed");
-            return done(internal_problem());
-        }
-    };
-    drop(grant.token);
-
-    let provisioned = match state
-        .warden()
-        .provision(&label, &grant.account_email, &ciphertext)
-        .await
-    {
-        Ok(p) => p,
         Err(WardenError::LabelTaken) => {
+            release();
             return done(pages::problem(
                 StatusCode::CONFLICT,
                 "That address was just taken",
@@ -323,7 +387,10 @@ pub async fn oauth_callback(
             ));
         }
         Err(e) => {
-            tracing::error!(error = %e, label = %label, "provisioning failed");
+            // PRIVACY: the error type and the label. Never the recipient, the
+            // bearer, or anything the warden said verbatim.
+            tracing::error!(error = %e, label = %label, "creating the tenant failed");
+            release();
             return done(pages::problem(
                 StatusCode::BAD_GATEWAY,
                 "Your mailbox could not be set up",
@@ -332,16 +399,69 @@ pub async fn oauth_callback(
         }
     };
 
-    // The record, and the last enforcement of both unique constraints.
+    // The ONE moment a plaintext refresh token exists on this machine ends
+    // here. From this line on there is only ciphertext, and it is readable by
+    // exactly one identity: the one the warden just minted for THIS tenant.
+    let ciphertext = match seal::seal_credentials(
+        &created.recipient,
+        &grant.account_email,
+        &grant.token,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, label = %label, "sealing the credential failed");
+            release();
+            // NOT `internal_problem`: call 1 has reserved the address, so
+            // "nothing was set up" would be false. It is not the retriable page
+            // either, because a warden that answered with an unusable key will
+            // answer with the same one on the retry (the recipient for a pending
+            // label is stable by contract), and promising "we will finish the
+            // job" would send someone round a loop.
+            return done(pages::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong on our side",
+                "Your mailbox was not set up and your invite code has not been used. Please start again, and if it happens twice, get in touch.",
+            ));
+        }
+    };
+    drop(grant.token);
+
+    // CALL 2. The credential is installed and the workload applied. A failure
+    // here leaves the pending tenant standing, which is the retriable state the
+    // page below describes: no credential was written, no invite was spent, and
+    // the same address is still reserved for this mailbox.
+    let pairing = match state.warden().put_credentials(&label, &ciphertext).await {
+        Ok(p) => p,
+        Err(WardenError::AlreadyProvisioned) => {
+            release();
+            return done(pages::problem(
+                StatusCode::CONFLICT,
+                "That mailbox is already set up",
+                "That address finished setting up a moment ago, so nothing was changed here and your invite code has not been used. Open Passband, point it at your mailbox, and ask for a new pairing code.",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, label = %label, "tenant created but the credential was not installed; the signup is retriable");
+            // The page tells this user to start again with the SAME code, so the
+            // hold has to go back now rather than in ten minutes.
+            release();
+            return done(incomplete_problem());
+        }
+    };
+
+    // The record, and the last enforcement of both unique constraints. NO
+    // RELEASE on this path: the mailbox is running in the cluster, so the code
+    // must not go back on the shelf for somebody to spend on a second one. It
+    // stays held, unspent, until an operator sorts the row out.
     if let Err(e) = state.store().insert_tenant(&label, &grant.account_email) {
-        // The daemon exists on the box but this control plane could not record
-        // it, so it will not be visible to `tenants list` and the label will
-        // look free here. Loud, with the label, because a human has to go clean
-        // it up.
+        // The daemon is running in the cluster but this control plane could not
+        // record it, so it will not be visible to `tenants list` and the label
+        // will look free here. Loud, with the label, because a human has to go
+        // clean it up.
         tracing::error!(
             error = %e,
             label = %label,
-            "PROVISIONED BUT NOT RECORDED: the tenant is running on the box and has no control-plane row"
+            "PROVISIONED BUT NOT RECORDED: the tenant is running in the cluster and has no control-plane row"
         );
         let detail = match e {
             StoreError::LabelTaken | StoreError::AccountTaken => {
@@ -356,18 +476,21 @@ pub async fn oauth_callback(
         ));
     }
 
-    // LAST: spend the invite. A failure here is logged and does not fail the
-    // signup, because the tenant exists and telling the user their mailbox did
-    // not get made would be a lie.
-    if let Err(e) = state.store().consume_invite(invite_id, &label) {
+    // LAST: spend the invite, which this session has held since the form was
+    // posted. That hold is what makes this consume unfailable: the code cannot
+    // have been spent by anyone else, and only a hold that lapsed AND was taken
+    // by another session could refuse it. A failure is therefore a broken
+    // invariant, logged at error and never shown: the tenant exists, and telling
+    // the user their mailbox did not get made would be a lie.
+    if let Err(e) = state.store().consume_invite(invite_id, &label, &holder) {
         tracing::error!(error = %e, label = %label, "tenant provisioned but the invite was not consumed");
     }
 
-    tracing::info!(label = %label, port = provisioned.port, "tenant provisioned");
+    tracing::info!(label = %label, "tenant provisioned");
 
     done(pages::success(
         &config.tenant_url(&label),
-        &provisioned.pair_code,
+        &pairing.pair_code,
         PAIRING_MINUTES,
     ))
 }
@@ -378,6 +501,31 @@ pub async fn oauth_callback(
 /// this sentence moves with it instead of quietly lying to the user.
 const PAIRING_MINUTES: i64 =
     squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS / 60;
+
+/// How long a signup holds its invite code: the session's own lifetime.
+///
+/// The two are one clock on purpose. A hold that died first would let a second
+/// tab in while the first is still at Google; a hold that outlived the session
+/// would strand the code for a user whose signup is already dead.
+fn reservation_window() -> chrono::Duration {
+    chrono::Duration::seconds(sessions::SESSION_TTL.as_secs() as i64)
+}
+
+/// Hand a held invite back, so whoever was refused can start again immediately
+/// rather than waiting out their own reservation.
+///
+/// Best effort, always on a path that is already reporting something else: a
+/// hold that will not release lapses on its own within the session window, and
+/// the cost of that is one person waiting, not a lost code.
+fn release_invite(state: &ControlState, invite_id: i64, holder: &str) {
+    match state.store().release_invite(invite_id, holder) {
+        Ok(true) => {}
+        // The hold lapsed and somebody else took the code, or an operator
+        // revoked it mid-signup. Nothing to undo, but worth a line.
+        Ok(false) => tracing::warn!("the invite hold was already gone"),
+        Err(e) => tracing::error!(error = %e, "releasing the invite hold failed"),
+    }
+}
 
 fn refused_session() -> Response {
     pages::problem(
@@ -392,6 +540,27 @@ fn internal_problem() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Something went wrong on our side",
         "Nothing was set up and your invite code has not been used. Please try again.",
+    )
+}
+
+/// The one page that describes the gap between the two provisioning calls.
+///
+/// It is deliberately not the generic failure: the address was reserved for this
+/// Google account, and the retry is the same three steps with the same two
+/// answers. Saying "nothing was set up" here would be a small lie that sends
+/// people off to pick a second address they do not need.
+///
+/// The wording describes WHAT HAPPENED rather than what is currently true on the
+/// far side, because one of the failures that lands here is the warden having
+/// lost the pending tenant altogether. The retry is right either way; only the
+/// reason it works differs.
+fn incomplete_problem() -> Response {
+    pages::problem(
+        StatusCode::BAD_GATEWAY,
+        "Your mailbox is not finished yet",
+        "We reserved your address and then could not finish setting it up. \
+         Your invite code has not been used. Start again with the same invite code, \
+         the same address, and the same Google account, and we will finish the job.",
     )
 }
 

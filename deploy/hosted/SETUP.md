@@ -1,8 +1,7 @@
 # Hosted Passband: a fresh Debian box to the first tenant
 
-This is the runbook for the VPS half of the hosted MVP (`docs/HOSTED.md`,
-Phase 2). The other half, `squelch-control`, runs on Railway and is not
-installed here.
+This is the runbook for the cluster half of hosted Passband. The other half,
+`squelch-control`, runs on Railway and is not installed here.
 
 ## What you are building
 
@@ -11,39 +10,49 @@ installed here.
                           |                            |
                     (CNAME to Railway)            (A to this box)
                           |                            |
-                   squelch-control  ---- HTTPS ---> squelch-warden   (root, loopback:8852)
-                   (Railway)          bearer token        |
-                          |                               | writes files, runs systemctl
-                          |                               v
-                          |                  /etc/squelch/tenants/<label>.env
-                          |                  /var/lib/squelch/tenants/<label>/
-                          |                  /etc/caddy/tenants/<label>.caddy
-                          |                  systemctl enable --now squelchd@<label>
-                          |                               |
-                          '--- age ciphertext ------------'
-                              (encrypted to THIS box's recipient;
-                               only the tenant daemons can decrypt)
+                   squelch-control  ---- HTTPS ---> Traefik --> squelch-warden
+                   (Railway)          bearer token             (pod, ns warden)
+                          |                                          |
+                          |                                          | kube API
+                          |                                          v
+                          |                        ns tenants: Secret, Secret, PVC,
+                          |                        NetworkPolicy, Service, Deployment,
+                          |                        Ingress  -- one set per tenant
+                          |                                          |
+                          '--- age ciphertext -----------------------'
+                              (sealed to THIS TENANT's recipient;
+                               only this tenant's pod can open it)
 
-  <label>.<base>  ---(A to this box)--->  Caddy  --->  127.0.0.1:<port>  squelchd@<label>
+  <label>.<base> --(A to this box)--> Traefik --> Service <label> --> squelchd pod
 ```
 
-The trust split is the point, so it is worth stating before you start:
+Three things hold, and they are the whole pitch:
 
-- The **control plane** holds the Google web-client secret and this box's age
-  **recipient** (a public key). It encrypts each tenant's credential the moment
-  the OAuth exchange returns. It never holds the private key.
-- The **warden** holds root on this box. It writes the ciphertext it is given
-  and never reads it: it has no age identity, by design.
-- The **tenant daemons** hold the age **identity** and are the only processes
-  that decrypt anything.
+- The **control plane** runs the Google web client. For each tenant it learns a
+  **recipient** (a public age key) from the warden and seals that tenant's
+  credentials to it the moment the OAuth exchange returns. It holds no identity,
+  for any tenant, ever.
+- The **warden** mints each tenant's identity in memory and writes it straight
+  into that tenant's Secret. It never logs it, never stores it anywhere else,
+  and forgets it. Its RBAC is one Role in one namespace, it cannot delete a
+  volume or a credential, and the one Secret it may delete is the identity of a
+  tenant that never finished signing up.
+- **Each tenant's pod** mounts its own identity and is the only thing in the
+  world that can decrypt that tenant's credentials.
+
+There is no box-wide key. Losing one tenant's Secret costs that tenant a
+re-consent with Google and costs nobody else anything.
 
 ## 0. What you need
 
 - A Debian 13 (trixie) box. Bookworm's glibc is too old for the embedding
   runtime the daemon links (`ort` needs 2.38+), so trixie is not optional.
+  2 vCPU and 4 GB is a sensible floor for a handful of tenants; each tenant pod
+  is a sync loop plus an ONNX embedder.
 - A domain. This runbook writes `passband.email`; substitute yours everywhere.
-- The Railway service for `squelch-control` already created (you need its
-  hostname for one DNS record, and it needs two values from step 3).
+- A DNS provider with an API, for the wildcard certificate (DNS-01 is the only
+  way to get one).
+- The Railway service for `squelch-control` already created.
 
 ## 1. DNS
 
@@ -54,235 +63,555 @@ The trust split is the point, so it is worth stating before you start:
 | `warden.passband.email` | A | your box IP | the control plane's way in |
 | `signup.passband.email` | CNAME | your Railway app hostname | signup never touches this box |
 
-The wildcard is what makes a new tenant instant: provisioning creates a Caddy
-site for `alice.passband.email` and DNS already answers for it.
+The wildcard is what makes a new tenant instant: provisioning creates an Ingress
+for `alice.passband.email` and DNS already answers for it.
 
-## 2. Box preparation
-
-```sh
-apt update && apt install -y curl ca-certificates debian-keyring debian-archive-keyring apt-transport-https age
-
-# The one unprivileged account every tenant daemon runs as.
-useradd --system --home-dir /var/lib/squelch --create-home --shell /usr/sbin/nologin squelch
-
-install -d -o root -g root -m 0755 /etc/squelch
-install -d -o root -g root -m 0755 /etc/squelch/tenants
-install -d -o squelch -g squelch -m 0755 /var/lib/squelch
-install -d -o squelch -g squelch -m 0755 /var/lib/squelch/tenants
-install -d -o root -g root -m 0700 /var/lib/squelch/warden
-```
-
-`/var/lib/squelch/tenants` is 0755 and owned by `squelch`; each tenant's
-directory inside it is 0700, created by the warden.
-
-## 3. The age identity
-
-This is the key to every mailbox on the box. Generate it once:
+## 2. k3s, with secrets encryption
 
 ```sh
-install -d -o root -g squelch -m 0750 /etc/squelch/age
-age-keygen -o /etc/squelch/age/identity.txt
-chown root:squelch /etc/squelch/age/identity.txt
-chmod 0640 /etc/squelch/age/identity.txt
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="\
+  --secrets-encryption \
+  --write-kubeconfig-mode=0600 \
+  --kube-apiserver-arg=feature-gates=UserNamespacesSupport=true \
+  --kubelet-arg=feature-gates=UserNamespacesSupport=true \
+" sh -
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+kubectl get nodes
+k3s secrets-encrypt status     # should say: Encryption Status: Enabled
 ```
 
-`age-keygen` prints the **recipient** (`age1...`) on stderr and writes the
-identity to the file. Two things happen with those:
+**`--secrets-encryption` is not optional here, and it cannot be added quietly
+later.** Every tenant's private age key lives in a Secret. Without this flag,
+k3s stores Secrets as plaintext rows in its sqlite datastore, which means a
+copied `/var/lib/rancher/k3s/server/db` is every tenant's mailbox. That would
+gut the design: encryption-at-rest for credentials is the reason the age
+identities exist at all, and storing the identities in the clear would make the
+whole chain decorative.
 
-- The recipient goes into the control plane's environment as
-  `SQUELCH_CONTROL_AGE_RECIPIENT`. It is a public key; it may be committed to a
-  deploy config, pasted in chat, whatever.
-- The identity stays in that file, readable by root and by the `squelch` group,
-  and is named in every tenant's env file as `SQUELCH_CRED_AGE_IDENTITY`. It
-  never leaves this box. Back it up somewhere you would put a root password:
-  **without it, every stored credential on the box is unrecoverable** and every
-  tenant has to sign in with Google again.
+If you are retrofitting an existing cluster, turn it on and then rewrite the
+existing Secrets so they are actually re-encrypted:
 
-One identity for the whole box is a documented MVP choice, not a claim of
-per-tenant cryptographic isolation. See "What this does not isolate" below.
+```sh
+k3s secrets-encrypt enable
+systemctl restart k3s
+k3s secrets-encrypt reencrypt --force
+```
 
-## 4. Binaries
+**`UserNamespacesSupport`** is the second flag and it is a nice-to-have rather
+than a must. It lets each tenant pod get its own user namespace, so root inside
+a tenant's container maps to an unprivileged id on the node. It needs a kernel
+with idmapped mounts (6.3+ is comfortable; trixie ships 6.12) and a container
+runtime that supports it. If tenant pods fail to start with a `hostUsers`
+complaint, set `SQUELCH_WARDEN_USER_NAMESPACES=off` in `20-warden.yaml`, restart
+the warden, and read "What this does and does not isolate" below to understand
+what you gave up.
 
-Build on a matching box (or cross-build and copy):
+## 3. cert-manager and the wildcard certificate
+
+```sh
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+kubectl -n cert-manager rollout status deploy/cert-manager-webhook
+```
+
+Then edit `40-wildcard-certificate.yaml`: your ACME email, your domain in three
+places, and the DNS-01 solver for your provider. The file ships a Cloudflare
+example because it is the one most people have; every other provider is the same
+file with a different `solvers` block. Your DNS provider only ever sees a TXT
+record on `_acme-challenge`, never a tenant's name.
+
+The DNS credential itself is **not** in that file, deliberately: a token with
+edit rights on your zone does not belong in a repository. Create it from the
+command line (`acme-dns-token.example.yaml` documents the shape):
+
+```sh
+kubectl apply -f deploy/hosted/00-namespaces.yaml
+
+kubectl -n cert-manager create secret generic acme-dns-token \
+  --from-literal=api-token="<zone-scoped DNS:Edit token>"
+
+kubectl apply -f deploy/hosted/40-wildcard-certificate.yaml
+kubectl -n tenants get certificate passband-wildcard -w   # READY=True
+```
+
+`00-namespaces.yaml` also puts Pod Security Admission on `tenants` at
+`restricted`, the strictest built-in level. Every tenant object the warden
+builds already satisfies it, with tests asserting each field, so this changes
+nothing about a tenant pod. It bounds what ELSE can run there: a debug pod, a
+stuck job, or a workload created with a stolen warden token is refused at
+admission unless it is non-root, capability-free, and off the host namespaces.
+
+A wildcard takes a minute or two the first time while ACME waits for DNS.
+
+## 4. Images
+
+Two images: the daemon every tenant runs, and the warden.
 
 ```sh
 git clone https://github.com/braelyn-ai/squelch && cd squelch
-apt install -y build-essential g++ pkg-config
-cargo build --release --locked -p squelchd -p squelch-warden
-install -m 0755 target/release/squelchd /usr/local/bin/squelchd
-install -m 0755 target/release/squelch-warden /usr/local/bin/squelch-warden
+
+docker build -f squelchd/Dockerfile -t ghcr.io/braelyn-ai/squelchd:v0.1.0 .
+docker build -f Dockerfile.warden -t ghcr.io/braelyn-ai/squelch-warden:v0.1.0 .
+docker push ghcr.io/braelyn-ai/squelchd:v0.1.0
+docker push ghcr.io/braelyn-ai/squelch-warden:v0.1.0
 ```
 
-The daemon downloads its embedding weights on first run, into
-`$HOME/.local/share/squelch/models` — and `HOME` is per tenant, so each tenant
-pays for its own copy (about 130 MB). To share one copy instead, pre-seed it and
-symlink after the first tenant is up:
+Tag them. The warden refuses to start with an untagged tenant image, because an
+untagged image means every tenant's daemon silently changes version on any pod
+restart, which is an upgrade nobody scheduled and nobody can roll back.
+
+If the packages are private, create the pull secret and uncomment
+`SQUELCH_WARDEN_IMAGE_PULL_SECRET` in `20-warden.yaml`:
 
 ```sh
-# after tenant one has downloaded them
-install -d -o squelch -g squelch /var/lib/squelch/models
-mv /var/lib/squelch/tenants/<first>/.local/share/squelch/models/* /var/lib/squelch/models/
-# then, per tenant:
-sudo -u squelch ln -sfn /var/lib/squelch/models \
-  /var/lib/squelch/tenants/<label>/.local/share/squelch/models
+kubectl -n tenants create secret docker-registry ghcr \
+  --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
+kubectl -n warden create secret docker-registry ghcr \
+  --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>
 ```
 
-Do that with tenants stopped: two daemons downloading into one directory at the
-same time is a race nobody has made safe.
+(The `warden` namespace needs its own copy: an image pull secret does not cross
+a namespace. Add `imagePullSecrets` to the warden Deployment if you use it.)
 
-## 5. systemd
+## 5. The warden's token
 
 ```sh
-install -m 0644 deploy/hosted/squelchd@.service /etc/systemd/system/squelchd@.service
-install -m 0644 deploy/hosted/warden.service /etc/systemd/system/warden.service
-
-# The warden's own environment. 0600: it holds the bearer token.
-umask 077
-cat > /etc/squelch/warden.env <<EOF
-SQUELCH_WARDEN_TOKEN=$(openssl rand -base64 32)
-SQUELCH_WARDEN_BASE_DOMAIN=passband.email
-SQUELCH_WARDEN_AGE_IDENTITY=/etc/squelch/age/identity.txt
-EOF
-chmod 0600 /etc/squelch/warden.env
-
-systemctl daemon-reload
-systemctl enable --now warden
-curl -fsS http://127.0.0.1:8852/healthz && echo
+kubectl -n warden create secret generic squelch-warden \
+  --from-literal=token="$(openssl rand -base64 32)"
 ```
 
-Copy that token into the control plane's environment as
-`SQUELCH_CONTROL_WARDEN_TOKEN` (with `SQUELCH_CONTROL_WARDEN_URL=https://warden.passband.email`).
-It is the only credential between the two halves, and it is root on this box:
-rotate it by editing this file and restarting both services.
-
-Everything else the warden reads has a default that matches this runbook; the
-full table is in `squelch-warden/README.md`.
-
-## 6. Caddy
+Read it back once and put it in the control plane's environment as
+`SQUELCH_CONTROL_WARDEN_TOKEN`, alongside
+`SQUELCH_CONTROL_WARDEN_URL=https://warden.passband.email`:
 
 ```sh
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-  | tee /etc/apt/sources.list.d/caddy-stable.list
-apt update && apt install -y caddy
-
-install -d -o root -g root -m 0755 /etc/caddy/tenants
-install -m 0644 deploy/hosted/Caddyfile /etc/caddy/Caddyfile
-# edit /etc/caddy/Caddyfile: your base domain and your ACME email
-systemctl reload caddy
+kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d; echo
 ```
 
-The warden runs `systemctl reload caddy` after it writes a tenant site file, so
-the `caddy` unit must be exactly that name (or set
-`SQUELCH_WARDEN_CADDY_UNIT`).
+That token is the tenant namespace. Treat it the way you would treat a database
+password. Rotation is in `warden-token.example.yaml`.
 
-Confirm the warden is reachable and refuses strangers:
+## 6. The Google OAuth client
+
+Every tenant daemon needs the OAuth client id and secret that the control plane
+consented with, and it will not start without them.
 
 ```sh
+kubectl -n tenants create secret generic google-oauth-client \
+  --from-literal=client_id="<the web client's id>" \
+  --from-literal=client_secret="<the web client's secret>"
+```
+
+**Why our client secret is inside tenant pods.** A Google refresh token only
+works for the OAuth client that minted it. Hosted signups run through
+`squelch-control`'s confidential **web** client, so a daemon holding a tenant's
+refresh token and not holding that client's credentials cannot refresh an access
+token; `squelchd serve` checks for them at boot and exits without them. It is
+the SAME client, from the SAME GCP project, that the control plane uses. Not the
+desktop client self-hosters get embedded in their image, and not a second client
+of our own: a second one would mint tokens the first cannot refresh.
+
+That is custody hosted already admits to. These daemons are our infrastructure,
+running our image, on our box, with the tenant's mail on a volume we control; a
+shared client secret in that pod adds nothing to what a hosted tenant is already
+trusting us with. Be precise about what it is not, though: on its own it opens
+nothing. Reading a tenant's mail still needs that tenant's refresh token, which
+is sealed to that tenant's age recipient and openable only inside that tenant's
+own pod. The self-host tier is untouched and stays untouched.
+
+The Secret's name is `SQUELCH_WARDEN_OAUTH_SECRET_NAME` on the warden (default
+`google-oauth-client`); its two keys are fixed at `client_id` and
+`client_secret`. Details and rotation: `google-oauth-client.example.yaml`.
+
+## 7. Tenant limits
+
+```sh
+kubectl apply -f deploy/hosted/70-tenant-limits.yaml
+```
+
+A LimitRange and a ResourceQuota on `tenants`. **Size them to your box before
+you apply them**; the shipped numbers assume the 2 vCPU / 4 GB floor above and
+are deliberately conservative.
+
+The warden already puts requests and limits on both containers of every tenant
+pod (`SQUELCH_WARDEN_CPU_REQUEST` and friends in `20-warden.yaml`, defaulting to
+100m/256Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on the pod's `/tmp`
+and an ephemeral-storage bound so a runaway tenant cannot fill the node's root
+filesystem). This file is the layer under that: defaults for anything that lands
+in the namespace without bounds of its own, and an aggregate ceiling.
+
+Sizing, in the order that matters:
+
+- **`requests.cpu` and `requests.memory` are your tenant count.** The scheduler
+  reserves requests, so at the shipped 100m/256Mi a 2-vCPU box carries about 20
+  tenants and no more, whatever the quota says about pods.
+- **Limits may oversubscribe.** Tenants are idle most of the time and a sync
+  burst is seconds long. 4x requests is comfortable on one node; much past that
+  and a few simultaneous backfills evict each other.
+- **`requests.storage` is disk you actually have.** local-path is the box's
+  filesystem, and a claim that cannot bind is a tenant that never comes up.
+- Raising a per-tenant limit without raising the quota simply means fewer
+  tenants. That is the correct trade to make consciously rather than discover.
+
+A tenant refused by the quota looks like a provision that times out
+(`500 not_ready`), with the real reason in
+`kubectl -n tenants describe replicaset`.
+
+## 8. The warden
+
+Edit `20-warden.yaml`: the four places marked `EDIT ME` (the warden image, your
+base domain, the squelchd image tenants run, and the warden's hostname in two
+spots on the Ingress). Then:
+
+```sh
+kubectl apply -f deploy/hosted/10-warden-rbac.yaml
+kubectl apply -f deploy/hosted/30-tenants-default-deny.yaml
+kubectl apply -f deploy/hosted/20-warden.yaml
+
+# Check the API server's in-cluster address matches the policy before applying it.
+kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}'; echo
+kubectl apply -f deploy/hosted/50-warden-networkpolicy.yaml
+
+kubectl -n warden rollout status deploy/squelch-warden
+```
+
+Confirm it is up and refuses strangers:
+
+```sh
+curl -sS https://warden.passband.email/healthz                                       # ok
 curl -sS -o /dev/null -w '%{http_code}\n' https://warden.passband.email/v1/tenants   # 401
-curl -sS https://warden.passband.email/healthz                                        # ok
 ```
 
-## 7. The first tenant
+A 401 with an empty body is the correct answer to every wrong credential, every
+missing header, and every malformed one. There is no other shape of failure on
+that surface.
 
-Normally the control plane does this at the end of a signup. To prove the box
-works before wiring signup up, do it by hand with a credential you can throw
-away:
+## 9. The first tenant, and verifying the policy
+
+Normally the control plane does this at the end of a signup. To prove the
+cluster works before wiring signup up, walk the two phases by hand:
 
 ```sh
-RECIPIENT=$(age-keygen -y /etc/squelch/age/identity.txt)
-CT=$(printf '{"refresh_token":"not-a-real-token"}' | age -a -r "$RECIPIENT")
-TOKEN=$(grep SQUELCH_WARDEN_TOKEN /etc/squelch/warden.env | cut -d= -f2-)
+export TOKEN=$(kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d)
+export W=https://warden.passband.email
 
-curl -sS -X POST https://warden.passband.email/v1/tenants \
-  -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' \
-  -d "$(jq -n --arg ct "$CT" '{label:"test1",account_email:"you@example.com",cred_read_ciphertext:$ct}')"
+# Phase one: mint this tenant's key. Nothing runs yet.
+RECIPIENT=$(curl -sS -X POST $W/v1/tenants \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"label":"test1","account_email":"you@example.com"}' | jq -r .recipient)
+echo "$RECIPIENT"          # age1...
+
+curl -sS -H "authorization: Bearer $TOKEN" $W/v1/tenants/test1    # {"status":"pending"}
+
+# Phase two: seal something to that recipient and hand it over.
+CT=$(printf '{"slots":{}}' | age -a -r "$RECIPIENT")
+curl -sS -X PUT $W/v1/tenants/test1/credentials \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d "$(jq -n --arg ct "$CT" '{cred_read_ciphertext:$ct}')"
 ```
 
-A 201 comes back with the port, the pairing code, the tenant URL, and the
-`passband://pair?...` deep link. Then:
+The `PUT` blocks while the pod pulls its image and comes up, then returns the
+pairing code, the tenant URL, and the `passband://pair?...` deep link. Then:
 
 ```sh
-systemctl status squelchd@test1
-curl -sS -o /dev/null -w '%{http_code}\n' https://test1.passband.email/healthz
-curl -sS -X DELETE -H "authorization: Bearer $TOKEN" \
-  https://warden.passband.email/v1/tenants/test1        # 204
+kubectl -n tenants get all,pvc,netpol -l app.kubernetes.io/instance=test1
+curl -sS -o /dev/null -w '%{http_code}\n' https://test1.passband.email/client/updates  # 401
+curl -sS -o /dev/null -w '%{http_code}\n' https://test1.passband.email/mcp             # 404
 ```
 
-The daemon will fail to sync with that fake credential, which is expected: what
-this proves is the unit, the route, the certificate, and the pairing exec.
+Those last two lines are the two-door split, observable from the internet: the
+human door answers (with a 401, because you presented no token) and the agent
+door does not exist. See "The agent door is not served" below.
 
-`DELETE` stops and disables the unit and removes the Caddy site. It KEEPS the
-data directory and the env file, so nothing here destroys a mailbox. Cleaning up
-a test tenant fully is manual:
+The daemon will fail to sync with that empty credential, which is expected. What
+this proves is the image, the volume, the certificate, the routing, and the
+pairing exec.
+
+### Do the probes get through?
+
+**Do this with the canary above, before you have real tenants.** A readiness
+probe is a TCP connection from the KUBELET, which originates at the node's own
+address and matches no pod and no namespace, so it matches no peer in a tenant's
+NetworkPolicy. Some CNIs exempt host-originated traffic from policy and some do
+not, and on one that does not, every provision times out on a pod that is
+perfectly healthy. k3s ships kube-router, and this is worth ten minutes of
+certainty rather than an assumption.
 
 ```sh
-rm -rf /var/lib/squelch/tenants/test1 /etc/squelch/tenants/test1.env
-# and drop its entry from /var/lib/squelch/warden/state.json
+kubectl -n tenants get pod -l app.kubernetes.io/instance=test1 \
+  -o custom-columns=NAME:.metadata.name,READY:.status.containerStatuses[0].ready
+kubectl -n tenants describe pod -l app.kubernetes.io/instance=test1 | grep -A3 Events
 ```
+
+If the `PUT` returned a pairing code, probes are getting through and there is
+nothing to do. If it returned `500 not_ready` while the container itself is
+running and the events show readiness probe timeouts, the probe is being
+dropped. Set the node network on the warden and re-apply:
+
+```sh
+kubectl get node -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'; echo
+# put that address as a /32 in SQUELCH_WARDEN_NODE_CIDR in 20-warden.yaml
+kubectl apply -f deploy/hosted/20-warden.yaml
+kubectl -n warden rollout restart deploy/squelch-warden
+```
+
+Then delete and re-provision the canary. The warden adds one ingress rule to
+every tenant's policy: that CIDR, TCP 8848, nothing else.
+
+The tradeoff, stated: it admits traffic originating at the node's address, which
+is the kubelet and anything else with a shell on the node. Anything with a shell
+on the node can read every volume on the box anyway, so this opens no new door.
+Other tenants' pods arrive from pod IPs, not the node IP, and stay blocked.
+Resist widening it to the pod CIDR: that is exactly the tenant-to-tenant
+reachability the rest of this design spends its effort removing. The warden
+refuses a `/0` outright.
+
+### Does the policy actually deny?
+
+The claim is that nothing reaches a tenant except the ingress controller. Check
+it rather than believing the YAML, with a scratch pod in the tenant namespace
+aimed at the canary's Service:
+
+```sh
+kubectl -n tenants run probe --rm -it --restart=Never --image=busybox:1.36 \
+  --overrides='{"spec":{"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":10001,"runAsGroup":10001,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"probe","image":"busybox:1.36","command":["sh","-c","nc -w 3 test1 8848 </dev/null && echo REACHABLE || echo blocked"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}}]}}'
+```
+
+`blocked` is the correct answer, and it is the whole tenant-isolation claim in
+one line: a pod in the same namespace, on the same node, cannot open a
+connection to another tenant's daemon. `REACHABLE` means the CNI is not
+enforcing NetworkPolicy at all (a cluster installed with
+`--disable-network-policy`, or a CNI that ignores it), and **nothing else here is
+worth doing until that is fixed**: per-tenant isolation is the product.
+
+The overrides are there because the namespace enforces Pod Security Admission at
+`restricted`, so a bare `kubectl run` is refused. That refusal is itself the
+admission control working, and a second thing this line demonstrates.
+
+Clean up:
+
+```sh
+curl -sS -X DELETE -H "authorization: Bearer $TOKEN" $W/v1/tenants/test1   # 204
+```
+
+`DELETE` removes the Deployment, Service, Ingress and NetworkPolicy. It KEEPS
+the volume and both Secrets, and the warden has no permission to remove them, so
+nothing reachable from the control plane can destroy a mailbox. Removing a test
+tenant for real is you, with kubectl:
+
+```sh
+kubectl -n tenants delete pvc test1-data secret/test1-identity secret/test1-credential
+```
+
+## 10. Embedding weights
+
+Each tenant's daemon downloads about 130 MB of ONNX weights the first time it
+embeds a message, into `$HOME/.local/share/squelch/models`, and `HOME` is that
+tenant's own volume. Left alone, that is the same download once per tenant,
+inside a signup somebody is watching.
+
+**The chosen mechanism: one shared read-only volume, copied into each tenant's
+volume by its init container.** The warden mounts the shared PVC into the init
+container only, which copies the cache across if the tenant does not have one
+yet. It is a copy rather than a symlink because the daemon's root filesystem is
+read-only and fastembed expects to own its cache directory; the cost is ~130 MB
+of local disk per tenant, which is nothing next to a mail index.
+
+Fill it once, from a tenant that has already downloaded them:
+
+```sh
+kubectl apply -f deploy/hosted/60-models.yaml
+kubectl -n tenants wait --for=condition=Ready pod/squelch-models-seed
+
+# From a tenant that has synced at least once:
+POD=$(kubectl -n tenants get pod -l app.kubernetes.io/instance=<first-label> -o name | head -1)
+kubectl -n tenants cp "${POD#pod/}:/data/.local/share/squelch/models" ./models
+kubectl -n tenants cp ./models squelch-models-seed:/seed
+
+# kubectl cp lands it one level deep; flatten it so the PVC root IS the cache.
+kubectl -n tenants exec squelch-models-seed -- sh -c 'mv /seed/models/* /seed/ && rmdir /seed/models'
+kubectl -n tenants exec squelch-models-seed -- ls /seed
+
+kubectl -n tenants delete pod squelch-models-seed
+```
+
+Then uncomment the `SQUELCH_WARDEN_MODEL_PVC` env entry in `20-warden.yaml`,
+re-apply it, and `kubectl -n warden rollout restart deploy/squelch-warden`. Every
+tenant provisioned after that skips the download. Tenants that already have their
+own copy are unaffected.
+
+The `ReadWriteOnce` volume is mounted by many pods, which is legal because they
+are all on the one node. **If you ever add a second node, this stops working.**
+The answer then is the other mechanism: build a squelchd image with the weights
+baked in at `/data/.local/share/squelch/models` and point
+`SQUELCH_WARDEN_IMAGE` at it. That costs image size and gains node
+independence.
 
 ## Operating notes
 
-**The state file.** `/var/lib/squelch/warden/state.json`, mode 0600, one entry
-per tenant with its port and status. It is written temp-then-rename, so it is
-never half a document. If it is ever lost, the warden does NOT rebuild it
-automatically: an empty state would hand port 9100 to the next signup while a
-live tenant is already there. Rebuild it by hand from the env files, which carry
-the port and the account:
+**Where the state is.** There is none. The warden keeps no database, no state
+file and no port allocator; the cluster is the record. A tenant's status is
+derived from what exists:
+
+| What exists | Status |
+|---|---|
+| identity Secret only | `pending` (phase one done, phase two never ran) |
+| Deployment with a ready replica | `active` |
+| Deployment with no ready replica | `failed` |
+| credential Secret, no Deployment | `stopped` (someone called DELETE) |
+| no identity Secret | 404 |
+
+**A signup that died between the two calls.** It shows as `pending`. Re-posting
+the same label with the same address returns the SAME recipient rather than
+minting a second key, so the control plane's retry is safe and idempotent. A
+different address on a pending label is a 409: that is two people asking for one
+subdomain, not a retry.
+
+A pending tenant nobody ever comes back for is collected automatically once it
+is older than `SQUELCH_WARDEN_PENDING_TTL_SECS` (24 hours by default): the
+warden deletes its identity Secret, which frees the subdomain. Nothing is lost,
+because nothing was ever sealed to that key and no mail exists; recovery for the
+person is signing up again. The sweep only ever touches a tenant that is still
+`pending` at the moment it looks, and only one whose Secret it stamped with a
+creation time, so a serving tenant, a stopped one, and a Secret restored from a
+backup are all beyond it.
+
+**A tenant stuck in `failed`.** Look at the pod, not the warden:
 
 ```sh
-for f in /etc/squelch/tenants/*.env; do
-  label=$(basename "$f" .env)
-  port=$(grep '^SQUELCH_BIND=' "$f" | cut -d: -f2)
-  email=$(grep '^SQUELCH_ACCOUNT_EMAIL=' "$f" | cut -d= -f2-)
-  echo "$label $port $email"
-done
+kubectl -n tenants describe pod -l app.kubernetes.io/instance=<label>
+kubectl -n tenants logs -l app.kubernetes.io/instance=<label> --tail=100
 ```
 
-...then write those into the JSON shape the warden reads (`version`, `tenants`
-keyed by label, each with `label`, `account_email`, `port`, `status`,
-`created_at`) and restart it.
+The usual causes are an image pull failure, a volume that will not bind, a
+namespace quota with nothing left in it, a missing `google-oauth-client` Secret
+(the daemon exits at boot without an OAuth client), and, with user namespaces on,
+a node that does not support `hostUsers`. Re-running
+`PUT /v1/tenants/<label>/credentials` is safe: every apply is a server-side
+apply, so a retry converges rather than duplicating.
 
-**A tenant is stuck in `provisioning`.** That means a warden died mid-provision.
-`GET /v1/tenants/<label>` reports it as `failed`. `DELETE` it, then let the
-control plane re-run the signup.
+**Re-consent, and what "converges" means for a credential.** A tenant's daemon
+reads a COPY of the sealed blob on its own volume, because a Secret mount is
+read-only and the file is rewritten on every token refresh. So storing a new
+blob is not by itself enough to change what a daemon uses. Two things make it
+land: the ciphertext's hash rides in an annotation on the pod template, so a new
+blob is a new pod spec and the Deployment rolls; and the init container keeps a
+marker of what it last installed and re-copies exactly when the mounted Secret
+differs from it. A daemon-refreshed credential survives every restart; a
+genuinely new one installs.
 
-**Pairing a second device.** `POST /v1/tenants/<label>/pair` re-mints a code.
-This supersedes the previous one, which is the daemon's documented behaviour:
-one live pairing code per account.
+The rule that falls out of it, worth knowing before you need it:
 
-**Rotating the warden token.** Edit `/etc/squelch/warden.env`, restart `warden`,
-update the control plane. There is no grace period; a signup in flight during
-the swap fails and the user retries.
+| Tenant is | `PUT /credentials` |
+|---|---|
+| `pending` | provisions it |
+| `failed` | converges: re-applies and rolls the pod |
+| `stopped` | brings it back with the new credential |
+| `active` | `409`. Re-consent for a running tenant is `DELETE` (which keeps the mail and both Secrets) and then `PUT`. |
 
-**Backups.** Two things matter and they are different sizes:
-`/etc/squelch/age/identity.txt` (a few hundred bytes, and everything depends on
-it) and `/var/lib/squelch/tenants/*/squelch.db` (the mail index). Litestream for
-the second one is Phase 2 work that is not in this runbook yet.
+**Pairing a second device.** `POST /v1/tenants/<label>/pair` re-mints a code by
+exec'ing into the tenant's pod. This supersedes the previous one, which is the
+daemon's documented behaviour: one live pairing code per account.
 
-## What this does not isolate
+**Upgrading the daemon.** Change `SQUELCH_WARDEN_IMAGE` and restart the warden,
+then re-apply each tenant. Existing tenants do NOT move on their own, by design.
+There is no "upgrade all tenants" button and that is deliberate: an upgrade that
+touches every mailbox at once is an outage waiting for a bad release.
 
-Worth being honest about, because the hosted pitch is per-tenant process
-isolation and this is where that claim stops:
+**Backups.** Two things, of very different sizes:
 
-- **Every tenant daemon runs as the same `squelch` user.** Tenant directories
-  are 0700, which keeps them away from every other account on the box but not
-  from each other: a compromised daemon could read another tenant's data dir.
-  Isolation here is process-level (separate units, separate SQLite files,
-  separate memory), not user-level. Per-tenant system users are the hardening
-  step, and they change what the warden's chown does.
-- **One age identity for the whole box.** Encryption at rest protects against a
-  stolen disk or a leaked backup, not against root on a running box. Per-tenant
-  identities need a key-per-tenant story and are deliberately not in the MVP.
-- **The warden runs as root.** Its bearer token is the box. It binds loopback
-  and Caddy fronts it, so the token never crosses the network unencrypted, but
-  there is no second factor between the control plane and root here.
+- The Secrets in `tenants`. A few kilobytes, and every tenant's ability to read
+  their own mail depends on theirs. `kubectl -n tenants get secret -o yaml`
+  produces base64 of the DECRYPTED values, so treat that output the way you
+  would treat the keys themselves.
+- The PersistentVolumes under `/var/lib/rancher/k3s/storage/`. The mail indexes.
+  Bigger, and rebuildable from Gmail given a working credential.
+
+Back up the first even if you skip the second. Without a tenant's identity, that
+tenant's stored credential is unrecoverable and they consent with Google again.
+
+## What this does and does not isolate
+
+The hosted pitch is per-tenant isolation, so here is exactly where that claim
+starts and stops.
+
+**What holds:**
+
+- **Separate pods, separate volumes, separate SQLite files.** Nothing is shared
+  between tenants at the application layer.
+- **A separate age identity per tenant.** A leaked Secret is one tenant. The
+  control plane holds recipients only and can never open anything. There is no
+  escrow: we cannot read a tenant's credential either, which is also why we
+  cannot recover one for them.
+- **Secrets encrypted at rest**, via `--secrets-encryption`. A stolen datastore
+  file is not a stolen key.
+- **No tenant-to-tenant network reachability.** Each tenant's NetworkPolicy
+  accepts connections only from the ingress controller, on one port, and its
+  egress is DNS plus TCP 443 to the public internet with every RFC 1918 range,
+  the CGNAT range, and link-local subtracted. On a default k3s that removes the
+  pod CIDR, the service CIDR, the in-cluster API server, the warden, and every
+  cloud metadata endpoint in one stroke. There is also a namespace-wide
+  default-deny underneath.
+- **No API access from a tenant pod.** `automountServiceAccountToken: false`,
+  so there is no token to use even if the network allowed it.
+- **A pod that has given up everything it can.** Non-root at a fixed high uid,
+  no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, a
+  read-only root filesystem with exactly two writable mounts, and (by default)
+  its own user namespace so uid 0 inside is nobody outside. Pod Security
+  Admission enforces `restricted` on the namespace, so that shape is the only
+  shape anything here may take, whoever creates it.
+- **Bounds on every container.** CPU, memory and ephemeral storage are requested
+  and limited per container, `/tmp` has a size limit, and a LimitRange plus a
+  ResourceQuota bound the namespace in aggregate. One tenant cannot starve the
+  others or fill the node's disk out from under them.
+- **A provisioner that cannot destroy mail.** The warden's Role has no `delete`
+  on PersistentVolumeClaims, and no code path anywhere deletes a credential
+  Secret. It does hold `delete` on Secrets, for one job: collecting the identity
+  Secret of a tenant that is still `pending` past the TTL. That is the honest
+  shape of it. The guarantee for a tenant that ever got as far as a credential
+  is enforced by the code and its tests rather than by RBAC.
+
+**What does not hold, and you should say so out loud if anyone asks:**
+
+- **The kernel is shared.** User namespaces, seccomp and dropped capabilities
+  raise the cost of a container escape; they do not make one impossible. A
+  kernel bug is every tenant on the box. The named next rung is microVM
+  isolation (Kata, Firecracker), where each tenant gets its own kernel. It is a
+  runtime change, not an application change, and this design does not preclude
+  it.
+- **Root on the node reads everything.** Encryption at rest protects a stolen
+  disk and a leaked backup. It does not protect against someone with a shell on
+  the running box, who can read the decryption key and every mounted volume.
+- **The warden's token is the tenant namespace.** Anyone holding it can create
+  workloads there and exec into tenant pods. It cannot delete a volume, it
+  cannot reach outside that namespace, and Pod Security Admission decides what
+  kind of workload it may create, but that is the boundary, and there is no
+  second factor between the control plane and it.
+- **We hold the Google web client, and every tenant pod holds it too.** It has
+  to be there: a refresh token only works for the client that minted it. On its
+  own it opens no mailbox, but it is one more thing on the box that a hosted
+  tenant is trusting us with, and the self-host tier exists precisely for people
+  who would rather not.
+- **A tenant can reach the ingress controller's public address**, the same as
+  any stranger on the internet, because it is a public IP on port 443. That is
+  not a path into another tenant's pod; it is the same front door everyone else
+  uses.
+- **One node is one failure domain.** No high availability, and a node loss is
+  a restore from backup.
 
 ## The agent door is not served
 
-Hosted ships the human door only. `/mcp` and `/mcp/*` are refused at Caddy in
-two places: inline in every generated tenant site, and as the `no_agent_door`
-snippet in the main Caddyfile. The daemon still serves the agent door on
-loopback, so anything on the box can reach it; nothing off the box can.
+Hosted publishes the human door only. Each tenant's Ingress declares exactly two
+path prefixes, `/client` and `/t`, and nothing else. `/mcp` matches no rule, so
+Traefik answers its own 404 for it, as it does for every other path on a tenant
+vhost.
+
+That is an allowlist, not a deny rule, and deliberately so: a deny rule has to
+enumerate every spelling of the thing it is refusing and fails open when it
+misses one. This fails closed. The cost is that a new unauthenticated route in
+the daemon needs a line in `HUMAN_DOOR_PREFIXES` in
+`squelch-warden/src/objects.rs`, which is a list in code with a test on it
+rather than a controller annotation nobody reads.
+
+The daemon still serves `/mcp` inside its own pod. Nothing off the box can
+reach it, and neither can another tenant.

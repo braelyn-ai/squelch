@@ -1,20 +1,33 @@
-//! The signup flow end to end, against a MOCK Google and a MOCK warden.
+//! The signup flow end to end, against a MOCK Google and a MOCK warden that
+//! speaks wire v2.
 //!
 //! Both mocks are real axum servers on ephemeral loopback ports, the way
 //! squelch-core tests the APNs relay, because the properties under test are
 //! properties OF THE WIRE:
 //!
-//! - the warden receives age ARMOR and never a refresh token,
+//! - provisioning is TWO calls, and the credential rides only on the second,
+//! - the ciphertext is sealed to EXACTLY the recipient the first call answered
+//!   with, and what is inside it is a credentials-file slot map (not a bare
+//!   token, which would decrypt into an empty map on the daemon),
+//! - a failure between the two calls leaves a retriable signup: the address is
+//!   held for that mailbox, the invite is NOT burned, and the retry lands on the
+//!   same recipient,
 //! - Google receives the PKCE verifier that matches the challenge the consent
 //!   URL carried,
 //! - the success page carries the pairing code, the tenant URL, and the deep
 //!   link.
 //!
-//! Nothing here touches a real Google endpoint, a real port 8848, or any store
-//! outside an in-memory SQLite. `Config` is constructed directly rather than
-//! read from the environment, which is exactly why `token_url`/`profile_url`
-//! are fields: `Config::from_env` pins Google's and nothing can move them.
+//! The MOCK WARDEN mints a per-tenant age identity, exactly as the real one
+//! does, and keeps it. This test process is the only place both halves of a key
+//! ever exist; the real control plane never sees an identity at all.
+//!
+//! Nothing here touches a real Google endpoint, a real cluster, a real port
+//! 8848, or any store outside an in-memory SQLite. `Config` is constructed
+//! directly rather than read from the environment, which is exactly why
+//! `token_url`/`profile_url` are fields: `Config::from_env` pins Google's and
+//! nothing can move them.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,9 +36,9 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::State as AxumState,
-    http::{Request, StatusCode, header},
-    response::IntoResponse,
-    routing::{get, post},
+    http::{HeaderMap, Request, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -41,20 +54,41 @@ const ACCESS_TOKEN: &str = "ya29.THE-SECRET-ACCESS-TOKEN";
 const MAILBOX: &str = "ada@example.com";
 const READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 
+/// One tenant as the mock warden holds it: the identity it minted (which never
+/// leaves the warden in production), the mailbox that reserved the label, and
+/// whether a credential has been installed.
+struct MockTenant {
+    account_email: String,
+    identity: age::x25519::Identity,
+    recipient: String,
+    provisioned: bool,
+}
+
 /// What the mocks recorded, so the test can assert on the bytes each service
 /// actually received.
 #[derive(Default)]
 struct Recorder {
     /// Form fields of the token exchange.
     token_form: Vec<(String, String)>,
-    /// Bodies posted to `POST /v1/tenants`.
-    provision_bodies: Vec<Value>,
-    /// Bearer values the warden saw.
+    /// Bodies posted to `POST /v1/tenants` (call 1).
+    create_bodies: Vec<Value>,
+    /// `(label, body)` seen on `PUT /v1/tenants/{label}/credentials` (call 2).
+    /// Recorded BEFORE the mock decides whether to fail, so a failed install is
+    /// still visible to the assertions.
+    credential_puts: Vec<(String, Value)>,
+    /// Bearer values the warden saw, on every route.
     warden_bearers: Vec<String>,
     /// Labels asked about via `GET /v1/tenants/{label}`.
     status_lookups: Vec<String>,
-    /// Labels the warden should report as ALREADY TAKEN.
+    /// Labels the warden should report as ALREADY LIVE (somebody else's).
     taken: Vec<String>,
+    /// Tenants the warden has minted an identity for, by label.
+    tenants: BTreeMap<String, MockTenant>,
+    /// When true, call 2 fails the way an apply that never went Ready does.
+    fail_credentials: bool,
+    /// When set, call 2 answers with this status instead of doing anything. For
+    /// the statuses that are a WIRE disagreement rather than an outcome.
+    credentials_status: Option<u16>,
     /// When set, the mock Google verifies PKCE the way Google does: the
     /// presented verifier must S256-hash to this challenge.
     expected_challenge: Option<String>,
@@ -117,44 +151,109 @@ async fn spawn_google(rec: Shared) -> String {
     spawn(app).await
 }
 
-/// A mock warden implementing the control -> warden contract.
+fn bearer_of(headers: &HeaderMap) -> String {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn str_field(v: &Value, name: &str) -> String {
+    v.get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_status(status: StatusCode, reason: &str) -> Response {
+    (status, Json(json!({ "error": reason }))).into_response()
+}
+
+/// A mock warden implementing the control -> warden contract, v2.
 async fn spawn_warden(rec: Shared) -> String {
     let app = Router::new()
         .route(
             "/v1/tenants",
             post(
+                |AxumState(rec): AxumState<Shared>, headers: HeaderMap, body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    r.create_bodies.push(parsed.clone());
+                    r.warden_bearers.push(bearer_of(&headers));
+
+                    let label = str_field(&parsed, "label");
+                    let account_email = str_field(&parsed, "account_email");
+                    if label.is_empty() || account_email.is_empty() {
+                        return json_status(StatusCode::UNPROCESSABLE_ENTITY, "invalid");
+                    }
+                    if r.taken.contains(&label) {
+                        return json_status(StatusCode::CONFLICT, "exists");
+                    }
+                    // THE IDEMPOTENCY THE CONTRACT PINS: a second create for a
+                    // PENDING label from the SAME mailbox answers with the SAME
+                    // recipient. A provisioned label, or a different mailbox,
+                    // is a duplicate and gets 409.
+                    if let Some(existing) = r.tenants.get(&label) {
+                        if existing.provisioned || existing.account_email != account_email {
+                            return json_status(StatusCode::CONFLICT, "exists");
+                        }
+                        return (
+                            StatusCode::CREATED,
+                            Json(json!({ "recipient": existing.recipient })),
+                        )
+                            .into_response();
+                    }
+
+                    let identity = age::x25519::Identity::generate();
+                    let recipient = identity.to_public().to_string();
+                    r.tenants.insert(
+                        label,
+                        MockTenant {
+                            account_email,
+                            identity,
+                            recipient: recipient.clone(),
+                            provisioned: false,
+                        },
+                    );
+                    (StatusCode::CREATED, Json(json!({ "recipient": recipient }))).into_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/tenants/{label}/credentials",
+            put(
                 |AxumState(rec): AxumState<Shared>,
-                 headers: axum::http::HeaderMap,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap,
                  body: String| async move {
                     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let mut r = rec.lock().unwrap();
-                    r.provision_bodies.push(parsed.clone());
-                    r.warden_bearers.push(
-                        headers
-                            .get(header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
-                    let label = parsed
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    if r.taken.contains(&label) {
-                        return (StatusCode::CONFLICT, Json(json!({"error":"exists"})))
-                            .into_response();
+                    r.credential_puts.push((label.clone(), parsed));
+                    r.warden_bearers.push(bearer_of(&headers));
+
+                    if let Some(status) = r.credentials_status {
+                        let status = StatusCode::from_u16(status).unwrap();
+                        return json_status(status, "refused");
                     }
-                    (
-                        StatusCode::CREATED,
-                        Json(json!({
-                            "port": 9100,
-                            "pair_code": "ABCD-EFGH",
-                            "pair_url": format!("https://{label}.passband.test"),
-                            "deep_link": "passband://pair?url=x&code=ABCD-EFGH",
-                        })),
-                    )
-                        .into_response()
+                    if r.fail_credentials {
+                        // The apply failed, or the pod never went Ready. The
+                        // tenant stays pending and keeps its identity.
+                        return json_status(StatusCode::INTERNAL_SERVER_ERROR, "apply_failed");
+                    }
+                    match r.tenants.get_mut(&label) {
+                        None => json_status(StatusCode::NOT_FOUND, "unknown"),
+                        Some(t) if t.provisioned => json_status(StatusCode::CONFLICT, "provisioned"),
+                        Some(t) => {
+                            t.provisioned = true;
+                            Json(json!({
+                                "pair_code": "ABCD-EFGH",
+                                "pair_url": format!("https://{label}.passband.test"),
+                                "deep_link": "passband://pair?url=x&code=ABCD-EFGH",
+                            }))
+                            .into_response()
+                        }
+                    }
                 },
             ),
         )
@@ -162,13 +261,18 @@ async fn spawn_warden(rec: Shared) -> String {
             "/v1/tenants/{label}",
             get(
                 |AxumState(rec): AxumState<Shared>,
-                 axum::extract::Path(label): axum::extract::Path<String>| async move {
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap| async move {
                     let mut r = rec.lock().unwrap();
                     r.status_lookups.push(label.clone());
+                    r.warden_bearers.push(bearer_of(&headers));
                     if r.taken.contains(&label) {
-                        Json(json!({"status":"active","port":9100})).into_response()
-                    } else {
-                        (StatusCode::NOT_FOUND, Json(json!({"error":"unknown"}))).into_response()
+                        return Json(json!({"status":"active"})).into_response();
+                    }
+                    match r.tenants.get(&label) {
+                        Some(t) if t.provisioned => Json(json!({"status":"active"})).into_response(),
+                        Some(_) => Json(json!({"status":"pending"})).into_response(),
+                        None => json_status(StatusCode::NOT_FOUND, "unknown"),
                     }
                 },
             ),
@@ -191,13 +295,11 @@ async fn spawn(app: Router) -> String {
     format!("http://{addr}")
 }
 
-/// A whole control plane wired to the two mocks, plus the identity that stands
-/// in for the one on the VPS (this process never holds it in production).
+/// A whole control plane wired to the two mocks.
 struct Harness {
     app: Router,
     state: ControlState,
     rec: Shared,
-    identity: age::x25519::Identity,
     invite_code: String,
 }
 
@@ -207,7 +309,6 @@ impl Harness {
         let google = spawn_google(rec.clone()).await;
         let warden_url = spawn_warden(rec.clone()).await;
 
-        let identity = age::x25519::Identity::generate();
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             public_url: "https://signup.passband.test".into(),
@@ -216,7 +317,6 @@ impl Harness {
             client_id: "test-client-id".into(),
             client_secret: "test-client-secret".into(),
             cookie_key: vec![42; 32],
-            age_recipient: identity.to_public().to_string(),
             warden_url: warden_url.clone(),
             warden_token: "warden-bearer".into(),
             db_path: ":memory:".into(),
@@ -228,22 +328,18 @@ impl Harness {
 
         let store = ControlStore::open_in_memory().unwrap();
         let minted = invites::mint().unwrap();
-        store.insert_invite(&minted.code_hash).unwrap();
+        store
+            .insert_invite(&minted.code_hash, default_expiry())
+            .unwrap();
 
         let warden = Arc::new(
-            HttpWarden::new(
-                warden_url,
-                "warden-bearer".into(),
-                Duration::from_secs(5),
-            )
-            .unwrap(),
+            HttpWarden::new(warden_url, "warden-bearer".into(), Duration::from_secs(5)).unwrap(),
         );
-        let state = ControlState::new(config, store, warden).unwrap();
+        let state = ControlState::new(config, store, warden);
         Self {
             app: router(state.clone()),
             state,
             rec,
-            identity,
             invite_code: minted.code,
         }
     }
@@ -251,12 +347,81 @@ impl Harness {
     /// Mint another invite straight into the control store, the way
     /// `squelch-control invite issue` does.
     fn issue_invite(&self) -> String {
+        self.issue_invite_expiring(default_expiry())
+    }
+
+    /// ...with an expiry of the test's choosing. A past one is a code that ran
+    /// out before the test started.
+    fn issue_invite_expiring(&self, expires_at: chrono::DateTime<chrono::Utc>) -> String {
         let minted = invites::mint().unwrap();
-        self.state.store().insert_invite(&minted.code_hash).unwrap();
+        self.state
+            .store()
+            .insert_invite(&minted.code_hash, expires_at)
+            .unwrap();
         minted.code
     }
 
-    async fn get(&self, uri: &str, cookie: Option<&str>) -> (StatusCode, axum::http::HeaderMap, String) {
+    /// Whether the code the harness minted is available to be held right now.
+    /// The reservation is invisible from the outside, so this is how a test
+    /// asserts a failed signup handed it back.
+    fn invite_is_available(&self) -> bool {
+        self.state
+            .store()
+            .find_available_invite(&invites::hash(&self.invite_code), chrono::Utc::now())
+            .unwrap()
+            .is_some()
+    }
+
+    /// How the store recorded the invite: `(used_by_label, still available)`.
+    fn invite_row(&self) -> (Option<String>, bool) {
+        let rows = self.state.store().list_invites().unwrap();
+        let row = rows.last().expect("the harness minted one").clone();
+        (row.used_by_label, self.invite_is_available())
+    }
+
+    /// The recipient the mock warden minted for `label`.
+    fn recipient_of(&self, label: &str) -> String {
+        self.rec.lock().unwrap().tenants[label].recipient.clone()
+    }
+
+    /// Open a ciphertext with the identity the WARDEN kept for `label`. This is
+    /// the assertion the whole per-tenant-key design rests on: if the control
+    /// plane sealed to anything other than the recipient call 1 answered with,
+    /// this fails.
+    fn open_with_tenant_identity(&self, label: &str, armor: &str) -> String {
+        let rec = self.rec.lock().unwrap();
+        let tenant = rec
+            .tenants
+            .get(label)
+            .expect("the warden minted an identity for this tenant");
+        let decryptor =
+            age::Decryptor::new(age::armor::ArmoredReader::new(armor.as_bytes())).unwrap();
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&tenant.identity as &dyn age::Identity))
+            .unwrap();
+        let mut plaintext = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut plaintext).unwrap();
+        plaintext
+    }
+
+    /// The armor the control plane sent on the nth `PUT .../credentials`.
+    fn credential_armor(&self, n: usize) -> (String, String) {
+        let rec = self.rec.lock().unwrap();
+        let (label, body) = &rec.credential_puts[n];
+        (
+            label.clone(),
+            body["cred_read_ciphertext"]
+                .as_str()
+                .expect("the credential body carries armor")
+                .to_string(),
+        )
+    }
+
+    async fn get(
+        &self,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
         let mut req = Request::builder().method("GET").uri(uri);
         if let Some(c) = cookie {
             req = req.header(header::COOKIE, c);
@@ -264,7 +429,11 @@ impl Harness {
         self.send(req.body(axum::body::Body::empty()).unwrap()).await
     }
 
-    async fn post_form(&self, uri: &str, body: String) -> (StatusCode, axum::http::HeaderMap, String) {
+    async fn post_form(
+        &self,
+        uri: &str,
+        body: String,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
         let req = Request::builder()
             .method("POST")
             .uri(uri)
@@ -274,14 +443,15 @@ impl Harness {
         self.send(req).await
     }
 
-    async fn send(&self, req: Request<axum::body::Body>) -> (StatusCode, axum::http::HeaderMap, String) {
+    async fn send(
+        &self,
+        req: Request<axum::body::Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
         let resp = self.app.clone().oneshot(req).await.unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body = String::from_utf8_lossy(
-            &to_bytes(resp.into_body(), 1 << 20).await.unwrap(),
-        )
-        .to_string();
+        let body =
+            String::from_utf8_lossy(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).to_string();
         (status, headers, body)
     }
 
@@ -305,6 +475,23 @@ impl Harness {
         let cookie = cookie.split(';').next().unwrap().to_string();
         (location, cookie)
     }
+
+    /// Walk one whole signup: form post, consent, callback.
+    async fn run_signup(&self, label: &str, invite: &str) -> (StatusCode, String) {
+        let (consent, cookie) = self.start_signup_with(label, invite).await;
+        let (status, _, body) = self
+            .get(
+                &format!("/oauth/callback?code=the-auth-code&state={}", state_param(&consent)),
+                Some(&cookie),
+            )
+            .await;
+        (status, body)
+    }
+}
+
+/// What `squelch-control invite issue` would stamp on a code minted now.
+fn default_expiry() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::days(invites::DEFAULT_TTL_DAYS)
 }
 
 fn urlencode(s: &str) -> String {
@@ -374,6 +561,10 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
         .join("|");
     assert!(set_cookie.contains("Max-Age=0"), "{set_cookie}");
 
+    // ---- what the warden actually received ----
+    let (put_label, armor) = h.credential_armor(0);
+    let plaintext = h.open_with_tenant_identity("ada", &armor);
+    let recipient = h.recipient_of("ada");
     let rec = h.rec.lock().unwrap();
 
     // Google got the PKCE verifier and our redirect URI, and the exchange was
@@ -387,36 +578,249 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
         "https://signup.passband.test/oauth/callback"
     );
 
-    // THE CENTRAL ASSERTION: what reached the warden is armor, addressed to the
-    // box, and contains no token in the clear.
-    assert_eq!(rec.provision_bodies.len(), 1);
-    let sent = &rec.provision_bodies[0];
-    assert_eq!(sent["label"], "ada");
-    assert_eq!(sent["account_email"], MAILBOX);
-    let ciphertext = sent["cred_read_ciphertext"].as_str().unwrap();
-    assert!(ciphertext.starts_with(seal::ARMOR_HEADER), "{ciphertext}");
-    assert!(!ciphertext.contains(REFRESH_TOKEN));
-    assert!(!ciphertext.contains(ACCESS_TOKEN));
-    let whole_body = serde_json::to_string(sent).unwrap();
+    // CALL 1 carries the label and the mailbox and NO credential: at that point
+    // the recipient it would be sealed to does not exist yet.
+    assert_eq!(rec.create_bodies.len(), 1);
+    let created = &rec.create_bodies[0];
+    assert_eq!(created["label"], "ada");
+    assert_eq!(created["account_email"], MAILBOX);
+    assert!(
+        created.get("cred_read_ciphertext").is_none(),
+        "the credential must not ride on call 1: {created}"
+    );
+
+    // CALL 2 carries armor, on the right label, and no token in the clear.
+    assert_eq!(rec.credential_puts.len(), 1);
+    assert_eq!(put_label, "ada");
+    assert!(armor.starts_with(seal::ARMOR_HEADER), "{armor}");
+    assert!(!armor.contains(REFRESH_TOKEN));
+    assert!(!armor.contains(ACCESS_TOKEN));
+    let whole_body = serde_json::to_string(&rec.credential_puts[0].1).unwrap();
     assert!(!whole_body.contains(REFRESH_TOKEN), "{whole_body}");
     assert!(!whole_body.contains(ACCESS_TOKEN), "{whole_body}");
+    // What call 1 answered with is a PUBLIC key. The private half never left the
+    // mock warden, which is the only reason this test process can decrypt at all.
+    assert!(recipient.starts_with("age1"), "{recipient}");
 
-    // ...and it is the tenant's real credential: only the box's identity opens
-    // it, and what comes out is the StoredToken the daemon expects.
+    // THE CENTRAL ASSERTION: the ciphertext opens with the identity the warden
+    // minted for THIS tenant (proved by `open_with_tenant_identity` above), and
+    // what is inside is the credentials-file SLOT MAP the daemon reads, not a
+    // bare token (which would decrypt into an empty map and fail days later).
+    let parsed: Value = serde_json::from_str(&plaintext).unwrap();
+    assert_eq!(parsed["slots"][MAILBOX]["refresh_token"], REFRESH_TOKEN);
+    assert_eq!(parsed["slots"][MAILBOX]["access_token"], ACCESS_TOKEN);
+    assert!(parsed.get("refresh_token").is_none(), "{plaintext}");
+
+    // ...and it is sealed to EXACTLY that recipient: another key opens nothing.
+    let stranger = age::x25519::Identity::generate();
     let decryptor =
-        age::Decryptor::new(age::armor::ArmoredReader::new(ciphertext.as_bytes())).unwrap();
-    let mut reader = decryptor
-        .decrypt(std::iter::once(&h.identity as &dyn age::Identity))
-        .unwrap();
-    let mut plaintext = String::new();
-    std::io::Read::read_to_string(&mut reader, &mut plaintext).unwrap();
-    let token: squelch_core::credentials::StoredToken = serde_json::from_str(&plaintext).unwrap();
-    assert_eq!(token.refresh_token.as_deref(), Some(REFRESH_TOKEN));
-    assert_eq!(token.access_token, ACCESS_TOKEN);
+        age::Decryptor::new(age::armor::ArmoredReader::new(armor.as_bytes())).unwrap();
+    assert!(
+        decryptor
+            .decrypt(std::iter::once(&stranger as &dyn age::Identity))
+            .is_err()
+    );
 
-    // The bearer went on the wire, and availability was checked before consent.
-    assert_eq!(rec.warden_bearers[0], "Bearer warden-bearer");
+    // The bearer went on every warden call, and availability was checked before
+    // consent.
+    assert!(!rec.warden_bearers.is_empty());
+    assert!(
+        rec.warden_bearers.iter().all(|b| b == "Bearer warden-bearer"),
+        "{:?}",
+        rec.warden_bearers
+    );
     assert_eq!(rec.status_lookups, vec!["ada".to_string()]);
+}
+
+/// A failure on call 2 is the state wire v2 invents, so it gets the most
+/// assertions: the address is held, the invite is NOT burned, the control plane
+/// records nothing, and the retry lands on the SAME per-tenant key.
+#[tokio::test]
+async fn a_failed_credential_install_leaves_a_retriable_signup() {
+    let h = Harness::new().await;
+    h.rec.lock().unwrap().fail_credentials = true;
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("not finished"), "{body}");
+    assert!(body.contains("has not been used"), "{body}");
+    // Honest copy: it does NOT claim nothing was set up, because the address is
+    // being held.
+    assert!(!body.contains("Nothing was set up"), "{body}");
+
+    // Nothing was recorded here: the tenant does not exist as far as this
+    // control plane is concerned, so its own label check will not block a retry.
+    assert!(!h.state.store().label_exists("ada").unwrap());
+    // ...and the code was handed back THE MOMENT the provision failed, not left
+    // held until the session would have expired ten minutes from now. The page
+    // above tells this person to start again with the same code; this is what
+    // makes that sentence true.
+    assert!(h.invite_is_available(), "the failed signup released its hold");
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.create_bodies.len(), 1);
+        assert_eq!(rec.credential_puts.len(), 1, "the install was attempted");
+        assert!(!rec.tenants["ada"].provisioned, "and it did not take");
+    }
+
+    // THE RETRY, with the same code and the same address. That the form accepts
+    // it at all proves two things: the invite was never spent, and a PENDING
+    // label passes the pre-consent availability check.
+    h.rec.lock().unwrap().fail_credentials = false;
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("ABCD-EFGH"), "{body}");
+
+    // ONE identity for this tenant across both attempts, and both ciphertexts
+    // open with it: the retry re-used the same recipient rather than orphaning
+    // the first key.
+    let (_, first) = h.credential_armor(0);
+    let (_, second) = h.credential_armor(1);
+    assert_ne!(first, second, "each seal is its own ciphertext");
+    for armor in [&first, &second] {
+        let plaintext = h.open_with_tenant_identity("ada", armor);
+        let parsed: Value = serde_json::from_str(&plaintext).unwrap();
+        assert_eq!(parsed["slots"][MAILBOX]["refresh_token"], REFRESH_TOKEN);
+    }
+
+    let rec = h.rec.lock().unwrap();
+    assert_eq!(rec.tenants.len(), 1, "no orphaned second tenant");
+    assert_eq!(rec.create_bodies.len(), 2, "call 1 ran again");
+    assert!(rec.tenants["ada"].provisioned);
+    // The invite is spent now, and only now.
+    assert!(h.state.store().label_exists("ada").unwrap());
+    drop(rec);
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+}
+
+/// THE RACE: one code, two tabs. The second is refused at the form, before it
+/// can spend a consent, and the first is unaffected. Without the hold both
+/// sessions passed the check and provisioned a tenant each, and only the second
+/// consume lost.
+#[tokio::test]
+async fn one_code_opens_one_signup_at_a_time() {
+    let h = Harness::new().await;
+    let invite = h.invite_code.clone();
+
+    // Tab one is at Google.
+    let (consent, cookie) = h.start_signup("ada").await;
+
+    // Tab two posts the same code. One message, the same one a wrong code gets.
+    let (status, _, body) = h
+        .post_form("/signup", format!("invite={}&label=grace", urlencode(&invite)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the form re-renders");
+    assert!(body.contains("not usable"), "{body}");
+    {
+        let rec = h.rec.lock().unwrap();
+        assert!(rec.token_form.is_empty(), "tab two reached nothing");
+        assert!(rec.create_bodies.is_empty());
+    }
+
+    // Tab one finishes normally: being raced cost it nothing.
+    let (status, _, body) = h
+        .get(
+            &format!("/oauth/callback?code=c1&state={}", state_param(&consent)),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rec = h.rec.lock().unwrap();
+    assert_eq!(rec.create_bodies.len(), 1, "one code, one tenant");
+    assert_eq!(rec.credential_puts.len(), 1);
+}
+
+/// A hold lapses with the session that took it, so a signup abandoned at Google
+/// does not strand the code for the person who was sent it.
+#[tokio::test]
+async fn a_lapsed_hold_does_not_strand_the_code() {
+    let h = Harness::new().await;
+    let hash = invites::hash(&h.invite_code);
+
+    // Somebody posted the form twenty minutes ago, went to Google, and closed
+    // the tab. Their session is long gone; only the row remains.
+    let then = chrono::Utc::now() - chrono::Duration::minutes(20);
+    h.state
+        .store()
+        .reserve_invite(&hash, "an-abandoned-session", then, then + chrono::Duration::minutes(10))
+        .unwrap()
+        .expect("the abandoned signup held it");
+    assert!(h.invite_is_available(), "and the hold has since lapsed");
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+}
+
+/// A code that ran out is refused exactly the way a wrong one is, and nothing
+/// downstream is asked about it.
+#[tokio::test]
+async fn an_expired_code_is_refused_like_any_other() {
+    let h = Harness::new().await;
+    let expired = h.issue_invite_expiring(chrono::Utc::now() - chrono::Duration::seconds(1));
+
+    let (status, _, body) = h
+        .post_form("/signup", format!("invite={}&label=ada", urlencode(&expired)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the form re-renders");
+    assert!(body.contains("not usable"), "{body}");
+
+    let rec = h.rec.lock().unwrap();
+    assert!(rec.token_form.is_empty(), "nothing reached Google");
+    assert!(rec.status_lookups.is_empty(), "nor the warden");
+}
+
+/// The shape codes are minted in now: sixteen Crockford symbols in four groups,
+/// working end to end through the form.
+#[tokio::test]
+async fn a_minted_code_signs_up_in_the_shape_it_is_printed() {
+    let h = Harness::new().await;
+    assert_eq!(h.invite_code.len(), 19, "{}", h.invite_code);
+    assert_eq!(h.invite_code.matches('-').count(), 3, "{}", h.invite_code);
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Retyped the way a person retypes it: no dashes, wrong case, extra space.
+    // Same credential, and it is spent.
+    let sloppy = format!(" {} ", invite.replace('-', "").to_lowercase());
+    let (status, _, page) = h
+        .post_form("/signup", format!("invite={}&label=grace", urlencode(&sloppy)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("not usable"), "{page}");
+}
+
+/// A label that goes live while the user is at Google is refused on call 1,
+/// after consent and before anything is sealed. The invite survives.
+#[tokio::test]
+async fn a_label_taken_during_consent_does_not_burn_the_invite() {
+    let h = Harness::new().await;
+    let (consent, cookie) = h.start_signup("ada").await;
+    h.rec.lock().unwrap().taken.push("ada".to_string());
+
+    let (status, _, body) = h
+        .get(
+            &format!("/oauth/callback?code=c1&state={}", state_param(&consent)),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("just taken"), "{body}");
+    assert!(body.contains("has not been used"), "{body}");
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.create_bodies.len(), 1, "call 1 was attempted");
+        assert!(rec.credential_puts.is_empty(), "and nothing was sealed");
+    }
+
+    // The invite still works: the form takes it and sends the user to Google.
+    // `start_signup_with` asserts the 303 itself, so reaching the end of this
+    // test is the assertion.
+    let invite = h.invite_code.clone();
+    h.start_signup_with("grace", &invite).await;
 }
 
 /// One mailbox, one daemon. The mock Google always names the same mailbox, so
@@ -426,28 +830,18 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
 #[tokio::test]
 async fn a_mailbox_gets_one_daemon() {
     let h = Harness::new().await;
-    let (consent, cookie) = h.start_signup("ada").await;
-    let (status, _, _) = h
-        .get(
-            &format!("/oauth/callback?code=c1&state={}", state_param(&consent)),
-            Some(&cookie),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     let second_code = h.issue_invite();
-    let (consent2, cookie2) = h.start_signup_with("grace", &second_code).await;
-    let (status, _, body) = h
-        .get(
-            &format!("/oauth/callback?code=c2&state={}", state_param(&consent2)),
-            Some(&cookie2),
-        )
-        .await;
+    let (status, body) = h.run_signup("grace", &second_code).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("already"), "{body}");
 
     let rec = h.rec.lock().unwrap();
-    assert_eq!(rec.provision_bodies.len(), 1, "only the first provisioned");
+    assert_eq!(rec.create_bodies.len(), 1, "only the first was created");
+    assert_eq!(rec.credential_puts.len(), 1);
 }
 
 /// An invite is spent by the signup that used it, and the code stops working
@@ -455,23 +849,42 @@ async fn a_mailbox_gets_one_daemon() {
 #[tokio::test]
 async fn an_invite_code_works_once() {
     let h = Harness::new().await;
-    let (consent, cookie) = h.start_signup("ada").await;
-    let (status, _, _) = h
-        .get(
-            &format!("/oauth/callback?code=c1&state={}", state_param(&consent)),
-            Some(&cookie),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // THE INVARIANT the hold buys: the session that provisioned held the code
+    // the whole way, so the consume at the end cannot have lost a race. If it
+    // had, the row would carry no label and this signup would have made a
+    // tenant for free.
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
 
     let (status, _, body) = h
-        .post_form(
-            "/signup",
-            format!("invite={}&label=grace", urlencode(&h.invite_code)),
-        )
+        .post_form("/signup", format!("invite={}&label=grace", urlencode(&invite)))
         .await;
     assert_eq!(status, StatusCode::OK, "the form re-renders");
     assert!(body.contains("not usable"), "{body}");
+}
+
+/// A 422 from call 2 is the two sides of the wire disagreeing, not something the
+/// person who typed the address did. It reads as the generic retriable failure,
+/// and NOTHING on the page blames their input.
+#[tokio::test]
+async fn a_refused_credential_body_is_not_reported_as_an_address_problem() {
+    let h = Harness::new().await;
+    h.rec.lock().unwrap().credentials_status = Some(422);
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("not finished"), "{body}");
+    assert!(!body.contains("taken"), "{body}");
+    assert!(!body.contains("address is already"), "{body}");
+    assert!(!body.contains("refused"), "{body}");
+
+    // Retriable means retriable: the code went straight back.
+    assert!(h.invite_is_available());
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 1);
 }
 
 /// If the verifier does not match the challenge, Google refuses the exchange
@@ -494,7 +907,8 @@ async fn an_exchange_google_refuses_provisions_nothing() {
 
     let rec = h.rec.lock().unwrap();
     assert!(!rec.token_form.is_empty(), "the exchange was attempted");
-    assert!(rec.provision_bodies.is_empty(), "and nothing was provisioned");
+    assert!(rec.create_bodies.is_empty(), "and no tenant was created");
+    assert!(rec.credential_puts.is_empty());
 }
 
 /// A callback whose `state` does not match the session is refused, and nothing
@@ -512,7 +926,7 @@ async fn a_state_mismatch_is_refused() {
 
     let rec = h.rec.lock().unwrap();
     assert!(rec.token_form.is_empty(), "no exchange was attempted");
-    assert!(rec.provision_bodies.is_empty());
+    assert!(rec.create_bodies.is_empty());
 }
 
 /// A tampered cookie fails its MAC and is indistinguishable from no cookie.
@@ -552,7 +966,7 @@ async fn a_tampered_cookie_is_refused() {
 
     let rec = h.rec.lock().unwrap();
     assert!(rec.token_form.is_empty());
-    assert!(rec.provision_bodies.is_empty());
+    assert!(rec.create_bodies.is_empty());
 }
 
 /// A callback is one-shot: replaying the same code and cookie gets the same
@@ -570,11 +984,11 @@ async fn a_replayed_callback_finds_nothing() {
     assert_eq!(second, StatusCode::BAD_REQUEST);
     assert!(body.contains("could not be verified"), "{body}");
 
-    assert_eq!(h.rec.lock().unwrap().provision_bodies.len(), 1);
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 1);
 }
 
-/// A label the warden already knows about is refused BEFORE the user is sent
-/// to Google, so nobody spends a consent on an address they cannot have.
+/// A label the warden already serves is refused BEFORE the user is sent to
+/// Google, so nobody spends a consent on an address they cannot have.
 #[tokio::test]
 async fn a_taken_label_is_refused_before_consent() {
     let h = Harness::new().await;
@@ -625,7 +1039,7 @@ async fn the_form_refuses_bad_input_without_leaving_the_page() {
 
     let rec = h.rec.lock().unwrap();
     assert!(rec.token_form.is_empty(), "nothing reached Google");
-    assert!(rec.provision_bodies.is_empty());
+    assert!(rec.create_bodies.is_empty());
 }
 
 /// The form and the health check are the only things reachable without a

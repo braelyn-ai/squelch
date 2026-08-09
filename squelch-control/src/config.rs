@@ -89,9 +89,6 @@ pub struct Config {
     pub client_secret: String,
     /// HMAC key for the signup cookie. Redacted from `Debug`.
     pub cookie_key: Vec<u8>,
-    /// The VPS box's age recipient (a PUBLIC key). Not a secret, and not an
-    /// identity: this process can seal and cannot open.
-    pub age_recipient: String,
     /// Base URL of the warden (`https://warden.passband.email`).
     pub warden_url: String,
     /// Bearer presented to the warden on every request. Redacted from `Debug`.
@@ -123,7 +120,6 @@ impl std::fmt::Debug for Config {
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
             .field("cookie_key", &format!("<{} bytes>", self.cookie_key.len()))
-            .field("age_recipient", &self.age_recipient)
             .field("warden_url", &self.warden_url)
             .field("warden_token", &"<redacted>")
             .field("db_path", &self.db_path)
@@ -191,16 +187,11 @@ impl Config {
             "base64 or hex, at least 32 bytes decoded; generate with `openssl rand -base64 48`",
         )?)?;
 
-        let age_recipient = require(
-            "SQUELCH_CONTROL_AGE_RECIPIENT",
-            "the VPS box's age recipient (public key, `age1...`) from `age-keygen`",
-        )?;
-        // Parsed and discarded: a recipient that does not parse must fail at
-        // boot, not at the first signup, where the user has already granted
-        // consent and there would be nowhere to put the token.
-        crate::seal::parse_recipient(&age_recipient).map_err(|e| {
-            ConfigError::invalid(format!("invalid SQUELCH_CONTROL_AGE_RECIPIENT: {e}"))
-        })?;
+        // NO AGE RECIPIENT HERE, and its absence is the v2 design: every tenant
+        // gets its own identity, minted by the warden and never seen by this
+        // process, so the recipient to seal to arrives in the 201 of the first
+        // provisioning call instead of sitting in this deployment's environment.
+        // One static recipient would have meant one key opening every mailbox.
 
         let warden_url = canonical_origin(
             "SQUELCH_CONTROL_WARDEN_URL",
@@ -211,7 +202,7 @@ impl Config {
         )?;
         let warden_token = require(
             "SQUELCH_CONTROL_WARDEN_TOKEN",
-            "the bearer the warden expects; must match SQUELCH_WARDEN_TOKEN on the VPS",
+            "the bearer the warden expects; must match SQUELCH_WARDEN_TOKEN in the cluster",
         )?;
 
         let trusted_proxy_hops = match var("SQUELCH_CONTROL_TRUSTED_PROXY_HOPS") {
@@ -239,7 +230,6 @@ impl Config {
             client_id,
             client_secret,
             cookie_key,
-            age_recipient,
             warden_url,
             warden_token,
             db_path: db_path_from_env(),
@@ -385,7 +375,6 @@ mod tests {
             client_id: "client-id".into(),
             client_secret: "TOP-SECRET-VALUE".into(),
             cookie_key: vec![7; 32],
-            age_recipient: "age1recipient".into(),
             warden_url: "https://warden.passband.email".into(),
             warden_token: "WARDEN-BEARER-VALUE".into(),
             db_path: PathBuf::from(":memory:"),

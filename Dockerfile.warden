@@ -1,0 +1,47 @@
+# Builds squelch-warden — the in-cluster tenant provisioner for hosted
+# Passband. Unlike the other three images in this repo, this one does not run on
+# shared infrastructure: it runs as a pod on the k3s box, with a ServiceAccount
+# scoped to one namespace. See deploy/hosted/SETUP.md.
+#
+# The build context must be the workspace root: squelch-warden is a workspace
+# member and cargo needs the root manifest + lockfile to resolve it.
+#
+# Bookworm is fine here, unlike the squelchd and control images: the warden
+# does NOT link squelch-core, so there is no ort, no onnxruntime, and no
+# glibc 2.38 floor. It links axum, kube-rs and age, and nothing else.
+
+FROM rust:1-slim-bookworm AS builder
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY squelch-core ./squelch-core
+COPY squelch-httpauth ./squelch-httpauth
+COPY squelch-mcp ./squelch-mcp
+COPY squelch-tui ./squelch-tui
+COPY squelch-api ./squelch-api
+COPY squelch-relay ./squelch-relay
+COPY squelch-broker ./squelch-broker
+COPY squelch-control ./squelch-control
+COPY squelch-warden ./squelch-warden
+COPY squelchd ./squelchd
+
+RUN cargo build --release --locked -p squelch-warden
+
+FROM debian:bookworm-slim
+# rustls everywhere, so the only runtime need is CA roots. The warden's one
+# outbound connection is to the in-cluster API server, whose certificate is
+# signed by the cluster CA that kube-rs reads from the ServiceAccount mount.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/squelch-warden /usr/local/bin/squelch-warden
+
+# No entrypoint script and no privileged start: the warden writes nothing to
+# disk, so there is no volume to chown, and the manifest runs it as a fixed
+# non-root uid with a read-only root filesystem.
+USER 10002:10002
+
+EXPOSE 8852
+
+ENTRYPOINT ["/usr/local/bin/squelch-warden"]

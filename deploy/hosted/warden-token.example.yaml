@@ -1,0 +1,28 @@
+# The one credential between the control plane and this cluster.
+#
+# DO NOT apply this file as it stands, and do not commit a filled-in copy.
+# Create the Secret from the command line so the value never reaches a file:
+#
+#     kubectl -n warden create secret generic squelch-warden \
+#       --from-literal=token="$(openssl rand -base64 32)"
+#
+# then read it back once to paste into the control plane's environment as
+# SQUELCH_CONTROL_WARDEN_TOKEN:
+#
+#     kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d; echo
+#
+# This file exists to document the shape, and as the fallback for a GitOps setup
+# where the value comes from a sealed-secrets or SOPS pipeline.
+#
+# Rotating it: replace the Secret, `kubectl -n warden rollout restart deploy/squelch-warden`,
+# then update the control plane. There is no grace period; a signup in flight
+# during the swap fails and the person retries.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: squelch-warden
+  namespace: warden
+type: Opaque
+stringData:
+  # 32 characters minimum. The warden refuses to start below that.
+  token: REPLACE_ME_WITH_openssl_rand_base64_32

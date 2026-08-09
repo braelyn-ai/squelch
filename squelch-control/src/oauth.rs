@@ -242,7 +242,7 @@ async fn fetch_profile_email(
     let email = profile.email_address.unwrap_or_default();
     let email = email.trim();
     // Shape, not validity: this string becomes a database key, an env-file
-    // value on the VPS, and a line on a page. Anything with a control
+    // value in a tenant's pod, and a line on a page. Anything with a control
     // character, a newline, or no `@` is not a mailbox.
     if email.is_empty()
         || email.len() > 320

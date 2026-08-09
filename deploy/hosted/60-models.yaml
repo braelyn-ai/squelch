@@ -1,0 +1,61 @@
+# The shared embedding-weights volume. OPTIONAL, and only useful once you have
+# one tenant running: see "8. Embedding weights" in SETUP.md for how to fill it.
+#
+# Without this, every tenant downloads about 130 MB from Hugging Face the first
+# time it embeds anything. That is not fatal, it is just the same bytes over and
+# over, and it happens inside the signup a person is watching.
+#
+# ReadWriteOnce, mounted read-only by every tenant's init container. That works
+# because this is a single-node cluster: RWO is one NODE, not one pod. On a
+# second node it stops working, and the fix then is baking the weights into a
+# squelchd image instead (also in SETUP.md).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: squelch-models
+  namespace: tenants
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+# A pod that does nothing but hold the volume open so `kubectl cp` has somewhere
+# to land. Delete it when the copy is done; nothing references it afterwards.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: squelch-models-seed
+  namespace: tenants
+  labels:
+    app.kubernetes.io/name: squelch-models-seed
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: seed
+      # Any image with a shell and tar. The squelchd image is the one already
+      # pulled on this node; substitute your tag.
+      image: ghcr.io/braelyn-ai/squelchd:v0.1.0
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: models
+          mountPath: /seed
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+  volumes:
+    - name: models
+      persistentVolumeClaim:
+        claimName: squelch-models

@@ -1,12 +1,20 @@
-//! Validation of everything the control plane sends.
+//! Validation of everything the control plane sends, and the one type that
+//! carries a validated tenant label into a manifest.
 //!
 //! The warden is authenticated (only the control plane holds the bearer), so
-//! none of this is defending against strangers. It is defending against a
-//! *bug* in the control plane turning into a hostname collision, a systemd unit
-//! named something unfortunate, an env file with an extra line in it, or a
-//! plaintext refresh token at rest on the box. Each of those is unrecoverable
+//! none of this is defending against strangers. It is defending against a *bug*
+//! in the control plane turning into a hostname collision, an object named
+//! something unfortunate in a namespace that holds every tenant's mail, or a
+//! plaintext refresh token at rest in a Secret. Each of those is unrecoverable
 //! in a different way, so each gets an explicit refusal here rather than a
 //! trusting `format!`.
+//!
+//! [`TenantName`] is the second half of the rule. Nothing in [`crate::objects`]
+//! takes a `&str` label: every object name, selector value and hostname is
+//! derived from a `TenantName`, and a `TenantName` exists only where
+//! [`validate_label`] succeeded. That is what "a tenant label may appear solely
+//! as a validated value inside typed object fields" means in types rather than
+//! in a comment.
 //!
 //! PRIVACY: no error here echoes the value it rejected. These strings go back
 //! over the wire and into the control plane's logs, and one of the values is a
@@ -14,11 +22,11 @@
 
 /// Shortest tenant label. Three is the shortest subdomain worth the collision
 /// risk, and it keeps the reserved list from having to enumerate every
-//  two-letter word anyone might want.
+/// two-letter word anyone might want.
 pub const MIN_LABEL_LEN: usize = 3;
 
 /// Longest tenant label. A DNS label may be 63, but the label also becomes a
-/// systemd instance name, a file name, and a Caddy site block, and 30 is plenty
+/// Kubernetes object name with a `-credential` suffix on it, and 30 is plenty
 /// for a person's handle.
 pub const MAX_LABEL_LEN: usize = 30;
 
@@ -31,23 +39,23 @@ pub const RESERVED_LABELS: &[&str] = &[
     "help", "docs", "app", "relay", "track",
 ];
 
-/// Longest address we will write into an env file. RFC 5321's ceiling.
+/// Longest address we will store. RFC 5321's ceiling.
 pub const MAX_EMAIL_LEN: usize = 254;
 
-/// Ceiling on the credential ciphertext. An age-armored `StoredToken` is a
+/// Ceiling on the credential ciphertext. An age-armored credentials file is a
 /// couple of kilobytes; this is loose enough for a format change and tight
-/// enough that the provisioning route is not a place to spend the box's disk.
+/// enough that the provisioning route is not a place to spend etcd.
 pub const MAX_CIPHERTEXT: usize = 64 * 1024;
 
 /// The first line of an age ASCII-armored file (RFC 7468 style, as produced by
 /// `age --armor` / the `age` crate's `ArmoredWriter`).
 ///
-/// This constant is the whole reason the warden can promise it never writes a
-/// plaintext refresh token to disk: a body that does not start and end with the
-/// armor is refused before anything touches the filesystem. It is restated here
-/// rather than imported from the `age` crate because the warden does not link
-/// age — it never decrypts, and a provisioner that could decrypt would be a
-/// worse trust story than one that cannot.
+/// This constant is the whole reason the warden can promise it never stores a
+/// plaintext refresh token: a body that does not start and end with the armor
+/// is refused before anything reaches the API server. It is restated here
+/// rather than taken from the `age` crate because the crate does not export it,
+/// and because this check must keep working even if the warden's own use of age
+/// (minting identities) ever goes away.
 pub const AGE_ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
 
 /// The last line of an age ASCII-armored file.
@@ -78,7 +86,7 @@ pub enum EmailError {
     TooLong,
     #[error("account_email must be a single address with one @ and text on both sides")]
     Shape,
-    #[error("account_email contains a character that is not allowed in an environment file")]
+    #[error("account_email contains a character that is not allowed in an environment value")]
     Charset,
 }
 
@@ -95,10 +103,66 @@ pub enum CiphertextError {
     Charset,
 }
 
+/// A tenant label that passed [`validate_label`], and the object names derived
+/// from it.
+///
+/// Constructible only through [`TenantName::parse`]. Every manifest builder in
+/// [`crate::objects`] takes one of these, so an unvalidated string cannot reach
+/// a `metadata.name`, a selector, or an Ingress host without going through the
+/// same four checks the wire does.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantName(String);
+
+impl TenantName {
+    /// Normalize and validate, or refuse.
+    pub fn parse(raw: &str) -> Result<Self, LabelError> {
+        validate_label(raw).map(Self)
+    }
+
+    /// The label itself. Also the name of the Deployment, the Service, the
+    /// Ingress and the NetworkPolicy: one tenant, one name, four kinds.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// `<label>-data`: the PersistentVolumeClaim. Survives a DELETE.
+    pub fn data_pvc(&self) -> String {
+        format!("{}-data", self.0)
+    }
+
+    /// `<label>-identity`: the Secret holding this tenant's age identity, its
+    /// public recipient, and its account address. Created in phase one, and
+    /// deleted by exactly one code path
+    /// ([`crate::provision::Warden::sweep_pending`], and only while the tenant
+    /// is still pending).
+    pub fn identity_secret(&self) -> String {
+        format!("{}-identity", self.0)
+    }
+
+    /// The label inside `<label>-identity`, for the sweep, which starts from a
+    /// Secret name and has to get back to a validated tenant.
+    pub fn from_identity_secret(secret_name: &str) -> Option<Self> {
+        Self::parse(secret_name.strip_suffix("-identity")?).ok()
+    }
+
+    /// `<label>-credential`: the Secret holding the age-armored credentials
+    /// file the control plane sealed to this tenant's recipient.
+    pub fn credential_secret(&self) -> String {
+        format!("{}-credential", self.0)
+    }
+}
+
+impl std::fmt::Display for TenantName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Case-fold and trim a label into the one spelling everything downstream uses.
 ///
 /// Done before validation, not after, so `Alice` and `alice` cannot both be
-/// provisioned: DNS does not distinguish them and neither may we.
+/// provisioned: DNS does not distinguish them, Kubernetes names may not contain
+/// capitals at all, and neither may we.
 pub fn normalize_label(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
@@ -108,8 +172,9 @@ pub fn normalize_label(raw: &str) -> String {
 /// Equivalent to `^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$` plus the reserved
 /// list, written out because the length bound and the hyphen bound say
 /// different things and a reader deserves to be told which one they tripped.
-/// Hand-rolled rather than `regex`: this is four `bytes()` passes, and the
-/// error a regex gives back is "no match".
+/// This is strictly tighter than DNS-1123, which is the point: Kubernetes would
+/// accept 63 characters and a leading digit, and we would rather refuse here
+/// than discover a name collision in a shared namespace.
 pub fn validate_label(raw: &str) -> Result<String, LabelError> {
     let label = normalize_label(raw);
     if label.len() < MIN_LABEL_LEN {
@@ -141,10 +206,12 @@ pub fn validate_label(raw: &str) -> Result<String, LabelError> {
 /// an opinion about someone else's address.
 ///
 /// The charset rule is the load-bearing one and it is not about email at all:
-/// this value is written into a systemd `EnvironmentFile`, where a newline
-/// would start a new assignment. A quote, a backslash, or a dollar sign would
-/// each survive into systemd's own unquoting with a meaning nobody intended.
-/// Real Google mailboxes contain none of them.
+/// this value becomes `SQUELCH_ACCOUNT_EMAIL` inside a container. A newline or
+/// a control byte there is legal as far as Kubernetes is concerned and is
+/// nonsense as far as every reader of it is, and real Google mailboxes contain
+/// neither. The quote/backslash/dollar refusals are inherited from the v1 env
+/// file and kept: nothing is gained by loosening them, and a shell one day
+/// reading this value would find nothing to expand.
 pub fn validate_account_email(raw: &str) -> Result<String, EmailError> {
     let email = raw.trim();
     if email.is_empty() {
@@ -171,18 +238,19 @@ pub fn validate_account_email(raw: &str) -> Result<String, EmailError> {
 
 /// Validate the credential body and normalize its trailing newline.
 ///
-/// The armor check is the invariant: the warden writes what the control plane
-/// hands it, verbatim and unread, into a file the daemon will decrypt. If that
-/// body were ever a plaintext `StoredToken` — a control-plane bug, a
-/// misconfigured recipient, a copy-paste — this is the last place on the path
-/// that can notice, because nothing downstream reads it until systemd has
-/// already started a daemon on it. So a body that is not armored is a refusal,
+/// The armor check is the invariant: the warden puts what the control plane
+/// hands it, verbatim and unread, into a Secret the daemon will decrypt. If
+/// that body were ever a plaintext credentials file (a control-plane bug, a
+/// misconfigured recipient, a copy-paste), this is the last place on the path
+/// that can notice, because nothing downstream reads it until a daemon has
+/// already been started on it. So a body that is not armored is a refusal,
 /// never a write.
 ///
 /// It is NOT a proof that the ciphertext decrypts, or that it was encrypted to
-/// this box's recipient. Nothing here can know that: the warden holds no age
-/// identity, by design. A body armored to the wrong recipient fails loudly at
-/// the daemon instead, which is the right place for it.
+/// this tenant's recipient. Nothing here can know that: the warden holds no age
+/// identity after the apply that created it, by design. A body armored to the
+/// wrong recipient fails loudly at the daemon instead, which is the right place
+/// for it.
 pub fn validate_ciphertext(raw: &str) -> Result<String, CiphertextError> {
     let body = raw.trim();
     if body.is_empty() {
@@ -193,7 +261,7 @@ pub fn validate_ciphertext(raw: &str) -> Result<String, CiphertextError> {
     }
     // Armor is base64 plus the two banner lines, so the only bytes that may
     // appear are printable ASCII and the line breaks between them. This also
-    // means the file we write can never contain a NUL or a control byte.
+    // means what we store can never contain a NUL or a control byte.
     if body
         .bytes()
         .any(|b| !(b == b'\n' || b == b'\r' || (b' '..=b'~').contains(&b)))
@@ -215,9 +283,9 @@ pub fn validate_ciphertext(raw: &str) -> Result<String, CiphertextError> {
 /// Whether a string is a pairing code as `squelchd pair` prints it: two groups
 /// of four Crockford base32 symbols, joined by one hyphen.
 ///
-/// Used to sanity-check what came back from the pair exec before it goes on the
-/// wire. The alphabet is the daemon's (`0123456789ABCDEFGHJKMNPQRSTVWXYZ` —
-/// no I, L, O or U), restated rather than imported for the same reason the age
+/// Used to sanity-check what came back from the pod exec before it goes on the
+/// wire. The alphabet is the daemon's (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`, no
+/// I, L, O or U), restated rather than imported for the same reason the age
 /// armor banner is.
 pub fn is_pairing_code(s: &str) -> bool {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -234,7 +302,13 @@ mod tests {
 
     #[test]
     fn accepts_ordinary_labels() {
-        for label in ["abc", "alice", "a-b-c", "x1y2z3", &"a".repeat(MAX_LABEL_LEN)] {
+        for label in [
+            "abc",
+            "alice",
+            "a-b-c",
+            "x1y2z3",
+            &"a".repeat(MAX_LABEL_LEN),
+        ] {
             assert_eq!(validate_label(label).as_deref(), Ok(label), "{label}");
         }
     }
@@ -266,6 +340,28 @@ mod tests {
         assert_eq!(validate_label("mcp"), Err(LabelError::Reserved));
     }
 
+    /// Every name a manifest can carry is derived here, so this is the test
+    /// that says what a tenant occupies in the shared namespace.
+    #[test]
+    fn derives_every_object_name_from_a_validated_label() {
+        let name = TenantName::parse("  ALICE ").unwrap();
+        assert_eq!(name.as_str(), "alice");
+        assert_eq!(name.to_string(), "alice");
+        assert_eq!(name.data_pvc(), "alice-data");
+        assert_eq!(name.identity_secret(), "alice-identity");
+        assert_eq!(name.credential_secret(), "alice-credential");
+        // Longest allowed label plus the longest suffix still fits the 63-byte
+        // DNS-1123 ceiling Kubernetes enforces on object names.
+        let longest = TenantName::parse(&"a".repeat(MAX_LABEL_LEN)).unwrap();
+        assert!(longest.credential_secret().len() <= 63);
+    }
+
+    #[test]
+    fn a_tenant_name_cannot_be_built_from_a_bad_label() {
+        assert_eq!(TenantName::parse("mcp"), Err(LabelError::Reserved));
+        assert_eq!(TenantName::parse("a/b"), Err(LabelError::Charset));
+    }
+
     #[test]
     fn accepts_ordinary_addresses() {
         assert_eq!(
@@ -275,9 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_addresses_that_would_break_an_env_file() {
-        // The whole point: a newline here would append an assignment of the
-        // attacker's choosing to the tenant's environment.
+    fn refuses_addresses_that_would_break_an_environment_value() {
         assert_eq!(
             validate_account_email("a@example.com\nSQUELCH_API_TOKEN=x"),
             Err(EmailError::Charset)
@@ -323,9 +417,9 @@ mod tests {
 
     #[test]
     fn refuses_anything_that_is_not_armor() {
-        // The case that matters: a plaintext StoredToken. It must never reach
-        // the disk, so it must never get past this function.
-        let plaintext = r#"{"refresh_token":"1//0gPLAINTEXT","access_token":"ya29."}"#;
+        // The case that matters: a plaintext credentials file. It must never
+        // reach a Secret, so it must never get past this function.
+        let plaintext = r#"{"slots":{"read:you@x.com":{"refresh_token":"1//0gPLAINTEXT"}}}"#;
         assert_eq!(
             validate_ciphertext(plaintext),
             Err(CiphertextError::NotArmored)

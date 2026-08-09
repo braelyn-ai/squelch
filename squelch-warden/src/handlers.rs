@@ -1,22 +1,22 @@
-//! The control-plane wire: four routes and a health check.
+//! The control-plane wire: five routes and a health check.
 //!
 //! ```text
-//! POST   /v1/tenants              -> 201 { port, pair_code, pair_url, deep_link }
-//! GET    /v1/tenants/{label}      -> 200 { status, port } | 404
-//! DELETE /v1/tenants/{label}      -> 204
-//! POST   /v1/tenants/{label}/pair -> 200 { pair_code, pair_url, deep_link }
-//! GET    /healthz                 -> 200 ok
+//! POST   /v1/tenants                     -> 201 { recipient }
+//! PUT    /v1/tenants/{label}/credentials -> 200 { pair_code, pair_url, deep_link }
+//! GET    /v1/tenants/{label}             -> 200 { status } | 404
+//! POST   /v1/tenants/{label}/pair        -> 200 { pair_code, pair_url, deep_link }
+//! DELETE /v1/tenants/{label}             -> 204
+//! GET    /healthz                        -> 200 ok
 //! ```
 //!
-//! Every handler is a thin shell: parse, hand to [`crate::provision::Warden`]
-//! on a blocking thread, shape the answer. The provisioning work forks
-//! processes and fsyncs files, so it must not run on an async worker.
+//! Every handler is a thin shell: parse, hand to [`crate::provision::Warden`],
+//! shape the answer. Nothing here decides anything.
 //!
-//! PRIVACY: a response body carries a port, a status word, and the pairing
-//! handoff the control plane is going to show the user. It never carries a
-//! path, an OS error, a mailbox address, or the ciphertext that came in. A 500
-//! is a machine reason and nothing else; the detail behind it is in this box's
-//! journal.
+//! PRIVACY: a response body carries a public age recipient, a status word, or
+//! the pairing handoff the control plane is about to show the user. It never
+//! carries an identity, a path, an API error, a mailbox address, or the
+//! ciphertext that came in. A 500 is a machine reason and nothing else; the
+//! detail behind it is in this pod's log.
 
 use axum::{
     Json,
@@ -29,7 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::WardenState;
-use crate::provision::{Pairing, ProvisionRequest, WardenError};
+use crate::pair::Pairing;
+use crate::provision::WardenError;
 
 /// Ceiling on a request body. The only large field is the age-armored
 /// credential, which [`crate::validate::MAX_CIPHERTEXT`] caps at 64 KiB; this
@@ -44,7 +45,7 @@ pub async fn healthz() -> &'static str {
 ///
 /// The 4xx bodies name the constraint that was violated, because the control
 /// plane shows a person a form again; the 5xx body is a machine reason with no
-/// detail, because the detail is this box's business.
+/// detail, because the detail is this cluster's business.
 fn error_response(e: &WardenError) -> Response {
     let (status, error, detail) = match e {
         WardenError::InvalidLabel(inner) => (
@@ -64,7 +65,7 @@ fn error_response(e: &WardenError) -> Response {
         ),
         WardenError::Conflict => (StatusCode::CONFLICT, "label_exists", None),
         WardenError::NotFound => (StatusCode::NOT_FOUND, "not_found", None),
-        WardenError::Host { reason } => (StatusCode::INTERNAL_SERVER_ERROR, *reason, None),
+        WardenError::Cluster { reason } => (StatusCode::INTERNAL_SERVER_ERROR, *reason, None),
     };
     match detail {
         Some(detail) => (status, Json(json!({ "error": error, "detail": detail }))).into_response(),
@@ -78,30 +79,11 @@ impl IntoResponse for WardenError {
     }
 }
 
-/// Run blocking provisioning work off the async runtime.
-///
-/// A panic inside becomes a 500 with a machine reason rather than a dropped
-/// connection: the control plane is mid-signup and needs an answer it can act
-/// on. The panic itself is already on stderr via the default hook.
-async fn blocking<T, F>(f: F) -> Result<T, WardenError>
-where
-    F: FnOnce() -> Result<T, WardenError> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!(error = %e, "warden task did not complete");
-            Err(WardenError::host("task_failed"))
-        }
-    }
-}
-
 /// Parse a JSON body, returning the serde message on failure.
 ///
 /// That message names the missing or mistyped FIELD, never the value, so it is
-/// safe to hand back — and it is the only thing that makes a 400 here
-/// debuggable from the other end.
+/// safe to hand back, and it is the only thing that makes a 400 here debuggable
+/// from the other end.
 fn parse_json<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, String> {
     serde_json::from_slice(body).map_err(|e| e.to_string())
 }
@@ -119,18 +101,21 @@ fn malformed(detail: String) -> Response {
 struct CreateTenant {
     label: String,
     account_email: String,
-    /// Age-armored ciphertext of the tenant's read credential, encrypted by the
-    /// control plane to the box's recipient. The warden writes it and never
-    /// reads it.
-    cred_read_ciphertext: String,
 }
 
 #[derive(Debug, Serialize)]
 struct CreateTenantResponse {
-    port: u16,
-    pair_code: String,
-    pair_url: String,
-    deep_link: String,
+    /// `age1...`. Public by construction: it is the half of the pair that
+    /// exists to be handed out.
+    recipient: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetCredentials {
+    /// Age-armored ciphertext of the tenant's read credential, sealed by the
+    /// control plane to the recipient this warden minted. Stored verbatim and
+    /// never read here.
+    cred_read_ciphertext: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,33 +138,24 @@ impl From<Pairing> for PairResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     status: &'static str,
-    port: u16,
 }
 
-/// `POST /v1/tenants` — provision a tenant and hand back its first pairing.
+/// `POST /v1/tenants` - mint this tenant's key pair and hand back the public
+/// half. Nothing runs yet.
 pub async fn create_tenant(State(state): State<WardenState>, body: Bytes) -> Response {
     let req: CreateTenant = match parse_json(&body) {
         Ok(req) => req,
         Err(detail) => return malformed(detail),
     };
-    let warden = state.warden();
-    let result = blocking(move || {
-        warden.provision(ProvisionRequest {
-            label: req.label,
-            account_email: req.account_email,
-            cred_read_ciphertext: req.cred_read_ciphertext,
-        })
-    })
-    .await;
-
-    match result {
-        Ok(done) => (
+    match state
+        .warden()
+        .create_tenant(&req.label, &req.account_email)
+        .await
+    {
+        Ok(created) => (
             StatusCode::CREATED,
             Json(CreateTenantResponse {
-                port: done.port,
-                pair_code: done.pairing.pair_code,
-                pair_url: done.pairing.pair_url,
-                deep_link: done.pairing.deep_link,
+                recipient: created.recipient,
             }),
         )
             .into_response(),
@@ -187,15 +163,34 @@ pub async fn create_tenant(State(state): State<WardenState>, body: Bytes) -> Res
     }
 }
 
-/// `GET /v1/tenants/{label}` — what systemd says about this tenant.
+/// `PUT /v1/tenants/{label}/credentials` - store the sealed blob, bring the
+/// tenant up, and hand back its first pairing.
+pub async fn set_credentials(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+    body: Bytes,
+) -> Response {
+    let req: SetCredentials = match parse_json(&body) {
+        Ok(req) => req,
+        Err(detail) => return malformed(detail),
+    };
+    match state
+        .warden()
+        .set_credentials(&label, &req.cred_read_ciphertext)
+        .await
+    {
+        Ok(pairing) => (StatusCode::OK, Json(PairResponse::from(pairing))).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /v1/tenants/{label}` - what the cluster says about this tenant.
 pub async fn get_tenant(State(state): State<WardenState>, Path(label): Path<String>) -> Response {
-    let warden = state.warden();
-    match blocking(move || warden.status(&label)).await {
-        Ok(view) => (
+    match state.warden().status(&label).await {
+        Ok(status) => (
             StatusCode::OK,
             Json(StatusResponse {
-                status: view.status,
-                port: view.port,
+                status: status.as_str(),
             }),
         )
             .into_response(),
@@ -203,26 +198,24 @@ pub async fn get_tenant(State(state): State<WardenState>, Path(label): Path<Stri
     }
 }
 
-/// `DELETE /v1/tenants/{label}` — stop and disable, keep the data.
+/// `DELETE /v1/tenants/{label}` - take the workload down, keep the data.
 pub async fn delete_tenant(
     State(state): State<WardenState>,
     Path(label): Path<String>,
 ) -> Response {
-    let warden = state.warden();
-    match blocking(move || warden.deprovision(&label)).await {
+    match state.warden().delete(&label).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
     }
 }
 
-/// `POST /v1/tenants/{label}/pair` — re-mint a pairing code for a later
+/// `POST /v1/tenants/{label}/pair` - re-mint a pairing code for a later
 /// device. No body: the tenant is the whole request.
 pub async fn repair_tenant(
     State(state): State<WardenState>,
     Path(label): Path<String>,
 ) -> Response {
-    let warden = state.warden();
-    match blocking(move || warden.repair(&label)).await {
+    match state.warden().repair(&label).await {
         Ok(pairing) => (StatusCode::OK, Json(PairResponse::from(pairing))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -265,18 +258,41 @@ mod tests {
         serde_json::json!({
             "label": label,
             "account_email": format!("{label}@example.com"),
-            "cred_read_ciphertext": armored(label),
         })
         .to_string()
     }
 
+    fn credential_body(label: &str) -> String {
+        serde_json::json!({ "cred_read_ciphertext": armored(label) }).to_string()
+    }
+
     #[tokio::test]
-    async fn creates_reads_repairs_and_deletes_a_tenant() {
+    async fn walks_a_tenant_through_both_phases_and_back_out() {
         let h = Harness::new();
 
         let (status, body) = call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(body["port"], 9100);
+        let recipient = body["recipient"].as_str().unwrap().to_string();
+        assert!(recipient.starts_with("age1"));
+        // The 201 carries the public half and nothing else.
+        assert_eq!(body.as_object().unwrap().len(), 1);
+        assert!(!body.to_string().contains("AGE-SECRET-KEY"));
+        assert!(!body.to_string().contains("example.com"));
+
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "pending");
+
+        let (status, body) = call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["pair_code"], "ABCD-1234");
         assert_eq!(body["pair_url"], "https://alice.passband.email");
         assert!(
@@ -286,68 +302,109 @@ mod tests {
                 .starts_with("passband://pair?url=")
         );
         // Nothing about the request comes back out.
-        assert!(!body.to_string().contains("example.com"));
         assert!(!body.to_string().contains("AGE ENCRYPTED"));
 
         let (status, body) = call(&h, authed("GET", "/v1/tenants/alice", "")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "active");
-        assert_eq!(body["port"], 9100);
 
-        h.runner.script(
-            "squelchd pair",
-            crate::host::CmdOutput::success(crate::testing::pair_stdout(
-                "WXYZ-9876",
-                "https://alice.passband.email",
-            )),
-        );
+        h.cluster.exec_prints(&crate::testing::pair_stdout(
+            "WXYZ-9876",
+            "https://alice.passband.email",
+        ));
         let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/pair", "")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["pair_code"], "WXYZ-9876");
-        assert_eq!(body["pair_url"], "https://alice.passband.email");
 
         let (status, body) = call(&h, authed("DELETE", "/v1/tenants/alice", "")).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(body, Value::Null);
+
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "stopped");
     }
 
     #[tokio::test]
-    async fn duplicate_is_409_and_invalid_is_422() {
+    async fn a_pending_label_is_idempotent_and_a_live_one_is_a_409() {
         let h = Harness::new();
-        let (status, _) = call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        let (status, first) = call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
         assert_eq!(status, StatusCode::CREATED);
 
+        // The retry after a lost response: same label, same address, same key.
+        let (status, second) = call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(first["recipient"], second["recipient"]);
+
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
         let (status, body) = call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "label_exists");
+    }
 
+    #[tokio::test]
+    async fn invalid_input_is_a_422_that_names_the_constraint() {
+        let h = Harness::new();
         for label in ["ab", "-alice", "ALICE!", "mcp", &"a".repeat(31)] {
             let (status, body) = call(&h, authed("POST", "/v1/tenants", &create_body(label))).await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}");
             assert_eq!(body["error"], "invalid_label", "{label}");
-            // The constraint is named; the value is not echoed.
+            // The constraint is named, and the request is not echoed: the
+            // address in particular must not travel back to a log aggregator
+            // on the other side of this call.
             assert!(body["detail"].is_string());
+            assert!(!body.to_string().contains("example.com"), "{label}");
         }
 
-        let plaintext = serde_json::json!({
-            "label": "bob",
-            "account_email": "bob@example.com",
-            "cred_read_ciphertext": "{\"refresh_token\":\"1//0gREAL\"}",
-        })
-        .to_string();
-        let (status, body) = call(&h, authed("POST", "/v1/tenants", &plaintext)).await;
+        let bad_email =
+            serde_json::json!({ "label": "bob", "account_email": "nobody" }).to_string();
+        let (status, body) = call(&h, authed("POST", "/v1/tenants", &bad_email)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "invalid_account_email");
+
+        // The one that matters: a plaintext credential is refused before it can
+        // be stored anywhere.
+        call(&h, authed("POST", "/v1/tenants", &create_body("carol"))).await;
+        let plaintext =
+            serde_json::json!({ "cred_read_ciphertext": "{\"refresh_token\":\"1//0gREAL\"}" })
+                .to_string();
+        let (status, body) = call(
+            &h,
+            authed("PUT", "/v1/tenants/carol/credentials", &plaintext),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"], "invalid_cred_read_ciphertext");
+        assert_eq!(h.cluster.applied_names(), vec!["carol-identity"]);
     }
 
     #[tokio::test]
-    async fn unknown_tenant_is_404_on_get_and_204_on_delete() {
+    async fn unknown_tenants_404_except_on_delete() {
         let h = Harness::new();
         let (status, body) = call(&h, authed("GET", "/v1/tenants/nobody", "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
 
         let (status, _) = call(&h, authed("POST", "/v1/tenants/nobody/pair", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/nobody/credentials",
+                &credential_body("nobody"),
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // DELETE is idempotent: the control plane retries it on its own unwind
@@ -357,16 +414,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_broken_box_is_a_500_with_a_machine_reason_and_no_detail() {
+    async fn a_broken_cluster_is_a_500_with_a_machine_reason_and_no_detail() {
         let h = Harness::new();
-        h.runner.fail_on("systemctl enable");
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        h.cluster.never_ready();
 
-        let (status, body) = call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        let (status, body) = call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["error"], "unit_start_failed");
+        assert_eq!(body["error"], "not_ready");
         assert!(body.get("detail").is_none());
-        // No path from this box on the wire.
-        assert!(!body.to_string().contains("/var/lib"));
+        // Nothing about this cluster crosses the wire.
+        let rendered = body.to_string();
+        for leak in ["tenants", "kube", "namespace", "10.0.0.0"] {
+            assert!(!rendered.contains(leak), "{leak} leaked: {rendered}");
+        }
     }
 
     #[tokio::test]
@@ -379,6 +448,9 @@ mod tests {
         // A missing field is the same class of caller bug.
         let (status, _) = call(&h, authed("POST", "/v1/tenants", r#"{"label":"alice"}"#)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/credentials", "{}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// Every gated route, every way of getting the bearer wrong. The answer is
@@ -388,6 +460,7 @@ mod tests {
         let h = Harness::new();
         let routes = [
             ("POST", "/v1/tenants"),
+            ("PUT", "/v1/tenants/alice/credentials"),
             ("GET", "/v1/tenants/alice"),
             ("DELETE", "/v1/tenants/alice"),
             ("POST", "/v1/tenants/alice/pair"),
@@ -398,8 +471,8 @@ mod tests {
             Some("Bearer".to_string()),
             Some("Bearer ".to_string()),
             Some("Basic hunter2".to_string()),
-            // Wrong, and a prefix of the real one: the compare is constant
-            // time and length-checked, so neither is closer than the other.
+            // Wrong, and a prefix of the real one: the compare is constant time
+            // and length-checked, so neither is closer than the other.
             Some(format!("Bearer {}", &TEST_TOKEN[..TEST_TOKEN.len() - 1])),
             Some(format!("Bearer {TEST_TOKEN}x")),
             Some("Bearer short".to_string()),
@@ -422,9 +495,9 @@ mod tests {
                 assert!(bytes.is_empty(), "401 must have no body");
             }
         }
-        // Nothing got past the gate: no command ran and no file was written.
-        assert!(h.runner.calls().is_empty());
-        assert!(h.fs.paths().is_empty());
+        // Nothing got past the gate: the cluster was never touched.
+        assert!(h.cluster.applied().is_empty());
+        assert!(h.cluster.deleted().is_empty());
     }
 
     #[tokio::test]
@@ -441,14 +514,14 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_body_is_refused_before_it_is_parsed() {
         let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
         let huge = serde_json::json!({
-            "label": "alice",
-            "account_email": "alice@example.com",
             "cred_read_ciphertext": "A".repeat(super::MAX_BODY + 1),
         })
         .to_string();
-        let (status, _) = call(&h, authed("POST", "/v1/tenants", &huge)).await;
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/credentials", &huge)).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(h.fs.paths().is_empty());
+        // The identity from phase one, and nothing more.
+        assert_eq!(h.cluster.applied_names(), vec!["alice-identity"]);
     }
 }

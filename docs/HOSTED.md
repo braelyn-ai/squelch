@@ -126,27 +126,77 @@ docker run -v squelch-data:/data -p 8848:8848 ghcr.io/<org>/squelch
 
 ## Hosted architecture
 
+> **Superseded 2026-08-09.** The systemd-and-Caddy design below is not what
+> shipped. Provisioning is Kubernetes (single-node k3s), the `Provisioner` trait
+> is gone, and the control plane makes TWO calls to create a tenant rather than
+> one, because the sealing key does not exist until the cluster mints it. What
+> follows is the design as built; the original paragraph is kept underneath it
+> because the reasoning that survived is the same reasoning.
+
 **Per-user daemon, not a multi-tenant rewrite.** squelchd stays single-tenant; that is
 a feature: hard tenant isolation, one user's mail can never leak into another's
 process, and the sealed-mail / two-door guarantees carry over untouched. One SQLite
-per user, Litestream to object storage from day one.
+per user.
 
-**New crate: `squelch-control`** — the only genuinely new component (axum, like
-everything else):
+**Two new crates.** `squelch-control` (on Railway) is signup, OAuth and the
+tenant record. `squelch-warden` is a small in-cluster provisioner on the box;
+it is the only thing that touches Kubernetes, and it renders no YAML at all
+(every tenant object is a typed `k8s-openapi` struct, so a tenant label can only
+ever land in a validated field).
 
-- Signup page → Google OAuth (web client) → refresh token encrypted into the tenant's
-  file-backend credential store.
-- Provisioning behind a trait (`Provisioner`); first impl is systemd template units
-  (`squelchd@<user>`) on a single VPS. The trait is what lets the backend graduate
-  later without a rearchitecture.
-- Routing: `<user>.passband.email` subdomains via Caddy + wildcard cert. Subdomains over
-  path-prefixes for clean per-tenant cookie/CORS isolation forever.
-- Invite-code gate for launch. **No Stripe in the MVP** — billing is Phase 3.
+**A tenant is seven objects in one namespace**, all named from the label: two
+Secrets (age identity, sealed credential), a PersistentVolumeClaim, a
+NetworkPolicy, a Service, a Deployment and an Ingress. `DELETE` removes the
+bottom four and keeps the top three, which is what "cancel my account, do not
+destroy my mail" means.
+
+**Two calls, and the reason is the key.** The control plane cannot seal a
+credential until it knows the tenant's recipient, and the recipient does not
+exist until somebody mints it:
+
+1. `POST /v1/tenants` mints that tenant's age identity in the cluster, writes it
+   straight into that tenant's Secret, and returns the public RECIPIENT.
+2. `PUT /v1/tenants/{label}/credentials` hands back the blob sealed to it,
+   applies the workload, waits for the pod, and execs `squelchd pair`.
+
+So the control plane holds recipients and never an identity, and the warden
+forgets each identity the instant it applies it. Nobody but the tenant's own pod
+can open that tenant's credential, including us, which is also why recovery from
+a lost Secret is re-consent rather than an escrow.
+
+- Routing: `<user>.passband.email` subdomains via Traefik and one wildcard
+  certificate (DNS-01). Subdomains over path-prefixes for clean per-tenant
+  cookie/CORS isolation forever.
+- The tenant Ingress declares `/client` and `/t` and nothing else, so the agent
+  door answers 404 from the internet while the daemon still serves it inside its
+  own pod. An allowlist, because a deny rule fails open when it misses a
+  spelling.
+- Invite-code gate for launch. **No Stripe in the MVP**, billing is Phase 3.
 - Signup → native app handoff: finish signup, page shows a
   `passband://pair?url=…&code=…` deep link / QR. That is the shape `squelchd pair`
   already prints: a short-lived pairing CODE plus the daemon's base URL, which the
   app trades at `POST /client/pair` for its own device token. The token itself
   never rides in a link.
+
+Runbook: `deploy/hosted/SETUP.md`. Crate: `squelch-warden/README.md`.
+
+<details>
+<summary>The original single-VPS design (2026-08-03), superseded</summary>
+
+- Provisioning behind a trait (`Provisioner`); first impl is systemd template units
+  (`squelchd@<user>`) on a single VPS. The trait is what lets the backend graduate
+  later without a rearchitecture.
+- Routing via Caddy + wildcard cert.
+- Signup page → Google OAuth (web client) → refresh token encrypted into the tenant's
+  file-backend credential store.
+
+What changed: kube already has a control loop, a secret store encrypted at rest,
+a network policy engine and an admission controller, and reimplementing four of
+those over systemd units and a JSON state file was the actual cost of the
+"simpler" option. Litestream is dropped for now with it; backups are the Secrets
+and the volumes.
+
+</details>
 
 **Changes to existing code (all in service of hosted, all benefiting self-host too):**
 
@@ -169,13 +219,16 @@ Considered and rejected: an Elixir rewrite. The value of this codebase is the Ru
 triage/seal/sync engine, and the thing BEAM buys — cheap concurrent per-tenant
 processes — tokio already provides. One BEAM node holding every tenant's tokens and
 mail in a single address space is a *weaker* isolation story than process-per-tenant.
-Also rejected: k8s-with-10,000-pods (one pod per user does not age well).
+Also rejected: k8s-with-10,000-pods (one pod per user does not age well — which
+is a statement about ten thousand, not about the first hundred; see step 1).
 
 The actual path, in order:
 
-1. **Now — one VPS.** An idle mailbox daemon is tens of MB; a single 64GB box
-   plausibly carries 1–2k users. This gets embarrassingly far, and the 100-user
-   verification cap makes it moot anyway.
+1. **Now — one box, single-node k3s.** An idle mailbox daemon is tens of MB; a
+   single 64GB box plausibly carries 1–2k users. One pod per user is fine at
+   this size and buys a control loop, encrypted-at-rest Secrets, NetworkPolicy
+   and admission control for free. This gets embarrassingly far, and the
+   100-user verification cap makes it moot anyway.
 2. **Next — Gmail push.** Hosted daemons switch from 45s polling to `users.watch` +
    Pub/Sub; the control plane receives pushes and pokes the right daemon. Idle
    tenants become nearly free and API quota stays flat as users grow. This is the
@@ -183,10 +236,10 @@ The actual path, in order:
    polling; containers can't receive Pub/Sub.)
 3. **At real scale — fleet mode inside squelchd.** One process hosting N tenants,
    each with its own SQLite file and its own tokio task tree, same sealed/two-door
-   code paths. The Elixir benefit without the rewrite. Then boring k8s or Fly
-   Machines orchestrates a few dozen fleet nodes instead of thousands of per-user
-   pods. Deferred: the `Provisioner` trait means this choice does not have to be
-   made today.
+   code paths. The Elixir benefit without the rewrite. Then the same k8s
+   orchestrates a few dozen fleet nodes instead of thousands of per-user pods.
+   Deferred: the warden's wire is five routes over a label, so what runs behind
+   it can change without the control plane noticing.
 
 ## Phasing
 
@@ -199,8 +252,8 @@ The actual path, in order:
    Status: the broker is implemented in-repo as `squelch-broker` (2026-08-04) per
    `docs/BROKER.md` but blocked for this tier; it ships with the hosted callback
    instead.
-3. **Phase 2 — hosted MVP:** `squelch-control`, systemd provisioning on the VPS,
-   human-door issued tokens + `/mcp` bearer auth, web signup → app pairing,
-   Litestream, invite codes.
+3. **Phase 2 — hosted MVP:** `squelch-control`, `squelch-warden` provisioning
+   onto single-node k3s, human-door issued tokens + `/mcp` bearer auth, web
+   signup → app pairing, invite codes.
 4. **Phase 3 — grow up:** Gmail push, Stripe, fleet-mode vs Fly Machines decision,
    iOS against hosted.

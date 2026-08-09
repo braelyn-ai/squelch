@@ -1,5 +1,10 @@
 //! Shared handler state: the config, the control store, the pending-signup
-//! table, the warden client, the age recipient, and one rate limiter per route.
+//! table, the warden client, and one rate limiter per route.
+//!
+//! NO AGE RECIPIENT LIVES HERE. Under wire v2 each tenant has its own identity,
+//! minted by the warden, and the recipient to seal to arrives per signup in the
+//! answer to the first provisioning call. A recipient held in process state
+//! would be a key shared by every mailbox.
 //!
 //! Cheap to clone (one `Arc`), because axum clones state per request and
 //! cloning must never fork the session table or the buckets.
@@ -7,8 +12,6 @@
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
-
-use age::x25519::Recipient;
 
 use crate::config::Config;
 use crate::ratelimit::{
@@ -27,9 +30,6 @@ pub struct ControlState {
 struct Inner {
     config: Config,
     store: ControlStore,
-    /// The box's age recipient, parsed once at startup. A public key: this
-    /// process can seal and cannot open.
-    recipient: Recipient,
     warden: Arc<dyn Warden>,
     sessions: Mutex<SessionStore>,
     page_limiter: Mutex<RateLimiter>,
@@ -39,26 +39,21 @@ struct Inner {
 
 impl ControlState {
     /// Build state from validated config, an open store, and a warden client.
-    /// The recipient is parsed here so a bad one is a startup failure and never
-    /// a failure discovered after a user has granted consent.
-    pub fn new(
-        config: Config,
-        store: ControlStore,
-        warden: Arc<dyn Warden>,
-    ) -> Result<Self, crate::seal::SealError> {
-        let recipient = crate::seal::parse_recipient(&config.age_recipient)?;
-        Ok(Self {
+    /// Infallible: everything that could be refused was refused when the config
+    /// was validated, and the only key material in the flow now arrives per
+    /// signup from the warden.
+    pub fn new(config: Config, store: ControlStore, warden: Arc<dyn Warden>) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 config,
                 store,
-                recipient,
                 warden,
                 sessions: Mutex::new(SessionStore::new()),
                 page_limiter: Mutex::new(RateLimiter::per_minute(PAGE_REQUESTS_PER_MINUTE)),
                 signup_limiter: Mutex::new(RateLimiter::per_minute(SIGNUP_REQUESTS_PER_MINUTE)),
                 callback_limiter: Mutex::new(RateLimiter::per_minute(CALLBACK_REQUESTS_PER_MINUTE)),
             }),
-        })
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -67,10 +62,6 @@ impl ControlState {
 
     pub fn store(&self) -> &ControlStore {
         &self.inner.store
-    }
-
-    pub fn recipient(&self) -> &Recipient {
-        &self.inner.recipient
     }
 
     pub fn warden(&self) -> &dyn Warden {

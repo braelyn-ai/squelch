@@ -1,0 +1,80 @@
+# What the warden itself may reach.
+#
+# CHECK THE CIDR BEFORE APPLYING. The egress rule names the Kubernetes API by
+# its in-cluster Service address, which on a default k3s is 10.43.0.1. Confirm
+# with:
+#
+#     kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}'
+#
+# If you passed --service-cidr to k3s, put your address here or the warden will
+# come up and be unable to do anything at all.
+#
+# The shape is the same argument as a tenant's: nothing gets in except the
+# ingress controller, and the only things it can reach out to are DNS and the
+# API server. In particular the warden cannot open a connection to a tenant pod.
+# It never needs to: `squelchd pair` goes through the API server's exec
+# subresource, which is an inbound call to the kubelet, not pod networking.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: squelch-warden
+  namespace: warden
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: squelch-warden
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8852
+    # UNCOMMENT IF PROBES ARE DROPPED. The warden's readiness and liveness
+    # probes are HTTP GETs from the kubelet, which originate at the NODE's own
+    # address and match no pod and no namespace. Some CNIs exempt
+    # host-originated traffic from policy and some do not; on one that does not,
+    # this pod never goes Ready and the deploy looks like a broken image.
+    #
+    # The symptom is a pod whose containers are running and whose readiness
+    # probe fails with a connection timeout. The fix is this block, with your
+    # node's address:
+    #
+    #     kubectl get node -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
+    #
+    # The same question applies to every TENANT pod, and there the answer is
+    # SQUELCH_WARDEN_NODE_CIDR on the warden. See "Verify the policy" in
+    # SETUP.md: check it once, with a canary, before you have tenants.
+    # - from:
+    #     - ipBlock:
+    #         cidr: 10.0.0.5/32
+    #   ports:
+    #     - protocol: TCP
+    #       port: 8852
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        # CHECK ME (see the header).
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443

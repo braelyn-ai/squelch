@@ -60,6 +60,9 @@ enum InviteCommand {
         /// How many to mint.
         #[arg(long, default_value_t = 1)]
         count: usize,
+        /// How many days each code stays usable.
+        #[arg(long, default_value_t = invites::DEFAULT_TTL_DAYS)]
+        ttl: i64,
     },
     /// List invite codes by id and status. Never prints codes or hashes.
     List,
@@ -70,6 +73,10 @@ enum InviteCommand {
 /// Ceiling on one `invite issue` run. A typo in `--count` should not write ten
 /// thousand rows and scroll the real codes off the operator's terminal.
 const MAX_ISSUE_COUNT: usize = 100;
+
+/// Ceiling on `--ttl`. A code good for years is a code that outlives the
+/// campaign it was minted for and the person who was sent it.
+const MAX_TTL_DAYS: i64 = 365;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -96,20 +103,26 @@ fn open_store() -> anyhow::Result<ControlStore> {
 fn invite(command: InviteCommand) -> anyhow::Result<()> {
     let store = open_store()?;
     match command {
-        InviteCommand::Issue { count } => {
+        InviteCommand::Issue { count, ttl } => {
             if count == 0 || count > MAX_ISSUE_COUNT {
                 anyhow::bail!("--count must be between 1 and {MAX_ISSUE_COUNT}");
             }
+            if !(1..=MAX_TTL_DAYS).contains(&ttl) {
+                anyhow::bail!("--ttl must be between 1 and {MAX_TTL_DAYS} days");
+            }
+            let expires_at = chrono::Utc::now() + chrono::Duration::days(ttl);
             for _ in 0..count {
                 let minted = invites::mint()?;
-                let id = store.insert_invite(&minted.code_hash)?;
+                let id = store.insert_invite(&minted.code_hash, expires_at)?;
                 // THE PLAINTEXT, ALONE ON STDOUT.
                 println!("{}", minted.code);
                 eprintln!("squelch-control: issued invite {id}");
             }
             eprintln!(
                 "squelch-control: that is the ONLY time those codes are shown. Only a hash is \
-                 stored, so a lost code is re-issued, never recovered. Each one works once."
+                 stored, so a lost code is re-issued, never recovered. Each one works once, and \
+                 expires {}.",
+                stamp(expires_at)
             );
             Ok(())
         }
@@ -119,12 +132,16 @@ fn invite(command: InviteCommand) -> anyhow::Result<()> {
                 eprintln!("squelch-control: no invite codes have been issued.");
                 return Ok(());
             }
-            println!("{:>5}  {:<20}  {:<20}  USED BY", "ID", "CREATED", "USED");
+            println!(
+                "{:>5}  {:<20}  {:<20}  {:<20}  USED BY",
+                "ID", "CREATED", "EXPIRES", "USED"
+            );
             for r in rows {
                 println!(
-                    "{:>5}  {:<20}  {:<20}  {}",
+                    "{:>5}  {:<20}  {:<20}  {:<20}  {}",
                     r.id,
                     stamp(r.created_at),
+                    r.expires_at.map(stamp).unwrap_or_else(|| "-".to_string()),
                     r.used_at.map(stamp).unwrap_or_else(|| "-".to_string()),
                     r.used_by_label.unwrap_or_else(|| "-".to_string()),
                 );
@@ -195,7 +212,7 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
         config.warden_token.clone(),
         OUTBOUND_TIMEOUT,
     )?);
-    let state = ControlState::new(config, store, warden)?;
+    let state = ControlState::new(config, store, warden);
     let app = router(state.clone());
 
     let sweeper = state.clone();

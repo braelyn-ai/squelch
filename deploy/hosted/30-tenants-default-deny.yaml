@@ -1,0 +1,22 @@
+# Default-deny for the tenant namespace.
+#
+# The warden writes a per-tenant NetworkPolicy that names exactly what that
+# tenant may reach, so this file is belt to that suspenders. It matters for the
+# window between a pod being scheduled and its own policy being applied, and it
+# matters for anything that ends up in this namespace without a policy of its
+# own (a debug pod, a stuck job, a mistake).
+#
+# An empty podSelector is every pod in the namespace; naming both policyTypes
+# with no rules underneath them is how Kubernetes spells "deny". Policies are
+# additive, so the per-tenant policy on top of this one is what a tenant
+# actually gets.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tenants
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress

@@ -1,12 +1,14 @@
 //! Tenant labels: the subdomain a hosted daemon answers on, and therefore the
 //! most load-bearing string a stranger gets to choose in this whole service.
 //!
-//! It becomes a DNS label, a systemd unit instance (`squelchd@<label>`), a
-//! directory name under `/var/lib/squelch/tenants/`, a Caddy site block, and a
-//! filename in the Caddy imports dir. Every one of those has its own way of
+//! It becomes a DNS label, a URL path segment on the warden's API, and on the
+//! far side the name of a Deployment, a Service, an Ingress host, a
+//! NetworkPolicy, a PVC, and two Secrets. Every one of those has its own way of
 //! being escaped out of, so validation is a strict ALLOWLIST applied once, here,
 //! before the label reaches any of them: lowercase ASCII letters, digits, and
-//! interior hyphens, and nothing else, ever.
+//! interior hyphens, and nothing else, ever. (That set is a subset of DNS-1123,
+//! so a label that passes here is also a legal Kubernetes object name; this is
+//! the stricter of the two gates and it is the outer one.)
 
 use std::sync::LazyLock;
 

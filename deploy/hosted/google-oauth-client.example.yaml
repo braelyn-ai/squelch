@@ -1,0 +1,53 @@
+# The Google OAuth client every tenant daemon refreshes with.
+#
+# DO NOT apply this file as it stands, and do not commit a filled-in copy.
+# Create it from the command line so the value never reaches a file:
+#
+#     kubectl -n tenants create secret generic google-oauth-client \
+#       --from-literal=client_id="<the web client's id>" \
+#       --from-literal=client_secret="<the web client's secret>"
+#
+# ## Why a client secret is inside a tenant pod at all
+#
+# A Google refresh token only works for the OAuth client that minted it. Hosted
+# signups run through `squelch-control`'s CONFIDENTIAL WEB client, so a tenant
+# daemon holding that tenant's refresh token and NOT holding that client's id
+# and secret cannot refresh an access token. It does not even get that far:
+# `squelchd serve` requires an OAuth client at boot and exits without one.
+#
+# So this is the SAME client, from the SAME GCP project, that the control plane
+# uses. Not the desktop client self-hosters get embedded in their image, and not
+# a second client: a second one would mint tokens the first cannot refresh.
+#
+# This is custody hosted already admits to. Hosted daemons are our
+# infrastructure, running our image, on our box, with the tenant's mail on a
+# volume we control; a shared client secret in that pod adds nothing to what a
+# hosted tenant is already trusting us with. It is worth being precise about
+# what it is NOT: it is not a credential for anyone's mailbox. On its own it
+# opens nothing. Reading a tenant's mail still needs that tenant's refresh
+# token, which is sealed to that tenant's age recipient and openable only inside
+# that tenant's pod.
+#
+# The self-host tier is unaffected and stays unaffected: those daemons use the
+# desktop client and never talk to our infrastructure after consent.
+#
+# ## Rotation
+#
+# Replace the Secret, then restart the tenants that need the new value:
+# `kubectl -n tenants rollout restart deploy -l app.kubernetes.io/name=squelchd`.
+# Rotating the client secret in Google's console invalidates nothing that is
+# already issued, so there is no rush and no outage; a daemon picks the new one
+# up at its next start.
+#
+# The Secret's NAME is `SQUELCH_WARDEN_OAUTH_SECRET_NAME` on the warden
+# (default `google-oauth-client`); the two data keys are fixed.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: google-oauth-client
+  namespace: tenants
+type: Opaque
+stringData:
+  # The web client from the same GCP project as squelch-control's.
+  client_id: REPLACE_ME.apps.googleusercontent.com
+  client_secret: REPLACE_ME

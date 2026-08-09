@@ -1,0 +1,206 @@
+# The warden itself: one Deployment, one Service, one Ingress.
+#
+# EDIT BEFORE APPLYING. Four values are placeholders and every one of them will
+# break the deploy if it is left alone:
+#
+#   1. `image:` on the Deployment          -> your squelch-warden image
+#   2. SQUELCH_WARDEN_BASE_DOMAIN          -> your domain
+#   3. SQUELCH_WARDEN_IMAGE                -> the squelchd image TENANTS run
+#   4. `host:` on the Ingress              -> warden.<your domain>
+#
+# The bearer token is NOT here. It comes from the `squelch-warden` Secret in
+# this namespace; see `warden-token.example.yaml`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: squelch-warden
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: squelch-warden
+spec:
+  replicas: 1
+  # Two wardens racing on the same label would both be settled correctly by the
+  # API server (the loser of `create` gets 409), but there is no reason to have
+  # two, and Recreate keeps the rollout honest.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: squelch-warden
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: squelch-warden
+    spec:
+      serviceAccountName: squelch-warden
+      # The one pod in this deployment that DOES need an API token. Tenant pods
+      # set this to false.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: warden
+          # 1. EDIT ME
+          image: ghcr.io/braelyn-ai/squelch-warden:v0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8852
+          env:
+            # 2. EDIT ME
+            - name: SQUELCH_WARDEN_BASE_DOMAIN
+              value: passband.email
+            # 3. EDIT ME. Pinned to a tag or a digest on purpose: an untagged
+            # image would silently upgrade every tenant's daemon on any pod
+            # restart. The warden refuses to start without one.
+            - name: SQUELCH_WARDEN_IMAGE
+              value: ghcr.io/braelyn-ai/squelchd:v0.1.0
+            - name: SQUELCH_WARDEN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: squelch-warden
+                  key: token
+            # Everything below is a default, restated so this file is the one
+            # place an operator has to look. See squelch-warden/README.md.
+            - name: SQUELCH_WARDEN_TENANT_NAMESPACE
+              value: tenants
+            - name: SQUELCH_WARDEN_INGRESS_CLASS
+              value: traefik
+            - name: SQUELCH_WARDEN_INGRESS_NAMESPACE
+              value: kube-system
+            - name: SQUELCH_WARDEN_INGRESS_POD_LABEL
+              value: app.kubernetes.io/name=traefik
+            - name: SQUELCH_WARDEN_TLS_SECRET
+              value: passband-wildcard-tls
+            - name: SQUELCH_WARDEN_STORAGE_CLASS
+              value: local-path
+            - name: SQUELCH_WARDEN_STORAGE_SIZE
+              value: 10Gi
+            # The Secret holding the Google web client every tenant daemon
+            # refreshes with, in the tenant namespace. Without it a tenant pod
+            # exits at boot; see google-oauth-client.example.yaml.
+            - name: SQUELCH_WARDEN_OAUTH_SECRET_NAME
+              value: google-oauth-client
+            # Per-tenant-container bounds. Restated here because the number of
+            # tenants a box carries is these divided into it; size them with
+            # 70-tenant-limits.yaml, not separately.
+            - name: SQUELCH_WARDEN_CPU_REQUEST
+              value: 100m
+            - name: SQUELCH_WARDEN_CPU_LIMIT
+              value: 1000m
+            - name: SQUELCH_WARDEN_MEMORY_REQUEST
+              value: 256Mi
+            - name: SQUELCH_WARDEN_MEMORY_LIMIT
+              value: 1Gi
+            - name: SQUELCH_WARDEN_EPHEMERAL_REQUEST
+              value: 256Mi
+            - name: SQUELCH_WARDEN_EPHEMERAL_LIMIT
+              value: 1Gi
+            - name: SQUELCH_WARDEN_TMP_SIZE
+              value: 512Mi
+            # How long an abandoned signup (phase one, never phase two) keeps
+            # its identity Secret and its subdomain before the sweep collects
+            # it. Recovery is signing up again.
+            - name: SQUELCH_WARDEN_PENDING_TTL_SECS
+              value: "86400"
+            # One ingress controller in front of this listener, which is what
+            # makes the rate limiter's per-IP buckets per-CLIENT rather than one
+            # shared bucket for the whole cluster. Set it to the number of
+            # proxies YOU run; 0 (the default) reads no forwarded header at all.
+            - name: SQUELCH_WARDEN_TRUSTED_PROXY_HOPS
+              value: "1"
+            # UNCOMMENT ONLY IF kubelet probes are dropped by the CNI, which
+            # makes every provision time out on a healthy pod. See "Verify the
+            # policy" in SETUP.md; this opens 8848 on every tenant to the node's
+            # own address and to nothing else.
+            # - name: SQUELCH_WARDEN_NODE_CIDR
+            #   value: 10.0.0.5/32
+            # Per-tenant user namespaces. Turn this off ONLY if tenant pods
+            # fail to start with a hostUsers error; read the isolation section
+            # of SETUP.md before you do.
+            - name: SQUELCH_WARDEN_USER_NAMESPACES
+              value: "on"
+            # Uncomment once the shared weights volume exists (SETUP.md step 10).
+            # - name: SQUELCH_WARDEN_MODEL_PVC
+            #   value: squelch-models
+            # Uncomment if the squelchd image is private.
+            # - name: SQUELCH_WARDEN_IMAGE_PULL_SECRET
+            #   value: ghcr
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        # The warden writes nothing to disk. This exists so the read-only root
+        # filesystem has somewhere for a library to put a scratch file.
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: squelch-warden
+  namespace: warden
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: squelch-warden
+  ports:
+    - name: http
+      port: 8852
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: squelch-warden
+  namespace: warden
+spec:
+  ingressClassName: traefik
+  tls:
+    # The wildcard certificate does NOT cover this host: `*.passband.email`
+    # matches one label, and `warden.passband.email` is one label, so it does.
+    # A cert-manager Certificate for the wildcard with `warden.<base>` as an
+    # extra DNS name is what 40-wildcard-certificate.yaml requests.
+    - hosts:
+        # 4. EDIT ME
+        - warden.passband.email
+      secretName: warden-tls
+  rules:
+    # 4. EDIT ME
+    - host: warden.passband.email
+      http:
+        paths:
+          # Unlike a tenant vhost, every path here goes to the service: the
+          # whole API is behind the bearer, and /healthz says only `ok`.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: squelch-warden
+                port:
+                  name: http

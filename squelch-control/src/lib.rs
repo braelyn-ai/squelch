@@ -1,21 +1,25 @@
 //! squelch-control: the hosted signup control plane (Passband hosted tier).
 //!
 //! It runs on Railway, holds the confidential web OAuth client, and turns one
-//! invite code plus one Google consent into one provisioned tenant daemon on the
-//! VPS. The provisioning itself belongs to `squelch-warden`, which this crate
-//! only ever talks to over the wire contract in `docs/HOSTED.md`.
+//! invite code plus one Google consent into one provisioned tenant daemon, which
+//! runs as its own pod. The provisioning itself belongs to `squelch-warden`, and
+//! this crate only ever talks to it over the two-call wire contract spelled out
+//! in [`warden`].
 //!
 //! THE TRUST SPLIT IS THE WHOLE DESIGN, and every module here exists to keep one
 //! half of it:
 //!
-//! - This process holds the OAuth client secret and an age RECIPIENT — a public
-//!   key. It can seal a tenant's token; it cannot open one. There is no identity
-//!   file on Railway and no code path here that would read one.
+//! - This process holds the OAuth client secret. It holds no age identity, and
+//!   as of wire v2 no long-lived recipient either: the warden mints an identity
+//!   PER TENANT and answers the first provisioning call with the public half, so
+//!   what this process can do is seal one tenant's token to one key it cannot
+//!   open, for the length of one request.
 //! - A plaintext refresh token exists ONLY in memory, between the token exchange
 //!   returning and [`seal`] encrypting it. It is never written to the control
 //!   store, never logged at any level, and never rendered into a page.
-//! - The warden receives ciphertext (age ASCII armor) and writes it verbatim.
-//!   Only the tenant's daemon, handed the identity by systemd, can decrypt.
+//! - The warden receives ciphertext (age ASCII armor) and writes it verbatim
+//!   into that tenant's Secret. Only that tenant's daemon, whose pod mounts the
+//!   matching identity, can decrypt, and it opens nothing else.
 //!
 //! PRIVACY, enforced by review of every `tracing` call in this crate: invite
 //! codes, their hashes, pairing codes, OAuth codes, `state`, PKCE verifiers,

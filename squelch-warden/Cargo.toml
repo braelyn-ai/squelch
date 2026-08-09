@@ -18,22 +18,32 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# `created_at` stamps in the state file, RFC3339 like every other timestamp in
-# the repo.
-chrono = { workspace = true }
+async-trait = { workspace = true }
 # Full-feature axum on the same 0.8 line the rest of the workspace pins.
 axum = { version = "0.8" }
 # Constant-time bearer compare + `Authorization` parse, shared byte-for-byte
 # with the two doors and the relay so a fix to any of them lands in one place.
 squelch-httpauth = { path = "../squelch-httpauth" }
+# The cluster is the state store. Everything the warden creates is a TYPED
+# k8s-openapi object handed to kube-rs; nothing in this crate renders YAML.
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+# The warden mints one age identity per tenant, in memory, and writes it
+# straight into that tenant's Secret. This is the ONLY reason it links age: it
+# still cannot decrypt anything, because it keeps no identity after the apply.
+age = { workspace = true }
+# SHA-256 of the credential ciphertext, so a re-consent changes the pod
+# template and the init container reinstalls it. No other cryptography here:
+# the sealing is the control plane's and the opening is the tenant's.
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Deliberately NOT a dependency: squelch-core. The warden allocates ports,
-# writes files, and drives systemd; it never opens a mailbox store, never parses
-# a token, and never decrypts anything. Linking the core would pull rusqlite,
-# keyring, an ONNX runtime and an embedding model onto the box's provisioner for
-# no reason, and would put mail code in a process that has no business with it.
+# Deliberately NOT a dependency: squelch-core. The warden renders manifests and
+# execs a pairing command; it never opens a mailbox store, never parses a token,
+# and never decrypts. Linking the core would pull rusqlite, keyring, an ONNX
+# runtime and an embedding model onto the provisioner for no reason, and would
+# put mail code in a process that has no business with it.
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
