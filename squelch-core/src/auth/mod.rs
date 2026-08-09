@@ -2128,10 +2128,7 @@ mod tests {
     /// delay.
     fn scripted_google(answers: Vec<ScriptedAnswer>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().unwrap().port()
-        );
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         std::thread::spawn(move || {
             for answer in answers {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -2410,9 +2407,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let browser = std::thread::spawn(move || {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let _ = s.write_all(
-                b"GET /?code=the-code&state=our-state HTTP/1.1\r\nHost: x\r\n\r\n",
-            );
+            let _ = s.write_all(b"GET /?code=the-code&state=our-state HTTP/1.1\r\nHost: x\r\n\r\n");
             // A browser reads the answer, which is what leaves the SERVER side
             // of this connection in TIME_WAIT once the listener closes first.
             let mut sink = Vec::new();

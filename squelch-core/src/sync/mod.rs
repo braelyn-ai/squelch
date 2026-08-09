@@ -1201,7 +1201,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
         let queued = Self::read_queue(
-            self.store.stage1_queue(self.account_id, cfg.batch_per_cycle),
+            self.store
+                .stage1_queue(self.account_id, cfg.batch_per_cycle),
             "stage-1",
         );
         if queued.is_empty() {
@@ -1552,7 +1553,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let global_daily_cap = caps.global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
         let queued = Self::read_queue(
-            self.store.stage2_queue(self.account_id, cfg.batch_per_cycle),
+            self.store
+                .stage2_queue(self.account_id, cfg.batch_per_cycle),
             "stage-2",
         );
         if queued.is_empty() {

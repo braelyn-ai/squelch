@@ -19,7 +19,10 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
         // LIKE metacharacters in the fragment are literal text to the user.
-        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let contains = format!("%{escaped}%");
         let prefix = format!("{escaped}%");
 

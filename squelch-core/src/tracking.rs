@@ -353,9 +353,14 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..256 {
             let t = mint_token().expect("OS entropy");
-            assert_eq!(t.len(), 32, "24 bytes is exactly 32 unpadded base64url chars");
+            assert_eq!(
+                t.len(),
+                32,
+                "24 bytes is exactly 32 unpadded base64url chars"
+            );
             assert!(
-                t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
                 "token must survive a URL path segment unescaped: {t}"
             );
             assert!(seen.insert(t), "minted the same token twice");
@@ -416,7 +421,10 @@ mod tests {
     #[test]
     fn a_fresh_cursor_starts_at_zero() {
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = SqliteStore::open_in_memory().unwrap().ensure_account("x@y.z").unwrap();
+        let acct = SqliteStore::open_in_memory()
+            .unwrap()
+            .ensure_account("x@y.z")
+            .unwrap();
         let poller = OpensPoller::for_test(store, acct, "http://127.0.0.1:1");
         assert_eq!(poller.cursor().unwrap(), 0);
         poller.set_cursor(41).unwrap();

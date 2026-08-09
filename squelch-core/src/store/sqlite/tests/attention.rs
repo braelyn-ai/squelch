@@ -226,7 +226,9 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
     );
 
     // Header counts agree with the collapsed list.
-    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    let stats = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(
         stats.bands.standing, 2,
         "standing counts threads, not messages"
@@ -294,7 +296,9 @@ fn sealed_rows_never_surface_through_the_ledger() {
 
     // Stats: sealed row contributes to `sealed`, never to any band, and
     // never advances last_surfaced_at.
-    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    let stats = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(stats.sealed, 1);
     assert_eq!(stats.bands.new, 0);
     assert_eq!(stats.bands.standing, 0);
@@ -363,7 +367,14 @@ fn standing_admits_dateless_mail_from_a_sender_the_user_has_written_to() {
         !standing.contains(&stranger),
         "a stranger's dateless mail is not owed"
     );
-    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 1);
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        1
+    );
 }
 
 #[test]
@@ -376,7 +387,14 @@ fn standing_known_contact_match_folds_address_case() {
 
     let shouty = dateless(&store, acct, "g1", "t1", "Johanna@WVFC.org");
     assert_eq!(standing_ids(&store, acct, since), vec![shouty]);
-    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 1);
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        1
+    );
 }
 
 #[test]
@@ -407,7 +425,14 @@ fn standing_admits_a_thread_the_user_has_written_in() {
         "sent mail is never listed"
     );
     assert!(!standing.contains(&reply));
-    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 1);
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        1
+    );
 }
 
 #[test]
@@ -427,7 +452,14 @@ fn standing_drops_a_resolved_participated_thread() {
         standing_ids(&store, acct, since).is_empty(),
         "done leaves the band"
     );
-    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 0);
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        0
+    );
 }
 
 #[test]
@@ -457,12 +489,27 @@ fn standing_correspondence_arms_do_not_cross_accounts() {
     );
     assert!(!standing_a.contains(&a_from_b_contact));
     assert!(!standing_a.contains(&a_in_b_thread));
-    assert_eq!(store.stats(a, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 0, "header agrees");
+    assert_eq!(
+        store
+            .stats(a, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        0,
+        "header agrees"
+    );
 
     // The same rows DO stand once account A itself is the correspondent.
     contact(&store, a, "johanna@wvfc.org", 4);
     assert_eq!(standing_ids(&store, a, since), vec![a_from_b_contact]);
-    assert_eq!(store.stats(a, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 1);
+    assert_eq!(
+        store
+            .stats(a, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        1
+    );
 }
 
 #[test]
@@ -496,7 +543,14 @@ fn standing_never_admits_sealed_mail_from_a_correspondent() {
     );
     assert!(!standing.contains(&sealed_known));
     assert!(!standing.contains(&sealed_thread));
-    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 0);
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        0
+    );
 }
 
 #[test]
@@ -553,7 +607,11 @@ fn stats_standing_count_matches_the_listed_standing_band() {
         "thread collapses to its sort-first row"
     );
     assert_eq!(
-        store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing as usize,
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing as usize,
         standing.len(),
         "header count equals the listed band"
     );
@@ -566,14 +624,18 @@ fn stats_bands_and_last_surfaced_at() {
     let bill = ingest_normal(&store, acct, "g1", "t1", Tier::Deadline, 90, Utc::now());
     let sig = ingest_normal(&store, acct, "g2", "t2", Tier::Signal, 70, Utc::now());
 
-    let s0 = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    let s0 = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(s0.bands.standing, 1, "deadline tier counts as standing");
     assert_eq!(s0.bands.new, 2);
     assert_eq!(s0.bands.open, 0);
     assert!(s0.last_surfaced_at.is_none());
 
     store.mark_surfaced(acct, &[bill, sig]).unwrap();
-    let s1 = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    let s1 = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(s1.bands.new, 0, "both surfaced");
     assert_eq!(s1.bands.open, 2);
     assert_eq!(s1.bands.standing, 1, "surfacing doesn't change standing");

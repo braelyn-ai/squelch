@@ -256,12 +256,12 @@ mod tests {
         // The field a hostile email would most want to steer.
         for raw in [
             "",
-            "ab",                              // too short
-            "use code WINTER30 at checkout",   // a sentence
-            "https://evil.example/claim",      // a url
-            "A".repeat(40).as_str(),           // too long
-            "1234567",                         // an order/tracking id
-            "CODE_30",                         // underscore not allowed
+            "ab",                            // too short
+            "use code WINTER30 at checkout", // a sentence
+            "https://evil.example/claim",    // a url
+            "A".repeat(40).as_str(),         // too long
+            "1234567",                       // an order/tracking id
+            "CODE_30",                       // underscore not allowed
         ] {
             assert_eq!(sanitize_code(Some(raw)), None, "{raw:?} must not be stored");
         }

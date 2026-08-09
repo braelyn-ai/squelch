@@ -68,7 +68,10 @@ pub fn worthy_kind(
         return None;
     }
     // A squelch/filtered rule is a standing "not from this sender".
-    if matches!(ctx.rule, Some(Disposition::Squelch) | Some(Disposition::Filtered)) {
+    if matches!(
+        ctx.rule,
+        Some(Disposition::Squelch) | Some(Disposition::Filtered)
+    ) {
         return None;
     }
     // STORM GUARD: old mail is silent no matter how good the verdict is.
@@ -196,14 +199,22 @@ mod tests {
         assert_eq!(worthy_kind(&ctx(now), &cfg, now), Some(EventKind::Surfaced));
         let mut c = ctx(now);
         c.importance = cfg.min_importance;
-        assert_eq!(worthy_kind(&c, &cfg, now), Some(EventKind::Surfaced), "boundary is inclusive");
+        assert_eq!(
+            worthy_kind(&c, &cfg, now),
+            Some(EventKind::Surfaced),
+            "boundary is inclusive"
+        );
 
         // Urgent tiers bypass the threshold entirely.
         for tier in [Tier::PastDue, Tier::Deadline] {
             let mut c = ctx(now);
             c.tier = tier;
             c.importance = 0;
-            assert_eq!(worthy_kind(&c, &cfg, now), Some(EventKind::Urgent), "{tier:?}");
+            assert_eq!(
+                worthy_kind(&c, &cfg, now),
+                Some(EventKind::Urgent),
+                "{tier:?}"
+            );
         }
 
         // A detected deadline on a non-urgent tier bypasses the threshold too.
@@ -269,10 +280,18 @@ mod tests {
         // A modestly wrong sender clock is still tolerated, both edges.
         let mut c = ctx(now);
         c.received_at = now + ChronoDuration::seconds(MAX_FUTURE_SKEW_SECS);
-        assert_eq!(worthy_kind(&c, &cfg, now), Some(EventKind::Surfaced), "skew edge is inclusive");
+        assert_eq!(
+            worthy_kind(&c, &cfg, now),
+            Some(EventKind::Surfaced),
+            "skew edge is inclusive"
+        );
         let mut c = ctx(now);
         c.received_at = now + ChronoDuration::seconds(MAX_FUTURE_SKEW_SECS + 1);
-        assert_eq!(worthy_kind(&c, &cfg, now), None, "one second past the skew allowance");
+        assert_eq!(
+            worthy_kind(&c, &cfg, now),
+            None,
+            "one second past the skew allowance"
+        );
     }
 
     /// The refine sites read the rule list LIVE, so a rule added after a message
@@ -301,7 +320,10 @@ mod tests {
             current_rule("alerts@monitoring.example", &rules),
             Some(Disposition::Squelch)
         );
-        assert_eq!(current_rule("boss@corp.example", &rules), Some(Disposition::Surface));
+        assert_eq!(
+            current_rule("boss@corp.example", &rules),
+            Some(Disposition::Surface)
+        );
         assert_eq!(current_rule("stranger@nowhere.example", &rules), None);
         // And the squelch it returns is what silences the verdict.
         let now = Utc::now();
@@ -336,7 +358,11 @@ mod tests {
         c.rule = current_rule("billing@vendor.example", &rules);
         c.tier = Tier::PastDue;
         c.importance = 100;
-        assert_eq!(worthy_kind(&c, &cfg, now), None, "filtered stays silent, want_text or not");
+        assert_eq!(
+            worthy_kind(&c, &cfg, now),
+            None,
+            "filtered stays silent, want_text or not"
+        );
     }
 
     /// SEAL INVARIANT: a sealed message can NEVER produce an event, whatever its
@@ -358,7 +384,11 @@ mod tests {
             c.tier = tier;
             c.importance = importance;
             c.deadline = deadline;
-            assert_eq!(worthy_kind(&c, &cfg, now), None, "sealed {tier:?}/{importance}");
+            assert_eq!(
+                worthy_kind(&c, &cfg, now),
+                None,
+                "sealed {tier:?}/{importance}"
+            );
             assert!(event_for(&c, &cfg, now).is_none());
         }
     }

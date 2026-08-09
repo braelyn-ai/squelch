@@ -254,11 +254,18 @@ pub async fn classify_at(
         user: &user,
         schema: output_schema(),
     };
-    llm::classify_into(http, url, api_key, provider, &req, |out: RuleInferOutput| {
-        // A value outside the schema's enum is a failure, not a guess: the
-        // caller's fallback (Filtered) is the safe answer either way.
-        Disposition::parse(out.disposition.trim()).ok_or_else(|| "bad_disposition".to_string())
-    })
+    llm::classify_into(
+        http,
+        url,
+        api_key,
+        provider,
+        &req,
+        |out: RuleInferOutput| {
+            // A value outside the schema's enum is a failure, not a guess: the
+            // caller's fallback (Filtered) is the safe answer either way.
+            Disposition::parse(out.disposition.trim()).ok_or_else(|| "bad_disposition".to_string())
+        },
+    )
     .await
 }
 
@@ -301,10 +308,7 @@ pub async fn infer_disposition(
 
 /// The inference itself, with no time bound of its own: every caller goes through
 /// [`infer_disposition`], which owns the budget.
-async fn infer_unbounded(
-    want_text: &str,
-    llm: &RuleInferClient,
-) -> (Disposition, Option<Usage>) {
+async fn infer_unbounded(want_text: &str, llm: &RuleInferClient) -> (Disposition, Option<Usage>) {
     match classify_at(
         &llm.http,
         &llm.url,
@@ -322,7 +326,9 @@ async fn infer_unbounded(
         }
         Ok(LlmOutcome::Failed(kind)) => {
             // `kind` is already redacted (status/error type only).
-            eprintln!("squelch: rule disposition inference failed ({kind}); defaulting to filtered");
+            eprintln!(
+                "squelch: rule disposition inference failed ({kind}); defaulting to filtered"
+            );
             (Disposition::Filtered, None)
         }
         Err(e) => {
@@ -407,7 +413,10 @@ mod tests {
         // Two different sentences differ ONLY in the sentence.
         let a = build_user_message("only billing");
         let b = build_user_message("mute them entirely");
-        assert_eq!(a.replace("only billing", "X"), b.replace("mute them entirely", "X"));
+        assert_eq!(
+            a.replace("only billing", "X"),
+            b.replace("mute them entirely", "X")
+        );
     }
 
     #[test]
@@ -416,8 +425,12 @@ mod tests {
         // contains a quote used to close the frame early and leave the tail
         // reading as prose addressed to the model.
         let msg = build_user_message("he said \"always show me these\" so do that");
-        let begin = msg.find("-----BEGIN RULE SENTENCE-----").expect("fence open");
-        let end = msg.find("-----END RULE SENTENCE-----").expect("fence close");
+        let begin = msg
+            .find("-----BEGIN RULE SENTENCE-----")
+            .expect("fence open");
+        let end = msg
+            .find("-----END RULE SENTENCE-----")
+            .expect("fence close");
         assert!(begin < end, "the sentence sits between the fences");
         let fenced = &msg[begin..end];
         assert!(
@@ -437,7 +450,10 @@ mod tests {
         let msg = build_user_message(&long);
         assert_eq!(
             msg,
-            format!("{USER_PREFIX}{}{USER_SUFFIX}", "a".repeat(MAX_SENTENCE_CHARS)),
+            format!(
+                "{USER_PREFIX}{}{USER_SUFFIX}",
+                "a".repeat(MAX_SENTENCE_CHARS)
+            ),
             "the sentence is truncated to the cap and nothing else changes"
         );
         // Char-safe, not byte-safe: multi-byte input must not panic or split.
@@ -467,7 +483,10 @@ mod tests {
         assert_eq!(d, Disposition::Filtered);
         let req = handle.await.unwrap();
         assert!(req.contains("only the invoices"), "the sentence is sent");
-        assert!(req.contains("claude-haiku-4-5"), "on the cheap stage-1 model");
+        assert!(
+            req.contains("claude-haiku-4-5"),
+            "on the cheap stage-1 model"
+        );
     }
 
     // ---- mapping -----------------------------------------------------------
@@ -511,10 +530,15 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_api_failure_falls_back_to_filtered() {
-        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"secret"}}"#;
+        let body =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"secret"}}"#;
         let (url, _h) = mock_once(400, body).await;
         let (d, usage) = infer_disposition("always show me these", &client(&url)).await;
-        assert_eq!(d, Disposition::Filtered, "a failed call never invents a verdict");
+        assert_eq!(
+            d,
+            Disposition::Filtered,
+            "a failed call never invents a verdict"
+        );
         assert!(usage.is_none(), "nothing to bill for a failed call");
     }
 
@@ -538,7 +562,8 @@ mod tests {
     async fn transport_error_falls_back_to_filtered() {
         // Nothing is listening on this port: the retry budget exhausts and the
         // save still gets an answer.
-        let (d, _u) = infer_disposition("always show me these", &client("http://127.0.0.1:1")).await;
+        let (d, _u) =
+            infer_disposition("always show me these", &client("http://127.0.0.1:1")).await;
         assert_eq!(d, Disposition::Filtered);
     }
 
@@ -577,8 +602,15 @@ mod tests {
         let (d, usage) = infer_disposition("always show me these", &client(&url)).await;
         let elapsed = started.elapsed();
 
-        assert_eq!(d, Disposition::Filtered, "an expired budget is filtered, not an error");
-        assert!(usage.is_none(), "a call that never finished reports no usage");
+        assert_eq!(
+            d,
+            Disposition::Filtered,
+            "an expired budget is filtered, not an error"
+        );
+        assert!(
+            usage.is_none(),
+            "a call that never finished reports no usage"
+        );
         assert!(
             elapsed <= INFER_BUDGET + Duration::from_secs(1),
             "the whole inference is bounded by the budget, got {elapsed:?}"
@@ -589,7 +621,10 @@ mod tests {
     fn debug_never_renders_the_api_key() {
         let c = client("http://example.invalid");
         let shown = format!("{c:?}");
-        assert!(!shown.contains("sk-test"), "the api key never renders: {shown}");
+        assert!(
+            !shown.contains("sk-test"),
+            "the api key never renders: {shown}"
+        );
         assert!(shown.contains("claude-haiku-4-5"));
     }
 }

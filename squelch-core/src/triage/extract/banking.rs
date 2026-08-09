@@ -368,7 +368,10 @@ mod tests {
         let mut o = out();
         o.account_hint = Some("account number 4111111111111234".into());
         let a = apply_result(&queued("banking_statement"), &o, "m");
-        assert_eq!(a.account_hint, None, "a full number in model output is stripped to null");
+        assert_eq!(
+            a.account_hint, None,
+            "a full number in model output is stripped to null"
+        );
     }
 
     // ---- classify against a one-shot mock server ------------------------
@@ -420,7 +423,8 @@ mod tests {
 
     #[tokio::test]
     async fn classify_400_is_permanent_failure() {
-        let resp = r#"{"type":"error","error":{"type":"invalid_request_error","message":"secret"}}"#;
+        let resp =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"secret"}}"#;
         let url = mock_once(400, resp).await;
         let http = reqwest::Client::new();
         let cfg = Stage1Config::default();

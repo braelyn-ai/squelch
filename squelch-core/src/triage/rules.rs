@@ -47,11 +47,10 @@ fn glob_rec(pat: &[char], cand: &[char]) -> bool {
 }
 
 /// Find the first sender rule whose `match_pattern` glob-matches `from_addr`.
-pub fn match_sender_rule<'a>(
-    from_addr: &str,
-    rules: &'a [SenderRule],
-) -> Option<&'a SenderRule> {
-    rules.iter().find(|r| glob_match(&r.match_pattern, from_addr))
+pub fn match_sender_rule<'a>(from_addr: &str, rules: &'a [SenderRule]) -> Option<&'a SenderRule> {
+    rules
+        .iter()
+        .find(|r| glob_match(&r.match_pattern, from_addr))
 }
 
 // ---- Static pattern batteries -------------------------------------------
@@ -131,7 +130,10 @@ fn patterns() -> &'static Patterns {
 
 /// Does this look like it came from an automated/no-reply sender?
 pub fn is_automated_sender(from_addr: &str) -> bool {
-    patterns().automated_sender.iter().any(|re| re.is_match(from_addr))
+    patterns()
+        .automated_sender
+        .iter()
+        .any(|re| re.is_match(from_addr))
 }
 
 /// Ops/monitoring alert language present in subject or body?

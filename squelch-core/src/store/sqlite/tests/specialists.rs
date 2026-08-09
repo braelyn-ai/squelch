@@ -40,7 +40,12 @@ fn banking_apply_writes_row_stamps_marker_and_auto_resolves() {
     assert_eq!(status, "done", "banking statement auto-resolves");
     assert!(resolved_at.is_some(), "resolved_at stamped");
     assert_eq!(marker.as_deref(), Some("claude-haiku-4-5"));
-    assert!(store.extract_queue(acct, &["banking_statement"], 10).unwrap().is_empty());
+    assert!(
+        store
+            .extract_queue(acct, &["banking_statement"], 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -53,7 +58,10 @@ fn invoice_row_is_not_auto_resolved_and_stays_standing() {
         .ingest(&store);
 
     assert!(
-        store.extract_queue(acct, &["banking_statement", "transaction_alert"], 10).unwrap().is_empty(),
+        store
+            .extract_queue(acct, &["banking_statement", "transaction_alert"], 10)
+            .unwrap()
+            .is_empty(),
         "invoice is never in the extract queue"
     );
     let (status, resolved_at, _) = triage_extract_status(&store, id);
@@ -89,10 +97,15 @@ fn receipt_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
     let fresh = store
         .attention_updates(acct, since, None, None, Some(SitrepBand::New))
         .unwrap();
-    assert!(fresh.is_empty(), "auto-done receipt must not be in the New band");
+    assert!(
+        fresh.is_empty(),
+        "auto-done receipt must not be in the New band"
+    );
 
     // 4. Bands counts agree: new == 0, standing == 0.
-    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    let stats = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(stats.bands.new, 0, "receipt excluded from new count");
     assert_eq!(stats.bands.standing, 0);
 }
@@ -103,7 +116,10 @@ fn receipt_with_no_amount_still_lists() {
     receipt_triaged(acct, "g-r2", "t-r2", None).ingest(&store);
     let receipts = store.list_receipts(acct, 30).unwrap();
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].amount, None, "a receipt with no total is still a receipt");
+    assert_eq!(
+        receipts[0].amount, None,
+        "a receipt with no total is still a receipt"
+    );
 }
 
 #[test]
@@ -112,7 +128,10 @@ fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
     let since = Utc::now() - chrono::Duration::days(30);
 
     let id = calendar_triaged(
-        acct, "g-cal1", crate::triage::CalendarKind::Invite, Utc::now(),
+        acct,
+        "g-cal1",
+        crate::triage::CalendarKind::Invite,
+        Utc::now(),
     )
     .ingest(&store);
 
@@ -145,8 +164,13 @@ fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
     let fresh = store
         .attention_updates(acct, since, None, None, Some(SitrepBand::New))
         .unwrap();
-    assert!(fresh.is_empty(), "auto-done calendar update must not be in New");
-    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    assert!(
+        fresh.is_empty(),
+        "auto-done calendar update must not be in New"
+    );
+    let stats = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(stats.bands.new, 0);
     assert_eq!(stats.bands.standing, 0);
 }
@@ -158,12 +182,16 @@ fn calendar_list_windows_on_received_at_hours() {
     let now = Utc::now();
 
     calendar_triaged(
-        acct, "g-cal-new", crate::triage::CalendarKind::Update,
+        acct,
+        "g-cal-new",
+        crate::triage::CalendarKind::Update,
         now - chrono::Duration::hours(2),
     )
     .ingest(&store);
     calendar_triaged(
-        acct, "g-cal-old", crate::triage::CalendarKind::Cancellation,
+        acct,
+        "g-cal-old",
+        crate::triage::CalendarKind::Cancellation,
         now - chrono::Duration::hours(30),
     )
     .ingest(&store);
@@ -182,7 +210,12 @@ fn calendar_list_windows_on_received_at_hours() {
 #[test]
 fn calendar_upsert_is_idempotent_per_message() {
     let (store, acct) = store();
-    let t = calendar_triaged(acct, "g-cal-i", crate::triage::CalendarKind::Invite, Utc::now());
+    let t = calendar_triaged(
+        acct,
+        "g-cal-i",
+        crate::triage::CalendarKind::Invite,
+        Utc::now(),
+    );
     let id1 = t.ingest(&store);
     let id2 = t.ingest(&store);
     assert_eq!(id1, id2);
@@ -200,15 +233,25 @@ fn receipt_matching_merchant_and_amount_closes_open_bill() {
 
     // An open PG&E bill for $84.20, received 10 days ago.
     let bill_id = bill_triaged(
-        acct, "g-bill1", "billing@pge.com", Some("PG&E"), Some(84.20),
-        now - chrono::Duration::days(10), now + chrono::Duration::days(5),
+        acct,
+        "g-bill1",
+        "billing@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now - chrono::Duration::days(10),
+        now + chrono::Duration::days(5),
     )
     .ingest(&store);
 
     // The payment receipt: different mailbox + subdomain, name spelled
     // "PGE", same amount.
     receipt_from(
-        acct, "g-pay1", "receipts@billing.pge.com", Some("PGE"), Some(84.20), now,
+        acct,
+        "g-pay1",
+        "receipts@billing.pge.com",
+        Some("PGE"),
+        Some(84.20),
+        now,
     )
     .ingest(&store);
 
@@ -217,13 +260,23 @@ fn receipt_matching_merchant_and_amount_closes_open_bill() {
     let (status, resolved_at) = triage_status(&store, acct, bill_id);
     assert_eq!(status, "done", "matched bill auto-closes");
     assert!(resolved_at.is_some(), "done stamps resolved_at");
-    assert_eq!(store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap().bands.standing, 0);
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        0
+    );
 
     // The WHY is on the audit trail, targeting the bill's message id.
     let audits = auto_close_audits(&store, acct);
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].actor, "ingest");
-    assert_eq!(audits[0].target.as_deref(), Some(bill_id.to_string().as_str()));
+    assert_eq!(
+        audits[0].target.as_deref(),
+        Some(bill_id.to_string().as_str())
+    );
 }
 
 #[test]
@@ -232,13 +285,23 @@ fn receipt_amount_mismatch_does_not_close_bill() {
     let now = Utc::now();
 
     let bill_id = bill_triaged(
-        acct, "g-bill2", "billing@pge.com", Some("PG&E"), Some(84.20),
-        now - chrono::Duration::days(10), now + chrono::Duration::days(5),
+        acct,
+        "g-bill2",
+        "billing@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now - chrono::Duration::days(10),
+        now + chrono::Duration::days(5),
     )
     .ingest(&store);
     // Same merchant, WRONG amount (a small partial charge, not the bill).
     receipt_from(
-        acct, "g-pay2", "receipts@pge.com", Some("PG&E"), Some(12.00), now,
+        acct,
+        "g-pay2",
+        "receipts@pge.com",
+        Some("PG&E"),
+        Some(12.00),
+        now,
     )
     .ingest(&store);
 
@@ -256,8 +319,13 @@ fn receipt_without_amount_never_closes_an_amounted_bill() {
     let now = Utc::now();
 
     let bill_id = bill_triaged(
-        acct, "g-bill3", "billing@pge.com", Some("PG&E"), Some(84.20),
-        now - chrono::Duration::days(3), now + chrono::Duration::days(12),
+        acct,
+        "g-bill3",
+        "billing@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now - chrono::Duration::days(3),
+        now + chrono::Duration::days(12),
     )
     .ingest(&store);
     receipt_from(acct, "g-pay3", "receipts@pge.com", Some("PG&E"), None, now).ingest(&store);
@@ -275,12 +343,22 @@ fn merchant_name_normalization_matches_across_domains() {
     let now = Utc::now();
 
     let bill_id = bill_triaged(
-        acct, "g-bill4", "billing@pacificgas.com", Some("PG&E"), Some(84.20),
-        now - chrono::Duration::days(7), now + chrono::Duration::days(7),
+        acct,
+        "g-bill4",
+        "billing@pacificgas.com",
+        Some("PG&E"),
+        Some(84.20),
+        now - chrono::Duration::days(7),
+        now + chrono::Duration::days(7),
     )
     .ingest(&store);
     receipt_from(
-        acct, "g-pay4", "no-reply@pge.com", Some("pge"), Some(84.20), now,
+        acct,
+        "g-pay4",
+        "no-reply@pge.com",
+        Some("pge"),
+        Some(84.20),
+        now,
     )
     .ingest(&store);
 
@@ -294,17 +372,29 @@ fn already_done_bill_is_not_touched() {
     let now = Utc::now();
 
     let bill_id = bill_triaged(
-        acct, "g-bill5", "billing@pge.com", Some("PG&E"), Some(84.20),
-        now - chrono::Duration::days(10), now + chrono::Duration::days(5),
+        acct,
+        "g-bill5",
+        "billing@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now - chrono::Duration::days(10),
+        now + chrono::Duration::days(5),
     )
     .ingest(&store);
     // The user already dismissed it.
-    assert!(store
-        .set_attention_status(acct, bill_id, AttentionStatus::Done)
-        .unwrap());
+    assert!(
+        store
+            .set_attention_status(acct, bill_id, AttentionStatus::Done)
+            .unwrap()
+    );
 
     receipt_from(
-        acct, "g-pay5", "receipts@pge.com", Some("PG&E"), Some(84.20), now,
+        acct,
+        "g-pay5",
+        "receipts@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now,
     )
     .ingest(&store);
 
@@ -323,12 +413,22 @@ fn receipt_with_no_matching_bill_does_nothing() {
 
     // An open Comcast bill; the receipt is from an unrelated merchant.
     let bill_id = bill_triaged(
-        acct, "g-bill6", "billing@comcast.com", Some("Comcast"), Some(89.99),
-        now - chrono::Duration::days(5), now + chrono::Duration::days(10),
+        acct,
+        "g-bill6",
+        "billing@comcast.com",
+        Some("Comcast"),
+        Some(89.99),
+        now - chrono::Duration::days(5),
+        now + chrono::Duration::days(10),
     )
     .ingest(&store);
     let receipt_id = receipt_from(
-        acct, "g-pay6", "no-reply@baywheels.com", Some("Bay Wheels"), Some(3.49), now,
+        acct,
+        "g-pay6",
+        "no-reply@baywheels.com",
+        Some("Bay Wheels"),
+        Some(3.49),
+        now,
     )
     .ingest(&store);
 
@@ -349,12 +449,22 @@ fn amountless_bill_closes_on_merchant_match_within_tight_window() {
     let now = Utc::now();
 
     let bill_id = bill_triaged(
-        acct, "g-bill7", "billing@pge.com", Some("PG&E"), None,
-        now - chrono::Duration::days(10), now + chrono::Duration::days(5),
+        acct,
+        "g-bill7",
+        "billing@pge.com",
+        Some("PG&E"),
+        None,
+        now - chrono::Duration::days(10),
+        now + chrono::Duration::days(5),
     )
     .ingest(&store);
     receipt_from(
-        acct, "g-pay7", "receipts@pge.com", Some("PG&E"), Some(84.20), now,
+        acct,
+        "g-pay7",
+        "receipts@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now,
     )
     .ingest(&store);
 
@@ -372,12 +482,22 @@ fn stale_bill_outside_recency_window_is_not_closed() {
     let now = Utc::now();
 
     let bill_id = bill_triaged(
-        acct, "g-bill8", "billing@pge.com", Some("PG&E"), Some(84.20),
-        now - chrono::Duration::days(90), now - chrono::Duration::days(75),
+        acct,
+        "g-bill8",
+        "billing@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now - chrono::Duration::days(90),
+        now - chrono::Duration::days(75),
     )
     .ingest(&store);
     receipt_from(
-        acct, "g-pay8", "receipts@pge.com", Some("PG&E"), Some(84.20), now,
+        acct,
+        "g-pay8",
+        "receipts@pge.com",
+        Some("PG&E"),
+        Some(84.20),
+        now,
     )
     .ingest(&store);
 
@@ -394,17 +514,32 @@ fn one_receipt_closes_only_the_earliest_due_of_identical_bills() {
     let now = Utc::now();
 
     let june = bill_triaged(
-        acct, "g-bill-jun", "billing@streamco.com", Some("StreamCo"), Some(15.49),
-        now - chrono::Duration::days(40), now - chrono::Duration::days(25),
+        acct,
+        "g-bill-jun",
+        "billing@streamco.com",
+        Some("StreamCo"),
+        Some(15.49),
+        now - chrono::Duration::days(40),
+        now - chrono::Duration::days(25),
     )
     .ingest(&store);
     let july = bill_triaged(
-        acct, "g-bill-jul", "billing@streamco.com", Some("StreamCo"), Some(15.49),
-        now - chrono::Duration::days(10), now + chrono::Duration::days(5),
+        acct,
+        "g-bill-jul",
+        "billing@streamco.com",
+        Some("StreamCo"),
+        Some(15.49),
+        now - chrono::Duration::days(10),
+        now + chrono::Duration::days(5),
     )
     .ingest(&store);
     receipt_from(
-        acct, "g-pay-jun", "receipts@streamco.com", Some("StreamCo"), Some(15.49), now,
+        acct,
+        "g-pay-jun",
+        "receipts@streamco.com",
+        Some("StreamCo"),
+        Some(15.49),
+        now,
     )
     .ingest(&store);
 
@@ -419,7 +554,9 @@ fn one_receipt_closes_only_the_earliest_due_of_identical_bills() {
 fn shipment_upsert_dedupes_and_state_machine_no_regress() {
     use crate::triage::{ShipmentInfo, ShipmentStatus};
     let (store, acct) = store();
-    let mid = store.upsert_message(&triaged(acct, "g1", "t1").msg()).unwrap();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
 
     let ship = |status, item: &str| ShipmentInfo {
         carrier: "ups".into(),

@@ -14,8 +14,15 @@ fn unsub_violation_bumps_only_after_grace_and_resets_on_rerequest() {
         .unwrap();
 
     // Within the 72h grace => no violation.
-    inbound_triaged(acct, "g1", "t1", "news@x.com", t0 + chrono::Duration::hours(1), false)
-        .ingest(&store);
+    inbound_triaged(
+        acct,
+        "g1",
+        "t1",
+        "news@x.com",
+        t0 + chrono::Duration::hours(1),
+        false,
+    )
+    .ingest(&store);
     assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 0);
 
     // Past the grace => first violation, last_violation_at stamped.
@@ -26,8 +33,15 @@ fn unsub_violation_bumps_only_after_grace_and_resets_on_rerequest() {
     assert_eq!(rec.last_violation_at, Some(v1_at));
 
     // Another past-grace message => second violation.
-    inbound_triaged(acct, "g3", "t3", "news@x.com", t0 + chrono::Duration::hours(100), false)
-        .ingest(&store);
+    inbound_triaged(
+        acct,
+        "g3",
+        "t3",
+        "news@x.com",
+        t0 + chrono::Duration::hours(100),
+        false,
+    )
+    .ingest(&store);
     assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 2);
 
     // A FRESH request resets the ledger (clock restarts).
@@ -52,19 +66,44 @@ fn unsub_violation_ignores_resolved_and_sent_and_is_case_insensitive() {
         .unwrap();
 
     // A SENT message past the grace never counts as a violation.
-    inbound_triaged(acct, "gs", "ts", "news@x.com", t0 + chrono::Duration::hours(80), true)
-        .ingest(&store);
+    inbound_triaged(
+        acct,
+        "gs",
+        "ts",
+        "news@x.com",
+        t0 + chrono::Duration::hours(80),
+        true,
+    )
+    .ingest(&store);
     assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 0);
 
     // Mixed-case sender still matches the lowercased ledger key.
-    inbound_triaged(acct, "g1", "t1", "News@X.com", t0 + chrono::Duration::hours(80), false)
-        .ingest(&store);
+    inbound_triaged(
+        acct,
+        "g1",
+        "t1",
+        "News@X.com",
+        t0 + chrono::Duration::hours(80),
+        false,
+    )
+    .ingest(&store);
     assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 1);
 
     // Once resolved, the detector is disarmed.
-    assert!(store.set_unsubscribe_resolution(acct, "news@x.com", "blocked").unwrap());
-    inbound_triaged(acct, "g2", "t2", "news@x.com", t0 + chrono::Duration::hours(100), false)
-        .ingest(&store);
+    assert!(
+        store
+            .set_unsubscribe_resolution(acct, "news@x.com", "blocked")
+            .unwrap()
+    );
+    inbound_triaged(
+        acct,
+        "g2",
+        "t2",
+        "news@x.com",
+        t0 + chrono::Duration::hours(100),
+        false,
+    )
+    .ingest(&store);
     assert_eq!(store.list_unsubscribes(acct).unwrap()[0].violation_count, 1);
 }
 
@@ -78,7 +117,10 @@ fn message_unsub_fields_reads_stored_headers_and_hides_sealed() {
         .list_unsubscribe("<https://sub.com/u/1>", true)
         .importance(10)
         .seed(&store);
-    let f = store.message_unsub_fields(acct, nid).unwrap().expect("present");
+    let f = store
+        .message_unsub_fields(acct, nid)
+        .unwrap()
+        .expect("present");
     assert_eq!(f.from_addr, "News@Sub.com");
     assert_eq!(f.list_unsubscribe.as_deref(), Some("<https://sub.com/u/1>"));
     assert!(f.list_unsub_one_click);
@@ -99,7 +141,12 @@ fn message_unsub_fields_reads_stored_headers_and_hides_sealed() {
 fn sender_rules_round_trip() {
     let (store, acct) = store();
     let id = store
-        .set_sender_rule(acct, "*@newsletter.com", "no marketing", Disposition::Squelch)
+        .set_sender_rule(
+            acct,
+            "*@newsletter.com",
+            "no marketing",
+            Disposition::Squelch,
+        )
         .unwrap();
     assert!(id > 0);
     let rules = store.list_sender_rules(acct).unwrap();
@@ -126,9 +173,11 @@ fn update_sender_rule_edits_by_id_and_404s_unknown() {
     assert_eq!(rules[0].disposition, Disposition::Surface);
 
     // Unknown id => false (handler turns this into 404).
-    assert!(!store
-        .update_sender_rule(acct, 9999, "*@x.com", "", Disposition::Squelch)
-        .unwrap());
+    assert!(
+        !store
+            .update_sender_rule(acct, 9999, "*@x.com", "", Disposition::Squelch)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -217,7 +266,10 @@ fn filtered_rules_reject_an_empty_want_text_on_every_write_path() {
         let e = store
             .set_sender_rule_audited(acct, "*@vendor.com", want, Disposition::Filtered, &audit)
             .unwrap_err();
-        assert!(matches!(e, CoreError::InvalidInput(_)), "set_audited: {want:?}");
+        assert!(
+            matches!(e, CoreError::InvalidInput(_)),
+            "set_audited: {want:?}"
+        );
     }
     // Nothing landed — no rule, and (fail-closed) no orphan audit row either.
     assert!(store.list_sender_rules(acct).unwrap().is_empty());
@@ -231,13 +283,25 @@ fn filtered_rules_reject_an_empty_want_text_on_every_write_path() {
     let e = store
         .update_sender_rule(acct, id, "*@vendor.com", " ", Disposition::Filtered)
         .unwrap_err();
-    assert!(matches!(e, CoreError::InvalidInput(_)), "update path validates too");
-    assert_eq!(store.list_sender_rules(acct).unwrap()[0].disposition, Disposition::Squelch);
+    assert!(
+        matches!(e, CoreError::InvalidInput(_)),
+        "update path validates too"
+    );
+    assert_eq!(
+        store.list_sender_rules(acct).unwrap()[0].disposition,
+        Disposition::Squelch
+    );
 
     // With a real want_text, Filtered writes fine on both mutating paths.
     assert!(
         store
-            .update_sender_rule(acct, id, "*@vendor.com", "only invoices", Disposition::Filtered)
+            .update_sender_rule(
+                acct,
+                id,
+                "*@vendor.com",
+                "only invoices",
+                Disposition::Filtered
+            )
             .unwrap()
     );
     store

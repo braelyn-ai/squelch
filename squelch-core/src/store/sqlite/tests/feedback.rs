@@ -13,7 +13,14 @@ fn correcting_triage_applies_records_and_survives_retriage() {
 
     // The pipeline called it noise; the human says it is a deadline.
     let fb = store
-        .correct_triage(acct, id, TriageAxis::Tier, "deadline", Some("this is a bill"), t0)
+        .correct_triage(
+            acct,
+            id,
+            TriageAxis::Tier,
+            "deadline",
+            Some("this is a bill"),
+            t0,
+        )
         .unwrap()
         .expect("message exists");
     assert_eq!(fb.dimension, "tier");
@@ -101,7 +108,10 @@ fn sealing_by_hand_retracts_the_notification_event() {
         })
         .unwrap()
         .unwrap();
-    let keep = store.append_event(&new_event(acct, other)).unwrap().unwrap();
+    let keep = store
+        .append_event(&new_event(acct, other))
+        .unwrap()
+        .unwrap();
     let before = store.event_by_id(acct, sealed_ev).unwrap().unwrap();
     assert!(!before.sender.is_empty() && !before.one_line.is_empty());
     assert!(before.deadline.is_some());
@@ -144,10 +154,17 @@ fn sealing_by_hand_retracts_the_notification_event() {
     // The next append gets a FRESH id rather than the sealed row's — which is
     // the whole reason this is an UPDATE.
     let third = inbound_triaged(acct, "g3", "t3", "bob@x.com", t0, false).ingest(&store);
-    let next = store.append_event(&new_event(acct, third)).unwrap().unwrap();
+    let next = store
+        .append_event(&new_event(acct, third))
+        .unwrap()
+        .unwrap();
     assert!(next > keep, "ids must keep moving forward, got {next}");
 
-    assert_eq!(store.sealed_messages(acct).unwrap().len(), 1, "it WAS sealed");
+    assert_eq!(
+        store.sealed_messages(acct).unwrap().len(),
+        1,
+        "it WAS sealed"
+    );
 }
 
 #[test]
@@ -183,7 +200,14 @@ fn sealing_by_hand_discards_the_reply_draft() {
     let t0 = Utc::now();
     let id = inbound_triaged(acct, "g1", "t1", "noreply@bank.com", t0, false).ingest(&store);
     let reply = store
-        .upsert_draft(acct, Some(id), "noreply@bank.com", "Re: code", "was this you?", t0)
+        .upsert_draft(
+            acct,
+            Some(id),
+            "noreply@bank.com",
+            "Re: code",
+            "was this you?",
+            t0,
+        )
         .unwrap();
     store
         .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t0)
@@ -198,7 +222,10 @@ fn sealing_by_hand_discards_the_reply_draft() {
     // DELETED, not merely filtered: the row is gone from the table.
     let left = store.list_drafts(acct).unwrap();
     assert_eq!(left.len(), 1);
-    assert!(left[0].reply_to_message_id.is_none(), "the new-message draft stands");
+    assert!(
+        left[0].reply_to_message_id.is_none(),
+        "the new-message draft stands"
+    );
     let n: i64 = store
         .lock()
         .unwrap()
@@ -215,8 +242,10 @@ fn sealing_by_hand_discards_the_reply_draft() {
 fn correcting_an_unknown_message_is_none_not_an_error() {
     let (store, acct) = store();
     let t0 = Utc::now();
-    assert!(store
-        .correct_triage(acct, 9999, TriageAxis::Category, "invoice", None, t0)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .correct_triage(acct, 9999, TriageAxis::Category, "invoice", None, t0)
+            .unwrap()
+            .is_none()
+    );
 }

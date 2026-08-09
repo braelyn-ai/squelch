@@ -246,8 +246,7 @@ fn split_title_clause(rest: &str) -> (String, Option<&str>) {
     for (i, _) in rest.match_indices('@') {
         // A separator "@" stands alone: at the start or after whitespace, and
         // followed by whitespace (never an email's "user@host").
-        let standalone = (i == 0
-            || rest[..i].ends_with(|c: char| c.is_whitespace()))
+        let standalone = (i == 0 || rest[..i].ends_with(|c: char| c.is_whitespace()))
             && rest[i + 1..].starts_with(|c: char| c.is_whitespace());
         if !standalone {
             continue;
@@ -280,8 +279,18 @@ fn parse_starts_at(clause: &str, received_at: DateTime<Utc>) -> Option<DateTime<
     let d = detector();
     let cap = d.month_day.captures(clause)?;
     let month = match cap.get(1)?.as_str().to_lowercase().as_str() {
-        "jan" => 1, "feb" => 2, "mar" => 3, "apr" => 4, "may" => 5, "jun" => 6,
-        "jul" => 7, "aug" => 8, "sep" => 9, "oct" => 10, "nov" => 11, "dec" => 12,
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
         _ => return None,
     };
     let day: u32 = cap.get(2)?.as_str().parse().ok()?;
@@ -302,8 +311,12 @@ fn parse_starts_at(clause: &str, received_at: DateTime<Utc>) -> Option<DateTime<
             let mut h: u32 = t.get(1)?.as_str().parse().ok()?;
             let m: u32 = t.get(2).map_or(0, |mm| mm.as_str().parse().unwrap_or(0));
             let pm = t.get(3)?.as_str().eq_ignore_ascii_case("pm");
-            if h == 12 { h = 0; }
-            if pm { h += 12; }
+            if h == 12 {
+                h = 0;
+            }
+            if pm {
+                h += 12;
+            }
             (h, m)
         }
         None => (0, 0), // date-only clause: midnight
@@ -345,7 +358,9 @@ pub fn detect_calendar(
         }
         (rule.kind, title, clause, None)
     } else if let Some(cap) = d.rsvp_template.captures(subject) {
-        let title = cap.name("title").map_or(String::new(), |m| m.as_str().trim().to_string());
+        let title = cap
+            .name("title")
+            .map_or(String::new(), |m| m.as_str().trim().to_string());
         let clause = cap.name("dates").map(|m| m.as_str());
         let who = cap
             .name("who")
@@ -485,7 +500,10 @@ mod tests {
         .expect("rsvp response");
         assert_eq!(c.kind, CalendarKind::Response);
         assert_eq!(c.event_title.as_deref(), Some("Budget review"));
-        assert_eq!(c.organizer, None, "RSVP sender is the attendee, not organizer");
+        assert_eq!(
+            c.organizer, None,
+            "RSVP sender is the attendee, not organizer"
+        );
     }
 
     #[test]
@@ -544,7 +562,11 @@ mod tests {
         .expect("relayed RSVP");
         assert_eq!(c.kind, CalendarKind::Response);
         assert_eq!(c.event_title.as_deref(), Some("Indiana trip"));
-        assert_eq!(c.starts_at, Some(ts(2026, 8, 5, 0, 0)), "range start, en dash");
+        assert_eq!(
+            c.starts_at,
+            Some(ts(2026, 8, 5, 0, 0)),
+            "range start, en dash"
+        );
         assert_eq!(c.organizer.as_deref(), Some("Ellie Huxtable"));
     }
 
@@ -560,7 +582,11 @@ mod tests {
         .expect("declined variant");
         assert_eq!(c.kind, CalendarKind::Response);
         assert_eq!(c.event_title.as_deref(), Some("Q3 offsite"));
-        assert_eq!(c.starts_at, Some(ts(2026, 9, 14, 0, 0)), "hyphen range start");
+        assert_eq!(
+            c.starts_at,
+            Some(ts(2026, 9, 14, 0, 0)),
+            "hyphen range start"
+        );
         assert_eq!(c.organizer.as_deref(), Some("Sam Chen"));
     }
 
@@ -670,16 +696,20 @@ mod tests {
     #[test]
     fn noon_and_midnight_clock_edges_parse() {
         let c = detect_calendar(
-            "s@g.com", None,
+            "s@g.com",
+            None,
             "Invitation: Lunch @ Wed Jul 22, 2026 12pm - 1pm",
-            "", at(2026, 7, 20),
+            "",
+            at(2026, 7, 20),
         )
         .expect("invite");
         assert_eq!(c.starts_at, Some(ts(2026, 7, 22, 12, 0)), "12pm is noon");
         let c = detect_calendar(
-            "s@g.com", None,
+            "s@g.com",
+            None,
             "Invitation: Midnight run @ Wed Jul 22, 2026 12am",
-            "", at(2026, 7, 20),
+            "",
+            at(2026, 7, 20),
         )
         .expect("invite");
         assert_eq!(c.starts_at, Some(ts(2026, 7, 22, 0, 0)), "12am is midnight");
@@ -688,9 +718,11 @@ mod tests {
     #[test]
     fn empty_title_after_stripping_is_none() {
         let c = detect_calendar(
-            "s@g.com", None,
+            "s@g.com",
+            None,
             "Invitation: @ Wed Jul 22, 2026 10am",
-            "", at(2026, 7, 20),
+            "",
+            at(2026, 7, 20),
         )
         .expect("still a calendar update");
         assert_eq!(c.event_title, None);
@@ -810,7 +842,10 @@ mod tests {
             "Check our calendar of sales events. Add to calendar! Unsubscribe.",
             at(2026, 7, 20),
         );
-        assert!(c.is_none(), "topical calendar mention must not match: {c:?}");
+        assert!(
+            c.is_none(),
+            "topical calendar mention must not match: {c:?}"
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! The Stage-1 / Stage-2 / extract queues, their applies, the LLM usage
 //! ledger and the per-account cap settings.
 
-use super::*;
 use super::messages::rewrite_deadline_conn;
+use super::*;
 
 // ---- LLM usage ledger helpers (shared by the stage-1 and stage-2 categories) --
 
@@ -23,7 +23,13 @@ fn bump_usage_category(
              calls = calls + 1,
              input_tokens = input_tokens + excluded.input_tokens,
              output_tokens = output_tokens + excluded.output_tokens",
-        params![account_id, day, category, input_tokens as i64, output_tokens as i64],
+        params![
+            account_id,
+            day,
+            category,
+            input_tokens as i64,
+            output_tokens as i64
+        ],
     )?;
     Ok(())
 }
@@ -41,7 +47,13 @@ fn usage_since_category(
          FROM stage2_usage
          WHERE account_id = ?1 AND day >= ?2 AND category = ?3",
         params![account_id, since_day, category],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     )?;
     Ok(Stage2Usage {
         calls: row.0.max(0) as u64,
@@ -206,7 +218,11 @@ impl SqliteStore {
 
     // ---- STAGE-2 ----------------------------------------------------------
 
-    pub(super) fn stage1_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage1Queued>> {
+    pub(super) fn stage1_queue(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<Stage1Queued>> {
         let conn = self.lock()?;
         // Rows still needing Stage-1: heuristic seed values in place
         // (stage1_model_used IS NULL), non-sealed, non-sent. Rule-decided rows
@@ -326,10 +342,21 @@ impl SqliteStore {
         output_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
-        bump_usage_category(&conn, account_id, day, "stage1", input_tokens, output_tokens)
+        bump_usage_category(
+            &conn,
+            account_id,
+            day,
+            "stage1",
+            input_tokens,
+            output_tokens,
+        )
     }
 
-    pub(super) fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
+    pub(super) fn stage1_usage_since(
+        &self,
+        account_id: AccountId,
+        since_day: &str,
+    ) -> Result<Stage2Usage> {
         let conn = self.lock()?;
         usage_since_category(&conn, account_id, since_day, "stage1")
     }
@@ -343,10 +370,21 @@ impl SqliteStore {
         output_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
-        bump_usage_category(&conn, account_id, day, category, input_tokens, output_tokens)
+        bump_usage_category(
+            &conn,
+            account_id,
+            day,
+            category,
+            input_tokens,
+            output_tokens,
+        )
     }
 
-    pub(super) fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
+    pub(super) fn list_usage_stage1(
+        &self,
+        account_id: AccountId,
+        days: u32,
+    ) -> Result<Vec<Stage2UsageDay>> {
         let conn = self.lock()?;
         list_usage_category(&conn, account_id, days, "stage1")
     }
@@ -380,7 +418,11 @@ impl SqliteStore {
             .collect()
     }
 
-    pub(super) fn stage2_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage2Queued>> {
+    pub(super) fn stage2_queue(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<Stage2Queued>> {
         let conn = self.lock()?;
         // Queue predicate: Stage-1 finished the row, flagged it for escalation,
         // and Stage-2 has not processed it. Sealed rows are structurally
@@ -542,10 +584,21 @@ impl SqliteStore {
         output_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
-        bump_usage_category(&conn, account_id, day, "stage2", input_tokens, output_tokens)
+        bump_usage_category(
+            &conn,
+            account_id,
+            day,
+            "stage2",
+            input_tokens,
+            output_tokens,
+        )
     }
 
-    pub(super) fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage> {
+    pub(super) fn stage2_usage_today(
+        &self,
+        account_id: AccountId,
+        day: &str,
+    ) -> Result<Stage2Usage> {
         let conn = self.lock()?;
         let row = conn
             .query_row(
@@ -570,17 +623,29 @@ impl SqliteStore {
             .unwrap_or_default())
     }
 
-    pub(super) fn list_usage(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
+    pub(super) fn list_usage(
+        &self,
+        account_id: AccountId,
+        days: u32,
+    ) -> Result<Vec<Stage2UsageDay>> {
         let conn = self.lock()?;
         list_usage_category(&conn, account_id, days, "stage2")
     }
 
-    pub(super) fn stage2_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
+    pub(super) fn stage2_usage_since(
+        &self,
+        account_id: AccountId,
+        since_day: &str,
+    ) -> Result<Stage2Usage> {
         let conn = self.lock()?;
         usage_since_category(&conn, account_id, since_day, "stage2")
     }
 
-    pub(super) fn get_app_setting(&self, account_id: AccountId, key: &str) -> Result<Option<String>> {
+    pub(super) fn get_app_setting(
+        &self,
+        account_id: AccountId,
+        key: &str,
+    ) -> Result<Option<String>> {
         let conn = self.lock()?;
         let v: Option<String> = conn
             .query_row(
@@ -592,7 +657,12 @@ impl SqliteStore {
         Ok(v)
     }
 
-    pub(super) fn set_app_setting(&self, account_id: AccountId, key: &str, value: &str) -> Result<()> {
+    pub(super) fn set_app_setting(
+        &self,
+        account_id: AccountId,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO app_settings(account_id, key, value)
@@ -613,10 +683,9 @@ impl SqliteStore {
         // A stored value only counts if it parses as an integer in the valid
         // range; anything else is treated as absent (fall back to config/default).
         let valid = |s: String| -> Option<u32> {
-            s.trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (crate::config::STAGE2_CAP_MIN..=crate::config::STAGE2_CAP_MAX).contains(n))
+            s.trim().parse::<u32>().ok().filter(|n| {
+                (crate::config::STAGE2_CAP_MIN..=crate::config::STAGE2_CAP_MAX).contains(n)
+            })
         };
         let mut out = Stage2CapOverrides::default();
         let rows = stmt.query_map(
@@ -650,7 +719,11 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub(super) fn count_inbound_since(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<u64> {
+    pub(super) fn count_inbound_since(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+    ) -> Result<u64> {
         let conn = self.lock()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM messages

@@ -308,17 +308,22 @@ fn extract_item_name_from_body(body: &str) -> String {
 /// phrase, collapse whitespace, and cap length.
 fn clean_item_phrase(s: &str) -> String {
     static TRACK: OnceLock<Regex> = OnceLock::new();
-    let track = TRACK.get_or_init(|| rx(r"\b1Z[0-9A-Z]{16}\b|\bTBA\d{9,}\b|\b\d{10,}\b|https?://\S+"));
+    let track =
+        TRACK.get_or_init(|| rx(r"\b1Z[0-9A-Z]{16}\b|\bTBA\d{9,}\b|\b\d{10,}\b|https?://\S+"));
     let mut out = track.replace_all(s, " ").to_string();
     for (_, re) in &detector().carrier_names {
         out = re.replace_all(&out, " ").to_string();
     }
     let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = joined.trim_matches(|c: char| {
-        c == ',' || c == '.' || c == '-' || c == ':' || c.is_whitespace()
-    });
+    let trimmed = joined
+        .trim_matches(|c: char| c == ',' || c == '.' || c == '-' || c == ':' || c.is_whitespace());
     // Cap length (defensive against a runaway capture).
-    trimmed.chars().take(60).collect::<String>().trim().to_string()
+    trimmed
+        .chars()
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Is `s` a generic placeholder ("Package", "Your order", …) rather than a real
@@ -489,11 +494,12 @@ mod tests {
         .expect("usps shipment");
         assert_eq!(s.carrier, "usps");
         assert_eq!(s.tracking_number, "9400111899223817428490");
-        assert!(s
-            .tracking_url
-            .as_deref()
-            .unwrap()
-            .contains("tools.usps.com"));
+        assert!(
+            s.tracking_url
+                .as_deref()
+                .unwrap()
+                .contains("tools.usps.com")
+        );
     }
 
     #[test]
@@ -532,7 +538,10 @@ mod tests {
         .expect("amazon shipment");
         assert_eq!(s.carrier, "amazon");
         assert_eq!(s.tracking_number, "TBA303392911000");
-        assert!(s.tracking_url.is_none(), "amazon has no public tracking url");
+        assert!(
+            s.tracking_url.is_none(),
+            "amazon has no public tracking url"
+        );
     }
 
     // ---- carrier disambiguation ------------------------------------------
@@ -724,18 +733,23 @@ mod tests {
 
     #[test]
     fn return_label_and_rma_are_excluded() {
-        assert!(detect_shipment(
-            "returns@shop.com",
-            "Your return label is ready",
-            "Print your return label and drop off the package. Tracking 1Z999AA10123456784.",
-        )
-        .is_none(), "a return label is outbound-from-user, not a tracked delivery");
-        assert!(detect_shipment(
-            "support@shop.com",
-            "RMA 4471 approved",
-            "Your RMA has been approved; ship the item back to us.",
-        )
-        .is_none());
+        assert!(
+            detect_shipment(
+                "returns@shop.com",
+                "Your return label is ready",
+                "Print your return label and drop off the package. Tracking 1Z999AA10123456784.",
+            )
+            .is_none(),
+            "a return label is outbound-from-user, not a tracked delivery"
+        );
+        assert!(
+            detect_shipment(
+                "support@shop.com",
+                "RMA 4471 approved",
+                "Your RMA has been approved; ship the item back to us.",
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -745,7 +759,10 @@ mod tests {
         let body = "We have received your return. Your package was delivered on July 1. Tracking 1Z999AA10123456784.";
         let hay = format!("x@y.com\n{subject}\n{body}");
         assert!(is_return_or_outbound(&hay));
-        assert!(has_inbound_delivery_signal(&hay), "inbound language is present");
+        assert!(
+            has_inbound_delivery_signal(&hay),
+            "inbound language is present"
+        );
         assert!(
             detect_shipment("x@y.com", subject, body).is_none(),
             "return exclusion must win over the inbound-delivery language"
@@ -763,7 +780,10 @@ mod tests {
             "Your package update",
             "Reference 1234567890 for your package.",
         );
-        assert!(s.is_none(), "bare digit-run, no carrier signal => no shipment: {s:?}");
+        assert!(
+            s.is_none(),
+            "bare digit-run, no carrier signal => no shipment: {s:?}"
+        );
     }
 
     #[test]
@@ -807,7 +827,10 @@ mod tests {
             "Your package has shipped. Tracking 1Z999AA10123456784.",
         )
         .expect("ups shipment");
-        assert_eq!(s.item_name, "", "no real phrase => empty, desktop fills the fallback");
+        assert_eq!(
+            s.item_name, "",
+            "no real phrase => empty, desktop fills the fallback"
+        );
     }
 
     #[test]

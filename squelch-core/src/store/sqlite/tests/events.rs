@@ -10,18 +10,30 @@ fn append_event_is_once_per_message_ever() {
     let (store, acct) = store();
 
     let first = store.append_event(&new_event(acct, 1)).unwrap();
-    assert_eq!(first, Some(1), "first append inserts and returns the new id");
+    assert_eq!(
+        first,
+        Some(1),
+        "first append inserts and returns the new id"
+    );
 
     // A SECOND append for the same message — a re-ingest, or a Stage-2 verdict
     // landing on a row that already notified at ingest — is a silent no-op.
     let mut again = new_event(acct, 1);
     again.kind = EventKind::Urgent;
     again.one_line = "a louder verdict".into();
-    assert_eq!(store.append_event(&again).unwrap(), None, "dedup on message_id");
+    assert_eq!(
+        store.append_event(&again).unwrap(),
+        None,
+        "dedup on message_id"
+    );
 
     let all = store.events_after(acct, 0, 100).unwrap();
     assert_eq!(all.len(), 1, "still exactly one row");
-    assert_eq!(all[0].kind, EventKind::Surfaced, "the FIRST verdict is the one kept");
+    assert_eq!(
+        all[0].kind,
+        EventKind::Surfaced,
+        "the FIRST verdict is the one kept"
+    );
     assert_eq!(all[0].one_line, "line 1");
 }
 
@@ -40,19 +52,33 @@ fn events_after_pages_in_id_order_and_scopes_by_account() {
     // From the zero cursor: everything, oldest first.
     let all = store.events_after(acct, 0, 100).unwrap();
     assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), ids);
-    assert_eq!(all.iter().map(|e| e.message_id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        all.iter().map(|e| e.message_id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
 
     // Limit truncates from the FRONT (the oldest unseen), so a client that
     // pages never skips a row.
     let page = store.events_after(acct, 0, 2).unwrap();
-    assert_eq!(page.iter().map(|e| e.id).collect::<Vec<_>>(), ids[..2].to_vec());
+    assert_eq!(
+        page.iter().map(|e| e.id).collect::<Vec<_>>(),
+        ids[..2].to_vec()
+    );
 
     // Resuming from a cursor is exclusive of the cursor itself.
     let rest = store.events_after(acct, ids[2], 100).unwrap();
-    assert_eq!(rest.iter().map(|e| e.id).collect::<Vec<_>>(), ids[3..].to_vec());
+    assert_eq!(
+        rest.iter().map(|e| e.id).collect::<Vec<_>>(),
+        ids[3..].to_vec()
+    );
 
     // Caught up.
-    assert!(store.events_after(acct, *ids.last().unwrap(), 100).unwrap().is_empty());
+    assert!(
+        store
+            .events_after(acct, *ids.last().unwrap(), 100)
+            .unwrap()
+            .is_empty()
+    );
     // Account scoping.
     assert_eq!(store.events_after(other, 0, 100).unwrap().len(), 1);
 }
@@ -93,7 +119,11 @@ fn latest_event_id_is_zero_until_something_happens() {
     let (store, acct) = store();
     let other = store.ensure_account("other@example.com").unwrap();
 
-    assert_eq!(store.latest_event_id(acct).unwrap(), 0, "empty => the 0 cursor");
+    assert_eq!(
+        store.latest_event_id(acct).unwrap(),
+        0,
+        "empty => the 0 cursor"
+    );
 
     let a = store.append_event(&new_event(acct, 1)).unwrap().unwrap();
     let b = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
@@ -118,7 +148,11 @@ fn append_event_pokes_the_attached_notifier_only_on_a_real_insert() {
     assert!(store.attach_event_notifier(tx).unwrap().is_none());
 
     let id = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
-    assert_eq!(rx.try_recv().unwrap(), id, "the new id is broadcast on insert");
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        id,
+        "the new id is broadcast on insert"
+    );
 
     // A deduped append broadcasts nothing — no phantom wake for a no-op.
     assert_eq!(store.append_event(&new_event(acct, 2)).unwrap(), None);
@@ -225,5 +259,9 @@ fn delete_device_by_token_is_scoped_and_idempotent() {
     // A second delete is a no-op, not an error.
     assert!(!store.delete_device_by_token(acct, TOK_A).unwrap());
     // An unknown token likewise.
-    assert!(!store.delete_device_by_token(acct, "ffff0000ffff0000").unwrap());
+    assert!(
+        !store
+            .delete_device_by_token(acct, "ffff0000ffff0000")
+            .unwrap()
+    );
 }

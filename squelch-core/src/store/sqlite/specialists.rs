@@ -171,10 +171,7 @@ pub(super) fn upsert_receipt_conn(
 /// transaction; a re-run overwrites in place.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
-fn upsert_banking_conn(
-    conn: &Connection,
-    applied: &BankingApplied,
-) -> Result<i64> {
+fn upsert_banking_conn(conn: &Connection, applied: &BankingApplied) -> Result<i64> {
     conn.execute(
         "INSERT INTO banking(account_id, message_id, kind, institution, amount,
              currency, account_hint, received_at)
@@ -293,12 +290,8 @@ pub(super) fn auto_close_bill_for_receipt_conn(
             continue;
         }
         // Merchant identity is mandatory.
-        if !receipt_match::merchant_matches(
-            from_addr,
-            from_name,
-            &bill_addr,
-            bill_name.as_deref(),
-        ) {
+        if !receipt_match::merchant_matches(from_addr, from_name, &bill_addr, bill_name.as_deref())
+        {
             continue;
         }
         // Amount rule picks the recency window (or refuses outright).
@@ -314,7 +307,10 @@ pub(super) fn auto_close_bill_for_receipt_conn(
         }
 
         let due_at = parse_dt(&due_s)?;
-        if best.as_ref().is_none_or(|(_, best_due, _)| due_at < *best_due) {
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_due, _)| due_at < *best_due)
+        {
             best = Some((bill_id, due_at, bill_amount));
         }
     }

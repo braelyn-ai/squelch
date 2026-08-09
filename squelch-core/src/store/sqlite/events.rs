@@ -119,7 +119,12 @@ impl SqliteStore {
         Ok(id)
     }
 
-    pub(super) fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device> {
+    pub(super) fn upsert_device(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        platform: &str,
+    ) -> Result<Device> {
         let conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
         // UPSERT on UNIQUE(token); `created_at` is deliberately NOT touched on
@@ -167,7 +172,11 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub(super) fn delete_device_by_token(&self, account_id: AccountId, token: &str) -> Result<bool> {
+    pub(super) fn delete_device_by_token(
+        &self,
+        account_id: AccountId,
+        token: &str,
+    ) -> Result<bool> {
         let conn = self.lock()?;
         let n = conn.execute(
             "DELETE FROM devices WHERE account_id = ?1 AND token = ?2",

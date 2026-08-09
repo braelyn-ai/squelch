@@ -463,7 +463,9 @@ fn sealed_body_reveal_audit_and_stats() {
     assert_eq!(audit[0].action, "reveal_sealed");
 
     // stats: 1 signal (t2), 1 sealed.
-    let stats = store.stats(acct, Utc::now() - chrono::Duration::days(30)).unwrap();
+    let stats = store
+        .stats(acct, Utc::now() - chrono::Duration::days(30))
+        .unwrap();
     assert_eq!(stats.total, 1);
     assert_eq!(stats.tier_counts.get("signal").copied(), Some(1));
     assert_eq!(stats.sealed, 1);
@@ -535,11 +537,15 @@ fn a_received_sighting_pins_is_sent_to_zero_across_re_upserts() {
 
     // Inbound first, mislabeled SENT copy second: the flip must not take.
     let id = triaged(acct, "g-flip", "t-flip").upsert(&store);
-    triaged(acct, "g-flip", "t-flip").is_sent(true).upsert(&store);
+    triaged(acct, "g-flip", "t-flip")
+        .is_sent(true)
+        .upsert(&store);
     assert_eq!(is_sent_of(id), 0, "a received row never flips to sent");
 
     // Sent first (the api echo path), inbox copy second: visibility is gained.
-    let id2 = triaged(acct, "g-gain", "t-gain").is_sent(true).upsert(&store);
+    let id2 = triaged(acct, "g-gain", "t-gain")
+        .is_sent(true)
+        .upsert(&store);
     triaged(acct, "g-gain", "t-gain").upsert(&store);
     assert_eq!(is_sent_of(id2), 0, "an inbox sighting always wins");
 

@@ -608,7 +608,9 @@ impl Default for Stage2CapSources {
 /// env var is set (non-empty); otherwise it fell through to the built-in default.
 fn cap_source(stage2_tbl: Option<&toml::Table>, key: &str, env_var: &str) -> CapSource {
     let in_toml = stage2_tbl.map(|t| t.contains_key(key)).unwrap_or(false);
-    let in_env = std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false);
+    let in_env = std::env::var(env_var)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     if in_toml || in_env {
         CapSource::Config
     } else {
@@ -899,11 +901,7 @@ impl Config {
         }
         std::env::var_os("HOME")
             .map(PathBuf::from)
-            .map(|h| {
-                h.join(".config")
-                    .join("squelch")
-                    .join("credentials.json")
-            })
+            .map(|h| h.join(".config").join("squelch").join("credentials.json"))
             .unwrap_or_else(|| PathBuf::from("credentials.json"))
     }
 
@@ -985,7 +983,9 @@ pub fn mirror_env_pairs_to_config(
     if let Some(v) = get2(ENV_DB_PATH, ENV_DB_PATH_LEGACY) {
         mapped.push(("db_path", toml::Value::String(v)));
     }
-    if let Some(b) = get("SQUELCH_CRED_BACKEND").and_then(|v| CredentialBackend::from_str_lenient(&v)) {
+    if let Some(b) =
+        get("SQUELCH_CRED_BACKEND").and_then(|v| CredentialBackend::from_str_lenient(&v))
+    {
         let s = match b {
             CredentialBackend::Keyring => "keyring",
             CredentialBackend::File => "file",
@@ -1101,7 +1101,10 @@ mod tests {
         assert!(!text.contains("ts.net"));
 
         let c = Config::from_path(&path).unwrap();
-        assert_eq!(c.client_id.as_deref(), Some("abc.apps.googleusercontent.com"));
+        assert_eq!(
+            c.client_id.as_deref(),
+            Some("abc.apps.googleusercontent.com")
+        );
         assert_eq!(c.client_secret.as_deref(), Some("sekret"));
         assert_eq!(c.account_email.as_deref(), Some("you@gmail.com"));
         assert_eq!(c.db_path, PathBuf::from("/tmp/squelch.db"));
@@ -1145,10 +1148,7 @@ mod tests {
         let pairs = vec![("SQUELCH_ACCOUNT_EMAIL".to_string(), "x@y.com".to_string())];
         assert!(mirror_env_pairs_to_config(&pairs, &path).is_err());
         // The broken file is left exactly as it was.
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "this is [not toml"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "this is [not toml");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1257,7 +1257,10 @@ backfill_days = 90
         let mut c = Config::default();
         c.tracking.base_url = Some("https://from-file.example".to_string());
         c.apply_env_overrides();
-        assert_eq!(c.tracking.base_url.as_deref(), Some("https://track.example.com"));
+        assert_eq!(
+            c.tracking.base_url.as_deref(),
+            Some("https://track.example.com")
+        );
 
         unsafe {
             std::env::remove_var("SQUELCH_TRACK_URL");
@@ -1705,7 +1708,10 @@ backfill_days = 90
         let mut c: Config = toml::from_str("[pusher]\nrelay_url = \"http://from-file\"\n").unwrap();
         assert_eq!(c.pusher.relay_url.as_deref(), Some("http://from-file"));
         c.apply_env_overrides();
-        assert_eq!(c.pusher.relay_url.as_deref(), Some("https://relay.example.com"));
+        assert_eq!(
+            c.pusher.relay_url.as_deref(),
+            Some("https://relay.example.com")
+        );
         assert_eq!(c.pusher.relay_token.as_deref(), Some("s3cret"));
         assert_eq!(c.pusher.topic.as_deref(), Some("dev.squelch.ios"));
         assert_eq!(c.pusher.environment.as_deref(), Some("sandbox"));

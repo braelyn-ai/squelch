@@ -168,7 +168,10 @@ fn has_inbound_money_phrasing(text: &str) -> bool {
 /// confirmation)? The money ALREADY moved, so the message is a RECORD, not a
 /// deadline: [`detect_bill`] suppresses unless an obligation signal also fires.
 fn has_past_transaction_phrasing(text: &str) -> bool {
-    detector().past_transaction.iter().any(|re| re.is_match(text))
+    detector()
+        .past_transaction
+        .iter()
+        .any(|re| re.is_match(text))
 }
 
 /// Genuine payment-OBLIGATION phrasing: the user owes money. Breaks the tie when
@@ -226,7 +229,12 @@ fn parse_date_fragment(frag: &str, received_at: DateTime<Utc>) -> Option<NaiveDa
 
     // Month-name formats WITH an explicit year: take them verbatim.
     const WITH_YEAR: &[&str] = &[
-        "%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%d %B %Y",
+        "%d %b %Y",
     ];
     for fmt in WITH_YEAR {
         if let Ok(d) = NaiveDate::parse_from_str(cleaned, fmt) {
@@ -253,11 +261,7 @@ fn parse_date_fragment(frag: &str, received_at: DateTime<Utc>) -> Option<NaiveDa
 /// `received_at`: the same-year date, rolled forward one year when it lands MORE
 /// THAN 14 DAYS BEFORE receipt (a year-less deadline is forward-looking, but a
 /// just-missed bill must still read as past-due by days). Never wall-clock now.
-fn resolve_yearless_date(
-    month: u32,
-    day: u32,
-    received_at: DateTime<Utc>,
-) -> Option<NaiveDate> {
+fn resolve_yearless_date(month: u32, day: u32, received_at: DateTime<Utc>) -> Option<NaiveDate> {
     let recv = received_at.date_naive();
     let same_year = NaiveDate::from_ymd_opt(recv.year(), month, day)?;
     if (recv - same_year).num_days() > 14 {
@@ -287,10 +291,7 @@ fn date_is_sane(due: DateTime<Utc>, received_at: DateTime<Utc>) -> bool {
 /// TODO(v0): relative dates ("due Friday", "due next week") are not parsed.
 /// Absolute dates dominate real bills; add relative parsing (anchored to
 /// `received_at`) in a later pass if recall analysis shows it matters.
-fn extract_due_at(
-    text: &str,
-    received_at: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+fn extract_due_at(text: &str, received_at: DateTime<Utc>) -> Option<(DateTime<Utc>, &'static str)> {
     let d = detector();
 
     if d.due_on_receipt.is_match(text) {
@@ -339,11 +340,7 @@ fn extract_amount(text: &str) -> Option<(f64, String)> {
 /// `now` is the message's `received_at`: it anchors year-less dates, the
 /// due-date sanity bounds, and the past-due math, all deterministically (never
 /// wall-clock now, so a backfilled message resolves the same way every run).
-pub fn detect_bill(
-    subject: &str,
-    body: &str,
-    now: DateTime<Utc>,
-) -> Option<DeadlineHit> {
+pub fn detect_bill(subject: &str, body: &str, now: DateTime<Utc>) -> Option<DeadlineHit> {
     let d = detector();
     let hay = format!("{subject}\n{body}");
 
@@ -598,18 +595,22 @@ mod tests {
 
     #[test]
     fn reimbursement_and_cashback_are_not_bills() {
-        assert!(detect_bill(
-            "Reimbursement processed",
-            "Your reimbursement of $40 will be deposited by August 1.",
-            now()
-        )
-        .is_none());
-        assert!(detect_bill(
-            "Cash back reward",
-            "You will receive $15 cash back on your next statement.",
-            now()
-        )
-        .is_none());
+        assert!(
+            detect_bill(
+                "Reimbursement processed",
+                "Your reimbursement of $40 will be deposited by August 1.",
+                now()
+            )
+            .is_none()
+        );
+        assert!(
+            detect_bill(
+                "Cash back reward",
+                "You will receive $15 cash back on your next statement.",
+                now()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -691,7 +692,10 @@ mod tests {
             "Your order has been delivered. Order confirmation #114-555. Total $27.30.",
             now(),
         );
-        assert!(hit.is_none(), "delivered order update must not be a bill: {hit:?}");
+        assert!(
+            hit.is_none(),
+            "delivered order update must not be a bill: {hit:?}"
+        );
     }
 
     #[test]
@@ -702,7 +706,10 @@ mod tests {
             "Thank you for your payment of $120.00. Your autopay was processed on July 1, 2026.",
             now(),
         );
-        assert!(hit.is_none(), "payment thank-you must not be a bill: {hit:?}");
+        assert!(
+            hit.is_none(),
+            "payment thank-you must not be a bill: {hit:?}"
+        );
     }
 
     // ---- extraction-level sanity guard on absurd dates --------------------
@@ -711,7 +718,10 @@ mod tests {
     fn absurd_past_year_is_dropped_no_deadline() {
         // A due date resolved to an absurd year (>365 days before receipt) is a
         // parser bug: no deadline emitted.
-        assert_eq!(extract_due_at("payment due date: January 5, 2020", now()), None);
+        assert_eq!(
+            extract_due_at("payment due date: January 5, 2020", now()),
+            None
+        );
     }
 
     #[test]

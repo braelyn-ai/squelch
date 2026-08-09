@@ -207,7 +207,10 @@ mod tests {
         let cases = [
             ("Password reset requested", "Click to reset your password"),
             ("", "You asked to reset your password"),
-            ("Change your password", "someone requested a password change"),
+            (
+                "Change your password",
+                "someone requested a password change",
+            ),
             ("Forgot your password?", "here is how to recover"),
         ];
         for (s, b) in cases {

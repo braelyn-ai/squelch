@@ -206,8 +206,8 @@ fn start_with_auth(
     seed(&store, acct);
 
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let pusher =
-        Pusher::for_test(store.clone() as Arc<dyn Store>, acct, base_url).with_relay_auth(relay_token);
+    let pusher = Pusher::for_test(store.clone() as Arc<dyn Store>, acct, base_url)
+        .with_relay_auth(relay_token);
     let handle = tokio::spawn(pusher.run(events.subscribe(), shutdown_rx));
     Harness {
         store,

@@ -228,7 +228,11 @@ mod tests {
             "Widget $9.99. Gadget $8.50. Order total: $12.00. Thanks for your purchase.",
         )
         .expect("receipt");
-        assert_eq!(r.amount, Some(12.00), "total-adjacent wins over the largest line");
+        assert_eq!(
+            r.amount,
+            Some(12.00),
+            "total-adjacent wins over the largest line"
+        );
     }
 
     #[test]

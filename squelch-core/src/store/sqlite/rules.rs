@@ -202,12 +202,14 @@ impl SqliteStore {
                 },
             )
             .optional()?;
-        Ok(row.map(|(from_addr, list_unsubscribe, one_click, body_html)| MessageUnsub {
-            from_addr,
-            list_unsubscribe,
-            list_unsub_one_click: one_click != 0,
-            body_html,
-        }))
+        Ok(row.map(
+            |(from_addr, list_unsubscribe, one_click, body_html)| MessageUnsub {
+                from_addr,
+                list_unsubscribe,
+                list_unsub_one_click: one_click != 0,
+                body_html,
+            },
+        ))
     }
 
     pub(super) fn upsert_unsubscribe(
@@ -240,7 +242,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(super) fn list_unsubscribes(&self, account_id: AccountId) -> Result<Vec<UnsubscribeRecord>> {
+    pub(super) fn list_unsubscribes(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<UnsubscribeRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT sender_addr, requested_at, method, violation_count,

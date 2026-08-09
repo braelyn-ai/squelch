@@ -16,13 +16,27 @@ fn t(minutes: i64) -> DateTime<Utc> {
 fn upsert_draft_edits_the_same_reply_key_in_place() {
     let (store, acct) = store();
     let first = store
-        .upsert_draft(acct, Some(7), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .upsert_draft(
+            acct,
+            Some(7),
+            "alice@example.com",
+            "Re: Lunch",
+            "sure",
+            t(0),
+        )
         .unwrap();
     assert_eq!(first.created_at, t(0));
     assert_eq!(first.updated_at, t(0));
 
     let second = store
-        .upsert_draft(acct, Some(7), "alice@example.com", "Re: Lunch", "sure, 1pm", t(5))
+        .upsert_draft(
+            acct,
+            Some(7),
+            "alice@example.com",
+            "Re: Lunch",
+            "sure, 1pm",
+            t(5),
+        )
         .unwrap();
     // Same composition: same id and created_at, only the body and clock move.
     assert_eq!(second.id, first.id);
@@ -39,7 +53,14 @@ fn upsert_draft_edits_the_same_reply_key_in_place() {
 fn reply_and_new_message_drafts_coexist_and_each_upsert_in_place() {
     let (store, acct) = store();
     let reply = store
-        .upsert_draft(acct, Some(7), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .upsert_draft(
+            acct,
+            Some(7),
+            "alice@example.com",
+            "Re: Lunch",
+            "sure",
+            t(0),
+        )
         .unwrap();
     let fresh = store
         .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t(1))
@@ -85,7 +106,14 @@ fn delete_draft_is_account_scoped_and_reports_a_miss() {
     let (store, acct) = store();
     let other = store.ensure_account("other@example.com").unwrap();
     let mine = store
-        .upsert_draft(acct, Some(7), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .upsert_draft(
+            acct,
+            Some(7),
+            "alice@example.com",
+            "Re: Lunch",
+            "sure",
+            t(0),
+        )
         .unwrap();
 
     // Unknown id => false (the handler turns this into 404).
@@ -151,7 +179,14 @@ fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
     let (store, acct) = store();
     let parent = triaged(acct, "g1", "t1").seed(&store);
     store
-        .upsert_draft(acct, Some(parent), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .upsert_draft(
+            acct,
+            Some(parent),
+            "alice@example.com",
+            "Re: Lunch",
+            "sure",
+            t(0),
+        )
         .unwrap();
     store
         .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t(1))
@@ -183,7 +218,14 @@ fn reingest_that_seals_the_parent_deletes_its_draft() {
     let normal = triaged(acct, "g1", "t1");
     let parent = normal.ingest(&store);
     store
-        .upsert_draft(acct, Some(parent), "alice@example.com", "Re: Lunch", "sure", t(0))
+        .upsert_draft(
+            acct,
+            Some(parent),
+            "alice@example.com",
+            "Re: Lunch",
+            "sure",
+            t(0),
+        )
         .unwrap();
 
     let again = normal.clone().sealed(SealedKind::Otp).ingest(&store);

@@ -60,9 +60,20 @@ pub fn sanitize_email_html(html: &str) -> String {
     // `width` only on <img>/<hr> — stripping it leaves every section table
     // auto-sized and the design falls apart. These are pure layout values, no URL
     // or script surface; `background` (a URL fetch) stays banned.
-    for tag in ["table", "thead", "tbody", "tfoot", "tr", "td", "th", "col", "colgroup"] {
+    for tag in [
+        "table", "thead", "tbody", "tfoot", "tr", "td", "th", "col", "colgroup",
+    ] {
         let attrs = tag_attributes.entry(tag).or_default();
-        for a in ["width", "height", "align", "valign", "bgcolor", "cellpadding", "cellspacing", "border"] {
+        for a in [
+            "width",
+            "height",
+            "align",
+            "valign",
+            "bgcolor",
+            "cellpadding",
+            "cellspacing",
+            "border",
+        ] {
             attrs.insert(a);
         }
     }
@@ -149,7 +160,10 @@ mod tests {
         let out = sanitize_email_html(input);
         assert!(out.contains("<table"));
         assert!(out.contains("<td"));
-        assert!(out.contains("style=\"color:red\""), "inline style must survive: {out}");
+        assert!(
+            out.contains("style=\"color:red\""),
+            "inline style must survive: {out}"
+        );
         assert!(out.contains("<strong"));
         assert!(out.contains("https://example.com"));
         assert!(out.contains("https://cdn.example.com/logo.png"));
@@ -167,14 +181,23 @@ mod tests {
              <tr><td width=\"300\" valign=\"top\" align=\"left\" height=\"40\">cell</td></tr></table>",
         );
         for kept in [
-            "width=\"600\"", "align=\"center\"", "bgcolor=\"#F1F2F4\"", "border=\"0\"",
-            "cellpadding=\"0\"", "cellspacing=\"0\"", "width=\"300\"", "valign=\"top\"",
+            "width=\"600\"",
+            "align=\"center\"",
+            "bgcolor=\"#F1F2F4\"",
+            "border=\"0\"",
+            "cellpadding=\"0\"",
+            "cellspacing=\"0\"",
+            "width=\"300\"",
+            "valign=\"top\"",
             "height=\"40\"",
         ] {
             assert!(out.contains(kept), "must survive: {kept} in {out}");
         }
         // `background` is a resource fetch, not layout — still stripped.
-        assert!(!out.contains("background="), "background attr must die: {out}");
+        assert!(
+            !out.contains("background="),
+            "background attr must die: {out}"
+        );
     }
 
     #[test]
@@ -186,10 +209,22 @@ mod tests {
              <div class=\"wrap\" id=\"outer\"><a href=\"https://x\">link</a></div>",
         );
         assert!(out.contains("<style>"), "style block must survive: {out}");
-        assert!(out.contains(".wrap > a { color: #ffffff; }"), "css must be verbatim: {out}");
-        assert!(out.contains("font-family: \"SF Pro\""), "quotes must not be escaped: {out}");
-        assert!(out.contains("class=\"wrap\""), "class must survive for selectors: {out}");
-        assert!(out.contains("id=\"outer\""), "id must survive for selectors: {out}");
+        assert!(
+            out.contains(".wrap > a { color: #ffffff; }"),
+            "css must be verbatim: {out}"
+        );
+        assert!(
+            out.contains("font-family: \"SF Pro\""),
+            "quotes must not be escaped: {out}"
+        );
+        assert!(
+            out.contains("class=\"wrap\""),
+            "class must survive for selectors: {out}"
+        );
+        assert!(
+            out.contains("id=\"outer\""),
+            "id must survive for selectors: {out}"
+        );
     }
 
     #[test]

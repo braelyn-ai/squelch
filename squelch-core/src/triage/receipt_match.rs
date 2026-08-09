@@ -39,14 +39,24 @@ const FREEMAIL_DOMAINS: &[&str] = &[
 /// Two-label PUBLIC (registry) suffixes, not registrable domains: `bar.co.uk`
 /// and `baz.co.uk` must NOT match on "co.uk". Pragmatic list, not the full PSL.
 const PUBLIC_TWO_LABEL_SUFFIXES: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp",
-    "com.br", "co.in",
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp", "com.br",
+    "co.in",
 ];
 
 /// Trailing corporate-suffix tokens dropped during name normalization, so
 /// "Comcast Inc." and "Comcast" are one merchant. Only TRAILING tokens go.
 const CORP_SUFFIX_TOKENS: &[&str] = &[
-    "inc", "llc", "llp", "ltd", "co", "corp", "corporation", "company", "gmbh", "sa", "plc",
+    "inc",
+    "llc",
+    "llp",
+    "ltd",
+    "co",
+    "corp",
+    "corporation",
+    "company",
+    "gmbh",
+    "sa",
+    "plc",
 ];
 
 /// Normalize a merchant DISPLAY NAME to a comparison key: lowercase, split on
@@ -72,7 +82,11 @@ pub fn normalize_merchant(name: &str) -> String {
 /// labels, or three when the last two are a known public suffix. `None` when
 /// there is no `@` or too few labels to compare.
 fn registrable_domain(addr: &str) -> Option<String> {
-    let domain = addr.rsplit('@').next().filter(|d| *d != addr)?.to_lowercase();
+    let domain = addr
+        .rsplit('@')
+        .next()
+        .filter(|d| *d != addr)?
+        .to_lowercase();
     let labels: Vec<&str> = domain.split('.').filter(|l| !l.is_empty()).collect();
     if labels.len() < 2 {
         return None;
@@ -103,8 +117,10 @@ pub fn merchant_matches(
     bill_name: Option<&str>,
 ) -> bool {
     // 1. Domain identity.
-    if let (Some(rd), Some(bd)) = (registrable_domain(receipt_addr), registrable_domain(bill_addr))
-        && rd == bd
+    if let (Some(rd), Some(bd)) = (
+        registrable_domain(receipt_addr),
+        registrable_domain(bill_addr),
+    ) && rd == bd
     {
         if FREEMAIL_DOMAINS.contains(&rd.as_str()) {
             if receipt_addr.eq_ignore_ascii_case(bill_addr) {
@@ -170,7 +186,10 @@ mod tests {
 
     #[test]
     fn registrable_domain_strips_subdomains() {
-        assert_eq!(registrable_domain("billing@pge.com").as_deref(), Some("pge.com"));
+        assert_eq!(
+            registrable_domain("billing@pge.com").as_deref(),
+            Some("pge.com")
+        );
         assert_eq!(
             registrable_domain("receipts@mail.billing.pge.com").as_deref(),
             Some("pge.com")

@@ -243,26 +243,32 @@ pub(crate) fn clamp_record_tier(
     deadline: Option<crate::triage::DeadlineHit>,
     tier_reason: String,
     stage_label: &str,
-) -> (crate::types::Tier, Option<crate::triage::DeadlineHit>, String) {
+) -> (
+    crate::types::Tier,
+    Option<crate::triage::DeadlineHit>,
+    String,
+) {
     use crate::types::Tier;
     if exception {
         return if matches!(tier, Tier::Noise | Tier::Signal) {
             (
                 Tier::Deadline,
                 deadline,
-                format!("{stage_label}: exception (routine {category} reporting a real problem) -> deadline band"),
+                format!(
+                    "{stage_label}: exception (routine {category} reporting a real problem) -> deadline band"
+                ),
             )
         } else {
             (tier, deadline, tier_reason)
         };
     }
-    if RECORD_CATEGORIES.contains(&category)
-        && matches!(tier, Tier::PastDue | Tier::Deadline)
-    {
+    if RECORD_CATEGORIES.contains(&category) && matches!(tier, Tier::PastDue | Tier::Deadline) {
         (
             Tier::Noise,
             None,
-            format!("{stage_label}: {category} is a record; lives in Banking, never the attention bands"),
+            format!(
+                "{stage_label}: {category} is a record; lives in Banking, never the attention bands"
+            ),
         )
     } else {
         (tier, deadline, tier_reason)
@@ -364,7 +370,11 @@ pub fn apply_result(
     let floored = queued.is_known_contact
         && !RECORD_CATEGORIES.contains(&category.as_str())
         && importance < known_contact_floor;
-    let importance = if floored { known_contact_floor } else { importance };
+    let importance = if floored {
+        known_contact_floor
+    } else {
+        importance
+    };
     // No matched-rule context here, so deadline trust rests on known-contact alone.
     let deadline_trusted = queued.is_known_contact;
 
@@ -398,8 +408,14 @@ pub fn apply_result(
         }
     };
 
-    let (tier, deadline, tier_reason) =
-        clamp_record_tier(&category, out.exception, tier, deadline, tier_reason, "stage-1");
+    let (tier, deadline, tier_reason) = clamp_record_tier(
+        &category,
+        out.exception,
+        tier,
+        deadline,
+        tier_reason,
+        "stage-1",
+    );
 
     Stage1Applied {
         message_id: queued.message_id,
@@ -466,13 +482,27 @@ mod tests {
         let s = output_schema();
         let req = s["required"].as_array().unwrap();
         assert_eq!(req.len(), 12);
-        for k in ["tier", "confident", "importance", "one_line", "category", "exception"] {
+        for k in [
+            "tier",
+            "confident",
+            "importance",
+            "one_line",
+            "category",
+            "exception",
+        ] {
             assert!(req.iter().any(|v| v == k), "missing required {k}");
         }
         // The category property is a closed enum of exactly the six routes.
         let en = s["properties"]["category"]["enum"].as_array().unwrap();
         assert_eq!(en.len(), CATEGORIES.len());
-        for c in ["general", "marketing", "invoice", "autopay_bill", "banking_statement", "transaction_alert"] {
+        for c in [
+            "general",
+            "marketing",
+            "invoice",
+            "autopay_bill",
+            "banking_statement",
+            "transaction_alert",
+        ] {
             assert!(en.iter().any(|v| v == c), "missing category enum {c}");
         }
     }
@@ -519,14 +549,24 @@ mod tests {
         assert_eq!(a.importance, 70);
         assert_eq!(a.tier, Tier::Signal);
         assert!(
-            a.field_reasons.importance.as_deref().unwrap().contains("known-contact floor"),
+            a.field_reasons
+                .importance
+                .as_deref()
+                .unwrap()
+                .contains("known-contact floor"),
             "floor must be visible in field_reasons"
         );
 
         // Above the floor the model's score stands untouched.
         let b = apply_result(&queued(true), &out(84, true), "m", 70, now());
         assert_eq!(b.importance, 84);
-        assert!(!b.field_reasons.importance.as_deref().unwrap().contains("floor"));
+        assert!(
+            !b.field_reasons
+                .importance
+                .as_deref()
+                .unwrap()
+                .contains("floor")
+        );
 
         // Unknown senders are the model's call alone.
         let c = apply_result(&queued(false), &out(55, true), "m", 70, now());
@@ -558,7 +598,11 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
         let a = apply_result(&queued(false), &o, "m", 70, now());
-        assert_eq!(a.tier, Tier::Deadline, "unknown-sender past-due caps at Deadline");
+        assert_eq!(
+            a.tier,
+            Tier::Deadline,
+            "unknown-sender past-due caps at Deadline"
+        );
         assert!(!a.deadline.unwrap().past_due);
         let tier = a.field_reasons.tier.as_deref().unwrap();
         assert!(tier.starts_with("stage-1:"), "stage-1 label: {tier}");
@@ -627,7 +671,11 @@ mod tests {
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past
         let a = apply_result(&queued(false), &o, "m", 70, now());
-        assert_eq!(a.tier, Tier::Deadline, "untrusted past date caps at Deadline");
+        assert_eq!(
+            a.tier,
+            Tier::Deadline,
+            "untrusted past date caps at Deadline"
+        );
     }
 
     #[test]
@@ -647,13 +695,23 @@ mod tests {
         let mut o = out(60, true);
         o.one_line = "y".repeat(500);
         let a = apply_result(&queued(true), &o, "m", 70, now());
-        assert_eq!(a.one_line.chars().count(), 160, "one_line capped to 160 chars");
+        assert_eq!(
+            a.one_line.chars().count(),
+            160,
+            "one_line capped to 160 chars"
+        );
     }
 
     #[test]
     fn field_reasons_use_stage1_label() {
         let a = apply_result(&queued(true), &out(80, true), "claude-haiku-4-5", 70, now());
-        assert!(a.field_reasons.importance.as_deref().unwrap().starts_with("stage-1"));
+        assert!(
+            a.field_reasons
+                .importance
+                .as_deref()
+                .unwrap()
+                .starts_with("stage-1")
+        );
         assert_eq!(a.stage1_model_used, "claude-haiku-4-5");
     }
 
@@ -717,7 +775,8 @@ mod tests {
     async fn classify_400_is_permanent_failure_for_heuristic_fallback() {
         // A 400 => Failed => the sync pass keeps the heuristic seed values
         // (stamps 'heuristic-only') rather than looping.
-        let resp = r#"{"type":"error","error":{"type":"invalid_request_error","message":"secret"}}"#;
+        let resp =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"secret"}}"#;
         let url = mock_once(400, resp).await;
         let http = reqwest::Client::new();
         let cfg = Stage1Config::default();
