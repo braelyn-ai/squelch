@@ -678,6 +678,21 @@ struct SendBody: Codable, Sendable {
     /// way `subject` is: absent reads as false server-side. `true` on a daemon
     /// with no tracking base_url is NOT an error — the mail goes out untracked.
     var include_tracker: Bool?
+    /// Answer EVERYONE on the parent, not just its sender. Omitted when false,
+    /// like the two above. The daemon derives the recipient set itself at send
+    /// time — the client never enumerates it into `to`, so a stale or failed
+    /// preview cannot change who the mail actually reaches.
+    var reply_all: Bool?
+}
+
+/// GET /client/messages/{id}/reply_recipients?all=true — the addresses a reply
+/// to this message would carry, as the daemon derives them. Asked for so the
+/// review pane can state the REAL set rather than guess at it; the send derives
+/// it again server-side, so this answer is display-only and never rides back.
+/// `cc` is absent or empty when the parent has no other participants.
+struct ReplyRecipients: Codable, Sendable, Hashable {
+    var to: String
+    var cc: String?
 }
 
 // MARK: - read tracking

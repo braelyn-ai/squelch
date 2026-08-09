@@ -29,7 +29,7 @@ use std::time::Duration;
 use crate::error::ApiError;
 use crate::gmail_write::{
     GmailWriteClient, ReplyParts, SentRef, WriteError, build_references, build_reply_rfc822,
-    reply_subject,
+    cc_excluding, derive_reply_recipients, reply_subject,
 };
 use crate::guard;
 use crate::state::ApiState;
@@ -1990,6 +1990,13 @@ pub struct SendBody {
     /// Explicit recipient (overrides the reply default).
     #[serde(default)]
     to: Option<String>,
+    /// Reply to EVERYONE on the parent: `to` from its Reply-To/From, `cc` from
+    /// the rest of its To/Cc minus this account. Requires
+    /// `reply_to_message_id` — there is no audience to widen without a parent —
+    /// and absent means today's single-recipient reply, so every existing caller
+    /// is unchanged. See [`crate::gmail_write::derive_reply_recipients`].
+    #[serde(default)]
+    reply_all: bool,
     /// Explicit subject (overrides the reply-derived subject).
     #[serde(default)]
     subject: Option<String>,
@@ -2229,6 +2236,14 @@ pub async fn action_send(
         audit_action(&state, "send", target, "rejected:empty_body").await;
         return Err(ApiError::bad_request("send requires a non-empty body"));
     }
+    // Reply-all has nothing to widen without a parent to read the audience off.
+    // Checked here, with the other body validations, so it costs no Gmail call.
+    if body.reply_all && body.reply_to_message_id.is_none() {
+        audit_action(&state, "send", target, "rejected:reply_all_no_parent").await;
+        return Err(ApiError::bad_request(
+            "reply_all requires `reply_to_message_id`",
+        ));
+    }
 
     // OUTBOUND GUARD: report only REDACTED kinds, never the matched text.
     let matches = guard::scan_kinds(&body.body);
@@ -2276,11 +2291,67 @@ pub async fn action_send(
         None => (None, None),
     };
 
+    // The parent's headers come from Gmail on the WRITE token (gmail.modify
+    // grants read), never the read credential. ONE fetch: it carries both the
+    // threading ids and the address lists reply-all derives from.
+    let parent_hdrs = match &parent {
+        Some(p) => match client.parent_headers(&p.gmail_msg_id).await {
+            Ok(h) => Some(h),
+            // Threading is best-effort — an unthreaded reply still reaches the
+            // right person. REPLY-ALL IS NOT: the audience IS the request, and
+            // quietly falling back to reply-to-sender would send to fewer people
+            // than the user reviewed. Fail loudly instead.
+            Err(_) if body.reply_all => {
+                audit_action(&state, "send", target, "failed:gmail").await;
+                return Err(ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "could not read the original message's recipients; \
+                     reply-all was not sent",
+                ));
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let (in_reply_to, references) = match &parent_hdrs {
+        Some(h) => {
+            let refs = build_references(h.message_id.as_deref(), h.references.as_deref());
+            (h.message_id.clone(), refs)
+        }
+        None => (None, None),
+    };
+
+    // The reply's derived audience, bare addresses only (display names
+    // dropped). Derived for EVERY reply with readable headers, not just
+    // reply-all: a plain reply must honor the parent's Reply-To, and the
+    // preview route runs this same derivation — "what was previewed is what is
+    // sent" only holds if the send derives too.
+    let derived = match &parent_hdrs {
+        Some(h) => {
+            // Whose address to leave off the copy list. Unreadable (which the
+            // account row makes near-impossible) only costs self-exclusion: the
+            // user is copied on their own reply rather than the send failing.
+            let own = store_call(&state, |store, account_id| store.account_email(account_id))
+                .await
+                .unwrap_or_default();
+            Some(derive_reply_recipients(h, &own, body.reply_all))
+        }
+        None => None,
+    };
+
+    // PRECEDENCE: an explicit `to` wins, then the derivation, then the stored
+    // From. A derived `cc` rides along on EVERY branch — dropping it because
+    // the caller retyped the `to` would send to fewer people than they asked
+    // for — always minus whoever the chosen `to` already covers.
+    let derived_cc = derived.as_ref().map(|d| d.cc.clone()).unwrap_or_default();
     let to = match body.to.clone().filter(|s| !s.trim().is_empty()) {
         Some(t) => t,
-        None => match &parent {
-            Some(p) => p.from_addr.clone(),
-            None => {
+        None => match (&derived, &parent) {
+            // Derivation that yielded nothing addressable falls through to the
+            // stored From rather than composing a recipient-less reply.
+            (Some(d), _) if !d.to.trim().is_empty() => d.to.clone(),
+            (_, Some(p)) => p.from_addr.clone(),
+            (_, None) => {
                 audit_action(&state, "send", target, "rejected:no_recipient").await;
                 return Err(ApiError::bad_request(
                     "send requires `to` (or `reply_to_message_id` to derive it)",
@@ -2288,6 +2359,9 @@ pub async fn action_send(
             }
         },
     };
+    let cc = cc_excluding(&derived_cc, &to);
+    // For the audit line, counted before `cc` moves into the MIME parts.
+    let copied = cc.split(',').filter(|s| !s.trim().is_empty()).count();
 
     let subject = body
         .subject
@@ -2297,20 +2371,6 @@ pub async fn action_send(
             Some(p) => reply_subject(&p.subject),
             None => String::new(),
         });
-
-    // Threading headers come from Gmail on the WRITE token (gmail.modify grants
-    // read), never the read credential.
-    let (in_reply_to, references) = match &parent {
-        Some(p) => match client.parent_headers(&p.gmail_msg_id).await {
-            Ok(h) => {
-                let refs = build_references(h.message_id.as_deref(), h.references.as_deref());
-                (h.message_id, refs)
-            }
-            // Non-fatal: send without threading headers rather than fail.
-            Err(_) => (None, None),
-        },
-        None => (None, None),
-    };
 
     // Last thing before composing, so every rejection above costs no token.
     let tracker = mint_tracker(
@@ -2322,6 +2382,7 @@ pub async fn action_send(
 
     let parts = ReplyParts {
         to,
+        cc: Some(cc).filter(|s| !s.trim().is_empty()),
         subject,
         body: body.body.clone(),
         in_reply_to,
@@ -2352,7 +2413,14 @@ pub async fn action_send(
             if let Some(draft_id) = body.draft_id {
                 discard_sent_draft(&state, draft_id).await;
             }
-            audit_action(&state, "send", target.clone(), "ok").await;
+            // A reply-all is the one send that reaches N people; the ledger
+            // says so, with the recipient count, instead of a plain "ok".
+            let outcome = if body.reply_all {
+                format!("ok:reply_all:{}", copied + 1)
+            } else {
+                "ok".to_string()
+            };
+            audit_action(&state, "send", target.clone(), &outcome).await;
             // The mail is away; everything below is bookkeeping that cannot fail
             // the request.
             let echo_message_id = echo_sent(&state, &client, target, &sent).await;
@@ -2376,6 +2444,55 @@ pub async fn action_send(
             Err(write_error(&e))
         }
     }
+}
+
+// --- GET /client/messages/{id}/reply_recipients ------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ReplyRecipientsQuery {
+    /// `true` = show what reply-all would address. Absent is a plain reply.
+    #[serde(default)]
+    all: bool,
+}
+
+/// What a reply would be addressed to. `cc` is omitted when there is none, so a
+/// plain reply's answer has exactly one field.
+#[derive(Debug, Serialize)]
+struct ReplyRecipientsView {
+    to: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    cc: String,
+}
+
+/// PREVIEW, not a send: the audience the send path would compose, so the client
+/// can show the user who they are about to write to BEFORE the mail leaves.
+/// Derived by the same function the send uses, from the same one metadata fetch,
+/// so what is previewed is what is sent.
+///
+/// Sealed and unknown ids are the same 404 every message-target route returns.
+/// A missing write credential is the usual 403 and an upstream failure a 502 —
+/// both are answers the client can show, not a 500.
+pub async fn reply_recipients(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+    Query(q): Query<ReplyRecipientsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let msg = resolve_target(&state, message_id).await?;
+    let client = write_client(&state)?;
+    let own = store_call(&state, |store, account_id| store.account_email(account_id)).await?;
+    let headers = client
+        .parent_headers(&msg.gmail_msg_id)
+        .await
+        .map_err(|e| write_error(&e))?;
+    let derived = derive_reply_recipients(&headers, &own, q.all);
+    // Headers too broken to yield an address fall back to the stored From, the
+    // same recipient a plain reply would have used all along.
+    let to = if derived.to.trim().is_empty() {
+        msg.from_addr.clone()
+    } else {
+        derived.to
+    };
+    Ok(Json(ReplyRecipientsView { to, cc: derived.cc }))
 }
 
 // --- UNSUBSCRIBE: human-door-only, no agent-door exposure --------------------

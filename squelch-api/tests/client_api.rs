@@ -2124,6 +2124,462 @@ async fn a_send_that_does_not_ask_for_tracking_never_gets_a_pixel() {
     );
 }
 
+// --- reply-all: recipient preview + the Cc on the wire ----------------------
+
+/// A `format=metadata` response whose headers are a group thread: Alice wrote
+/// to the account, Bob and Carol, and Cc'd Dave. Display names carry commas and
+/// a CRLF injection attempt, because that is what the derivation has to survive.
+fn group_metadata_body() -> String {
+    serde_json::json!({
+        "id": "gmail-parent",
+        "threadId": "thread-77",
+        "payload": { "headers": [
+            { "name": "Message-ID", "value": "<parent@x>" },
+            { "name": "References", "value": "<root@x>" },
+            { "name": "From", "value": "\"Doe, Alice\" <alice@example.com>" },
+            // The account is listed in a DIFFERENT case than the accounts row,
+            // and one display name tries to smuggle a header through a CRLF.
+            { "name": "To", "value":
+                "Me <ME@Example.com>, \"evil\r\nBcc: attacker@evil.test\" <bob@example.com>" },
+            { "name": "Cc", "value": "Carol <carol@example.com>, Dave <dave@example.com>" },
+        ]}
+    })
+    .to_string()
+}
+
+/// A parent whose Reply-To routes replies somewhere other than its From — a
+/// mailing list, the common case Reply-To exists for at all.
+fn reply_to_metadata_body() -> String {
+    serde_json::json!({
+        "id": "gmail-parent",
+        "threadId": "thread-77",
+        "payload": { "headers": [
+            { "name": "Message-ID", "value": "<parent@x>" },
+            { "name": "From", "value": "Alice <alice@example.com>" },
+            { "name": "Reply-To", "value": "list@example.com" },
+            { "name": "To", "value": "me@example.com" },
+        ]}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_plain_reply_previews_and_sends_the_same_reply_to_address() {
+    // The bug this pins: the preview honored Reply-To while the send used the
+    // stored From, so a user reviewed a list address and mailed an individual.
+    // Both legs now derive, so they agree. One fetch each.
+    let (pbase, phandle) = mock_gmail_seq(vec![(200, reply_to_metadata_body())]).await;
+    let Harness { app, store, acct } = app_with_writes(pbase, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let preview = app
+        .oneshot(authed(
+            "GET",
+            &format!("/client/messages/{id}/reply_recipients"),
+        ))
+        .await
+        .unwrap();
+    let json = body_json(preview).await;
+    assert_eq!(json["to"], "list@example.com", "preview honors Reply-To");
+    phandle.await.unwrap();
+
+    let (sbase, shandle) = mock_gmail_seq(vec![
+        (200, reply_to_metadata_body()),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(sbase, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&shandle.await.unwrap()[1]);
+    assert!(
+        mime.contains("To: list@example.com\r\n"),
+        "the send honors Reply-To too: {mime}"
+    );
+}
+
+#[tokio::test]
+async fn reply_recipients_preview_answers_sender_only_by_default() {
+    let (base, handle) = mock_gmail_seq(vec![(200, group_metadata_body())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            &format!("/client/messages/{id}/reply_recipients"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["to"], "alice@example.com");
+    // No cc at all on a plain reply — the field is omitted, not empty.
+    assert!(json.get("cc").is_none(), "{json}");
+
+    let reqs = handle.await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "the preview costs exactly one metadata fetch"
+    );
+    assert!(reqs[0].starts_with("GET "));
+    assert!(reqs[0].contains("format=metadata"));
+}
+
+#[tokio::test]
+async fn reply_recipients_preview_with_all_lists_the_room_minus_the_account() {
+    let (base, handle) = mock_gmail_seq(vec![(200, group_metadata_body())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            &format!("/client/messages/{id}/reply_recipients?all=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    handle.await.unwrap();
+    assert_eq!(json["to"], "alice@example.com");
+    // Bare addresses only, the account itself dropped, To before Cc.
+    assert_eq!(
+        json["cc"],
+        "bob@example.com, carol@example.com, dave@example.com"
+    );
+    let wire = json.to_string();
+    assert!(!wire.contains("evil.test"), "{wire}");
+    assert!(!wire.contains("Doe"), "display names never survive: {wire}");
+}
+
+#[tokio::test]
+async fn reply_recipients_preview_404s_a_sealed_message() {
+    // Sealed and unknown are the same 404, and neither reaches Gmail.
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        let s = store
+            .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
+            .unwrap();
+        store
+            .set_triage(
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+    let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
+
+    for uri in [
+        format!("/client/messages/{sealed_id}/reply_recipients"),
+        format!("/client/messages/{sealed_id}/reply_recipients?all=true"),
+        "/client/messages/999999/reply_recipients".to_string(),
+    ] {
+        let resp = app.clone().oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    handle.abort();
+}
+
+#[tokio::test]
+async fn reply_recipients_preview_needs_the_bearer_and_a_write_credential() {
+    // No write credential: a 403 the client can show, not a 500.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/client/messages/{id}/reply_recipients"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // And the route is behind the bearer like everything else in the tree.
+    let req = Request::builder()
+        .uri(format!("/client/messages/{id}/reply_recipients"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reply_recipients_preview_surfaces_an_upstream_failure_as_502() {
+    let (base, handle) = mock_gmail_seq(vec![(500, "{\"error\":\"backend\"}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            &format!("/client/messages/{id}/reply_recipients"),
+        ))
+        .await
+        .unwrap();
+    handle.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn reply_all_send_addresses_the_room_off_one_metadata_fetch() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "reply_all": true,
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let reqs = handle.await.unwrap();
+    // TWO calls, not three: the headers fetch that threads the reply is the same
+    // one that derived its audience.
+    assert_eq!(reqs.len(), 2);
+    assert!(reqs[0].starts_with("GET ") && reqs[0].contains("format=metadata"));
+    let mime = sent_mime(&reqs[1]);
+    assert!(mime.contains("To: alice@example.com\r\n"), "{mime}");
+    assert!(
+        mime.contains("Cc: bob@example.com, carol@example.com, dave@example.com\r\n"),
+        "{mime}"
+    );
+    // Threading still comes off the same fetch.
+    assert!(mime.contains("In-Reply-To: <parent@x>\r\n"));
+    assert!(mime.contains("References: <root@x> <parent@x>\r\n"));
+    // Nothing the crafted display name carried reached the headers.
+    let headers = mime.split("\r\n\r\n").next().unwrap();
+    assert!(!headers.contains("Bcc"), "{headers}");
+    assert!(!headers.contains("evil.test"), "{headers}");
+    assert!(
+        !headers.to_lowercase().contains("me@example.com"),
+        "the account never copies itself: {headers}"
+    );
+
+    // The ledger records a reply-all AS one, with its recipient count (to +
+    // cc = 1 + 3), so a wide send is never filed as a plain "ok".
+    assert!(
+        store
+            .list_audit(acct, 20)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok:reply_all:4"))
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_reply_still_carries_no_cc() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    let mime = sent_mime(&reqs[1]);
+    assert!(!mime.contains("Cc:"), "{mime}");
+    // A plain reply now DERIVES too (so the preview route and the send agree),
+    // but with no Reply-To in the fixture the derived To is just the From
+    // address — same result, one recipient, no Cc.
+    assert!(mime.contains("To: alice@example.com\r\n"), "{mime}");
+}
+
+#[tokio::test]
+async fn an_explicit_to_wins_but_keeps_the_derived_copies() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "to": "bob@example.com",
+                "body": "noon works",
+                "reply_all": true,
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    assert!(mime.contains("To: bob@example.com\r\n"), "{mime}");
+    // Bob was promoted out of the Cc rather than being written twice.
+    assert!(
+        mime.contains("Cc: carol@example.com, dave@example.com\r\n"),
+        "{mime}"
+    );
+}
+
+#[tokio::test]
+async fn reply_all_without_a_parent_is_a_400() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "hello",
+                "reply_all": true,
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    handle.abort();
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert_eq!(audit[0].action, "send");
+    assert_eq!(
+        audit[0].detail.as_deref(),
+        Some("rejected:reply_all_no_parent")
+    );
+}
+
+/// Reply-all's whole point is the audience. If the headers it comes from cannot
+/// be read, quietly sending to the sender alone would deliver to fewer people
+/// than the user reviewed — so the send fails instead. (A plain reply keeps its
+/// best-effort threading: see `reply_send_survives_a_headers_failure`.)
+#[tokio::test]
+async fn reply_all_refuses_to_send_when_the_parent_headers_cannot_be_read() {
+    let (base, handle) = mock_gmail_seq(vec![(500, "{\"error\":\"backend\"}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "reply_all": true,
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // The mock was scripted for ONE request: nothing was sent.
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].starts_with("GET "));
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("failed:gmail"))
+    );
+    assert!(
+        !audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
+    );
+}
+
+/// The other half of the rule above: a PLAIN reply whose headers fetch fails
+/// still goes out, unthreaded, to the sender the store already knows.
+#[tokio::test]
+async fn reply_send_survives_a_headers_failure() {
+    let (base, handle) = mock_gmail_seq(vec![
+        (500, "{\"error\":\"backend\"}".to_string()),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    assert!(mime.contains("To: alice@example.com\r\n"), "{mime}");
+    assert!(!mime.contains("In-Reply-To:"), "{mime}");
+    assert!(!mime.contains("Cc:"), "{mime}");
+}
+
 // --- sitrep: seen-ledger + bands + resolution over HTTP ---------------------
 
 use squelch_core::types::AttentionStatus;

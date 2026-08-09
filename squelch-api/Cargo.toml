@@ -42,6 +42,11 @@ regex = { workspace = true }
 # Markdown → HTML for the send path's multipart/alternative body. `html` only;
 # raw HTML in the source is escaped in src/markdown.rs, never passed through.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# Structured parsing of the parent's address-list headers (To/Cc/From/Reply-To)
+# when deriving reply-all recipients. The same parser core uses at ingest, so
+# both doors read a display name containing a comma the same way — splitting on
+# commas ourselves is what would produce a wrong (or attacker-chosen) audience.
+mail-parser = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

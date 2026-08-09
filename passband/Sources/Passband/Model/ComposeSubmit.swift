@@ -42,7 +42,11 @@ enum ComposeSubmit {
                 overrideGuard: override, draftId: c.draftId,
                 // The composer's own switch, every time — the daemon's stored
                 // default is a client preference it never applies itself.
-                includeTracker: c.includeTracker)
+                includeTracker: c.includeTracker,
+                // Only a reply can widen: `reply_all` names a parent to widen
+                // FROM, so a new message carrying it would be asking the daemon
+                // to derive a recipient set out of nothing.
+                replyAll: c.replyToMessageId != nil && c.replyAll)
             capture(c, override, "sent")
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
@@ -87,6 +91,11 @@ enum ComposeCopy {
     /// show: the pane composer works off an update, which carries an LLM summary
     /// rather than the real header.
     static let derivedSubject = "Re: (derived from thread)"
+
+    /// Stands in for a reply-all's recipients while the lookup is in flight or
+    /// after it failed. It states who decides rather than naming addresses the
+    /// client does not have: the daemon derives the set at send time either way.
+    static let derivedRecipients = "derived by the daemon at send"
 
     /// What the daemon will title a reply, mirrored for DISPLAY only — see
     /// `gmail_write::reply_subject`, which prefixes "Re: " exactly once, so an

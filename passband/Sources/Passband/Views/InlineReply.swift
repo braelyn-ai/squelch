@@ -13,6 +13,12 @@
 // and the daemon derives the recipient and `Re: <subject>` from the parent. The
 // header line here is INFORMATIONAL — it states what the daemon will do, it does
 // not send anything.
+//
+// REPLY-ALL keeps that shape: the send carries a `reply_all` FLAG and the daemon
+// expands the set. The addresses shown here are a separate read-only lookup of
+// the same derivation, so review states the real recipients — but the send never
+// carries them back, and a lookup that fails or is still in flight degrades to
+// naming the daemon as the authority rather than blocking a reply.
 
 import SwiftUI
 
@@ -31,6 +37,13 @@ struct InlineReply: View {
 
     @Environment(AppStore.self) private var store
 
+    /// The daemon's derived recipient set, TAGGED with the key it was fetched
+    /// for. The tag is what makes a stale read impossible: this view is
+    /// mounted unconditionally, so bare state would survive one composer and
+    /// render — for a frame, before the keyed task clears it — under the next.
+    /// nil = nothing landed yet; `(key, nil)` = the fetch for that key failed.
+    @State private var fetchedRecipients: (key: String, set: ReplyRecipients?)?
+
     private var compose: ComposeState? { store.inlineReply }
     private var inReview: Bool { compose?.phase == .review }
     private var guarded: Bool { !(compose?.guardKinds.isEmpty ?? true) }
@@ -42,6 +55,30 @@ struct InlineReply: View {
     }
     /// What the daemon will title the reply, mirrored for display.
     private var replySubject: String { ComposeCopy.replySubject(threadSubject) }
+
+    /// The fetch's identity: which parent, in which mode. EVERY reply fetches
+    /// now, not just reply-all — the daemon honors the parent's Reply-To on a
+    /// plain reply too, so the stored sender the client holds can be the wrong
+    /// answer. Mode is part of the key so `r` then Enter on the same message
+    /// refetches rather than showing the other mode's set.
+    private var recipientsKey: String? {
+        guard let compose = store.inlineReply, let parent = compose.replyToMessageId else {
+            return nil
+        }
+        return "\(parent):\(compose.replyAll)"
+    }
+
+    /// The fetched set, only if it belongs to the CURRENT key.
+    private var recipients: ReplyRecipients? {
+        guard let fetchedRecipients, fetchedRecipients.key == recipientsKey else { return nil }
+        return fetchedRecipients.set
+    }
+
+    /// True once the current key's fetch has come back (with or without a set)
+    /// — the difference between "deriving…" and "the daemon will derive it".
+    private var recipientsSettled: Bool {
+        fetchedRecipients?.key == recipientsKey
+    }
 
     var body: some View {
         if let compose, let parent {
@@ -76,22 +113,44 @@ struct InlineReply: View {
             // FIRST and invert that layering: Escape would close the thread out
             // from under an open draft.
             .keyBindings(.thread, bindings)
+            // Once per (parent, mode). Keyed, and the fetched value carries its
+            // key too, so reopening the composer on another message or in the
+            // other mode can never show the last one's addresses — not even for
+            // the frame before this task runs.
+            .task(id: recipientsKey) { await loadRecipients() }
         }
+    }
+
+    /// Ask the daemon who this reply would reach. Best-effort by contract: the
+    /// send derives the set again server-side (and, for a reply-all, hard-fails
+    /// there if it cannot), so a failure here is a missing preview, never a
+    /// blocked reply — which is why it neither surfaces an error nor touches
+    /// `compose.error`.
+    private func loadRecipients() async {
+        guard let key = recipientsKey, let compose = store.inlineReply,
+            let parentId = compose.replyToMessageId
+        else { return }
+        let fetched = try? await APIClient.shared.replyRecipients(parentId, all: compose.replyAll)
+        // The composer may have closed, or moved on, while this was in flight.
+        guard recipientsKey == key else { return }
+        fetchedRecipients = (key, fetched)
     }
 
     // MARK: - panes
 
     private func headerLine(_ compose: ComposeState, parent: ClientMessage) -> some View {
         HStack(spacing: 5) {
-            Text("replying to")
+            Text(compose.replyAll ? "replying to all" : "replying to")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
-            // Sender strings are email-derived: rendered as Text only, never as
-            // markup, and never interpolated into a localized literal.
-            Text(SenderCache.resolved(parent.senderString).displayName)
+            // Addresses and sender strings alike are email-derived: rendered as
+            // Text only, never as markup, and never interpolated into a
+            // localized literal.
+            Text(headerTarget(compose, parent: parent))
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(Palette.inkDim)
                 .lineLimit(1)
+                .truncationMode(.tail)
             Text("·").foregroundStyle(Palette.inkFaintest)
             Text(replySubject)
                 .font(Typo.micro)
@@ -108,6 +167,50 @@ struct InlineReply: View {
                     .foregroundStyle(Palette.accent)
             }
         }
+    }
+
+    /// Who the header names. A plain reply names the parent's sender; a
+    /// reply-all names the fetched set — and until that lands (or when it never
+    /// does) it says the derivation is pending rather than naming the sender,
+    /// who is NOT certainly in the set: a mailing list's Reply-To routes the
+    /// mail somewhere the sender's own address never appears.
+    private func headerTarget(_ compose: ComposeState, parent: ClientMessage) -> String {
+        let sender = SenderCache.resolved(parent.senderString).displayName
+        guard compose.replyAll else { return sender }
+        if let summary = recipientSummary { return summary }
+        return recipientsSettled ? "recipients derived at send" : "deriving recipients…"
+    }
+
+    /// "alice@example.com +3 more" — the header is one line above the mail, so a
+    /// twelve-person thread has to collapse into a count rather than push the
+    /// composer around. The full set is in review, where it belongs.
+    private var recipientSummary: String? {
+        guard let recipients else { return nil }
+        let addresses =
+            Self.splitAddresses(recipients.to) + Self.splitAddresses(recipients.cc ?? "")
+        guard let first = addresses.first else { return nil }
+        guard addresses.count > 1 else { return first }
+        return "\(first) +\(addresses.count - 1) more"
+    }
+
+    /// Split an address-list header on the commas that SEPARATE addresses. A
+    /// comma inside a quoted display name ("Doe, John" <j@x>) is part of the
+    /// name, and counting it would report a recipient who does not exist.
+    private static func splitAddresses(_ list: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var quoted = false
+        for ch in list {
+            if ch == "\"" { quoted.toggle() }
+            if ch == ",", !quoted {
+                out.append(current)
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        out.append(current)
+        return out.map { $0.trimmed }.filter { !$0.isEmpty }
     }
 
     private func editor(_ compose: ComposeState) -> some View {
@@ -133,7 +236,26 @@ struct InlineReply: View {
     /// there is one.
     private func reviewPane(_ compose: ComposeState, parent: ClientMessage) -> some View {
         VStack(alignment: .leading, spacing: 9) {
-            ComposeSummaryRow("to", parent.from_addr)
+            // Review must show the REAL derived set, not the guess a client
+            // would make by scraping headers — this is the last screen before
+            // the mail goes out, and the daemon honors Reply-To even on a plain
+            // reply, so the stored sender can be the wrong answer. Until the
+            // lookup lands (or when it never does) a plain reply falls back to
+            // the stored sender and a reply-all names the daemon as the
+            // authority; the send still goes, and the daemon fails a reply-all
+            // there if it cannot derive the set. Recipient rows are CAPPED —
+            // a thirty-person Cc must not grow the pinned composer into the
+            // mail it sits under.
+            if let recipients, !recipients.to.trimmed.isEmpty {
+                ComposeSummaryRow("to", recipients.to).lineLimit(3)
+                if let cc = recipients.cc, !cc.trimmed.isEmpty {
+                    ComposeSummaryRow("cc", cc).lineLimit(3)
+                }
+            } else if compose.replyAll {
+                ComposeSummaryRow("to", ComposeCopy.derivedRecipients)
+            } else {
+                ComposeSummaryRow("to", parent.from_addr)
+            }
             ComposeSummaryRow("subject", replySubject)
             // Same as the pane composer: review states everything about to go
             // out, and the pixel is the one part the body cannot show.

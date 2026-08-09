@@ -242,6 +242,10 @@ struct ComposeState: Sendable, Equatable {
     /// from the account's stored default when the composer opens, then owned by
     /// the composer — the daemon applies no default of its own.
     var includeTracker = false
+    /// Answer everyone on the parent rather than only its sender. Meaningless
+    /// without `replyToMessageId`, and fixed when the composer opens: which key
+    /// opened it is the whole choice, so there is no switch to flip afterwards.
+    var replyAll = false
 }
 
 /// The email currently being reclassified by the `v` palette.
@@ -920,11 +924,16 @@ final class AppStore {
     /// Open the reader's inline reply on a specific message. Never resets a
     /// composer that is already open — a draft is not something a repeated `r`
     /// gets to throw away.
-    func openInlineReply(replyTo messageId: Int) {
+    ///
+    /// `replyAll` is the Enter key's answer to `r`'s: same composer, same
+    /// ceremony, and the daemon does the widening. It is fixed here rather than
+    /// toggled later, so what the header says is what the opening keystroke
+    /// asked for.
+    func openInlineReply(replyTo messageId: Int, replyAll: Bool = false) {
         guard inlineReply == nil else { return }
         inlineReply = ComposeState(
             replyToMessageId: messageId, body: Prefs.shared.signatureSeed,
-            includeTracker: trackingDefault)
+            includeTracker: trackingDefault, replyAll: replyAll)
         DraftSaver.shared.noteOpened(.inlineReply)
         // Both ways in (the reader's `r` and the list's hand-off) come through
         // here, so the restore is wired once.

@@ -105,6 +105,15 @@ fn client_router(state: ApiState) -> Router {
             "/client/messages/{message_id}/opens",
             get(tracking::get_message_opens),
         )
+        // Reply-recipient preview: who a reply (or `?all=true`, a reply-all)
+        // would be addressed to, derived server-side from the parent's headers
+        // by the same code the send path uses. A READ — it reaches Gmail for
+        // metadata only and sends nothing — so it needs no confirm gate, but it
+        // does need the write credential the fetch rides on.
+        .route(
+            "/client/messages/{message_id}/reply_recipients",
+            get(handlers::reply_recipients),
+        )
         .route(
             "/client/tracking-config",
             get(tracking::get_tracking_config).post(tracking::set_tracking_config),

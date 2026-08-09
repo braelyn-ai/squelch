@@ -44,21 +44,50 @@ enum ReadReceipts {
     }
 }
 
+/// Sentences the chip, its tooltip and the detail popover share. The same
+/// uncertainty must not be described in three different voices.
+private enum ReceiptCopy {
+    static let proxyCaveat =
+        "Fetched by Gmail's image proxy, which sometimes loads images before "
+        + "the recipient reads the message."
+
+    /// "just now" / "3h ago" — the chip's own phrasing, reused per row.
+    static func age(_ open: MessageOpen) -> String {
+        let age = Fmt.relAge(open.date)
+        return age == "now" ? "just now" : "\(age) ago"
+    }
+}
+
 /// The mark itself, rendered beside a sent message's header.
+///
+/// The chip states the LATEST open, which is the answer to "did it land"; every
+/// recorded open is one click away, because "opened 4 times over two days" is a
+/// different fact from "opened", and the chip has no room for it.
 struct ReadReceiptMark: View {
     /// Every recorded open, oldest first. Empty renders nothing.
     let opens: [MessageOpen]
 
+    @State private var detailOpen = false
+
     var body: some View {
         if let latest = opens.last {
-            Chip(text: label(latest), tone: Palette.inkFaint, symbol: "eye")
-                .help(tooltip(latest))
+            Button { detailOpen.toggle() } label: {
+                Chip(text: label(latest), tone: Palette.inkFaint, symbol: "eye")
+            }
+            // Plain: the chip already IS the button's shape, and a bordered
+            // style would staple a second pill around it.
+            .buttonStyle(.plain)
+            .help(tooltip(latest))
+            // Downward: the mark sits in a message's header, so the space
+            // below it is the message body — the one direction with room.
+            .popover(isPresented: $detailOpen, arrowEdge: .bottom) {
+                OpensDetail(opens: opens)
+            }
         }
     }
 
     private func label(_ latest: MessageOpen) -> String {
-        let age = Fmt.relAge(latest.date)
-        let when = age == "now" ? "just now" : "\(age) ago"
+        let when = ReceiptCopy.age(latest)
         return latest.viaProxy ? "opened (via proxy) \(when)" : "opened \(when)"
     }
 
@@ -70,8 +99,84 @@ struct ReadReceiptMark: View {
             ? "opened \(Fmt.dateTime(latest.date))"
             : "\(opens.count) opens · latest \(Fmt.dateTime(latest.date))"
         guard latest.viaProxy else { return head }
-        return head
-            + ". Fetched by Gmail's image proxy, which sometimes loads images before "
-            + "the recipient reads the message."
+        return head + ". " + ReceiptCopy.proxyCaveat
+    }
+}
+
+/// EVERY recorded open, newest first: when, how long ago, and what fetched it.
+///
+/// There is no location on this wire and there will not be one invented here —
+/// an open is a pixel fetch, and the honest columns are the time and the agent
+/// string. That agent string is REMOTE-CONTROLLED (it is whatever the fetching
+/// client sent), so it renders as plain `Text` and is never markup, never
+/// interpolated into another sentence.
+private struct OpensDetail: View {
+    /// Oldest first, as the wire carries them.
+    let opens: [MessageOpen]
+
+    /// Newest first: the interesting end of the list, and the one the chip
+    /// summarizes.
+    private var newestFirst: [MessageOpen] { opens.reversed() }
+    private var anyProxied: Bool { opens.contains(where: \.viaProxy) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(opens.count == 1 ? "1 open" : "\(opens.count) opens")
+                .font(Typo.sectionLabel)
+                .foregroundStyle(Palette.inkFaint)
+                .textCase(.uppercase)
+
+            // Capped and scrolled, the same way the debug inspector is: a pixel
+            // that got fetched thirty times must not grow a popover taller than
+            // the window it hangs off.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    // Indexed: two identical opens (same second, same agent) are
+                    // a real possibility, and they are two facts, not one row.
+                    ForEach(Array(newestFirst.enumerated()), id: \.offset) { _, open in
+                        row(open)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 240)
+
+            if anyProxied {
+                Hairline()
+                Text(ReceiptCopy.proxyCaveat)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .frame(width: 300, alignment: .leading)
+    }
+
+    private func row(_ open: MessageOpen) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(Fmt.dateTime(open.date))
+                    .font(Typo.num(11))
+                    .foregroundStyle(Palette.ink)
+                Text(ReceiptCopy.age(open))
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+                if open.viaProxy {
+                    Chip(text: "via proxy", tone: Palette.inkFaintest)
+                }
+                Spacer(minLength: 0)
+            }
+            if let agent = open.user_agent, !agent.isEmpty {
+                // PLAIN TEXT, deliberately: this string came off the wire from
+                // whoever fetched the pixel. Middle truncation because the
+                // distinguishing part of a UA is at both ends.
+                Text(agent)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
     }
 }

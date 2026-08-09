@@ -394,7 +394,8 @@ actor APIClient {
     @discardableResult
     func actionSend(
         body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
-        overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false
+        overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
+        replyAll: Bool = false
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
@@ -406,7 +407,20 @@ actor APIClient {
                 confirm: true, override_guard: overrideGuard, draft_id: draftId,
                 // Omitted rather than `false`, like `subject`: an untracked send
                 // says nothing about tracking at all.
-                include_tracker: includeTracker ? true : nil))
+                include_tracker: includeTracker ? true : nil,
+                // Same omission rule, and the daemon expands the set itself —
+                // this is a flag, never a recipient list.
+                reply_all: replyAll ? true : nil))
+    }
+
+    /// The recipients a reply to `messageId` would carry, derived server-side.
+    /// DISPLAY ONLY: the send derives the same set again from the parent, so a
+    /// failure here costs a preview and never the send. 404 on a sealed or
+    /// unknown message; a daemon with no write credential answers with an error.
+    func replyRecipients(_ messageId: Int, all: Bool = true) async throws -> ReplyRecipients {
+        try await get(
+            "/client/messages/\(messageId)/reply_recipients",
+            query: ["all": all ? "true" : nil])
     }
 
     // MARK: - read tracking

@@ -463,6 +463,23 @@ struct ThreadViewer: View {
             // allowInInput) and types a character, which is what it should do
             // inside a text field.
             KeyBinding("r", "reply") { openReply() },
+            // Enter = the same reply, addressed to EVERYONE on the parent.
+            //
+            // Deliberately NOT allowInInput: with the composer's body focused
+            // Enter is a newline and must stay one, and a search field that
+            // still holds focus beside the reader keeps its own Enter too. The
+            // composer's declining Enter (registered after ours, so it is asked
+            // first) passes the key down here in edit phase — that is the one
+            // path that reaches this handler with a draft open, and DECLINING
+            // there (rather than swallowing) is what lets the key keep falling:
+            // a no-op that consumes Enter would also eat the Return a focused
+            // button in the error state is waiting for. There is no undo for a
+            // lost reply, so an open draft is never replaced.
+            KeyBinding(declining: "Enter", "reply all") {
+                guard store.inlineReply == nil, newest != nil else { return false }
+                openReplyAll()
+                return true
+            },
             // `t` = tune sender rule, same as on a list row: one verb, one key
             // everywhere. The target differs (the thread's sender rather than the
             // selected row's) but that is the only sender in view here. This
@@ -491,6 +508,15 @@ struct ThreadViewer: View {
     private func openReply() {
         guard let newest else { return }
         store.openInlineReply(replyTo: newest.id)
+    }
+
+    /// Enter — the same reply as `r`, on the same newest message, addressed to
+    /// everyone the parent reached. The composer is not re-addressable once
+    /// open, so an already-open draft is left exactly as it is rather than
+    /// silently becoming a reply-all (or being thrown away for one).
+    private func openReplyAll() {
+        guard store.inlineReply == nil, let newest else { return }
+        store.openInlineReply(replyTo: newest.id, replyAll: true)
     }
 
     /// A hand-off from another surface: `r` on a list row navigates here and asks

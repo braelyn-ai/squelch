@@ -244,6 +244,7 @@ struct ShortcutsOverlay: View {
                 (["j", "k"], "older / newer message"),
                 (["h", "l"], "previous / next queued email"),
                 (["r"], "reply"),
+                (["Enter"], "reply all"),
                 (["c"], "new message"),
                 (["e", "d"], "done + next"),
                 (["u"], "unsubscribe from this sender"),
