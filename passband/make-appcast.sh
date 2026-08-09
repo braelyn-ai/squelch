@@ -22,7 +22,17 @@ for zip in build/Passband-*.zip; do
   if [ -e "$zip" ]; then cp -f "$zip" releases/; fi
 done
 
+# Signing key: the login keychain by default (this machine), or a key file
+# when SPARKLE_ED_KEY_FILE is set (CI, where the key arrives as a secret).
+KEY_ARGS=()
+if [ -n "${SPARKLE_ED_KEY_FILE:-}" ]; then
+  KEY_ARGS=(--ed-key-file "$SPARKLE_ED_KEY_FILE")
+fi
+
+# (macOS bash 3.2: expanding an empty array under set -u is an error, hence
+# the ${arr[@]+...} guard.)
 ./vendor/Sparkle/bin/generate_appcast releases \
+  ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} \
   --download-url-prefix "https://passband.app/download/" \
   --maximum-deltas 0 \
   -o ../passband-site/appcast.xml

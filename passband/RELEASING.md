@@ -1,15 +1,28 @@
 # Releasing Passband
 
-One command: bump `VERSION` (and its project.yml mirror), commit, then
+Push a tag; CI does the rest:
+
+```sh
+# bump VERSION (and its project.yml mirror), commit, then:
+git tag "passband-v$(cat VERSION)" && git push origin "passband-v$(cat VERSION)"
+```
+
+`.github/workflows/passband-release.yml` builds, signs, notarizes, publishes
+the GitHub release, regenerates the appcast (committed to main, which
+redeploys the site), and bumps the Homebrew cask. It needs five repo
+secrets, listed at the top of the workflow file. The daemon's bare `v*`
+tags are a different workflow; the two never overlap.
+
+## Local fallback
+
+The same release can be cut from this machine with one command:
 
 ```sh
 ./release.sh        # or --dry to rehearse without publishing
 ```
 
-It runs the steps below, publishes the GitHub release under `passband-v*`,
-pushes the appcast, and bumps the Homebrew cask in braelyn-ai/homebrew-tap.
-The rest of this file is what the script does, for when a step needs doing
-by hand. Prerequisites on the release machine:
+It runs the steps below, which are also what CI does — kept documented for
+when a step needs doing by hand. Prerequisites on the release machine:
 the Developer ID certificate, the `passband-notary` notarytool profile
 (see build-release.sh), and the Sparkle EdDSA private key in the login
 keychain (created by `vendor/Sparkle/bin/generate_keys`; back it up with
