@@ -1,0 +1,18 @@
+# Railway deployment config for squelch-control (built by Dockerfile.control).
+#
+# This file exists because the root railway.toml pins dockerfilePath to the
+# relay's Dockerfile, and config-as-code OUTRANKS the RAILWAY_DOCKERFILE_PATH
+# service variable (learned the hard way: the control service's first deploy
+# built and shipped the relay). Every service deployed from this repo's root
+# needs its own config file, selected in the service's settings under
+# "Config-as-code file path". The broker note in railway.toml predates this
+# lesson and still trusts the variable; correct it when the broker deploys.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.control"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
