@@ -139,12 +139,21 @@ environment.
 ## Deploying to Railway
 
 A **separate Railway service** off this same repo, alongside the APNs relay
-(root `Dockerfile`) and the consent broker (`Dockerfile.broker`). Railway picks
-this one per-service:
+(root `Dockerfile`) and the consent broker (`Dockerfile.broker`). The one thing
+that decides which of the three a service builds is its **config-as-code file**,
+so that is step 1:
 
-1. New service from the repo. Set `RAILWAY_DOCKERFILE_PATH=Dockerfile.control`.
-   (`railway.toml` at the repo root belongs to the relay and must not be
-   inherited.)
+1. New service from the repo. Set its **Config-as-code file path** to
+   `railway.control.toml`, which pins `dockerfilePath = "Dockerfile.control"`
+   along with the health check and restart policy.
+
+   Do not rely on `RAILWAY_DOCKERFILE_PATH` for this. Left at the default,
+   a service inherits the root `railway.toml` — which belongs to the relay and
+   pins `dockerfilePath = "Dockerfile"` — and **config-as-code outranks the
+   service variable**. This service's first deploys built and shipped the relay
+   image with the variable set correctly, which is a green deploy serving the
+   wrong binary and no error anywhere. Setting the variable as well is harmless;
+   it is just not what makes this work.
 2. Attach a volume mounted at `/data` for the control store.
 3. Set every required variable from the table above.
 4. Add the custom domain for the signup surface (`signup.passband.app` — the
@@ -155,7 +164,9 @@ this one per-service:
 5. Health check: `GET /healthz`.
 
 DNS for the rest of the hosted tier (`*.<base domain>` tenant wildcard and
-`warden.passband.app` pointing at the k3s node) is in `deploy/hosted/SETUP.md`.
+`warden.passband.app` pointing at the k3s node) is in `deploy/hosted/SETUP.md`;
+what the live deployment actually looks like — box, domains, secret inventory —
+is `deploy/hosted/PRODUCTION.md`.
 
 ## Notes on the surface
 

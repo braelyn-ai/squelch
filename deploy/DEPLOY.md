@@ -290,12 +290,26 @@ It is a SECOND Railway service from the same repo, not another copy of the relay
 The two share a posture and nothing else, and they must not share a service:
 `railway.toml` at the repo root builds the relay.
 
+> **Which Dockerfile a service builds: config-as-code wins, and it is not close.**
+> Proven the hard way on 2026-08-10 by the `control` service, which was configured
+> with `RAILWAY_DOCKERFILE_PATH=Dockerfile.control` and shipped the **relay** image
+> anyway, twice. The root `railway.toml` pins `dockerfilePath = "Dockerfile"`, every
+> service off this repo inherits that file by default, and its config-as-code
+> OUTRANKS the service variable. Setting the variable and nothing else is a deploy
+> that looks green and serves the wrong binary.
+>
+> The only reliable mechanism is a **per-service config file** selected in that
+> service's settings under "Config-as-code file path". `squelch-control` has
+> `railway.control.toml` (its header comment records this lesson); the broker needs
+> its own `railway.broker.toml`, pinning `dockerfilePath = "Dockerfile.broker"`,
+> created and pointed at before its first deploy.
+
 **Service settings**
 
 | Setting | Value |
 |---|---|
-| `RAILWAY_DOCKERFILE_PATH` | `Dockerfile.broker` (a service variable) |
-| Config-as-code path | clear it, or point it at a broker-specific file. Left at the default it picks up the root `railway.toml`, which pins `dockerfilePath = "Dockerfile"` and would build the relay from this service. |
+| Config-as-code path | `railway.broker.toml` — **this is the setting that decides the image.** Left at the default the service picks up the root `railway.toml` and builds the relay. |
+| `RAILWAY_DOCKERFILE_PATH` | `Dockerfile.broker`. Belt-and-braces only: it is overridden by any config-as-code file the service resolves, so it is not what makes this work. |
 | Healthcheck path | `/healthz` — unauthenticated and outside both rate limiters, so it answers while a client is being throttled |
 | Restart policy | on failure. A restart drops every pending consent, which is the design: the recovery is re-running `squelchd auth`. |
 | Custom domain | `auth.passband.email` |

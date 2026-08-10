@@ -1,7 +1,10 @@
 # Hosted squelch: the plan
 
-Status: planned 2026-08-03, not yet started. This is the decision record and roadmap
-for offering squelch beyond "clone the repo and run cargo".
+Status: planned 2026-08-03. Phase 1 shipped; Phase 2's code shipped 2026-08-09/10 and
+its first deployment is going up now. This is the decision record and roadmap
+for offering squelch beyond "clone the repo and run cargo" — what was decided and
+why. What is actually deployed, box by box and secret by secret, is
+`deploy/hosted/PRODUCTION.md`.
 
 ## Naming (decided 2026-08-03)
 
@@ -12,7 +15,9 @@ band the filter lets through — the daemon kills the noise, Passband is where y
 see what made it through.
 
 - Mac client: **Passband.app**. Repo, crates, and binary names stay `squelch*`.
-- Domains (all unregistered as of 2026-08-03 — **register immediately**):
+- Domains (`passband.app` and `passband.email` are registered and live as of
+  2026-08-10; registrar and DNS-provider layout per zone is in
+  `deploy/hosted/PRODUCTION.md`):
   `passband.app` (product/homepage, and every internal hosted surface:
   `signup.passband.app`, `warden.passband.app` — decided 2026-08-10),
   `passband.email` (tenants ONLY: a `<user>.passband.email` wildcard subdomain
@@ -61,6 +66,38 @@ under **one GCP project and one consent screen** ("Squelch"):
 - **Hosted: Web-type confidential client.** The control plane runs a normal
   server-side flow and stores the refresh token encrypted, because holding it is the
   product.
+
+The same subtlety has a consequence people find surprising: **that web client's id
+and secret also ride into every tenant pod** (the `google-oauth-client` Secret in
+the `tenants` namespace). A daemon holding a tenant's refresh token and not holding
+the client that minted it cannot refresh an access token, so `squelchd serve` refuses
+to boot without them. On its own the client opens no mailbox; it is one more thing a
+hosted tenant is trusting us with, and the self-host tier is exactly for people who
+would rather not. Full reasoning: `deploy/hosted/SETUP.md` §6.
+
+### One consent, both slots (decided 2026-08-10)
+
+Hosted signup asks for `gmail.readonly`, `gmail.modify` and `gmail.send` in **one**
+consent screen and seals the resulting grant into **both** credential slots — Read
+for the sync loop, Write for human-door actions. The two-slot split is a code-path
+guarantee (sync never touches the Write slot), not a claim about two grants.
+
+The reason is that hosted has no second consent screen. Self-host can run
+`squelchd auth --write` later and get the action credential whenever it wants;
+a hosted tenant's only path to Google is the signup page they already left. Ship
+compose, archive and label — which hosted does — and a Read-only seal looks perfect
+until the first archive, then dead-ends with nothing in the app that can fix it.
+
+So the scope check after the exchange is a floor over all three, and **a partial
+consent provisions nothing**: the callback stops before the first warden call, hands
+the invite code back unspent, and says all three permissions are needed. Better to
+lose a signup at the door than to hand somebody a tenant that half-works. (Google
+unions grants across a Cloud project, so a token reporting *more* than was asked for
+still passes; the check is a subset floor, never an exact match — `AUTH-FINDINGS.md`
+has the reasoning and the test that pins it.)
+
+Implementation, and where the scope constants actually live:
+`squelch-control/README.md`, "One consent, both slots".
 
 ### The consent relay (broker for self-host)
 
@@ -209,9 +246,19 @@ and the volumes.
   dead on the next request. The pairing flow this was a prerequisite for is shipped
   with it (`squelchd pair`).
 - `/mcp` gets real bearer auth once internet-facing (today: localhost trust +
-  allowed-hosts). Later, MCP-spec OAuth so claude.ai can connect natively — marquee
-  feature: point Claude at your mailbox intelligence with no localhost anywhere.
+  allowed-hosts). **STILL OPEN**, and the MVP ships around it rather than through
+  it: a tenant's Ingress declares `/client` and `/t` only, so the agent door is
+  simply not published (see the runbook's "The agent door is not served"). That is
+  a routing answer to an auth question, and it holds exactly as long as nobody
+  wants MCP from the internet — which is the next thing somebody will want. Later,
+  MCP-spec OAuth so claude.ai can connect natively — marquee feature: point Claude
+  at your mailbox intelligence with no localhost anywhere.
 - Credential file backend gains encryption-at-rest with a per-tenant key (KMS/age).
+  SHIPPED, as age rather than KMS. The daemon reads `SQUELCH_CRED_AGE_IDENTITY`;
+  the identity is minted in-cluster per tenant and written straight into that
+  tenant's Secret, so there is no box-wide key and no escrow — which is the same
+  sentence as "we cannot recover a tenant's mailbox for them", and both halves are
+  true on purpose.
 - LLM triage in hosted runs on our key; the existing per-user budget caps and cost
   ledger become the pricing mechanism. BYOK stays as an option.
 
@@ -247,15 +294,31 @@ The actual path, in order:
 
 1. **Phase 0 — paper (start immediately, gates everything public):** homepage,
    privacy policy, data-handling doc, Google verification + CASA for the one project
-   with both clients. Longest lead time, zero code.
-2. **Phase 1 — self-host as a product:** GHCR multi-arch image, `auth --export`/
-   `--import` consent, first-run auth UX. Ships value to real users while
-   verification grinds, and de-risks the consent patterns hosted signup reuses.
-   Status: the broker is implemented in-repo as `squelch-broker` (2026-08-04) per
+   with both clients. Longest lead time, zero code. **Still open**, and it is the
+   gate on user 101: the unverified cap is 100, and nothing below moves it.
+2. **Phase 1 — self-host as a product: SHIPPED.** GHCR multi-arch image on every
+   `v*` tag, `auth --export`/`--import` consent, first-run auth UX. It shipped value
+   to real users while verification grinds and de-risked the consent patterns hosted
+   signup reuses, which was the whole point of ordering it first.
+   The broker is implemented in-repo as `squelch-broker` (2026-08-04) per
    `docs/BROKER.md` but blocked for this tier; it ships with the hosted callback
    instead.
-3. **Phase 2 — hosted MVP:** `squelch-control`, `squelch-warden` provisioning
-   onto single-node k3s, human-door issued tokens + `/mcp` bearer auth, web
-   signup → app pairing, invite codes.
+3. **Phase 2 — hosted MVP: code shipped 2026-08-09/10, first deployment in
+   progress.** `squelch-control` and `squelch-warden` provisioning onto single-node
+   k3s, per-tenant age identities and two-phase provisioning, human-door issued
+   tokens, web signup → app pairing, invite codes. The cluster half is going up on
+   `carrier` now; `deploy/hosted/PRODUCTION.md` is the record of that install.
+   Still open from this phase's original list:
+   - **`/mcp` bearer auth.** Routed around, not solved: the tenant Ingress simply
+     does not publish the agent door. See "Changes to existing code" above.
+   - **Litestream.** The pre-k3s design promised streaming SQLite backup to object
+     storage "from day one"; the k3s rewrite dropped it and nothing replaced it, so
+     say the true thing out loud: today's backup is Hetzner's **root-disk** snapshot,
+     which covers the k3s datastore (every tenant's identity Secret — load-bearing)
+     and does **not** cover the block volume the mailboxes live on. Losing a mailbox
+     costs a slow re-sync from Gmail; losing an identity Secret costs that tenant a
+     re-consent, because there is no escrow. Acceptable at ten tenants, not at a
+     hundred. `deploy/hosted/SETUP.md` → "Backups today, stated honestly" is the
+     operator's version.
 4. **Phase 3 — grow up:** Gmail push, Stripe, fleet-mode vs Fly Machines decision,
    iOS against hosted.

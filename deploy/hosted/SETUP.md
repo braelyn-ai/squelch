@@ -58,8 +58,10 @@ re-consent with Google and costs nobody else anything.
   internal surfaces (signup, the warden) live on the product domain
   (`passband.app` here) so nothing operator-owned ever squats in the tenant
   namespace. Substitute yours everywhere.
-- A DNS provider with an API, for the wildcard certificate (DNS-01 is the only
-  way to get one).
+- For the TENANT zone, a DNS provider **cert-manager has a DNS-01 solver for**.
+  Not "a provider with an API" — a wildcard can only be issued over DNS-01, and
+  cert-manager can only drive the providers it (or a webhook) implements. See
+  "Your registrar is probably not your DNS provider" under §1.
 - The Railway service for `squelch-control` already created.
 
 ## 1. DNS
@@ -67,12 +69,43 @@ re-consent with Google and costs nobody else anything.
 | Name | Type | Value | Why |
 |---|---|---|---|
 | `passband.email` | A | your box IP (or the marketing site) | optional |
-| `*.passband.email` | A | your box IP | every tenant's subdomain |
+| `*.passband.email` | A | your box IP | every tenant's subdomain — DNS-only, never proxied |
 | `warden.passband.app` | A | your box IP | the control plane's way in |
 | `signup.passband.app` | CNAME | your Railway app hostname | signup never touches this box |
 
 The wildcard is what makes a new tenant instant: provisioning creates an Ingress
 for `alice.passband.email` and DNS already answers for it.
+
+### Your registrar is probably not your DNS provider
+
+The two domains have different certificate needs, and that decides where each
+zone's DNS lives:
+
+- **The tenant zone needs DNS-01**, because it needs a wildcard and nothing else
+  issues one. cert-manager has to write the `_acme-challenge` TXT record itself,
+  every 60 days, unattended — so this zone must be hosted by a provider
+  cert-manager can drive (Cloudflare, Route53, DigitalOcean, Google, Azure,
+  AcmeDNS, or a provider webhook).
+- **The product zone does not.** `warden.passband.app` is a single host, so it
+  issues over the HTTP-01 catch-all solver in `40-wildcard-certificate.yaml`,
+  which needs port 80 open to Traefik and no DNS credential at all.
+  `signup.passband.app` is a CNAME to Railway, which handles its own TLS. So this
+  zone can stay wherever it was registered.
+
+This install is the concrete case: both domains are registered at Namecheap,
+which has **no cert-manager DNS-01 solver**. The sanctioned fix is to move only
+the tenant zone's DNS to a provider that does — Cloudflare's free tier is enough,
+and moving a zone is changing its nameservers at the registrar, not transferring
+the domain. The product zone stays put. Registration and DNS hosting are separate
+things and there is no reason to move both.
+
+> **If you use Cloudflare: the wildcard record must be DNS-only (grey cloud).**
+> Never proxied. The orange cloud puts Cloudflare's TLS termination in front of
+> every tenant mailbox — it would be decrypting mail traffic that this whole
+> design spends its effort keeping inside one pod — and it hides the box's real
+> address from ACME's HTTP-01 fallback while fighting the certificate
+> cert-manager just issued. Check it after every zone edit; the dashboard
+> defaults new A records to proxied.
 
 ## 2. k3s, with secrets encryption
 
@@ -114,6 +147,72 @@ runtime that supports it. If tenant pods fail to start with a `hostUsers`
 complaint, set `SQUELCH_WARDEN_USER_NAMESPACES=off` in `20-warden.yaml`, restart
 the warden, and read "What this does and does not isolate" below to understand
 what you gave up.
+
+## Tenant data on a block volume
+
+Unnumbered because it is optional, but do it here — between k3s and the first
+tenant — or not at all. Repointing storage is free with zero PVCs and a migration
+with fifty.
+
+Out of the box, k3s's local-path provisioner carves every tenant PVC out of
+`/var/lib/rancher/k3s/storage/`, which is the **root disk**. That is the wrong
+disk for mail on any cloud that sells disks the way Hetzner does: a root disk
+grows with the instance type and never shrinks back, so one busy month of mail
+permanently raises the floor on what the box costs. A block volume is the
+opposite shape — attach 50 GB, grow it online when it fills, pay for exactly
+that, and keep the mail on something you can detach and re-attach to a
+replacement box.
+
+Create the volume in the provider's console (delete protection ON — this is every
+tenant's mailbox and the console offers exactly one click between it and
+nothing), attach it, then on the box:
+
+```sh
+mkfs.ext4 /dev/disk/by-id/<your-volume-device>
+mkdir -p /mnt/tenant-data
+# fstab, by-id and never by /dev/sdX, which renumbers on reboot:
+echo '/dev/disk/by-id/<your-volume-device> /mnt/tenant-data ext4 discard,nofail,defaults 0 0' >> /etc/fstab
+mount -a && df -h /mnt/tenant-data
+```
+
+`nofail` is not optional: without it, a volume that is slow to attach or has been
+detached turns a reboot into a box that never finishes booting.
+
+Then point local-path at it. The durable way is the k3s server flag, because it
+is what renders the provisioner's config in the first place:
+
+```sh
+# In the k3s systemd unit's ExecStart (or INSTALL_K3S_EXEC on a fresh install):
+#   --default-local-storage-path /mnt/tenant-data
+systemctl daemon-reload && systemctl restart k3s
+kubectl -n kube-system get cm local-path-config -o jsonpath='{.data.config\.json}'; echo
+kubectl -n kube-system rollout restart deploy/local-path-provisioner
+```
+
+Editing the `local-path-config` ConfigMap by hand does the same thing and takes
+effect the same way, but it is a bundled k3s manifest: the next k3s upgrade that
+touches `local-storage.yaml` puts the old path back, and the symptom is new
+tenants quietly landing on the root disk again. The flag survives upgrades.
+
+Either way this only affects **new** claims. A PV already bound keeps the path it
+was created with, which is the other reason to do this before there are any.
+
+Last, make the quota agree with the disk. In `70-tenant-limits.yaml`,
+`requests.storage` is the aggregate ceiling on PVCs in the namespace and should be
+sized to **this volume**, not to the root disk and not to optimism: local-path
+does not enforce a claim's size, so the quota is the only thing standing between
+fifty tenants and a full filesystem. Divide the volume by the per-tenant claim
+size and you have your tenant count.
+
+Growing it later is online and in that order: expand the volume in the console,
+then `resize2fs /dev/disk/by-id/<device>` on the box (no unmount, no downtime),
+then raise `requests.storage` and re-apply. Shrinking is not a thing, on any of
+the three, which is why 50 GB and grow beats 500 GB and hope.
+
+The thing this does NOT do is back anything up, and it moves the mail out from
+under the one thing that did: provider server snapshots image the ROOT disk, and
+this volume is now deliberately not the root disk. Read "Backups today, stated
+honestly" under Operating notes before you assume otherwise.
 
 ## 3. cert-manager and the wildcard certificate
 
@@ -256,8 +355,11 @@ Sizing, in the order that matters:
 - **Limits may oversubscribe.** Tenants are idle most of the time and a sync
   burst is seconds long. 4x requests is comfortable on one node; much past that
   and a few simultaneous backfills evict each other.
-- **`requests.storage` is disk you actually have.** local-path is the box's
-  filesystem, and a claim that cannot bind is a tenant that never comes up.
+- **`requests.storage` is disk you actually have.** local-path is a real
+  filesystem — the root disk, or the block volume if you repointed it above — and
+  it does not enforce a claim's size, so this quota is the only thing standing
+  between N tenants and a full disk. Size it to whichever filesystem local-path
+  is writing to, and a claim that cannot bind is a tenant that never comes up.
 - Raising a per-tenant limit without raising the quota simply means fewer
   tenants. That is the correct trade to make consciously rather than discover.
 
@@ -532,11 +634,44 @@ touches every mailbox at once is an outage waiting for a bad release.
   their own mail depends on theirs. `kubectl -n tenants get secret -o yaml`
   produces base64 of the DECRYPTED values, so treat that output the way you
   would treat the keys themselves.
-- The PersistentVolumes under `/var/lib/rancher/k3s/storage/`. The mail indexes.
-  Bigger, and rebuildable from Gmail given a working credential.
+- The PersistentVolumes (under `/var/lib/rancher/k3s/storage/`, or wherever
+  local-path was repointed). The mail indexes. Bigger, and rebuildable from Gmail
+  given a working credential.
 
 Back up the first even if you skip the second. Without a tenant's identity, that
 tenant's stored credential is unrecoverable and they consent with Google again.
+
+### Backups today, stated honestly
+
+What is actually running on the install this runbook was written from, as of
+2026-08-10, is one mechanism, and it is not the one anybody would design:
+
+- **Provider server backups are ROOT DISK ONLY.** Hetzner's backups (7 daily
+  snapshots) image the server's own disk. They do **not** include attached block
+  volumes, ever, and nothing in the console says so at the moment you enable
+  them.
+- That happens to cover the load-bearing half. The k3s datastore lives on root
+  (`/var/lib/rancher/k3s/server/db`), and it holds every tenant's identity
+  Secret. Encrypted at rest, so the snapshot is not a pile of keys — but it is
+  the difference between "restore" and "every tenant re-consents".
+- It does **not** cover the mailboxes, if the block volume above is in use. That
+  is the deliberate trade, not an oversight: mail is the big, rebuildable half.
+- **Litestream is not wired up.** `docs/HOSTED.md` once promised streaming SQLite
+  backup to object storage "from day one"; the k3s design dropped it and nothing
+  replaced it. It is still owed.
+
+So, in plain terms, what each loss costs:
+
+| What you lose | What it costs |
+|---|---|
+| the block volume | every tenant re-syncs from Gmail — slow, noisy, but nothing is gone |
+| the root disk, without a snapshot | every tenant's identity Secret, therefore every sealed credential, therefore a re-consent each. There is no escrow; we cannot recover this for them |
+| one tenant's identity Secret | that one tenant re-consents |
+
+Which is why, until Litestream lands: keep server backups ON, and if you take
+nothing else off this box on a schedule, take
+`kubectl -n tenants get secret -o yaml` — encrypted, somewhere that is not this
+box. It is kilobytes and it is the whole recovery story.
 
 ## What this does and does not isolate
 
