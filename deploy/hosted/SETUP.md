@@ -45,10 +45,14 @@ re-consent with Google and costs nobody else anything.
 
 ## 0. What you need
 
-- A Debian 13 (trixie) box. Bookworm's glibc is too old for the embedding
-  runtime the daemon links (`ort` needs 2.38+), so trixie is not optional.
-  2 vCPU and 4 GB is a sensible floor for a handful of tenants; each tenant pod
-  is a sync loop plus an ONNX embedder.
+- A Linux box that runs k3s: Debian 13 or Ubuntu 24.04 both work — pick the one
+  you can operate half-asleep. The daemon's glibc floor (`ort` needs 2.38+)
+  lives INSIDE the squelchd container image, not on the host; the old "trixie
+  is not optional" rule died with the systemd design. What the host does need
+  is a kernel with idmapped mounts (6.3+) for the user-namespace pods — trixie
+  ships 6.12, Ubuntu 24.04 ships 6.8, both fine. 2 vCPU and 4 GB is a sensible
+  floor for a handful of tenants; each tenant pod is a sync loop plus an ONNX
+  embedder.
 - Two domains, on purpose. The tenant base domain (`passband.email` here) means
   exactly one thing: a wildcard subdomain is a tenant, full stop. Product and
   internal surfaces (signup, the warden) live on the product domain
