@@ -53,6 +53,24 @@ daemon reads is decided in exactly one place. A bare `StoredToken` would encrypt
 and decrypt fine and then deserialize into an empty slot map, which surfaces as
 "no stored credentials" on a box nobody can easily debug.
 
+## One consent, both slots
+
+Signup asks for `gmail.readonly`, `gmail.modify`, and `gmail.send` **in one
+consent** (squelch-core's `GMAIL_READONLY_SCOPE` + `WRITE_SCOPES`, never spelled
+out here), and seals the resulting grant into **both** credential slots: `email`
+for the Read side and `email#write` for the Write side. Hosted Passband ships
+compose, archive, and label, and the daemon's action path loads the Write slot,
+which nothing else on a hosted box can fill: there is no second consent screen a
+tenant can reach from inside the app.
+
+The scope check after the exchange is therefore a floor over all three. Google
+unions grants across a Cloud project, so a token may report **more** than was
+asked for and that passes; **less** does not. A partial consent (a box unchecked
+on Google's screen) provisions nothing at all: the callback stops before call 1,
+hands the invite code back, and says all three permissions are needed. A tenant
+sealed on a partial grant would look fine until the first archive or send, with
+no way back to Google from the app.
+
 The corollary worth stating plainly: **a full compromise of this Railway service
 yields no mailbox.** It yields the ability to provision new tenants and to seal
 things nobody can open, plus a list of labels and addresses. The refresh tokens

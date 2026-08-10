@@ -109,8 +109,15 @@ pub struct Created {
 /// `PUT /v1/tenants/{label}/credentials` request body.
 #[derive(Debug, Serialize)]
 struct CredentialsRequest<'a> {
-    /// The tenant's Read credential, age ASCII armor. The field name says
+    /// The tenant's credential, age ASCII armor. The field name says
     /// "ciphertext" because that is the only thing that may ever be put in it.
+    ///
+    /// The `read` in the name is the WIRE's, kept because the warden and every
+    /// deployed control plane agree on it; what rides in it is the whole
+    /// credentials file, which since hosted signup started asking for one
+    /// consent covering readonly + modify + send carries BOTH slots (`email` and
+    /// `email#write`). The warden writes the blob into the tenant's Secret
+    /// verbatim and never looks inside, so the name is stale, not wrong.
     cred_read_ciphertext: &'a str,
 }
 

@@ -67,7 +67,20 @@ pub fn parse_recipient(s: &str) -> Result<Recipient, SealError> {
         .map_err(|e| SealError::Recipient(e.to_string()))
 }
 
-/// Seal one tenant's Read credential to `recipient`, returning ASCII armor.
+/// Seal one tenant's credential into BOTH slots, returning ASCII armor.
+///
+/// ONE TOKEN, TWO SLOTS. Hosted signup takes a single consent covering
+/// readonly + modify + send, so the grant behind it opens the sync path and the
+/// action path alike. The daemon does not go looking: its read path loads the
+/// Read slot and its write path loads the Write slot, each bound to a
+/// [`CredentialKind`] that can never return the other's token. A blob carrying
+/// only Read would provision a tenant whose Archive and Send buttons 403 with
+/// nothing in the logs but "no stored credentials for the Write slot".
+///
+/// The two slots are the SAME refresh token by design rather than by accident:
+/// Google issued one grant, and splitting a single grant across two slots is
+/// exactly what [`squelch_core::credentials::credentials_file_plaintext`] is
+/// shaped for (`email` and `email#write`).
 ///
 /// The plaintext is built, encrypted, and dropped inside this function. The ONLY
 /// thing that leaves is ciphertext.
@@ -83,12 +96,17 @@ pub fn seal_credentials(
     parse_recipient(recipient)?;
 
     // Core owns the on-disk shape: a slot map keyed by `CredentialKind::slot_key`,
-    // which for Read is the bare account email. The clone is core's signature,
-    // not a choice; it is one more copy of the refresh token in this function's
-    // frame and it dies with the frame.
-    let plaintext =
-        credentials_file_plaintext(account_email, &[(CredentialKind::Read, token.clone())])
-            .map_err(|_| SealError::Render)?;
+    // which is the bare account email for Read and `email#write` for Write. The
+    // clones are core's signature, not a choice; they are two more copies of the
+    // refresh token in this function's frame and they die with the frame.
+    let plaintext = credentials_file_plaintext(
+        account_email,
+        &[
+            (CredentialKind::Read, token.clone()),
+            (CredentialKind::Write, token.clone()),
+        ],
+    )
+    .map_err(|_| SealError::Render)?;
 
     let armored = seal_credentials_for_recipient(recipient, plaintext.as_bytes())
         .map_err(|_| SealError::Encrypt)?;
@@ -174,6 +192,35 @@ mod tests {
         assert_eq!(parsed["slots"][MAILBOX]["refresh_token"], REFRESH);
         assert_eq!(parsed["slots"][MAILBOX]["access_token"], ACCESS);
         assert!(parsed.get("refresh_token").is_none(), "{plaintext}");
+    }
+
+    /// BOTH SLOTS, from the one consent hosted signup takes. The Write slot is
+    /// what the daemon's action path loads, and it is keyed `email#write` by
+    /// core's `slot_key`; a blob with only the Read slot reads as "no stored
+    /// credentials" on every archive, label, and send.
+    #[test]
+    fn seals_the_grant_into_both_the_read_and_the_write_slot() {
+        let identity = age::x25519::Identity::generate();
+        let armor =
+            seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
+
+        let plaintext = open(&armor, &identity);
+        let parsed: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+
+        // The keys, spelled the way core spells them, derived rather than typed.
+        let read_key = CredentialKind::Read.slot_key(MAILBOX);
+        let write_key = CredentialKind::Write.slot_key(MAILBOX);
+        assert_eq!(read_key, MAILBOX);
+        assert_eq!(write_key, format!("{MAILBOX}#write"));
+
+        let slots = parsed["slots"].as_object().expect("a slot map");
+        assert_eq!(slots.len(), 2, "{plaintext}");
+        for key in [&read_key, &write_key] {
+            // Both slots carry the REFRESH token: an access token alone dies
+            // within the hour, and the write path would then be dead for good.
+            assert_eq!(slots[key]["refresh_token"], REFRESH, "{key}");
+            assert_eq!(slots[key]["access_token"], ACCESS, "{key}");
+        }
     }
 
     /// Per-tenant keys are the point of v2: another tenant's identity gets

@@ -339,6 +339,19 @@ pub async fn oauth_callback(
 
     let grant = match oauth::exchange_code(&endpoints(&state), code, session.pkce_verifier).await {
         Ok(g) => g,
+        // A PARTIAL CONSENT is its own answer, and the only exchange failure a
+        // user can act on: Google's screen lets the boxes be unchecked one by
+        // one, and the person who unchecked one is the person reading this page.
+        // ONE page for whichever box it was: naming the missing scope would say
+        // nothing they cannot see on Google's screen and would put a third
+        // wording of the same instruction in front of them.
+        //
+        // Nothing has been provisioned at this point, so the retry is clean.
+        Err(oauth::OAuthError::Scope) => {
+            tracing::info!(label = %label, "consent granted only part of the scope set");
+            release();
+            return done(partial_consent_problem());
+        }
         Err(e) => {
             // The error type only. Its `Display` is written to carry no code,
             // no secret, and no provider body.
@@ -347,7 +360,7 @@ pub async fn oauth_callback(
             return done(pages::problem(
                 StatusCode::BAD_GATEWAY,
                 "Google did not complete the sign in",
-                "Nothing was set up. Please start again, and approve the Gmail read permission when Google asks.",
+                "Nothing was set up. Please start again, and approve all three Gmail permissions when Google asks.",
             ));
         }
     };
@@ -540,6 +553,26 @@ fn internal_problem() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Something went wrong on our side",
         "Nothing was set up and your invite code has not been used. Please try again.",
+    )
+}
+
+/// What a consent that left something out gets: all three, or none.
+///
+/// Honest about why rather than vague about what happened. Passband cannot run
+/// on two of the three: the daemon reads with one grant, archives and labels
+/// with the second, and sends with the third, and a tenant provisioned on a
+/// partial grant would look fine until the first button that needed the missing
+/// one, with no way back to Google's screen from inside the app.
+///
+/// `200`, like the "changed my mind" page above and for the same reason: this is
+/// a choice the person made at Google, not a failure of this service.
+fn partial_consent_problem() -> Response {
+    pages::problem(
+        StatusCode::OK,
+        "Passband needs all three Gmail permissions",
+        "Nothing was set up and your invite code has not been used. Passband needs all three: \
+         reading your mail to triage it, changing it to archive and label, and sending so you \
+         can reply from the app. Start again and leave every box checked on Google's screen.",
     )
 }
 

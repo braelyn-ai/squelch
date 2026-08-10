@@ -26,7 +26,7 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
-use squelch_core::config::GMAIL_READONLY_SCOPE;
+use squelch_core::config::{GMAIL_READONLY_SCOPE, WRITE_SCOPES};
 use squelch_core::credentials::StoredToken;
 
 /// Ceiling on any response body read here. Google's token and profile answers
@@ -53,8 +53,9 @@ pub enum OAuthError {
     #[error("the authorization code could not be exchanged")]
     Exchange,
     /// Google granted less than was asked for. A partial consent is fatal, not
-    /// a warning: a daemon that cannot read the mailbox is not a daemon.
-    #[error("the Google consent did not include read access to Gmail")]
+    /// a warning: a daemon that cannot read the mailbox is not a daemon, and one
+    /// that cannot archive or send is a tenant whose app 403s on every button.
+    #[error("the Google consent did not include every Gmail permission signup asks for")]
     Scope,
     /// The profile call failed or answered something that is not a mailbox.
     #[error("Google did not say which mailbox this grant is for")]
@@ -124,12 +125,27 @@ fn http(timeout: Duration) -> Result<reqwest::Client, OAuthError> {
         .map_err(|_| OAuthError::Http)
 }
 
-/// Build the consent URL for one signup.
+/// Every scope hosted signup asks for, in the order the copy explains them:
+/// read to triage, modify to archive and label, send to compose.
 ///
-/// `gmail.readonly` ONLY. The hosted MVP never asks for write or send at
-/// signup: the daemon syncs and triages with the read credential, and the
-/// action scopes are a separate, later, opt-in grant. Asking for them here
-/// would put "send mail as you" on the first screen a user ever sees.
+/// ONE CONSENT FOR ALL THREE, deliberately. Hosted Passband ships the actions
+/// in the app, and the daemon's write path loads the
+/// [`squelch_core::credentials::CredentialKind::Write`] slot, which cannot be
+/// filled by a grant that was never asked for. A second consent later would mean
+/// a tenant whose Archive and Send buttons 403 until they go find it, so the
+/// honest thing is to ask once, on the screen that explains why.
+///
+/// Both halves come from squelch-core's constants rather than being spelled out
+/// here: these strings are also what the daemon checks a token against, and two
+/// copies of a scope URL is one typo away from a mailbox nobody can open.
+fn signup_scopes() -> Vec<&'static str> {
+    let mut scopes = Vec::with_capacity(1 + WRITE_SCOPES.len());
+    scopes.push(GMAIL_READONLY_SCOPE);
+    scopes.extend_from_slice(WRITE_SCOPES);
+    scopes
+}
+
+/// Build the consent URL for one signup.
 ///
 /// `access_type=offline` + `prompt=consent` are what make Google return a
 /// refresh token, which is the entire point of the exchange: an access token
@@ -139,7 +155,7 @@ pub fn consent_url(e: &GoogleEndpoints<'_>, state: String) -> Result<Consent, OA
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let (url, csrf) = oauth
         .authorize_url(|| CsrfToken::new(state))
-        .add_scope(Scope::new(GMAIL_READONLY_SCOPE.to_string()))
+        .add_scopes(signup_scopes().into_iter().map(|s| Scope::new(s.to_string())))
         .add_extra_param("access_type", "offline")
         .add_extra_param("prompt", "consent")
         .set_pkce_challenge(challenge)
@@ -199,19 +215,32 @@ pub async fn exchange_code(
     })
 }
 
-/// Hold the granted scopes against what signup asked for.
+/// Hold the granted scopes against what signup asked for: EVERY scope in
+/// [`signup_scopes`] must be present.
 ///
 /// A SUBSET FLOOR, not an exact match, and that is not laziness: Google unions
 /// grants across a Cloud project, so a user who has previously granted more to
-/// another client of the same project gets a token that reports more than
-/// `gmail.readonly`. What must never happen is LESS, which is the case this
-/// catches. An absent `scope` field means "same as the request" per RFC 6749
-/// section 5.1, so it passes.
+/// another client of the same project gets a token that reports more than we
+/// asked for. What must never happen is LESS, which is the case this catches:
+/// Google's screen lets a user uncheck individual boxes, and a token missing
+/// `gmail.send` provisions a tenant whose Compose button fails forever with no
+/// way back to the consent screen.
+///
+/// An absent `scope` field means "same as the request" per RFC 6749 section 5.1,
+/// so it passes.
 fn check_scope_grant(granted: Option<&[String]>) -> Result<(), OAuthError> {
     match granted {
         None => Ok(()),
-        Some(scopes) if scopes.iter().any(|s| s == GMAIL_READONLY_SCOPE) => Ok(()),
-        Some(_) => Err(OAuthError::Scope),
+        Some(scopes) => {
+            let all_granted = signup_scopes()
+                .iter()
+                .all(|want| scopes.iter().any(|got| got == want));
+            if all_granted {
+                Ok(())
+            } else {
+                Err(OAuthError::Scope)
+            }
+        }
     }
 }
 
@@ -284,16 +313,22 @@ mod tests {
     }
 
     /// The consent URL is the one thing a user sees before Google does, so
-    /// every parameter on it is asserted: the scope (readonly ONLY), the PKCE
-    /// method, the state we chose, and the refresh-token parameters.
+    /// every parameter on it is asserted: all three scopes, the PKCE method, the
+    /// state we chose, and the refresh-token parameters.
     #[test]
-    fn builds_a_consent_url_asking_for_readonly_with_pkce() {
+    fn builds_a_consent_url_asking_for_all_three_scopes_with_pkce() {
         let c = consent_url(&endpoints(), "the-state".into()).unwrap();
         let url = url::Url::parse(&c.url).unwrap();
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
 
         assert_eq!(url.host_str(), Some("accounts.google.com"));
-        assert_eq!(q.get("scope").map(String::as_str), Some(GMAIL_READONLY_SCOPE));
+        // Space-delimited, as OAuth spells a scope set.
+        let scope = q.get("scope").map(String::as_str).unwrap_or_default();
+        let asked: Vec<&str> = scope.split(' ').collect();
+        assert_eq!(asked, signup_scopes(), "{scope}");
+        assert!(scope.contains("gmail.readonly"), "{scope}");
+        assert!(scope.contains("gmail.modify"), "{scope}");
+        assert!(scope.contains("gmail.send"), "{scope}");
         assert_eq!(q.get("state").map(String::as_str), Some("the-state"));
         assert_eq!(c.state, "the-state");
         assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
@@ -306,9 +341,6 @@ mod tests {
         // The verifier is kept, and the URL carries only its S256 challenge.
         assert!(!c.pkce_verifier.is_empty());
         assert!(!c.url.contains(&c.pkce_verifier));
-        // Write scopes are never requested at signup.
-        assert!(!c.url.contains("gmail.modify"));
-        assert!(!c.url.contains("gmail.send"));
     }
 
     #[test]
@@ -318,20 +350,35 @@ mod tests {
         assert_ne!(a.pkce_verifier, b.pkce_verifier);
     }
 
+    fn granted(scopes: &[&str]) -> Vec<String> {
+        scopes.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn a_partial_consent_is_fatal() {
+        // No `scope` field means "exactly what was requested" (RFC 6749 §5.1).
         assert!(check_scope_grant(None).is_ok());
-        assert!(check_scope_grant(Some(&[GMAIL_READONLY_SCOPE.to_string()])).is_ok());
+        assert!(check_scope_grant(Some(&granted(&signup_scopes()))).is_ok());
         // The union case: more than we asked for still covers what we asked for.
-        assert!(
-            check_scope_grant(Some(&[
-                GMAIL_READONLY_SCOPE.to_string(),
-                "https://www.googleapis.com/auth/gmail.send".to_string(),
-            ]))
-            .is_ok()
-        );
-        // Less is not.
+        let mut unioned = granted(&signup_scopes());
+        unioned.push("https://www.googleapis.com/auth/userinfo.email".to_string());
+        assert!(check_scope_grant(Some(&unioned)).is_ok());
+
+        // Every way to grant LESS, including each single box a user can uncheck
+        // on Google's screen. Read alone used to pass and now must not: it
+        // provisions a tenant that cannot archive, label, or send.
         assert!(check_scope_grant(Some(&[])).is_err());
-        assert!(check_scope_grant(Some(&["openid".to_string()])).is_err());
+        assert!(check_scope_grant(Some(&granted(&["openid"]))).is_err());
+        for dropped in signup_scopes() {
+            let partial: Vec<String> = signup_scopes()
+                .into_iter()
+                .filter(|s| *s != dropped)
+                .map(String::from)
+                .collect();
+            assert!(
+                check_scope_grant(Some(&partial)).is_err(),
+                "a consent missing {dropped} must be refused"
+            );
+        }
     }
 }

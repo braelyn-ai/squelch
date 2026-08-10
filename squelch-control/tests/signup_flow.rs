@@ -53,6 +53,14 @@ const REFRESH_TOKEN: &str = "1//THE-SECRET-REFRESH-TOKEN";
 const ACCESS_TOKEN: &str = "ya29.THE-SECRET-ACCESS-TOKEN";
 const MAILBOX: &str = "ada@example.com";
 const READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
+const MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
+const SEND: &str = "https://www.googleapis.com/auth/gmail.send";
+
+/// What a consent that left every box checked reports back, the way Google
+/// spells a scope set: space delimited, in one string.
+fn full_grant() -> String {
+    format!("{READONLY} {MODIFY} {SEND}")
+}
 
 /// One tenant as the mock warden holds it: the identity it minted (which never
 /// leaves the warden in production), the mailbox that reserved the label, and
@@ -92,6 +100,9 @@ struct Recorder {
     /// When set, the mock Google verifies PKCE the way Google does: the
     /// presented verifier must S256-hash to this challenge.
     expected_challenge: Option<String>,
+    /// The `scope` the mock Google reports on the token. `None` is the whole set
+    /// signup asks for; `Some` is a user who unchecked something.
+    granted_scope: Option<String>,
 }
 
 type Shared = Arc<Mutex<Recorder>>;
@@ -106,10 +117,13 @@ async fn spawn_google(rec: Shared) -> String {
                     let form: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
                         .map(|(k, v)| (k.into_owned(), v.into_owned()))
                         .collect();
-                    let expected_challenge = {
+                    let (expected_challenge, granted_scope) = {
                         let mut r = rec.lock().unwrap();
                         r.token_form = form.clone();
-                        r.expected_challenge.clone()
+                        (
+                            r.expected_challenge.clone(),
+                            r.granted_scope.clone().unwrap_or_else(full_grant),
+                        )
                     };
 
                     // PKCE is verified here, the way Google verifies it: the
@@ -137,7 +151,7 @@ async fn spawn_google(rec: Shared) -> String {
                         "refresh_token": REFRESH_TOKEN,
                         "expires_in": 3599,
                         "token_type": "Bearer",
-                        "scope": READONLY,
+                        "scope": granted_scope,
                     }))
                     .into_response()
                 },
@@ -523,9 +537,16 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
     let h = Harness::new().await;
 
     let (consent_url, cookie) = h.start_signup("ada").await;
-    // The consent URL is the mock's authorize endpoint, asking for readonly.
+    // The consent URL is the mock's authorize endpoint, asking for all three
+    // grants in ONE consent: hosted Passband ships the actions, and the daemon's
+    // write path has no other way to be filled.
     assert!(consent_url.contains("/authorize"), "{consent_url}");
-    assert!(consent_url.contains("gmail.readonly"));
+    let asked = query_param(&consent_url, "scope");
+    assert_eq!(
+        asked.split(' ').collect::<Vec<_>>(),
+        vec![READONLY, MODIFY, SEND],
+        "{consent_url}"
+    );
     assert!(consent_url.contains("code_challenge_method=S256"));
 
     // Hold the exchange to the PKCE challenge that rode on THIS consent URL,
@@ -606,9 +627,21 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
     // minted for THIS tenant (proved by `open_with_tenant_identity` above), and
     // what is inside is the credentials-file SLOT MAP the daemon reads, not a
     // bare token (which would decrypt into an empty map and fail days later).
+    //
+    // BOTH SLOTS, from the one consent: `email` is what sync and triage load,
+    // `email#write` is what the action handlers load. A blob with only the first
+    // provisions a mailbox whose Archive and Send buttons fail forever.
     let parsed: Value = serde_json::from_str(&plaintext).unwrap();
-    assert_eq!(parsed["slots"][MAILBOX]["refresh_token"], REFRESH_TOKEN);
-    assert_eq!(parsed["slots"][MAILBOX]["access_token"], ACCESS_TOKEN);
+    let write_slot = format!("{MAILBOX}#write");
+    assert_eq!(
+        parsed["slots"].as_object().map(|s| s.len()),
+        Some(2),
+        "{plaintext}"
+    );
+    for slot in [MAILBOX, write_slot.as_str()] {
+        assert_eq!(parsed["slots"][slot]["refresh_token"], REFRESH_TOKEN, "{slot}");
+        assert_eq!(parsed["slots"][slot]["access_token"], ACCESS_TOKEN, "{slot}");
+    }
     assert!(parsed.get("refresh_token").is_none(), "{plaintext}");
 
     // ...and it is sealed to EXACTLY that recipient: another key opens nothing.
@@ -682,6 +715,10 @@ async fn a_failed_credential_install_leaves_a_retriable_signup() {
         let plaintext = h.open_with_tenant_identity("ada", armor);
         let parsed: Value = serde_json::from_str(&plaintext).unwrap();
         assert_eq!(parsed["slots"][MAILBOX]["refresh_token"], REFRESH_TOKEN);
+        assert_eq!(
+            parsed["slots"][format!("{MAILBOX}#write")]["refresh_token"],
+            REFRESH_TOKEN
+        );
     }
 
     let rec = h.rec.lock().unwrap();
@@ -1042,14 +1079,67 @@ async fn the_form_refuses_bad_input_without_leaving_the_page() {
     assert!(rec.create_bodies.is_empty());
 }
 
+/// A consent that left a box unchecked provisions NOTHING. Whichever of the
+/// three is missing, the answer is the same page, the invite is handed back, and
+/// no half-capable tenant is created.
+#[tokio::test]
+async fn a_partial_consent_provisions_nothing_and_says_so() {
+    for partial in [
+        READONLY.to_string(),
+        format!("{READONLY} {MODIFY}"),
+        format!("{READONLY} {SEND}"),
+        format!("{MODIFY} {SEND}"),
+        String::new(),
+    ] {
+        let h = Harness::new().await;
+        h.rec.lock().unwrap().granted_scope = Some(partial.clone());
+
+        let invite = h.invite_code.clone();
+        let (status, body) = h.run_signup("ada", &invite).await;
+        assert_eq!(status, StatusCode::OK, "{partial:?} -> {body}");
+        // ONE wording, whichever box it was, and it names what is needed.
+        assert!(body.contains("all three Gmail permissions"), "{body}");
+        assert!(body.contains("has not been used"), "{body}");
+        assert!(body.contains("Nothing was set up"), "{body}");
+
+        // The exchange happened; nothing past it did.
+        let rec = h.rec.lock().unwrap();
+        assert!(!rec.token_form.is_empty(), "the exchange was attempted");
+        assert!(rec.create_bodies.is_empty(), "no tenant was created");
+        assert!(rec.credential_puts.is_empty(), "nothing was sealed");
+        drop(rec);
+        assert!(!h.state.store().label_exists("ada").unwrap());
+        // ...and the code is spendable again, which is what "start again" means.
+        assert!(h.invite_is_available(), "{partial:?}");
+    }
+}
+
+/// The union case, on the wire: a Google account that has granted this project
+/// more than signup asks for reports MORE, and that is a pass, not a refusal.
+#[tokio::test]
+async fn a_wider_grant_than_we_asked_for_is_accepted() {
+    let h = Harness::new().await;
+    h.rec.lock().unwrap().granted_scope = Some(format!(
+        "{} https://www.googleapis.com/auth/userinfo.email",
+        full_grant()
+    ));
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("ABCD-EFGH"), "{body}");
+}
+
 /// The form and the health check are the only things reachable without a
-/// session, and the form states the grant it is about to ask for.
+/// session, and the form states the grants it is about to ask for.
 #[tokio::test]
 async fn the_landing_page_states_the_grant() {
     let h = Harness::new().await;
     let (status, _, body) = h.get("/", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("gmail.readonly"), "{body}");
+    assert!(body.contains("gmail.modify"), "{body}");
+    assert!(body.contains("gmail.send"), "{body}");
     assert!(body.contains(".passband.test"), "{body}");
 
     let (status, _, body) = h.get("/healthz", None).await;

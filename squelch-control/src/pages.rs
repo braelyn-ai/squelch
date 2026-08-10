@@ -153,7 +153,8 @@ pub fn signup_form(base_domain: &str, label: &str, invite: &str, error: Option<&
         &format!(
             r#"<h1>Set up your Passband mailbox</h1>
 <p>Passband runs a mailbox daemon for you. It reads your Gmail, sorts what
-matters from what does not, and serves the result to the Passband app.</p>
+matters from what does not, and serves the result to the Passband app, where you
+archive, label, and reply.</p>
 {error_html}
 <form method="post" action="/signup">
 <label for="invite">Invite code</label>
@@ -167,12 +168,18 @@ Lowercase letters, numbers, and hyphens, 3 to 30 characters.</p>
 <button type="submit">Continue to Google</button>
 </form>
 <h2>What Google will ask you to approve</h2>
+<p>Three permissions, on one screen. Passband needs all three, so leave every box
+checked. If one is missing we will send you back rather than set up a mailbox
+that half works.</p>
 <ul>
-<li><strong>Read your Gmail</strong> (the <code>gmail.readonly</code> permission):
-every message, every attachment, and your mail settings.</li>
-<li><strong>Nothing else.</strong> Sending mail, changing labels, archiving, and
-deleting are not requested here and cannot be done with what you grant on the
-next screen.</li>
+<li><strong>Read your Gmail</strong> (<code>gmail.readonly</code>): every message,
+every attachment, and your mail settings. This is what the triage runs on.</li>
+<li><strong>Change your Gmail</strong> (<code>gmail.modify</code>): archiving and
+labeling, so the app can act on a message instead of only showing it to you.
+Permanent deletion is not included and Passband never asks for it.</li>
+<li><strong>Send mail as you</strong> (<code>gmail.send</code>): composing and
+replying from the app. Nothing is ever sent that you did not write and send
+yourself.</li>
 </ul>
 <p class="muted">Your mail is read by a daemon that runs only for you, in its own
 process, with its own database. Signing up means we hold your Google refresh
@@ -280,10 +287,19 @@ mod tests {
         );
     }
 
+    /// The form is the only place the three grants are explained in the
+    /// product's own words before Google states them in Google's, so all three
+    /// are named and each says what it is for.
     #[tokio::test]
-    async fn the_form_states_the_grant_and_the_base_domain() {
+    async fn the_form_states_all_three_grants_and_the_base_domain() {
         let html = body_of(signup_form("passband.email", "", "", None)).await;
         assert!(html.contains("gmail.readonly"));
+        assert!(html.contains("gmail.modify"));
+        assert!(html.contains("gmail.send"));
+        // ...and the reason for each, not just the scope name.
+        assert!(html.contains("triage"), "{html}");
+        assert!(html.contains("labeling"), "{html}");
+        assert!(html.contains("replying from the app"), "{html}");
         assert!(html.contains(".passband.email"));
         assert!(html.contains(r#"action="/signup""#));
         // No script anywhere, and nothing to fetch.
