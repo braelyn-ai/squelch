@@ -13,8 +13,10 @@ see what made it through.
 
 - Mac client: **Passband.app**. Repo, crates, and binary names stay `squelch*`.
 - Domains (all unregistered as of 2026-08-03 — **register immediately**):
-  `passband.app` (product/homepage), `passband.email` (hosted:
-  `<user>.passband.email`, consent relay at `auth.passband.email`),
+  `passband.app` (product/homepage, and every internal hosted surface:
+  `signup.passband.app`, `warden.passband.app` — decided 2026-08-10),
+  `passband.email` (tenants ONLY: a `<user>.passband.email` wildcard subdomain
+  means "a tenant" and nothing else),
   `passband.io` (defensive).
 - Deep link scheme: `passband://`.
 - Collision search found no software product named Passband; a proper USPTO

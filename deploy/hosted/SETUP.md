@@ -6,7 +6,7 @@ This is the runbook for the cluster half of hosted Passband. The other half,
 ## What you are building
 
 ```
-                    signup.<base>                warden.<base>
+                    signup.passband.app                warden.passband.app
                           |                            |
                     (CNAME to Railway)            (A to this box)
                           |                            |
@@ -49,7 +49,11 @@ re-consent with Google and costs nobody else anything.
   runtime the daemon links (`ort` needs 2.38+), so trixie is not optional.
   2 vCPU and 4 GB is a sensible floor for a handful of tenants; each tenant pod
   is a sync loop plus an ONNX embedder.
-- A domain. This runbook writes `passband.email`; substitute yours everywhere.
+- Two domains, on purpose. The tenant base domain (`passband.email` here) means
+  exactly one thing: a wildcard subdomain is a tenant, full stop. Product and
+  internal surfaces (signup, the warden) live on the product domain
+  (`passband.app` here) so nothing operator-owned ever squats in the tenant
+  namespace. Substitute yours everywhere.
 - A DNS provider with an API, for the wildcard certificate (DNS-01 is the only
   way to get one).
 - The Railway service for `squelch-control` already created.
@@ -60,8 +64,8 @@ re-consent with Google and costs nobody else anything.
 |---|---|---|---|
 | `passband.email` | A | your box IP (or the marketing site) | optional |
 | `*.passband.email` | A | your box IP | every tenant's subdomain |
-| `warden.passband.email` | A | your box IP | the control plane's way in |
-| `signup.passband.email` | CNAME | your Railway app hostname | signup never touches this box |
+| `warden.passband.app` | A | your box IP | the control plane's way in |
+| `signup.passband.app` | CNAME | your Railway app hostname | signup never touches this box |
 
 The wildcard is what makes a new tenant instant: provisioning creates an Ingress
 for `alice.passband.email` and DNS already answers for it.
@@ -182,7 +186,7 @@ kubectl -n warden create secret generic squelch-warden \
 
 Read it back once and put it in the control plane's environment as
 `SQUELCH_CONTROL_WARDEN_TOKEN`, alongside
-`SQUELCH_CONTROL_WARDEN_URL=https://warden.passband.email`:
+`SQUELCH_CONTROL_WARDEN_URL=https://warden.passband.app`:
 
 ```sh
 kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d; echo
@@ -278,8 +282,8 @@ kubectl -n warden rollout status deploy/squelch-warden
 Confirm it is up and refuses strangers:
 
 ```sh
-curl -sS https://warden.passband.email/healthz                                       # ok
-curl -sS -o /dev/null -w '%{http_code}\n' https://warden.passband.email/v1/tenants   # 401
+curl -sS https://warden.passband.app/healthz                                       # ok
+curl -sS -o /dev/null -w '%{http_code}\n' https://warden.passband.app/v1/tenants   # 401
 ```
 
 A 401 with an empty body is the correct answer to every wrong credential, every
@@ -293,7 +297,7 @@ cluster works before wiring signup up, walk the two phases by hand:
 
 ```sh
 export TOKEN=$(kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d)
-export W=https://warden.passband.email
+export W=https://warden.passband.app
 
 # Phase one: mint this tenant's key. Nothing runs yet.
 RECIPIENT=$(curl -sS -X POST $W/v1/tenants \

@@ -26,11 +26,25 @@ spec:
     privateKeySecretRef:
       name: letsencrypt-account-key
     solvers:
-      - dns01:
+      # DNS-01 is scoped to the TENANT zone: it is the only solver that can
+      # issue the wildcard, and the DNS token's blast radius stays one zone.
+      - selector:
+          dnsZones:
+            # EDIT ME with the tenant base domain.
+            - passband.email
+        dns01:
           cloudflare:
             apiTokenSecretRef:
               name: acme-dns-token
               key: api-token
+      # Catch-all for single-host certificates on OTHER zones (the warden lives
+      # on the product domain, not the tenant one). HTTP-01 needs port 80 to
+      # reach Traefik and no DNS credential at all. If the product zone shares
+      # the same DNS account, widening the selector above works too; this way
+      # needs nothing.
+      - http01:
+          ingress:
+            ingressClassName: traefik
 ---
 # The wildcard, in the TENANT namespace: a certificate can only be used by an
 # Ingress in the namespace its Secret lives in, and every tenant Ingress is in
@@ -50,8 +64,10 @@ spec:
     # One label deep only, which is exactly what a tenant hostname is.
     - "*.passband.email"
 ---
-# The warden's own host. Separate because it lives in a different namespace, and
-# a Secret does not cross one.
+# The warden's own host. Separate because it lives in a different namespace (a
+# Secret does not cross one) and on a different DOMAIN: the tenant zone means
+# exactly one thing, a tenant, so internal surfaces live on the product domain.
+# A single host needs no wildcard, so this issues over the HTTP-01 catch-all.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -64,4 +80,4 @@ spec:
     kind: ClusterIssuer
   dnsNames:
     # EDIT ME
-    - warden.passband.email
+    - warden.passband.app

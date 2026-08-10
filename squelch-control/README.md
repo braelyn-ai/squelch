@@ -66,12 +66,12 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | Variable | Required | Meaning |
 |---|---|---|
 | `SQUELCH_CONTROL_BIND` | no | Listener. Default `127.0.0.1:8852`; the container entrypoint widens it to `0.0.0.0:$PORT`. |
-| `SQUELCH_CONTROL_PUBLIC_URL` | **yes** | This service's externally visible origin, e.g. `https://signup.passband.email`. The Google `redirect_uri` is this plus `/oauth/callback`. |
+| `SQUELCH_CONTROL_PUBLIC_URL` | **yes** | This service's externally visible origin, e.g. `https://signup.passband.app`. Deliberately NOT on the tenant base domain: wildcard subdomains there mean "a tenant" and nothing else. The Google `redirect_uri` is this plus `/oauth/callback`. |
 | `SQUELCH_CONTROL_BASE_DOMAIN` | **yes** | The hosted base domain, e.g. `passband.email`. Tenant URLs are `https://<label>.<base domain>`. Never hardcoded. |
 | `SQUELCH_CONTROL_CLIENT_ID` | **yes** | The confidential **web** OAuth client id (not the desktop client the self-hosted daemon uses). |
 | `SQUELCH_CONTROL_CLIENT_SECRET` | **yes** | Its secret. |
 | `SQUELCH_CONTROL_COOKIE_KEY` | **yes** | HMAC key for the signup cookie. base64 or hex, at least 32 bytes decoded. `openssl rand -base64 48`. |
-| `SQUELCH_CONTROL_WARDEN_URL` | **yes** | The warden's base URL, e.g. `https://warden.passband.email`. |
+| `SQUELCH_CONTROL_WARDEN_URL` | **yes** | The warden's base URL, e.g. `https://warden.passband.app` (product domain, same reasoning as the public URL). |
 | `SQUELCH_CONTROL_WARDEN_TOKEN` | **yes** | Bearer presented to the warden. Must match `SQUELCH_WARDEN_TOKEN` in the cluster. |
 | `SQUELCH_CONTROL_DB_PATH` | no | Control store. Default `/data/control.sqlite3`. |
 | `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS` | no | How many proxies write `X-Forwarded-For` in front of this listener. `0` (default) meters the TCP peer, which behind a platform edge means one shared rate-limit bucket. Set `1` on Railway. |
@@ -129,14 +129,15 @@ this one per-service:
    inherited.)
 2. Attach a volume mounted at `/data` for the control store.
 3. Set every required variable from the table above.
-4. Add the custom domain `signup.<base domain>` and point a CNAME at the
+4. Add the custom domain for the signup surface (`signup.passband.app` — the
+   product domain, never the tenant base domain) and point a CNAME at the
    Railway target. The same hostname must be registered as an authorized
-   redirect URI (`https://signup.<base domain>/oauth/callback`) on the web
+   redirect URI (`https://signup.passband.app/oauth/callback`) on the web
    OAuth client in Google Cloud Console.
 5. Health check: `GET /healthz`.
 
-DNS for the rest of the hosted tier (`*.<base domain>` and
-`warden.<base domain>` pointing at the k3s node) is in `deploy/hosted/SETUP.md`.
+DNS for the rest of the hosted tier (`*.<base domain>` tenant wildcard and
+`warden.passband.app` pointing at the k3s node) is in `deploy/hosted/SETUP.md`.
 
 ## Notes on the surface
 

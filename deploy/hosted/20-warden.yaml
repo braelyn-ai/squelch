@@ -182,17 +182,17 @@ metadata:
 spec:
   ingressClassName: traefik
   tls:
-    # The wildcard certificate does NOT cover this host: `*.passband.email`
-    # matches one label, and `warden.passband.email` is one label, so it does.
-    # A cert-manager Certificate for the wildcard with `warden.<base>` as an
-    # extra DNS name is what 40-wildcard-certificate.yaml requests.
+    # The warden lives on the PRODUCT domain, not the tenant one: `*.passband.email`
+    # is reserved to mean "a tenant" and nothing else, so internal surfaces go
+    # through passband.app. 40-wildcard-certificate.yaml issues warden-tls for
+    # this single host over HTTP-01.
     - hosts:
         # 4. EDIT ME
-        - warden.passband.email
+        - warden.passband.app
       secretName: warden-tls
   rules:
     # 4. EDIT ME
-    - host: warden.passband.email
+    - host: warden.passband.app
       http:
         paths:
           # Unlike a tenant vhost, every path here goes to the service: the
