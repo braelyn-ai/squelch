@@ -191,6 +191,13 @@ a lost code is re-issued, never recovered.
   is ever served from the internet.
 - **Google verification + CASA Tier 2** — the restricted-scope cap is 100 users.
   This gates user 101 and has the longest lead time of anything on this list.
+- **Public Suffix List entry for `passband.email`** — a PR to `publicsuffix/list`
+  (private section, plus a `_psl` TXT record) makes browsers treat every tenant
+  subdomain as its own registrable domain: no cross-tenant cookies, per-tenant
+  SameSite boundaries — the `github.io` treatment. Low urgency while tenant
+  vhosts serve only the bearer-authed API, but file it well before any
+  browser-facing surface: propagation into shipped browsers takes weeks and
+  listing is effectively permanent.
 - **USPTO trademark search** — a collision search found no software product
   named Passband; a proper search is still owed before paperwork is filed under
   the name (`docs/HOSTED.md`, "Naming").

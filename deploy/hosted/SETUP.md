@@ -182,9 +182,10 @@ Then point local-path at it. The durable way is the k3s server flag, because it
 is what renders the provisioner's config in the first place:
 
 ```sh
-# In the k3s systemd unit's ExecStart (or INSTALL_K3S_EXEC on a fresh install):
-#   --default-local-storage-path /mnt/tenant-data
-systemctl daemon-reload && systemctl restart k3s
+# /etc/rancher/k3s/config.yaml is how k3s takes server flags durably: it
+# survives upgrades AND re-runs of the install script, which rewrite the unit.
+echo "default-local-storage-path: /mnt/tenant-data" >> /etc/rancher/k3s/config.yaml
+systemctl restart k3s
 kubectl -n kube-system get cm local-path-config -o jsonpath='{.data.config\.json}'; echo
 kubectl -n kube-system rollout restart deploy/local-path-provisioner
 ```
