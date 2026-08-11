@@ -1,10 +1,14 @@
 # What the warden itself may reach.
 #
-# CHECK THE CIDR BEFORE APPLYING. The egress rule names the Kubernetes API by
-# its in-cluster Service address, which on a default k3s is 10.43.0.1. Confirm
-# with:
+# CHECK BOTH CIDRS BEFORE APPLYING. The API server must be allowed by BOTH its
+# in-cluster Service address AND its real endpoint, because kube-router
+# evaluates egress AFTER the Service VIP is DNATed to the endpoint — an
+# allowlist naming only 10.43.0.1 matches no packet that actually leaves the
+# pod (learned live: the warden's first provision failed `cluster_unavailable`
+# until the endpoint was added). Confirm both with:
 #
 #     kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}'
+#     kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes
 #
 # If you passed --service-cidr to k3s, put your address here or the warden will
 # come up and be unable to do anything at all.
@@ -72,9 +76,19 @@ spec:
         - protocol: TCP
           port: 53
     - to:
-        # CHECK ME (see the header).
+        # CHECK ME (see the header). The Service VIP, kept for CNIs that
+        # evaluate pre-DNAT.
         - ipBlock:
             cidr: 10.43.0.1/32
       ports:
         - protocol: TCP
           port: 443
+    - to:
+        # CHECK ME (see the header). The API server's REAL endpoint - on a
+        # single-node k3s this is the node's own IP, and post-DNAT this is the
+        # address kube-router actually filters on.
+        - ipBlock:
+            cidr: 5.78.205.240/32
+      ports:
+        - protocol: TCP
+          port: 6443
