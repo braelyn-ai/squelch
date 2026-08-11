@@ -1,0 +1,13 @@
+# Railway deployment config for the blackbox exporter (Dockerfile.blackbox).
+# Selected in the service's settings under "Config-as-code file path"
+# (deploy/DEPLOY.md §8). Private networking only: never mint a public domain
+# for this service.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.blackbox"
+
+[deploy]
+healthcheckPath = "/-/healthy"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5

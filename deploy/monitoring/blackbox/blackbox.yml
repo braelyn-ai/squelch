@@ -1,0 +1,12 @@
+# Blackbox exporter modules. http_2xx is all we use today: follow redirects,
+# require a 2xx, record TLS expiry (probe_ssl_earliest_cert_expiry comes free
+# with any https probe). No public domain is ever minted for this service —
+# Prometheus reaches it over Railway private networking only.
+modules:
+  http_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      follow_redirects: true
+      fail_if_not_ssl: true

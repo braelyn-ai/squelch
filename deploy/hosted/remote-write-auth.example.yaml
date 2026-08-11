@@ -1,0 +1,14 @@
+# The basic-auth password prometheus-agent uses to push metrics to the Railway
+# Prometheus receiver. Same value as PROM_REMOTE_WRITE_PASSWORD on the Railway
+# prometheus service (which also holds its bcrypt hash as PROM_WEB_BCRYPT).
+#
+# Create imperatively — never commit the real value:
+#   kubectl -n monitoring create secret generic remote-write-auth \
+#     --from-literal=password='<the value>'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: remote-write-auth
+  namespace: monitoring
+stringData:
+  password: REPLACE-ME

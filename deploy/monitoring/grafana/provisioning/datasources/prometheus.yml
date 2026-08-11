@@ -1,0 +1,20 @@
+# Provisioned datasource: the Prometheus service in this same Railway project,
+# over private networking. PROM_PASSWORD is a Grafana service variable holding
+# the same value as Prometheus's PROM_REMOTE_WRITE_PASSWORD (one credential,
+# two names, because each service names its own env).
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus.railway.internal:9090
+    isDefault: true
+    basicAuth: true
+    basicAuthUser: remote
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 30s
+    secureJsonData:
+      basicAuthPassword: $PROM_PASSWORD

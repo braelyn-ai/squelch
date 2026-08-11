@@ -1,0 +1,5 @@
+# Blackbox exporter for external probes (railway.blackbox.toml). Private
+# networking only — do not mint a public domain for this service.
+FROM prom/blackbox-exporter:v0.25.0
+COPY deploy/monitoring/blackbox/blackbox.yml /etc/blackbox_exporter/config.yml
+EXPOSE 9115

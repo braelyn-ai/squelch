@@ -1,0 +1,13 @@
+# Railway deployment config for the monitoring Prometheus
+# (Dockerfile.prometheus). Selected in the service's settings under
+# "Config-as-code file path" — the setting, not RAILWAY_DOCKERFILE_PATH,
+# because the root railway.toml outranks the variable (deploy/DEPLOY.md §8).
+# No healthcheckPath: Prometheus sits entirely behind basic auth and Railway's
+# checker cannot send credentials.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.prometheus"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5

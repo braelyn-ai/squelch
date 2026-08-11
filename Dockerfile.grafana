@@ -1,0 +1,7 @@
+# Grafana for the monitoring stack on Railway (railway.grafana.toml).
+# Dashboards and the datasource are provisioned from files baked in here, so
+# the dashboard is code-reviewed in this repo, not hand-edited in a UI.
+FROM grafana/grafana:12.2.0
+COPY deploy/monitoring/grafana/provisioning /etc/grafana/provisioning
+COPY deploy/monitoring/grafana/dashboards /etc/grafana/dashboards
+EXPOSE 3000

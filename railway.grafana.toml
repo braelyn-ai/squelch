@@ -1,0 +1,11 @@
+# Railway deployment config for Grafana (Dockerfile.grafana). Selected in the
+# service's settings under "Config-as-code file path" (deploy/DEPLOY.md §8).
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.grafana"
+
+[deploy]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5

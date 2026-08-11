@@ -1,0 +1,9 @@
+# Prometheus for the monitoring stack on Railway (railway.prometheus.toml).
+# Root user because the Railway volume at /prometheus mounts root-owned and the
+# stock image's nobody user cannot write it.
+FROM prom/prometheus:v3.5.0
+USER root
+COPY deploy/monitoring/prometheus/prometheus.yml /etc/prometheus/prometheus.yml
+COPY deploy/monitoring/prometheus/entrypoint.sh /entrypoint.sh
+EXPOSE 9090
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]

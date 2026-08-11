@@ -1,0 +1,45 @@
+# Prometheus on Railway: the storage half of hosted monitoring.
+#
+# Metrics arrive two ways:
+#   1. remote_write PUSHED from prometheus-agent on carrier (see
+#      deploy/hosted/80-monitoring.yaml) — carrier's firewall stays inbound
+#      22/80/443 because the agent only ever dials OUT to this receiver.
+#   2. Blackbox probes scraped from here, so uptime is measured from OUTSIDE
+#      the box being watched. A dead carrier still produces probe_success==0.
+#
+# Auth: every route (including /api/v1/write) sits behind basic auth via
+# web.yml, which the entrypoint renders from env at boot. The scrape of our own
+# blackbox sidecar rides Railway private networking and needs no auth.
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - https://signup.passband.app/healthz
+          - https://warden.passband.app/healthz
+          - https://passband.app/
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox.railway.internal:9115
+
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: [blackbox.railway.internal:9115]
+
+  - job_name: prometheus
+    basic_auth:
+      username: remote
+      password_file: /etc/prometheus/password
+    static_configs:
+      - targets: [localhost:9090]
