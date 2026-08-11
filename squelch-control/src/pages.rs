@@ -21,8 +21,13 @@ use axum::{
 /// The Content-Security-Policy every page carries. The single allowance is the
 /// inline `<style>`; `frame-ancestors 'none'` (with the older `X-Frame-Options`
 /// beside it) keeps a signup decision from being framed inside someone else's
-/// page. `form-action 'self'` keeps the one form on the page posting here.
-const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+/// page. `form-action` names accounts.google.com as well as 'self' because
+/// Chrome enforces form-action against the REDIRECT TARGET of a form
+/// submission (a long-standing, spec-contested behavior): POST /signup answers
+/// 303 to Google consent, and under `form-action 'self'` Chrome silently eats
+/// that navigation - the button "does nothing" while the server logs a
+/// perfectly healthy signup. Found live on the first real signup, 2026-08-11.
+const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://accounts.google.com; frame-ancestors 'none'; base-uri 'none'";
 
 /// Escape text for HTML.
 pub fn escape_html(s: &str) -> String {
