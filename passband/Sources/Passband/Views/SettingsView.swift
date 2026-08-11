@@ -22,6 +22,7 @@ struct SettingsView: View {
                         case .general:
                             ConnectionSection()
                             AppearanceSection()
+                            NotificationsSection()
                             DeveloperSection()
                             YouSection()
                         case .mail:
@@ -353,6 +354,39 @@ private struct AppearanceSection: View {
             }
             SettingsHint("Auto follows the system appearance. \\ flips light/dark from anywhere.")
         }
+    }
+}
+
+/// The banner chime. Picking an option plays it once, right here — judging a
+/// half-second sound from its name alone is not a thing.
+private struct NotificationsSection: View {
+    @Environment(Prefs.self) private var prefs
+    /// Held for the duration of playback: NSSound stops when deallocated.
+    @State private var player: NSSound?
+
+    var body: some View {
+        @Bindable var prefs = prefs
+        SectionCard(label: "Notifications") {
+            InlineRow(key: "sound") {
+                GlassSegmented(
+                    options: NotificationSound.allCases.map { ($0, $0.label) },
+                    selection: $prefs.notificationSound)
+            }
+            SettingsHint(
+                "Chimes on urgent and deadline banners. Surfaced mail stays silent either way."
+            )
+        }
+        .onChange(of: prefs.notificationSound) { _, choice in preview(choice) }
+    }
+
+    private func preview(_ choice: NotificationSound) {
+        guard let resource = choice.resourceName,
+            let url = Bundle.main.url(
+                forResource: resource, withExtension: "caf", subdirectory: "Sounds")
+        else { return }
+        player?.stop()
+        player = NSSound(contentsOf: url, byReference: true)
+        player?.play()
     }
 }
 

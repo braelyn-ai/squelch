@@ -31,6 +31,42 @@ final class Notifier {
     /// the delegate exists, and a center without one drops it.
     func install() {
         UNUserNotificationCenter.current().delegate = delegate
+        Self.installSounds()
+    }
+
+    /// Copy the bundled chimes into ~/Library/Sounds. UNNotificationSound
+    /// resolves names against that folder reliably; resolution against the app
+    /// bundle is famously flaky on macOS, so the bundle is treated purely as the
+    /// shipping vehicle. Idempotent: a copy that already matches by size is
+    /// left alone, and any failure just means the system default plays.
+    private static func installSounds() {
+        let fm = FileManager.default
+        guard let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first
+        else { return }
+        let sounds = library.appendingPathComponent("Sounds", isDirectory: true)
+        try? fm.createDirectory(at: sounds, withIntermediateDirectories: true)
+        for choice in NotificationSound.allCases {
+            guard let resource = choice.resourceName, let installed = choice.installedFileName,
+                let src = Bundle.main.url(
+                    forResource: resource, withExtension: "caf", subdirectory: "Sounds")
+            else { continue }
+            let dst = sounds.appendingPathComponent(installed)
+            let size = { (url: URL) in
+                (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil
+            }
+            if fm.fileExists(atPath: dst.path) {
+                if size(src) == size(dst) { continue }
+                try? fm.removeItem(at: dst)
+            }
+            try? fm.copyItem(at: src, to: dst)
+        }
+    }
+
+    /// The UN sound for a preference choice. Falls back to the system default
+    /// for `.system` (and, at delivery time, for an installed file gone missing).
+    static func sound(for choice: NotificationSound) -> UNNotificationSound {
+        guard let installed = choice.installedFileName else { return .default }
+        return UNNotificationSound(named: UNNotificationSoundName(installed))
     }
 
     /// Ask for the alert/sound grant, once per launch. A denial is not worth
@@ -123,7 +159,7 @@ final class Notifier {
         content.body = copy.body
         content.threadIdentifier = copy.threadIdentifier
         content.userInfo = [Self.threadKey: event.thread_id, Self.eventKey: event.id]
-        if copy.sound { content.sound = .default }
+        if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
 
         // The event id as the REQUEST id makes a re-delivered frame (a replay
         // overlapping the live seam after a reconnect) replace its own banner

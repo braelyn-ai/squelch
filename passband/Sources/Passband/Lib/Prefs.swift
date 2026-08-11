@@ -44,6 +44,35 @@ enum TelemetryLevel: String, CaseIterable, Sendable {
     }
 }
 
+/// The banner chime. `system` is the macOS default alert; the rest are bundled
+/// CAFs named for what they are on the air. Referenced by file name because
+/// UNNotificationSound only resolves names, never paths — Notifier installs the
+/// files where the system looks (see `Notifier.installSounds`).
+enum NotificationSound: String, CaseIterable, Sendable {
+    case system, squelch, `static`, morse, carrier
+
+    var label: String {
+        switch self {
+        case .system: "Default"
+        case .squelch: "Squelch"
+        case .static: "Static"
+        case .morse: "Morse"
+        case .carrier: "Carrier"
+        }
+    }
+
+    /// Bundle resource name under Resources/Sounds, nil for the system sound.
+    var resourceName: String? {
+        self == .system ? nil : label
+    }
+
+    /// The file name in ~/Library/Sounds — prefixed, because that folder is
+    /// shared by every app on the machine and shows up in system sound pickers.
+    var installedFileName: String? {
+        resourceName.map { "Passband \($0).caf" }
+    }
+}
+
 /// Two palettes selected explicitly; `system` follows the OS and is the default.
 enum ThemeChoice: String, CaseIterable, Sendable {
     case system, light, dark
@@ -78,6 +107,7 @@ final class Prefs {
         static let rankWeight = "passband.pref.rankWeight"
         static let developerMode = "passband.pref.developerMode"
         static let theme = "passband.pref.theme"
+        static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
         static let signature = "passband.pref.signature"
         static let assistantModel = "passband.assistant.model"
@@ -91,6 +121,7 @@ final class Prefs {
             Key.rankWeight: defaultRankWeight,
             Key.developerMode: false,
             Key.theme: ThemeChoice.system.rawValue,
+            Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
         ])
         _loadRemoteImages = defaults.bool(forKey: Key.loadRemoteImages)
@@ -100,6 +131,9 @@ final class Prefs {
         _rankWeight = defaults.double(forKey: Key.rankWeight)
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
+        _notificationSound =
+            NotificationSound(rawValue: defaults.string(forKey: Key.notificationSound) ?? "")
+            ?? .system
         _telemetry =
             TelemetryLevel(rawValue: defaults.string(forKey: Key.telemetry) ?? "") ?? .full
         _userName = defaults.string(forKey: Key.userName) ?? ""
@@ -167,6 +201,15 @@ final class Prefs {
         set {
             _theme = newValue
             defaults.set(newValue.rawValue, forKey: Key.theme)
+        }
+    }
+
+    private var _notificationSound: NotificationSound
+    var notificationSound: NotificationSound {
+        get { _notificationSound }
+        set {
+            _notificationSound = newValue
+            defaults.set(newValue.rawValue, forKey: Key.notificationSound)
         }
     }
 
