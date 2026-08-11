@@ -1,3 +1,5 @@
+import { useEffect, useMemo, useRef } from "react";
+
 // The background is a procedurally repeated fake inbox: the drudgery Passband
 // exists to kill, blurred into wallpaper so the pitch sits on top of it.
 // Snippets are written long so rows run the full viewport width.
@@ -114,18 +116,74 @@ const styles = {
 } as const;
 
 function FakeInbox() {
-  // Enough rows to cover any viewport; cycle the list so it never runs out.
-  const rows = Array.from({ length: 60 }, (_, i) => FAKE_EMAILS[i % FAKE_EMAILS.length]);
+  // One randomized batch of rows, rendered twice so the scroll can wrap
+  // seamlessly: when the offset passes one copy's height it resets mod that
+  // height and the second copy is pixel-identical to where the first began.
+  const rows = useMemo(
+    () =>
+      Array.from({ length: 60 }, () => {
+        const [sender, subject, snippet] =
+          FAKE_EMAILS[Math.floor(Math.random() * FAKE_EMAILS.length)];
+        const h = Math.floor(Math.random() * 12) + 1;
+        const m = String(Math.floor(Math.random() * 60)).padStart(2, "0");
+        const ampm = Math.random() < 0.5 ? "AM" : "PM";
+        return { sender, subject, snippet, time: `${h}:${m} ${ampm}` };
+      }),
+    [],
+  );
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Fake doomscroll: a flick of random distance and speed, a random pause,
+  // repeat forever. rAF drives each flick; timeouts space them out.
+  useEffect(() => {
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    let offset = 0;
+    let raf = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    let cancelled = false;
+    const easeOut = (t: number) => 1 - Math.pow(1 - t, 3);
+
+    const flick = () => {
+      if (cancelled) return;
+      const distance = 40 + Math.random() * 360;
+      const duration = 350 + Math.random() * 900;
+      const from = offset;
+      const start = performance.now();
+      const frame = (now: number) => {
+        if (cancelled) return;
+        const t = Math.min(1, (now - start) / duration);
+        offset = from + distance * easeOut(t);
+        const wrap = el.scrollHeight / 2 || 1;
+        el.style.transform = `translateY(-${offset % wrap}px)`;
+        if (t < 1) raf = requestAnimationFrame(frame);
+        else timer = setTimeout(flick, 250 + Math.random() * 2200);
+      };
+      raf = requestAnimationFrame(frame);
+    };
+
+    timer = setTimeout(flick, 600);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      clearTimeout(timer);
+    };
+  }, []);
+
   return (
     <div style={styles.inbox} aria-hidden="true">
-      {rows.map(([sender, subject, snippet], i) => (
-        <div key={i} style={styles.row}>
-          <span style={styles.sender}>{sender}</span>
-          <span style={styles.subject}>{subject}</span>
-          <span style={styles.snippet}>{snippet}</span>
-          <span style={styles.time}>{`${(i * 7) % 12 || 12}:${String((i * 13) % 60).padStart(2, "0")} ${i % 2 ? "AM" : "PM"}`}</span>
-        </div>
-      ))}
+      <div ref={scrollRef} style={{ willChange: "transform" }}>
+        {[...rows, ...rows].map(({ sender, subject, snippet, time }, i) => (
+          <div key={i} style={styles.row}>
+            <span style={styles.sender}>{sender}</span>
+            <span style={styles.subject}>{subject}</span>
+            <span style={styles.snippet}>{snippet}</span>
+            <span style={styles.time}>{time}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -144,7 +202,7 @@ export function App() {
           style={{ borderRadius: "1.5rem" }}
         />
         <h1 style={styles.title}>Passband</h1>
-        <p style={styles.tagline}>fuck email. its time to make it bearable</p>
+        <p style={styles.tagline}>fuck email. lets make it bearable</p>
         <a
           style={{
             padding: "0.6rem 1.4rem",
