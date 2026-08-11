@@ -22,7 +22,7 @@ spec:
   acme:
     server: https://acme-v02.api.letsencrypt.org/directory
     # EDIT ME. Where expiry warnings go.
-    email: you@example.com
+    email: bboynton97@gmail.com
     privateKeySecretRef:
       name: letsencrypt-account-key
     solvers:
