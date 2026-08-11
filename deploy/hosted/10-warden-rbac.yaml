@@ -63,11 +63,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
-  # `squelchd pair`, run inside the tenant's own pod. This is the one verb here
+  # `squelchd pair`, run inside the tenant's own pod. This is the one rule here
   # that can reach a tenant's data, and it is why the warden's token matters.
+  # BOTH verbs are load-bearing: the API server maps the HTTP verb to the RBAC
+  # verb, so SPDY exec (POST) authorizes as `create` while WebSocket exec (GET,
+  # which is what kube-rs sends) authorizes as `get`. Trimming "unused" get here
+  # broke pairing with a 403 the first time this ran against a real cluster.
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create"]
+    verbs: ["get", "create"]
   # `get` for the status derivation (a ready replica is what `active` means).
   - apiGroups: ["apps"]
     resources: ["deployments"]

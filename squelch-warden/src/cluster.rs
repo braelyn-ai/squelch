@@ -27,6 +27,7 @@ use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::client::UpgradeConnectionError;
 use kube::{Api, Client, Resource};
 use tokio::io::AsyncReadExt;
 
@@ -141,6 +142,24 @@ impl ClusterError {
         match self {
             Self::Api { op, source } => match source.as_ref() {
                 kube::Error::Api(response) => format!("api({op}): http {}", response.code),
+                // The exec path only. `pods/exec` is a WebSocket, and
+                // `Client::connect` does NOT turn a non-101 answer into
+                // `Error::Api` the way an ordinary request does — it reports
+                // the missing upgrade instead. Flattening that into a bare
+                // `transport` threw away the one number that names the cause:
+                // 403 for a `pods/exec` grant the Role does not carry, 404 for
+                // a container name that is not in the pod, and anything at all
+                // if the connection ever ends up on HTTP/2, which cannot carry
+                // an upgrade at all. A status code is a number the branch
+                // above already logs, not request content, so this stays as
+                // log-safe as it was.
+                kube::Error::UpgradeConnection(UpgradeConnectionError::ProtocolSwitch(status)) => {
+                    format!("api({op}): transport(upgrade) http {}", status.as_u16())
+                }
+                // The remaining upgrade failures are handshake mismatches: the
+                // fact that the handshake is what broke is the whole message,
+                // and their payloads (a hyper error, a key) are not for logs.
+                kube::Error::UpgradeConnection(_) => format!("api({op}): transport(upgrade)"),
                 // Not a response: a transport, TLS or decode failure, whose
                 // variant name says everything a log line should.
                 _ => format!("api({op}): transport"),
@@ -194,6 +213,32 @@ pub struct KubeCluster {
 impl KubeCluster {
     /// Connect using the pod's ServiceAccount. Fails at startup if the warden
     /// is not running in a cluster, which is the only place it is meant to run.
+    ///
+    /// ## This client has to speak HTTP/1.1, and it is one line for a reason
+    ///
+    /// [`Cluster::exec`] is `pods/exec`, and `pods/exec` is a WebSocket: the
+    /// request goes out with `Connection: Upgrade` and the API server answers
+    /// `101 Switching Protocols`. HTTP/2 has no 101 — a stream there is
+    /// multiplexed, never handed over — so an exec dispatched on an h2
+    /// connection dies at the transport in under a millisecond while every
+    /// plain request sharing that same pool keeps working. Nothing but pairing
+    /// breaks, which is what makes the failure so easy to misread.
+    ///
+    /// [`Client::try_default`] is the safe construction, and it is safe on
+    /// purpose rather than by luck: kube-rs builds its rustls connector with
+    /// `enable_http1()` and nothing else, and hyper-rustls leaves
+    /// `alpn_protocols` EMPTY in exactly that state. An empty ALPN list is
+    /// never offered, so the API server cannot select `h2`, so hyper's pool
+    /// takes its HTTP/1.1 path — the one that carries upgrades. The warden is
+    /// a handful of calls per signup; multiplexing has nothing to win here.
+    ///
+    /// So do not hand-roll a connector for this. `enable_all_versions()`,
+    /// `enable_http2()` and any `HttpsConnector::from((http, tls_config))`
+    /// carrying an ALPN list of your own all put `h2` on the wire, and all of
+    /// them break pairing and only pairing. Today the image is built with
+    /// `cargo build -p squelch-warden`, which resolves hyper-rustls without its
+    /// `http2` feature, so the first two would not even compile — treat that as
+    /// a second lock rather than as the reason this comment is unnecessary.
     pub async fn connect(namespace: String) -> Result<Self, kube::Error> {
         Ok(Self {
             client: Client::try_default().await?,
@@ -549,6 +594,56 @@ mod tests {
             }
             .summary(),
             "refused tenants/alice"
+        );
+    }
+
+    /// The one transport failure that gets a word, because the word is the
+    /// diagnosis. `Client::connect` does not raise a non-101 answer as
+    /// `Error::Api`, so a refused or misaddressed exec used to land in the same
+    /// bare `transport` bucket as a TLS failure — and an exec that reached an
+    /// HTTP/2 connection, which can never carry an upgrade, landed there too.
+    /// The status is a number, so this costs nothing in privacy.
+    #[test]
+    fn an_exec_that_never_reached_101_says_which_kind_of_never() {
+        // Same `http` crate kube parses responses with: axum re-exports it and
+        // the workspace resolves exactly one 1.x.
+        use axum::http::StatusCode;
+
+        let upgrade = |e: UpgradeConnectionError| ClusterError::Api {
+            op: "exec",
+            source: Box::new(kube::Error::UpgradeConnection(e)),
+        };
+
+        // What a Role without `pods/exec` produces, and what an h2 connection
+        // or a stray reverse proxy would produce: an answer that was not 101.
+        assert_eq!(
+            upgrade(UpgradeConnectionError::ProtocolSwitch(StatusCode::FORBIDDEN)).summary(),
+            "api(exec): transport(upgrade) http 403"
+        );
+        assert_eq!(
+            upgrade(UpgradeConnectionError::ProtocolSwitch(StatusCode::NOT_FOUND)).summary(),
+            "api(exec): transport(upgrade) http 404"
+        );
+
+        // A handshake that got its 101 and then disagreed. No payload printed.
+        for mismatch in [
+            UpgradeConnectionError::MissingUpgradeWebSocketHeader,
+            UpgradeConnectionError::MissingConnectionUpgradeHeader,
+            UpgradeConnectionError::SecWebSocketAcceptKeyMismatch,
+            UpgradeConnectionError::SecWebSocketProtocolMismatch,
+        ] {
+            assert_eq!(upgrade(mismatch).summary(), "api(exec): transport(upgrade)");
+        }
+
+        // Everything that is not an upgrade failure stays exactly as terse as
+        // it was: the hint is additive, not a loosening.
+        assert_eq!(
+            ClusterError::Api {
+                op: "exec",
+                source: Box::new(kube::Error::LinesCodecMaxLineLengthExceeded),
+            }
+            .summary(),
+            "api(exec): transport"
         );
     }
 
