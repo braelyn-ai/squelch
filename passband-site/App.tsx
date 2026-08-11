@@ -14,6 +14,15 @@ const styles = {
     fontWeight: 600,
     margin: 0,
   },
+  blurb: {
+    maxWidth: "34rem",
+    margin: 0,
+    padding: "0 1.5rem",
+    textAlign: "center",
+    color: "#444",
+    fontSize: "1.05rem",
+    lineHeight: 1.6,
+  },
   link: {
     color: "#555",
     fontSize: "1rem",
@@ -23,7 +32,21 @@ const styles = {
 export function App() {
   return (
     <main style={styles.page}>
+      <img
+        src="/knob.png"
+        alt="Passband"
+        width={112}
+        height={112}
+        style={{ borderRadius: "1.5rem" }}
+      />
       <h1 style={styles.title}>Passband</h1>
+      <p style={styles.blurb}>
+        Email with the noise squelched. Passband filters your inbox the way a
+        radio filters a channel: mail from real people comes through, while
+        newsletters, receipts, and notification spam fade into the background.
+        It runs on your own machine against your Gmail account, and the whole
+        thing is open source.
+      </p>
       <a
         style={{
           padding: "0.6rem 1.4rem",
