@@ -1,7 +1,11 @@
 # Grafana for the monitoring stack on Railway (railway.grafana.toml).
 # Dashboards and the datasource are provisioned from files baked in here, so
 # the dashboard is code-reviewed in this repo, not hand-edited in a UI.
+# Root user for the same reason as Dockerfile.prometheus: the Railway volume
+# at /var/lib/grafana mounts root-owned and Grafana's stock uid 472 cannot
+# write it.
 FROM grafana/grafana:12.2.0
+USER root
 COPY deploy/monitoring/grafana/provisioning /etc/grafana/provisioning
 COPY deploy/monitoring/grafana/dashboards /etc/grafana/dashboards
 EXPOSE 3000
