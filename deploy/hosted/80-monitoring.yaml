@@ -267,7 +267,7 @@ data:
             action: keep
 
     remote_write:
-      - url: https://REPLACE-WITH-PROMETHEUS-DOMAIN/api/v1/write
+      - url: https://prometheus-production-2d43.up.railway.app/api/v1/write
         basic_auth:
           username: remote
           password_file: /etc/prometheus/secrets/remote-write/password
