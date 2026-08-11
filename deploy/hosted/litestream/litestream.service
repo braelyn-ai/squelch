@@ -1,0 +1,122 @@
+# /etc/systemd/system/litestream.service
+#
+# ONE litestream process on the host, streaming every tenant's SQLite database
+# to Cloudflare R2. Not a sidecar in each tenant pod: a sidecar needs the R2
+# write credential inside the pod, so one compromised tenant could delete every
+# other tenant's backups. Here the credential stays with root, which already
+# owns the disk those databases sit on. See README.md in this directory.
+#
+# The litestream .deb ships its own unit at
+# /usr/lib/systemd/system/litestream.service (Description, Restart=always,
+# ExecStart, WantedBy -- no hardening, no EnvironmentFile). A unit of the same
+# name in /etc/systemd/system OUTRANKS it, which is what this file is doing.
+# Install it there, `systemctl daemon-reload`, and confirm with:
+#
+#   systemctl cat litestream.service | head -1     # expect /etc/systemd/system/...
+#
+# PINNED TO LITESTREAM 0.3.13. 0.3.x is the last line with client-side age
+# encryption; 0.5.x deleted it. Do not let an unattended upgrade move this --
+# and note that the 0.5 config schema differs in a way that parses cleanly and
+# replicates nothing. See README.md in this directory.
+#
+# EDIT ME: /mnt/tenant-data appears twice below. It is the block-volume mount
+# from SETUP.md, i.e. the k3s --default-local-storage-path. If you never
+# repointed local-path, it is /var/lib/rancher/k3s/storage.
+
+[Unit]
+Description=Litestream: stream tenant SQLite databases to Cloudflare R2
+Documentation=https://litestream.io/ file:///usr/local/bin/litestream-sync-config.sh
+
+# Object storage needs a default route and working DNS, not merely a NIC that
+# exists. network.target is not that promise; network-online.target is.
+After=network-online.target
+Wants=network-online.target
+
+# The tenant databases live on the block volume. Started before it is mounted,
+# litestream finds nothing at every configured path and backs up nothing while
+# looking perfectly healthy. Make the mount a hard prerequisite instead.
+RequiresMountsFor=/mnt/tenant-data
+
+[Service]
+Type=simple
+
+# The whole point of the split: /etc/litestream.yml is generated, contains only
+# ${LITESTREAM_R2_*} and ${LITESTREAM_AGE_RECIPIENT} placeholders, and is safe
+# to read. The actual R2 keys enter the process here and nowhere else.
+# root:root 0600 -- litestream-sync-config.sh refuses to run if it is anything
+# looser.
+#
+# What is NOT in that file, deliberately: the age IDENTITY. This process needs
+# only the public recipient to seal a backup, so the daemon that runs around the
+# clock cannot open one. Restores load the identity by hand, into one shell,
+# for minutes. See README.md -> "Encryption".
+EnvironmentFile=/etc/litestream/env
+
+# No -config flag: /etc/litestream.yml is litestream's default, which keeps
+# every ad-hoc `litestream databases` / `generations` / `snapshots` you type at
+# 3am pointed at the same file the daemon is using. (0.3.x has no `status` and
+# no `ltx`; those are 0.5 commands.)
+ExecStart=/usr/bin/litestream replicate
+
+Restart=always
+RestartSec=5
+# litestream-sync-config.sh restarts this unit whenever a tenant appears, and a
+# 90s default stop timeout would stall that behind a hung upload.
+TimeoutStopSec=30
+
+# --- Hardening -------------------------------------------------------------
+# This process is root with network access and write access to every tenant's
+# mailbox, so it is worth boxing in. If it ever fails to start after an upgrade,
+# comment out SystemCallFilter first and RestrictAddressFamilies second; those
+# are the two that break when a dependency changes how it talks to the kernel.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Read-only everywhere except the two places it has business writing.
+#
+# No leading "-" on either path, on purpose: systemd refuses to start a unit
+# whose ReadWritePaths do not exist. If the block volume is not mounted, this
+# unit failing loudly is strictly better than it starting and replicating
+# nothing. That is also why RequiresMountsFor= is above.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/litestream /mnt/tenant-data
+
+# NOT set: UMask=0077, which `systemd-analyze security` will nag about. SQLite
+# creates -wal and -shm files next to each tenant database and the TENANT'S POD
+# has to be able to open them. A tight umask here risks a file the pod cannot
+# read, i.e. breaking the mailbox in order to harden the backup of it. SQLite
+# matches those files to the database's own mode, so leave this alone.
+
+# WHY IT STILL NEEDS WRITE ON THE TENANT VOLUME: litestream is a SQLite client.
+# It checkpoints the WAL and SQLite writes -wal and -shm next to each database,
+# so read-only replication is not a thing that exists. State it plainly rather
+# than let someone discover it: this process can modify tenant mailboxes.
+
+# AF_INET/AF_INET6 for R2, AF_UNIX for the local daemon-control socket and for
+# journald, AF_NETLINK because Go's resolver enumerates interfaces through it.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Runs as root ON PURPOSE -- the tenant PVC directories are owned by the pods'
+# uids (shifted again when user namespaces are on), and no single unprivileged
+# user can read all of them. These two capabilities are what root is actually
+# being used FOR; everything else is dropped.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

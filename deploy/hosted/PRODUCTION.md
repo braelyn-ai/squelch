@@ -153,6 +153,28 @@ The per-tenant identity Secrets are the only irreplaceable thing in this
 cluster. Losing one is a re-consent for that tenant; there is no escrow, by
 design.
 
+## Monitoring
+
+The rule: nothing that judges carrier's health lives on carrier. Full design:
+`deploy/monitoring/README.md`.
+
+- **On carrier**, ns `monitoring` (from `80-monitoring.yaml`): node-exporter,
+  kube-state-metrics, and `prometheus-agent`, which scrapes locally and pushes
+  via `remote_write` — outbound only, the firewall stays 22/80/443.
+- **On Railway**, three more services in the same project, each with its own
+  config-as-code file (the §8 lesson): `prometheus` (receiver + 30d storage,
+  volume at `/prometheus`, `prometheus-production-2d43.up.railway.app`, basic
+  auth on every route), `blackbox` (probes signup/warden/landing from outside;
+  **no public domain, ever**), `grafana` (volume at `/var/lib/grafana`,
+  `grafana-production-00b9.up.railway.app`, the `passband-health` dashboard
+  provisioned from the repo — edit the JSON and redeploy, never the UI).
+- Secrets: `monitoring`/`remote-write-auth` (key `password`) on carrier; the
+  same value as `PROM_REMOTE_WRITE_PASSWORD` + its bcrypt `PROM_WEB_BCRYPT`
+  on the prometheus service; same value again as `PROM_PASSWORD` plus
+  `GF_SECURITY_ADMIN_PASSWORD` on the grafana service.
+- The daemon itself is still a black box to all of this — squelchd `/metrics`
+  is issue #27.
+
 ## Invites
 
 Minted on the control service, not locally — the store is on its volume:
@@ -170,19 +192,82 @@ a lost code is re-issued, never recovered.
 
 ## Backups
 
-- Hetzner server backups: ON, 7 daily, **root disk only**. That covers the k3s
-  datastore, therefore every tenant's identity Secret. Load-bearing.
-- The `passband-tenant-data` volume is **not** covered. Mailbox loss = every
-  tenant re-syncs from Gmail. Slow, not fatal.
-- Litestream is **not** wired up. Still owed.
+Two mechanisms, split by which disk they cover:
 
-`SETUP.md` → "Backups today, stated honestly" has the failure-mode table.
+- **Hetzner server backups: ON, 7 daily, root disk only.** Covers the k3s
+  datastore, therefore every tenant's identity Secret. Load-bearing, and the
+  only thing that covers the Secrets at all.
+- **Litestream → Cloudflare R2: ON** (built 2026-08-10; retargeted to the 0.3.13
+  line for client-side encryption 2026-08-11). Covers the
+  `passband-tenant-data` volume, which Hetzner's snapshots do not.
+
+| | |
+|---|---|
+| What streams | each tenant's SQLite, continuously, from the WAL, **age-encrypted before upload** |
+| From | `/mnt/tenant-data/pvc-<pv-uid>_tenants_<label>-data/squelch.db` |
+| To | `s3://passband-tenant-backups/tenants/<label>/store.db` (R2) |
+| How | **one** systemd service on `carrier` (`litestream.service`), not a sidecar per pod — see below |
+| Discovery | `litestream-config.timer` → `/usr/local/bin/litestream-sync-config.sh` re-renders `/etc/litestream.yml` from the PVC directories every 2 min |
+| Litestream state | `/var/lib/litestream/<label>` (`meta-path`) — off the tenant volume, so a tenant pod cannot touch its own backup bookkeeping |
+| Units | `/etc/systemd/system/{litestream,litestream-config}.service`, `litestream-config.timer`, from `deploy/hosted/litestream/` |
+| Version | litestream **v0.3.13**, upstream `.deb`, `apt-mark hold` |
+
+**Why 0.3.13 and not the current line.** 0.3.x is the last release series with
+client-side age encryption; 0.5.x removed it and refuses to start on a config
+that asks for it. Encrypting the copy handed to a third party outweighs being on
+the maintained line, given the payload is the full text of other people's mail.
+0.3.13 shipped October 2023 and gets no fixes — the mitigation is running the
+restore drill on a schedule. The two lines' config schemas also differ in a way
+that **fails silently**: 0.3 wants `replicas:` (a list), 0.5 wants `replica:`,
+and 0.3.13 accepts the 0.5 shape with zero replicas attached and no error. The
+health check that catches it is `litestream databases` printing `s3` in the
+replicas column.
+
+**Why host-level and not a sidecar.** A sidecar needs the R2 write credential
+inside every tenant pod, and S3-style credentials cannot be scoped to
+"your own prefix, append only" — so one compromised tenant could delete the
+whole fleet's backups. Host-level keeps that credential with root, which already
+owns the disk.
+
+### Key custody
+
+| Secret | Lives | If lost |
+|---|---|---|
+| R2 token (Object Read & Write, scoped to `passband-tenant-backups`) | `/etc/litestream/env` on `carrier`, root:root 0600. Never in git, never in a Secret | mint a new one in the Cloudflare dashboard; nothing is lost |
+| **backup age recipient** (public) | `LITESTREAM_AGE_RECIPIENT` in `/etc/litestream/env` | re-derive with `age-keygen -y` from the identity |
+| **backup age identity** (private) | `/etc/litestream/backup-age.key` on `carrier`, root:root 0600, **and the password manager**. Read by nothing automatically; exported by hand for the minutes a restore takes | **unrecoverable, fleet-wide.** Every backup in R2 becomes permanently unreadable, and nothing tells you until you try to restore |
+| tenant identity Secrets (`<label>-identity`, ns `tenants`) | k3s datastore, encrypted at rest. Covered by the Hetzner snapshot only | **unrecoverable.** Every affected tenant re-consents with Google. No escrow, by design |
+
+**Backups are age-encrypted client-side.** Every snapshot and WAL segment is
+sealed to the recipient before it leaves the box, so R2 objects begin
+`age-encryption.org/v1` and Cloudflare cannot read a tenant's mail index. The
+replicating daemon holds only the public half and therefore cannot open a single
+backup it writes; restores load the identity into one operator shell. A
+compromised bucket on its own discloses nothing. `SETUP.md` §11 step 3 has the
+generation procedure and the custody warning.
+
+**The custody rule this creates.** The backup age identity now sits in the same
+tier as the tenant identity Secrets: kilobytes, off-box, in the password manager,
+or the thing they protect is gone. It is not in the bucket it opens, and it never
+will be.
+
+`SETUP.md` → "Backups today, stated honestly" has the failure-mode table, and
+§11.6/§11.7 have the per-tenant and full-DR restore drills. The first line of the
+DR drill is `systemctl mask litestream.service litestream-config.timer` — on a
+fresh box, a re-provisioned tenant creates an empty database that litestream
+would happily stream over the real history.
 
 ## Open items
 
-- **Litestream** — promised in `docs/HOSTED.md` "from day one", never built. The
-  only thing standing between a bad day and a fleet-wide re-consent is a
-  root-disk snapshot.
+- **A scheduled restore drill.** 0.3.13 is an unmaintained pin (see above) and a
+  backup nobody has restored is a hypothesis. `SETUP.md` §11.6 is the drill; it
+  needs a calendar entry, not just a runbook entry.
+- **Off-box schedule for the two irreplaceable keys** — the tenant identity
+  Secrets and `/etc/litestream/backup-age.key`. Both are still covered only by
+  Hetzner's root-disk snapshot and by whoever remembers to run
+  `kubectl -n tenants get secret -o yaml` and copy the key file. Litestream does
+  not touch Secrets and never will, and it certainly does not back up its own
+  key into the bucket that key opens.
 - **Warden image in CI** — a release-workflow job that publishes
   `squelch-warden` the way `squelchd` is already published. Closes the registry
   gap above.

@@ -232,8 +232,9 @@ Runbook: `deploy/hosted/SETUP.md`. Crate: `squelch-warden/README.md`.
 What changed: kube already has a control loop, a secret store encrypted at rest,
 a network policy engine and an admission controller, and reimplementing four of
 those over systemd units and a JSON state file was the actual cost of the
-"simpler" option. Litestream is dropped for now with it; backups are the Secrets
-and the volumes.
+"simpler" option. Litestream was dropped for now with it; backups are the Secrets
+and the volumes. (It came back on 2026-08-10, as a host-level service rather than
+the per-daemon thing this design imagined — `deploy/hosted/SETUP.md` §11.)
 
 </details>
 
@@ -311,14 +312,38 @@ The actual path, in order:
    Still open from this phase's original list:
    - **`/mcp` bearer auth.** Routed around, not solved: the tenant Ingress simply
      does not publish the agent door. See "Changes to existing code" above.
-   - **Litestream.** The pre-k3s design promised streaming SQLite backup to object
-     storage "from day one"; the k3s rewrite dropped it and nothing replaced it, so
-     say the true thing out loud: today's backup is Hetzner's **root-disk** snapshot,
-     which covers the k3s datastore (every tenant's identity Secret — load-bearing)
-     and does **not** cover the block volume the mailboxes live on. Losing a mailbox
-     costs a slow re-sync from Gmail; losing an identity Secret costs that tenant a
-     re-consent, because there is no escrow. Acceptable at ten tenants, not at a
-     hundred. `deploy/hosted/SETUP.md` → "Backups today, stated honestly" is the
-     operator's version.
+   - **Litestream. BUILT 2026-08-10**, after being owed since the pre-k3s design
+     promised it "from day one"; **client-side encryption added 2026-08-11**.
+     One host-level systemd service on `carrier` streams every tenant's SQLite to
+     Cloudflare R2 continuously, at `tenants/<label>/store.db`, with a timer that
+     discovers new tenants from the PVC directories within two minutes.
+     Deliberately **not** a sidecar per pod: a sidecar puts the object-storage
+     write credential inside every tenant pod, where one compromised tenant could
+     delete the whole fleet's backups. Artifacts in `deploy/hosted/litestream/`;
+     install, verification and both restore drills in `deploy/hosted/SETUP.md`
+     §11 "Backups: Litestream to R2". That closes the mailbox half of the gap —
+     losing the block volume is now minutes of mail rather than a fleet-wide
+     re-sync from Gmail.
+
+     **The backups are age-encrypted under a key we hold.** Every snapshot and
+     WAL segment is sealed before upload, so R2 holds ciphertext and Cloudflare
+     cannot read a tenant's mail index. This is why litestream is **pinned to
+     v0.3.13 and held**: 0.3.x is the last line with age support, 0.5.x removed
+     it and refuses to start on a config that sets it. The trade is running an
+     unmaintained release (October 2023, no fixes) in exchange for not handing a
+     third party a readable copy of other people's mail, and it comes with a
+     schema footgun — 0.3 wants `replicas:` where 0.5 wants `replica:`, and
+     0.3.13 accepts the 0.5 shape silently with zero replicas attached.
+
+     The custody consequence is the thing to carry away: the private half lives
+     at `/etc/litestream/backup-age.key` and in the password manager, and **losing
+     it makes every backup in R2 permanently unreadable, fleet-wide**. It joins
+     the tenant identity Secrets in the tier of things no re-sync can rebuild.
+
+     What it still does not close: **the identity Secrets are not in it.** They
+     live in the k3s datastore, covered only by Hetzner's root-disk snapshot, and
+     losing one is still that tenant re-consenting because there is no escrow.
+     `deploy/hosted/SETUP.md` → "Backups today, stated honestly" is the
+     operator's version, with the per-scenario loss table.
 4. **Phase 3 — grow up:** Gmail push, Stripe, fleet-mode vs Fly Machines decision,
    iOS against hosted.

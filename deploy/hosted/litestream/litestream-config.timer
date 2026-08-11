@@ -1,0 +1,31 @@
+# /etc/systemd/system/litestream-config.timer
+#
+# The thing that notices a new tenant. Nothing on this box is told when a signup
+# finishes; the warden creates a PVC in the cluster and k3s local-path makes a
+# directory on the volume, so the only way to learn about it is to look.
+#
+# Two minutes is the answer to "how long may a brand new mailbox go unreplicated"
+# and nothing else. It costs one directory listing. Shorten it if you like;
+# every tick that finds no change writes nothing and restarts nothing.
+#
+#   systemctl enable --now litestream-config.timer
+#   systemctl list-timers litestream-config.timer
+
+[Unit]
+Description=Re-render /etc/litestream.yml as tenants come and go
+Documentation=file:///usr/local/bin/litestream-sync-config.sh
+
+[Timer]
+Unit=litestream-config.service
+
+# OnUnitActiveSec only starts counting after the first run, so a fresh boot
+# needs OnBootSec to prime it. Without this pair a rebooted box waits for the
+# first manual start before it ever ticks again.
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+# Let systemd coalesce this with other timers. Nothing here is time-critical.
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

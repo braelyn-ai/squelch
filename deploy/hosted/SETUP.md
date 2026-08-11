@@ -212,8 +212,12 @@ the three, which is why 50 GB and grow beats 500 GB and hope.
 
 The thing this does NOT do is back anything up, and it moves the mail out from
 under the one thing that did: provider server snapshots image the ROOT disk, and
-this volume is now deliberately not the root disk. Read "Backups today, stated
-honestly" under Operating notes before you assume otherwise.
+this volume is now deliberately not the root disk. §11 puts a backup back under
+it — Litestream, streaming each tenant's database to R2, age-encrypted — and the
+path you choose here is the path that section scans, so pick it now and keep it.
+Read
+"Backups today, stated honestly" under Operating notes for what each of the two
+mechanisms does and does not cover.
 
 ## 3. cert-manager and the wildcard certificate
 
@@ -558,6 +562,538 @@ baked in at `/data/.local/share/squelch/models` and point
 `SQUELCH_WARDEN_IMAGE` at it. That costs image size and gains node
 independence.
 
+## 11. Backups: Litestream to R2
+
+Everything above this line builds a box where losing one disk loses every
+mailbox on it. This section is the answer, and it is deliberately the last thing
+you install: it wants tenants to exist so you can watch it pick one up.
+
+Litestream tails each tenant's SQLite write-ahead log and streams it to
+Cloudflare R2 continuously, **age-encrypted under a keypair we hold**. The
+recovery objective it buys is **minutes**, not a nightly snapshot's worth of
+hours, and it costs one process and pennies of storage. Artifacts live in
+`deploy/hosted/litestream/`.
+
+**Pinned to litestream 0.3.13, and that is a decision, not staleness.** 0.3.x is
+the last line with client-side age encryption; 0.5.x removed it and refuses to
+start on a config that asks for it. Encrypting the copy we hand to a third party
+is worth more here than being on the maintained line, because the thing being
+replicated is the full text of other people's mail. The cost, stated: 0.3.13
+shipped in October 2023 and receives no fixes. The mitigation is running the
+restore drill in step 6 on a schedule, not after a disaster.
+
+The two lines also disagree about config schema in a way that **fails silently** —
+0.3 wants `replicas:` (a list), 0.5 wants `replica:` (one mapping), and 0.3.13
+accepts a 0.5-shaped config without complaint and attaches zero replicas. If you
+ever hand-edit `/etc/litestream.yml`, `litestream databases` must still print
+`s3` in the replicas column. `deploy/hosted/litestream/README.md` has the full
+table.
+
+**One process on the HOST, not a sidecar in each tenant pod.** This is the
+design decision worth understanding before you install anything, because the
+sidecar is the obvious shape and it is wrong here. A sidecar needs the R2 write
+credential *inside the tenant pod*. S3-style credentials cannot be meaningfully
+scoped to "your own prefix, append only", so every tenant would hold a key that
+can delete every other tenant's backups, and one tenant getting code execution
+in their own pod would become a fleet-wide loss of the exact thing backups exist
+for. Host-level keeps that credential with root, which already owns the disk all
+of these databases sit on — it hands a tenant pod nothing it did not have. The
+price is that litestream must discover tenants itself, which is what the config
+generator in step 4 is for. `deploy/hosted/litestream/README.md` has the full
+ledger, including the costs.
+
+### 1. Install litestream
+
+The Debian package, from the upstream release. **Do not substitute a newer
+tag** — read the pin note above first; 0.5.x cannot do what this section is for.
+Upstream ships a `.deb` for `amd64` and `arm64` at v0.3.13, so this is a package
+install, not a tarball.
+
+```sh
+LS=v0.3.13
+A=$(dpkg --print-architecture)      # amd64 or arm64; note 0.3.x uses dpkg's
+                                    # names, not the x86_64 the 0.5 assets use
+case "$A" in amd64|arm64) ;; *) echo "no 0.3.13 .deb for $A"; exit 1;; esac
+wget "https://github.com/benbjohnson/litestream/releases/download/${LS}/litestream-${LS}-linux-${A}.deb"
+dpkg -i "litestream-${LS}-linux-${A}.deb"
+litestream version     # v0.3.13
+```
+
+Then hold it, because an unattended upgrade to the 0.5 line would take the
+encryption away and, worse, leave a config that parses:
+
+```sh
+apt-mark hold litestream
+```
+
+The package installs `/usr/bin/litestream`, a four-line systemd unit at
+`/usr/lib/systemd/system/litestream.service`, and a placeholder
+`/etc/litestream.yml`. We replace the first two of those; the third gets
+overwritten by the generator. Do **not** `systemctl enable litestream` yet.
+
+You also need `age`, for the keypair in step 3:
+
+```sh
+apt install age
+```
+
+### 2. The R2 bucket and a bucket-scoped token
+
+In the Cloudflare dashboard, on the account that owns `passband.email`:
+
+1. **R2 → Create bucket.** Name it `passband-tenant-backups`. Location: pick the
+   automatic hint nearest the box. There is no reason to make it public and
+   several not to; leave public access off.
+2. **Object lifecycle:** leave it alone. Litestream manages its own retention
+   and a lifecycle rule that expires objects underneath it will quietly eat the
+   history you are paying for.
+3. **R2 → API → Manage API Tokens → Create API Token.**
+   - Permission: **Object Read & Write**. Not Admin.
+   - Specify bucket: **`passband-tenant-backups` only**. This credential is
+     about to live on an internet-facing box; the blast radius of it leaking
+     should be one bucket, not all of R2.
+   - TTL: whatever your rotation appetite is. Expiry here is silent replication
+     failure later, so if you set one, set a calendar reminder with it.
+4. Cloudflare shows the **Access Key ID**, the **Secret Access Key** and the
+   **S3 endpoint** (`<32-hex-account-id>.r2.cloudflarestorage.com`) exactly
+   once. Take all three.
+
+Every tenant is a prefix inside this one bucket
+(`tenants/<label>/store.db`), so there is nothing to create per signup.
+
+### 3. The encryption keypair
+
+One keypair for the whole fleet's backups. Litestream seals every snapshot and
+every WAL segment to it before upload, so what lands in R2 begins
+`age-encryption.org/v1` and Cloudflare holds ciphertext.
+
+```sh
+umask 077
+install -d -m 0700 -o root -g root /etc/litestream
+age-keygen -o /etc/litestream/backup-age.key
+# Public key: age1...        <- this is the RECIPIENT. Copy it.
+chmod 0600 /etc/litestream/backup-age.key
+chown root:root /etc/litestream/backup-age.key
+```
+
+`age-keygen` prints the public key and also writes it into the file's header
+comment; `age-keygen -y /etc/litestream/backup-age.key` re-derives it any time.
+
+The split that makes this worth doing:
+
+| | Where it lives | Who uses it |
+|---|---|---|
+| **recipient** (public) | `LITESTREAM_AGE_RECIPIENT` in `/etc/litestream/env` | the always-running replicator, to seal |
+| **identity** (private) | `/etc/litestream/backup-age.key`, root 0600, read by nothing automatically | a human, exported into one shell, for the minutes a restore takes |
+
+The replicating daemon therefore **cannot decrypt a single backup it writes**.
+That is deliberate, and it is why the identity is not in `/etc/litestream/env`
+next to the R2 keys.
+
+> ## ⚠ THE IDENTITY IS THE BACKUP. PUT IT IN THE PASSWORD MANAGER NOW.
+>
+> **Lose `/etc/litestream/backup-age.key` and every byte in R2 becomes
+> permanently unreadable — by us, by Cloudflare, by anyone. There is no escrow
+> and there is no recovery.**
+>
+> Do it before you start replicating, not after: a backup key that exists only
+> on the machine it protects is not a backup key, it is a second copy of the
+> same failure. Store it beside your tenant identity Secrets dump. Those two
+> things are the entirety of what a re-sync from Gmail cannot rebuild.
+>
+> If it is ever exposed: mint a new pair, change `LITESTREAM_AGE_RECIPIENT`,
+> restart litestream — and **keep the old identity forever**, because every
+> object written before the swap is still sealed to it.
+
+#### What the R2 copy is and is not protected by
+
+**Is:** age encryption with a key that never leaves this box and your password
+manager (X25519 + ChaCha20-Poly1305, client-side, before upload); R2 encryption
+at rest underneath that; TLS in transit; and a token scoped to one bucket.
+
+**Is not:** protection against losing that key — see the warning above — and not
+protection against root on `carrier`, which can read every tenant's live
+database directly and does not need the backups at all (see "Root on the node
+reads everything").
+
+What is *in* these backups, since encryption is not a reason to stop caring:
+
+| Thing | In the R2 backup? |
+|---|---|
+| a tenant's mail index, bodies, subjects, contacts | **yes** — this is the whole point, and it is ciphertext at rest |
+| a tenant's age identity (`<label>-identity`) | no. Kubernetes Secret, k3s datastore, never on this volume |
+| a tenant's sealed Google credential (`credentials.json`) | no. It is on the volume but it is not SQLite, so litestream does not touch it — and it is age ciphertext anyway |
+| the Google OAuth client secret | no |
+| the backup age identity itself | **no, and never** — do not "back up the backup key" into the bucket it opens |
+
+So a compromised R2 bucket, on its own, is not a disclosure at all: it is a pile
+of age files. A compromised bucket **plus** the backup identity is a mail-content
+disclosure, and still not a path to anyone's mailbox, Google account, or
+credential.
+
+### 4. Wire it up
+
+```sh
+cd /path/to/squelch/deploy/hosted/litestream
+
+# The credential. 0600, root, and nothing else on the box reads it.
+install -d -m 0700 -o root -g root /etc/litestream
+install -m 0600 -o root -g root env.example /etc/litestream/env
+${EDITOR:-vi} /etc/litestream/env        # four values from step 2, plus the
+                                         # age RECIPIENT from step 3
+
+# Litestream's own state, off the tenant volume on purpose (see below).
+install -d -m 0700 -o root -g root /var/lib/litestream
+
+# The generator, and the units.
+install -m 0755 -o root -g root litestream-sync-config.sh /usr/local/bin/
+install -m 0644 -o root -g root litestream.service litestream-config.service \
+  litestream-config.timer /etc/systemd/system/
+systemctl daemon-reload
+
+# Our unit outranks the .deb's -- confirm it, don't assume it.
+systemctl cat litestream.service | head -1     # /etc/systemd/system/litestream.service
+```
+
+**Check the tenant root before you go further.** `TENANT_ROOT` at the top of
+`litestream-sync-config.sh`, and `RequiresMountsFor=` in both units, default to
+`/mnt/tenant-data` — the block volume from "Tenant data on a block volume"
+above. If you never repointed local-path, all three are
+`/var/lib/rancher/k3s/storage`. A wrong value here is a service that runs
+happily and backs up nothing.
+
+Then look before you leap:
+
+```sh
+DRY_RUN=1 VERBOSE=1 /usr/local/bin/litestream-sync-config.sh
+```
+
+That prints the config it *would* write and changes nothing. You should see one
+`- path:` block per tenant that has synced at least once, each with a
+`meta-path` under `/var/lib/litestream/`, a `replicas:` **list** whose single
+entry has a path of `tenants/<label>/store.db`, and an `age: recipients:` block.
+If you see zero blocks and you have tenants, the tenant root is wrong. If you
+see credentials or an `age1...` string in that output, stop and file a bug: the
+config is supposed to carry `${LITESTREAM_R2_*}` and
+`${LITESTREAM_AGE_RECIPIENT}` names only, which is the entire reason it is safe
+to read.
+
+The generator refuses, loudly and with the fix, if `/etc/litestream/env` is
+missing a value, is looser than 0600 root, or spells `LITESTREAM_R2_ENDPOINT`
+with an `https://` scheme. That last one is a house rule rather than litestream's
+— it accepts either — but everything downstream here composes
+`https://${LITESTREAM_R2_ENDPOINT}`, and `https://https://` is a miserable thing
+to debug mid-restore.
+
+**If you are moving an existing box onto these artifacts,** rename the variables
+in `/etc/litestream/env` to the canonical set. Litestream 0.3.13 reads exactly
+one variable on its own (`LITESTREAM_CONFIG`); every other name matters only
+because the generated config spells it, so older names like
+`LITESTREAM_ACCESS_KEY_ID`, `R2_ENDPOINT` and `R2_BUCKET` are read by nothing:
+
+| Old | Canonical |
+|---|---|
+| `LITESTREAM_ACCESS_KEY_ID` | `LITESTREAM_R2_ACCESS_KEY_ID` |
+| `LITESTREAM_SECRET_ACCESS_KEY` | `LITESTREAM_R2_SECRET_ACCESS_KEY` |
+| `R2_ENDPOINT` (with `https://`) | `LITESTREAM_R2_ENDPOINT` (bare host) |
+| `R2_BUCKET` | `LITESTREAM_R2_BUCKET` |
+| — | `LITESTREAM_AGE_RECIPIENT` (new, required) |
+
+Happy? Start it:
+
+```sh
+systemctl enable --now litestream-config.timer
+systemctl start litestream-config          # don't wait 2 minutes for the first tick
+systemctl enable --now litestream
+systemctl status litestream litestream-config.timer
+```
+
+Order matters slightly: the timer renders the config, and litestream started
+against the .deb's placeholder simply logs "no databases specified in
+configuration" and idles until the next render. It does not exit, so there is no
+crash loop either way.
+
+**Why litestream's state lives in `/var/lib/litestream/<label>`.** Its default
+is a hidden `.squelch.db-litestream` directory beside the database — which is
+*inside the volume the tenant's own pod mounts read-write*. Relocating it keeps
+the bookkeeping that describes each backup out of tenant-writable space. The
+generator emits `meta-path` for every database to do this; it is not optional
+polish.
+
+### 5. Verify it is actually replicating
+
+Four checks, cheapest first. The last one is the only one that proves bytes left
+the building.
+
+```sh
+set -a; . /etc/litestream/env; set +a     # the CLI needs the same credentials
+
+litestream databases      # every tenant listed, and "s3" in the replicas column
+```
+
+**Read the replicas column, not just the paths.** A blank there is the silent
+0.5-schema failure: databases understood, nothing replicated. There is no
+`litestream status` on 0.3.x; local progress comes from the journal
+(`journalctl -u litestream`, one "wal segment written" line per sync).
+
+For what actually reached R2 — 0.3.x calls these `generations`, `snapshots` and
+`wal`, not `ltx`:
+
+```sh
+DB=/mnt/tenant-data/pvc-<uid>_tenants_<label>-data/squelch.db
+litestream generations "$DB"    # generation, lag, and the time range it covers
+litestream snapshots   "$DB"
+```
+
+A generation with a small lag is replication working. These read object metadata
+only, so they need the R2 credentials but **not** the age identity. Then the
+ground truth, from outside litestream entirely:
+
+```sh
+aws --endpoint-url "https://${LITESTREAM_R2_ENDPOINT}" \
+    s3 ls "s3://${LITESTREAM_R2_BUCKET}/tenants/" --recursive | head
+```
+
+You are looking for `tenants/<label>/store.db/generations/<gen>/snapshots/...`
+and `.../wal/...`. (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` set to the R2
+pair, `AWS_DEFAULT_REGION=auto`. `rclone` works equally well. This is worth doing
+once so you know what a healthy bucket looks like when you are staring at an
+unhealthy one.)
+
+While you are in there, confirm the encryption once, with your own eyes:
+
+```sh
+aws --endpoint-url "https://${LITESTREAM_R2_ENDPOINT}" \
+    s3 cp "s3://${LITESTREAM_R2_BUCKET}/tenants/<label>/store.db/generations/<gen>/snapshots/00000000.snapshot.lz4" - \
+  | head -c 21
+# age-encryption.org/v1
+```
+
+If that prints anything else, the backups are not sealed and something is wrong
+with `LITESTREAM_AGE_RECIPIENT`. Do not proceed on the assumption that it is.
+
+And prove the discovery loop, which is the part with a moving piece: provision a
+canary tenant as in §9, wait two minutes, and confirm it appears in
+`litestream databases` on its own. A tenant that never shows up is the whole
+mechanism failing silently.
+
+```sh
+journalctl -u litestream-config --since -10min    # what the generator decided
+journalctl -u litestream -f                       # replication, live
+```
+
+### 6. Restore drill: one tenant, nothing stopped
+
+Do this now, on the canary, while nothing is on fire. A backup you have never
+restored is a hypothesis.
+
+**A restore needs the age identity, and `/etc/litestream.yml` does not have it.**
+That is the design (step 3), so every restore starts with two extra lines: load
+the identity into this shell, and render a config that references it.
+
+```sh
+set -a; . /etc/litestream/env; set +a
+export LITESTREAM_AGE_IDENTITY="$(grep -v '^#' /etc/litestream/backup-age.key | tr -d '[:space:]')"
+
+umask 077
+DRY_RUN=1 WITH_IDENTITY=1 /usr/local/bin/litestream-sync-config.sh > /root/restore.yml
+```
+
+`/root/restore.yml` is the same tenants and the same replicas as the live config,
+plus an `identities:` line. It still contains no key material — only the
+`${LITESTREAM_AGE_IDENTITY}` name — so the secret exists in that shell's
+environment and nowhere on disk but the key file.
+
+Restoring to a **scratch path** then touches no tenant and needs no downtime:
+
+```sh
+DB=/mnt/tenant-data/pvc-<uid>_tenants_<label>-data/squelch.db
+litestream restore -config /root/restore.yml -o /root/restore-<label>.db "$DB"
+
+sqlite3 /root/restore-<label>.db 'pragma integrity_check;'
+sqlite3 /root/restore-<label>.db 'select count(*) from messages;'
+```
+
+The argument is the **live database path**, which litestream resolves through
+the config to find the replica; `-o` sends the output somewhere else.
+Point-in-time works the same way:
+
+```sh
+litestream restore -config /root/restore.yml -timestamp 2026-08-10T09:00:00Z \
+  -o /root/rewind.db "$DB"
+```
+
+(There is no `-dry-run` on 0.3.x. To see what is available without fetching it,
+use `litestream generations "$DB"` and `litestream snapshots "$DB"` from step 5.)
+
+> **The error you will actually hit**, if you skip the identity or run in a
+> different shell than the `export`:
+>
+> ```
+> cannot restore snapshot: lz4: bad magic number
+> ```
+>
+> That is litestream trying to decompress age ciphertext. It means "no identity",
+> not "corrupt backup". Check `[ -n "$LITESTREAM_AGE_IDENTITY" ]` and that you
+> passed `-config /root/restore.yml`.
+
+To put a restored database **back** into a live tenant, stop **both** writers
+first. There are two, and forgetting the second is the mistake worth naming: the
+tenant's own daemon, and litestream itself, which is a SQLite client that
+checkpoints this file. Swapping the database out from under a running litestream
+leaves its bookkeeping describing a file that no longer exists.
+
+```sh
+# 1. The daemon.
+kubectl -n tenants scale deploy/<label> --replicas=0
+kubectl -n tenants wait --for=delete pod -l app.kubernetes.io/instance=<label> --timeout=120s
+
+# 2. The replicator. Stop the timer too, or it restarts the service under you.
+systemctl stop litestream-config.timer litestream
+
+# 3. Stale -wal/-shm next to a restored database is its own corruption. Move the
+#    whole set aside; do not delete until the tenant is verified up.
+mkdir -p /root/old-<label>
+mv "$DB" "$DB"-wal "$DB"-shm /root/old-<label>/ 2>/dev/null || true
+
+# Same restore config as above -- the identity is what makes this possible.
+litestream restore -config /root/restore.yml -o "$DB" "$DB"
+chown --reference="$(dirname "$DB")" "$DB"      # see the note below
+
+# 4. Litestream's local state for this tenant describes the database you just
+#    replaced. Clear it and let it re-derive from the replica.
+rm -rf /var/lib/litestream/<label>
+
+# 5. Back up, replicator first so the daemon's first writes are covered.
+systemctl start litestream litestream-config.timer
+kubectl -n tenants scale deploy/<label> --replicas=1
+litestream databases | grep <label>         # back in the config, with an s3 replica
+journalctl -u litestream --since -2min | grep <label>   # and actually syncing
+
+# 6. Done: drop the restore config and the identity out of this shell.
+rm -f /root/restore.yml
+unset LITESTREAM_AGE_IDENTITY
+```
+
+That `chown --reference` line is the one people forget, and it is the single
+most likely way this drill ends in a tenant that will not come up.
+
+**Why `--reference` and not a literal uid.** Tenant pods run as uid 10001 with
+`fsGroup: 10001` and `fsGroupChangePolicy: OnRootMismatch`, which means the
+kubelet only re-chowns a volume when its *root directory* looks wrong. Restore a
+root-owned file into a directory that already looks right and nothing fixes it:
+the pod starts, cannot write, and the failure surfaces as a sync error rather
+than a permissions one. And with user namespaces on (`UserNamespacesSupport`,
+§2), the on-disk owner is a *shifted* uid, not 10001 at all — so hard-coding
+10001 is wrong on exactly the boxes this runbook tells you to build. Copying the
+ownership off the directory that is already there is correct in both worlds.
+
+### 7. Restore drill: the whole box is gone
+
+The full-DR order, and the first step is the one that matters:
+
+> **MASK LITESTREAM BEFORE YOU PROVISION ANYTHING.** On a fresh box, a
+> re-provisioned tenant's daemon creates an empty `squelch.db` within seconds.
+> If litestream is running, it starts replicating that empty database to the
+> same R2 key holding the tenant's real history. Do not find out how gracefully
+> it handles that. Mask, restore, then unmask.
+
+```sh
+# 0. Fresh box: §0 through §8 of this runbook, plus step 1 above (install the
+#    litestream .deb and the units) -- but ENABLE NOTHING.
+systemctl mask litestream.service litestream-config.timer
+
+# 1. Restore the irreplaceable half FIRST, from the password manager and your
+#    off-box dump: the BACKUP AGE IDENTITY and the tenant identity Secrets.
+#    Without the first, every object in R2 is noise. Without the second, the
+#    credentials are sealed to keys nobody has. Neither has an escrow.
+umask 077
+install -d -m 0700 -o root -g root /etc/litestream
+${EDITOR:-vi} /etc/litestream/backup-age.key      # paste it back, 0600 root:root
+chmod 0600 /etc/litestream/backup-age.key
+age-keygen -y /etc/litestream/backup-age.key      # sanity: prints the recipient
+kubectl apply -f tenant-secrets.yaml
+
+# 2. Which tenants were there? The bucket is the inventory that survived.
+set -a; . /etc/litestream/env; set +a
+export LITESTREAM_AGE_IDENTITY="$(grep -v '^#' /etc/litestream/backup-age.key | tr -d '[:space:]')"
+aws --endpoint-url "https://${LITESTREAM_R2_ENDPOINT}" \
+    s3 ls "s3://${LITESTREAM_R2_BUCKET}/tenants/"
+
+# 3. Per tenant: provision it (§9's two calls, or let the control plane do it),
+#    which is what makes k3s local-path create the PVC directory at all --
+#    the storage class binds on first consumer, so no pod means no directory.
+#    Then immediately take the writer away again.
+kubectl -n tenants scale deploy/<label> --replicas=0
+kubectl -n tenants wait --for=delete pod -l app.kubernetes.io/instance=<label> --timeout=120s
+
+DIR=$(ls -d /mnt/tenant-data/pvc-*_tenants_<label>-data)
+rm -f "$DIR"/squelch.db "$DIR"/squelch.db-wal "$DIR"/squelch.db-shm
+
+# 4. Restore. The generator cannot help here -- it only renders tenants whose
+#    squelch.db already exists, and you just deleted it -- so hand-write the
+#    scratch config. Note the 0.3 schema: replicas is a LIST, and age carries
+#    the identities without which this downloads ciphertext and fails.
+umask 077
+cat > /tmp/restore.yml <<EOF
+dbs:
+  - path: ${DIR}/squelch.db
+    replicas:
+      - type: s3
+        bucket: \${LITESTREAM_R2_BUCKET}
+        path: tenants/<label>/store.db
+        endpoint: \${LITESTREAM_R2_ENDPOINT}
+        region: auto
+        access-key-id: \${LITESTREAM_R2_ACCESS_KEY_ID}
+        secret-access-key: \${LITESTREAM_R2_SECRET_ACCESS_KEY}
+        age:
+          identities:
+            - \${LITESTREAM_AGE_IDENTITY}
+          recipients:
+            - \${LITESTREAM_AGE_RECIPIENT}
+EOF
+litestream restore -config /tmp/restore.yml "${DIR}/squelch.db"
+chown --reference="$DIR" "${DIR}/squelch.db"    # see the note below
+sqlite3 "${DIR}/squelch.db" 'pragma integrity_check;'
+
+kubectl -n tenants scale deploy/<label> --replicas=1
+
+# 5. Only once EVERY tenant is restored and verified:
+rm -f /tmp/restore.yml
+unset LITESTREAM_AGE_IDENTITY
+systemctl unmask litestream.service litestream-config.timer
+systemctl enable --now litestream-config.timer litestream
+systemctl start litestream-config
+litestream databases       # every restored tenant, WITH an s3 replica listed
+```
+
+(`lz4: bad magic number` at step 4 means the identity did not reach litestream:
+either `LITESTREAM_AGE_IDENTITY` is empty in this shell, or the `age:` block is
+missing from the scratch config.)
+
+A tenant you cannot restore is not a disaster on its own: with a working
+identity Secret and credential, that tenant re-syncs from Gmail. Slow and noisy,
+but recoverable. A tenant whose **identity Secret** is gone is not recoverable by
+anyone, us included — and if the **backup age identity** is gone, R2 is a pile of
+noise for every tenant at once. Those two keys are step 1 for that reason, and
+why the next section still says what it says.
+
+### What this section was verified against
+
+Litestream **v0.3.13**, on 2026-08-11. The config schema, the `age` block, the
+CLI surface and the failure messages quoted above were read out of the v0.3.13
+source and then confirmed by running the real v0.3.13 binary against a scratch
+tenant layout: the generator's render is accepted (`litestream databases` reports
+an `s3` replica per tenant), a replicate → restore round trip comes back with
+`pragma integrity_check` = `ok`, the on-disk snapshot begins
+`age-encryption.org/v1`, and restoring without `identities:` fails with exactly
+`lz4: bad magic number`. The `.deb` asset names and layout above come from the
+v0.3.13 release, not from memory.
+
+Not verified, and worth ten seconds on the box the first time you install:
+`systemd-analyze verify /etc/systemd/system/litestream*.{service,timer}`. The
+units were written on a machine with no systemd.
+
 ## Operating notes
 
 **Where the state is.** There is none. The warden keeps no database, no state
@@ -629,12 +1165,14 @@ then re-apply each tenant. Existing tenants do NOT move on their own, by design.
 There is no "upgrade all tenants" button and that is deliberate: an upgrade that
 touches every mailbox at once is an outage waiting for a bad release.
 
-**Backups.** Two things, of very different sizes:
+**Backups.** Three things, of very different sizes:
 
 - The Secrets in `tenants`. A few kilobytes, and every tenant's ability to read
   their own mail depends on theirs. `kubectl -n tenants get secret -o yaml`
   produces base64 of the DECRYPTED values, so treat that output the way you
   would treat the keys themselves.
+- `/etc/litestream/backup-age.key`. Under a kilobyte, and every tenant's backup
+  in R2 depends on it. Same custody as the Secrets dump; see §11 step 3.
 - The PersistentVolumes (under `/var/lib/rancher/k3s/storage/`, or wherever
   local-path was repointed). The mail indexes. Bigger, and rebuildable from Gmail
   given a working credential.
@@ -645,7 +1183,8 @@ tenant's stored credential is unrecoverable and they consent with Google again.
 ### Backups today, stated honestly
 
 What is actually running on the install this runbook was written from, as of
-2026-08-10, is one mechanism, and it is not the one anybody would design:
+2026-08-11. Three mechanisms, each covering a different half of a different
+problem, and one gap that is still open:
 
 - **Provider server backups are ROOT DISK ONLY.** Hetzner's backups (7 daily
   snapshots) image the server's own disk. They do **not** include attached block
@@ -655,24 +1194,45 @@ What is actually running on the install this runbook was written from, as of
   (`/var/lib/rancher/k3s/server/db`), and it holds every tenant's identity
   Secret. Encrypted at rest, so the snapshot is not a pile of keys — but it is
   the difference between "restore" and "every tenant re-consents".
-- It does **not** cover the mailboxes, if the block volume above is in use. That
-  is the deliberate trade, not an oversight: mail is the big, rebuildable half.
-- **Litestream is not wired up.** `docs/HOSTED.md` once promised streaming SQLite
-  backup to object storage "from day one"; the k3s design dropped it and nothing
-  replaced it. It is still owed.
+- It does **not** cover the mailboxes, because they are on the block volume.
+- **Litestream IS wired up** (built 2026-08-10, retargeted to the 0.3.13 line
+  2026-08-11, §11 above). One host-level systemd service streams every tenant's
+  SQLite to Cloudflare R2 continuously, at `tenants/<label>/store.db`,
+  discovered automatically within two minutes of a tenant existing. That closes
+  the mailbox half: losing the volume is now minutes of mail rather than every
+  index on the box.
+- **It is encrypted with a key we hold.** Every snapshot and WAL segment is
+  age-sealed to `LITESTREAM_AGE_RECIPIENT` before upload, so R2 holds ciphertext
+  and Cloudflare cannot read a tenant's mail index. The private half lives at
+  `/etc/litestream/backup-age.key` and in the password manager, and **nowhere
+  else** — losing it makes every backup permanently unreadable. That is the
+  trade this bought, and it is why litestream is pinned to 0.3.13 (§11 step 1).
+- **What Litestream does NOT do.** It backs up **only SQLite**. The identity
+  Secrets are in the k3s datastore, not on the volume, and the sealed
+  `credentials.json` is on the volume but is not a database — so neither is in
+  R2. The remaining gap is not disclosure any more; it is that the Secrets are
+  still not on any schedule.
 
 So, in plain terms, what each loss costs:
 
 | What you lose | What it costs |
 |---|---|
-| the block volume | every tenant re-syncs from Gmail — slow, noisy, but nothing is gone |
-| the root disk, without a snapshot | every tenant's identity Secret, therefore every sealed credential, therefore a re-consent each. There is no escrow; we cannot recover this for them |
+| the block volume | minutes of mail. `litestream restore` per tenant from R2 (§11.7); no re-sync from Gmail, no tenant action |
+| the block volume, and R2 with it | every tenant re-syncs from Gmail — slow, noisy, but nothing is gone |
+| one tenant's database (corruption, bad restore) | `litestream restore` to scratch, verify, swap it in with the pod scaled to 0 (§11.6). Point-in-time works too |
+| the root disk, without a snapshot | every tenant's identity Secret, therefore every sealed credential, therefore a re-consent each. There is no escrow; we cannot recover this for them. **Litestream does not help here** |
 | one tenant's identity Secret | that one tenant re-consents |
+| the R2 bucket, to an attacker | nothing readable. It is age ciphertext, and the key is not on Cloudflare's side of the wire. Rotate the bucket token anyway |
+| the R2 bucket **and** the backup age key, to an attacker | disclosure of mail indexes. Still not a path to any mailbox, credential or Google account: no identities and no credentials are in there |
+| the backup age key, to nobody (just lost) | every backup in R2 is permanently unreadable, fleet-wide, and nothing tells you until you try to restore. Password manager. Today |
 
-Which is why, until Litestream lands: keep server backups ON, and if you take
-nothing else off this box on a schedule, take
-`kubectl -n tenants get secret -o yaml` — encrypted, somewhere that is not this
-box. It is kilobytes and it is the whole recovery story.
+The shape to take away: **Litestream covers the big, noisy half; the Secrets are
+still the whole recovery story and they are still not covered by anything on a
+schedule.** So keep server backups ON, and if you take nothing else off this box
+regularly, take `kubectl -n tenants get secret -o yaml` and
+`/etc/litestream/backup-age.key` — encrypted, somewhere that is not this box.
+They are kilobytes, and they are the things neither Hetzner nor R2 will hand
+back to you.
 
 ## What this does and does not isolate
 

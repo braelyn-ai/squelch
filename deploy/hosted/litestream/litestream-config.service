@@ -1,0 +1,64 @@
+# /etc/systemd/system/litestream-config.service
+#
+# Re-render /etc/litestream.yml from whatever tenant PVCs exist right now, and
+# bounce litestream if that changed anything. Driven by litestream-config.timer;
+# harmless and idempotent to run by hand.
+#
+#   systemctl start litestream-config.service      # sync now
+#   journalctl -u litestream-config --since -10min # what it decided
+
+[Unit]
+Description=Render /etc/litestream.yml from the tenant PVCs on this box
+Documentation=file:///usr/local/bin/litestream-sync-config.sh
+
+# It scans the block volume. Running before the mount lands would see zero
+# tenants; the script has its own refusal for that case, but not reaching the
+# refusal is better than logging it every boot.
+# EDIT ME alongside TENANT_ROOT in the script if your volume is elsewhere.
+RequiresMountsFor=/mnt/tenant-data
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/litestream-sync-config.sh
+
+# --- Hardening -------------------------------------------------------------
+# Defence in depth rather than a boundary: this is a root script whose whole job
+# is writing /etc and restarting a service, so there is no version of it that is
+# meaningfully sandboxed. What these do buy is that a bug in it cannot wander
+# into /home, /srv, or the k3s datastore.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# Safe here (unlike in litestream.service): everything this unit creates gets an
+# explicit mode from the script -- 0644 on the config, 0700 on the metadata
+# directories -- so a tight umask changes nothing except the audit score.
+UMask=0077
+
+ProtectSystem=strict
+# /etc in full, not /etc/litestream.yml alone: the script renders to a temp file
+# beside the target and renames over it, so that litestream can never read a
+# half-written config -- and rename(2) needs the DIRECTORY writable.
+ReadWritePaths=/etc /var/lib/litestream
+
+# Reading PVC directories owned by tenant pod uids (DAC_*), and creating the
+# per-tenant metadata directories root:root 0700 (CHOWN, FOWNER).
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
+
+# No [Install]. This unit is started by litestream-config.timer, which is the
+# thing you enable. Enabling the service itself would run it once at boot and
+# never again, which looks like it works for exactly one tenant.
