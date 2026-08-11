@@ -5,6 +5,8 @@ passband/
 passband-site/
 docs/
 deploy/
+# ...except the monitoring configs, which Dockerfile.{prometheus,blackbox,grafana} COPY.
+!deploy/monitoring/
 scripts/
 *.md
 .dockerignore
