@@ -641,10 +641,30 @@ struct RuleEditor: View {
     /// knows it up front.
     private func save() async {
         guard !saving, blocked == nil else { return }
-        saving = true
-        error = nil
         let body = CreateRuleBody(
             match_pattern: pattern.trimmed, want: want.trimmed, disposition: disposition)
+        // A DEMONSTRATION SAVE stops here: the editor still validates and still
+        // builds the body, so the ceremony is the real one, but nothing leaves
+        // the machine and no rule_created event is claimed for a rule that does
+        // not exist. Only the onboarding tour sets this.
+        if let intercept = request.intercept {
+            intercept(body)
+            // The glob reads as a domain in the toast; nobody demonstrating a
+            // rule needs to see the star.
+            let shown =
+                body.match_pattern.hasPrefix("*@")
+                ? String(body.match_pattern.dropFirst(2)) : body.match_pattern
+            // The outcome clause only when the user said the outcome out loud.
+            // On auto it is the daemon that resolves the disposition, and this
+            // save never asked it — so naming one here would be a guess.
+            let outcome = body.disposition.map { " → \($0.label)" } ?? ""
+            store.pushToast("rule saved · \(shown)\(outcome) (demo)", .success)
+            request.onSaved?()
+            onClose()
+            return
+        }
+        saving = true
+        error = nil
         do {
             let saved: CreatedRule
             if let existing = request.rule {

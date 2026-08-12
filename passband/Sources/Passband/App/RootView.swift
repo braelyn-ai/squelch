@@ -156,6 +156,10 @@ struct MainShell: View {
             ActionLayer()
                 .zIndex(30)
         }
+        // The tour measures dashboard regions and places its coach marks in
+        // ONE space, and this ZStack is the closest common ancestor of the
+        // sitrep that reports them and the action layer that draws on them.
+        .coordinateSpace(.named(tourSpace))
         .animation(.easeOut(duration: 0.18), value: store.modalOverlayOpen)
         .animation(.smooth(duration: 0.22), value: store.sideView)
         // The BOOL, never the ComposeState: the state changes on every
@@ -165,6 +169,15 @@ struct MainShell: View {
         .keyBindings(.global, globalBindings)
         .onChange(of: store.sitrep.sealed) { _, sealed in
             AuthArrival.shared.observe(sealed: sealed)
+        }
+        // THE TOUR'S TRIGGER: the first sync of the session landing. Not
+        // `onAppear` — the board is empty until a pull returns, and a tour that
+        // opens over "You're all clear." has nothing to point at. Not connect
+        // either, which can succeed against a daemon that then goes dark.
+        // A reconnect clears `lastRefresh`, so this fires again; the tour's own
+        // once-a-session flag is what stops it starting twice.
+        .onChange(of: store.lastRefresh) { old, new in
+            if old == nil, new != nil { store.tour.maybeStart() }
         }
         }
     }
