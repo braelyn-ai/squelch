@@ -8,62 +8,131 @@
 // under gmail.readonly.
 //
 // The seen-set is PER ACCOUNT: the ids in it are one daemon's SQLite ints and
-// mean something else entirely in another mailbox.
+// mean something else entirely in another mailbox. It is also SHARED — the
+// class below runs this flow for the account on screen, and
+// `BackgroundAuthWatch` runs a much thinner one for every account that is not,
+// both against the same stored set. `AuthSeenSet` is that shared rule, kept in
+// one place so the two can never disagree about what "already seen" means.
 
 import Foundation
+
+// MARK: - the shared seen-set
+
+/// One account's record of which auth messages have already been reacted to,
+/// plus the freshness rule that decides whether a newly-seen one is worth
+/// making a noise about at all.
+///
+/// TWO WATCHERS, ONE SET. `AuthArrival` folds observations in for the live
+/// account; `BackgroundAuthWatch` does it for the accounts that are not. They
+/// are exclusive per account — `AccountManager` starts one at the exact moment
+/// it stops the other — and both persist under the same scoped key, so a
+/// message one of them has already answered for is never answered for a second
+/// time by the other after a switch.
+///
+/// A value type carrying its own account id: the key it reads and writes is
+/// derived from that id and nothing else, so a set can never be saved back
+/// under an account it was not loaded for.
+struct AuthSeenSet {
+    /// Base name of the persisted set; the live key is this scoped to the
+    /// account (see `key`). Mirrored in `AccountIndex.scopedDefaultsKeys`,
+    /// which is what carries it across a migration and drops it on a removal.
+    private static let keyBase = "passband.auth-seen"
+    private static let cap = 200
+    /// A message older than this on first sight is treated as history.
+    static let freshWindow: TimeInterval = 2 * 60
+
+    /// Whose set this is. Read by the owners to notice that the live account
+    /// has moved out from under them.
+    let accountId: UUID
+
+    private var ids: Set<Int>
+    /// Whether this instance has taken its first look yet. Per INSTANCE and
+    /// deliberately not persisted: the silent seeding below is about what was
+    /// already sitting in the mailbox when this watcher started watching.
+    private var seeded = false
+
+    init(accountId: UUID) {
+        self.accountId = accountId
+        let raw = UserDefaults.standard.array(forKey: Self.key(accountId)) as? [Int] ?? []
+        ids = Set(raw)
+    }
+
+    static func key(_ accountId: UUID) -> String {
+        AccountIndex.scopedKey(keyBase, accountId)
+    }
+
+    /// Seconds since an ISO stamp; huge when missing/invalid (=> treat as old).
+    /// Shared with the callers, which order what comes back by it.
+    static func age(_ iso: String?, now: Date = Date()) -> TimeInterval {
+        guard let d = Fmt.date(iso) else { return .greatestFiniteMagnitude }
+        return now.timeIntervalSince(d)
+    }
+
+    /// Fold one observation of the sealed list in and answer with the messages
+    /// worth reacting to: not already seen, AND received recently enough to
+    /// still be live.
+    ///
+    /// The FIRST observation answers with nothing. Whatever is sealed when a
+    /// watcher starts is that mailbox's backlog, and seeding it silently is
+    /// what stops a launch — or an account switch — from firing a fortnight of
+    /// history at the human.
+    mutating func arrivals(in sealed: [SealedMeta], now: Date = Date()) -> [SealedMeta] {
+        if !seeded {
+            seeded = true
+            var changed = false
+            for m in sealed where ids.insert(m.id).inserted { changed = true }
+            if changed { save() }
+            return []
+        }
+
+        var fresh: [SealedMeta] = []
+        for m in sealed {
+            // Marked the moment it is seen, so a re-poll can never fire twice
+            // for one message. Late-arriving history is recorded here and then
+            // stays quiet, which is the whole difference between the two.
+            guard ids.insert(m.id).inserted else { continue }
+            if Self.age(m.received_at, now: now) <= Self.freshWindow { fresh.append(m) }
+        }
+        // Written only when something actually fires. An id seen but too old to
+        // fire costs nothing to re-examine after a restart — it will be just as
+        // old then — and not writing keeps a quiet mailbox from rewriting this
+        // key on every poll.
+        guard !fresh.isEmpty else { return [] }
+        save()
+        return fresh
+    }
+
+    private func save() {
+        // Cap to the most-recent ids (numeric order == arrival order).
+        let capped = Array(ids.sorted().suffix(Self.cap))
+        UserDefaults.standard.set(capped, forKey: Self.key(accountId))
+    }
+}
+
+// MARK: - the live account's arrival flow
 
 @MainActor
 final class AuthArrival {
     static let shared = AuthArrival()
 
-    /// Base name of the persisted seen-set; the live key is this scoped to the
-    /// account (see `seenKey`).
-    private static let seenKeyBase = "passband.auth-seen"
-    private static let seenCap = 200
-    /// A message older than this on first sight is treated as history.
-    private static let freshWindow: TimeInterval = 2 * 60
-
-    private var seen: Set<Int>?
-    private var seeded = false
-    /// WHICH account the in-memory set was read for. Answered explicitly
-    /// rather than assumed, because a switch tears the store down before it
-    /// commits the new id, and an observation landing in that window would
-    /// otherwise seed the new account's watch from the old account's set.
-    private var boundTo: UUID?
+    /// The live account's seen-set, or nil before the first observation. Which
+    /// account it belongs to is answered explicitly by the set itself rather
+    /// than assumed, because a switch tears the store down before it commits
+    /// the new id, and an observation landing in that window would otherwise
+    /// seed the new account's watch from the old account's set.
+    private var seen: AuthSeenSet?
 
     private var store: AppStore { AppStore.shared }
 
     private init() {}
 
-    private static func seenKey(_ account: UUID) -> String {
-        AccountIndex.scopedKey(seenKeyBase, account)
-    }
-
-    private func loadSeen(_ account: UUID) -> Set<Int> {
-        let raw = UserDefaults.standard.array(forKey: Self.seenKey(account)) as? [Int] ?? []
-        return Set(raw)
-    }
-
-    private func saveSeen(_ set: Set<Int>, _ account: UUID) {
-        // Cap to the most-recent ids (numeric order == arrival order).
-        let capped = Array(set.sorted().suffix(Self.seenCap))
-        UserDefaults.standard.set(capped, forKey: Self.seenKey(account))
-    }
-
     /// An account switch. The set in memory belongs to the account that just
     /// went away — dropped rather than saved, being already persisted under
     /// that account's own key, and re-read for whoever is live at the next
-    /// observation.
+    /// observation. The background watcher that picks that account up reads
+    /// the same key, from disk, for the same reason.
     func resetForSwitch() {
         seen = nil
-        seeded = false
-        boundTo = nil
-    }
-
-    /// Seconds since an ISO stamp; huge when missing/invalid (=> treat as old).
-    private func ageSeconds(_ iso: String?) -> TimeInterval {
-        guard let d = Fmt.date(iso) else { return .greatestFiniteMagnitude }
-        return Date().timeIntervalSince(d)
     }
 
     /// Call whenever the sealed list changes (the poller drives this).
@@ -74,41 +143,14 @@ final class AuthArrival {
         // A different account (or the first observation) re-reads under its
         // key and re-seeds: the new mailbox's current sealed mail is ITS
         // backlog, however loudly the old one's would have rung.
-        if boundTo != account || seen == nil {
-            boundTo = account
-            seen = loadSeen(account)
-            seeded = false
-        }
-        guard var seen else { return }
-
-        // First run of this session: seed the backlog silently, so we only ever
-        // fire for messages that arrive AFTER we are watching.
-        if !seeded {
-            seeded = true
-            var changed = false
-            for m in sealed where !seen.contains(m.id) {
-                seen.insert(m.id)
-                changed = true
-            }
-            self.seen = seen
-            if changed { saveSeen(seen, account) }
-            return
-        }
-
-        var arrivals: [SealedMeta] = []
-        for m in sealed {
-            if seen.contains(m.id) { continue }
-            seen.insert(m.id)  // mark immediately so a re-poll never double-fires
-            // Only fresh messages fire the flow; late-arriving history stays quiet
-            // but is still recorded as seen above.
-            if ageSeconds(m.received_at) <= Self.freshWindow { arrivals.append(m) }
-        }
-        self.seen = seen
+        if seen?.accountId != account { seen = AuthSeenSet(accountId: account) }
+        let arrivals = seen?.arrivals(in: sealed) ?? []
         guard !arrivals.isEmpty else { return }
-        saveSeen(seen, account)
 
         // Ring for every arrival; oldest-first so the queue ends up newest-first.
-        let ordered = arrivals.sorted { ageSeconds($0.received_at) > ageSeconds($1.received_at) }
+        let ordered = arrivals.sorted {
+            AuthSeenSet.age($0.received_at) > AuthSeenSet.age($1.received_at)
+        }
         for m in ordered {
             store.pushAuthRing(m.id)
             if AuthCode.isCodeKind(m.kind) {

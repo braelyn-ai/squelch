@@ -1,5 +1,7 @@
 // macOS notification delivery for the event feed: one banner per event, a tap
-// opens that thread.
+// opens that thread. Plus the ONE other thing worth interrupting a human for —
+// auth mail landing in an account that is not on screen (`postAuth`, driven by
+// BackgroundAuthWatch), whose tap opens the Auth view instead of a thread.
 //
 // The Event row is a denormalized snapshot, so a banner renders from the frame
 // alone with no round trip. `copy(for:)` is that mapping, kept pure and separate
@@ -34,6 +36,11 @@ final class Notifier {
     /// The posting account's uuid, as a string (userInfo has to survive being
     /// written to disk by the system and read back into a later launch).
     nonisolated static let accountKey = "passband.account_id"
+    /// Where the tap goes when there is no thread to open. Carried ONLY by the
+    /// background auth banners; its absence is how every event banner says
+    /// "open the thread named in `threadKey`".
+    nonisolated static let routeKey = "passband.route"
+    nonisolated static let authRoute = "auth"
 
     /// UNUserNotificationCenter holds its delegate WEAKLY. This property is the
     /// only strong reference in the process — assigning a freshly-made delegate
@@ -202,6 +209,48 @@ final class Notifier {
         UNUserNotificationCenter.current().add(request)
     }
 
+    /// Post one BACKGROUND auth banner: a mailbox that is not on screen has
+    /// just been sent a login code (or a reset, or a sign-in alert), and the
+    /// only thing this notification exists to say is which mailbox to go to.
+    /// The live account never comes through here — its auth mail gets the ring,
+    /// the audited auto-reveal and the code modal instead.
+    ///
+    /// WHAT IS DELIBERATELY NOT IN IT: the code, and the subject line that so
+    /// often IS the code ("725104 is your Acme code" is a real subject). A
+    /// reveal is audited server-side and belongs to the account the human is
+    /// looking at; a notification is not a place to leave a credential.
+    func postAuth(_ meta: SealedMeta, accountId: UUID, accountName: String) {
+        let account = accountId.uuidString
+        let content = UNMutableNotificationContent()
+        // The kind leads, the mailbox follows: WHICH account this is happening
+        // in is the entire reason the banner is worth reading, and `AuthCopy`
+        // is the app's one vocabulary for the other half ("sealed" is internal
+        // jargon and never reaches a human).
+        content.title = "\(AuthCopy.label(meta.kind)) · \(accountName)"
+        let sender = Self.flatten(SenderID.displayName(meta.sender), max: 64)
+        content.body = sender.isEmpty ? "New auth mail." : "from \(sender)"
+        // One group per account's auth mail: a login code and the sign-in alert
+        // behind it are the same conversation, and account-prefixed because two
+        // daemons' auth mail is not.
+        content.threadIdentifier = "\(account).passband.auth"
+        content.userInfo = [
+            Self.accountKey: account,
+            Self.routeKey: Self.authRoute,
+        ]
+        // Always a chime. A login code is the definition of time-bound — it
+        // expires while you are not looking at it.
+        content.sound = Self.sound(for: Prefs.shared.notificationSound)
+
+        // Message ids are per-daemon SQLite ints, so the account prefix is
+        // load-bearing here for the same reason it is on an event's identifier:
+        // unprefixed, account B's message 41 would silently REPLACE account A's
+        // banner for message 41. Within one account, re-posting the same id
+        // replaces its own banner rather than stacking a second copy.
+        let request = UNNotificationRequest(
+            identifier: "passband.auth.\(account).\(meta.id)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: - delegate behaviour
 
     /// What to do with a notification that arrives while the app is running.
@@ -215,31 +264,56 @@ final class Notifier {
         (appActive && windowVisible) ? [.list] : [.banner, .sound, .list]
     }
 
+    /// Where a tap lands once the right mailbox is on screen.
+    private enum TapTarget {
+        case thread(String?)
+        case auth
+    }
+
     /// A tap: front the app, restore the window if it was closed, open the
     /// thread — in the account the banner was posted from, switching to it
     /// first when that is not the account currently on screen.
-    ///
-    /// Synchronous because the delegate's entry point is, so the cross-account
-    /// path hands itself to a Task: `openThread` MUST come after the switch,
-    /// which tears the whole world down (including any open thread) on its way
-    /// through.
     func handleTap(threadId: String?, accountId: UUID?) {
         Analytics.capture("notification_opened", ["has_thread": !(threadId ?? "").isEmpty])
+        deliver(.thread(threadId), accountId: accountId)
+    }
 
+    /// A background auth banner's tap: the Auth view of the mailbox the code
+    /// arrived in. NOT a reveal — the human lands on the list and asks for the
+    /// code themselves, which is the audited act this whole flow keeps in their
+    /// hands.
+    ///
+    /// The same analytics event as a thread tap, because it is the same act (a
+    /// banner opened) and the bool already says which shape it had.
+    func handleAuthTap(accountId: UUID?) {
+        Analytics.capture("notification_opened", ["has_thread": false])
+        deliver(.auth, accountId: accountId)
+    }
+
+    /// The shared body of both taps. ONE definition, because the account rules
+    /// — a payload with no account, an account since removed, the Connect gate,
+    /// a switch that declines — are the same rules whatever the banner was
+    /// about, and two copies of them would eventually stop agreeing.
+    ///
+    /// Synchronous because the delegate's entry point is, so the cross-account
+    /// path hands itself to a Task: opening MUST come after the switch, which
+    /// tears the whole world down (including any open thread) on its way
+    /// through.
+    private func deliver(_ target: TapTarget, accountId: UUID?) {
         // No account on the payload: a banner posted by a build from before
         // notifications carried one, still sitting in Notification Center. The
         // live account is the only guess available, and it is the same one that
         // build would have opened it against.
         guard let accountId, accountId != AccountManager.shared.activeId else {
             front()
-            open(threadId)
+            open(target)
             return
         }
-        // An account that has since been REMOVED. Its thread ids address a
-        // daemon this install no longer has credentials for, and opening one
-        // against whoever is live would show a stranger's mail — so the tap
-        // fronts the app and stops there, which is the honest whole of what
-        // can still be done about it.
+        // An account that has since been REMOVED. Its ids address a daemon this
+        // install no longer has credentials for, and opening one against
+        // whoever is live would show a stranger's mail — so the tap fronts the
+        // app and stops there, which is the honest whole of what can still be
+        // done about it.
         guard AccountManager.shared.accounts.contains(where: { $0.id == accountId }) else {
             front()
             return
@@ -260,9 +334,10 @@ final class Notifier {
             // allowed to fail (the credentials behind the record are gone, and
             // it lands on the Connect gate). Either way a DIFFERENT mailbox is
             // on screen, and thread ids are per-daemon: opening one here would
-            // show whatever that id happens to name in the wrong account.
+            // show whatever that id happens to name in the wrong account. The
+            // Auth view is no safer — it renders the live account's codes.
             guard AccountManager.shared.activeId == accountId else { return }
-            open(threadId)
+            open(target)
         }
     }
 
@@ -275,9 +350,18 @@ final class Notifier {
         #endif
     }
 
-    private func open(_ threadId: String?) {
-        guard let threadId, !threadId.isEmpty else { return }
-        AppStore.shared.openThread(threadId)
+    private func open(_ target: TapTarget) {
+        switch target {
+        case .thread(let threadId):
+            guard let threadId, !threadId.isEmpty else { return }
+            AppStore.shared.openThread(threadId)
+        case .auth:
+            // The routed page on the Mac. The phone's tab bar owns its own
+            // navigation and has no Auth tab yet, so there this sets a view
+            // nothing renders — exactly what `openThread` already does on that
+            // shell, and it starts working the day the tab arrives.
+            AppStore.shared.setView(.auth)
+        }
     }
 }
 
@@ -313,8 +397,15 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // hold anything, and an unparseable id must read as "no account", not
         // as some other account.
         let accountId = (userInfo[Notifier.accountKey] as? String).flatMap(UUID.init(uuidString:))
+        // An auth banner carries no thread to open — routing it as an ordinary
+        // one would front the app and then do nothing.
+        let isAuth = (userInfo[Notifier.routeKey] as? String) == Notifier.authRoute
         await MainActor.run {
-            Notifier.shared.handleTap(threadId: threadId, accountId: accountId)
+            if isAuth {
+                Notifier.shared.handleAuthTap(accountId: accountId)
+            } else {
+                Notifier.shared.handleTap(threadId: threadId, accountId: accountId)
+            }
         }
     }
 }

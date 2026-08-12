@@ -46,16 +46,17 @@ struct MobileRootView: View {
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
                 SitrepPoller.shared.start()
-                // One feed per account, live or not — same as the Mac. The
-                // phone has no account switcher yet, so today that is a list
-                // of one; it is the same call because the lifecycle is the
-                // shell's job and the shell is the only part that differs.
-                AccountManager.shared.startAllStreams()
+                // One feed per account, live or not, plus an auth watch on each
+                // account that is not live — same as the Mac. The phone has no
+                // account switcher yet, so today that is a list of one and no
+                // watches at all; it is the same call because the lifecycle is
+                // the shell's job and the shell is the only part that differs.
+                AccountManager.shared.startAllFeeds()
                 Task { await store.refreshMail(.inbox) }
                 Task { await store.refreshTrackingConfig() }
             } else {
                 SitrepPoller.shared.stop()
-                AccountManager.shared.stopAllStreams()
+                AccountManager.shared.stopAllFeeds()
             }
         }
     }

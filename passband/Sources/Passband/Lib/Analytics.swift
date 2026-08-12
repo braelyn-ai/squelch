@@ -74,6 +74,7 @@ enum Analytics {
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
+        "account_added",
     ]
 
     /// The counter events that ride at `minimal`: anonymous counts and
@@ -88,6 +89,7 @@ enum Analytics {
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
+        "account_added",
     ]
 
     /// The closed set of STRING property values allowed off the machine.

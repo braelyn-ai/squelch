@@ -497,7 +497,7 @@ final class AppStore {
             // build took. It is here for the OTHER arrival: a re-connect that
             // never left `.connected`, where the running stream is holding the
             // credentials this call just replaced.
-            AccountManager.shared.restartStream(account.id, with: fresh)
+            AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
             connStatus = .connected
             connError = nil
@@ -538,7 +538,7 @@ final class AppStore {
             // does not fire. A rotated token means the old connection is one
             // 401 away from a silent backoff loop, so it is replaced outright
             // — streams take their credentials at construction and keep them.
-            AccountManager.shared.restartStream(account.id, with: fresh)
+            AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
             return (true, nil)
         } catch {
