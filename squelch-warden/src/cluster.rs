@@ -501,7 +501,7 @@ mod tests {
             Object::Secret(Box::new(objects::credential_secret(&config, &name, "ct"))),
             Object::Service(Box::new(objects::service(&config, &name))),
             Object::Ingress(Box::new(objects::ingress(&config, &name))),
-            Object::Deployment(Box::new(objects::deployment(&config, &name, "hash"))),
+            Object::Deployment(Box::new(objects::deployment(&config, &name, "hash", None))),
             Object::NetworkPolicy(Box::new(objects::network_policy(&config, &name))),
             Object::Pvc(Box::new(objects::data_pvc(&config, &name))),
         ] {
@@ -651,7 +651,7 @@ mod tests {
     fn an_object_knows_its_own_kind_and_name() {
         let config = test_config();
         let name = TenantName::parse("alice").unwrap();
-        let object = Object::Deployment(Box::new(objects::deployment(&config, &name, "hash")));
+        let object = Object::Deployment(Box::new(objects::deployment(&config, &name, "hash", None)));
         assert_eq!(object.kind(), Kind::Deployment);
         assert_eq!(object.name(), "alice");
     }

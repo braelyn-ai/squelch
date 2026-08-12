@@ -47,6 +47,11 @@ pub const MAX_EMAIL_LEN: usize = 254;
 /// enough that the provisioning route is not a place to spend etcd.
 pub const MAX_CIPHERTEXT: usize = 64 * 1024;
 
+/// Ceiling on the LLM virtual key. A gateway virtual key is a short opaque
+/// token; this is loose enough for any token format and tight enough that the
+/// route is not a place to park a document.
+pub const MAX_LLM_API_KEY: usize = 4 * 1024;
+
 /// The first line of an age ASCII-armored file (RFC 7468 style, as produced by
 /// `age --armor` / the `age` crate's `ArmoredWriter`).
 ///
@@ -87,6 +92,17 @@ pub enum EmailError {
     #[error("account_email must be a single address with one @ and text on both sides")]
     Shape,
     #[error("account_email contains a character that is not allowed in an environment value")]
+    Charset,
+}
+
+/// Why an LLM virtual key was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ApiKeyError {
+    #[error("api_key is empty")]
+    Empty,
+    #[error("api_key is longer than {MAX_LLM_API_KEY} bytes")]
+    TooLong,
+    #[error("api_key contains a character that is not allowed in a token")]
     Charset,
 }
 
@@ -149,6 +165,12 @@ impl TenantName {
     /// file the control plane sealed to this tenant's recipient.
     pub fn credential_secret(&self) -> String {
         format!("{}-credential", self.0)
+    }
+
+    /// `<label>-llm`: the Secret holding this tenant's LLM gateway virtual
+    /// key, minted per-tenant by the control plane and never read here.
+    pub fn llm_secret(&self) -> String {
+        format!("{}-llm", self.0)
     }
 }
 
@@ -280,6 +302,34 @@ pub fn validate_ciphertext(raw: &str) -> Result<String, CiphertextError> {
     Ok(format!("{body}\n"))
 }
 
+/// Validate the LLM virtual key, returning it trimmed.
+///
+/// The warden stores this verbatim in a Secret and never presents it to
+/// anyone; the charset rule is the same one the account address obeys and for
+/// the same reason: the value becomes an environment variable inside a
+/// container (via `secretKeyRef`), and a newline or a control byte there is
+/// legal to Kubernetes and nonsense to every reader. No shape beyond that is
+/// assumed, because the gateway's token format is the gateway's business.
+///
+/// PRIVACY: this is a live credential. No error here echoes it, and nothing on
+/// this path logs it.
+pub fn validate_llm_api_key(raw: &str) -> Result<String, ApiKeyError> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(ApiKeyError::Empty);
+    }
+    if key.len() > MAX_LLM_API_KEY {
+        return Err(ApiKeyError::TooLong);
+    }
+    if key
+        .bytes()
+        .any(|b| !(b'!'..=b'~').contains(&b) || matches!(b, b'"' | b'\'' | b'\\' | b'$' | b'`'))
+    {
+        return Err(ApiKeyError::Charset);
+    }
+    Ok(key.to_string())
+}
+
 /// Whether a string is a pairing code as `squelchd pair` prints it: two groups
 /// of four Crockford base32 symbols, joined by one hyphen.
 ///
@@ -350,10 +400,12 @@ mod tests {
         assert_eq!(name.data_pvc(), "alice-data");
         assert_eq!(name.identity_secret(), "alice-identity");
         assert_eq!(name.credential_secret(), "alice-credential");
+        assert_eq!(name.llm_secret(), "alice-llm");
         // Longest allowed label plus the longest suffix still fits the 63-byte
         // DNS-1123 ceiling Kubernetes enforces on object names.
         let longest = TenantName::parse(&"a".repeat(MAX_LABEL_LEN)).unwrap();
         assert!(longest.credential_secret().len() <= 63);
+        assert!(longest.llm_secret().len() <= 63);
     }
 
     #[test]
@@ -440,6 +492,28 @@ mod tests {
             validate_ciphertext(&"a".repeat(MAX_CIPHERTEXT + 1)),
             Err(CiphertextError::TooLong)
         );
+    }
+
+    #[test]
+    fn accepts_ordinary_api_keys_and_refuses_broken_ones() {
+        assert_eq!(
+            validate_llm_api_key(" sk-vk-abc123 ").as_deref(),
+            Ok("sk-vk-abc123")
+        );
+        assert_eq!(validate_llm_api_key(""), Err(ApiKeyError::Empty));
+        assert_eq!(validate_llm_api_key("   "), Err(ApiKeyError::Empty));
+        assert_eq!(
+            validate_llm_api_key(&"a".repeat(MAX_LLM_API_KEY + 1)),
+            Err(ApiKeyError::TooLong)
+        );
+        // The one that would break an environment value, or smuggle a second
+        // one in behind it.
+        assert_eq!(
+            validate_llm_api_key("sk-vk\nSQUELCH_API_TOKEN=x"),
+            Err(ApiKeyError::Charset)
+        );
+        assert_eq!(validate_llm_api_key("sk$vk"), Err(ApiKeyError::Charset));
+        assert_eq!(validate_llm_api_key("sk vk"), Err(ApiKeyError::Charset));
     }
 
     #[test]

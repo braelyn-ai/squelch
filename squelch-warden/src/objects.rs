@@ -9,20 +9,23 @@
 //! that installs the warden itself is YAML, and it lives in `deploy/hosted/`
 //! where no tenant value ever appears.
 //!
-//! A tenant is seven objects in the `tenants` namespace:
+//! A tenant is seven objects in the `tenants` namespace, plus one optional
+//! eighth:
 //!
 //! | Object | Name | Lifetime |
 //! |---|---|---|
 //! | Secret (identity) | `<label>-identity` | forever; the tenant's age key |
 //! | Secret (credential) | `<label>-credential` | forever; the sealed blob |
 //! | PersistentVolumeClaim | `<label>-data` | forever; the mailbox index |
+//! | Secret (LLM key) | `<label>-llm` | while the control plane keeps one minted |
 //! | NetworkPolicy | `<label>` | while provisioned |
 //! | Service | `<label>` | while provisioned |
 //! | Deployment | `<label>` | while provisioned |
 //! | Ingress | `<label>` | while provisioned |
 //!
-//! DELETE removes the bottom four and keeps the top three, which is what
-//! "cancel my account, do not destroy my mail" means.
+//! DELETE removes the bottom five and keeps the top three, which is what
+//! "cancel my account, do not destroy my mail" means: the LLM Secret goes with
+//! the workload because it is a gateway credential, not tenant data.
 
 use std::collections::BTreeMap;
 
@@ -115,6 +118,15 @@ pub const ACCOUNT_EMAIL_KEY: &str = "account-email";
 /// Data key holding the age-armored credentials file.
 pub const CREDENTIAL_KEY: &str = "credentials.json";
 
+/// Data key holding the tenant's LLM gateway virtual key, in `<label>-llm`.
+///
+/// The daemon receives it as a `secretKeyRef` (see [`llm_secret`]), and the
+/// warden does handle the plaintext: it writes it into the Secret and reads it
+/// back to hash it for [`LLM_KEY_HASH_ANNOTATION`]. The posture is narrower:
+/// never logged, never returned on the wire, and only the hash lands on the
+/// world-readable pod spec.
+pub const LLM_API_KEY_KEY: &str = "api-key";
+
 /// Data keys in the shared Google OAuth client Secret
 /// ([`crate::config::Config::oauth_secret_name`]).
 ///
@@ -136,6 +148,16 @@ pub const OAUTH_CLIENT_SECRET_KEY: &str = "client_secret";
 /// The HASH, never the ciphertext: an annotation is world-readable to anyone
 /// with `get deployment`.
 pub const CREDENTIAL_HASH_ANNOTATION: &str = "passband.email/credential-hash";
+
+/// Annotation on the pod template carrying the SHA-256 of the LLM virtual key
+/// this pod was rolled for, when one exists.
+///
+/// Same rationale as [`CREDENTIAL_HASH_ANNOTATION`]: a rotated key changes
+/// only the contents of a Secret, and a Secret's contents are not part of a
+/// Deployment's pod template, so without this nothing would restart and the
+/// running daemon would keep the env value it booted with. The HASH, never the
+/// key: an annotation is world-readable to anyone with `get deployment`.
+pub const LLM_KEY_HASH_ANNOTATION: &str = "passband.email/llm-key-hash";
 
 /// Annotation on the identity Secret recording when phase one ran, as Unix
 /// seconds. The pending sweep needs an age, and this is the only place a
@@ -387,6 +409,27 @@ pub fn credential_secret(config: &Config, name: &TenantName, ciphertext: &str) -
         string_data: Some(BTreeMap::from([(
             CREDENTIAL_KEY.to_string(),
             ciphertext.to_string(),
+        )])),
+        ..Default::default()
+    }
+}
+
+/// The tenant's LLM Secret: the gateway virtual key the control plane minted
+/// for this tenant, verbatim.
+///
+/// Unlike the credential blob, this one is plaintext to the warden: it is
+/// embedded in this Secret object and read back to be hashed for the roll
+/// annotation ([`LLM_KEY_HASH_ANNOTATION`]). What holds instead: the key is
+/// never logged, never returned on the wire, and only its hash lands on the
+/// world-readable pod spec — the daemon gets the key itself as a
+/// `secretKeyRef` (see [`daemon_env`]).
+pub fn llm_secret(config: &Config, name: &TenantName, api_key: &str) -> Secret {
+    Secret {
+        metadata: meta(config, name, name.llm_secret()),
+        type_: Some("Opaque".to_string()),
+        string_data: Some(BTreeMap::from([(
+            LLM_API_KEY_KEY.to_string(),
+            api_key.to_string(),
         )])),
         ..Default::default()
     }
@@ -657,7 +700,16 @@ pub fn network_policy(config: &Config, name: &TenantName) -> NetworkPolicy {
 /// `credential_hash` is [`credential_hash`] of the ciphertext this tenant is
 /// being provisioned with. It rides in an annotation on the pod template so a
 /// re-consent actually reaches the daemon; see [`CREDENTIAL_HASH_ANNOTATION`].
-pub fn deployment(config: &Config, name: &TenantName, credential_hash: &str) -> Deployment {
+///
+/// `llm_key_hash` is the same mechanism for the LLM virtual key, when this
+/// tenant has one: absent for a tenant never keyed, present so a rotated key
+/// is a changed pod spec and a roll. See [`LLM_KEY_HASH_ANNOTATION`].
+pub fn deployment(
+    config: &Config,
+    name: &TenantName,
+    credential_hash: &str,
+    llm_key_hash: Option<&str>,
+) -> Deployment {
     let pod_security = PodSecurityContext {
         run_as_non_root: Some(true),
         run_as_user: Some(config.run_as),
@@ -859,12 +911,20 @@ pub fn deployment(config: &Config, name: &TenantName, credential_hash: &str) -> 
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels(name)),
-                    // What makes a re-consent land: see
-                    // [`CREDENTIAL_HASH_ANNOTATION`].
-                    annotations: Some(BTreeMap::from([(
-                        CREDENTIAL_HASH_ANNOTATION.to_string(),
-                        credential_hash.to_string(),
-                    )])),
+                    // What makes a re-consent (and a key rotation) land: see
+                    // [`CREDENTIAL_HASH_ANNOTATION`] and
+                    // [`LLM_KEY_HASH_ANNOTATION`].
+                    annotations: Some({
+                        let mut annotations = BTreeMap::from([(
+                            CREDENTIAL_HASH_ANNOTATION.to_string(),
+                            credential_hash.to_string(),
+                        )]);
+                        if let Some(hash) = llm_key_hash {
+                            annotations
+                                .insert(LLM_KEY_HASH_ANNOTATION.to_string(), hash.to_string());
+                        }
+                        annotations
+                    }),
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
@@ -916,7 +976,22 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         }),
         ..Default::default()
     };
-    vec![
+    // Like `from_secret`, but the Secret is allowed to not exist yet. Required
+    // references make a missing Secret a pod that never starts; the one place
+    // this variant is used, that would be wrong (see the LLM block below).
+    let from_secret_optional = |key: &str, secret: String, data_key: &str| EnvVar {
+        name: key.to_string(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: secret,
+                key: data_key.to_string(),
+                optional: Some(true),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut env = vec![
         // Inside the pod's own network namespace. Not reachable from anywhere
         // the NetworkPolicy does not allow.
         plain("SQUELCH_BIND", "0.0.0.0:8848"),
@@ -958,7 +1033,42 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
             config.oauth_secret_name.clone(),
             OAUTH_CLIENT_SECRET_KEY,
         ),
-    ]
+    ];
+    // The LLM gateway block, present only when the operator configured one.
+    // With it absent the vec above is byte-identical to what a warden without
+    // the feature built, which is the env-contract tests' whole claim.
+    if let Some(base_url) = &config.llm_base_url {
+        env.push(plain("SQUELCH_ANTHROPIC_BASE_URL", base_url));
+        // Belt and braces: the base URL alone would already select Anthropic's
+        // wire shape, but the daemon also sniffs the provider from the model
+        // name, and a gateway-side model alias must not flip a tenant onto a
+        // provider path the gateway does not speak.
+        env.push(plain("SQUELCH_STAGE2_PROVIDER", "anthropic"));
+        // The virtual key, from the Secret, never inline — and OPTIONAL: a
+        // tenant whose key was never minted must still boot. The daemon
+        // fail-softs triage when the var is absent, which is a degraded tenant
+        // rather than a pod stuck in CreateContainerConfigError.
+        env.push(from_secret_optional(
+            "SQUELCH_STAGE2_API_KEY",
+            name.llm_secret(),
+            LLM_API_KEY_KEY,
+        ));
+        if let Some(model) = &config.llm_stage1_model {
+            env.push(plain("SQUELCH_STAGE1_MODEL", model));
+        }
+        if let Some(model) = &config.llm_stage2_model {
+            // Stage 2's model variable really is `SQUELCH_MODEL`: it predates
+            // the stage split and the daemon never grew a prefixed alias.
+            env.push(plain("SQUELCH_MODEL", model));
+        }
+        if let Some(cap) = config.llm_stage1_daily_cap {
+            env.push(plain("SQUELCH_STAGE1_GLOBAL_DAILY_CAP", &cap.to_string()));
+        }
+        if let Some(cap) = config.llm_stage2_daily_cap {
+            env.push(plain("SQUELCH_STAGE2_GLOBAL_DAILY_CAP", &cap.to_string()));
+        }
+    }
+    env
 }
 
 /// The argv `squelchd pair` runs as inside a tenant pod.
@@ -986,9 +1096,17 @@ mod tests {
     }
 
     /// A tenant's Deployment as provisioning builds it, for the tests that do
-    /// not care which ciphertext it was rolled for.
+    /// not care which ciphertext it was rolled for. No LLM key, which is also
+    /// the shape every unkeyed tenant gets.
     fn tenant_deployment(config: &Config) -> Deployment {
-        deployment(config, &name(), &credential_hash("ct"))
+        deployment(config, &name(), &credential_hash("ct"), None)
+    }
+
+    /// A config with the LLM gateway turned on and nothing else changed.
+    fn llm_config() -> Config {
+        let mut c = test_config();
+        c.llm_base_url = Some("https://llm.passband.internal".to_string());
+        c
     }
 
     #[test]
@@ -1149,6 +1267,141 @@ mod tests {
         let from = email.value_from.clone().unwrap().secret_key_ref.unwrap();
         assert_eq!(from.name, "alice-identity");
         assert_eq!(from.key, "account-email");
+
+        // With no gateway configured, the LLM block is entirely absent: not a
+        // base URL, not a provider pin, not an optional key reference. This is
+        // the byte-identical-when-unset half of the contract.
+        for llm_var in [
+            "SQUELCH_ANTHROPIC_BASE_URL",
+            "SQUELCH_STAGE2_PROVIDER",
+            "SQUELCH_STAGE2_API_KEY",
+            "SQUELCH_STAGE1_MODEL",
+            "SQUELCH_MODEL",
+            "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
+            "SQUELCH_STAGE2_GLOBAL_DAILY_CAP",
+        ] {
+            assert!(
+                env.iter().all(|e| e.name != llm_var),
+                "{llm_var} appears in an unconfigured pod"
+            );
+        }
+    }
+
+    /// The LLM half of the env contract: a configured gateway reaches the pod
+    /// as a base URL, a provider pin, and an OPTIONAL secretKeyRef — a tenant
+    /// whose virtual key was never minted must still boot, and the daemon
+    /// fail-softs triage when the var is absent.
+    #[test]
+    fn a_configured_gateway_reaches_the_daemon_and_the_key_stays_optional() {
+        let c = llm_config();
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+
+        let plain: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(
+            plain["SQUELCH_ANTHROPIC_BASE_URL"],
+            "https://llm.passband.internal"
+        );
+        assert_eq!(plain["SQUELCH_STAGE2_PROVIDER"], "anthropic");
+
+        let key = env
+            .iter()
+            .find(|e| e.name == "SQUELCH_STAGE2_API_KEY")
+            .unwrap();
+        // From the Secret, never inline in the pod spec.
+        assert!(key.value.is_none());
+        let from = key.value_from.clone().unwrap().secret_key_ref.unwrap();
+        assert_eq!(from.name, "alice-llm");
+        assert_eq!(from.key, "api-key");
+        assert_eq!(from.optional, Some(true));
+
+        // The base URL alone pins no model and no cap: those are separate
+        // knobs, absent unless the operator set them.
+        for tuned in [
+            "SQUELCH_STAGE1_MODEL",
+            "SQUELCH_MODEL",
+            "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
+            "SQUELCH_STAGE2_GLOBAL_DAILY_CAP",
+        ] {
+            assert!(env.iter().all(|e| e.name != tuned), "{tuned} appeared unset");
+        }
+    }
+
+    /// The tuning knobs, each landing under the daemon's real variable name.
+    /// Stage 2's model is `SQUELCH_MODEL`, not `SQUELCH_STAGE2_MODEL`: it
+    /// predates the stage split.
+    #[test]
+    fn the_llm_tuning_knobs_land_under_the_daemons_real_names() {
+        let mut c = llm_config();
+        c.llm_stage1_model = Some("claude-haiku-4-5".to_string());
+        c.llm_stage2_model = Some("claude-sonnet-4-5".to_string());
+        c.llm_stage1_daily_cap = Some(200);
+        c.llm_stage2_daily_cap = Some(40);
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+
+        let plain: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(plain["SQUELCH_STAGE1_MODEL"], "claude-haiku-4-5");
+        assert_eq!(plain["SQUELCH_MODEL"], "claude-sonnet-4-5");
+        assert!(!plain.contains_key("SQUELCH_STAGE2_MODEL"));
+        assert_eq!(plain["SQUELCH_STAGE1_GLOBAL_DAILY_CAP"], "200");
+        assert_eq!(plain["SQUELCH_STAGE2_GLOBAL_DAILY_CAP"], "40");
+    }
+
+    /// The rotation mechanism for the virtual key, same story as the
+    /// credential hash: a keyed pod carries the hash, an unkeyed pod carries
+    /// nothing, and a different key is a different pod spec.
+    #[test]
+    fn a_new_llm_key_rolls_the_deployment_and_an_unkeyed_pod_carries_no_hash() {
+        let c = llm_config();
+        let n = name();
+        let annotations = |llm_hash: Option<&str>| {
+            deployment(&c, &n, &credential_hash("ct"), llm_hash)
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()
+        };
+
+        assert!(!annotations(None).contains_key(LLM_KEY_HASH_ANNOTATION));
+        let first = annotations(Some(&credential_hash("key-one")));
+        let a = first[LLM_KEY_HASH_ANNOTATION].clone();
+        assert_eq!(
+            a,
+            annotations(Some(&credential_hash("key-one")))[LLM_KEY_HASH_ANNOTATION],
+            "the same key is the same pod spec"
+        );
+        assert_ne!(
+            a,
+            annotations(Some(&credential_hash("key-two")))[LLM_KEY_HASH_ANNOTATION],
+            "a new key must roll the pod"
+        );
+        // A hash, not the key: the annotation is world-readable.
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        // And the credential hash rides alongside untouched.
+        assert!(first.contains_key(CREDENTIAL_HASH_ANNOTATION));
+    }
+
+    #[test]
+    fn the_llm_secret_is_the_key_verbatim_under_the_one_data_key() {
+        let c = test_config();
+        let secret = llm_secret(&c, &name(), "sk-vk-abc123");
+        assert_eq!(secret.metadata.name.as_deref(), Some("alice-llm"));
+        assert_eq!(secret.metadata.namespace.as_deref(), Some("tenants"));
+        assert_eq!(secret.type_.as_deref(), Some("Opaque"));
+        let data = secret.string_data.unwrap();
+        assert_eq!(data[LLM_API_KEY_KEY], "sk-vk-abc123");
+        assert_eq!(data.len(), 1);
     }
 
     /// Without these the daemon exits at boot: `Config::oauth_client` is
@@ -1303,7 +1556,7 @@ mod tests {
         let second = crate::testing::armored("second");
 
         let annotation = |ct: &str| {
-            deployment(&c, &n, &credential_hash(ct))
+            deployment(&c, &n, &credential_hash(ct), None)
                 .spec
                 .unwrap()
                 .template

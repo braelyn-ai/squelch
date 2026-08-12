@@ -70,6 +70,20 @@ pub fn test_config() -> Config {
         ready_timeout: Duration::from_secs(1),
         pending_ttl: Duration::from_secs(DEFAULT_PENDING_TTL_SECS),
         trusted_proxy_hops: 0,
+        llm_base_url: None,
+        llm_stage1_model: None,
+        llm_stage2_model: None,
+        llm_stage1_daily_cap: None,
+        llm_stage2_daily_cap: None,
+    }
+}
+
+/// [`test_config`] with the LLM gateway feature switched on, for the llm-key
+/// paths: `set_llm_key` refuses outright when `llm_base_url` is absent.
+pub fn llm_test_config() -> Config {
+    Config {
+        llm_base_url: Some("https://bifrost.railway.internal".to_string()),
+        ..test_config()
     }
 }
 
