@@ -81,6 +81,11 @@ struct ConnectView: View {
                 connectCard
             }
         }
+        // The phone's screen margin. On the Mac the card is a fixed measure
+        // floating in a large window and needs none.
+        #if !os(macOS)
+            .padding(.horizontal, 16)
+        #endif
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // A link can arrive before this gate mounts (the app was launched by
         // one) or while it is up, so both entry points are covered.
@@ -142,7 +147,14 @@ struct ConnectView: View {
                     .padding(.top, 14)
             }
             .padding(30)
-            .frame(width: 440)
+            // A window can always be 440pt wide; a phone cannot. Same intended
+            // measure either way — the Mac states it, the phone treats it as a
+            // ceiling and takes whatever the screen leaves (see body's margin).
+            #if os(macOS)
+                .frame(width: 440)
+            #else
+                .frame(maxWidth: 440)
+            #endif
             .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
     }

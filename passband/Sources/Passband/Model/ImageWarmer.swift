@@ -81,41 +81,52 @@ final class ImageWarmer {
 
     /// Warm one thread's bodies. The thread is normally already cached, so this is
     /// usually a dictionary hit followed by the image fetches.
+    ///
+    /// The thread fetch is shared; the IMAGE half is fenced, because finding a
+    /// body's image URLs means preparing the body, and preparation lives in the
+    /// reader's web view — which is macOS-only until the reader ships on iOS.
+    /// A phone therefore warms the thread cache and stops there, which is the
+    /// honest amount of prefetching for a build with nothing to render into.
     private func warmThread(_ threadId: String) async {
         guard !threadId.isEmpty,
             let view = try? await ThreadPrefetch.shared.fetch(threadId)
         else { return }
 
-        let repeats =
-            ThreadPrefetch.shared.cachedRepeatedImages(threadId)
-            ?? ThreadPrefetch.repeatedImages(in: view)
+        #if os(macOS)
+            let repeats =
+                ThreadPrefetch.shared.cachedRepeatedImages(threadId)
+                ?? ThreadPrefetch.repeatedImages(in: view)
 
-        for message in view.messages {
-            guard let html = message.html, !html.isEmpty else { continue }
-            let seenEarlier = repeats[message.id] ?? []
-            let prepared = await Self.prepared(html, seenEarlier)
-            guard !prepared.imageURLs.isEmpty else { continue }
-            await ImageStore.shared.warm(urls: prepared.imageURLs, pin: message.id)
+            for message in view.messages {
+                guard let html = message.html, !html.isEmpty else { continue }
+                let seenEarlier = repeats[message.id] ?? []
+                let prepared = await Self.prepared(html, seenEarlier)
+                guard !prepared.imageURLs.isEmpty else { continue }
+                await ImageStore.shared.warm(urls: prepared.imageURLs, pin: message.id)
+            }
+        #endif
+    }
+
+    #if os(macOS)
+        /// The warm cache's answer, or a fresh pass OFF the main actor: an
+        /// already-prepared body costs one dictionary probe, and one that is not
+        /// prepared is never scanned on the main thread.
+        ///
+        /// ALWAYS the STRIPPED preparation, even for a known sender whose pixels the
+        /// reader will keep: this runs before the mail is opened, and pre-fetching a
+        /// tracking pixel would report an open that never happened. The known-sender
+        /// body is prepared for real when the card renders it.
+        private static func prepared(_ html: String, _ seenEarlier: Set<String>)
+            async -> EmailWebView.Prepared
+        {
+            let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, false)
+            if let warm = PreparedBodies.shared.get(key) { return warm }
+            let made = await Task.detached(priority: .utility) {
+                EmailWebView.Prepared.make(
+                    from: html, seenEarlier: seenEarlier, allowTrackers: false)
+            }.value
+            PreparedBodies.shared.set(key, made)
+            return made
         }
-    }
-
-    /// The warm cache's answer, or a fresh pass OFF the main actor: an
-    /// already-prepared body costs one dictionary probe, and one that is not
-    /// prepared is never scanned on the main thread.
-    ///
-    /// ALWAYS the STRIPPED preparation, even for a known sender whose pixels the
-    /// reader will keep: this runs before the mail is opened, and pre-fetching a
-    /// tracking pixel would report an open that never happened. The known-sender
-    /// body is prepared for real when the card renders it.
-    private static func prepared(_ html: String, _ seenEarlier: Set<String>)
-        async -> EmailWebView.Prepared
-    {
-        let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, false)
-        if let warm = PreparedBodies.shared.get(key) { return warm }
-        let made = await Task.detached(priority: .utility) {
-            EmailWebView.Prepared.make(from: html, seenEarlier: seenEarlier, allowTrackers: false)
-        }.value
-        PreparedBodies.shared.set(key, made)
-        return made
-    }
+    #endif
 }

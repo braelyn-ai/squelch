@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<!-- Literal, not $(PRODUCT_NAME): the product is PassbandiOS.app so the
+	     generated scheme can name it, and nothing a human reads should say so. -->
+	<key>CFBundleName</key>
+	<string>Passband</string>
+	<key>CFBundleDisplayName</key>
+	<string>Passband</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>$(IPHONEOS_DEPLOYMENT_TARGET)</string>
+	<!-- REQUIRED even when empty: without a launch screen iOS renders the app
+	     into a compatibility-sized canvas instead of the full device screen. -->
+	<key>UILaunchScreen</key>
+	<dict/>
+	<!-- Portrait is the reading posture; landscape stays available. Upside-down
+	     is deliberately absent — a phone that flips a mail app on its head while
+	     it sits on a desk is nobody's intent. -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- The macOS bundle points ATSApplicationFontsPath at a folder; iOS has no
+	     such directory sweep, so the two faces are named one by one. Bare names
+	     because an iOS bundle is flat — see project.yml on why these two files
+	     may not live under a `Resources/` directory here. -->
+	<key>UIAppFonts</key>
+	<array>
+		<string>newsreader-var.ttf</string>
+		<string>newsreader-italic-var.ttf</string>
+	</array>
+	<!-- passband://pair?url=…&amp;code=XXXX-XXXX — the deep link `squelchd pair`
+	     prints, so a tap carries the server URL and the one-shot pairing code
+	     into the Connect gate. Handled in PassbandiOSApp via onOpenURL; the link
+	     is treated as untrusted input (see PairLink). -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>app.passband.client.ios.pair</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>passband</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- The simulator shares the Mac's loopback, so a daemon on
+		     http://127.0.0.1:8848 is reachable in development. A phone reaching a
+		     daemon across the network still needs TLS: this exemption covers
+		     loopback and .local only, never the open internet. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- Asked for the first time a phone (not the simulator) dials a daemon on
+	     the LAN rather than on loopback. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Passband connects to the squelchd daemon you run, which may live on another machine on your network.</string>
+</dict>
+</plist>
