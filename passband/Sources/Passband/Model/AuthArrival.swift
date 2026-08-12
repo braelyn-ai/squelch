@@ -46,13 +46,19 @@ struct AuthSeenSet {
     let accountId: UUID
 
     private var ids: Set<Int>
-    /// Whether this instance has taken its first look yet. Per INSTANCE and
-    /// deliberately not persisted: the silent seeding below is about what was
-    /// already sitting in the mailbox when this watcher started watching.
-    private var seeded = false
+    /// Whether this ACCOUNT has ever been seeded, read off the persisted key's
+    /// existence. Per account and durable, deliberately not per instance: a
+    /// new instance is constructed on every switch (both the incoming
+    /// `AuthArrival` and the outgoing account's background watch), and a
+    /// per-instance flag would spend one silent observation per handoff —
+    /// swallowing exactly the just-landed code the human is switching over to
+    /// read. The backlog guard for everything after the first-ever look is the
+    /// `freshWindow` filter, not the seed.
+    private var seeded: Bool
 
     init(accountId: UUID) {
         self.accountId = accountId
+        seeded = UserDefaults.standard.object(forKey: Self.key(accountId)) != nil
         let raw = UserDefaults.standard.array(forKey: Self.key(accountId)) as? [Int] ?? []
         ids = Set(raw)
     }
@@ -72,16 +78,17 @@ struct AuthSeenSet {
     /// worth reacting to: not already seen, AND received recently enough to
     /// still be live.
     ///
-    /// The FIRST observation answers with nothing. Whatever is sealed when a
-    /// watcher starts is that mailbox's backlog, and seeding it silently is
-    /// what stops a launch — or an account switch — from firing a fortnight of
-    /// history at the human.
+    /// The first observation EVER for an account answers with nothing.
+    /// Whatever is sealed the first time anything watches that mailbox is its
+    /// backlog, and seeding it silently is what stops a first launch from
+    /// firing a fortnight of history at the human. Saved unconditionally so
+    /// the key exists afterwards even for an empty mailbox — the key's
+    /// existence is what marks the account seeded for every later instance.
     mutating func arrivals(in sealed: [SealedMeta], now: Date = Date()) -> [SealedMeta] {
         if !seeded {
             seeded = true
-            var changed = false
-            for m in sealed where ids.insert(m.id).inserted { changed = true }
-            if changed { save() }
+            for m in sealed { ids.insert(m.id) }
+            save()
             return []
         }
 
