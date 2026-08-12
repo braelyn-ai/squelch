@@ -308,8 +308,11 @@ pub struct LlmCategoryUsage {
     /// The ledger's own label (`stage1`, `stage2`, `extract_banking`, ...).
     pub category: String,
     pub calls: u64,
+    /// The UNCACHED prompt remainder — cache writes/reads are separate below.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 /// Everything the db-derived half of a scrape needs, gathered by the caller in
@@ -337,11 +340,15 @@ pub fn usage_from_ledger(rows: Vec<(String, Vec<Stage2UsageDay>)>) -> Vec<LlmCat
                 calls: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             };
             for d in days {
                 usage.calls += d.calls;
                 usage.input_tokens += d.input_tokens;
                 usage.output_tokens += d.output_tokens;
+                usage.cache_creation_tokens += d.cache_creation_tokens;
+                usage.cache_read_tokens += d.cache_read_tokens;
             }
             usage
         })
@@ -370,6 +377,12 @@ pub fn estimate_cost_usd(usage: &[LlmCategoryUsage], config: &Config) -> f64 {
             };
             (u.input_tokens as f64 / 1_000_000.0) * price_in
                 + (u.output_tokens as f64 / 1_000_000.0) * price_out
+                + (u.cache_creation_tokens as f64 / 1_000_000.0)
+                    * price_in
+                    * crate::config::CACHE_WRITE_INPUT_MULT
+                + (u.cache_read_tokens as f64 / 1_000_000.0)
+                    * price_in
+                    * crate::config::CACHE_READ_INPUT_MULT
         })
         .sum()
 }
@@ -531,6 +544,18 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
                 &[("category", &u.category), ("direction", "output")],
                 u.output_tokens as f64,
             );
+            // `input` above is the uncached remainder only; the cache split gets
+            // its own directions so the exported totals cover the whole prompt.
+            e.sample(
+                "squelchd_llm_tokens_total",
+                &[("category", &u.category), ("direction", "cache_write")],
+                u.cache_creation_tokens as f64,
+            );
+            e.sample(
+                "squelchd_llm_tokens_total",
+                &[("category", &u.category), ("direction", "cache_read")],
+                u.cache_read_tokens as f64,
+            );
         }
         e.scalar(
             "squelchd_llm_cost_usd_total",
@@ -677,12 +702,16 @@ mod tests {
                         calls: 2,
                         input_tokens: 100,
                         output_tokens: 10,
+                        cache_creation_tokens: 30,
+                        cache_read_tokens: 400,
                     },
                     Stage2UsageDay {
                         day: "2026-08-09".to_string(),
                         calls: 1,
                         input_tokens: 50,
                         output_tokens: 5,
+                        cache_creation_tokens: 10,
+                        cache_read_tokens: 200,
                     },
                 ],
             )]),
@@ -697,6 +726,12 @@ mod tests {
         assert!(text.contains(
             "squelchd_llm_tokens_total{category=\"extract_banking\",direction=\"input\"} 150\n"
         ));
+        assert!(text.contains(
+            "squelchd_llm_tokens_total{category=\"extract_banking\",direction=\"cache_write\"} 40\n"
+        ));
+        assert!(text.contains(
+            "squelchd_llm_tokens_total{category=\"extract_banking\",direction=\"cache_read\"} 600\n"
+        ));
         assert!(text.contains("squelchd_llm_cost_usd_total 0.25\n"));
         assert!(text.contains("squelchd_db_size_bytes{file=\"wal\"} 0\n"));
     }
@@ -710,16 +745,56 @@ mod tests {
                 calls: 1,
                 input_tokens: 1_000_000,
                 output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             },
             LlmCategoryUsage {
                 category: "extract_banking".to_string(),
                 calls: 1,
                 input_tokens: 1_000_000,
                 output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
             },
         ];
         let expected = config.stage2.price_in_per_mtok + config.stage1.price_in_per_mtok;
         assert!((estimate_cost_usd(&usage, &config) - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_prices_cache_tokens_off_the_input_price() {
+        let config = Config::default();
+        let cached = vec![LlmCategoryUsage {
+            category: "stage2".to_string(),
+            calls: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+        }];
+        let expected = config.stage2.price_in_per_mtok
+            * (crate::config::CACHE_WRITE_INPUT_MULT + crate::config::CACHE_READ_INPUT_MULT);
+        assert!((estimate_cost_usd(&cached, &config) - expected).abs() < 1e-9);
+
+        // A cached-read prompt must cost LESS than the same tokens uncached —
+        // the whole point of recording the split.
+        let raw = vec![LlmCategoryUsage {
+            category: "stage2".to_string(),
+            calls: 1,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        }];
+        let read_only = vec![LlmCategoryUsage {
+            category: "stage2".to_string(),
+            calls: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 1_000_000,
+        }];
+        assert!(estimate_cost_usd(&read_only, &config) < estimate_cost_usd(&raw, &config));
     }
 
     #[test]

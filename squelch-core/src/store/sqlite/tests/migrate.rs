@@ -161,6 +161,49 @@ fn migrate_rebuilds_stage2_usage_with_category_pk() {
 }
 
 #[test]
+fn migrate_adds_cache_token_columns_to_a_preexisting_usage_table() {
+    // A category-keyed stage2_usage that predates the cache columns gains them
+    // additively — old rows read 0, and the cache-carrying bump upsert works.
+    // Also covers the rebuild path: the pre-category shape from the test above
+    // is rebuilt WITHOUT the cache columns, so they must be added after.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE stage2_usage (
+             account_id INTEGER NOT NULL, day TEXT NOT NULL,
+             category TEXT NOT NULL DEFAULT 'stage2',
+             calls INTEGER NOT NULL DEFAULT 0,
+             input_tokens INTEGER NOT NULL DEFAULT 0,
+             output_tokens INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(account_id, day, category));
+         INSERT INTO stage2_usage VALUES (1, '2026-08-01', 'stage2', 2, 100, 50);",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    let (cache_w, cache_r): (i64, i64) = conn
+        .query_row(
+            "SELECT cache_creation_tokens, cache_read_tokens FROM stage2_usage
+             WHERE account_id=1 AND day='2026-08-01' AND category='stage2'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((cache_w, cache_r), (0, 0), "history reads as zero cache");
+    // The widened bump upsert (this was the failing INSERT pre-migration).
+    conn.execute(
+        "INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens,
+                                  cache_creation_tokens, cache_read_tokens)
+         VALUES (1, '2026-08-01', 'stage2', 1, 10, 5, 700, 9000)
+         ON CONFLICT(account_id, day, category) DO UPDATE SET
+             cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+             cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens",
+        [],
+    )
+    .unwrap();
+    // Idempotent: migrate again is a no-op.
+    migrate(&conn).unwrap();
+}
+
+#[test]
 fn migrate_cleans_year_slipped_stage_deadlines() {
     // A stage-sourced deadline far before its message's receipt is nulled
     // (tier demoted from past_due) and its deadlines row deleted;

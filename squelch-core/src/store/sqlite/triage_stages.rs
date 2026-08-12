@@ -15,20 +15,27 @@ fn bump_usage_category(
     category: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens)
-         VALUES(?1, ?2, ?3, 1, ?4, ?5)
+        "INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens,
+                                  cache_creation_tokens, cache_read_tokens)
+         VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)
          ON CONFLICT(account_id, day, category) DO UPDATE SET
              calls = calls + 1,
              input_tokens = input_tokens + excluded.input_tokens,
-             output_tokens = output_tokens + excluded.output_tokens",
+             output_tokens = output_tokens + excluded.output_tokens,
+             cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+             cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens",
         params![
             account_id,
             day,
             category,
             input_tokens as i64,
-            output_tokens as i64
+            output_tokens as i64,
+            cache_creation_tokens as i64,
+            cache_read_tokens as i64
         ],
     )?;
     Ok(())
@@ -43,7 +50,8 @@ fn usage_since_category(
 ) -> Result<Stage2Usage> {
     let row = conn.query_row(
         "SELECT COALESCE(SUM(calls), 0), COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0)
+                COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0)
          FROM stage2_usage
          WHERE account_id = ?1 AND day >= ?2 AND category = ?3",
         params![account_id, since_day, category],
@@ -52,6 +60,8 @@ fn usage_since_category(
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         },
     )?;
@@ -59,6 +69,8 @@ fn usage_since_category(
         calls: row.0.max(0) as u64,
         input_tokens: row.1.max(0) as u64,
         output_tokens: row.2.max(0) as u64,
+        cache_creation_tokens: row.3.max(0) as u64,
+        cache_read_tokens: row.4.max(0) as u64,
     })
 }
 
@@ -70,7 +82,8 @@ fn list_usage_category(
     category: &str,
 ) -> Result<Vec<Stage2UsageDay>> {
     let mut stmt = conn.prepare(
-        "SELECT day, calls, input_tokens, output_tokens FROM stage2_usage
+        "SELECT day, calls, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+         FROM stage2_usage
          WHERE account_id = ?1 AND category = ?3
          ORDER BY day DESC
          LIMIT ?2",
@@ -82,6 +95,8 @@ fn list_usage_category(
                 calls: r.get::<_, i64>(1)?.max(0) as u64,
                 input_tokens: r.get::<_, i64>(2)?.max(0) as u64,
                 output_tokens: r.get::<_, i64>(3)?.max(0) as u64,
+                cache_creation_tokens: r.get::<_, i64>(4)?.max(0) as u64,
+                cache_read_tokens: r.get::<_, i64>(5)?.max(0) as u64,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -340,6 +355,8 @@ impl SqliteStore {
         day: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
         bump_usage_category(
@@ -349,6 +366,8 @@ impl SqliteStore {
             "stage1",
             input_tokens,
             output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
     }
 
@@ -368,6 +387,8 @@ impl SqliteStore {
         category: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
         bump_usage_category(
@@ -377,6 +398,8 @@ impl SqliteStore {
             category,
             input_tokens,
             output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
     }
 
@@ -582,6 +605,8 @@ impl SqliteStore {
         day: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()> {
         let conn = self.lock()?;
         bump_usage_category(
@@ -591,6 +616,8 @@ impl SqliteStore {
             "stage2",
             input_tokens,
             output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
     }
 
@@ -602,7 +629,9 @@ impl SqliteStore {
         let conn = self.lock()?;
         let row = conn
             .query_row(
-                "SELECT calls, input_tokens, output_tokens FROM stage2_usage
+                "SELECT calls, input_tokens, output_tokens, cache_creation_tokens,
+                        cache_read_tokens
+                 FROM stage2_usage
                  WHERE account_id = ?1 AND day = ?2 AND category = 'stage2'",
                 params![account_id, day],
                 |r| {
@@ -610,15 +639,19 @@ impl SqliteStore {
                         r.get::<_, i64>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
         Ok(row
-            .map(|(calls, in_tok, out_tok)| Stage2Usage {
+            .map(|(calls, in_tok, out_tok, cache_w, cache_r)| Stage2Usage {
                 calls: calls.max(0) as u64,
                 input_tokens: in_tok.max(0) as u64,
                 output_tokens: out_tok.max(0) as u64,
+                cache_creation_tokens: cache_w.max(0) as u64,
+                cache_read_tokens: cache_r.max(0) as u64,
             })
             .unwrap_or_default())
     }

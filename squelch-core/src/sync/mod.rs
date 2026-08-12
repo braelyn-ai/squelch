@@ -1318,6 +1318,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             &day,
                             u.input_tokens,
                             u.output_tokens,
+                            u.cache_creation_input_tokens,
+                            u.cache_read_input_tokens,
                         ) {
                             eprintln!("squelch: stage-1 usage ledger bump failed ({e})");
                         }
@@ -1496,6 +1498,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 marketing::LEDGER_CATEGORY,
                                 u.input_tokens,
                                 u.output_tokens,
+                                u.cache_creation_input_tokens,
+                                u.cache_read_input_tokens,
                             ) {
                                 eprintln!("squelch: extract usage ledger bump failed ({e})");
                             }
@@ -1544,6 +1548,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             banking::LEDGER_CATEGORY,
                             u.input_tokens,
                             u.output_tokens,
+                            u.cache_creation_input_tokens,
+                            u.cache_read_input_tokens,
                         ) {
                             eprintln!("squelch: extract usage ledger bump failed ({e})");
                         }
@@ -1762,6 +1768,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             &day,
                             u.input_tokens,
                             u.output_tokens,
+                            u.cache_creation_input_tokens,
+                            u.cache_read_input_tokens,
                         ) {
                             eprintln!("squelch: stage-2 usage ledger bump failed ({e})");
                         }

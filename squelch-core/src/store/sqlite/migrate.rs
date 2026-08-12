@@ -86,6 +86,22 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Prompt-cache token columns, AFTER the category rebuild so they land on the
+    // rebuilt table too. Zero is correct history: pre-existing rows never
+    // recorded cache traffic, and zero cache tokens cost nothing at read time.
+    add_column_if_missing(
+        conn,
+        "stage2_usage",
+        "cache_creation_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "stage2_usage",
+        "cache_read_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
     // CATEGORIZE-THEN-EXTRACT markers. NULL is the correct resting value for
     // both (no category => never queued for extraction), so no backfill.
     add_column_if_missing(conn, "triage", "category", "TEXT")?;

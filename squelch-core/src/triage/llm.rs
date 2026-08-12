@@ -264,6 +264,9 @@ impl OpenAiUsage {
         Usage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
+            // OpenAI's wire has no prompt-cache split; the ledger records zero.
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         }
     }
 }
@@ -287,13 +290,20 @@ struct ContentBlock {
     text: Option<String>,
 }
 
-/// Token usage — numbers are fine to log.
+/// Token usage — numbers are fine to log. Requests set `cache_control:
+/// ephemeral` on the system block, so Anthropic reports the prompt split three
+/// ways: `input_tokens` is the UNCACHED remainder only, with cache writes and
+/// reads in their own fields — dropping them under-reports the ledger.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
 }
 
 // ===========================================================================
@@ -543,4 +553,42 @@ async fn sleep_backoff(attempt: u32, retry_after: Option<Duration>) {
         Duration::from_secs(secs)
     });
     tokio::time::sleep(base.min(BACKOFF_CAP)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_deserializes_cache_token_fields() {
+        let u: Usage = serde_json::from_str(
+            r#"{"input_tokens":10,"output_tokens":5,
+                "cache_creation_input_tokens":700,"cache_read_input_tokens":9000}"#,
+        )
+        .unwrap();
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+        assert_eq!(u.cache_creation_input_tokens, 700);
+        assert_eq!(u.cache_read_input_tokens, 9000);
+    }
+
+    #[test]
+    fn usage_without_cache_fields_defaults_them_to_zero() {
+        let u: Usage = serde_json::from_str(r#"{"input_tokens":10,"output_tokens":5}"#).unwrap();
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn openai_usage_leaves_cache_fields_zero() {
+        let u = OpenAiUsage {
+            prompt_tokens: 42,
+            completion_tokens: 7,
+        }
+        .into_usage();
+        assert_eq!(u.input_tokens, 42);
+        assert_eq!(u.output_tokens, 7);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 0);
+    }
 }

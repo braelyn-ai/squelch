@@ -65,23 +65,26 @@ fn extract_queue_selects_banking_only_excludes_others_sealed_and_receipts() {
 fn extract_bump_usage_records_its_own_ledger_category() {
     let (store, acct) = store();
     store
-        .extract_bump_usage(acct, "2026-07-23", "extract_banking", 500, 20)
+        .extract_bump_usage(acct, "2026-07-23", "extract_banking", 500, 20, 700, 3000)
         .unwrap();
     store
-        .extract_bump_usage(acct, "2026-07-23", "extract_banking", 300, 10)
+        .extract_bump_usage(acct, "2026-07-23", "extract_banking", 300, 10, 300, 1000)
         .unwrap();
     let conn = store.lock().unwrap();
-    let (calls, in_tok, out_tok): (i64, i64, i64) = conn
+    let (calls, in_tok, out_tok, cache_w, cache_r): (i64, i64, i64, i64, i64) = conn
         .query_row(
-            "SELECT calls, input_tokens, output_tokens FROM stage2_usage
+            "SELECT calls, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+             FROM stage2_usage
              WHERE account_id=?1 AND day=?2 AND category='extract_banking'",
             params![acct, "2026-07-23"],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .unwrap();
     assert_eq!(calls, 2);
     assert_eq!(in_tok, 800);
     assert_eq!(out_tok, 30);
+    assert_eq!(cache_w, 1000);
+    assert_eq!(cache_r, 4000);
 }
 
 #[test]
@@ -228,16 +231,18 @@ fn stage1_mark_processed_preserves_needs_stage2_seed() {
 fn stage1_usage_ledger_is_a_separate_category() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", 100, 20)
+        .stage1_bump_usage(acct, "2026-07-09", 100, 20, 40, 900)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", 500, 90)
+        .stage2_bump_usage(acct, "2026-07-09", 500, 90, 0, 0)
         .unwrap();
 
     let s1 = store.stage1_usage_since(acct, "2026-07-01").unwrap();
     assert_eq!(s1.calls, 1);
     assert_eq!(s1.input_tokens, 100);
     assert_eq!(s1.output_tokens, 20);
+    assert_eq!(s1.cache_creation_tokens, 40);
+    assert_eq!(s1.cache_read_tokens, 900);
     let s2 = store.stage2_usage_since(acct, "2026-07-01").unwrap();
     assert_eq!(s2.calls, 1);
     assert_eq!(s2.input_tokens, 500);
@@ -245,6 +250,8 @@ fn stage1_usage_ledger_is_a_separate_category() {
     let rows1 = store.list_usage_stage1(acct, 30).unwrap();
     assert_eq!(rows1.len(), 1);
     assert_eq!(rows1[0].input_tokens, 100);
+    assert_eq!(rows1[0].cache_creation_tokens, 40);
+    assert_eq!(rows1[0].cache_read_tokens, 900);
     // The stage-2 list is unaffected by the stage-1 row.
     let rows2 = store.list_usage(acct, 30).unwrap();
     assert_eq!(rows2.len(), 1);
@@ -255,19 +262,19 @@ fn stage1_usage_ledger_is_a_separate_category() {
 fn list_usage_by_category_surfaces_extractors_nobody_named() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", 100, 20)
+        .stage1_bump_usage(acct, "2026-07-09", 100, 20, 0, 0)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", 500, 90)
+        .stage2_bump_usage(acct, "2026-07-09", 500, 90, 0, 0)
         .unwrap();
     // An extractor category, and a category invented right here: the point of
     // enumerating is that a ledger writer added LATER still reports, without
     // anyone editing the reader.
     store
-        .extract_bump_usage(acct, "2026-07-09", "extract_banking", 40, 8)
+        .extract_bump_usage(acct, "2026-07-09", "extract_banking", 40, 8, 0, 0)
         .unwrap();
     store
-        .extract_bump_usage(acct, "2026-07-10", "extract_something_new", 7, 3)
+        .extract_bump_usage(acct, "2026-07-10", "extract_something_new", 7, 3, 0, 0)
         .unwrap();
 
     let all = store.list_usage_by_category(acct, 30).unwrap();
@@ -592,12 +599,18 @@ fn stage2_usage_ledger_bumps_and_reads() {
     let z = store.stage2_usage_today(acct, day).unwrap();
     assert_eq!(z, Stage2Usage::default());
 
-    store.stage2_bump_usage(acct, day, 1200, 60).unwrap();
-    store.stage2_bump_usage(acct, day, 800, 40).unwrap();
+    store
+        .stage2_bump_usage(acct, day, 1200, 60, 500, 4000)
+        .unwrap();
+    store
+        .stage2_bump_usage(acct, day, 800, 40, 100, 2000)
+        .unwrap();
     let u = store.stage2_usage_today(acct, day).unwrap();
     assert_eq!(u.calls, 2);
     assert_eq!(u.input_tokens, 2000);
     assert_eq!(u.output_tokens, 100);
+    assert_eq!(u.cache_creation_tokens, 600);
+    assert_eq!(u.cache_read_tokens, 6000);
 
     // A different day is an independent row.
     assert_eq!(
@@ -614,16 +627,16 @@ fn list_usage_returns_recent_days_newest_first() {
     assert!(store.list_usage(acct, 30).unwrap().is_empty());
 
     store
-        .stage2_bump_usage(acct, "2026-07-07", 100, 10)
+        .stage2_bump_usage(acct, "2026-07-07", 100, 10, 0, 0)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", 200, 20)
+        .stage2_bump_usage(acct, "2026-07-08", 200, 20, 0, 0)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", 300, 30)
+        .stage2_bump_usage(acct, "2026-07-09", 300, 30, 0, 0)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", 100, 10)
+        .stage2_bump_usage(acct, "2026-07-09", 100, 10, 0, 0)
         .unwrap();
 
     // Newest-first, sparse (only days with a row).
@@ -774,13 +787,13 @@ fn stage2_usage_since_sums_window_inclusively() {
     );
 
     store
-        .stage2_bump_usage(acct, "2026-07-05", 100, 10)
+        .stage2_bump_usage(acct, "2026-07-05", 100, 10, 0, 0)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", 200, 20)
+        .stage2_bump_usage(acct, "2026-07-08", 200, 20, 0, 0)
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", 300, 30)
+        .stage2_bump_usage(acct, "2026-07-08", 300, 30, 0, 0)
         .unwrap();
 
     // since_day <= earliest => everything summed (2 days, 3 calls).

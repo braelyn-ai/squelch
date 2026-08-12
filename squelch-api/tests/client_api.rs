@@ -3606,15 +3606,17 @@ async fn failed_rule_mutations_write_no_audit_row() {
 
 #[tokio::test]
 async fn stats_expose_stage2_usage_and_cost() {
-    // Cost comes from the default Stage-2 per-MTok prices (3.0 in / 15.0 out).
+    // Cost comes from the default Stage-2 per-MTok prices (3.0 in / 15.0 out),
+    // with cache writes at 1.25x and reads at 0.1x of the input price.
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let Harness { app, .. } = harness(move |store, acct| {
-        // 2 calls: 1_000_000 in, 200_000 out.
+        // 2 calls: 1_000_000 in, 200_000 out, 200_000 cache-write, 1_000_000
+        // cache-read.
         store
-            .stage2_bump_usage(acct, &day, 600_000, 100_000)
+            .stage2_bump_usage(acct, &day, 600_000, 100_000, 200_000, 1_000_000)
             .unwrap();
         store
-            .stage2_bump_usage(acct, &day, 400_000, 100_000)
+            .stage2_bump_usage(acct, &day, 400_000, 100_000, 0, 0)
             .unwrap();
     });
 
@@ -3625,20 +3627,24 @@ async fn stats_expose_stage2_usage_and_cost() {
     assert_eq!(s2["calls_today"], 2);
     assert_eq!(s2["input_tokens_today"], 1_000_000);
     assert_eq!(s2["output_tokens_today"], 200_000);
-    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6) = 3.0 + 3.0 = 6.0
+    assert_eq!(s2["cache_creation_tokens_today"], 200_000);
+    assert_eq!(s2["cache_read_tokens_today"], 1_000_000);
+    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6)
+    //      + 3.0*1.25*(0.2e6/1e6) + 3.0*0.1*(1e6/1e6) = 3.0 + 3.0 + 0.75 + 0.3
     let cost = s2["est_cost_usd_today"].as_f64().unwrap();
-    assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
+    assert!((cost - 7.05).abs() < 1e-9, "expected 7.05, got {cost}");
 }
 
 #[tokio::test]
 async fn usage_returns_rows_totals_and_is_bearer_gated() {
-    // Newest-first daily rows, totals costed at the default 3.0 in / 15.0 out.
+    // Newest-first daily rows, totals costed at the default 3.0 in / 15.0 out
+    // (cache writes at 1.25x, reads at 0.1x of the input price).
     let Harness { app, .. } = harness(|store, acct| {
         store
-            .stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000)
+            .stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000, 0, 0)
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000)
+            .stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000, 400_000, 2_000_000)
             .unwrap();
     });
 
@@ -3655,15 +3661,20 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // Newest-first.
     assert_eq!(rows[0]["day"], "2026-07-09");
     assert_eq!(rows[0]["input_tokens"], 600_000);
+    assert_eq!(rows[0]["cache_creation_tokens"], 400_000);
+    assert_eq!(rows[0]["cache_read_tokens"], 2_000_000);
     assert_eq!(rows[1]["day"], "2026-07-08");
 
     let totals = &json["totals"];
     assert_eq!(totals["calls"], 2);
     assert_eq!(totals["input_tokens"], 1_000_000);
     assert_eq!(totals["output_tokens"], 200_000);
-    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6) = 6.0
+    assert_eq!(totals["cache_creation_tokens"], 400_000);
+    assert_eq!(totals["cache_read_tokens"], 2_000_000);
+    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6)
+    //      + 3.0*1.25*(0.4e6/1e6) + 3.0*0.1*(2e6/1e6) = 3.0 + 3.0 + 1.5 + 0.6
     let cost = totals["est_cost_usd"].as_f64().unwrap();
-    assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
+    assert!((cost - 8.1).abs() < 1e-9, "expected 8.1, got {cost}");
 
     // Stage-1 and Stage-2 appear as separate usage categories.
     assert_eq!(json["model"], "claude-sonnet-5");
@@ -4525,8 +4536,8 @@ async fn triage_config_get_computes_trailing_averages() {
         }
         // One day with 2 calls, 1000 in / 200 out tokens.
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        store.stage2_bump_usage(acct, &day, 600, 120).unwrap();
-        store.stage2_bump_usage(acct, &day, 400, 80).unwrap();
+        store.stage2_bump_usage(acct, &day, 600, 120, 0, 0).unwrap();
+        store.stage2_bump_usage(acct, &day, 400, 80, 0, 0).unwrap();
     });
 
     let resp = app
