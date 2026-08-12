@@ -289,6 +289,10 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     var item_name: String
     var status: ShipmentStatus
     var tracking_url: String?
+    /// Latest message that touched this shipment; absent from an older daemon
+    /// or when the message row was pruned.
+    var message_id: Int?
+    var thread_id: String?
     var first_seen: String
     var last_update: String
 }

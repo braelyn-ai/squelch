@@ -322,6 +322,11 @@ pub struct Shipment {
     pub status: String,
     /// Carrier tracking URL, or `None` (Amazon / unknown carrier).
     pub tracking_url: Option<String>,
+    /// The latest message that touched this shipment, so the client can open
+    /// the email from the row. `None` only for rows whose message was pruned.
+    pub message_id: Option<i64>,
+    /// That message's thread. `None` when the message row is gone.
+    pub thread_id: Option<String>,
     pub first_seen: DateTime<Utc>,
     pub last_update: DateTime<Utc>,
 }

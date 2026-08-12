@@ -372,16 +372,22 @@ impl SqliteStore {
         let conn = self.lock()?;
         // No sealed filter needed: detection never runs on sealed mail, so the
         // table holds no sealed rows by construction.
+        // LEFT JOIN: a pruned message leaves the shipment row standing, just
+        // with nowhere to jump to.
         let sql = if include_delivered {
-            "SELECT id, account_id, tracking_number, carrier, item_name, status,
-                    tracking_url, first_seen, last_update
-             FROM shipments WHERE account_id=?1
-             ORDER BY last_update DESC"
+            "SELECT s.id, s.account_id, s.tracking_number, s.carrier, s.item_name, s.status,
+                    s.tracking_url, s.first_seen, s.last_update, m.id, m.thread_id
+             FROM shipments s
+             LEFT JOIN messages m ON m.id = s.last_message_id
+             WHERE s.account_id=?1
+             ORDER BY s.last_update DESC"
         } else {
-            "SELECT id, account_id, tracking_number, carrier, item_name, status,
-                    tracking_url, first_seen, last_update
-             FROM shipments WHERE account_id=?1 AND status != 'delivered'
-             ORDER BY last_update DESC"
+            "SELECT s.id, s.account_id, s.tracking_number, s.carrier, s.item_name, s.status,
+                    s.tracking_url, s.first_seen, s.last_update, m.id, m.thread_id
+             FROM shipments s
+             LEFT JOIN messages m ON m.id = s.last_message_id
+             WHERE s.account_id=?1 AND s.status != 'delivered'
+             ORDER BY s.last_update DESC"
         };
         let mut stmt = conn.prepare(sql)?;
         let out = stmt
@@ -396,6 +402,8 @@ impl SqliteStore {
                     tracking_url: r.get(6)?,
                     first_seen: dt(r, 7)?,
                     last_update: dt(r, 8)?,
+                    message_id: r.get(9)?,
+                    thread_id: r.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

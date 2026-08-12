@@ -101,7 +101,10 @@ struct ShipmentsZone: View {
 }
 
 private struct ShipmentCard: View {
+    @Environment(AppStore.self) private var store
     let shipment: Shipment
+
+    @State private var hovering = false
 
     private var title: String {
         let trimmed = shipment.item_name.trimmingCharacters(in: .whitespaces)
@@ -120,37 +123,54 @@ private struct ShipmentCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 7) {
-                CarrierBadge(carrier: shipment.carrier)
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(title)
-            }
-            HStack(spacing: 7) {
-                Chip(
-                    text: shipment.status.label, tone: tone,
-                    symbol: shipment.status == .delivered ? "checkmark.circle.fill" : nil,
-                    filled: shipment.status == .outForDelivery)
-                Spacer(minLength: 0)
-                if let url = shipment.tracking_url {
-                    ChromeChip(
-                        text: "Track", icon: "arrow.up.right", tone: Palette.accent,
-                        help: "track \(shipment.tracking_number) · \(shipment.carrier.label)"
-                    ) { Opener.open(url) }
+        // The card is the click target; the Track chip is a Button INSIDE it and
+        // keeps its own clicks, like every nested chip in the app.
+        Button(action: open) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    CarrierBadge(carrier: shipment.carrier)
+                    Text(title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Palette.ink)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help(title)
+                }
+                HStack(spacing: 7) {
+                    Chip(
+                        text: shipment.status.label, tone: tone,
+                        symbol: shipment.status == .delivered ? "checkmark.circle.fill" : nil,
+                        filled: shipment.status == .outForDelivery)
+                    Spacer(minLength: 0)
+                    if let url = shipment.tracking_url {
+                        ChromeChip(
+                            text: "Track", icon: "arrow.up.right", tone: Palette.accent,
+                            help: "track \(shipment.tracking_number) · \(shipment.carrier.label)"
+                        ) { Opener.open(url) }
+                    }
                 }
             }
+            .padding(9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(Palette.hairline.opacity(hovering ? 0.85 : 0.5))
+            )
+            .contentShape(Rectangle())
         }
-        .padding(9)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Palette.hairline.opacity(0.5))
-        )
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
         .opacity(shipment.status == .delivered ? 0.65 : 1)
+    }
+
+    /// An older daemon (or a pruned message) sends no thread/message; then the
+    /// click is a no-op rather than a broken jump.
+    private func open() {
+        if let tid = shipment.thread_id, !tid.isEmpty {
+            store.openThread(tid)
+        } else if let mid = shipment.message_id {
+            store.viewInEmails(mid)
+        }
     }
 }
 
