@@ -3631,6 +3631,49 @@ async fn stats_expose_stage2_usage_and_cost() {
 }
 
 #[tokio::test]
+async fn stats_carry_gmail_inbox_unread_only_once_the_sync_loop_has_fetched_it() {
+    // Never fetched (old DB, or every fetch so far failed): the key is ABSENT.
+    // A zeroed object would read as "your inbox is clear", which is a claim this
+    // daemon cannot make without having asked Gmail.
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert!(
+        json.get("inbox_unread").is_none(),
+        "unfetched counts must be absent, not zero"
+    );
+
+    // Once the sync loop has stored a pair, it rides along with the stats.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        store.set_inbox_unread(acct, 214, 190).unwrap();
+    });
+    let stamped = store.inbox_unread(acct).unwrap().unwrap().fetched_at;
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["inbox_unread"]["messages"], 214);
+    assert_eq!(json["inbox_unread"]["threads"], 190);
+    // The counts keep being served while a fetch is failing, so the stamp is
+    // what separates a live pair from one frozen since the scope was revoked.
+    assert_eq!(
+        json["inbox_unread"]["fetched_at"],
+        Value::String(stamped.to_rfc3339()),
+        "the stored stamp, verbatim RFC3339"
+    );
+    // Still the same body it always was.
+    assert!(json["stage2"].is_object());
+
+    // A real zero IS reported: nothing unread is a different answer from not
+    // knowing, and the client renders them differently.
+    let Harness { app, .. } = harness(|store, acct| {
+        store.set_inbox_unread(acct, 0, 0).unwrap();
+    });
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["inbox_unread"]["messages"], 0);
+    assert_eq!(json["inbox_unread"]["threads"], 0);
+}
+
+#[tokio::test]
 async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // Newest-first daily rows, totals costed at the default 3.0 in / 15.0 out.
     let Harness { app, .. } = harness(|store, acct| {
