@@ -737,6 +737,20 @@ struct ThreadViewer: View {
             ThreadPrefetch.shared.cachedRepeatedImages(threadId)
             ?? ThreadPrefetch.repeatedImages(in: view)
         index = 0  // newest renders first — land on it
+        // What the ⌘K agent is told it is looking at. Lifted into the store
+        // because the ask bar is a modal above this view and cannot see its
+        // state, and written HERE because this is the one place a thread lands
+        // — `newest` so the agent targets exactly what `u`, `e` and the triage
+        // inspector already do. Guarded because a slow fetch can land after the
+        // user moved on: openThread(B) cleared the summary, and A's late adopt
+        // must not put A's subject and message id back under B's thread id.
+        if store.threadId == threadId {
+            store.openThreadSummary = newest.map {
+                OpenThreadSummary(
+                    subject: view.subject.isEmpty ? "(no subject)" : view.subject,
+                    newestMessageId: $0.id)
+            }
+        }
     }
 
     /// Read receipts for this thread's messages.

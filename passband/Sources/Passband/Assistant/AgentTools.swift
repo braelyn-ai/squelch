@@ -40,6 +40,7 @@ enum AgentTools {
         case searchMail = "search_mail"
         case getThread = "get_thread"
         case getUpdates = "get_updates"
+        case explainTriage = "explain_triage"
         case getRecords = "get_records"
         case searchContacts = "search_contacts"
         case showEmails = "show_emails"
@@ -52,12 +53,13 @@ enum AgentTools {
         case unsubscribeSender = "unsubscribe_sender"
 
         /// The chip's glyph. On the tool rather than in the view: a second
-        /// stringly-typed list of the same twelve names is a list that drifts.
+        /// stringly-typed list of the same fourteen names is a list that drifts.
         var symbol: String {
             switch self {
             case .searchMail: "magnifyingglass"
             case .getThread: "envelope.open"
             case .getUpdates: "tray"
+            case .explainTriage: "questionmark.circle"
             case .getRecords: "shippingbox"
             case .searchContacts: "person.crop.circle"
             case .showEmails: "mail.stack"
@@ -94,6 +96,7 @@ enum AgentTools {
             case .searchMail: return try await searchMail(input, cite: cite)
             case .getThread: return try await getThread(input, cite: cite)
             case .getUpdates: return try await getUpdates(input, cite: cite)
+            case .explainTriage: return await explainTriage(input)
             case .getRecords: return try await getRecords(input)
             case .searchContacts: return try await searchContacts(input)
             case .showEmails: return await showEmails(input, show: show)
@@ -139,8 +142,10 @@ enum AgentTools {
     /// model invented — or lifted out of an injected instruction — cannot ride
     /// along under a card that describes some other message.
     ///
-    /// Both ids are required because the client door is thread-id-only: there
-    /// is no "fetch message N" route, so the proof is a membership test.
+    /// Both ids are required because the client door has no route that returns
+    /// a message BODY by id — /client/triage-debug/{id} answers by message id,
+    /// but with triage metadata, not with the mail — so the proof is a
+    /// membership test through the thread.
     @MainActor
     private static func verify(
         _ input: [String: JSONValue], summary: String
@@ -285,6 +290,56 @@ enum AgentTools {
             ])
         }
         return ok(["updates": rows], summary: "checked the attention list")
+    }
+
+    /// Why ONE message landed where it did: the triage row behind it.
+    ///
+    /// NO CARD AND NO `verify`. This is a read on the authed human door of the
+    /// user's own metadata about their own mail — the membership ceremony
+    /// exists to stop an invented message id riding under a card somebody taps,
+    /// and there is nothing here to tap and nothing to undo. A sealed message
+    /// is structurally absent from this door like every other, so it arrives
+    /// the same way a wrong id does: a 404.
+    @MainActor
+    private static func explainTriage(_ input: [String: JSONValue]) async -> ToolOutcome {
+        guard let messageId = int(input, "message_id") else {
+            return failure("missing message_id", summary: "triage lookup failed")
+        }
+        let info: TriageDebug
+        do {
+            info = try await APIClient.shared.getTriageDebug(messageId)
+        } catch let error as APIError where error.kind == .notFound {
+            return failure(
+                "no triage record for message \(messageId) — either that id isn't one of the "
+                    + "user's messages, or it is mail Passband keeps sealed (auth codes and the "
+                    + "like), which never reaches this door at all",
+                summary: "no triage record")
+        } catch {
+            return failure(
+                errText(error, "could not read the triage record"), summary: "triage lookup failed")
+        }
+        // The model markers (which stage ran, which model, needs_stage2) are
+        // left out: they are the dev inspector's plumbing, and none of them
+        // answers "why is this in my inbox".
+        return ok(
+            row([
+                "message_id": info.message_id,
+                "subject": info.subject,
+                "tier": info.tier,
+                "importance": info.importance,
+                "category": info.category,
+                "one_line": info.one_line,
+                "reason": info.reason,
+                "why_importance": info.field_reasons?.importance,
+                "why_deadline": info.field_reasons?.deadline,
+                "why_tier": info.field_reasons?.tier,
+                "deadline": info.deadline,
+                "matched_rule": info.matched_rule_id.map {
+                    "a sender rule decided this, rule id \($0)"
+                },
+                "status": info.status,
+            ]),
+            summary: "explained the triage")
     }
 
     /// How many cards one show_emails call may put on screen. Past this the
@@ -884,6 +939,26 @@ enum AgentTools {
                     "limit": .init(type: "integer", description: "Max rows (default 20, max 50)."),
                 ],
                 required: nil)),
+
+        Wire.ToolDef(
+            name: Tool.explainTriage.rawValue,
+            description: """
+                Why Passband triaged ONE message the way it did. Returns that \
+                message's tier, importance, category, deadline and status, the \
+                one-line summary, and the reasoning behind each of them — plus the \
+                sender rule that decided it, if one did. This is the tool for "why \
+                is this in my inbox", "why was this flagged past due", "why did you \
+                call this noise". Takes a message_id (the newest message of the \
+                thread on screen, or one from an earlier result); it reads no mail \
+                and changes nothing.
+                """,
+            input_schema: .init(
+                properties: [
+                    "message_id": .init(
+                        type: "integer",
+                        description: "The message whose triage to explain.")
+                ],
+                required: ["message_id"])),
 
         Wire.ToolDef(
             name: Tool.getRecords.rawValue,

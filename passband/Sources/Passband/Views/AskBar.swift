@@ -30,6 +30,20 @@ struct AskBar: View {
     /// The conversation outlives this view — see AppStore.assistant.
     private var session: AssistantSession { store.assistant }
 
+    /// The email behind the bar, as the agent should hear about it — nil when
+    /// the bar was opened from a list. The subject and the message id land a
+    /// beat after the thread id does (the viewer writes them when the thread
+    /// arrives), so a question asked in that gap still pins the thread: which
+    /// email is meant is the part that matters, and get_thread recovers the
+    /// rest.
+    private var openEmail: OpenEmailContext? {
+        guard let threadId = store.threadId else { return nil }
+        let summary = store.openThreadSummary
+        return OpenEmailContext(
+            threadId: threadId, subject: summary?.subject,
+            newestMessageId: summary?.newestMessageId)
+    }
+
     /// Scroll target pinned to the bottom of the log.
     private static let bottomAnchor = "askbar.bottom"
 
@@ -58,7 +72,10 @@ struct AskBar: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "close", allowInInput: true) { onClose() }
         ])
-        .onAppear { focused = true }
+        .onAppear {
+            focused = true
+            session.pin(openEmail)
+        }
         // STRUCTURE ONLY. Animating anything that changes per token would smear
         // the streaming text; the count changes once per row.
         .animation(.smooth(duration: 0.25), value: session.transcript.count)
@@ -75,6 +92,21 @@ struct AskBar: View {
                 .font(Typo.sectionLabel)
                 .foregroundStyle(Palette.inkFaint)
                 .textCase(.uppercase)
+            // WHAT THE AGENT CAN SEE, said before the question is asked: the
+            // bar is opened over the reader often enough that "this email"
+            // should look like it means something. Shown only once the thread
+            // has landed — a subject is the only thing here worth naming.
+            if let subject = store.openThreadSummary?.subject {
+                Text("in: \(subject)")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkDim)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 230, alignment: .leading)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(Palette.hairline))
+                    .help("This email is part of the question")
+            }
             Spacer()
             if !session.transcript.isEmpty {
                 Button {
@@ -127,6 +159,10 @@ struct AskBar: View {
         guard canSubmit else { return }
         let text = question.trimmed
         question = ""
+        // PINNED PER QUESTION, and only here. Every place that opens the bar
+        // would otherwise have to remember to, and the one that forgot would
+        // hand the agent an email the user had already walked away from.
+        session.pin(openEmail)
         session.send(text)
     }
 

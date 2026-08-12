@@ -287,6 +287,17 @@ struct RuleEditorRequest: Identifiable, Sendable {
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
 
+/// The open thread, reduced to what the ⌘K agent needs to be told about it:
+/// which email the person is looking at, and the id every thread-level verb in
+/// the reader already targets. A named struct rather than a tuple because it is
+/// an `@Observable` property, and lifted out of the viewer because the ask bar
+/// is a modal ABOVE it with no other way to see what it holds.
+struct OpenThreadSummary: Sendable, Equatable {
+    var subject: String
+    /// The NEWEST message in the thread — see ThreadViewer's `newest`.
+    var newestMessageId: Int
+}
+
 // MARK: - the store
 
 /// The read model the SitrepView renders: updates bucketed by band.
@@ -347,6 +358,10 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
+    /// What that thread IS, once it has landed — written by the viewer, read by
+    /// the ask bar's pin. nil while a thread is loading, which the pin handles:
+    /// the thread id alone is still enough to say which email is meant.
+    var openThreadSummary: OpenThreadSummary?
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
@@ -614,6 +629,12 @@ final class AppStore {
                 "via_reply": replyTo != nil,
                 "from_noise": activeView == .emails && mailMode == .noise,
             ])
+        // A DIFFERENT thread drops the summary NOW rather than when the new one
+        // lands: in that gap the reader is showing thread B while this still
+        // described A, and the ask bar would pin B's id under A's subject and
+        // A's message id. Same-thread reopens keep it — the viewer is already
+        // mounted and may never re-adopt.
+        if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
         self.threadQueue = queue
         // HERE, not in the search panel's open path: the reader can be opened
@@ -634,6 +655,7 @@ final class AppStore {
     func closeThread() {
         threadId = nil
         threadQueue = []
+        openThreadSummary = nil
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
