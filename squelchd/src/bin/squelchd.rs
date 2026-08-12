@@ -20,8 +20,8 @@ use squelch_core::credentials::{
     store_token_backend, store_tokens_backend, write_private,
 };
 use squelch_core::embed::{Embedder, FastEmbedder};
-use squelch_core::store::SqliteStore;
 use squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS;
+use squelch_core::store::{SqliteStore, Store};
 use squelch_core::sync::SyncEngine;
 use squelch_core::types::AccountId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1398,6 +1398,137 @@ fn report_tracking_posture(config: &Config) {
     }
 }
 
+/// Resolve `[metrics] bind` (env `SQUELCH_METRICS_BIND`) into a socket address.
+/// `None` means the config never asked for a metrics listener. A value that is
+/// present but unparseable is FATAL, and eagerly so, for the same reason as
+/// [`resolve_bind`]: an operator who asked for a scrape endpoint and silently
+/// got none has monitoring that reports nothing and looks fine doing it.
+fn resolve_metrics_bind(config: &Config) -> Result<Option<SocketAddr>, squelch_core::CoreError> {
+    let Some(raw) = config
+        .metrics
+        .bind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    raw.parse()
+        .map(Some)
+        .map_err(|e| other_err(format!("invalid metrics bind address `{raw}`: {e}")))
+}
+
+/// Say, at startup, whether anything can scrape this daemon.
+///
+/// The endpoint is UNAUTHENTICATED — a scraper has no credential to offer — so
+/// its bind address is the whole access control, which is why it prints rather
+/// than hides. It exposes counts and sizes only: no sender, no subject, no
+/// message id ever becomes a label.
+fn report_metrics_posture(config: &Config) {
+    match config
+        .metrics
+        .bind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(addr) => eprintln!(
+            "squelchd: metrics enabled at http://{addr}/metrics (no auth; bind it where only your scraper reaches it)"
+        ),
+        None => eprintln!(
+            "squelchd: metrics disabled (set SQUELCH_METRICS_BIND / [metrics] bind, e.g. 127.0.0.1:9848, to serve GET /metrics)"
+        ),
+    }
+}
+
+/// Everything the metrics door reads. Shared with the daemon proper; the only
+/// thing it owns is its concurrency gate.
+#[derive(Clone)]
+struct MetricsState {
+    metrics: Arc<squelch_core::metrics::SyncMetrics>,
+    store: Arc<SqliteStore>,
+    account_id: AccountId,
+    config: Arc<Config>,
+    /// ONE store read at a time, and the permit is held across the whole read.
+    /// This route carries no credential and every store call queues on the
+    /// daemon-wide mutex that both doors and the sync loop wait on, so a scrape
+    /// flood is capped here rather than allowed to serialize the daemon — the
+    /// same reasoning as `PAIR_CONCURRENCY`, one slot tighter because a scrape
+    /// is a periodic housekeeping read, not a user waiting on a screen.
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+/// The db-derived half of a scrape, or `None` if the store could not be read.
+async fn gather_store_metrics(
+    state: &MetricsState,
+) -> Option<squelch_core::metrics::StoreSnapshot> {
+    let _permit = state.gate.acquire().await.ok()?;
+    let store = state.store.clone();
+    let config = state.config.clone();
+    let account_id = state.account_id;
+
+    let gathered = tokio::task::spawn_blocking(move || {
+        // Band counts are not exported (they are a windowed view of the same
+        // rows the tier gauges already carry), so this window only satisfies
+        // `stats`'s signature.
+        let bands_since = chrono::Utc::now() - Duration::days(30);
+        let stats = store.stats(account_id, bands_since)?;
+        let llm = squelch_core::metrics::usage_from_ledger(
+            store.list_usage_by_category(account_id, squelch_core::metrics::LEDGER_ALL_DAYS)?,
+        );
+        let (db_bytes, wal_bytes) = squelch_core::metrics::db_file_sizes(&config.db_path);
+        Ok::<_, squelch_core::CoreError>(squelch_core::metrics::StoreSnapshot {
+            llm_cost_usd: squelch_core::metrics::estimate_cost_usd(&llm, &config),
+            stats,
+            llm,
+            db_bytes,
+            wal_bytes,
+        })
+    })
+    .await;
+
+    match gathered {
+        Ok(Ok(snapshot)) => Some(snapshot),
+        // A HALF-WORKING SCRAPE BEATS A 500. The in-process counters are still
+        // true and are exactly what an operator needs when the store is the
+        // thing that is unhappy; a failed scrape would instead take the whole
+        // series down and read as "the daemon is gone".
+        Ok(Err(e)) => {
+            eprintln!(
+                "squelchd: metrics scrape could not read the store ({e}); serving counters only"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("squelchd: metrics scrape task join error ({e}); serving counters only");
+            None
+        }
+    }
+}
+
+async fn serve_metrics(
+    axum::extract::State(state): axum::extract::State<MetricsState>,
+) -> impl axum::response::IntoResponse {
+    let db = gather_store_metrics(&state).await;
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        squelch_core::metrics::render(&state.metrics, db.as_ref()),
+    )
+}
+
+/// The metrics door: `GET /metrics` and nothing else, on a listener of its own.
+/// Kept off the main router deliberately — the doors sit behind whatever proxy
+/// fronts them, and an unauthenticated scrape route must not inherit that
+/// exposure.
+fn build_metrics_router(state: MetricsState) -> axum::Router {
+    axum::Router::new()
+        .route("/metrics", axum::routing::get(serve_metrics))
+        .with_state(state)
+}
+
 /// The router hosting both doors: `/mcp` (agent door, read-only, sealed-absent)
 /// and `/client/*` (human door, bearer-authed, the only write capability). They
 /// share the store; the agent door never sees the write credential.
@@ -1422,6 +1553,7 @@ fn cmd_serve(
 ) -> Result<(), squelch_core::CoreError> {
     // Fail fast on config/address problems before opening the store or runtime.
     let bind = resolve_bind(args)?;
+    let metrics_bind = resolve_metrics_bind(&config)?;
     let email = config.require_account_email()?;
     let client = config.oauth_client()?;
 
@@ -1484,6 +1616,11 @@ fn cmd_serve(
     // daemon never collects looks exactly like nobody opening the mail. Neither
     // is visible from Passband, so the posture is stated here or nowhere.
     report_tracking_posture(&config);
+    report_metrics_posture(&config);
+
+    // ONE registry for the process: the sync engine writes it, the metrics door
+    // reads it. Built here so both sides get the same Arc.
+    let sync_metrics = squelch_core::metrics::SyncMetrics::new();
 
     // The human door SERVES WITH OR WITHOUT SQUELCH_API_TOKEN. Without it the
     // door accepts only the per-device tokens in the store, and a daemon with
@@ -1553,9 +1690,11 @@ fn cmd_serve(
             let config = config.clone();
             let refresh = refresh.clone();
             let creds = sync_creds.clone();
+            let sync_metrics = sync_metrics.clone();
             tokio::spawn(async move {
                 SyncEngine::new(store, creds, account_id, email, config)
                     .with_refresh(refresh)
+                    .with_metrics(sync_metrics)
                     .run(shutdown_rx)
                     .await
             })
@@ -1613,6 +1752,44 @@ fn cmd_serve(
         eprintln!(
             "squelchd: serving agent door http://{bound}/mcp and human door http://{bound}/client/*"
         );
+
+        // The metrics door, on its OWN listener: a second bind, a one-route
+        // router, and the same shutdown watch the doors and sync share. Absent
+        // `[metrics] bind`, none of this exists.
+        let metrics_handle = match metrics_bind {
+            Some(addr) => {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| other_err(format!("bind metrics {addr}: {e}")))?;
+                let bound = listener.local_addr().unwrap_or(addr);
+                eprintln!("squelchd: serving metrics http://{bound}/metrics");
+                let app = build_metrics_router(MetricsState {
+                    metrics: sync_metrics.clone(),
+                    store: store.clone(),
+                    account_id,
+                    config: Arc::new(config.clone()),
+                    gate: Arc::new(tokio::sync::Semaphore::new(1)),
+                });
+                // Its own receiver off the sender, so it does not depend on
+                // where in this block the sync engine took the original.
+                let mut shutdown_rx = shutdown_tx.subscribe();
+                Some(tokio::spawn(async move {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            loop {
+                                if *shutdown_rx.borrow() {
+                                    return;
+                                }
+                                if shutdown_rx.changed().await.is_err() {
+                                    return;
+                                }
+                            }
+                        })
+                        .await
+                }))
+            }
+            None => None,
+        };
 
         // Build off the async workers and attach to the shared store when ready;
         // search is keyword-only until then.
@@ -1679,6 +1856,13 @@ fn cmd_serve(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("squelchd: opens poller ended with error: {e}"),
                 Err(e) => eprintln!("squelchd: opens poller task join error: {e}"),
+            }
+        }
+        if let Some(handle) = metrics_handle {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("squelchd: metrics server ended with error: {e}"),
+                Err(e) => eprintln!("squelchd: metrics server task join error: {e}"),
             }
         }
 
@@ -2548,6 +2732,85 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "/mcp must be mounted"
+        );
+    }
+
+    /// The metrics bind IS the feature flag: absent or blank means no listener,
+    /// and a present-but-bad value fails the daemon rather than quietly serving
+    /// no metrics.
+    #[test]
+    fn resolve_metrics_bind_is_the_feature_flag() {
+        let mut config = Config::default();
+        assert_eq!(resolve_metrics_bind(&config).unwrap(), None);
+
+        config.metrics.bind = Some("   ".to_string());
+        assert_eq!(resolve_metrics_bind(&config).unwrap(), None);
+
+        config.metrics.bind = Some(" 127.0.0.1:9848 ".to_string());
+        assert_eq!(
+            resolve_metrics_bind(&config).unwrap(),
+            Some("127.0.0.1:9848".parse::<SocketAddr>().unwrap())
+        );
+
+        config.metrics.bind = Some("nine-thousand".to_string());
+        assert!(resolve_metrics_bind(&config).is_err());
+    }
+
+    /// The metrics door serves `/metrics` and NOTHING else — no door of the
+    /// main router leaks onto this unauthenticated listener.
+    #[tokio::test]
+    async fn metrics_door_serves_only_metrics() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let account_id = store.ensure_account("me@localhost").expect("account");
+        let mut config = Config::default();
+        // A path that does not exist: the db-size gauges must report 0 rather
+        // than measuring whatever sits at the developer's default db path.
+        config.db_path = std::env::temp_dir().join("squelch-metrics-door-test.db");
+        let app = build_metrics_router(MetricsState {
+            metrics: squelch_core::metrics::SyncMetrics::new(),
+            store,
+            account_id,
+            config: Arc::new(config),
+            gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("squelchd_build_info{version="));
+        // The store read succeeded, so the db-derived block is present.
+        assert!(text.contains("squelchd_db_size_bytes{file=\"wal\"} 0\n"));
+        assert!(text.contains("squelchd_store_messages_sealed 0\n"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/client/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "the metrics listener hosts no other route"
         );
     }
 }

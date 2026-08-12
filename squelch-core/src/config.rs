@@ -268,6 +268,21 @@ pub struct TrackingConfig {
     pub base_url: Option<String>,
 }
 
+/// Prometheus scrape-endpoint config; see [`crate::metrics`].
+///
+/// `bind` IS THE FEATURE FLAG: absent (the default), the listener is never
+/// opened and nothing can scrape this daemon. It is a SEPARATE address from the
+/// doors on purpose — `/metrics` carries no credential, so it is reachable only
+/// from wherever the operator points it (loopback, or a private interface a
+/// scraper reaches), never from whatever fronts `/client/*`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Host:port for the metrics listener (e.g. `127.0.0.1:9848`).
+    /// Env: `SQUELCH_METRICS_BIND`. `None` => no listener is opened at all.
+    pub bind: Option<String>,
+}
+
 /// Default embedding-weights cache dir, a sibling of the sqlite db under the
 /// XDG data dir; CWD-relative only when `HOME` is unset.
 pub fn default_embed_cache_dir() -> PathBuf {
@@ -681,6 +696,9 @@ pub struct Config {
     pub pusher: PusherConfig,
     /// Outbound read tracking. Absent `base_url` means no send is ever tracked.
     pub tracking: TrackingConfig,
+    /// Prometheus scrape endpoint. Absent `bind` means the listener is never
+    /// opened.
+    pub metrics: MetricsConfig,
 }
 
 impl Default for Config {
@@ -701,6 +719,7 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             pusher: PusherConfig::default(),
             tracking: TrackingConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -788,6 +807,10 @@ impl Config {
             // "unset" rather than "configured with nothing", so an exported-but-
             // empty var cannot mint pixels pointing at "/t/<token>".
             ("SQUELCH_TRACK_URL", &mut self.tracking.base_url),
+            // ---- Prometheus scrape endpoint --------------------------------
+            // Same rule again: an exported-but-empty var leaves the listener
+            // closed rather than trying to bind an empty address.
+            ("SQUELCH_METRICS_BIND", &mut self.metrics.bind),
         ] {
             if let Ok(v) = std::env::var(name) {
                 let v = v.trim();
@@ -1264,6 +1287,45 @@ backfill_days = 90
 
         unsafe {
             std::env::remove_var("SQUELCH_TRACK_URL");
+        }
+    }
+
+    /// `SQUELCH_METRICS_BIND` rides the same block, and the blank case matters
+    /// as much here: an empty value must leave the scrape listener closed, not
+    /// try to bind "".
+    #[test]
+    fn metrics_bind_env_override_matches_the_relay_block() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_METRICS_BIND");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.metrics.bind, None, "unset => no metrics listener");
+
+        unsafe {
+            std::env::set_var("SQUELCH_METRICS_BIND", "   ");
+        }
+        let mut c = Config::default();
+        c.metrics.bind = Some("127.0.0.1:9848".to_string());
+        c.apply_env_overrides();
+        assert_eq!(
+            c.metrics.bind.as_deref(),
+            Some("127.0.0.1:9848"),
+            "a blank env value does not clobber the file"
+        );
+
+        unsafe {
+            std::env::set_var("SQUELCH_METRICS_BIND", "  0.0.0.0:9999  ");
+        }
+        let mut c = Config::default();
+        c.metrics.bind = Some("127.0.0.1:9848".to_string());
+        c.apply_env_overrides();
+        assert_eq!(c.metrics.bind.as_deref(), Some("0.0.0.0:9999"));
+
+        unsafe {
+            std::env::remove_var("SQUELCH_METRICS_BIND");
         }
     }
 

@@ -8,6 +8,7 @@ pub mod config;
 pub mod credentials;
 pub mod embed;
 pub mod error;
+pub mod metrics;
 pub mod push;
 pub mod store;
 pub mod sync;

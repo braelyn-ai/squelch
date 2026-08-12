@@ -10,6 +10,7 @@ pub mod html;
 pub mod ingest;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -20,6 +21,7 @@ use serde::Deserialize;
 use crate::config::{Config, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
+use crate::metrics::{GmailErrorKind, Stage1Verdict, Stage2Verdict, SyncMetrics};
 use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState};
 use crate::sync::ingest::{RawFetched, ingest_with_rules, is_robot_address};
 use crate::triage::events;
@@ -235,6 +237,17 @@ struct ProfileResp {
     history_id: String,
 }
 
+/// A Gmail `users.labels.get` resource; only the unread pair is read. Both
+/// default to 0 because Gmail omits the counters on a label with nothing in it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LabelResp {
+    #[serde(default)]
+    messages_unread: i64,
+    #[serde(default)]
+    threads_unread: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryListResp {
@@ -333,6 +346,14 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// Per-cap-kind last-warned UTC day. In-memory only; a restart re-arms them,
     /// and one fresh notice on restart is acceptable.
     warn_days: std::sync::Mutex<WarnDays>,
+    /// Set while the INBOX unread fetch is failing, so a persistent failure
+    /// (revoked scope, Gmail outage) says so ONCE instead of once per poll. The
+    /// next success re-arms it.
+    unread_warned: AtomicBool,
+    /// Scrape-facing counters. Its own registry unless the daemon shares one
+    /// via [`SyncEngine::with_metrics`], so an engine built anywhere (tests, the
+    /// contacts harvest, `run`) still records rather than branching on absence.
+    metrics: Arc<SyncMetrics>,
     /// Gmail REST base for every call this engine makes. Always
     /// [`GMAIL_API_BASE`] in production; the tests point it at a loopback mock so
     /// the walk/cursor rules are asserted on the wire rather than on a struct.
@@ -373,8 +394,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             embedder: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
+            unread_warned: AtomicBool::new(false),
+            metrics: SyncMetrics::new(),
             api_base: GMAIL_API_BASE.to_string(),
         }
+    }
+
+    /// Share the daemon's [`SyncMetrics`] so what this engine records is what
+    /// `/metrics` serves: create ONE at startup and hand a clone to each side.
+    /// Without it the engine still counts, into a registry nobody scrapes.
+    pub fn with_metrics(mut self, metrics: Arc<SyncMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Point every Gmail call at `base` instead of [`GMAIL_API_BASE`]. Test-only:
@@ -422,25 +453,51 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 .json::<T>()
                 .await
                 .map_err(|e| CoreError::Other(anyhow::anyhow!("gmail json decode: {e}"))),
+            // NOT an error metric: this is the expired-historyId signal the
+            // caller recovers from with a catch-up, and counting a routine
+            // self-heal would make the errors family unalertable.
             StatusCode::NOT_FOUND => Err(CoreError::NotFound),
-            s => Err(CoreError::Other(anyhow::anyhow!(
-                "gmail api status {}",
-                s.as_u16()
-            ))),
+            s => {
+                // Classified HERE, the last place the status is typed AND the
+                // body is still readable: a 403 is a quota refusal or an
+                // authorization one depending only on the reason string Google
+                // puts in the body, and once this is an `anyhow` chain nothing
+                // downstream can tell them apart. The body is read for that one
+                // decision and never logged.
+                let body = resp.text().await.unwrap_or_default();
+                self.metrics
+                    .record_gmail_error(classify_gmail_status(s.as_u16(), &body));
+                Err(CoreError::Other(anyhow::anyhow!(
+                    "gmail api status {}",
+                    s.as_u16()
+                )))
+            }
         }
     }
 
     /// Send a GET with a Bearer token, retrying once on 401 with a fresh token.
     async fn send_get(&self, url: &str) -> Result<reqwest::Response> {
-        let token = self.creds.token(self.account_id).await?;
+        let token = self.token_for_request().await?;
         let resp = self.bearer_get(url, &token.access_token).await?;
         if resp.status() == StatusCode::UNAUTHORIZED {
             // Redacted: the fact of a retry, never token/header content.
             eprintln!("squelch: gmail 401; refreshing token and retrying once");
-            let token = self.creds.token(self.account_id).await?;
+            let token = self.token_for_request().await?;
             return self.bearer_get(url, &token.access_token).await;
         }
         Ok(resp)
+    }
+
+    /// The access token for one Gmail call. A credential failure never reaches
+    /// a status code — the refresh exchange is what failed, `invalid_grant`
+    /// included — so it is counted as `auth` on the typed variant here rather
+    /// than string-matched out of an error chain later.
+    async fn token_for_request(&self) -> Result<crate::credentials::OAuthToken> {
+        self.creds.token(self.account_id).await.inspect_err(|e| {
+            if matches!(e, CoreError::Credential(_)) {
+                self.metrics.record_gmail_error(GmailErrorKind::Auth);
+            }
+        })
     }
 
     async fn bearer_get(&self, url: &str, access_token: &str) -> Result<reqwest::Response> {
@@ -449,7 +506,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|e| CoreError::Other(anyhow::anyhow!("gmail request: {e}")))
+            .map_err(|e| {
+                // No status ever arrived: DNS, TLS, connect or the client's own
+                // timeout. Distinct from `http` because the fix is different.
+                self.metrics.record_gmail_error(GmailErrorKind::Network);
+                CoreError::Other(anyhow::anyhow!("gmail request: {e}"))
+            })
     }
 
     /// One full lifecycle: backfill if needed (establishing the historyId), then
@@ -512,7 +574,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             if *shutdown.borrow() {
                 return Ok(());
             }
+            // BEFORE the walk, not after: the walk is what can return Err and
+            // bounce the whole lifecycle, and a mailbox stuck in that retry loop
+            // should still have a fresh unread count for the human door.
+            self.refresh_inbox_unread().await;
             self.poll_once().await?;
+            // THE freshness stamp for a healthy daemon: `run()` only records one
+            // on its way out, and a mailbox that polls happily for a month never
+            // goes there — staleness alerts would fire on the boot timestamp.
+            self.metrics.stamp_sync_success();
             // Both stages refine within the same cycle; neither can crash the
             // loop (all failures are handled internally).
             self.stage1_pass().await;
@@ -1231,6 +1301,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     HEURISTIC_ONLY,
                 );
                 stale_skipped += 1;
+                self.metrics.record_stage1(Stage1Verdict::StaleSkipped);
                 continue;
             }
 
@@ -1280,6 +1351,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         Ok(false) => {}
                         Ok(true) => {
                             refined += 1;
+                            self.metrics.record_stage1(Stage1Verdict::Ok);
                             // The refined verdict is final, so it emits whatever
                             // the seed thought; the freshness window is what stops
                             // this pass storming a fresh install's backlog.
@@ -1318,6 +1390,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         HEURISTIC_ONLY,
                     );
                     fallback += 1;
+                    self.metrics.record_stage1(Stage1Verdict::Fallback);
                 }
                 Err(e) => {
                     // Retryable class exhausted / transport error. Leave the row
@@ -1583,6 +1656,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     STALE_SKIP_MODEL,
                 );
                 stale_skipped += 1;
+                self.metrics.record_stage2(Stage2Verdict::StaleSkipped);
                 continue;
             }
 
@@ -1717,6 +1791,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         Ok(false) => {}
                         Ok(true) => {
                             processed += 1;
+                            self.metrics.record_stage2(Stage2Verdict::Ok);
                             self.emit_event(
                                 &events::EventContext {
                                     account_id: self.account_id,
@@ -1746,6 +1821,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     // Keep Stage-1 values; mark processed so it doesn't loop.
                     // Redacted: no body/subject logged.
                     eprintln!("squelch: stage-2 refusal (redacted); keeping stage-1 values");
+                    self.metrics.record_stage2(Stage2Verdict::Refused);
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
                         row.message_id,
@@ -1756,6 +1832,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     // Permanent failure (400/401/truncation/parse): mark the row
                     // processed so it cannot loop. `kind` is already redacted.
                     eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
+                    self.metrics.record_stage2(Stage2Verdict::Failed);
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
                         row.message_id,
@@ -1766,6 +1843,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     // Retryable class exhausted / transport error: leave the row
                     // queued for a later cycle. `e` is redacted.
                     eprintln!("squelch: stage-2 {e}; row stays queued");
+                    self.metrics.record_stage2(Stage2Verdict::Retryable);
                 }
             }
         }
@@ -1776,6 +1854,43 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                  out_tok={out_tok}); stale-skipped {stale_skipped}",
                 cfg.model
             );
+        }
+    }
+
+    /// `users.labels.get(INBOX)` -> Gmail's own unread counts, into the store.
+    ///
+    /// The ONLY source for these numbers: the read scope cannot see (or write)
+    /// read state through any other call, and our tables hold just the backfill
+    /// window, so nothing local can answer "how much unread mail is sitting in
+    /// Gmail right now".
+    ///
+    /// Cannot fail a cycle — sync's job is mail, and a stale count is a far
+    /// better outcome than a poll loop that gives up over a cosmetic number. On
+    /// failure the previous row stands (no clearing, no zeroing) and the notice
+    /// is printed once per failing streak rather than every poll.
+    async fn refresh_inbox_unread(&self) {
+        let url = format!("{}/labels/{LABEL_INBOX}", self.api_base);
+        match self.get_json::<LabelResp>(&url).await {
+            Ok(label) => {
+                if let Err(e) = self.store.set_inbox_unread(
+                    self.account_id,
+                    label.messages_unread,
+                    label.threads_unread,
+                ) {
+                    eprintln!("squelch: storing the inbox unread counts failed ({e})");
+                    return;
+                }
+                self.unread_warned.store(false, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // `swap` is the arm-and-test: only the transition into failure
+                // prints. Error strings from this crate carry no secrets.
+                if !self.unread_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "squelch: inbox unread count fetch failed ({e}); keeping the last known counts"
+                    );
+                }
+            }
         }
     }
 
@@ -1826,8 +1941,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 return Ok(());
             }
             match self.run_once(&mut shutdown).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.metrics.record_sync_ok();
+                    return Ok(());
+                }
                 Err(e) => {
+                    self.metrics.record_sync_error();
                     if *shutdown.borrow() {
                         return Ok(());
                     }
@@ -1846,6 +1965,39 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
             }
         }
+    }
+}
+
+/// Which [`GmailErrorKind`] a non-2xx Gmail response is.
+///
+/// 429 is unambiguous. 403 is NOT: Google returns it both for "you are asking
+/// too fast" and for "this credential may not do that", separated only by the
+/// `reason` in the JSON body. Everything else is `http`, which is the bucket
+/// that means "read the logs".
+fn classify_gmail_status(status: u16, body: &str) -> GmailErrorKind {
+    const QUOTA_REASONS: [&str; 4] = [
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "quotaexceeded",
+        "dailylimitexceeded",
+    ];
+    match status {
+        401 => GmailErrorKind::Auth,
+        429 => GmailErrorKind::Quota,
+        // Bounded: an error body is a few hundred bytes, and the reason sits at
+        // the front of it. Never logged, only matched.
+        403 => {
+            let head: String = body.chars().take(2048).collect::<String>().to_lowercase();
+            if QUOTA_REASONS.iter().any(|r| head.contains(r)) {
+                GmailErrorKind::Quota
+            } else {
+                // A scope/permission 403 stays in `http`: it is rare, it is not
+                // a credential this daemon can refresh its way out of, and the
+                // stderr line already names it.
+                GmailErrorKind::Http
+            }
+        }
+        _ => GmailErrorKind::Http,
     }
 }
 
@@ -1902,6 +2054,25 @@ mod tests {
     use crate::config::Stage1Config;
     use crate::store::SqliteStore;
     use crate::types::{Disposition, Tier, TriageAxis};
+
+    /// The 403 split is the whole reason this classifier reads the body: Google
+    /// spends one status on "too fast" and on "not allowed", and only the reason
+    /// string tells them apart.
+    #[test]
+    fn gmail_status_classification_splits_403_on_the_reason() {
+        let quota_body = r#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#;
+        assert_eq!(
+            classify_gmail_status(403, quota_body),
+            GmailErrorKind::Quota
+        );
+        assert_eq!(
+            classify_gmail_status(403, r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#),
+            GmailErrorKind::Http
+        );
+        assert_eq!(classify_gmail_status(429, ""), GmailErrorKind::Quota);
+        assert_eq!(classify_gmail_status(401, ""), GmailErrorKind::Auth);
+        assert_eq!(classify_gmail_status(500, ""), GmailErrorKind::Http);
+    }
 
     /// Build a RawFetched from an RFC822 string, as the transport layer would.
     /// The account's own address is fixed to `me@example.com` in these fixtures.
@@ -2791,6 +2962,10 @@ mod tests {
         listing: HashMap<String, Vec<String>>,
         /// gmail message id -> RFC822 source.
         bodies: HashMap<String, String>,
+        /// labelId -> the `(messagesUnread, threadsUnread)` `labels.get`
+        /// answers with. Absent (or `None`) means 500: an unscripted label must
+        /// not read as a real zero.
+        labels: HashMap<String, Option<(i64, i64)>>,
         /// `users.getProfile`'s historyId.
         profile_history_id: u64,
         /// Every call this mock served, in order, as `verb:key`.
@@ -2814,6 +2989,16 @@ mod tests {
         }
         fn body(&self, id: &str, eml: String) -> &Self {
             self.0.lock().unwrap().bodies.insert(id.to_string(), eml);
+            self
+        }
+        /// Script `labels.get` for one label: `Some(counts)` answers them,
+        /// `None` answers 500 (the outage the stored counts must survive).
+        fn label(&self, label: &str, unread: Option<(i64, i64)>) -> &Self {
+            self.0
+                .lock()
+                .unwrap()
+                .labels
+                .insert(label.to_string(), unread);
             self
         }
         fn profile(&self, history_id: u64) -> &Self {
@@ -2892,6 +3077,20 @@ mod tests {
         }
     }
 
+    async fn mock_label(State(g): State<MockGmail>, AxumPath(id): AxumPath<String>) -> Response {
+        let mut st = g.0.lock().unwrap();
+        st.seen.push(format!("label:{id}"));
+        match st.labels.get(&id).copied().flatten() {
+            Some((messages, threads)) => Json(json!({
+                "id": id,
+                "messagesUnread": messages,
+                "threadsUnread": threads,
+            }))
+            .into_response(),
+            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
     async fn mock_profile(State(g): State<MockGmail>) -> Json<Value> {
         let st = g.0.lock().unwrap();
         Json(json!({ "historyId": st.profile_history_id.to_string() }))
@@ -2903,6 +3102,7 @@ mod tests {
             .route("/history", get(mock_history))
             .route("/messages", get(mock_messages_list))
             .route("/messages/{id}", get(mock_message_get))
+            .route("/labels/{id}", get(mock_label))
             .route("/profile", get(mock_profile))
             .with_state(g);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3341,5 +3541,37 @@ mod tests {
             .expect("triage row");
         assert_eq!(row.tier, "noise");
         assert_eq!(row.importance, 0);
+    }
+
+    #[tokio::test]
+    async fn the_inbox_unread_counts_refresh_and_survive_a_failed_fetch() {
+        // Gmail owns these numbers: nothing local can be re-derived into them,
+        // so a failed fetch must leave the last known pair standing rather than
+        // clear it or read as "0 unread".
+        let (store, acct) = store_at_cursor(Some(100));
+
+        let g = MockGmail::default();
+        g.label(LABEL_INBOX, Some((214, 190)));
+        let base = serve_mock(g.clone()).await;
+        let engine = engine(store.clone(), acct, &base);
+
+        engine.refresh_inbox_unread().await;
+        let got = store.inbox_unread(acct).unwrap().expect("counts stored");
+        assert_eq!((got.messages, got.threads), (214, 190));
+        assert_eq!(g.calls("label:INBOX"), 1, "one labels.get per refresh");
+
+        // Gmail goes down mid-run: the refresh swallows it (a poll cycle must
+        // not die over a cosmetic number) and the stored pair is untouched.
+        g.label(LABEL_INBOX, None);
+        engine.refresh_inbox_unread().await;
+        let kept = store.inbox_unread(acct).unwrap().expect("last counts kept");
+        assert_eq!((kept.messages, kept.threads), (214, 190));
+        assert_eq!(kept.fetched_at, got.fetched_at, "the stamp did not move");
+
+        // Recovery overwrites with the newer truth.
+        g.label(LABEL_INBOX, Some((3, 3)));
+        engine.refresh_inbox_unread().await;
+        let fresh = store.inbox_unread(acct).unwrap().unwrap();
+        assert_eq!((fresh.messages, fresh.threads), (3, 3));
     }
 }
