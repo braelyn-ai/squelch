@@ -660,6 +660,7 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					280FE723801466ACE268726B = {
+						DevelopmentTeam = AAT39BQ9LV;
 						ProvisioningStyle = Automatic;
 					};
 					7F9441F4F38B8847FF4BC62A = {
@@ -912,7 +913,10 @@
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				"CODE_SIGN_IDENTITY[config=Release]" = "-";
+				"CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]" = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AAT39BQ9LV;
 				ENABLE_HARDENED_RUNTIME = NO;
 				"ENABLE_HARDENED_RUNTIME[config=Release]" = NO;
 				INFOPLIST_FILE = Sources/PassbandiOS/Info.plist;
@@ -1029,7 +1033,10 @@
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				"CODE_SIGN_IDENTITY[config=Release]" = "-";
+				"CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]" = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AAT39BQ9LV;
 				ENABLE_HARDENED_RUNTIME = NO;
 				"ENABLE_HARDENED_RUNTIME[config=Release]" = NO;
 				INFOPLIST_FILE = Sources/PassbandiOS/Info.plist;
