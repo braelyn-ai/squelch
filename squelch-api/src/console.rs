@@ -1123,6 +1123,20 @@ mod tests {
         String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
     }
 
+    /// Typing the bare hostname lands on the console, not a 404. Temporary on
+    /// purpose: a cached permanent redirect would outlive any future change of
+    /// heart about what the root serves.
+    #[tokio::test]
+    async fn the_root_redirects_to_the_console() {
+        let (_store, _acct, app) = fixture();
+        let resp = app.oneshot(get("/", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/console"
+        );
+    }
+
     /// Line noise must never reach the store, because a store miss charges the
     /// TENANT'S live code (five misses burn it): the shape gate is what keeps a
     /// stranger's garbage from denying the sign-in flow. The proof is the real

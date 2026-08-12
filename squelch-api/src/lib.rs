@@ -55,6 +55,16 @@ pub fn router(state: ApiState) -> Router {
         .merge(pair::pair_router(state.clone()))
         .merge(console::console_router(state.clone()))
         .merge(tracking::pixel_router(state))
+        // The bare root: a browser typing the tenant hostname lands on the
+        // console's login page instead of a 404. A redirect carries nothing,
+        // so it needs no auth; on hosted the Ingress publishes "/" as an
+        // EXACT match so this stays the only extra path a vhost serves.
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::response::Redirect::temporary("/console")
+            }),
+        )
 }
 
 /// The `/client/*` router. Bearer auth is layered over every route in it: the
