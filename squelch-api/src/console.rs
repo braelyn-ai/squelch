@@ -38,7 +38,7 @@
 //!   the login page. Uniformly: a burned code, a wrong code, an expired one and a
 //!   claim against a store that could not answer produce the same bytes.
 //!
-//! CSRF: `SameSite=Strict` on the cookie, plus an `Origin`/`Sec-Fetch-Site` check
+//! CSRF: `SameSite=Lax` on the cookie, plus an `Origin`/`Sec-Fetch-Site` check
 //! in front of EVERY mutating POST (see [`csrf_guard`]) so the console does not
 //! rest on one browser control alone.
 
@@ -443,15 +443,21 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
 ///
 /// - `HttpOnly`: there is no script on this origin, and nothing injected into one
 ///   can read the session either;
-/// - `SameSite=Strict`: no cross-site request carries it, which is the first half
-///   of the CSRF answer ([`csrf_guard`] is the second);
+/// - `SameSite=Lax`, NOT `Strict`, and this was learned live: the SSO landing is
+///   a navigation chain that STARTED at accounts.google.com, and Chrome withholds
+///   Strict cookies from every request in a cross-site-initiated chain — including
+///   the same-site 303 hop to `/console` — so the first thing a freshly signed-in
+///   user saw was the login page again. Lax sends the cookie on top-level GET
+///   navigations (fixing the landing) while still withholding it from cross-site
+///   POSTs; the mutating routes are guarded by [`csrf_guard`]'s Origin checks
+///   regardless, so CSRF has two answers and neither is this attribute alone;
 /// - `Secure` unless this is loopback ([`is_loopback`]);
 /// - `Path=/` and NO `Domain`, so the cookie is bound to this exact host and
 ///   never offered to a sibling tenant on the same base domain.
 fn set_cookie(token: &str, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
     format!(
-        "{COOKIE_NAME}={token}; Path=/; Max-Age={COOKIE_TTL_SECS}; HttpOnly; SameSite=Strict{secure}"
+        "{COOKIE_NAME}={token}; Path=/; Max-Age={COOKIE_TTL_SECS}; HttpOnly; SameSite=Lax{secure}"
     )
 }
 
@@ -460,7 +466,7 @@ fn set_cookie(token: &str, secure: bool) -> String {
 /// credential that will never work again.
 fn clear_cookie(secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!("{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}")
+    format!("{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure}")
 }
 
 /// Pull the console cookie out of the request. Hand-parsed rather than pulled in
@@ -558,7 +564,7 @@ fn same_origin_request(headers: &HeaderMap, site: &Site) -> bool {
 /// Refuse every mutating request that did not come from this origin, ahead of any
 /// handler and ahead of the session check.
 ///
-/// This is the second half of the CSRF answer; `SameSite=Strict` is the first.
+/// This is the second half of the CSRF answer; `SameSite=Lax` is the first.
 /// Two independent controls because the cost is one header comparison and the
 /// failure mode of relying on one is somebody else's page spending the user's
 /// credential.
@@ -1260,7 +1266,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(set.contains("HttpOnly"), "{set}");
-        assert!(set.contains("SameSite=Strict"), "{set}");
+        assert!(set.contains("SameSite=Lax"), "{set}");
         assert!(set.contains("Secure"), "{set}");
         assert!(set.contains("Path=/"), "{set}");
         assert!(!set.contains("Domain"), "{set}");
@@ -1679,7 +1685,7 @@ mod tests {
         let set = resp.headers()[header::SET_COOKIE].to_str().unwrap();
         assert!(!set.contains("Secure"), "{set}");
         assert!(
-            set.contains("HttpOnly") && set.contains("SameSite=Strict"),
+            set.contains("HttpOnly") && set.contains("SameSite=Lax"),
             "{set}"
         );
     }
