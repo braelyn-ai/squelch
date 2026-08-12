@@ -244,9 +244,24 @@ final class Notifier {
             front()
             return
         }
+        // NOT FROM BEHIND THE CONNECT GATE. A switch assumes a live world to
+        // replace — it never touches `connStatus`, so from the gate it would
+        // point the client at a daemon while the screen is still asking the
+        // human to name one, and nothing would show for it. Fronting the app
+        // puts the banner's own tap where it can still be acted on.
+        guard AppStore.shared.connStatus == .connected else {
+            front()
+            return
+        }
         Task {
             await AccountManager.shared.switchTo(accountId)
             front()
+            // The switch is allowed to decline (one already running) and
+            // allowed to fail (the credentials behind the record are gone, and
+            // it lands on the Connect gate). Either way a DIFFERENT mailbox is
+            // on screen, and thread ids are per-daemon: opening one here would
+            // show whatever that id happens to name in the wrong account.
+            guard AccountManager.shared.activeId == accountId else { return }
             open(threadId)
         }
     }

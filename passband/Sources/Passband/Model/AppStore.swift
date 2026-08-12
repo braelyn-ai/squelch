@@ -297,11 +297,18 @@ final class AppStore {
     var connError: String?
 
     /// A `passband://pair` link waiting to be acted on. ConnectView is its only
-    /// consumer and clears it as it applies it — which is also what makes an
-    /// already-connected install ignore pair links: the Connect gate is not
-    /// mounted, so nothing reads this, and pairing never silently swaps the
-    /// device identity this install already holds.
+    /// consumer and clears it as it applies it — and applying it only ever
+    /// FILLS THE FORM, never claims, so a link can be parked without it ever
+    /// becoming a credential on its own.
     var pairLink: PairLink?
+
+    /// The Add Account sheet. Raised by Settings, the rail's account menu, the
+    /// Accounts menu, and by a pair link arriving at an install that already
+    /// has an identity — that link names a SECOND daemon, and the sheet is
+    /// where a second daemon is added. It is deliberately not a connection
+    /// state: adding an account must not move `connStatus`, or the shell would
+    /// unmount and the account already on screen would go with it.
+    var addAccountSheetOpen = false
 
     // MARK: sitrep slice
     var sitrep = SitrepData()
@@ -417,9 +424,13 @@ final class AppStore {
                 connStatus = .connected
                 connError = nil
                 // A link that arrived during boot (the app was LAUNCHED by one)
-                // races the keychain read. This install already has an identity,
-                // so the link loses.
-                pairLink = nil
+                // races the keychain read and finds no Connect gate to land on.
+                // It is no longer dropped for that: this install having an
+                // identity is precisely what makes the link an ADD rather than
+                // a re-pair, so it goes to the same sheet a link arriving a
+                // minute later would. The link itself stays parked for the
+                // sheet's ConnectView to read as it mounts.
+                if pairLink != nil { addAccountSheetOpen = true }
             } else {
                 connStatus = .disconnected
             }
@@ -429,17 +440,33 @@ final class AppStore {
         }
     }
 
-    /// Take a `passband://` URL the OS handed us. Parked for the Connect gate to
-    /// pick up rather than acted on here: an install that is already connected
-    /// must not re-pair, and the gate not being on screen is exactly that check.
+    /// Take a `passband://` URL the OS handed us. Never acted on here — it is
+    /// parked for a ConnectView to pick up, and that view only ever fills its
+    /// form from it. Which ConnectView depends on what this install already is:
+    ///
+    /// - No identity yet: the Connect gate is on screen and reads it there.
+    /// - Already connected: the gate is not mounted, and the link is a SECOND
+    ///   daemon asking to be added, so the Add Account sheet is opened for it.
+    ///   Re-pairing over the identity this install holds is still impossible —
+    ///   the sheet adds an account beside it, it does not replace it.
     func receivePairLink(_ url: URL) {
-        guard connStatus != .connected, let link = PairLink(url) else { return }
+        guard let link = PairLink(url) else { return }
         pairLink = link
+        if connStatus == .connected { addAccountSheetOpen = true }
     }
 
     /// Test a candidate URL+token via /client/stats; on success persist + connect.
+    ///
+    /// THE GATE'S path, and the first account's: it moves `connStatus`, which
+    /// is what swaps the Connect screen for the shell. Adding an account to an
+    /// install that already has one is `addAccount` instead, precisely because
+    /// this one moves connection state the live account is standing on.
+    ///
+    /// `label` is the optional name from the form. Empty means "unchanged"
+    /// rather than "unnamed", so a re-connect through the gate cannot silently
+    /// erase a label the account already had.
     @discardableResult
-    func connect(serverURL: String, apiToken: String) async -> Bool {
+    func connect(serverURL: String, apiToken: String, label: String = "") async -> Bool {
         connStatus = .connecting
         connError = nil
         // Probe with a throwaway config so a bad token never gets persisted.
@@ -449,7 +476,12 @@ final class AppStore {
             // Re-connecting keeps the live account's id (and so its keychain
             // slots); a first connection mints one. The index entry is written
             // only after the credentials are in the keychain.
-            let account = AccountIndex.activeOrNew()
+            var account = AccountIndex.activeOrNew()
+            let named = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !named.isEmpty { account.label = named }
+            // The name the switcher shows when there is no label, learned here
+            // rather than from a keychain read later on the main actor.
+            account.displayHost = AccountRecord.host(from: serverURL)
             let fresh = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             try await SettingsStore.saveAsync(fresh, accountId: account.id).get()
             AccountIndex.upsert(account)
@@ -492,7 +524,10 @@ final class AppStore {
             _ = try await APIClient.shared.getStats()
             // Same account, new credentials — `activeOrNew` returns the live
             // record here, so this overwrites its slots rather than adding one.
-            let account = AccountIndex.activeOrNew()
+            var account = AccountIndex.activeOrNew()
+            // A moved daemon renames its own row in the switcher; the label,
+            // if the human gave one, is untouched.
+            account.displayHost = AccountRecord.host(from: serverURL)
             let fresh = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             try await SettingsStore.saveAsync(fresh, accountId: account.id).get()
             AccountIndex.upsert(account)
@@ -525,47 +560,119 @@ final class AppStore {
         }
     }
 
-    func disconnect() {
-        // Wipe the live account's persisted settings — credentials first, then
-        // the index entry that names them — so the next boot lands on the
-        // Connect gate.
-        //
-        // A REFUSED KEYCHAIN DELETE IS NOT SWALLOWED. The entry goes either
-        // way (the human asked to disconnect and is entitled to have it
-        // happen), and that entry is the only thing that still names those
-        // slots — so the id is parked for the boot sweep, which keeps
-        // retrying until the token is really gone.
-        if let id = AccountIndex.load().activeId {
-            // The feed before the credentials, for the reason
-            // `AccountManager.remove` spells out: a stream that outlives its
-            // account keeps dialling a daemon this install has forgotten, and
-            // writes its cursor key straight back after the removal below has
-            // dropped it. Every OTHER account's feed goes down with the
-            // `.disconnected` transition at the end of this method.
-            AccountManager.shared.stopStream(id)
-            do {
-                try SettingsStore.clear(accountId: id)
-            } catch {
-                AccountIndex.parkOrphan(id)
-            }
-            AccountIndex.remove(id)
-            // Disconnecting the last account empties the index, which is the
-            // one shape a boot can still read as a pre-multi-account install
-            // and repair back into existence — see `sealLegacyIfEmpty`.
-            AccountIndex.sealLegacyIfEmpty()
-            AccountManager.shared.reload()
+    /// Add a SECOND (or fifth) account and switch to it.
+    ///
+    /// The whole difference from `connect` is what it refuses to touch. This
+    /// install already has an identity and a mailbox on screen, so:
+    ///
+    /// - the probe goes through `APIClient.probe`, which builds its one request
+    ///   from the candidate credentials instead of installing them — the live
+    ///   account's requests keep working while a stranger's token is tested,
+    ///   and a bad one is never configured to find out that it is bad;
+    /// - `connStatus` never moves, so the shell stays mounted (dropping to
+    ///   `.connecting` would unmount the account already on screen and flash
+    ///   the Connect gate under the sheet);
+    /// - the credentials land under a NEW id via `AccountManager.add`, which
+    ///   writes the keychain before the index entry that names it.
+    ///
+    /// Only then is the world torn down, and only through the ordinary switch —
+    /// the one place that knows how to do it safely.
+    /// Whether a daemon is already one of this install's accounts. Matched on
+    /// host:port, which the index already holds and no keychain read is needed
+    /// for; a different spelling of the same host (localhost for 127.0.0.1)
+    /// slips through, and the cost of that is the duplicate the human
+    /// explicitly asked for. Public because `ConnectView` must ask BEFORE
+    /// claiming a pairing code — a claim mints a device token on the daemon,
+    /// and a duplicate refused after that has already spent the code and
+    /// orphaned the token server-side.
+    func isKnownDaemon(_ serverURL: String) -> Bool {
+        let host = AccountRecord.host(from: serverURL)
+        return AccountManager.shared.accounts.contains { $0.displayHost == host }
+    }
+
+    func addAccount(serverURL: String, apiToken: String, label: String = "") async -> (
+        ok: Bool, error: String?
+    ) {
+        // ONE DAEMON IS ONE MAILBOX, so the same daemon twice is not two
+        // accounts — it is every banner delivered twice and one mailbox's state
+        // split across two records.
+        if isKnownDaemon(serverURL) {
+            return (false, "that daemon is already one of your accounts")
         }
-        connStatus = .disconnected
-        settings = nil
-        sitrep = SitrepData()
-        lastRefresh = nil
-        refreshError = nil
-        selectedId = nil
-        route(to: .sitrep)
-        closeThread()
-        sideView = .none
-        history = [HistoryEntry(view: .sitrep, selectedId: nil)]
-        historyIndex = 0
+        do {
+            try await APIClient.shared.probe(baseURL: serverURL, token: apiToken)
+        } catch {
+            return (false, Self.connectErrorText(error))
+        }
+        let fresh = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
+        guard
+            let record = await AccountManager.shared.add(
+                label: label.trimmingCharacters(in: .whitespacesAndNewlines), settings: fresh)
+        else {
+            // The keychain refused the write and `add` rolled it back, so
+            // nothing was recorded. Nothing to undo here either.
+            return (false, "could not save to the keychain")
+        }
+        Analytics.capture("account_added")
+        // Adding an account is asking to use it. Through the ordinary switch,
+        // which flushes drafts, wipes every per-account cache and bumps the
+        // epoch — the new account is a whole new daemon, and none of the ids on
+        // screen mean anything there. Waited for rather than raced: the
+        // switch's guard silently declines while another is in flight, and
+        // "added but never shown" would read as a failed add.
+        while switching { try? await Task.sleep(for: .milliseconds(50)) }
+        await AccountManager.shared.switchTo(record.id)
+        return (true, nil)
+    }
+
+    /// Forget one account, wherever it sits in the list. THE removal path:
+    /// Settings' per-row Remove, the rail's account menu and the old
+    /// Disconnect button all land here, so there is exactly one answer to
+    /// "what happens to the world when the mailbox on screen goes away".
+    ///
+    /// `AccountManager.remove` does the durable half — feed down, keychain
+    /// cleared (off the main actor, a refusal parked for the boot sweep), index
+    /// entry dropped, scoped defaults forgotten, the legacy slots sealed if
+    /// that was the last account. What is left for here is the world on screen,
+    /// and only when it belonged to the account that just went.
+    func removeAccount(_ id: UUID) async {
+        // Wait out any in-flight switch, then hold its gate for the duration:
+        // a remove landing inside a switch's suspension windows would leave
+        // the index, the configured client and the per-account-keyed stores
+        // disagreeing about which mailbox is live — and `wasActive` below is
+        // only meaningful once whoever was switching has finished doing so.
+        // Both loop and flag are MainActor, so the handoff has no gap.
+        while switching { try? await Task.sleep(for: .milliseconds(50)) }
+        switching = true
+        defer { switching = false }
+
+        let wasActive = AccountManager.shared.activeId == id
+        await AccountManager.shared.remove(id)
+        guard wasActive else { return }
+
+        guard let survivor = AccountManager.shared.active else {
+            // THE LAST ACCOUNT. Back to the Connect gate, torn down exactly as
+            // a switch tears it down: every id on screen addressed a daemon
+            // this install no longer holds credentials for. The drafts are
+            // deliberately NOT flushed on the way out (a switch flushes them) —
+            // there is nowhere to send them that we are still entitled to talk
+            // to, and the human asked for this account to be forgotten.
+            epoch &+= 1
+            SitrepPoller.shared.stop()
+            assistant.clear()
+            wipeAccountState()
+            wipeAccountCaches()
+            settings = nil
+            connStatus = .disconnected
+            connError = nil
+            return
+        }
+        // Straight to `performSwitch` rather than `AccountManager.switchTo`:
+        // that one refuses a switch to the account already marked active, and
+        // `AccountIndex.remove` handed `active` to this survivor on its way
+        // through. The index has moved on; the store has not, and this is what
+        // moves it — under the gate this function already holds.
+        await performSwitch(to: survivor)
     }
 
     // MARK: - switching accounts
@@ -592,7 +699,13 @@ final class AppStore {
         switching = true
         // (10) Whichever path we leave by.
         defer { switching = false }
+        await performSwitch(to: record)
+    }
 
+    /// Steps (2)–(9), gate already held. Split out so `removeAccount` — which
+    /// holds the same gate across its OWN awaits — can run a switch without
+    /// tripping the guard that exists to keep everyone else out.
+    private func performSwitch(to record: AccountRecord) async {
         // (2) From here, every answer still in flight belongs to the old
         //     account and every writer that captured the old epoch is inert.
         epoch &+= 1

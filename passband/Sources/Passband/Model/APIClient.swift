@@ -235,6 +235,30 @@ actor APIClient {
 
     func getStats() async throws -> StoreStats { try await get("/client/stats") }
 
+    /// Prove a CANDIDATE credential pair against /client/stats without adopting
+    /// it. Same test `connect` makes, minus the part that makes it this app's
+    /// identity: adding a second account has to check its daemon while the live
+    /// account keeps working, and `configure` is a whole-app change — every
+    /// request in flight would finish against the candidate.
+    ///
+    /// So the request is built here from the arguments instead of from
+    /// `config`, and the answer is decoded rather than merely 200-checked: a
+    /// host that answers but is not a daemon must fail the same way it fails at
+    /// the Connect gate.
+    func probe(baseURL: String, token: String) async throws {
+        var base = baseURL
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let url = URL(string: base + "/client/stats") else {
+            throw APIError(.network, 0, "bad server url")
+        }
+        var req = URLRequest(url: url, timeoutInterval: Self.requestTimeout)
+        req.httpMethod = Method.GET.rawValue
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, _) = try await perform(req)
+        _ = try decode(StoreStats.self, from: data)
+    }
+
     func getUsage(days: Int? = nil) async throws -> UsageResponse {
         try await get("/client/usage", query: ["days": days.map(String.init)])
     }

@@ -9,6 +9,7 @@ struct PassbandApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var store = AppStore.shared
     @State private var prefs = Prefs.shared
+    @State private var accounts = AccountManager.shared
 
     init() {
         Typo.registerBundledFonts()
@@ -32,7 +33,7 @@ struct PassbandApp: App {
         .defaultSize(width: 1320, height: 880)
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
-        .commands { PassbandCommands(store: store, prefs: prefs) }
+        .commands { PassbandCommands(store: store, prefs: prefs, accounts: accounts) }
     }
 }
 
@@ -70,7 +71,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct PassbandCommands: Commands {
     let store: AppStore
     let prefs: Prefs
+    let accounts: AccountManager
     @ObservedObject private var updater = Updater.shared
+
+    /// ⌘number SWITCHES ACCOUNTS. One constant, because the decision behind it
+    /// is one decision: the digits used to route the Go menu's five views, and
+    /// they were taken away from it (the bare `1`–`5` in RootView's global
+    /// bindings still route, input-guarded, which is the whole reason the menu
+    /// could give the chord up). A menu shortcut fires app-wide — inside text
+    /// fields, inside modals — and for "show me my other mailbox" that is
+    /// correct: it is not a character anyone means to type.
+    private static let accountChordModifiers: EventModifiers = [.command]
+
+    /// How many accounts get a chord. Nine digits, and ⌘0 is not a tenth.
+    private static let chordedAccounts = 9
+
+    /// The chord for the account at one position, or none past the ninth —
+    /// those switch from the menu (or by cycling), which is the honest whole of
+    /// what a tenth account can have.
+    private static func accountChord(_ index: Int) -> KeyboardShortcut? {
+        guard index < chordedAccounts else { return nil }
+        return KeyboardShortcut(
+            KeyEquivalent(Character("\(index + 1)")), modifiers: accountChordModifiers)
+    }
 
     var body: some Commands {
         // Directly under "About Passband", where every Mac app keeps it.
@@ -94,10 +117,13 @@ struct PassbandCommands: Commands {
         }
 
         CommandMenu("Go") {
-            ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in
+            // NO KEYBOARD SHORTCUT. These five used to hold ⌘1–⌘5; the digits
+            // went to account switching, and the BARE `1`–`5` in
+            // RootView.globalBindings do the routing — which they always did,
+            // behind the dispatcher's input guard, so nothing was lost but the
+            // menu's ability to advertise them.
+            ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { _, view in
                 Button(view.label) { store.setView(view) }
-                    .keyboardShortcut(
-                        KeyEquivalent(Character("\(index + 1)")), modifiers: [.command])
             }
             Divider()
             Button("Usage") { store.setView(.usage) }
@@ -109,6 +135,44 @@ struct PassbandCommands: Commands {
             Button("Forward") { store.goForward() }
                 .keyboardShortcut("]", modifiers: [.command])
                 .disabled(!store.canGoForward)
+        }
+
+        // ACCOUNTS — one entry per mailbox this install knows about, on the
+        // digits the Go menu gave up. Present even with a single account: it is
+        // where "Add Account…" lives, and a menu that appears only once you
+        // already have two is a feature nobody finds.
+        CommandMenu("Accounts") {
+            ForEach(Array(accounts.accounts.enumerated()), id: \.element.id) { index, account in
+                Button {
+                    Task { await accounts.switchTo(account.id) }
+                } label: {
+                    // The live one wears a check, the way every account picker
+                    // on this platform says which one you are looking at.
+                    if account.id == accounts.activeId {
+                        Label(account.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(account.displayName)
+                    }
+                }
+                .keyboardShortcut(Self.accountChord(index))
+                // Nothing to switch INTO from the Connect gate: the app has no
+                // identity on screen, and pointing the client at a daemon
+                // behind a screen that is still asking for one is a switch the
+                // human cannot see happen.
+                .disabled(store.connStatus != .connected)
+            }
+            Divider()
+            // DELIBERATELY CHORDLESS. ⌘` is the system's window cycler, and
+            // every account inside the first nine already has a digit of its
+            // own — this is the tenth-account escape hatch and a place for the
+            // menu to say the list wraps, not a primary way to move.
+            Button("Next Account") { Task { await accounts.switchToNext() } }
+                .disabled(store.connStatus != .connected || accounts.accounts.count < 2)
+            Divider()
+            Button("Add Account…") { store.addAccountSheetOpen = true }
+                // The gate is already a connect form. Offering a second one on
+                // top of it would add an account to an install that has none.
+                .disabled(store.connStatus != .connected)
         }
 
         CommandMenu("Inbox") {

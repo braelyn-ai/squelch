@@ -25,18 +25,78 @@
 import Foundation
 import Observation
 
-/// One account the client can talk to. IDENTITY ONLY — the server URL and
+/// One account the client can talk to. NO CREDENTIALS — the server URL and
 /// token live in the keychain under `id`. `label` is the human's name for it
 /// and may be empty, in which case the UI falls back to the server's host:port.
 struct AccountRecord: Codable, Sendable, Equatable, Identifiable {
     var id: UUID
     var label: String
     var createdAt: Date
+    /// The daemon's host, with its port when the URL names one. Kept in the
+    /// index so the UI can NAME an unlabelled account without going to the
+    /// keychain for it: a menu is rebuilt on every render and a keychain read
+    /// can raise the system's access panel, which blocks the main actor until
+    /// the human answers. A hostname is not a credential — it is the thing the
+    /// human typed into the connect form, and the token behind it stays where
+    /// it was.
+    ///
+    /// Empty means "not known yet": a record written by a build from before
+    /// this field existed. `AccountManager.noteDisplayHost` fills those in from
+    /// the credentials the notification feed reads at boot anyway, so nothing
+    /// pays an extra keychain round trip for it.
+    var displayHost: String
 
-    init(id: UUID = UUID(), label: String = "", createdAt: Date = Date()) {
+    init(
+        id: UUID = UUID(), label: String = "", createdAt: Date = Date(), displayHost: String = ""
+    ) {
         self.id = id
         self.label = label
         self.createdAt = createdAt
+        self.displayHost = displayHost
+    }
+
+    /// Decoded by hand for ONE reason: `displayHost` post-dates the stored
+    /// format, and the synthesized decoder would reject every record written
+    /// without it — which is every record on an install that has been upgraded.
+    /// A missing host is simply unknown, not a corrupt index.
+    enum CodingKeys: String, CodingKey { case id, label, createdAt, displayHost }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        label = try c.decode(String.self, forKey: .label)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        displayHost = try c.decodeIfPresent(String.self, forKey: .displayHost) ?? ""
+    }
+
+    /// The host:port to show for a server URL. The port is included because
+    /// two daemons on one machine differ by nothing else, which is exactly the
+    /// shape of a local two-account setup. Anything unparseable falls back to
+    /// the raw string: it is what the human typed, so it is the best name we
+    /// have for it.
+    static func host(from serverURL: String) -> String {
+        guard let comps = URLComponents(string: serverURL), let host = comps.host, !host.isEmpty
+        else { return serverURL }
+        guard let port = comps.port else { return host }
+        return "\(host):\(port)"
+    }
+
+    /// What the UI calls this account: the human's label, the daemon's host
+    /// when they have not given one, and a last-resort placeholder when the
+    /// host is not known either (a pre-`displayHost` record whose feed has not
+    /// come up yet). Never empty — a nameless row in a switcher is unclickable
+    /// in practice.
+    var displayName: String {
+        let named = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !named.isEmpty { return named }
+        if !displayHost.isEmpty { return displayHost }
+        return "unnamed account"
+    }
+
+    /// The one character the rail badge wears.
+    var initial: String {
+        guard let first = displayName.first(where: { !$0.isWhitespace }) else { return "?" }
+        return String(first).uppercased()
     }
 }
 
@@ -333,7 +393,12 @@ enum AccountIndex {
         // index commit would otherwise leave a second copy of the token under
         // an id nothing names; reusing the parked id means the retry overwrites
         // those very slots instead of stranding them.
-        let record = AccountRecord(id: pendingMigrationId())
+        //
+        // The host comes along for free: the legacy credentials are already in
+        // hand here, so the migrated record can name itself without anyone
+        // going back to the keychain to ask.
+        let record = AccountRecord(
+            id: pendingMigrationId(), displayHost: AccountRecord.host(from: legacy.serverURL))
 
         // 1. Credentials into the suffixed slots. Both or neither: a partial
         //    write is rolled back so the retry does not strand a lone slot.
@@ -459,7 +524,8 @@ final class AccountManager {
     /// change, and not something that should fall out of saving a token.
     @discardableResult
     func add(label: String = "", settings: ConnectionSettings) async -> AccountRecord? {
-        let record = AccountRecord(label: label)
+        let record = AccountRecord(
+            label: label, displayHost: AccountRecord.host(from: settings.serverURL))
         guard case .success = await SettingsStore.saveAsync(settings, accountId: record.id) else {
             // Roll a partial write back for the same reason the migration
             // does: a lone slot under an id nothing names is unreachable.
@@ -478,8 +544,27 @@ final class AccountManager {
     /// Rename one account. Label only — an id is identity and the position in
     /// the list is the human's switching number, so neither may move.
     func rename(_ id: UUID, to label: String) {
-        guard var record = accounts.first(where: { $0.id == id }) else { return }
+        guard var record = accounts.first(where: { $0.id == id }), record.label != label else {
+            return
+        }
         record.label = label
+        AccountIndex.upsert(record, activate: false)
+        reload()
+    }
+
+    /// Record the host one account's credentials point at, so the UI can name
+    /// it without a keychain read (see `AccountRecord.displayHost`).
+    ///
+    /// Called from the feed's start, which has JUST read those credentials for
+    /// its own reasons: the index learns the host for free rather than paying
+    /// a second access panel for it. A no-op unless something actually changed,
+    /// which is the usual case — this writes on the first boot after an upgrade
+    /// (a record from before the field existed) and after a daemon moves.
+    func noteDisplayHost(_ id: UUID, serverURL: String) {
+        let host = AccountRecord.host(from: serverURL)
+        guard var record = accounts.first(where: { $0.id == id }), record.displayHost != host
+        else { return }
+        record.displayHost = host
         AccountIndex.upsert(record, activate: false)
         reload()
     }
@@ -525,6 +610,19 @@ final class AccountManager {
     func switchTo(_ id: UUID) async {
         guard let record = accounts.first(where: { $0.id == id }), id != activeId else { return }
         await AppStore.shared.switchAccount(to: record)
+    }
+
+    /// The next account in index order, wrapping. The menu item behind it is
+    /// deliberately chordless (see PassbandCommands): every account inside the
+    /// first nine already has its own ⌘number, so this is a discoverability
+    /// affordance rather than the primary way to move.
+    func switchToNext() async {
+        guard accounts.count > 1 else { return }
+        // An unknown active id (nothing live yet) lands on the first account,
+        // which is the only sensible "next" from nowhere.
+        let current = accounts.firstIndex { $0.id == activeId } ?? -1
+        let next = accounts[(current + 1) % accounts.count]
+        await switchTo(next.id)
     }
 
     // MARK: - the notification feeds
@@ -596,6 +694,11 @@ final class AccountManager {
                 wantedStreams.remove(id)
                 return
             }
+            // The one keychain read every account pays at boot, so the index
+            // takes its host from here rather than raising a second panel of
+            // its own. Nothing else in the app needs an inactive account's
+            // credentials.
+            noteDisplayHost(id, serverURL: stored.serverURL)
             let stream = EventStream(accountId: id, settings: stored)
             streams[id] = stream
             stream.start()
@@ -622,6 +725,9 @@ final class AccountManager {
         // Unconditional, even with the feeds down: whatever is connected right
         // now is presenting credentials that are no longer the truth.
         stopStream(id)
+        // Before the `feedsUp` bail: a moved daemon has to rename its row in
+        // the switcher whether or not the feeds happen to be running.
+        noteDisplayHost(id, serverURL: settings.serverURL)
         guard feedsUp else { return }
         wantedStreams.insert(id)
         let stream = EventStream(accountId: id, settings: settings)

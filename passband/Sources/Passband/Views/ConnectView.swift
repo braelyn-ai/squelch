@@ -1,5 +1,12 @@
-// First-run connect screen. Two ways in, one destination: a bearer token in the
-// OS keychain, proved against /client/stats before it is stored.
+// The connect screen. Two ways in, one destination: a bearer token in the OS
+// keychain, proved against /client/stats before it is stored.
+//
+// TWO PLACES SHOW IT, and `purpose` is the whole difference. As the GATE it is
+// the window: this install has no identity, so it also teaches what a daemon is
+// and, on success, becomes the identity. As the ADD ACCOUNT sheet it sits over
+// a working app and adds a SECOND daemon beside the one already live — same
+// form, same proof, but it must not touch the connection state the shell behind
+// it is standing on (see AppStore.addAccount).
 //
 // PAIRING is the default. `squelchd pair` prints a code, this screen trades it
 // for a token minted for THIS Mac alone — one that shows up by name in
@@ -15,19 +22,44 @@ import SwiftUI
 /// Which way in the screen is showing.
 private enum ConnectMode: Hashable { case pair, token }
 
+/// Why this screen is up. See the file header — it decides what a success
+/// MEANS, and nothing else about the form.
+enum ConnectPurpose: Hashable {
+    /// The app has no identity; connecting becomes it.
+    case gate
+    /// The app is connected; connecting adds another account beside it.
+    case addAccount
+}
+
 /// Field focus, so Enter walks the form instead of dead-ending. `submit` is the
 /// button itself: a deep link fills the form and lands here, because pairing is
 /// never something a link does on its own.
-private enum ConnectField: Hashable { case url, code, device, token, submit }
+private enum ConnectField: Hashable { case url, code, device, token, name, submit }
 
 struct ConnectView: View {
     @Environment(AppStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+
+    /// Defaults to the gate, so the two shells that mount it as the whole
+    /// window say nothing about it.
+    var purpose: ConnectPurpose = .gate
 
     @State private var mode: ConnectMode = .pair
     @State private var url = "http://127.0.0.1:8848"
     @State private var code = ""
     @State private var deviceName = Pairing.defaultDeviceName()
     @State private var token = ""
+    /// The human's name for this account. Optional everywhere: an empty label
+    /// leaves the switcher showing the daemon's host:port, which is a real
+    /// answer rather than a placeholder.
+    @State private var accountLabel = ""
+    /// An add-account attempt is in flight. The gate reads `store.connStatus`
+    /// for this, but adding deliberately never moves it — the shell behind the
+    /// sheet is standing on it.
+    @State private var adding = false
+    /// The failure from an add. Kept out of `store.connError`, which belongs to
+    /// the gate and would still be sitting there next time one opened.
+    @State private var addError: String?
     /// A claim is in flight. Separate from `connStatus`, which only starts
     /// moving once pairing has produced a token to test.
     @State private var claiming = false
@@ -50,11 +82,11 @@ struct ConnectView: View {
     @State private var linkArmed = false
     @FocusState private var focus: ConnectField?
 
-    private var busy: Bool { claiming || store.connStatus == .connecting }
+    private var busy: Bool { claiming || adding || store.connStatus == .connecting }
 
     /// One error line, whichever half produced it. A pairing failure wins: it is
     /// the more recent thing the user did.
-    private var errorText: String? { pairError ?? store.connError }
+    private var errorText: String? { pairError ?? addError ?? store.connError }
 
     private var canSubmit: Bool {
         guard !busy, !url.trimmed.isEmpty else { return false }
@@ -69,6 +101,24 @@ struct ConnectView: View {
     }
 
     var body: some View {
+        Group {
+            switch purpose {
+            case .gate: gateBody
+            // A sheet is sized by its content, so the card's own measure is the
+            // sheet's — no filling the screen, and no getting-started pane: an
+            // install adding a SECOND daemon plainly knows what the first one
+            // was.
+            case .addAccount: connectCard.padding(24)
+            }
+        }
+        // A link can arrive before this view mounts (the app was launched by
+        // one, or the sheet is being opened BY one) or while it is up, so both
+        // entry points are covered.
+        .task { applyPairLink(store.pairLink) }
+        .onChange(of: store.pairLink) { _, link in applyPairLink(link) }
+    }
+
+    private var gateBody: some View {
         ZStack {
             // A fresh download lands here with no daemon and no idea what one
             // is, so the gate teaches: getting-started beside the form when the
@@ -87,10 +137,6 @@ struct ConnectView: View {
             .padding(.horizontal, 16)
         #endif
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // A link can arrive before this gate mounts (the app was launched by
-        // one) or while it is up, so both entry points are covered.
-        .task { applyPairLink(store.pairLink) }
-        .onChange(of: store.pairLink) { _, link in applyPairLink(link) }
     }
 
     private var connectCard: some View {
@@ -108,6 +154,9 @@ struct ConnectView: View {
                 case .token: tokenForm
                 }
 
+                nameField
+                    .padding(.top, 14)
+
                 if let errorText {
                     Label(errorText, systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 12))
@@ -116,26 +165,35 @@ struct ConnectView: View {
                         .padding(.top, 12)
                 }
 
-                Button {
-                    submit()
-                } label: {
-                    Text(buttonLabel)
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 5)
-                }
-                .buttonStyle(.glassProminent)
-                .tint(Palette.accent)
-                .disabled(!canSubmit)
-                .focused($focus, equals: .submit)
-                // A link fills the form and stops. The ring is where the one
-                // deliberate press has to land for anything to be claimed.
-                .overlay {
-                    if linkArmed {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(Palette.accent, lineWidth: 2)
-                            .padding(-4)
-                            .allowsHitTesting(false)
+                HStack(spacing: 12) {
+                    // Only the sheet can be walked away from. The gate has no
+                    // "cancel": there is nothing behind it.
+                    if purpose == .addAccount {
+                        Button("cancel") { dismiss() }
+                            .buttonStyle(.textAction)
+                            .disabled(busy)
+                    }
+                    Button {
+                        submit()
+                    } label: {
+                        Text(buttonLabel)
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(Palette.accent)
+                    .disabled(!canSubmit)
+                    .focused($focus, equals: .submit)
+                    // A link fills the form and stops. The ring is where the one
+                    // deliberate press has to land for anything to be claimed.
+                    .overlay {
+                        if linkArmed {
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(Palette.accent, lineWidth: 2)
+                                .padding(-4)
+                                .allowsHitTesting(false)
+                        }
                     }
                 }
                 .padding(.top, 18)
@@ -161,15 +219,33 @@ struct ConnectView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("passband")
-                .font(Typo.serif(40, weight: .medium))
+            Text(purpose == .gate ? "passband" : "add account")
+                .font(Typo.serif(purpose == .gate ? 40 : 30, weight: .medium))
                 .foregroundStyle(Palette.ink)
-            Text("connect to your human door")
-                .font(.system(size: 13))
-                .foregroundStyle(Palette.inkFaint)
+            Text(
+                purpose == .gate
+                    ? "connect to your human door"
+                    : "one daemon per mailbox. this one joins the accounts you already have."
+            )
+            .font(.system(size: 13))
+            .foregroundStyle(Palette.inkFaint)
+            .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 22)
+    }
+
+    /// The account's name, optional in both purposes. It matters most in the
+    /// sheet — a second row in the switcher wants a word a human picked — but
+    /// the first account is allowed one too, since it is about to have company.
+    private var nameField: some View {
+        Field(label: "account name") {
+            TextField("optional, defaults to the server host", text: $accountLabel)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .focused($focus, equals: .name)
+                .onSubmit { submit() }
+        }
     }
 
     /// Names the server a deep link chose, whenever that server is not this
@@ -255,11 +331,12 @@ struct ConnectView: View {
 
     private var buttonLabel: String {
         if claiming { return "pairing…" }
-        if store.connStatus == .connecting { return "testing…" }
+        if adding || store.connStatus == .connecting { return "testing…" }
         // The claim is done and only its probe is outstanding, so the button
         // offers the step that is actually left.
-        if mode == .pair && heldToken != nil { return "connect" }
-        return mode == .pair ? "pair" : "connect"
+        let done = purpose == .gate ? "connect" : "add account"
+        if mode == .pair && heldToken != nil { return done }
+        return mode == .pair ? "pair" : done
     }
 
     private var footnote: String {
@@ -286,6 +363,7 @@ struct ConnectView: View {
                 guard next != mode else { return }
                 mode = next
                 pairError = nil
+                addError = nil
                 store.connError = nil
                 focus = next == .pair ? .code : .token
             })
@@ -329,7 +407,32 @@ struct ConnectView: View {
         guard canSubmit else { return }
         switch mode {
         case .pair: Task { await claim() }
-        case .token: Task { await store.connect(serverURL: url.trimmed, apiToken: token.trimmed) }
+        case .token: Task { await finish(serverURL: url.trimmed, apiToken: token.trimmed) }
+        }
+    }
+
+    /// THE destination both forms share, and the one place `purpose` changes
+    /// what happens: the gate's credentials become this install's identity, the
+    /// sheet's become one more account beside it. Returns whether the
+    /// credentials were accepted, which is what tells `claim` its held token is
+    /// spent.
+    @discardableResult
+    private func finish(serverURL: String, apiToken: String) async -> Bool {
+        addError = nil
+        switch purpose {
+        case .gate:
+            return await store.connect(
+                serverURL: serverURL, apiToken: apiToken, label: accountLabel.trimmed)
+        case .addAccount:
+            adding = true
+            let outcome = await store.addAccount(
+                serverURL: serverURL, apiToken: apiToken, label: accountLabel.trimmed)
+            adding = false
+            addError = outcome.error
+            // The sheet's whole job is done, and the app behind it has already
+            // switched to the account that was just added.
+            if outcome.ok { dismiss() }
+            return outcome.ok
         }
     }
 
@@ -345,11 +448,21 @@ struct ConnectView: View {
         let base = url.trimmed
         linkArmed = false
         pairError = nil
+        addError = nil
         store.connError = nil
 
         // Already paid for. Retry the connection, not the claim.
         if let held = heldToken {
-            if await store.connect(serverURL: base, apiToken: held) { heldToken = nil }
+            if await finish(serverURL: base, apiToken: held) { heldToken = nil }
+            return
+        }
+
+        // A duplicate daemon must be refused BEFORE the claim, not after:
+        // claiming mints a device token on the daemon and spends one of the
+        // code's five attempts, and `addAccount`'s own check would only see
+        // the duplicate once both are already gone.
+        if purpose == .addAccount, store.isKnownDaemon(base) {
+            addError = "that daemon is already one of your accounts"
             return
         }
 
@@ -365,7 +478,7 @@ struct ConnectView: View {
             // which is for USER edits and would drop the token we just held.
             code = ""
             heldToken = issued.token
-            if await store.connect(serverURL: base, apiToken: issued.token) { heldToken = nil }
+            if await finish(serverURL: base, apiToken: issued.token) { heldToken = nil }
         } catch {
             claiming = false
             pairError = Pairing.message(for: error)
@@ -386,6 +499,7 @@ struct ConnectView: View {
         code = Pairing.formatted(link.code)
         heldToken = nil
         pairError = nil
+        addError = nil
         store.connError = nil
         // Loopback is the URL `squelchd pair` prints for its own machine, so it
         // fills quietly. Any other host was chosen by whoever wrote the link,

@@ -12,6 +12,8 @@ struct RootView: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
+        @Bindable var store = store
+
         Group {
             switch store.connStatus {
             case .loading:
@@ -21,6 +23,14 @@ struct RootView: View {
             default:
                 ConnectView()
             }
+        }
+        // ADD ACCOUNT — the same form as the gate, over a working app. Hung on
+        // the whole shell rather than on any one surface: it is raised from
+        // Settings, from the rail's account menu, from the Accounts menu, and
+        // by a pair link from a second daemon, and none of those can be sure
+        // which page is on screen.
+        .sheet(isPresented: $store.addAccountSheetOpen) {
+            ConnectView(purpose: .addAccount)
         }
         .task {
             // Pay WebKit's process-launch cost at boot rather than on the first
@@ -49,6 +59,11 @@ struct RootView: View {
             } else {
                 SitrepPoller.shared.stop()
                 AccountManager.shared.stopAllStreams()
+                // The Connect gate is now the whole window, and it is the same
+                // form the sheet holds. Leaving one stacked on the other would
+                // offer two ways to connect at once, the front one adding an
+                // account to an install that no longer has any.
+                store.addAccountSheetOpen = false
             }
         }
     }
