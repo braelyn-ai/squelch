@@ -1,0 +1,16 @@
+# Bifrost, the LLM gateway for hosted tenants (railway.bifrost.toml).
+#
+# Tenant daemons never hold our Anthropic key: each pod gets a Bifrost
+# virtual key (minted by squelch-control at signup) and sends its unchanged
+# Anthropic-wire traffic to this service's /anthropic route. Bifrost holds
+# the real provider key, enforces per-tenant dollar budgets, and meters
+# usage — the metering the daemon's own ledger is reconciled against.
+#
+# Wrapped in a Dockerfile rather than deployed straight from the upstream
+# image so the pinned version is code-reviewed here, and so an auth proxy
+# or baked config has an obvious place to land if the OSS admin plane ever
+# needs fronting. Root user for the same reason as Dockerfile.prometheus:
+# the Railway volume at /app/data mounts root-owned.
+FROM maximhq/bifrost:v1.6.9
+USER root
+EXPOSE 8080
