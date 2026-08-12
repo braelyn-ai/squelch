@@ -376,9 +376,17 @@ final class AppStore {
     // MARK: - settings
 
     func loadSettings() async {
+        // The index says WHICH account's credentials to read, and repairs a
+        // pre-multi-account install on the way through. Off the main actor for
+        // the same reason the load below is.
+        let index = await AccountIndex.loadOrMigrate()
+        guard let active = index.active else {
+            connStatus = .disconnected
+            return
+        }
         // Off the main actor: a keychain read can put up the system's "allow
         // access?" panel and block until answered.
-        switch await SettingsStore.loadAsync() {
+        switch await SettingsStore.loadAsync(accountId: active.id) {
         case .success(let stored):
             if let stored {
                 await APIClient.shared.configure(
@@ -416,8 +424,15 @@ final class AppStore {
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
             _ = try await APIClient.shared.getStats()  // 401 => bad token; network => bad url
+            // Re-connecting keeps the live account's id (and so its keychain
+            // slots); a first connection mints one. The index entry is written
+            // only after the credentials are in the keychain.
+            let account = AccountIndex.activeOrNew()
             try await SettingsStore.saveAsync(
-                ConnectionSettings(serverURL: serverURL, apiToken: apiToken)).get()
+                ConnectionSettings(serverURL: serverURL, apiToken: apiToken),
+                accountId: account.id
+            ).get()
+            AccountIndex.upsert(account)
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             connStatus = .connected
             connError = nil
@@ -442,8 +457,14 @@ final class AppStore {
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
             _ = try await APIClient.shared.getStats()
+            // Same account, new credentials — `activeOrNew` returns the live
+            // record here, so this overwrites its slots rather than adding one.
+            let account = AccountIndex.activeOrNew()
             try await SettingsStore.saveAsync(
-                ConnectionSettings(serverURL: serverURL, apiToken: apiToken)).get()
+                ConnectionSettings(serverURL: serverURL, apiToken: apiToken),
+                accountId: account.id
+            ).get()
+            AccountIndex.upsert(account)
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             return (true, nil)
         } catch {
@@ -466,8 +487,13 @@ final class AppStore {
     }
 
     func disconnect() {
-        // Wipe persisted settings so the next boot lands on the Connect gate.
-        try? SettingsStore.clear()
+        // Wipe the live account's persisted settings — credentials first, then
+        // the index entry that names them — so the next boot lands on the
+        // Connect gate.
+        if let id = AccountIndex.load().activeId {
+            try? SettingsStore.clear(accountId: id)
+            AccountIndex.remove(id)
+        }
         connStatus = .disconnected
         settings = nil
         sitrep = SitrepData()
