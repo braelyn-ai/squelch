@@ -450,17 +450,23 @@ final class AppStore {
             // slots); a first connection mints one. The index entry is written
             // only after the credentials are in the keychain.
             let account = AccountIndex.activeOrNew()
-            try await SettingsStore.saveAsync(
-                ConnectionSettings(serverURL: serverURL, apiToken: apiToken),
-                accountId: account.id
-            ).get()
+            let fresh = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
+            try await SettingsStore.saveAsync(fresh, accountId: account.id).get()
             AccountIndex.upsert(account)
             // Into the observable mirror too: everything account-scoped — the
-            // 2FA seen-set, the decisions ledger — derives its storage key
-            // from `AccountManager.activeId`, and a first connection is the
-            // moment that goes from nothing to something.
+            // 2FA seen-set, the decisions ledger, the notification feeds —
+            // derives its storage key (or its very existence) from
+            // `AccountManager`, and a first connection is the moment that goes
+            // from nothing to something.
             AccountManager.shared.reload()
-            settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
+            // This account's feed. Arriving from the Connect gate the feeds
+            // are down, so this is a no-op and the `.connected` transition
+            // below is what raises them — the same route the single-account
+            // build took. It is here for the OTHER arrival: a re-connect that
+            // never left `.connected`, where the running stream is holding the
+            // credentials this call just replaced.
+            AccountManager.shared.restartStream(account.id, with: fresh)
+            settings = fresh
             connStatus = .connected
             connError = nil
             Analytics.capture("connect_succeeded")
@@ -487,13 +493,18 @@ final class AppStore {
             // Same account, new credentials — `activeOrNew` returns the live
             // record here, so this overwrites its slots rather than adding one.
             let account = AccountIndex.activeOrNew()
-            try await SettingsStore.saveAsync(
-                ConnectionSettings(serverURL: serverURL, apiToken: apiToken),
-                accountId: account.id
-            ).get()
+            let fresh = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
+            try await SettingsStore.saveAsync(fresh, accountId: account.id).get()
             AccountIndex.upsert(account)
             AccountManager.shared.reload()
-            settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
+            // The feed is still connected with the OLD token, and nothing else
+            // will ever tell it otherwise: re-validating deliberately never
+            // leaves `.connected`, so the transition that starts the streams
+            // does not fire. A rotated token means the old connection is one
+            // 401 away from a silent backoff loop, so it is replaced outright
+            // — streams take their credentials at construction and keep them.
+            AccountManager.shared.restartStream(account.id, with: fresh)
+            settings = fresh
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
@@ -525,6 +536,13 @@ final class AppStore {
         // slots — so the id is parked for the boot sweep, which keeps
         // retrying until the token is really gone.
         if let id = AccountIndex.load().activeId {
+            // The feed before the credentials, for the reason
+            // `AccountManager.remove` spells out: a stream that outlives its
+            // account keeps dialling a daemon this install has forgotten, and
+            // writes its cursor key straight back after the removal below has
+            // dropped it. Every OTHER account's feed goes down with the
+            // `.disconnected` transition at the end of this method.
+            AccountManager.shared.stopStream(id)
             do {
                 try SettingsStore.clear(accountId: id)
             } catch {
@@ -579,8 +597,10 @@ final class AppStore {
         //     account and every writer that captured the old epoch is inert.
         epoch &+= 1
 
-        // (3) Stop polling this daemon. The EventStreams keep running: mail
-        //     notifications come from every account, live or not (Phase 3).
+        // (3) Stop polling this daemon. The EventStreams are deliberately left
+        //     alone — every account holds one, live or not, so that mail
+        //     arriving anywhere still raises a banner. Switching changes which
+        //     mailbox is on screen, not which ones are worth hearing from.
         SitrepPoller.shared.stop()
 
         // (4) Both composers' last save — and then WAIT for it. Reconfiguring

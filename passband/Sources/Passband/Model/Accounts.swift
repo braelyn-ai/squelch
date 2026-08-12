@@ -19,7 +19,8 @@
 //
 // `AccountManager` at the bottom is the live, observable view of all that — the
 // list the UI renders, the id everything account-scoped derives its keys from,
-// and the entry point to a switch.
+// the entry point to a switch, and the owner of the one permanently
+// per-account object: an `EventStream` per record, live account or not.
 
 import Foundation
 import Observation
@@ -467,6 +468,10 @@ final class AccountManager {
         }
         AccountIndex.upsert(record, activate: false)
         reload()
+        // An account added while the app is already up gets its feed here:
+        // nothing else will start it, because the `.connected` transition that
+        // brings the feeds up happened long before this account existed.
+        startStream(record.id)
         return record
     }
 
@@ -483,6 +488,11 @@ final class AccountManager {
     /// the id for the boot sweep rather than being swallowed: the index entry
     /// is about to go, and it is the only thing that still names those slots.
     func remove(_ id: UUID) async {
+        // The feed FIRST, before the credentials it is holding are deleted and
+        // before `AccountIndex.remove` drops its cursor: a stream left running
+        // through that would keep dialling a daemon this install has just
+        // forgotten, and would write the cursor key straight back.
+        stopStream(id)
         let cleared = await offMain { Result { try SettingsStore.clear(accountId: id) } }
         if case .failure = cleared { AccountIndex.parkOrphan(id) }
         AccountIndex.remove(id)
@@ -508,8 +518,114 @@ final class AccountManager {
     /// Step (1) of the switch sequence — is this a real, different account —
     /// lives here; `AppStore.switchAccount` is the rest of it, because the
     /// state being torn down is that store's own and half of it is private.
+    ///
+    /// Note what this does NOT do: touch the feeds. Every account's stream
+    /// keeps running across a switch, because which mailbox is on screen has
+    /// nothing to do with which mailboxes are worth being told about.
     func switchTo(_ id: UUID) async {
         guard let record = accounts.first(where: { $0.id == id }), id != activeId else { return }
         await AppStore.shared.switchAccount(to: record)
+    }
+
+    // MARK: - the notification feeds
+
+    /// One SSE connection per account, keyed by id — INCLUDING the accounts
+    /// that are not live. That is the entire point of holding them: the human
+    /// wants to hear about mail in every mailbox they have added, not only the
+    /// one currently on screen. Owned here rather than by `AppStore` because
+    /// the store is only ever the ACTIVE account's world.
+    private var streams: [UUID: EventStream] = [:]
+
+    /// The accounts whose feeds SHOULD be up. It differs from `streams` only
+    /// across the keychain read that starting one has to await — and that gap
+    /// is exactly why it exists. A `remove` landing inside it takes the id out
+    /// of here, so the read resumes, finds itself unwanted, and drops the
+    /// stream instead of dialling a daemon this install has just forgotten.
+    private var wantedStreams: Set<UUID> = []
+
+    /// Whether feeds should be running AT ALL — raised by the `.connected`
+    /// transition and dropped by its opposite. Without it, an account recorded
+    /// while the app is sitting on the Connect gate would quietly open a
+    /// connection from a screen that says the app has no identity.
+    private var feedsUp = false
+
+    /// Bring up one feed per account. Called on the `.connected` transition,
+    /// which is the moment this install is known to have an identity.
+    /// Idempotent: an account already streaming keeps the connection it has
+    /// rather than being cut and redialled.
+    func startAllStreams() {
+        feedsUp = true
+        for account in accounts { startStream(account.id) }
+    }
+
+    /// Drop every feed. The `.disconnected` transition — an app with no
+    /// identity on screen holds no connections either.
+    func stopAllStreams() {
+        feedsUp = false
+        wantedStreams.removeAll()
+        // Every stream is stopped BEFORE the dictionary is emptied: a
+        // `ResidentTask` is retained by the runtime while its loop runs, so a
+        // stream merely dropped on the floor would keep reconnecting forever
+        // with nothing left in the process holding a reference to stop it.
+        for stream in streams.values { stream.stop() }
+        streams.removeAll()
+    }
+
+    /// Start ONE account's feed. Asynchronous underneath because the
+    /// credentials come from the keychain, but fire-and-forget from the
+    /// caller's side: nothing in the app waits on a notification feed.
+    func startStream(_ id: UUID) {
+        // `insert` reporting no insertion means the id is already wanted —
+        // streaming, or mid-keychain-read. Either way a second connection to
+        // the same daemon is nobody's intent.
+        guard feedsUp, wantedStreams.insert(id).inserted else { return }
+        Task {
+            let stored = await settings(for: id)
+            // The world can have moved during that read: a stop, a removal, a
+            // whole disconnect. `wantedStreams` answers all three at once. A
+            // stream already under this id means a `restartStream` overtook us
+            // with credentials it did not need the keychain for; that one is
+            // the fresher of the two, so leave it alone.
+            guard wantedStreams.contains(id), streams[id] == nil else { return }
+            guard let stored else {
+                // No credentials behind the record: slots gone, or the
+                // keychain refused. A feed with nothing to connect to is a
+                // backoff loop that never ends, so none is started and the id
+                // goes back to unwanted — the next `.connected` transition (or
+                // the next launch) is the retry.
+                wantedStreams.remove(id)
+                return
+            }
+            let stream = EventStream(accountId: id, settings: stored)
+            streams[id] = stream
+            stream.start()
+        }
+    }
+
+    /// Stop and forget ONE account's feed, including a start still waiting on
+    /// the keychain.
+    func stopStream(_ id: UUID) {
+        wantedStreams.remove(id)
+        streams.removeValue(forKey: id)?.stop()
+    }
+
+    /// Rebuild one feed against credentials that have just changed — a
+    /// re-validated token, a moved server URL.
+    ///
+    /// A stream's settings are fixed for its lifetime BY DESIGN (see
+    /// EventStream), so new credentials mean a new connection: mutating one in
+    /// place is how a feed ends up holding one account's URL with another's
+    /// token. The settings are handed in rather than re-read, because the
+    /// caller has just written them and a second keychain round trip is a
+    /// second chance to raise the access panel.
+    func restartStream(_ id: UUID, with settings: ConnectionSettings) {
+        // Unconditional, even with the feeds down: whatever is connected right
+        // now is presenting credentials that are no longer the truth.
+        stopStream(id)
+        guard feedsUp else { return }
+        wantedStreams.insert(id)
+        let stream = EventStream(accountId: id, settings: settings)
+        streams[id] = stream
+        stream.start()
     }
 }

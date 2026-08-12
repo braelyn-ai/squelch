@@ -31,7 +31,11 @@ struct RootView: View {
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
                 SitrepPoller.shared.start()
-                EventStream.shared.start()
+                // EVERY account's notification feed, not just the live one:
+                // the poller above follows whichever mailbox is on screen,
+                // while the feeds are how the human hears about mail in the
+                // ones that are not. A switch leaves them all running.
+                AccountManager.shared.startAllStreams()
                 // Warm the emails page at CONNECT, not on its first visit: the
                 // list lives in the store, so fetching it now means opening the
                 // page lands on rows instead of on "loading mail…". This also
@@ -44,7 +48,7 @@ struct RootView: View {
                 Task { await store.refreshTrackingConfig() }
             } else {
                 SitrepPoller.shared.stop()
-                EventStream.shared.stop()
+                AccountManager.shared.stopAllStreams()
             }
         }
     }

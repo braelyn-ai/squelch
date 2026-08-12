@@ -5,6 +5,14 @@
 // alone with no round trip. `copy(for:)` is that mapping, kept pure and separate
 // from posting. On a dev machine the grant resets every recompile: an ad-hoc
 // signature's identity is a hash of the build.
+//
+// EVERY BANNER NAMES ITS ACCOUNT. There is one event feed per account and the
+// ids on those feeds are per-daemon SQLite ints, so two accounts hand this
+// class the same event id and the same thread id for entirely unrelated mail.
+// Both of the identifiers the system dedupes and groups on are therefore
+// prefixed with the account uuid, and the uuid rides in `userInfo` so a tap can
+// take the human to the mailbox the mail is actually in — switching accounts
+// first if that is where it lives.
 
 import UserNotifications
 
@@ -18,10 +26,14 @@ import UserNotifications
 final class Notifier {
     static let shared = Notifier()
 
-    /// userInfo keys — a tap routes on the thread id. `nonisolated` because the
-    /// delegate reads the payload on whatever queue the system delivers it to.
+    /// userInfo keys — a tap routes on the thread id, WITHIN the account named
+    /// by the account id. `nonisolated` because the delegate reads the payload
+    /// on whatever queue the system delivers it to.
     nonisolated static let threadKey = "passband.thread_id"
     nonisolated static let eventKey = "passband.event_id"
+    /// The posting account's uuid, as a string (userInfo has to survive being
+    /// written to disk by the system and read back into a later launch).
+    nonisolated static let accountKey = "passband.account_id"
 
     /// UNUserNotificationCenter holds its delegate WEAKLY. This property is the
     /// only strong reference in the process — assigning a freshly-made delegate
@@ -156,21 +168,37 @@ final class Notifier {
 
     // MARK: - posting
 
-    func post(_ event: Event) {
+    /// Post one event's banner on behalf of one account. `copy(for:)` stays
+    /// account-blind — the display copy is the same wherever the mail landed —
+    /// and the account is folded into the two IDENTIFIERS below plus userInfo.
+    func post(_ event: Event, accountId: UUID) {
+        let account = accountId.uuidString
         let copy = Self.copy(for: event)
         let content = UNMutableNotificationContent()
         content.title = copy.title
         if !copy.subtitle.isEmpty { content.subtitle = copy.subtitle }
         content.body = copy.body
-        content.threadIdentifier = copy.threadIdentifier
-        content.userInfo = [Self.threadKey: event.thread_id, Self.eventKey: event.id]
+        // The coalescing group, NAMESPACED BY ACCOUNT. Thread ids come from the
+        // daemon (and the fallback is built from an event id), so two accounts
+        // can hand us the same one for unrelated mail — unprefixed, the system
+        // would stack two mailboxes' banners into a single group as though they
+        // were one conversation.
+        content.threadIdentifier = "\(account).\(copy.threadIdentifier)"
+        content.userInfo = [
+            Self.threadKey: event.thread_id,
+            Self.eventKey: event.id,
+            Self.accountKey: account,
+        ]
         if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
 
         // The event id as the REQUEST id makes a re-delivered frame (a replay
         // overlapping the live seam after a reconnect) replace its own banner
-        // rather than stack a second copy.
+        // rather than stack a second copy. Also account-prefixed, and for a
+        // sharper reason than the group is: event ids are per-daemon SQLite
+        // ints, so account B's event 41 would REPLACE account A's event 41 —
+        // one banner silently eating the other.
         let request = UNNotificationRequest(
-            identifier: "passband.event.\(event.id)", content: content, trigger: nil)
+            identifier: "passband.event.\(account).\(event.id)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
 
@@ -188,13 +216,51 @@ final class Notifier {
     }
 
     /// A tap: front the app, restore the window if it was closed, open the
-    /// thread.
-    func handleTap(threadId: String?) {
+    /// thread — in the account the banner was posted from, switching to it
+    /// first when that is not the account currently on screen.
+    ///
+    /// Synchronous because the delegate's entry point is, so the cross-account
+    /// path hands itself to a Task: `openThread` MUST come after the switch,
+    /// which tears the whole world down (including any open thread) on its way
+    /// through.
+    func handleTap(threadId: String?, accountId: UUID?) {
         Analytics.capture("notification_opened", ["has_thread": !(threadId ?? "").isEmpty])
+
+        // No account on the payload: a banner posted by a build from before
+        // notifications carried one, still sitting in Notification Center. The
+        // live account is the only guess available, and it is the same one that
+        // build would have opened it against.
+        guard let accountId, accountId != AccountManager.shared.activeId else {
+            front()
+            open(threadId)
+            return
+        }
+        // An account that has since been REMOVED. Its thread ids address a
+        // daemon this install no longer has credentials for, and opening one
+        // against whoever is live would show a stranger's mail — so the tap
+        // fronts the app and stops there, which is the honest whole of what
+        // can still be done about it.
+        guard AccountManager.shared.accounts.contains(where: { $0.id == accountId }) else {
+            front()
+            return
+        }
+        Task {
+            await AccountManager.shared.switchTo(accountId)
+            front()
+            open(threadId)
+        }
+    }
+
+    /// Bring the app forward. AppKit-only, and a no-op elsewhere: on the phone
+    /// the tap has already foregrounded the app by the time this runs.
+    private func front() {
         #if os(macOS)
             NSApp.activate(ignoringOtherApps: true)
             MainWindow.show()
         #endif
+    }
+
+    private func open(_ threadId: String?) {
         guard let threadId, !threadId.isEmpty else { return }
         AppStore.shared.openThread(threadId)
     }
@@ -225,8 +291,15 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
     ) async {
-        let threadId =
-            response.notification.request.content.userInfo[Notifier.threadKey] as? String
-        await MainActor.run { Notifier.shared.handleTap(threadId: threadId) }
+        let userInfo = response.notification.request.content.userInfo
+        let threadId = userInfo[Notifier.threadKey] as? String
+        // Stored as a string and parsed here rather than crossing as one: a
+        // payload that survived a relaunch (or came from an older build) can
+        // hold anything, and an unparseable id must read as "no account", not
+        // as some other account.
+        let accountId = (userInfo[Notifier.accountKey] as? String).flatMap(UUID.init(uuidString:))
+        await MainActor.run {
+            Notifier.shared.handleTap(threadId: threadId, accountId: accountId)
+        }
     }
 }
