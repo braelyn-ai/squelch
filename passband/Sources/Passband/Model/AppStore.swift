@@ -473,10 +473,21 @@ final class AppStore {
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
             _ = try await APIClient.shared.getStats()  // 401 => bad token; network => bad url
-            // Re-connecting keeps the live account's id (and so its keychain
-            // slots); a first connection mints one. The index entry is written
-            // only after the credentials are in the keychain.
-            var account = AccountIndex.activeOrNew()
+            // Re-connecting to the SAME daemon keeps the live account's id
+            // (and so its keychain slots and scoped cursors); anything else
+            // mints a fresh record. The gate can be reached with healthy
+            // accounts still in the index — a failed switch, a denied keychain
+            // read at boot — and reusing the active record there would
+            // overwrite a surviving account's credentials with a stranger
+            // daemon's. The index entry is written only after the credentials
+            // are in the keychain.
+            let activeRecord = AccountIndex.load().active
+            var account: AccountRecord
+            if let activeRecord, activeRecord.displayHost == AccountRecord.host(from: serverURL) {
+                account = activeRecord
+            } else {
+                account = AccountRecord()
+            }
             let named = label.trimmingCharacters(in: .whitespacesAndNewlines)
             if !named.isEmpty { account.label = named }
             // The name the switcher shows when there is no label, learned here
@@ -498,6 +509,15 @@ final class AppStore {
             // message ids, and persisted wholesale under the new key on the
             // first `set`.
             AuthDecisions.shared.reload()
+            // The gate's world is empty, but not necessarily CLEAN: view state
+            // parked before the disconnect — a thread id planted by a stale
+            // notification tap, answers still in flight from the previous
+            // daemon — would otherwise survive into this account. Same fence a
+            // switch uses; costs nothing when there was truly nothing on
+            // screen.
+            epoch &+= 1
+            wipeAccountState()
+            wipeAccountCaches()
             // Arriving from the Connect gate the feeds are down, so this is a
             // no-op and the `.connected` transition below is what raises them
             // — the same route the single-account build took. Kept as a
@@ -549,9 +569,12 @@ final class AppStore {
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
-            // leave the app pointed at a bad config.
+            // leave the app pointed at a bad config. With no prior config to
+            // restore, the rejected candidate must not linger either.
             if let prev {
                 await APIClient.shared.configure(baseURL: prev.serverURL, token: prev.apiToken)
+            } else {
+                await APIClient.shared.deconfigure()
             }
             return (false, Self.connectErrorText(error))
         }
@@ -623,11 +646,16 @@ final class AppStore {
         // Adding an account is asking to use it. Through the ordinary switch,
         // which flushes drafts, wipes every per-account cache and bumps the
         // epoch — the new account is a whole new daemon, and none of the ids on
-        // screen mean anything there. Waited for rather than raced: the
-        // switch's guard silently declines while another is in flight, and
-        // "added but never shown" would read as a failed add.
+        // screen mean anything there. Waited for AND held: a spin alone leaves
+        // a gap where a switch starting between the loop and the call makes
+        // `switchTo`'s guard silently decline, and "added but never shown"
+        // would read as a failed add. Loop and flag are both MainActor, so the
+        // handoff has no gap; `performSwitch` directly, because `switchTo`
+        // would bounce off the very gate held here.
         while switching { try? await Task.sleep(for: .milliseconds(50)) }
-        await AccountManager.shared.switchTo(record.id)
+        switching = true
+        defer { switching = false }
+        await performSwitch(to: record)
         return (true, nil)
     }
 
@@ -653,6 +681,15 @@ final class AppStore {
         defer { switching = false }
 
         let wasActive = AccountManager.shared.activeId == id
+        // Fenced BEFORE the index moves: `remove` suspends on keychain awaits,
+        // and a sitrep pull of this daemon already in flight would otherwise
+        // land under the old epoch — attributed to the survivor the index
+        // reassigns `active` to, and folded into the survivor's persisted
+        // seen-set (message ids are per-daemon ints; they collide).
+        if wasActive {
+            epoch &+= 1
+            SitrepPoller.shared.stop()
+        }
         await AccountManager.shared.remove(id)
         guard wasActive else { return }
 
@@ -672,6 +709,11 @@ final class AppStore {
             // a later `connect` cannot inherit (and then persist) the removed
             // account's verdicts under a new daemon's colliding ids.
             AuthDecisions.shared.reload()
+            // The client would otherwise keep the removed daemon's URL and a
+            // token whose slots were just deleted — and anything that survived
+            // the fence above would present it to the daemon the human just
+            // asked to forget.
+            await APIClient.shared.deconfigure()
             settings = nil
             connStatus = .disconnected
             connError = nil
@@ -685,7 +727,7 @@ final class AppStore {
         // NOT flushed on the way: the daemon they would go to is the one the
         // human just asked to forget, same principle as the last-account
         // branch above.
-        await performSwitch(to: survivor, flushDrafts: false)
+        await performSwitch(to: survivor, flushDrafts: false, currentWorldGone: true)
     }
 
     // MARK: - switching accounts
@@ -723,18 +765,61 @@ final class AppStore {
     /// drafts would go to is the one being forgotten. The settle still runs —
     /// a debounced save already in flight must finish before the client is
     /// reconfigured, whoever it was addressed to.
-    private func performSwitch(to record: AccountRecord, flushDrafts: Bool = true) async {
-        // (2) From here, every answer still in flight belongs to the old
+    private func performSwitch(
+        to record: AccountRecord, flushDrafts: Bool = true, currentWorldGone: Bool = false
+    ) async {
+        // (2) The target's credentials, BEFORE anything is torn down — the one
+        //     step that can fail. Failing here, with the old world untouched,
+        //     keeps the human on a working mailbox; checking after the wipe
+        //     (the old shape) turned a single denied access panel into a
+        //     logout, and the gate it landed on then endangered the surviving
+        //     accounts' credentials. A keychain read can raise the access
+        //     panel, but nothing has been suspended or wiped yet, so blocking
+        //     here is safe.
+        let loaded = await AccountManager.shared.credentialLoad(for: record.id)
+        guard case .ok(let next) = loaded else {
+            let why: String
+            if case .unreadable = loaded {
+                why = "the keychain refused to unlock \(record.displayName)"
+            } else {
+                why = "no credentials for \(record.displayName) in the keychain"
+            }
+            guard currentWorldGone else {
+                // A plain switch: the world on screen is intact and the
+                // credentials backing it were never touched. Stay.
+                connError = why
+                return
+            }
+            // The removal path: the account on screen is already gone from the
+            // index, so there is no working world to stay in — the Connect
+            // gate is the honest answer, torn down exactly as the last-account
+            // branch tears it down. The ledger goes with the world, and the
+            // client must not keep presenting a token for a daemon this
+            // install no longer holds.
+            epoch &+= 1
+            SitrepPoller.shared.stop()
+            assistant.clear()
+            wipeAccountState()
+            wipeAccountCaches()
+            AuthDecisions.shared.reload()
+            await APIClient.shared.deconfigure()
+            settings = nil
+            connStatus = .disconnected
+            connError = why
+            return
+        }
+
+        // (3) From here, every answer still in flight belongs to the old
         //     account and every writer that captured the old epoch is inert.
         epoch &+= 1
 
-        // (3) Stop polling this daemon. The EventStreams are deliberately left
+        // (4) Stop polling this daemon. The EventStreams are deliberately left
         //     alone — every account holds one, live or not, so that mail
         //     arriving anywhere still raises a banner. Switching changes which
         //     mailbox is on screen, not which ones are worth hearing from.
         SitrepPoller.shared.stop()
 
-        // (4) Both composers' last save — and then WAIT for it. Reconfiguring
+        // (5) Both composers' last save — and then WAIT for it. Reconfiguring
         //     the client underneath an in-flight draft PUT would post what the
         //     human typed into account A into account B's drafts, under an id
         //     that means something else there.
@@ -744,29 +829,18 @@ final class AppStore {
         }
         await DraftSaver.shared.settle()
 
-        // (5) The ⌘K session: its transcript cites the old account's mail and
+        // (6) The ⌘K session: its transcript cites the old account's mail and
         //     its parked tool calls would act on it.
         assistant.clear()
 
-        // (6) + (7) The world itself, in one synchronous pass so no frame is
+        // (7) The world itself, in one synchronous pass so no frame is
         //     ever painted showing a mix of two mailboxes.
         wipeAccountState()
         wipeAccountCaches()
 
-        // (8) The new credentials. This is the only step that can fail.
-        guard let next = await AccountManager.shared.settings(for: record.id) else {
-            // The slots behind the record are gone or unreadable, and the old
-            // world is already torn down — there is nothing to switch into and
-            // nothing to go back to, so the Connect gate is the honest answer.
-            // The ledger goes with the world: whoever connects next must not
-            // inherit the torn-down account's verdicts.
-            AuthDecisions.shared.reload()
-            settings = nil
-            connStatus = .disconnected
-            connError = "account settings load failed"
-            return
-        }
+        // (8) The new credentials go live.
         settings = next
+        connError = nil
         await APIClient.shared.configure(baseURL: next.serverURL, token: next.apiToken)
         AccountManager.shared.markActive(record.id)
         // AFTER `markActive`, deliberately: the ledger's UserDefaults key is
