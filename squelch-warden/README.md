@@ -190,7 +190,15 @@ link-local. On a default k3s that subtraction removes the pod CIDR, the service
 CIDR, the in-cluster API server, the warden, and every cloud metadata endpoint
 in one stroke.
 
-One optional second ingress rule: `SQUELCH_WARDEN_NODE_CIDR`, which allows that
+A second ingress rule carries the metrics allowance: the `monitoring`
+namespace's `app.kubernetes.io/name=prometheus-agent` pod may reach 9464, where
+the daemon serves Prometheus text (`SQUELCH_METRICS_BIND`, set on every tenant).
+That listener is unauthenticated, so this rule is the whole control: one
+namespace and one pod label on the same peer, one port, and not 8848. The port
+is on the pod and on nothing that publishes it, so no `HUMAN_DOOR_PREFIXES`
+mistake can route to it.
+
+One optional third ingress rule: `SQUELCH_WARDEN_NODE_CIDR`, which allows that
 CIDR to 8848. A kubelet readiness probe originates at the NODE's address and
 matches no pod and no namespace, so a CNI that does not exempt host-originated
 traffic drops every probe and every provision times out on a healthy pod. It is
@@ -276,11 +284,12 @@ cluster, no kubeconfig, and no network. It asserts the exact ordered list of
 typed objects a two-phase provision applies, the full pod securityContext, that
 no container and no volume is unbounded, the OAuth client arriving by
 `secretKeyRef`, the NetworkPolicy peers and CIDR exceptions (with and without a
-node CIDR), the `/mcp` arrangement on the Ingress, the pending-label
-idempotency, the 409 both ways round including a lost create race, that a new
-ciphertext rolls the pod and a stopped tenant can be re-credentialed, that the
-sweep collects abandoned pending tenants and nothing else, every 4xx path, that
-DELETE keeps the volume and both Secrets, a 401 for every way of getting the
-bearer wrong, that a cluster error never reaches a log line verbatim, the
-boot-refusal table for every environment variable, and the pairing parser
-against a captured copy of the daemon's real output.
+node CIDR), that the metrics port is admitted to one pod and published by
+neither the Service nor the Ingress, the `/mcp` arrangement on the Ingress, the
+pending-label idempotency, the 409 both ways round including a lost create race,
+that a new ciphertext rolls the pod and a stopped tenant can be
+re-credentialed, that the sweep collects abandoned pending tenants and nothing
+else, every 4xx path, that DELETE keeps the volume and both Secrets, a 401 for
+every way of getting the bearer wrong, that a cluster error never reaches a log
+line verbatim, the boot-refusal table for every environment variable, and the
+pairing parser against a captured copy of the daemon's real output.

@@ -56,6 +56,18 @@ use crate::validate::TenantName;
 /// and no collision, and every tenant uses the same number.
 pub const DAEMON_PORT: i32 = 8848;
 
+/// The port the daemon serves Prometheus text metrics on, when
+/// `SQUELCH_METRICS_BIND` is set. A listener with no authentication of any
+/// kind, which is why it is a second port and not a route on the first.
+///
+/// **It is deliberately absent from the Service and from the Ingress**, and
+/// that absence is the isolation argument: an Ingress can only send traffic to
+/// a port its backing Service declares, so no allowlist mistake in
+/// [`HUMAN_DOOR_PREFIXES`] can publish this port through a tenant vhost. The
+/// only thing that reaches it is the one [`network_policy`] ingress rule that
+/// names the monitoring namespace's prometheus-agent pod.
+pub const METRICS_PORT: i32 = 9464;
+
 /// The tenant's own volume: SQLite index, the writable credentials file, and
 /// the embedding-weights cache under `HOME`.
 pub const DATA_DIR: &str = "/data";
@@ -459,8 +471,9 @@ pub fn ingress(config: &Config, name: &TenantName) -> Ingress {
 /// The tenant's NetworkPolicy: the isolation claim, written down.
 ///
 /// Ingress: nothing may open a connection to a tenant pod except the ingress
-/// controller, on the daemon port. Not other tenants, not the warden, not
-/// anything else in the cluster.
+/// controller, on the daemon port, and the monitoring namespace's
+/// prometheus-agent, on the metrics port. Not other tenants, not the warden,
+/// not anything else in the cluster.
 ///
 /// Egress: DNS, and TCP 443 to the public internet minus
 /// [`BLOCKED_EGRESS_CIDRS`]. That is Gmail and Anthropic and the model
@@ -468,7 +481,17 @@ pub fn ingress(config: &Config, name: &TenantName) -> Ingress {
 /// tenant's pod. Note what selecting both `policyTypes` does: an empty rule
 /// list would be deny-all, and these two lists are the entire allowance.
 ///
-/// One optional second ingress rule: the NODE, when
+/// The second ingress rule is the metrics allowance, and it is worth stating
+/// precisely because this is the isolation claim: one pod
+/// ([`MONITORING_POD_LABEL`]) in one namespace ([`MONITORING_NAMESPACE`]) may
+/// open a connection to [`METRICS_PORT`] and to nothing else. It cannot reach
+/// 8848, which stays sealed to the ingress controller, so the agent can read a
+/// tenant's counters and cannot touch a tenant's mail; and no other tenant gains
+/// anything, because a peer is a namespace AND a pod selector, not either. The
+/// metrics port is absent from the Service and the Ingress, so this rule is the
+/// only path to it that exists.
+///
+/// One optional third ingress rule: the NODE, when
 /// [`crate::config::Config::node_cidr`] is set. A kubelet readiness probe is a
 /// connection from the node's own address, which matches no pod and no
 /// namespace, so a CNI that does not exempt host-originated traffic drops every
@@ -500,6 +523,30 @@ pub fn network_policy(config: &Config, name: &TenantName) -> NetworkPolicy {
         }]),
         ports: Some(daemon_port.clone()),
     }];
+    ingress.push(NetworkPolicyIngressRule {
+        from: Some(vec![NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    NAMESPACE_NAME_LABEL.to_string(),
+                    MONITORING_NAMESPACE.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    MONITORING_POD_LABEL.0.to_string(),
+                    MONITORING_POD_LABEL.1.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        ports: Some(vec![NetworkPolicyPort {
+            port: Some(IntOrString::Int(METRICS_PORT)),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        }]),
+    });
     if let Some(node_cidr) = &config.node_cidr {
         ingress.push(NetworkPolicyIngressRule {
             from: Some(vec![NetworkPolicyPeer {
@@ -736,12 +783,24 @@ pub fn deployment(config: &Config, name: &TenantName, credential_hash: &str) -> 
         // The image's ENTRYPOINT is root-then-setpriv; see the doc comment.
         command: Some(vec!["/usr/local/bin/squelchd".to_string()]),
         args: Some(vec!["serve".to_string()]),
-        ports: Some(vec![ContainerPort {
-            name: Some("http".to_string()),
-            container_port: DAEMON_PORT,
-            protocol: Some("TCP".to_string()),
-            ..Default::default()
-        }]),
+        ports: Some(vec![
+            ContainerPort {
+                name: Some("http".to_string()),
+                container_port: DAEMON_PORT,
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            },
+            // Declared so prometheus-agent's pod discovery can keep on a port
+            // NAME rather than a number. Naming a port here publishes nothing:
+            // the Service does not carry it, so it is reachable only through
+            // the NetworkPolicy rule. See [`METRICS_PORT`].
+            ContainerPort {
+                name: Some("metrics".to_string()),
+                container_port: METRICS_PORT,
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            },
+        ]),
         env: Some(daemon_env(config, name)),
         volume_mounts: Some(vec![
             data_mount,
@@ -849,6 +908,10 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         // Inside the pod's own network namespace. Not reachable from anywhere
         // the NetworkPolicy does not allow.
         plain("SQUELCH_BIND", "0.0.0.0:8848"),
+        // Turns on the metrics listener, which is off unless this is set. A
+        // second port, unauthenticated, and reachable only from
+        // prometheus-agent: see [`METRICS_PORT`] and [`network_policy`].
+        plain("SQUELCH_METRICS_BIND", "0.0.0.0:9464"),
         plain("SQUELCH_DB_PATH", "/data/squelch.db"),
         plain("SQUELCH_CRED_BACKEND", "file"),
         plain("SQUELCH_CREDENTIALS_PATH", CREDENTIAL_PATH),
@@ -1052,6 +1115,9 @@ mod tests {
             .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
             .collect();
         assert_eq!(plain["SQUELCH_BIND"], "0.0.0.0:8848");
+        // Absent, the daemon serves no metrics at all; the collectors would
+        // scrape a closed port forever and the dashboard would stay empty.
+        assert_eq!(plain["SQUELCH_METRICS_BIND"], "0.0.0.0:9464");
         assert_eq!(plain["SQUELCH_CRED_BACKEND"], "file");
         assert_eq!(plain["SQUELCH_DB_PATH"], "/data/squelch.db");
         assert_eq!(plain["SQUELCH_CREDENTIALS_PATH"], "/data/credentials.json");
@@ -1426,7 +1492,7 @@ mod tests {
         );
 
         let ingress_rules = spec.ingress.unwrap();
-        assert_eq!(ingress_rules.len(), 1);
+        assert_eq!(ingress_rules.len(), 2);
         let from = ingress_rules[0].from.clone().unwrap();
         assert_eq!(from.len(), 1);
         assert_eq!(
@@ -1495,12 +1561,98 @@ mod tests {
         );
     }
 
+    /// The metrics allowance, asserted as narrowly as it is written: one
+    /// namespace AND one pod label, one port, and that port is not 8848.
+    #[test]
+    fn only_the_metrics_collector_reaches_the_metrics_port() {
+        let c = test_config();
+        let rule = network_policy(&c, &name()).spec.unwrap().ingress.unwrap()[1].clone();
+
+        let from = rule.from.clone().unwrap();
+        assert_eq!(from.len(), 1, "one peer, not a list of alternatives");
+        // Both selectors on the SAME peer: a namespace selector alone would let
+        // in anything that ever lands in `monitoring`.
+        assert_eq!(
+            from[0]
+                .namespace_selector
+                .clone()
+                .unwrap()
+                .match_labels
+                .unwrap()["kubernetes.io/metadata.name"],
+            "monitoring"
+        );
+        assert_eq!(
+            from[0].pod_selector.clone().unwrap().match_labels.unwrap()["app.kubernetes.io/name"],
+            "prometheus-agent"
+        );
+        assert!(from[0].ip_block.is_none());
+
+        let ports = rule.ports.unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, Some(IntOrString::Int(9464)));
+        assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+        // The load-bearing half: the human door stays sealed to Traefik, so a
+        // collector that went rogue reads counters and not mail.
+        assert_ne!(ports[0].port, Some(IntOrString::Int(DAEMON_PORT)));
+    }
+
+    /// The other half of the metrics isolation claim: the port exists on the
+    /// pod and on nothing that publishes it. An Ingress can only reach a port
+    /// its Service declares, so a Service without it cannot be routed to by any
+    /// mistake in [`HUMAN_DOOR_PREFIXES`].
+    #[test]
+    fn the_metrics_port_is_on_the_pod_and_on_nothing_public() {
+        let c = test_config();
+        let n = name();
+
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let ports = pod.containers[0].ports.clone().unwrap();
+        let named: Vec<(&str, i32)> = ports
+            .iter()
+            .map(|p| (p.name.as_deref().unwrap(), p.container_port))
+            .collect();
+        assert_eq!(named, vec![("http", 8848), ("metrics", 9464)]);
+
+        // Not on the Service...
+        let service_ports = service(&c, &n).spec.unwrap().ports.unwrap();
+        assert_eq!(service_ports.len(), 1);
+        assert_eq!(service_ports[0].port, DAEMON_PORT);
+        assert!(
+            service_ports
+                .iter()
+                .all(|p| p.name.as_deref() != Some("metrics")),
+            "the metrics port on the Service would make it routable"
+        );
+
+        // ...so nothing the Ingress declares can arrive at it, and no path
+        // spelling reaches /metrics either.
+        let rules = ingress(&c, &n).spec.unwrap().rules.unwrap();
+        let paths = rules[0].http.clone().unwrap().paths;
+        for path in &paths {
+            assert_eq!(
+                path.backend.service.as_ref().unwrap().port,
+                Some(ServiceBackendPort {
+                    name: Some("http".to_string()),
+                    ..Default::default()
+                })
+            );
+        }
+        let declared: Vec<&str> = paths.iter().map(|p| p.path.as_deref().unwrap()).collect();
+        for spelling in ["/metrics", "/metrics/"] {
+            assert!(
+                !declared.iter().any(|p| spelling.starts_with(*p)),
+                "{spelling} would be routed to the daemon"
+            );
+        }
+    }
+
     /// The kubelet probe hole: absent unless the operator states the node
     /// network, and when present it is one CIDR to one port and nothing else.
     #[test]
     fn the_node_may_probe_only_when_the_operator_says_so() {
         let mut c = test_config();
         assert!(c.node_cidr.is_none());
+        // Traefik and the metrics collector; the node is not in the list yet.
         assert_eq!(
             network_policy(&c, &name())
                 .spec
@@ -1508,13 +1660,13 @@ mod tests {
                 .ingress
                 .unwrap()
                 .len(),
-            1
+            2
         );
 
         c.node_cidr = Some("10.0.0.5/32".to_string());
         let ingress = network_policy(&c, &name()).spec.unwrap().ingress.unwrap();
-        assert_eq!(ingress.len(), 2);
-        let from = ingress[1].from.clone().unwrap();
+        assert_eq!(ingress.len(), 3);
+        let from = ingress[2].from.clone().unwrap();
         assert_eq!(from.len(), 1);
         let block = from[0].ip_block.clone().unwrap();
         assert_eq!(block.cidr, "10.0.0.5/32");
@@ -1523,7 +1675,7 @@ mod tests {
         // node-originated traffic, not "anything on that address".
         assert!(from[0].pod_selector.is_none());
         assert!(from[0].namespace_selector.is_none());
-        let ports = ingress[1].ports.clone().unwrap();
+        let ports = ingress[2].ports.clone().unwrap();
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, Some(IntOrString::Int(8848)));
         assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));

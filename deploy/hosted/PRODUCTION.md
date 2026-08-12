@@ -172,8 +172,19 @@ The rule: nothing that judges carrier's health lives on carrier. Full design:
   same value as `PROM_REMOTE_WRITE_PASSWORD` + its bcrypt `PROM_WEB_BCRYPT`
   on the prometheus service; same value again as `PROM_PASSWORD` plus
   `GF_SECURITY_ADMIN_PASSWORD` on the grafana service.
-- The daemon itself is still a black box to all of this — squelchd `/metrics`
-  is issue #27.
+- **Inside the daemon**: every tenant pod runs with
+  `SQUELCH_METRICS_BIND=0.0.0.0:9464` and serves `squelchd_*` Prometheus text on
+  container port `metrics` (sync timestamps, Gmail API errors by kind, LLM
+  spend, store size, triage verdicts). `prometheus-agent` keeps on
+  `app.kubernetes.io/name=squelchd` in `tenants` plus the port name, and
+  relabels `app.kubernetes.io/instance` to `tenant`.
+- That listener is unauthenticated, so its reachability is the whole control:
+  the per-tenant NetworkPolicy admits only the `monitoring` namespace's
+  `app.kubernetes.io/name=prometheus-agent` pod, only to 9464. The port is on
+  the pod and on nothing that publishes it (absent from the tenant Service and
+  from its Ingress), and 8848 stays sealed to Traefik. Alert on
+  `time() - squelchd_sync_last_success_timestamp_seconds > 900`: it is the only
+  signal that separates a healthy pod from one that stopped syncing days ago.
 
 ## Invites
 

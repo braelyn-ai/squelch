@@ -89,6 +89,8 @@ revoking every device.
 
 Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUELCH_BIND` (default `127.0.0.1:8848`), `SQUELCH_POLL_SECS` (default 45), `SQUELCH_MCP_ALLOWED_HOSTS` if you front the server with a proxy like `tailscale serve`, `SQUELCH_CRED_BACKEND` (`keyring` on macOS, `file` on Linux) and `SQUELCH_CREDENTIALS_PATH` (default `~/.config/squelch/credentials.json`) for the file backend.
 
+`SQUELCH_METRICS_BIND` (unset by default, e.g. `127.0.0.1:9464`) opens a second listener serving Prometheus text metrics at `/metrics`: sync timestamps, Gmail error counts, LLM spend, store sizes. **That listener is plaintext and unauthenticated**, by design, because a scrape credential in a Prometheus config is its own problem. Bind it to loopback or to a private interface and let your collector reach it there; never bind it to a public one. Leave it unset and the daemon opens no such port at all.
+
 To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be changed at runtime (no restart) from Passband's Settings.
 
 ### 3. Authorize and run
