@@ -1,12 +1,13 @@
 # The warden itself: one Deployment, one Service, one Ingress.
 #
-# EDIT BEFORE APPLYING. Four values are placeholders and every one of them will
+# EDIT BEFORE APPLYING. Five values are placeholders and every one of them will
 # break the deploy if it is left alone:
 #
 #   1. `image:` on the Deployment          -> your squelch-warden image
 #   2. SQUELCH_WARDEN_BASE_DOMAIN          -> your domain
 #   3. SQUELCH_WARDEN_IMAGE                -> the squelchd image TENANTS run
 #   4. `host:` on the Ingress              -> warden.<your domain>
+#   5. SQUELCH_WARDEN_CONSOLE_SSO_URL      -> your control plane's origin
 #
 # The bearer token is NOT here. It comes from the `squelch-warden` Secret in
 # this namespace; see `warden-token.example.yaml`.
@@ -85,6 +86,25 @@ spec:
             # exits at boot; see google-oauth-client.example.yaml.
             - name: SQUELCH_WARDEN_OAUTH_SECRET_NAME
               value: google-oauth-client
+            # The Secret holding the Anthropic key tenant daemons run Stage-2
+            # triage with, in the tenant namespace. Unlike the OAuth one this
+            # reference is OPTIONAL: no Secret means every tenant still starts
+            # and runs heuristic-only triage. Create it with
+            #   kubectl -n tenants create secret generic anthropic-api-key \
+            #     --from-literal=ANTHROPIC_API_KEY=sk-ant-...
+            # This is the shared-key bridge (issue #33); the relay replaces it.
+            - name: SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME
+              value: anthropic-api-key
+            # 5. EDIT ME. The control plane's origin, handed to every tenant
+            # daemon as SQUELCH_CONSOLE_SSO_URL. It is what puts "Continue with
+            # Google" on a tenant's own /console login page: Google forbids
+            # wildcard redirect URIs, so a per-tenant hostname cannot run OAuth
+            # itself and the control plane does the hop. An ORIGIN, no path:
+            # the daemon builds /console/auth?tenant=<label> itself. Leave it
+            # out and every console is the pasted-code form only (which is what
+            # a self-host gets, and what `squelchd pair` is for).
+            - name: SQUELCH_WARDEN_CONSOLE_SSO_URL
+              value: https://signup.passband.app
             # Per-tenant-container bounds. Restated here because the number of
             # tenants a box carries is these divided into it; size them with
             # 70-tenant-limits.yaml, not separately.

@@ -97,12 +97,121 @@ pub struct ApiState {
     /// is process-local and unbounded, but any `sqd_`-shaped guess from a caller
     /// with no credential reaches the store, so that branch queues here.
     pub(crate) device_auth_slots: Arc<tokio::sync::Semaphore>,
+    /// The control plane's origin, from `[console] sso_url` /
+    /// `SQUELCH_CONSOLE_SSO_URL`, behind the console's "Continue with Google"
+    /// link.
+    ///
+    /// THE FEATURE FLAG for console SSO, and the whole self-host/hosted split in
+    /// one field: hosted tenants are provisioned with it, a self-host never sets
+    /// it, and without it the login page simply does not render the button. It is
+    /// a LINK TARGET and nothing more: no trust flows from here, because whatever
+    /// comes back is a pairing code the store adjudicates on its own terms.
+    pub(crate) console_sso_url: Option<Arc<str>>,
+    /// THE ESCAPE HATCH, from `[console] allow_insecure_cookie` /
+    /// `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`: serve the console session cookie
+    /// without `Secure` on an origin that is not loopback.
+    ///
+    /// OFF BY DEFAULT AND MEANT TO STAY THERE. The cookie IS a device token, so
+    /// turning this on puts a live credential on the wire in the clear for
+    /// anything on the path to take. It exists for the self-host running the
+    /// console over plain http on a LAN, who would otherwise have a console that
+    /// simply does not work (a browser will not store a `Secure` cookie from
+    /// `http://`). When it is on, the login page says so where the user can see
+    /// it. See [`crate::console`].
+    pub(crate) console_allow_insecure_cookie: bool,
+    /// Per-client buckets over the two console routes that reach the store with
+    /// no credential in front of them. See
+    /// [`crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE`].
+    pub(crate) console_signin_limiter: Arc<std::sync::Mutex<ConsoleRateLimiter>>,
     /// The cheap-model handle behind rule-disposition inference: when a rule
     /// write omits `disposition`, the owner's `want` sentence is classified with
     /// this. `None` (no API key configured, and every test harness) means
     /// inference resolves to `filtered`, which is the safe default. HUMAN DOOR
     /// ONLY, like every other rule write.
     pub(crate) rule_infer: Option<Arc<RuleInferClient>>,
+}
+
+/// A fixed-rate token bucket per client address, for the console's
+/// unauthenticated sign-in paths.
+///
+/// A SIBLING of `squelch_control::ratelimit`'s, not a copy of convenience: the
+/// arithmetic and the pruning are the same because they were right there, and
+/// what differs is what it hangs off. In-memory, per-process abuse dampening
+/// rather than a quota system: a restart forgives everyone.
+///
+/// WHO A "CLIENT" IS depends on how the router was served. The peer address is
+/// read from axum's `ConnectInfo` when the listener attached one; when it did
+/// not, every request meters under one shared key. That is coarse, never a
+/// bypass: the worst case is one bucket for the whole process, and no caller can
+/// choose their own key (no forwarded header is read here, because one that is
+/// believed is a way to mint unlimited fresh identities).
+pub(crate) struct ConsoleRateLimiter {
+    buckets: std::collections::HashMap<std::net::IpAddr, (f64, std::time::Instant)>,
+    capacity: f64,
+    refill_per_sec: f64,
+    last_prune: Option<std::time::Instant>,
+}
+
+/// Buckets idle longer than this are dropped on the next prune. An idle bucket
+/// has refilled to capacity anyway, so forgetting it costs nothing.
+const BUCKET_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A prune is a full-map scan, so it runs on a clock rather than per request.
+const BUCKET_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hard ceiling on tracked buckets: a client rotating addresses faster than
+/// [`BUCKET_IDLE_TTL`] leaves nothing to reclaim, so the TTL alone does not
+/// bound the map. Forgetting a bucket only ever FORGIVES a client, so evicting
+/// is safe; an unbounded map would not be.
+const MAX_BUCKETS: usize = 16_384;
+
+impl ConsoleRateLimiter {
+    /// `per_minute` sustained requests, with a burst allowance of the same size.
+    pub(crate) fn per_minute(per_minute: f64) -> Self {
+        Self {
+            buckets: std::collections::HashMap::new(),
+            capacity: per_minute,
+            refill_per_sec: per_minute / 60.0,
+            last_prune: None,
+        }
+    }
+
+    /// Charge one request against `ip`. `false` means the bucket is empty.
+    pub(crate) fn check(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+        self.maintain(now);
+        let capacity = self.capacity;
+        let refill = self.refill_per_sec;
+        let bucket = self.buckets.entry(ip).or_insert((capacity, now));
+        // `saturating_duration_since` cannot panic on a non-monotonic clock; the
+        // worst case is no refill for this request.
+        let elapsed = now.saturating_duration_since(bucket.1).as_secs_f64();
+        bucket.0 = (bucket.0 + elapsed * refill).min(capacity);
+        bucket.1 = now;
+        if bucket.0 >= 1.0 {
+            bucket.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Everything expensive lives here so `check`'s common path stays one hash
+    /// lookup.
+    fn maintain(&mut self, now: std::time::Instant) {
+        let due = self
+            .last_prune
+            .is_none_or(|t| now.saturating_duration_since(t) >= BUCKET_PRUNE_EVERY);
+        if due {
+            self.buckets
+                .retain(|_, (_, last)| now.saturating_duration_since(*last) < BUCKET_IDLE_TTL);
+            self.last_prune = Some(now);
+        }
+        if self.buckets.len() >= MAX_BUCKETS {
+            // Nothing left to reclaim on the clock, so drop the lot rather than
+            // grow: every client is forgiven, which is the safe direction.
+            self.buckets.clear();
+        }
+    }
 }
 
 /// Capacity of the `GET /client/events` wake channel. THE PAYLOAD IS ONLY A HINT
@@ -188,6 +297,11 @@ impl ApiState {
             device_auth_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::auth::DEVICE_AUTH_CONCURRENCY,
             )),
+            console_sso_url: None,
+            console_allow_insecure_cookie: false,
+            console_signin_limiter: Arc::new(std::sync::Mutex::new(ConsoleRateLimiter::per_minute(
+                crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE,
+            ))),
             rule_infer: None,
         }
     }
@@ -255,6 +369,32 @@ impl ApiState {
     /// tracking is not configured and no send may mint a token.
     pub(crate) fn tracking_base_url(&self) -> Option<&str> {
         self.tracking_base_url.as_deref()
+    }
+
+    /// Set the control plane's origin behind the console's Google sign-in link,
+    /// from `SQUELCH_CONSOLE_SSO_URL`.
+    ///
+    /// Treated exactly like [`ApiState::with_tracking_base_url`]: blank is unset
+    /// (an exported-but-empty variable must not become configuration), a trailing
+    /// slash is trimmed, and a value with no http(s) scheme is unset, because it
+    /// would ride into the page as a RELATIVE href and resolve against the tenant
+    /// origin rather than the control plane.
+    pub fn with_console_sso_url(mut self, url: Option<String>) -> Self {
+        self.console_sso_url = url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .filter(|u| {
+                let lower = u.to_ascii_lowercase();
+                lower.starts_with("https://") || lower.starts_with("http://")
+            })
+            .map(|u| Arc::from(u.as_str()));
+        self
+    }
+
+    /// The control plane's origin, if console SSO is configured. `None` => the
+    /// console renders the pasted-code form only, which is the self-host posture.
+    pub(crate) fn console_sso_url(&self) -> Option<&str> {
+        self.console_sso_url.as_deref()
     }
 
     /// Slots for concurrent tracking-pixel writes; see
@@ -419,7 +559,11 @@ impl ApiState {
             );
         }
         let account_id = store.ensure_account(account_email)?;
-        Ok(Self::new(store, account_id, token))
+        // Console SSO is env-only and hosted-only: the warden sets it when it
+        // provisions a tenant, and a self-host leaves it unset, which is what
+        // keeps the Google button off a page that has no control plane behind it.
+        Ok(Self::new(store, account_id, token)
+            .with_console_sso_url(std::env::var("SQUELCH_CONSOLE_SSO_URL").ok()))
     }
 
     /// THE one way a binary turns a loaded [`Config`] into serving state:

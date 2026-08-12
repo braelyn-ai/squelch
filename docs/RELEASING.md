@@ -69,9 +69,13 @@ Then:
 git tag v0.X.Y && git push origin v0.X.Y
 ```
 
-`.github/workflows/release.yml` builds all three images, multi-arch
-amd64+arm64, and pushes to GHCR. No secrets beyond `GITHUB_TOKEN`. squelchd
-cross-compiles; warden and control build under QEMU and are slower.
+`.github/workflows/release.yml` builds all three images and pushes to GHCR. No
+secrets beyond `GITHUB_TOKEN`. **squelchd is amd64 + arm64** (its Dockerfile
+cross-compiles, so one runner covers both); **warden and control are amd64
+only**, because they build natively and emulating their ONNX build risks the
+six-hour job ceiling in a token-holding job. The one box that runs them is
+amd64. There is no QEMU step in this workflow, and re-adding one is not how
+arm64 comes back — a native arm runner or a cross-compiling Dockerfile is.
 
 Verify (the failure mode is a half-published release):
 

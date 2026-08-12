@@ -21,6 +21,12 @@
 //!   must not spend the budget a real signup needs.
 //! - `POST /signup` is tight. It is the one route where a stranger can guess at
 //!   a secret (the invite code), and a real human posts it once.
+//! - `GET /console/auth` is TIGHTER STILL, and has its own bucket rather than
+//!   sharing signup's. It is the only route that opens a server-side session
+//!   with nothing presented at all: no invite, no cookie, no credential. A real
+//!   human hits it once per sign in, so the budget is small, and it is separate
+//!   so that a stranger walking the label space cannot spend the budget a paying
+//!   signup needs.
 //! - `GET /oauth/callback` is the most generous. Refusing it destroys a consent
 //!   the user has ALREADY granted at Google.
 
@@ -44,6 +50,13 @@ pub const PAGE_REQUESTS_PER_MINUTE: f64 = 300.0;
 /// The same, for `POST /signup`. A human posts this once and then leaves for
 /// Google; anything sustained above this is guessing at invite codes.
 pub const SIGNUP_REQUESTS_PER_MINUTE: f64 = 20.0;
+
+/// The same, for `GET /console/auth`, in its OWN bucket and tighter than
+/// signup's. Opening a console session costs nothing to ask for, so this is the
+/// cheapest thing on the service to loop; a person signing in to their own
+/// console does it once, and a browser that reloads the hop a few times still
+/// fits.
+pub const CONSOLE_AUTH_REQUESTS_PER_MINUTE: f64 = 10.0;
 
 /// The same, for `GET /oauth/callback`. The highest number here because it is
 /// the one route whose refusal costs a user something they cannot get back.
@@ -172,6 +185,16 @@ pub async fn limit_signup(
     next: Next,
 ) -> Result<Response, StatusCode> {
     gate(&state, ControlState::check_signup_rate, req, next).await
+}
+
+/// Middleware: the same for `GET /console/auth`, against its own bucket. NOT
+/// signup's: see [`CONSOLE_AUTH_REQUESTS_PER_MINUTE`].
+pub async fn limit_console_auth(
+    State(state): State<ControlState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, ControlState::check_console_auth_rate, req, next).await
 }
 
 /// Middleware: the same for `GET /oauth/callback`.

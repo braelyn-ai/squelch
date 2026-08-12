@@ -46,6 +46,19 @@ Decisions made and closed:
   want hosted at all. People who want local custody self-host.
 - **No web UI for hosted.** The web surface is signup only. The product is the native
   clients plus the MCP URL.
+  *Amended 2026-08-11:* the signup-only rule is about PRODUCT web apps and it stands,
+  so there is no webmail and no hosted dashboard. The tenant-local technical console
+  (issue #36) is served by each user's own daemon at `/console`, so it lands on both
+  tiers and is not one more web app we operate.
+  The self-host half is written up in
+  [docs/GETTING-STARTED.md](GETTING-STARTED.md), §6 "The console": the address,
+  signing in with a `squelchd pair` code, and why the "Continue with Google"
+  button is hosted-only. The button is the one thing that differs between the
+  tiers, because Google forbids a redirect URI per tenant subdomain, so the hop
+  goes through the control plane and appears only when `SQUELCH_CONSOLE_SSO_URL`
+  is set — which for hosted tenants the warden does, from
+  `SQUELCH_WARDEN_CONSOLE_SSO_URL` in `deploy/hosted/20-warden.yaml`, and which a
+  self-host never sets. Gates and cookie posture: `docs/SECURITY.md` §4.
 - **No end-to-end-encryption story for hosted.** Hosted means we hold it: encrypted at
   rest, per-tenant process isolation, honest about it. The half-crypto alternatives
   (bodies local / index hosted, etc.) complicate everything and convince nobody. The
@@ -206,10 +219,10 @@ a lost Secret is re-consent rather than an escrow.
 - Routing: `<user>.passband.email` subdomains via Traefik and one wildcard
   certificate (DNS-01). Subdomains over path-prefixes for clean per-tenant
   cookie/CORS isolation forever.
-- The tenant Ingress declares `/client` and `/t` and nothing else, so the agent
-  door answers 404 from the internet while the daemon still serves it inside its
-  own pod. An allowlist, because a deny rule fails open when it misses a
-  spelling.
+- The tenant Ingress declares `/client`, `/console` and `/t` and nothing else, so
+  the agent door answers 404 from the internet while the daemon still serves it
+  inside its own pod. An allowlist, because a deny rule fails open when it misses
+  a spelling.
 - Invite-code gate for launch. **No Stripe in the MVP**, billing is Phase 3.
 - Signup → native app handoff: finish signup, page shows a
   `passband://pair?url=…&code=…` deep link / QR. That is the shape `squelchd pair`
@@ -248,7 +261,7 @@ the per-daemon thing this design imagined — `deploy/hosted/SETUP.md` §11.)
   with it (`squelchd pair`).
 - `/mcp` gets real bearer auth once internet-facing (today: localhost trust +
   allowed-hosts). **STILL OPEN**, and the MVP ships around it rather than through
-  it: a tenant's Ingress declares `/client` and `/t` only, so the agent door is
+  it: a tenant's Ingress declares the human-door prefixes only, so the agent door is
   simply not published (see the runbook's "The agent door is not served"). That is
   a routing answer to an auth question, and it holds exactly as long as nobody
   wants MCP from the internet — which is the next thing somebody will want. Later,

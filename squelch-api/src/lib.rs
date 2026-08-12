@@ -6,6 +6,7 @@
 //! docs/SECURITY.md §4.
 
 mod auth;
+mod console;
 mod devices;
 mod error;
 mod events;
@@ -41,9 +42,18 @@ use axum::{
 ///
 /// Nothing else is ever added to either. Everything in [`client_router`] is
 /// behind the bearer.
+///
+/// `/console` ([`console::console_router`]) is the third tree, and the only one
+/// authenticated by a COOKIE rather than a header. It sits outside the bearer
+/// layer (signing in has to be possible without a credential) and outside the
+/// `/client` CORS layer (a browser attaches a cookie by itself, so the
+/// permissive CORS the JSON tree can afford would be a gift to any page on the
+/// web). What it authenticates with is not a new credential: a console session
+/// IS a device token, verified by the same store call.
 pub fn router(state: ApiState) -> Router {
     client_router(state.clone())
         .merge(pair::pair_router(state.clone()))
+        .merge(console::console_router(state.clone()))
         .merge(tracking::pixel_router(state))
 }
 

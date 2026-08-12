@@ -1,5 +1,42 @@
-//! The four routes: the signup form, the form post, Google's callback, and
-//! liveness.
+//! The routes: the signup form, the form post, the console login hop, Google's
+//! callback, and liveness.
+//!
+//! THE CONSOLE HOP is the second thing that walks through Google here, and it is
+//! deliberately the smaller half. Google forbids wildcard redirect URIs, so a
+//! tenant console at `https://<label>.<base>` cannot run OAuth itself; it links
+//! to `GET /console/auth?tenant=<label>` here, this service proves who is signed
+//! in, and the "ticket" handed back is an ordinary PAIRING CODE minted through
+//! the warden. The daemon claims it into a device token like any other device.
+//! No new crypto, no new trust relationship, and revocation, audit, one-shot and
+//! TTL are all the ones already shipped.
+//!
+//! THE REDIRECT IS CONSTRUCTED, NEVER ECHOED. There is no return-URL parameter
+//! on `/console/auth`, so there is no open redirect to find: the destination is
+//! this deployment's own base domain plus a label this crate validated. See
+//! [`crate::pages::console_callback_url`].
+//!
+//! THE CONSOLE HOP ANSWERS EVERY WELL-FORMED LABEL THE SAME WAY: a 302 to
+//! Google. It does NOT look the tenant up first, and that is a deliberate
+//! reversal of this file's other rule (check everything before Google). Looking
+//! it up meant a real address got a redirect and an unprovisioned one got a
+//! page, which is a directory of which hosted addresses exist, answerable by
+//! anybody, one label at a time. The only thing that shapes the answer now is
+//! whether the label could BE a label: a malformed one is a `400` and tells a
+//! stranger nothing they did not type themselves.
+//!
+//! WHAT PAYS FOR THAT is the callback: the mailbox check there refuses "the
+//! wrong Google account" and "no such tenant" with one page and one status, so
+//! walking the label space costs a full consent per guess and still learns
+//! nothing. A person who mistypes their own address spends one Google screen,
+//! which is the price of not running an address oracle.
+//!
+//! REFUSALS ON THE CONSOLE PATH ARE UNIFORM. A tenant that does not exist, a
+//! tenant that is not active, and a Google account that is not the one that owns
+//! the mailbox all produce one page, because anything that told them apart would
+//! answer "which addresses are real" and "who owns this one" to anybody who
+//! asked. They are also CONSOLE pages: a person who was signing in to a mailbox
+//! they already own is never handed the signup form (see
+//! [`crate::pages::console_problem`]).
 //!
 //! THE SHAPE OF THE FLOW, and why it is split where it is:
 //!
@@ -53,13 +90,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::config::OUTBOUND_TIMEOUT;
-use crate::cookie::{self, SignupClaim};
+use crate::cookie::{self, SessionClaim};
 use crate::invites;
 use crate::labels;
-use crate::oauth::{self, GoogleEndpoints};
+use crate::oauth::{self, Flow, GoogleEndpoints};
 use crate::pages;
 use crate::seal;
-use crate::sessions::{self, InsertError};
+use crate::sessions::{self, InsertError, SessionKind};
 use crate::state::ControlState;
 use crate::store::StoreError;
 use crate::warden::WardenError;
@@ -92,10 +129,30 @@ const INVITE_REFUSED: &str = "That invite code is not usable. Check it and try a
 /// cannot tell which of the two knows about an address.
 const LABEL_TAKEN: &str = "That address is already taken. Pick another one.";
 
-/// What every failure of the signup session says on the callback. Expired,
+/// What every failure of a pending session says on the callback. Expired,
 /// missing, tampered, and state-mismatched are one answer for the same reason.
 const SESSION_REFUSED: &str =
     "That signup could not be verified, or it took too long. Please start again.";
+
+/// THE ONE ANSWER the console login gives to every identity-shaped refusal: a
+/// label that is not a label, a tenant nobody has provisioned, a tenant that is
+/// not running, and a Google account that does not own the mailbox.
+///
+/// One sentence for all four because they are the same question asked four
+/// ways. Distinguishing them would hand a stranger a directory of which
+/// addresses exist and, worse, a check for whether a given Google account owns
+/// one. The copy is written to be actionable ANYWAY: whichever of the four it
+/// was, the fix is the same two things.
+const CONSOLE_REFUSED_HEADING: &str = "That sign in could not be completed";
+const CONSOLE_REFUSED: &str = "Check that you opened this from your own mailbox address, and sign \
+     in with the Google account that mailbox belongs to.";
+
+/// [`SESSION_REFUSED`] in the console flow's own words. Same four causes
+/// (expired, missing, tampered, state-mismatched) and the same single answer;
+/// what changes is that it says SIGN IN rather than sign up, and the page it
+/// renders on links back to the console rather than to the signup form.
+const CONSOLE_SESSION_REFUSED: &str =
+    "That sign in could not be verified, or it took too long. Open your console and sign in again.";
 
 pub async fn healthz() -> &'static str {
     "ok"
@@ -185,7 +242,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         }
     };
 
-    let consent = match oauth::consent_url(&endpoints(&state), csrf_state) {
+    let consent = match oauth::consent_url(&endpoints(&state), csrf_state, Flow::Signup) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "building the consent url failed");
@@ -218,10 +275,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     // count, because a std `Mutex` is not reentrant.
     let inserted = state.sessions().insert(
         sid.clone(),
+        SessionKind::Signup { invite_id },
         consent.state,
         consent.pkce_verifier,
         label.clone(),
-        invite_id,
         Instant::now(),
     );
     if let Err(InsertError::Full) = inserted {
@@ -235,10 +292,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         );
     }
 
-    let claim = SignupClaim {
+    let claim = SessionClaim {
         sid,
         label: label.clone(),
-        invite: invite_id,
+        invite: Some(invite_id),
         iat: chrono::Utc::now().timestamp(),
     };
     let cookie_value = cookie::sign(&config.cookie_key, &claim);
@@ -248,6 +305,98 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
 
     (
         StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, consent.url),
+            (
+                header::SET_COOKIE,
+                cookie::set_cookie(&cookie_value, !config.is_insecure()),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// `GET /console/auth?tenant=<label>` — the console login hop.
+///
+/// THE ONE THING CHECKED HERE IS SHAPE. This route deliberately does NOT ask
+/// whether the tenant exists, because the answer would be visible from outside:
+/// a real address would get a 302 and an unprovisioned one a page, and that
+/// difference is a directory of every hosted mailbox, one guess at a time. A
+/// well-formed label goes to Google whether or not anybody owns it, and the
+/// callback refuses "not your mailbox" and "no such mailbox" with one page.
+///
+/// The cost is a consent screen spent by somebody who mistyped their own
+/// address. The alternative was answering "does ada exist" to anybody who asked,
+/// so this is the trade taken.
+///
+/// NO RETURN URL, and no parameter that could become one. The only thing this
+/// route accepts is a label, and the only place it can send anybody is that
+/// label's own console under this deployment's own base domain.
+pub async fn console_auth(
+    State(state): State<ControlState>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let config = state.config();
+    let raw_label = param(query.as_deref(), "tenant").unwrap_or_default();
+    // Bounded before it is case-folded, exactly as the form field is: a
+    // megabyte of "tenant" is not run through Unicode.
+    let raw_label: String = raw_label.chars().take(MAX_FIELD).collect();
+
+    // SHAPE ONLY, and the validator's own messages are dropped: they are useful
+    // on the signup form, where the person is choosing the label, and here they
+    // would say which rule a guess broke. A label nobody has provisioned is NOT
+    // refused here at all; it goes to Google like any other and is refused on
+    // the way back, so this route cannot be asked which addresses exist.
+    let Ok(label) = labels::parse(&raw_label) else {
+        return console_refused();
+    };
+
+    let (sid, csrf_state) = match (random_token(), random_token()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            tracing::error!("the system random source failed");
+            return console_unavailable();
+        }
+    };
+
+    let consent = match oauth::consent_url(&endpoints(&state), csrf_state, Flow::Console) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "building the console consent url failed");
+            return console_unavailable();
+        }
+    };
+
+    let inserted = state.sessions().insert(
+        sid.clone(),
+        SessionKind::Console,
+        consent.state,
+        consent.pkce_verifier,
+        label.clone(),
+        Instant::now(),
+    );
+    if let Err(InsertError::Full) = inserted {
+        tracing::warn!(sessions = state.live_sessions(), "session table full");
+        return console_unavailable();
+    }
+
+    let claim = SessionClaim {
+        sid,
+        label: label.clone(),
+        // A console login spends nothing, and the callback holds this against
+        // the session's own kind: a cookie that claimed an invite here would be
+        // refused as a mismatch.
+        invite: None,
+        iat: chrono::Utc::now().timestamp(),
+    };
+    let cookie_value = cookie::sign(&config.cookie_key, &claim);
+
+    // PRIVACY: the label and a count. Never the session id, the state, or which
+    // mailbox owns the label.
+    tracing::info!(label = %label, sessions = state.live_sessions(), "console login started");
+
+    (
+        StatusCode::FOUND,
         [
             (header::LOCATION, consent.url),
             (
@@ -297,43 +446,70 @@ pub async fn oauth_callback(
     // and `state` mismatched all end here with one message. Nothing about which
     // it was reaches the page or the log.
     let Some(claim) = claim else {
+        // No cookie, so no way to know which flow this was. The signup wording
+        // is the fallback because a callback with no cookie at all is very
+        // nearly always a stale bookmark of the flow that has one.
         return done(refused_session());
     };
+    // WHICH FLOW THIS IS, for the refusals below. Taken from the cookie only
+    // while the cookie is all there is; once the session is in hand it is the
+    // authority, here as everywhere else.
+    let claimed_console = claim.invite.is_none();
     // Bound in its own statement so the session lock is released before
     // anything below can want it again.
     let session = state.sessions().take(&claim.sid, Instant::now());
     let Some(session) = session else {
         // Nothing to hand back: an expired session's hold expired with it, and a
         // replay is finding a session that already spent or released its code.
-        return done(refused_session());
+        let console_label = claimed_console.then(|| claim.label.clone());
+        return done(refused_session_for(&state, console_label.as_deref()));
     };
+    let console_label =
+        matches!(session.kind, SessionKind::Console).then(|| session.label.clone());
+    let console_label = console_label.as_deref();
 
-    // From here the session is gone but its invite is still held, so every exit
-    // hands the code back. The holder is recomputed from the session id the
-    // cookie carried, which `take` has just proved names a live session.
+    // From here the session is gone but a signup's invite is still held, so
+    // every exit hands the code back. The holder is recomputed from the session
+    // id the cookie carried, which `take` has just proved names a live session.
+    // A console login holds nothing, so `release` is a no-op on that branch and
+    // the exits below do not have to know which flow they are on.
     let holder = sessions::fingerprint(&claim.sid);
-    let invite_id = session.invite_id;
-    let release = || release_invite(&state, invite_id, &holder);
+    let held_invite = session.kind.invite_id();
+    let release = || {
+        if let Some(id) = held_invite {
+            release_invite(&state, id, &holder);
+        }
+    };
 
     if !squelch_httpauth::ct_eq(returned_state.as_bytes(), session.state.as_bytes()) {
         tracing::warn!("callback state mismatch");
         release();
-        return done(refused_session());
+        return done(refused_session_for(&state, console_label));
     }
-    // The cookie and the server-side session must agree. The session is the
-    // authority; this catches a cookie signed by this key for a DIFFERENT
-    // session, which is the one forgery a valid MAC cannot rule out on its own.
-    if claim.label != session.label || claim.invite != session.invite_id {
+    // The cookie and the server-side session must agree, on the label AND on
+    // which flow this is. The session is the authority; this catches a cookie
+    // signed by this key for a DIFFERENT session, which is the one forgery a
+    // valid MAC cannot rule out on its own.
+    if claim.label != session.label || claim.invite != held_invite {
         tracing::warn!("callback cookie does not match its session");
         release();
-        return done(refused_session());
+        return done(refused_session_for(&state, console_label));
     }
     let Some(code) = code.filter(|c| is_code(c)) else {
         release();
-        return done(refused_session());
+        return done(refused_session_for(&state, console_label));
     };
 
     let label = session.label;
+
+    // THE FORK. A console login shares everything above (state, cookie, one-shot
+    // session, code shape) and nothing below: it provisions nothing, seals
+    // nothing, and spends no invite. Destructured rather than tested, so the
+    // signup half below holds an invite id the type system produced instead of
+    // one it was told to assume.
+    let SessionKind::Signup { invite_id } = session.kind else {
+        return done(console_login(&state, &label, code, session.pkce_verifier).await);
+    };
 
     // ---- from here on, the irreversible half ----
 
@@ -508,6 +684,135 @@ pub async fn oauth_callback(
     ))
 }
 
+/// The console login's half of the callback: prove who is signed in, hold it
+/// against who owns the mailbox, and hand the browser a pairing code for that
+/// tenant's own console.
+///
+/// THE ORDER MATTERS. The mailbox is DISCOVERED from Google (never taken from
+/// anything the browser sent) and then compared, constant time, against what
+/// this control plane's store says owns the label. Only after that does anything
+/// reach the warden, so a stranger who guesses a real label cannot make a
+/// pairing code exist, let alone see one.
+///
+/// The tenant is looked up again HERE rather than carried in the session: a
+/// tenant torn down while somebody was at Google must not be signed in to on the
+/// strength of a ten-minute-old row.
+async fn console_login(
+    state: &ControlState,
+    label: &str,
+    code: String,
+    pkce_verifier: String,
+) -> Response {
+    // Identity only, and the function that does it hands back a mailbox rather
+    // than a token: there is no credential on this path for anything downstream
+    // to hold.
+    let account_email = match oauth::verify_identity(&endpoints(state), code, pkce_verifier).await {
+        Ok(email) => email,
+        Err(e) => {
+            // PRIVACY: the error type, which is written to carry no code, no
+            // token, and no provider body.
+            tracing::info!(error = %e, label = %label, "console login did not complete at Google");
+            return console_refused();
+        }
+    };
+
+    let owner = match state.store().active_tenant_email(label) {
+        Ok(Some(email)) => email,
+        // Provisioned and then torn down while the user was at Google, or a
+        // label that never existed and only reached here because nothing before
+        // this point could tell the difference either.
+        Ok(None) => return console_refused(),
+        Err(e) => {
+            tracing::error!(error = %e, "console tenant lookup failed");
+            return console_unavailable();
+        }
+    };
+
+    // BOTH SIDES normalized the way the store normalizes on insert, so a
+    // capitalized Google answer is the same mailbox rather than a stranger. The
+    // stored side is folded too even though every row is written folded: this is
+    // the comparison that decides whether somebody gets into a mailbox, and it
+    // must not turn on a column's history. `ct_eq` for the compare itself.
+    let presented = account_email.trim().to_lowercase();
+    let owner = owner.trim().to_lowercase();
+    if !squelch_httpauth::ct_eq(presented.as_bytes(), owner.as_bytes()) {
+        // PRIVACY: the label, never either address. That somebody signed in with
+        // the wrong Google account is not a reason to write a list of mailboxes
+        // into a log.
+        tracing::info!(label = %label, "console login refused: not the mailbox owner");
+        return console_refused();
+    }
+
+    // THE TICKET. An ordinary pairing code for an ordinary device, one-shot and
+    // ten minutes, which the tenant's own daemon will claim into a device token.
+    let pairing = match state.warden().pair(label).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, label = %label, "minting the console pairing code failed");
+            return console_unavailable();
+        }
+    };
+
+    // PRIVACY: never the code, which is live for ten minutes and is the whole
+    // credential.
+    tracing::info!(label = %label, "console login complete");
+
+    // CONSTRUCTED, not echoed: this deployment's base domain, the validated
+    // label, and the validated code, percent-encoded.
+    let destination = pages::console_callback_url(
+        &state.config().tenant_url(label),
+        &pairing.pair_code,
+    );
+    let Ok(location) = header::HeaderValue::from_str(&destination) else {
+        // Unreachable with a validated label and an encoded code; a refusal
+        // rather than a panic, because the alternative is a 500 on the one route
+        // whose failure locks somebody out of their own console.
+        tracing::error!(label = %label, "the console redirect would not fit in a header");
+        return console_unavailable();
+    };
+
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, location),
+            // The URL in that header carries a live pairing code. Nothing may
+            // cache it, and it must not ride out as a referer.
+            (
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store, no-cache"),
+            ),
+            (
+                header::REFERRER_POLICY,
+                header::HeaderValue::from_static("no-referrer"),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// The one page every identity-shaped console refusal gets. See
+/// [`CONSOLE_REFUSED`].
+fn console_refused() -> Response {
+    pages::console_problem(
+        StatusCode::BAD_REQUEST,
+        CONSOLE_REFUSED_HEADING,
+        CONSOLE_REFUSED,
+    )
+}
+
+/// What a console login gets when THIS service could not do its job: a store
+/// that would not answer, a warden that would not mint. Distinct from
+/// [`console_refused`] and not an oracle, because none of these depend on the
+/// label or the mailbox: they say "try again", which is true, where the refusal
+/// says "check who you are", which would not be.
+fn console_unavailable() -> Response {
+    pages::console_problem(
+        StatusCode::BAD_GATEWAY,
+        "Sign in is unavailable right now",
+        "Nothing changed. Please try again in a few minutes.",
+    )
+}
+
 /// The pairing window, in minutes, for the success page's copy. Derived from
 /// the DAEMON's constant rather than typed here, because the warden mints that
 /// code by running `squelchd pair` on the box: if the daemon's TTL ever moves,
@@ -546,6 +851,25 @@ fn refused_session() -> Response {
         "That signup could not be verified",
         SESSION_REFUSED,
     )
+}
+
+/// The unverifiable-session refusal, in the words of whichever flow it was.
+///
+/// `console_label` is `Some` only when this service knows the request was a
+/// console login, and it is that login's own label. A console refusal must not
+/// render signup copy or a link to the signup form: the person on the other end
+/// already has a mailbox and was trying to get into it, and "start again" on the
+/// signup page is an instruction to do the one thing they must not.
+fn refused_session_for(state: &ControlState, console_label: Option<&str>) -> Response {
+    match console_label {
+        Some(label) => pages::console_problem_with_link(
+            StatusCode::BAD_REQUEST,
+            CONSOLE_REFUSED_HEADING,
+            CONSOLE_SESSION_REFUSED,
+            &state.config().tenant_url(label),
+        ),
+        None => refused_session(),
+    }
 }
 
 fn internal_problem() -> Response {
@@ -615,6 +939,7 @@ fn endpoints(state: &ControlState) -> GoogleEndpoints<'_> {
         auth_url: &c.auth_url,
         token_url: &c.token_url,
         profile_url: &c.profile_url,
+        userinfo_url: &c.userinfo_url,
         timeout: OUTBOUND_TIMEOUT,
     }
 }
