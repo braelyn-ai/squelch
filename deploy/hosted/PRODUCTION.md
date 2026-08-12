@@ -1,6 +1,6 @@
 # Hosted Passband: what is actually deployed
 
-The record of THIS install, as of 2026-08-10. `SETUP.md` is the generic runbook
+The record of THIS install, as of 2026-08-12. `SETUP.md` is the generic runbook
 and explains why each piece exists; this file is the answers — which box, which
 domain at which provider, which secret in which namespace — so nobody has to
 reverse-engineer them at 3am.
@@ -78,8 +78,48 @@ Environment (names only — values are in Railway):
 `SQUELCH_CONTROL_PUBLIC_URL`, `SQUELCH_CONTROL_BASE_DOMAIN`,
 `SQUELCH_CONTROL_CLIENT_ID`, `SQUELCH_CONTROL_CLIENT_SECRET`,
 `SQUELCH_CONTROL_COOKIE_KEY`, `SQUELCH_CONTROL_WARDEN_URL`,
-`SQUELCH_CONTROL_WARDEN_TOKEN`, `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS=1`.
+`SQUELCH_CONTROL_WARDEN_TOKEN`, `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS=1`,
+plus the Bifrost trio — `SQUELCH_CONTROL_BIFROST_URL`,
+`SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN`, `SQUELCH_CONTROL_LLM_BUDGET_USD` —
+which is all-or-nothing: a partial trio is a refusal to boot.
 Full table: `squelch-control/README.md`.
+
+### The LLM gateway
+
+| | |
+|---|---|
+| Service | `bifrost` — [Bifrost](https://github.com/maximhq/bifrost) `v1.6.9`, via `Dockerfile.bifrost` |
+| Build | `railway.bifrost.toml`, set as the service's **Config-as-code file path** — the same landmine as `control` above: the variable alone ships the relay image |
+| Volume | mounted at `/app/data` — the governance state: virtual keys, per-tenant budgets, recorded spend |
+| Health check | none, deliberately: Bifrost's `GET /health` sits behind its session auth once auth is on, and Railway's probe cannot present credentials |
+
+Environment: `ANTHROPIC_API_KEY` — **the only place our real Anthropic key
+lives, anywhere** — plus `APP_HOST` and `APP_PORT`.
+
+Tenant daemons reach it over public 443, which their egress policy already
+allows; there is no cluster-side plumbing to the gateway at all. Each daemon
+presents its own **virtual key**, minted by the control plane at signup with a
+monthly dollar budget and installed through the warden as that tenant's
+`<label>-llm` Secret. Bifrost swaps in the real key, meters the spend on its
+volume, and refuses a tenant that has blown its budget.
+
+The cluster half of the feature is the `SQUELCH_WARDEN_LLM_*` block in
+`20-warden.yaml`: `SQUELCH_WARDEN_LLM_BASE_URL` (the feature gate — the warden
+refuses to boot if any of the rest are set without it),
+`SQUELCH_WARDEN_LLM_STAGE1_MODEL`, `SQUELCH_WARDEN_LLM_STAGE2_MODEL`,
+`SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP`, `SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP`.
+Install procedure: `SETUP.md` → "LLM triage through the gateway".
+
+> **The stopgap this supersedes.** Before the gateway, keyed tenants ran on a
+> shared `anthropic-api-key` Secret in ns `tenants` with the env hand-patched
+> onto their Deployments — the real key, inside tenant pods, exactly what this
+> design exists to avoid. Both halves get removed during the gateway rollout:
+> delete the Secret, then push each tenant's virtual key through the warden
+> (`squelch-control llm mint <label>`). The llm-key install re-applies the
+> whole Deployment from the warden's rendered spec (server-side apply), so any
+> hand-patched Deployment converges back to spec in the same stroke — no
+> manual un-patching, and a hand-patch that lingers is a rollout that skipped
+> that tenant.
 
 ## DNS
 
@@ -147,7 +187,12 @@ a chat window.
 Managed by the cluster, listed so an inventory sweep does not mistake them for
 strays: `passband-wildcard-tls` (ns `tenants`), `warden-tls` (ns `warden`),
 `letsencrypt-account-key` (ns `cert-manager`), and per tenant
-`<label>-identity` + `<label>-credential` (ns `tenants`).
+`<label>-identity` + `<label>-credential` + `<label>-llm` (ns `tenants`). The
+`-llm` one is the tenant's Bifrost virtual key (key `api-key`), written by the
+warden when the control plane mints it; it is absent for a tenant that signed
+up while the gateway was down (the pod boots without it and triages on rules —
+backfill is `squelch-control llm mint <label>`), and unlike the other two it is
+replaceable: revoke and re-mint, nothing is lost.
 
 The per-tenant identity Secrets are the only irreplaceable thing in this
 cluster. Losing one is a re-consent for that tenant; there is no escrow, by
