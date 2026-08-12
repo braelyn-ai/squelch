@@ -15,7 +15,9 @@
 // mid-lesson unmounts the sitrep whose measured rects the rings are drawn from,
 // and hands Escape to whatever surface you landed on. Escape is the way out.
 
-import AppKit
+#if os(macOS)
+    import AppKit
+#endif
 import SwiftUI
 
 /// The coordinate space every measured region and the overlay itself report
@@ -155,9 +157,24 @@ struct TourOverlay: View {
 
     // MARK: - welcome
 
+    /// The app's own icon, spelled per platform: AppKit hands it over directly;
+    /// UIKit only offers the asset-catalog lookup, whose miss falls back to a
+    /// symbol rather than crashing the welcome card.
+    private var appIcon: Image {
+        #if os(macOS)
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+        #else
+            if let icon = UIImage(named: "AppIcon") {
+                Image(platformImage: icon)
+            } else {
+                Image(systemName: "envelope.circle.fill")
+            }
+        #endif
+    }
+
     private var welcomeCard: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Image(nsImage: NSApplication.shared.applicationIconImage)
+            appIcon
                 .resizable()
                 .frame(width: 64, height: 64)
                 .shadow(color: .black.opacity(0.25), radius: 10, y: 5)
