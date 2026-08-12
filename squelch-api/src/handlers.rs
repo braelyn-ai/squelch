@@ -687,8 +687,9 @@ pub async fn get_shipments(
     State(state): State<ApiState>,
     Query(q): Query<ShipmentsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // The shipments table holds no sealed rows by construction: detection never
-    // runs on sealed mail, so there is no sealed filtering to apply.
+    // The shipments table holds no sealed rows: detection never runs on sealed
+    // mail, and hand-sealing a message deletes the shipment row it fed
+    // (correct_triage), so there is no sealed filtering to apply.
     query(&state, move |store, account_id| {
         store.list_shipments(account_id, q.include_delivered)
     })

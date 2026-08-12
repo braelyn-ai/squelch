@@ -589,19 +589,20 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
     assert_eq!(en_route[0].item_name, "Wireless Headphones");
 
     // Deliver it.
+    let delivered_at = t0 + chrono::Duration::minutes(2);
     store
-        .upsert_shipment(
-            acct,
-            mid,
-            &ship(ShipmentStatus::Delivered, ""),
-            t0 + chrono::Duration::minutes(2),
-        )
+        .upsert_shipment(acct, mid, &ship(ShipmentStatus::Delivered, ""), delivered_at)
         .unwrap();
-    // A LATE stale "shipped" email must NOT regress the delivered shipment.
+    // A LATE stale "shipped" email (from another thread) must NOT regress the
+    // delivered shipment — and must not become the row's click target or bump
+    // its clock either.
+    let stale_mid = store
+        .upsert_message(&triaged(acct, "g-stale", "t-stale").msg())
+        .unwrap();
     store
         .upsert_shipment(
             acct,
-            mid,
+            stale_mid,
             &ship(ShipmentStatus::Shipped, ""),
             t0 + chrono::Duration::minutes(3),
         )
@@ -613,4 +614,54 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
     let all = store.list_shipments(acct, true).unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].status, "delivered", "delivered never regresses");
+    // The rejected stale email moved neither the click target nor the clock.
+    assert_eq!(
+        all[0].thread_id.as_deref(),
+        Some("t1"),
+        "a rejected status must not steal the click target"
+    );
+    assert_eq!(
+        all[0].last_update, delivered_at,
+        "a rejected status must not bump last_update"
+    );
+}
+
+#[test]
+fn list_shipments_serves_thread_and_left_join_keeps_pointerless_rows() {
+    use crate::triage::{ShipmentInfo, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: "Headphones".into(),
+                status: ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    // The join serves the feeding message's thread so the card can open it.
+    let listed = store.list_shipments(acct, false).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].thread_id.as_deref(), Some("t1"));
+
+    // A row written by an older daemon has no message pointer. The join MUST
+    // stay a LEFT JOIN: the shipment still lists, just with no thread — an
+    // inner join would silently drop it and this assert is what notices.
+    store
+        .lock()
+        .unwrap()
+        .execute("UPDATE shipments SET last_message_id = NULL", [])
+        .unwrap();
+    let listed = store.list_shipments(acct, false).unwrap();
+    assert_eq!(listed.len(), 1, "pointerless rows must still list");
+    assert_eq!(listed[0].thread_id, None);
 }

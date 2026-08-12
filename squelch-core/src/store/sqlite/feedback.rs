@@ -175,6 +175,17 @@ impl SqliteStore {
                 "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
+            // Shipments are keyed by tracking number, not message, so the row
+            // outlives any one email — but its item name, status, and click
+            // target all came from the mail that fed it. When the row's latest
+            // feeder is the message being sealed, the whole row goes: nulling
+            // the pointer would keep sealed-derived content on a Sitrep card.
+            // Losing a card a legit earlier email also fed is the cost of the
+            // seal, same as the draft below.
+            tx.execute(
+                "DELETE FROM shipments WHERE account_id = ?1 AND last_message_id = ?2",
+                params![account_id, message_id],
+            )?;
             // And the LOCAL DRAFT replying to it, for the same reason: `put_draft`
             // refuses a sealed parent, so a draft keyed to one is a row the human
             // door would never have accepted, and it quotes mail the user has just

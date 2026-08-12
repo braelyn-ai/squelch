@@ -26,8 +26,10 @@ fn select_row_id(
 /// Upsert a shipment keyed by `(account_id, tracking_number)` in the caller's
 /// transaction. A repeat applies the no-regress status state machine
 /// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
-/// walked back — refreshes `last_update`/`last_message_id`, and adopts a more
-/// informative `item_name` or a carrier more specific than "unknown".
+/// walked back — and adopts a more informative `item_name` or a carrier more
+/// specific than "unknown". `last_update`/`last_message_id` advance only when
+/// the merge accepts the incoming status, so a stale duplicate never becomes
+/// the row's click target.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 pub(super) fn upsert_shipment_conn(
@@ -102,18 +104,27 @@ pub(super) fn upsert_shipment_conn(
                 (cur_carrier, None) // tracking_url handled below (keep existing)
             };
 
+            // The message pointer and clock advance only when the merge ACCEPTS
+            // the incoming status: a stale out-of-order email (a late "shipped"
+            // after delivered) must not become the row's click target or bump
+            // last_update. Its better item name / carrier is still welcome.
+            let accepted = merged == s.status;
+
             // When we kept the existing carrier, don't clobber a good tracking_url
             // with NULL — only update the url when we switched carrier.
             if carrier == s.carrier && s.carrier != "unknown" {
                 conn.execute(
                     "UPDATE shipments SET status=?1, item_name=?2, carrier=?3,
-                         tracking_url=?4, last_message_id=?5, last_update=?6
-                     WHERE id=?7",
+                         tracking_url=?4,
+                         last_message_id = CASE WHEN ?5 THEN ?6 ELSE last_message_id END,
+                         last_update     = CASE WHEN ?5 THEN ?7 ELSE last_update END
+                     WHERE id=?8",
                     params![
                         merged.as_str(),
                         item_name,
                         carrier,
                         s.tracking_url,
+                        accepted,
                         message_id,
                         ts,
                         id,
@@ -123,9 +134,10 @@ pub(super) fn upsert_shipment_conn(
                 let _ = tracking_url; // existing url retained
                 conn.execute(
                     "UPDATE shipments SET status=?1, item_name=?2,
-                         last_message_id=?3, last_update=?4
-                     WHERE id=?5",
-                    params![merged.as_str(), item_name, message_id, ts, id],
+                         last_message_id = CASE WHEN ?3 THEN ?4 ELSE last_message_id END,
+                         last_update     = CASE WHEN ?3 THEN ?5 ELSE last_update END
+                     WHERE id=?6",
+                    params![merged.as_str(), item_name, accepted, message_id, ts, id],
                 )?;
             }
             Ok(id)
@@ -370,26 +382,22 @@ impl SqliteStore {
         include_delivered: bool,
     ) -> Result<Vec<crate::types::Shipment>> {
         let conn = self.lock()?;
-        // No sealed filter needed: detection never runs on sealed mail, so the
-        // table holds no sealed rows by construction.
-        // LEFT JOIN: a pruned message leaves the shipment row standing, just
-        // with nowhere to jump to.
-        let sql = if include_delivered {
+        // No sealed rows: detection never runs on sealed mail, and sealing an
+        // already-extracted message deletes its shipment row (correct_triage).
+        // LEFT JOIN: a NULL last_message_id (row written by an older daemon)
+        // leaves the shipment standing, just with nowhere to jump to.
+        let mut sql = String::from(
             "SELECT s.id, s.account_id, s.tracking_number, s.carrier, s.item_name, s.status,
-                    s.tracking_url, s.first_seen, s.last_update, m.id, m.thread_id
+                    s.tracking_url, s.first_seen, s.last_update, m.thread_id
              FROM shipments s
-             LEFT JOIN messages m ON m.id = s.last_message_id
-             WHERE s.account_id=?1
-             ORDER BY s.last_update DESC"
-        } else {
-            "SELECT s.id, s.account_id, s.tracking_number, s.carrier, s.item_name, s.status,
-                    s.tracking_url, s.first_seen, s.last_update, m.id, m.thread_id
-             FROM shipments s
-             LEFT JOIN messages m ON m.id = s.last_message_id
-             WHERE s.account_id=?1 AND s.status != 'delivered'
-             ORDER BY s.last_update DESC"
-        };
-        let mut stmt = conn.prepare(sql)?;
+             LEFT JOIN messages m ON m.id = s.last_message_id AND m.account_id = s.account_id
+             WHERE s.account_id=?1",
+        );
+        if !include_delivered {
+            sql.push_str(" AND s.status != 'delivered'");
+        }
+        sql.push_str(" ORDER BY s.last_update DESC");
+        let mut stmt = conn.prepare(&sql)?;
         let out = stmt
             .query_map(params![account_id], |r| {
                 Ok(crate::types::Shipment {
@@ -402,8 +410,7 @@ impl SqliteStore {
                     tracking_url: r.get(6)?,
                     first_seen: dt(r, 7)?,
                     last_update: dt(r, 8)?,
-                    message_id: r.get(9)?,
-                    thread_id: r.get(10)?,
+                    thread_id: r.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
