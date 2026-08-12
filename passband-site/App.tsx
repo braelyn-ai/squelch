@@ -109,46 +109,6 @@ const styles = {
     textAlign: "center",
     padding: "0 1.5rem",
   },
-  card: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: "1rem",
-    padding: "1.25rem 1.5rem 1.5rem",
-    borderRadius: "1rem",
-    background: "rgba(255, 255, 255, 0.055)",
-    border: "1px solid rgba(255, 255, 255, 0.11)",
-  },
-  cardLabel: {
-    fontSize: "0.72rem",
-    fontWeight: 600,
-    letterSpacing: "0.12em",
-    textTransform: "uppercase",
-    color: "#8a8a90",
-  },
-  tile: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: "0.6rem",
-    padding: "1rem 1.25rem",
-    borderRadius: "0.75rem",
-    minWidth: "7.5rem",
-    color: "#d6d6d9",
-    textDecoration: "none",
-    fontSize: "0.9rem",
-    background: "rgba(255, 255, 255, 0.04)",
-    border: "1px solid rgba(255, 255, 255, 0.09)",
-  },
-  pill: {
-    padding: "0.28rem 0.8rem",
-    borderRadius: "999px",
-    border: "1px solid #3a3a3f",
-    color: "#b8b8bd",
-    fontSize: "0.75rem",
-    background: "transparent",
-    fontFamily: "inherit",
-  },
   button: {
     padding: "0.55rem 1.4rem",
     borderRadius: "0.6rem",
@@ -171,38 +131,6 @@ const styles = {
     textDecoration: "none",
   },
 } as const;
-
-const iconProps = {
-  width: 30,
-  height: 30,
-  viewBox: "0 0 24 24",
-  fill: "none",
-  stroke: "currentColor",
-  strokeWidth: 1.8,
-  strokeLinecap: "round",
-  strokeLinejoin: "round",
-} as const;
-
-const TerminalIcon = () => (
-  <svg {...iconProps} aria-hidden="true">
-    <polyline points="4 17 10 11 4 5" />
-    <line x1="12" y1="19" x2="20" y2="19" />
-  </svg>
-);
-
-const CloudIcon = () => (
-  <svg {...iconProps} aria-hidden="true">
-    <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" />
-  </svg>
-);
-
-const DownloadIcon = () => (
-  <svg {...iconProps} width={38} height={38} aria-hidden="true">
-    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-    <polyline points="7 10 12 15 17 10" />
-    <line x1="12" y1="15" x2="12" y2="3" />
-  </svg>
-);
 
 function FakeInbox() {
   // One randomized batch of rows, rendered twice so the scroll can wrap
@@ -292,55 +220,9 @@ export function App() {
         />
         <h1 style={styles.title}>Passband</h1>
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            justifyContent: "center",
-            alignItems: "stretch",
-            gap: "1rem",
-            marginTop: "0.75rem",
-            padding: "0 1.5rem",
-          }}
-        >
-          <section style={styles.card}>
-            <span style={styles.cardLabel}>the daemon</span>
-            <div style={{ display: "flex", gap: "0.75rem" }}>
-              <a style={styles.tile} href="/self-host">
-                <TerminalIcon />
-                self-host
-              </a>
-              <div style={styles.tile}>
-                <CloudIcon />
-                hosted
-                {/* Waitlist wiring comes later; this is a visual placeholder. */}
-                <button style={styles.pill} type="button">
-                  join waitlist
-                </button>
-              </div>
-            </div>
-          </section>
-          <section style={styles.card}>
-            <span style={styles.cardLabel}>the mac app</span>
-            <div
-              style={{
-                flex: 1,
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: "1rem",
-                color: "#d6d6d9",
-                padding: "0 1rem",
-              }}
-            >
-              <DownloadIcon />
-              <a style={styles.button} href="/download/latest">
-                download
-              </a>
-            </div>
-          </section>
-        </div>
+        <a style={{ ...styles.button, marginTop: "0.5rem" }} href="/download/latest">
+          download the client
+        </a>
       </div>
       <footer style={{ ...styles.corner, left: "1.5rem" }}>
         <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
