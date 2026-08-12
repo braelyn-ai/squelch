@@ -48,6 +48,11 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // backfilled: NULL is the safe reading (no tracking-pixel bypass), and a
     // re-sync refills it through the message upsert.
     add_column_if_missing(conn, "messages", "auth_pass", "INTEGER")?;
+    // Display recipients of sent mail. NULL on every pre-existing row, which is
+    // exactly the recipients-backfill queue predicate (`is_sent=1 AND to_addrs
+    // IS NULL`); the backfill runs from the sync engine, over the network, so it
+    // cannot live in this synchronous seam.
+    add_column_if_missing(conn, "messages", "to_addrs", "TEXT")?;
     // Per-property triage reasons (JSON object). NULL on pre-existing rows.
     add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
 

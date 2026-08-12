@@ -59,18 +59,24 @@ fn bump_unsub_violation_conn(
 /// the first defense; this clause is the backstop that holds regardless of
 /// ingest order or upstream filter quality. The reverse flip (1 -> 0) stays
 /// allowed: a message can only gain visibility, never lose it.
+///
+/// `to_addrs` is the one column that PREFERS THE STORED VALUE over a NULL
+/// (`COALESCE(excluded, messages)`): only a sent-path ingest parses recipients,
+/// so a re-fetch that skips them — or an old row the backfill already filled —
+/// must not be blanked by the next writer that has no opinion.
 fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
-             subject, received_at, snippet, body, body_html, is_sent,
+             subject, received_at, snippet, body, body_html, is_sent, to_addrs,
              list_unsubscribe, list_unsub_one_click, auth_pass)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
          ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
              thread_id=excluded.thread_id, from_addr=excluded.from_addr,
              from_name=excluded.from_name, subject=excluded.subject,
              received_at=excluded.received_at, snippet=excluded.snippet,
              body=excluded.body, body_html=excluded.body_html,
              is_sent=MIN(messages.is_sent, excluded.is_sent),
+             to_addrs=COALESCE(excluded.to_addrs, messages.to_addrs),
              list_unsubscribe=excluded.list_unsubscribe,
              list_unsub_one_click=excluded.list_unsub_one_click,
              auth_pass=excluded.auth_pass",
@@ -86,6 +92,7 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.body,
             msg.body_html,
             msg.is_sent as i64,
+            msg.to_addrs,
             msg.list_unsubscribe,
             msg.list_unsub_one_click as i64,
             msg.auth_pass.map(|p| p as i64),
@@ -786,5 +793,121 @@ impl SqliteStore {
             )
             .optional()?;
         row.ok_or(CoreError::NotFound)
+    }
+
+    pub(super) fn sent_listing(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SentMessage>> {
+        let conn = self.lock()?;
+        // HUMAN-DOOR-ONLY, and the ONE listing that reads `is_sent = 1` — every
+        // other one filters it out. That inversion is why the sealed guard here
+        // FAILS CLOSED: an INNER JOIN on `triage` plus `sensitivity != 'sealed'`,
+        // so a sent row whose triage row is missing (an interrupted ingest, a
+        // hand-written row) is excluded rather than COALESCEd to visible. Sent
+        // mail always gets its triage row in the same transaction as the message,
+        // so a missing one is a broken row, not an untriaged one.
+        //
+        // The NOT EXISTS is the THREAD-level belt on top of that per-row guard:
+        // seal detection is content-based per message, so the user's own reply
+        // in a thread sealed by a sibling (or sealed by hand) commits as
+        // 'normal' — yet `thread_view` 404s the whole thread. Listing that row
+        // would leak "Re: <sealed subject>" and dead-end the click, so a thread
+        // with ANY sealed sighting is excluded wholesale, matching the
+        // thread-level semantics of `thread_guard_and_subject`.
+        //
+        // A self-addressed message (a note to self) never lists here: its INBOX
+        // sighting pins `is_sent` to 0 in the upsert, by design — it surfaces
+        // as inbox mail instead.
+        //
+        // `opens` counts read receipts through `send_trackers`, which is what
+        // scopes the tracker to this account; `message_opens` carries no account
+        // of its own. NULL `to_addrs` (pre-backfill history, or a message whose
+        // headers named nobody) reads as "" on the wire.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.thread_id, COALESCE(m.to_addrs, ''), m.subject, m.snippet,
+                    m.received_at,
+                    (SELECT COUNT(*) FROM message_opens o
+                     JOIN send_trackers st ON st.token = o.token
+                     WHERE st.account_id = m.account_id AND st.message_id = m.id) AS opens
+             FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND m.is_sent = 1
+               AND t.sensitivity != 'sealed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM messages m2
+                   JOIN triage t2 ON t2.message_id = m2.id
+                   WHERE m2.account_id = m.account_id
+                     AND m2.thread_id = m.thread_id
+                     AND t2.sensitivity = 'sealed')
+             ORDER BY m.received_at DESC, m.id DESC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let out = stmt
+            .query_map(params![account_id, limit as i64, offset as i64], |r| {
+                Ok(SentMessage {
+                    id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    to: r.get(2)?,
+                    subject: r.get(3)?,
+                    snippet: r.get(4)?,
+                    // The stored string verbatim — this is the same RFC3339 the
+                    // rest of the door serves, and re-formatting it would only
+                    // invent a second spelling of one timestamp.
+                    sent_at: r.get(5)?,
+                    opens: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    pub(super) fn sent_missing_recipients(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+    ) -> Result<Vec<SentMissingRecipients>> {
+        let conn = self.lock()?;
+        // The recipients-backfill queue: sent rows ingested before `to_addrs`
+        // existed. Newest first, so an interrupted pass has already covered the
+        // mail the user is most likely to look at.
+        let mut stmt = conn.prepare(
+            "SELECT id, gmail_msg_id FROM messages
+             WHERE account_id = ?1 AND is_sent = 1 AND to_addrs IS NULL
+             ORDER BY received_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let out = stmt
+            .query_map(params![account_id, limit as i64], |r| {
+                Ok(SentMissingRecipients {
+                    message_id: r.get(0)?,
+                    gmail_msg_id: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    pub(super) fn set_message_to_addrs(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        to_addrs: &str,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        // `is_sent = 1` in the predicate, not just in the caller: recipients are
+        // a property of mail the user SENT, and a backfill that ever pointed at
+        // an inbound row must write nothing rather than invent a "to" for it.
+        // Writing "" is meaningful — it takes the row out of the backfill queue
+        // as "looked, and the headers named nobody".
+        let n = conn.execute(
+            "UPDATE messages SET to_addrs = ?3
+             WHERE account_id = ?1 AND id = ?2 AND is_sent = 1",
+            params![account_id, message_id, to_addrs],
+        )?;
+        Ok(n > 0)
     }
 }

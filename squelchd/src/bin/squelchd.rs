@@ -1700,10 +1700,14 @@ fn cmd_serve(
             })
         };
 
-        // One-time Sent-history sweep seeding recipient autocomplete (headers
-        // only, read credential). Staggered past the startup sync burst; a
-        // failure just retries on the next daemon start — the done flag is only
-        // set on completion.
+        // One-time Sent-history sweeps, both headers-only on the read credential:
+        // the contacts harvest seeding recipient autocomplete, then the
+        // recipients backfill filling `to_addrs` on sent mail that predates the
+        // column. Staggered past the startup sync burst and run one after the
+        // other so they never contend for the same Gmail quota. Either failing
+        // just retries on the next daemon start — each done flag is only set on
+        // completion — and neither can block the sync loop, which runs in its own
+        // task.
         {
             let store = store.clone();
             let email = email.clone();
@@ -1715,6 +1719,11 @@ fn cmd_serve(
                 if let Err(e) = engine.harvest_sent_contacts().await {
                     eprintln!(
                         "squelchd: sent-contacts harvest incomplete (retries next start): {e}"
+                    );
+                }
+                if let Err(e) = engine.backfill_sent_recipients().await {
+                    eprintln!(
+                        "squelchd: sent-recipients backfill incomplete (retries next start): {e}"
                     );
                 }
             });

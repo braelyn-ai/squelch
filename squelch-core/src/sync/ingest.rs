@@ -185,16 +185,60 @@ fn first_addr(addr: &Address) -> (String, Option<String>) {
     }
 }
 
-/// Collect every non-empty email address from an [`Address`] header (flat or
-/// grouped lists). Used to derive contacts from Sent mail's To/Cc recipients.
-fn collect_addrs(addr: &Address, out: &mut Vec<String>) {
+/// Collect every non-empty mailbox from an [`Address`] header (flat or grouped
+/// lists) as `(address, display name)`. Sent mail's To/Cc drives two different
+/// consumers off this one parse: the addresses become contacts, and the pairs
+/// become the stored display recipients.
+pub(crate) fn collect_mailboxes(addr: &Address, out: &mut Vec<(String, Option<String>)>) {
     for a in addr.iter() {
         if let Some(email) = a.address()
             && !email.is_empty()
         {
-            out.push(email.to_string());
+            let name = a
+                .name()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty());
+            out.push((email.to_string(), name));
         }
     }
+}
+
+/// Render To/Cc mailboxes as the stored display string: `Name <addr>` when the
+/// header carried a name, the bare address otherwise, comma-joined in header
+/// order and deduplicated case-insensitively by address. A name holding a `,`
+/// or `<` is quoted (`"Doe, John" <j@x.com>`) — the client splits this list on
+/// unquoted commas, so a lastname-first address-book name must not read as two
+/// recipients. Embedded `"` are dropped rather than escaped: the client's
+/// splitter is quote-aware but not backslash-aware.
+///
+/// Deliberately NOT filtered the way contact seeding is: the contacts gates
+/// (drop self, drop robot addresses) protect the "people I know" table, whereas
+/// this field answers "who did this go to" and has to answer it faithfully —
+/// including a note to self and including `support@`. `None` when nothing was
+/// addressed at all, which leaves the column NULL.
+pub(crate) fn format_recipients(mailboxes: &[(String, Option<String>)]) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for (addr, name) in mailboxes {
+        let addr = addr.trim();
+        let lc = addr.to_ascii_lowercase();
+        if addr.is_empty() || seen.contains(&lc) {
+            continue;
+        }
+        seen.push(lc);
+        parts.push(match name {
+            Some(n) => {
+                let n = n.replace('"', "");
+                if n.contains(',') || n.contains('<') {
+                    format!("\"{n}\" <{addr}>")
+                } else {
+                    format!("{n} <{addr}>")
+                }
+            }
+            None => addr.to_string(),
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Heuristic: does `addr` look like a machine/robot address rather than a person?
@@ -791,19 +835,23 @@ pub fn ingest(
 ) -> TriagedMessage {
     let parsed = MessageParser::default().parse(&fetched.raw);
 
-    // Recipient addresses (To + Cc) — only meaningful for Sent mail, where they
-    // become contacts. Collected here while the parse is in hand.
-    let mut recipients: Vec<String> = Vec::new();
+    // Recipients (To + Cc) — only meaningful for Sent mail, where they become
+    // BOTH the contacts seed and the stored display recipients. Collected here
+    // while the parse is in hand. Received mail collects nothing, so `to_addrs`
+    // stays NULL on it.
+    let mut mailboxes: Vec<(String, Option<String>)> = Vec::new();
     if fetched.is_sent
         && let Some(m) = &parsed
     {
         if let Some(to) = m.to() {
-            collect_addrs(to, &mut recipients);
+            collect_mailboxes(to, &mut mailboxes);
         }
         if let Some(cc) = m.cc() {
-            collect_addrs(cc, &mut recipients);
+            collect_mailboxes(cc, &mut mailboxes);
         }
     }
+    let to_addrs = format_recipients(&mailboxes);
+    let mut recipients: Vec<String> = mailboxes.into_iter().map(|(addr, _)| addr).collect();
 
     // Extract fields with graceful fallbacks for malformed mail.
     #[allow(clippy::type_complexity)]
@@ -956,6 +1004,7 @@ pub fn ingest(
         body: text.clone(),
         body_html,
         is_sent: fetched.is_sent,
+        to_addrs,
         list_unsubscribe,
         list_unsub_one_click,
         auth_pass,
@@ -994,7 +1043,8 @@ pub fn ingest(
     // The user's own outbox must never pollute the ranked inbox. We write a
     // neutral tier=noise/importance=0 row (belt: ranked_updates/search also
     // exclude is_sent=1) and skip the LLM path entirely. Recipients still seed
-    // the contacts table via `ingest_message`.
+    // the contacts table via `ingest_message`, and ride along on the row itself
+    // as `to_addrs` for the human door's sent listing.
     if fetched.is_sent {
         return TriagedMessage {
             message,
@@ -1390,6 +1440,54 @@ mod tests {
         // Sent mail is not triaged: neutral noise / importance 0.
         assert_eq!(t.tier, Tier::Noise);
         assert_eq!(t.importance, 0);
+    }
+
+    #[test]
+    fn sent_mail_stores_display_recipients_received_mail_stores_none() {
+        // The display string is To then Cc in header order, `Name <addr>` where a
+        // name exists and bare otherwise — and it is NOT filtered the way contact
+        // seeding is: `support@` is who this went to, whatever the contacts table
+        // thinks of it.
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Alice <alice@friends.com>, bob@friends.com\r\n\
+                   Cc: unsubscribe@unsub.spmta.com\r\n\
+                   Subject: dinner\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   see you friday\r\n";
+        let f = raw(1, "g-to", eml, /* is_sent */ true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(
+            t.message.to_addrs.as_deref(),
+            Some("Alice <alice@friends.com>, bob@friends.com, unsubscribe@unsub.spmta.com")
+        );
+        // The contacts seed keeps its own, narrower rules.
+        assert!(!t.recipients.iter().any(|r| r.contains("unsub")));
+
+        // Received mail has no "to" worth showing: the column stays NULL.
+        let f = raw(1, "g-recv", eml, /* is_sent */ false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.to_addrs, None);
+    }
+
+    #[test]
+    fn recipient_names_holding_commas_are_requoted_for_the_client_splitter() {
+        // The client splits the stored list on unquoted commas, so an
+        // address-book lastname-first name must come back out quoted exactly as
+        // the header carried it — unquoted, "Doe, John" would read as two
+        // recipients ("Doe" and "John <j@x.com>").
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: \"Doe, John\" <john@friends.com>, Plain Name <p@friends.com>\r\n\
+                   Subject: dinner\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   see you friday\r\n";
+        let f = raw(1, "g-quoted", eml, /* is_sent */ true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(
+            t.message.to_addrs.as_deref(),
+            Some("\"Doe, John\" <john@friends.com>, Plain Name <p@friends.com>")
+        );
     }
 
     #[test]
@@ -2317,8 +2415,13 @@ mod tests {
             updates.is_empty(),
             "sent mail never enters the attention bands"
         );
-        // Recipients still seed contacts.
+        // Recipients still seed contacts, and ride along on the row itself so the
+        // app-send echo shows up in the sent listing addressed to somebody.
         assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
+        let listed = store.sent_listing(acct, 10, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].to, "Alice <alice@friends.com>");
 
         // Re-ingesting the same Gmail id upserts onto the same local row.
         let again = ingest_sent(
@@ -2368,6 +2471,7 @@ mod tests {
                 body: "hello".to_string(),
                 body_html: None,
                 is_sent: false,
+                to_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
                 auth_pass: None,

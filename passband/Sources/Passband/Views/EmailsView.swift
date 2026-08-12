@@ -7,6 +7,11 @@
 // TWO PAGES, one list: the inbox and the noise bin (`n`, or the header's noise
 // count). Only the DATA SOURCE differs — every verb, the queue handed to the
 // reader and the cursor behave identically on noise rows.
+//
+// A THIRD PAGE, `sent`, shares the chrome and the cursor but not the verbs: it
+// holds outbound mail, which nothing triaged and no verb here can resolve. So
+// the rows are SentRows, j/k/Enter work exactly as they do everywhere else, and
+// r/e/d/v/f are inert rather than acting on a row they have no meaning for.
 
 import SwiftUI
 
@@ -20,8 +25,10 @@ struct EmailsView: View {
     @State private var hovering = false
 
     private var mode: MailMode { store.mailMode }
-    /// The cached page for whichever mode is showing.
+    /// The cached page for whichever INBOX-shaped mode is showing (sent has its
+    /// own wire type and its own cache — see `sentPage`).
     private var page: Loadable<[AttentionUpdate]> { store.mailPage(mode) }
+    private var sentPage: Loadable<[SentItem]> { store.sentPage }
 
     /// The cached page MINUS anything resolved since it was fetched: the page
     /// only reloads on the 10s `store.lastRefresh` poll, so without this filter
@@ -29,9 +36,24 @@ struct EmailsView: View {
     private var rows: [AttentionUpdate] {
         (page.value ?? []).filter { !store.resolvedIds.contains($0.id) }
     }
+    /// Sent rows are NOT filtered against `resolvedIds`: a resolve is an inbox
+    /// verdict, and it must never delete a record of something you sent.
+    private var sent: [SentItem] { sentPage.value ?? [] }
+
     private var selected: AttentionUpdate? { rows[safe: index] }
+    private var selectedSent: SentItem? { sent[safe: index] }
+    /// However many rows the page on screen has — the cursor's only bound.
+    private var rowCount: Int { mode == .sent ? sent.count : rows.count }
+    /// The row under the cursor as the two things every page can answer: the
+    /// message id (a `.task` key, and the scroll target) and the thread to warm.
+    private var cursorRow: (id: Int, threadId: String)? {
+        if mode == .sent { return selectedSent.map { ($0.id, $0.thread_id) } }
+        return selected.map { ($0.id, $0.thread_id) }
+    }
     /// Action keys are inert unless something is actually highlighted.
     private var actionable: Bool { kbActive || hovering }
+    /// The triage verbs on top of that: sent mail has no triage to act on.
+    private var triageable: Bool { actionable && mode != .sent }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -39,44 +61,16 @@ struct EmailsView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 1) {
-                        // Both notes are gated on having NO rows at all. A reload
-                        // keeps the last page on screen, so a revisit — or a
-                        // failure while offline — updates underneath what you are
-                        // already reading instead of replacing it with a word.
-                        if let error = page.error, page.value == nil {
-                            BandNote(error)
-                        } else if page.value == nil {
-                            BandNote(mode == .noise ? "loading noise…" : "loading mail…")
-                        } else if rows.isEmpty {
-                            // The window the daemon answers with is 30 days, so an
-                            // empty noise page says so rather than implying "ever".
-                            BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
-                        } else {
-                            ForEach(Array(rows.enumerated()), id: \.element.id) { i, u in
-                                UpdateRow(
-                                    update: u,
-                                    selected: kbActive && i == index,
-                                    onHover: {
-                                        // A hover must NOT follow-scroll: a row near
-                                        // the viewport edge would jump the list out
-                                        // from under the cursor.
-                                        hovering = true
-                                        kbActive = false
-                                        index = i
-                                    },
-                                    onOpen: { store.openThread(u.thread_id, queue: rows) }
-                                )
-                                .id(u.id)
-                            }
-                        }
+                        if mode == .sent { sentList } else { mailList }
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 10)
                 }
                 .onChange(of: index) { _, i in
-                    // Follow the KEYBOARD selection only.
-                    guard kbActive, let u = rows[safe: i] else { return }
-                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(u.id, anchor: .center) }
+                    // Follow the KEYBOARD selection only. Both pages key their
+                    // rows on the message id, so one scroll target serves both.
+                    guard kbActive, let id = rowId(at: i) else { return }
+                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(id, anchor: .center) }
                 }
             }
             .onContinuousHover { phase in
@@ -89,18 +83,22 @@ struct EmailsView: View {
         // there. The store's short TTL is what makes the mount half free when a
         // tick just landed; the tick half always outruns it and refreshes for real.
         .task(id: RefreshKey(tick: store.lastRefresh, mode: mode)) {
-            await store.refreshMail(mode)
+            if mode == .sent {
+                await store.refreshSent()
+            } else {
+                await store.refreshMail(mode)
+            }
         }
         // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
         // a 500-row list fires one request for the row you stop on rather than
         // one per row you pass. Covers everything past the bounded head-warm.
-        .task(id: selected?.id) {
-            guard let u = selected else { return }
+        .task(id: cursorRow?.id) {
+            guard let row = cursorRow else { return }
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled else { return }
-            ThreadPrefetch.shared.prefetch(u.thread_id)
+            ThreadPrefetch.shared.prefetch(row.threadId)
         }
-        .onChange(of: rows.count) { _, count in
+        .onChange(of: rowCount) { _, count in
             index = max(0, min(index, count - 1))
         }
         // A mode switch replaces every row, so the cursor cannot keep its index —
@@ -116,6 +114,72 @@ struct EmailsView: View {
             kbActive = true
             index = i
         }
+    }
+
+    // MARK: - the lists
+
+    /// The inbox / noise rows. Every note is gated on having NO rows at all: a
+    /// reload keeps the last page on screen, so a revisit — or a failure while
+    /// offline — updates underneath what you are already reading instead of
+    /// replacing it with a word.
+    @ViewBuilder private var mailList: some View {
+        if let error = page.error, page.value == nil {
+            BandNote(error)
+        } else if page.value == nil {
+            BandNote(mode == .noise ? "loading noise…" : "loading mail…")
+        } else if rows.isEmpty {
+            // The window the daemon answers with is 30 days, so an empty noise
+            // page says so rather than implying "ever".
+            BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
+        } else {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { i, u in
+                UpdateRow(
+                    update: u,
+                    selected: kbActive && i == index,
+                    onHover: {
+                        // A hover must NOT follow-scroll: a row near the
+                        // viewport edge would jump the list out from under
+                        // the cursor.
+                        hovering = true
+                        kbActive = false
+                        index = i
+                    },
+                    onOpen: { store.openThread(u.thread_id, queue: rows) }
+                )
+                .id(u.id)
+            }
+        }
+    }
+
+    /// The sent rows, same three gated notes. The reader opens with NO queue:
+    /// "done + next" walks a triage list, and there is nothing to finish here.
+    @ViewBuilder private var sentList: some View {
+        if let error = sentPage.error, sentPage.value == nil {
+            BandNote(error)
+        } else if sentPage.value == nil {
+            BandNote("loading sent…")
+        } else if sent.isEmpty {
+            BandNote("Nothing sent yet.")
+        } else {
+            ForEach(Array(sent.enumerated()), id: \.element.id) { i, item in
+                SentRow(
+                    item: item,
+                    selected: kbActive && i == index,
+                    onHover: {
+                        hovering = true
+                        kbActive = false
+                        index = i
+                    },
+                    onOpen: { store.openThread(item.thread_id) }
+                )
+                .id(item.id)
+            }
+        }
+    }
+
+    /// The scroll target for a row position on whichever page is showing.
+    private func rowId(at i: Int) -> Int? {
+        mode == .sent ? sent[safe: i]?.id : rows[safe: i]?.id
     }
 
     // MARK: - header
@@ -201,26 +265,34 @@ struct EmailsView: View {
             KeyBinding("ArrowDown", "next") { moveByKey(+1) },
             KeyBinding("ArrowUp", "prev") { moveByKey(-1) },
             // A LADDER, the same shape as the reader closing over a still-open
-            // side panel: from the noise page Escape steps back to the inbox, and
-            // only a second press leaves the tab.
+            // side panel: from any page that is not the inbox Escape steps back
+            // to it, and only a second press leaves the tab.
             KeyBinding("Escape", "back") {
-                if mode == .noise {
+                if mode != .inbox {
                     store.mailMode = .inbox
                 } else {
                     store.setView(.sitrep)
                 }
             },
             // One key both ways — noise is a page you dip into, not a mode you
-            // have to remember you are in.
+            // have to remember you are in. It stays the inbox/noise flip from
+            // the sent page too; `sent` is reached by the segments.
             KeyBinding("n", "noise / back") { store.mailMode = mode.flipped },
             KeyBinding("Enter", "drill in") {
-                guard actionable, let u = selected else { return }
-                // The ordered rows become the viewer's queue, so "done + next"
-                // (e/d) can advance in place.
-                store.openThread(u.thread_id, queue: rows)
+                guard actionable else { return }
+                if mode == .sent {
+                    guard let item = selectedSent else { return }
+                    // No queue: "done + next" walks a triage list, and sent mail
+                    // has nothing to finish.
+                    store.openThread(item.thread_id)
+                } else if let u = selected {
+                    // The ordered rows become the viewer's queue, so "done + next"
+                    // (e/d) can advance in place.
+                    store.openThread(u.thread_id, queue: rows)
+                }
             },
             KeyBinding("v", "fix triage") {
-                guard actionable, let u = selected else { return }
+                guard triageable, let u = selected else { return }
                 store.openTriageFix(
                     TriageFixTarget(
                         messageId: u.id, sender: u.sender, subject: u.one_line,
@@ -229,14 +301,15 @@ struct EmailsView: View {
             // Reply opens the email and composes in it, so it hands over the same
             // queue Enter does — done + next keeps working from inside the reader.
             KeyBinding("r", "reply") {
-                guard actionable, let u = selected else { return }
+                guard triageable, let u = selected else { return }
                 Actions.reply(u, queue: rows)
             },
             // `sender` IS the address on this wire type (see AttentionUpdate's
             // SenderStringConvertible note) — the display name would search the
-            // body text of unrelated mail.
+            // body text of unrelated mail. Inert on the sent page, where the
+            // sender is the reader and the seed would find their whole archive.
             KeyBinding("f", "search this sender") {
-                guard actionable, let u = selected else { return }
+                guard triageable, let u = selected else { return }
                 store.openSearch(seed: "from:\(u.sender)")
             },
             KeyBinding("e", "done") { resolveSelected() },
@@ -259,11 +332,11 @@ struct EmailsView: View {
 
     private func moveByKey(_ delta: Int) {
         kbActive = true
-        index = max(0, min(rows.count - 1, index + delta))
+        index = max(0, min(rowCount - 1, index + delta))
     }
 
     private func resolveSelected() {
-        guard actionable, let u = selected else { return }
+        guard triageable, let u = selected else { return }
         Task { await Actions.done(u) }
         // `rows` already filters on resolvedIds, so the row leaves on the next
         // frame regardless; this keeps it out of the cached page too, so the
