@@ -99,11 +99,7 @@ targets:
           # Views/EmailWebCore.swift and compiles here; the UIKit twin is
           # Sources/PassbandiOS/Views/EmailWebViewiOS.swift.
           - "Views/EmailWebView.swift"
-          # --- phase 3: attachments, composing + the assistant ------------
-          # NSSavePanel (Downloads.saveBytes is macOS-fenced) + a PDFView
-          # NSViewRepresentable. iOS saves through a document picker instead, so
-          # the thread viewer's strip stays fenced until there is one.
-          - "Views/AttachmentStrip.swift"
+          # --- phase 4: composing + the assistant -------------------------
           # NSTextView representable — the markdown editor the composers use.
           - "Views/MarkdownTextView.swift"
           # Needs MarkdownTextView.
@@ -112,8 +108,11 @@ targets:
           - "Views/InlineReply.swift"
           # Needs ComposePane's ComposeSummaryRow.
           - "Views/AskBar.swift"
-          # Needs AskBar. Otherwise portable — the toasts, the palettes and the
-          # tour overlay it hosts all compile here already.
+          # Needs AskBar. Otherwise portable — the palettes and the tour overlay
+          # it hosts all compile here already, and its TOAST half is re-laid-out
+          # for a thumb (over the tab bar, undo as a button) in
+          # Sources/PassbandiOS/Views/MobileToastHost.swift, off the same
+          # store.toasts / store.undos state.
           - "Views/ActionLayer.swift"
           # --- phase 4: the remaining destinations ------------------------
           # The rail is the Mac's navigation model; the phone's is the tab bar.

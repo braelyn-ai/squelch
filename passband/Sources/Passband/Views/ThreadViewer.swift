@@ -841,14 +841,7 @@ private struct MessageCard: View {
                 PlainBody(content: message.content)
             }
 
-            // PHASE 3 ON THE PHONE: the strip's tiles are fine, but its two
-            // verbs are not — saving is an NSSavePanel and previewing is a
-            // PDFView representable, and iOS answers both with a document
-            // picker and a QuickLook controller instead. Showing the tiles
-            // without them would be a row of cards that do nothing.
-            #if os(macOS)
-                AttachmentStrip(attachments: message.attachmentList)
-            #endif
+            AttachmentStrip(attachments: message.attachmentList)
         }
         // The gutter is reserved whether or not this message is selected, so
         // j/k moves a rule rather than shifting every body left and right.
