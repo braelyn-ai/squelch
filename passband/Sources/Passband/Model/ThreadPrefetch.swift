@@ -105,31 +105,25 @@ final class ThreadPrefetch {
     /// Fire-and-forget and idempotent: a key already in PreparedBodies is
     /// skipped. Everything crossing out is a value type and Trackers /
     /// ImageRepeats are pure, so only the hand-back needs the main actor.
-    ///
-    /// macOS-only: a "prepared body" is defined by the reader's web view, which
-    /// has no iOS twin yet. Nothing on a phone reads this cache, so filling it
-    /// there would only be a regex walk nobody collects.
     private func warmBodies(_ threadId: String, _ view: ClientThreadView) {
-        #if os(macOS)
-            Task.detached(priority: .utility) {
-                let map = Self.repeatedImages(in: view)
-                for message in view.messages {
-                    guard let html = message.html, !html.isEmpty else { continue }
-                    let seenEarlier = map[message.id] ?? []
-                    // The tracker policy is part of the prepared identity, so the
-                    // warmer must key on the SAME one the card will render under or
-                    // every known-sender body misses and re-scans on the main path.
-                    let allow = message.allowsTrackers
-                    let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, allow)
-                    guard PreparedBodies.shared.get(key) == nil else { continue }
-                    PreparedBodies.shared.set(
-                        key,
-                        EmailWebView.Prepared.make(
-                            from: html, seenEarlier: seenEarlier, allowTrackers: allow))
-                }
-                await MainActor.run { ThreadPrefetch.shared.noteRepeated(threadId, map) }
+        Task.detached(priority: .utility) {
+            let map = Self.repeatedImages(in: view)
+            for message in view.messages {
+                guard let html = message.html, !html.isEmpty else { continue }
+                let seenEarlier = map[message.id] ?? []
+                // The tracker policy is part of the prepared identity, so the
+                // warmer must key on the SAME one the card will render under or
+                // every known-sender body misses and re-scans on the main path.
+                let allow = message.allowsTrackers
+                let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, allow)
+                guard PreparedBodies.shared.get(key) == nil else { continue }
+                PreparedBodies.shared.set(
+                    key,
+                    EmailWebView.Prepared.make(
+                        from: html, seenEarlier: seenEarlier, allowTrackers: allow))
             }
-        #endif
+            await MainActor.run { ThreadPrefetch.shared.noteRepeated(threadId, map) }
+        }
     }
 
     /// Only remember the map while the view it describes is still cached — a
@@ -179,44 +173,40 @@ final class ThreadPrefetch {
     }
 }
 
-// macOS-only for the same reason `warmBodies` is: this cache's element type is
-// defined by the reader's web view.
-#if os(macOS)
-    /// Preprocessed email bodies, keyed by `EmailWebView.Prepared.cacheKey` — the
-    /// html AND the suppression set, since the same body prepared against a
-    /// different thread is a different document.
-    ///
-    /// LOCK-BASED RATHER THAN @MainActor, deliberately: the warmer fills it from a
-    /// detached task while `EmailWebView.init` — which SwiftUI runs nonisolated,
-    /// before any `.task` or `onAppear` — reads it to seed state, and neither can
-    /// await.
-    final class PreparedBodies: @unchecked Sendable {
-        static let shared = PreparedBodies()
+/// Preprocessed email bodies, keyed by `EmailWebView.Prepared.cacheKey` — the
+/// html AND the suppression set, since the same body prepared against a
+/// different thread is a different document.
+///
+/// LOCK-BASED RATHER THAN @MainActor, deliberately: the warmer fills it from a
+/// detached task while `EmailWebView.init` — which SwiftUI runs nonisolated,
+/// before any `.task` or `onAppear` — reads it to seed state, and neither can
+/// await.
+final class PreparedBodies: @unchecked Sendable {
+    static let shared = PreparedBodies()
 
-        /// Several threads' worth of messages — enough that walking a queue back
-        /// and forth never re-scans, bounded because each entry holds a body copy.
-        private static let cap = 300
+    /// Several threads' worth of messages — enough that walking a queue back
+    /// and forth never re-scans, bounded because each entry holds a body copy.
+    private static let cap = 300
 
-        private let lock = NSLock()
-        /// The LRU is not thread-safe on its own; the lock that publishes these
-        /// entries across isolation domains is what makes touching it safe.
-        private var entries = LRUMap<Int, EmailWebView.Prepared>(limit: cap)
+    private let lock = NSLock()
+    /// The LRU is not thread-safe on its own; the lock that publishes these
+    /// entries across isolation domains is what makes touching it safe.
+    private var entries = LRUMap<Int, EmailWebView.Prepared>(limit: cap)
 
-        private init() {}
+    private init() {}
 
-        func get(_ key: Int) -> EmailWebView.Prepared? {
-            lock.lock()
-            defer { lock.unlock() }
-            return entries.get(key)
-        }
-
-        func set(_ key: Int, _ prepared: EmailWebView.Prepared) {
-            lock.lock()
-            defer { lock.unlock() }
-            entries.set(key, prepared)
-        }
+    func get(_ key: Int) -> EmailWebView.Prepared? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.get(key)
     }
-#endif
+
+    func set(_ key: Int, _ prepared: EmailWebView.Prepared) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries.set(key, prepared)
+    }
+}
 
 /// Remembered rendered heights, keyed by message id: a frame with one renders
 /// at its final size instantly, with no resize on reopen (the reader perceives

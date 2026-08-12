@@ -184,7 +184,57 @@ struct EmailsView: View {
 
     // MARK: - header
 
+    /// A Mac's page header is also the app's chrome bar: wordmark, counts, the
+    /// freshness stamp, and the doors to auth / audit / shortcuts / theme. A
+    /// phone has a navigation bar for the name and a tab bar for the doors, so
+    /// all that is left up here is the one thing this page owns — which of the
+    /// two lists you are looking at, and how much is in the other one.
+    @ViewBuilder
     private var header: some View {
+        #if os(macOS)
+            desktopHeader
+        #else
+            phoneHeader
+        #endif
+    }
+
+    #if !os(macOS)
+        private var phoneHeader: some View {
+            @Bindable var store = store
+            let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
+
+            return HStack(spacing: 10) {
+                GlassSegmented(
+                    options: MailMode.allCases.map { ($0, $0.label) },
+                    selection: $store.mailMode)
+                Spacer(minLength: 8)
+                if let err = store.refreshError {
+                    Text("offline")
+                        .font(Typo.micro).foregroundStyle(Palette.warn)
+                        .help(err.message)
+                } else if mode == .inbox, noise > 0 {
+                    // The count is the door to the page it counts, same as on the
+                    // Mac — just without the word "signal" beside it, because the
+                    // list underneath is already the signal.
+                    Button { store.mailMode = .noise } label: {
+                        HStack(spacing: 6) {
+                            Text("\(noise)")
+                                .font(Typo.num(12, weight: .bold))
+                                .foregroundStyle(Palette.inkFaint)
+                            Text("noise").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+        }
+    #endif
+
+    #if os(macOS)
+    private var desktopHeader: some View {
         @Bindable var store = store
         let signal = store.sitrep.standing.count + store.sitrep.new.count + store.sitrep.open.count
         let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
@@ -255,6 +305,7 @@ struct EmailsView: View {
         .padding(.bottom, 12)
         .overlay(alignment: .bottom) { Hairline() }
     }
+    #endif
 
     // MARK: - keymap
 

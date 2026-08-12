@@ -108,9 +108,16 @@ struct ThreadViewer: View {
                 // of the column — for a change that only ever touches the bar at
                 // the bottom. (`@Observable` tracks the property, not the field,
                 // so there is no way to read the draft's target here cheaply.)
-                InlineReply(
-                    messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
-                    onEchoed: { Task { await reloadAfterSend() } })
+                //
+                // PHASE 3 ON THE PHONE: the composer is built on MarkdownTextView,
+                // an NSTextView representable with no UIKit twin yet. `r` and the
+                // store's draft slot are untouched — only the bar is missing, so
+                // nothing here has to be re-plumbed when it lands.
+                #if os(macOS)
+                    InlineReply(
+                        messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
+                        onEchoed: { Task { await reloadAfterSend() } })
+                #endif
             }
 
             if let debugInfo {
@@ -150,115 +157,148 @@ struct ThreadViewer: View {
 
     // MARK: - chrome
 
+    /// A Mac reads the whole header on ONE line: subject left, actions right,
+    /// the subject taking whatever width the actions leave. A phone has no such
+    /// width — four text buttons beside a subject would squeeze it to an
+    /// ellipsis — so the same pieces stack, the actions under the line they act
+    /// on, and leaving belongs to the navigation bar above rather than to a
+    /// button of our own.
     private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    // The subject IS the copy affordance — no icon earns a
-                    // place in this header for a once-in-a-while verb.
-                    Button {
-                        if let subject = thread?.subject, !subject.isEmpty {
-                            Clip.copy(subject, flashing: $subjectCopied)
-                        }
-                    } label: {
-                        Text(thread?.subject ?? "…")
-                            .font(Typo.serif(19, weight: .medium))
-                            .foregroundStyle(Palette.ink)
-                            .lineLimit(2)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("copy subject")
-                    if subjectCopied {
-                        Text("copied!")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.positive)
-                            .transition(.opacity)
-                    }
-                }
-                .animation(.easeOut(duration: 0.18), value: subjectCopied)
-                if !participantLine.isEmpty {
-                    Text(participantLine)
-                        .font(Typo.rowSub)
-                        .foregroundStyle(Palette.inkFaint)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            // EVERY ACTION HERE NEEDS THE THREAD: they act on its newest message
-            // and they all call the daemon. With nothing loaded they are a row of
-            // controls that silently do nothing, offered next to an error saying
-            // the server is unreachable. Only `back` still means something.
-            if thread != nil {
-                // JUMP TO WHAT SURFACED THE THREAD: shown only while the
-                // attention-bearing message is not the selected one — a
-                // highlight below the fold helps nobody. Selecting it scrolls
-                // (the index watcher owns the animation).
-                if let target = attentionIndex, target != index {
-                    Button { index = target } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.down.to.line.compact")
-                                .font(.system(size: 10, weight: .semibold))
-                            Text(attentionJumpLabel).font(Typo.micro)
-                        }
-                    }
-                    .buttonStyle(.textAction)
-                    .foregroundStyle(
-                        messages[safe: target]?.tier == .pastDue ? Palette.danger : Palette.warn
-                    )
-                    .help(messages[safe: target]?.one_line ?? "jump to the message that needs attention")
-                }
-
-                if prefs.developerMode {
-                    Button("triage debug") { Task { await openDebug() } }
-                        .buttonStyle(.textAction).font(Typo.micro)
-                    Button(retriaging ? "re-triaging…" : "re-triage") {
-                        Task { await retriageThis() }
-                    }
-                    .buttonStyle(.textAction).font(Typo.micro)
-                    .disabled(retriaging)
-                    .help("dev: reset this email's LLM verdicts and re-run triage")
-                }
-
-                Button { openSenderRule() } label: {
+        #if os(macOS)
+            HStack(alignment: .firstTextBaseline, spacing: 14) {
+                titleBlock
+                actions
+                Button { store.closeThread() } label: {
                     HStack(spacing: 4) {
-                        Kbd("t")
-                        Text("new rule").font(Typo.micro)
+                        Kbd("esc")
+                        Text("back").font(Typo.micro)
                     }
                 }
                 .buttonStyle(.textAction)
-                .help("write a rule for this sender — shows the ones already in effect")
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 13)
+            .overlay(alignment: .bottom) { Hairline() }
+        #else
+            VStack(alignment: .leading, spacing: 10) {
+                titleBlock
+                HStack(spacing: 16) {
+                    actions
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 2)
+            .padding(.bottom, 12)
+            .overlay(alignment: .bottom) { Hairline() }
+        #endif
+    }
 
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                // The subject IS the copy affordance — no icon earns a
+                // place in this header for a once-in-a-while verb.
                 Button {
-                    confirmMode = .ask
+                    if let subject = thread?.subject, !subject.isEmpty {
+                        Clip.copy(subject, flashing: $subjectCopied)
+                    }
                 } label: {
-                    if let unsub {
-                        Text("unsubscribe requested \(Fmt.relAge(unsub.requested_at)) ago")
-                            .font(Typo.micro)
-                    } else {
-                        HStack(spacing: 4) {
-                            Kbd("u")
-                            Text("unsubscribe").font(Typo.micro)
-                        }
+                    Text(thread?.subject ?? "…")
+                        .font(Typo.serif(19, weight: .medium))
+                        .foregroundStyle(Palette.ink)
+                        .lineLimit(2)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("copy subject")
+                if subjectCopied {
+                    Text("copied!")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.positive)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: subjectCopied)
+            if !participantLine.isEmpty {
+                Text(participantLine)
+                    .font(Typo.rowSub)
+                    .foregroundStyle(Palette.inkFaint)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// EVERY ACTION HERE NEEDS THE THREAD: they act on its newest message and
+    /// they all call the daemon. With nothing loaded they are a row of controls
+    /// that silently do nothing, offered next to an error saying the server is
+    /// unreachable. Only `back` still means something, and it is not here.
+    @ViewBuilder
+    private var actions: some View {
+        if thread != nil {
+            // JUMP TO WHAT SURFACED THE THREAD: shown only while the
+            // attention-bearing message is not the selected one — a
+            // highlight below the fold helps nobody. Selecting it scrolls
+            // (the index watcher owns the animation).
+            if let target = attentionIndex, target != index {
+                Button { index = target } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.down.to.line.compact")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(attentionJumpLabel).font(Typo.micro)
                     }
                 }
                 .buttonStyle(.textAction)
-                .help("unsubscribe from this sender")
+                .foregroundStyle(
+                    messages[safe: target]?.tier == .pastDue ? Palette.danger : Palette.warn
+                )
+                .help(messages[safe: target]?.one_line ?? "jump to the message that needs attention")
             }
 
-            Button { store.closeThread() } label: {
+            if prefs.developerMode {
+                Button("triage debug") { Task { await openDebug() } }
+                    .buttonStyle(.textAction).font(Typo.micro)
+                Button(retriaging ? "re-triaging…" : "re-triage") {
+                    Task { await retriageThis() }
+                }
+                .buttonStyle(.textAction).font(Typo.micro)
+                .disabled(retriaging)
+                .help("dev: reset this email's LLM verdicts and re-run triage")
+            }
+
+            Button { openSenderRule() } label: {
                 HStack(spacing: 4) {
-                    Kbd("esc")
-                    Text("back").font(Typo.micro)
+                    // The key chip is the Mac's promise that a key does this.
+                    // A phone has no keyboard to promise anything to.
+                    #if os(macOS)
+                        Kbd("t")
+                    #endif
+                    Text("new rule").font(Typo.micro)
                 }
             }
             .buttonStyle(.textAction)
+            .help("write a rule for this sender — shows the ones already in effect")
+
+            Button {
+                confirmMode = .ask
+            } label: {
+                if let unsub {
+                    Text("unsubscribe requested \(Fmt.relAge(unsub.requested_at)) ago")
+                        .font(Typo.micro)
+                } else {
+                    HStack(spacing: 4) {
+                        #if os(macOS)
+                            Kbd("u")
+                        #endif
+                        Text("unsubscribe").font(Typo.micro)
+                    }
+                }
+            }
+            .buttonStyle(.textAction)
+            .help("unsubscribe from this sender")
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 13)
-        .overlay(alignment: .bottom) { Hairline() }
     }
 
     @ViewBuilder
@@ -286,7 +326,7 @@ struct ThreadViewer: View {
                             .id(i)
                         }
                     }
-                    .padding(.horizontal, 22)
+                    .padding(.horizontal, Self.columnPadding)
                     .padding(.vertical, 4)
                     .frame(maxWidth: Self.columnWidth)
                     .frame(maxWidth: .infinity)
@@ -315,6 +355,14 @@ struct ThreadViewer: View {
     /// itself to the same measure, so the reply sits under the column it answers.
     static let columnWidth: CGFloat = 900
 
+    /// The mail's own inset. A phone is narrower than the column will ever be,
+    /// so the padding IS the measure there and it matches the header above it.
+    #if os(macOS)
+        private static let columnPadding: CGFloat = 22
+    #else
+        private static let columnPadding: CGFloat = 18
+    #endif
+
     /// CLICK BESIDE THE MAIL TO LEAVE IT — the same exit as Esc.
     ///
     /// Only the two strips FLANKING the column take hits: the middle is exactly
@@ -322,33 +370,45 @@ struct ThreadViewer: View {
     /// still selects it, and a link, button or selection inside a web frame is
     /// never intercepted. In a window narrower than the full measure the strips
     /// collapse to nothing, which is right — there is no gutter to click.
+    ///
+    /// NOTHING ON A PHONE: the screen is narrower than the column, so the strips
+    /// would be zero-width anyway — and a tap-to-leave target laid over a
+    /// reading surface answers a gesture the navigation bar and the edge swipe
+    /// already own.
+    @ViewBuilder
     private var gutterDismiss: some View {
-        HStack(spacing: 0) {
-            gutterStrip
-            Color.clear
-                .frame(width: Self.columnWidth)
-                .allowsHitTesting(false)
-            gutterStrip
-        }
+        #if os(macOS)
+            HStack(spacing: 0) {
+                gutterStrip
+                Color.clear
+                    .frame(width: Self.columnWidth)
+                    .allowsHitTesting(false)
+                gutterStrip
+            }
+        #endif
     }
 
-    private var gutterStrip: some View {
-        Color.clear
-            .frame(maxWidth: .infinity)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                // Every modal here owns a full-window scrim and already takes
-                // the click before this layer sees it. The guard is what keeps
-                // that true if one ever stops doing so: dismissing a dialog must
-                // never also throw away the email behind it.
-                guard confirmMode == nil, debugInfo == nil, !store.modalOverlayOpen else { return }
-                // An unsent draft is not something a stray click beside the mail
-                // gets to destroy — there is no undo for a lost reply. Esc leaves
-                // the composer first, then the email.
-                guard store.inlineReply == nil else { return }
-                store.closeThread()
-            }
-    }
+    #if os(macOS)
+        private var gutterStrip: some View {
+            Color.clear
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    // Every modal here owns a full-window scrim and already takes
+                    // the click before this layer sees it. The guard is what keeps
+                    // that true if one ever stops doing so: dismissing a dialog must
+                    // never also throw away the email behind it.
+                    guard confirmMode == nil, debugInfo == nil, !store.modalOverlayOpen else {
+                        return
+                    }
+                    // An unsent draft is not something a stray click beside the mail
+                    // gets to destroy — there is no undo for a lost reply. Esc leaves
+                    // the composer first, then the email.
+                    guard store.inlineReply == nil else { return }
+                    store.closeThread()
+                }
+        }
+    #endif
 
     private func centeredNote(_ text: String, tone: Color = Palette.inkFaintest) -> some View {
         Text(text)
@@ -401,7 +461,9 @@ struct ThreadViewer: View {
 
                 Button { store.closeThread() } label: {
                     HStack(spacing: 5) {
-                        Kbd("esc")
+                        #if os(macOS)
+                            Kbd("esc")
+                        #endif
                         Text("back").font(.system(size: 12, weight: .medium))
                     }
                 }
@@ -779,7 +841,14 @@ private struct MessageCard: View {
                 PlainBody(content: message.content)
             }
 
-            AttachmentStrip(attachments: message.attachmentList)
+            // PHASE 3 ON THE PHONE: the strip's tiles are fine, but its two
+            // verbs are not — saving is an NSSavePanel and previewing is a
+            // PDFView representable, and iOS answers both with a document
+            // picker and a QuickLook controller instead. Showing the tiles
+            // without them would be a row of cards that do nothing.
+            #if os(macOS)
+                AttachmentStrip(attachments: message.attachmentList)
+            #endif
         }
         // The gutter is reserved whether or not this message is selected, so
         // j/k moves a rule rather than shifting every body left and right.
