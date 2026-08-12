@@ -1417,10 +1417,11 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     let day = Utc::now().format("%Y-%m-%d").to_string();
     // Band counts run under the same default window as the lists they head.
     let bands_since = Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS);
-    let (stats, usage) = store_call(&state, move |store, account_id| {
+    let (stats, usage, unread) = store_call(&state, move |store, account_id| {
         let stats = store.stats(account_id, bands_since)?;
         let usage = store.stage2_usage_today(account_id, &day)?;
-        Ok((stats, usage))
+        let unread = store.inbox_unread(account_id)?;
+        Ok((stats, usage, unread))
     })
     .await?;
 
@@ -1438,6 +1439,21 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
         "output_tokens_today": usage.output_tokens,
         "est_cost_usd_today": est_cost_usd_today,
     });
+    // Gmail's own unread counts, as of the sync loop's last successful fetch.
+    // The key is OMITTED when the counts were never fetched (older DB, or the
+    // fetch has never succeeded) so a client reads absence, not "0 unread" —
+    // which is a real answer this daemon has no business inventing.
+    //
+    // `fetched_at` rides along because a failing fetch keeps serving the last
+    // good pair: without the stamp a client cannot tell a live count from one
+    // frozen since the scope was revoked.
+    if let Some(unread) = unread {
+        body["inbox_unread"] = json!({
+            "messages": unread.messages,
+            "threads": unread.threads,
+            "fetched_at": unread.fetched_at.to_rfc3339(),
+        });
+    }
     Ok(Json(body))
 }
 

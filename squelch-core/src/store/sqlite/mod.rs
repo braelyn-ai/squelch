@@ -36,7 +36,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{CoreError, Result};
 use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, ExtractQueued,
-    IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
+    InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
     MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, SealedBody, SealedMessage,
     SearchFilter, SentMessage, SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued,
     Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
@@ -647,6 +647,14 @@ impl Store for SqliteStore {
         state: &SyncState,
     ) -> Result<()> {
         self.set_sync_state(account_id, mailbox, state)
+    }
+
+    fn inbox_unread(&self, account_id: AccountId) -> Result<Option<InboxUnread>> {
+        self.inbox_unread(account_id)
+    }
+
+    fn set_inbox_unread(&self, account_id: AccountId, messages: i64, threads: i64) -> Result<()> {
+        self.set_inbox_unread(account_id, messages, threads)
     }
 
     fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>> {

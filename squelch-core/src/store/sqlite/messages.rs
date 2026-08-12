@@ -738,6 +738,42 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub(super) fn inbox_unread(&self, account_id: AccountId) -> Result<Option<InboxUnread>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT messages, threads, fetched_at FROM inbox_unread WHERE account_id=?1",
+            params![account_id],
+            |r| {
+                Ok(InboxUnread {
+                    messages: r.get(0)?,
+                    threads: r.get(1)?,
+                    fetched_at: dt(r, 2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(super) fn set_inbox_unread(
+        &self,
+        account_id: AccountId,
+        messages: i64,
+        threads: i64,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO inbox_unread(account_id, messages, threads, fetched_at)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 messages=excluded.messages,
+                 threads=excluded.threads,
+                 fetched_at=excluded.fetched_at",
+            params![account_id, messages, threads, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>> {
         // LOCAL-ONLY: the only method that returns sealed rows. TUI use only.
         let conn = self.lock()?;

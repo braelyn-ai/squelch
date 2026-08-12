@@ -64,6 +64,19 @@ pub struct SyncState {
     pub last_uid: u64,
 }
 
+/// Gmail's own unread counts for INBOX, as the sync loop last saw them.
+///
+/// This is the mailbox's truth, not ours: nothing local tracks reads (the read
+/// scope cannot write them), and the ingest window covers only a slice of the
+/// inbox, so these numbers can only come from Gmail. `fetched_at` says how stale
+/// they are — a fetch failure keeps the previous row rather than clearing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxUnread {
+    pub messages: i64,
+    pub threads: i64,
+    pub fetched_at: DateTime<Utc>,
+}
+
 /// One Sent-derived contact, as both the autocomplete hit shape and the
 /// Sent-history harvest's merge input (same fields either way).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -886,6 +899,17 @@ pub trait Store: Send + Sync {
     /// Upsert the sync cursor for a mailbox key.
     fn set_sync_state(&self, account_id: AccountId, mailbox: &str, state: &SyncState)
     -> Result<()>;
+
+    /// The last Gmail INBOX unread counts the sync loop stored, or `None` when
+    /// none were ever fetched (old DB, or every fetch so far has failed). `None`
+    /// is NOT zero and callers must keep the distinction: zero unread is a real
+    /// answer, "we do not know" is not.
+    fn inbox_unread(&self, account_id: AccountId) -> Result<Option<InboxUnread>>;
+
+    /// Overwrite this account's Gmail INBOX unread counts, stamping `fetched_at`
+    /// now. Only ever called with numbers that came back from Gmail, so a failed
+    /// fetch leaves the previous row in place.
+    fn set_inbox_unread(&self, account_id: AccountId, messages: i64, threads: i64) -> Result<()>;
 
     /// LOCAL-ONLY (TUI): list sealed messages. This is the ONLY method that
     /// exposes sealed content and must never be reachable from MCP.

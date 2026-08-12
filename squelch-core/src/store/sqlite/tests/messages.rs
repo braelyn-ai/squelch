@@ -1,4 +1,4 @@
-//! Ingest, thread view, attachment and sealed-read tests.
+//! Ingest, thread view, attachment, sealed-read and Gmail-counter tests.
 
 use super::super::*;
 use super::support::*;
@@ -768,4 +768,41 @@ fn upsert_keeps_stored_recipients_when_a_later_write_has_none() {
         })
         .unwrap();
     assert_eq!(stored.as_deref(), Some("Alice <alice@friends.com>"));
+}
+
+#[test]
+fn inbox_unread_counts_round_trip_and_overwrite_one_row() {
+    // The human door serves absence differently from zero, so the never-fetched
+    // case must be None and a real zero must be Some(0) — this is the whole
+    // reason the counts are their own row instead of a defaulted column.
+    let (store, acct) = store();
+    assert!(
+        store.inbox_unread(acct).unwrap().is_none(),
+        "never fetched reads as absence"
+    );
+
+    let before = Utc::now();
+    store.set_inbox_unread(acct, 214, 190).unwrap();
+    let got = store.inbox_unread(acct).unwrap().expect("counts stored");
+    assert_eq!((got.messages, got.threads), (214, 190));
+    assert!(got.fetched_at >= before, "fetched_at is stamped at write");
+
+    // A later fetch OVERWRITES: this mirrors Gmail's current state, so a second
+    // row would be a second answer to a question with one answer.
+    store.set_inbox_unread(acct, 0, 0).unwrap();
+    let got = store
+        .inbox_unread(acct)
+        .unwrap()
+        .expect("zero is an answer");
+    assert_eq!((got.messages, got.threads), (0, 0));
+    let rows: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM inbox_unread", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "one row per account, overwritten in place");
+
+    // Per account: another mailbox's counts are not this one's.
+    let other = store.ensure_account("other@example.com").unwrap();
+    assert!(store.inbox_unread(other).unwrap().is_none());
 }

@@ -388,6 +388,21 @@ CREATE TABLE IF NOT EXISTS sync_state (
     PRIMARY KEY(account_id, mailbox)
 );
 
+-- GMAIL-SIDE INBOX UNREAD COUNTS (labels/INBOX messagesUnread/threadsUnread),
+-- refreshed once per sync cycle. One row per account, overwritten each fetch:
+-- this mirrors Gmail's current state, it is not a history. Sync's own tables
+-- cannot answer it — they hold only what the backfill window ingested, and
+-- nothing here ever learns that Gmail marked a message read.
+--
+-- NO ROW MEANS NEVER FETCHED, which readers must serve as absence: zero unread
+-- is a real and different answer.
+CREATE TABLE IF NOT EXISTS inbox_unread (
+    account_id INTEGER NOT NULL PRIMARY KEY,
+    messages   INTEGER NOT NULL,
+    threads    INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
 -- STAGE-2 BUDGET (circuit breaker). model_calls counts API attempts, incremented
 -- BEFORE the call so retry storms cannot exceed the cap. Two scopes share the
 -- table, keyed by thread_id:
