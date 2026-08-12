@@ -70,6 +70,25 @@ struct ConnectView: View {
 
     var body: some View {
         ZStack {
+            // A fresh download lands here with no daemon and no idea what one
+            // is, so the gate teaches: getting-started beside the form when the
+            // window is wide enough, the form alone when it is not.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 20) {
+                    GettingStartedPane()
+                    connectCard
+                }
+                connectCard
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // A link can arrive before this gate mounts (the app was launched by
+        // one) or while it is up, so both entry points are covered.
+        .task { applyPairLink(store.pairLink) }
+        .onChange(of: store.pairLink) { _, link in applyPairLink(link) }
+    }
+
+    private var connectCard: some View {
             VStack(spacing: 0) {
                 header
                 linkNotice
@@ -126,12 +145,6 @@ struct ConnectView: View {
             .frame(width: 440)
             .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // A link can arrive before this gate mounts (the app was launched by
-        // one) or while it is up, so both entry points are covered.
-        .task { applyPairLink(store.pairLink) }
-        .onChange(of: store.pairLink) { _, link in applyPairLink(link) }
     }
 
     private var header: some View {
@@ -368,6 +381,114 @@ struct ConnectView: View {
         linkHost = link.isLoopback ? nil : link.displayHost
         linkArmed = true
         focus = .submit
+    }
+}
+
+/// What a fresh install needs to hear before the connect form makes any sense:
+/// the app is a window onto a daemon the user runs, and here is how to get one.
+/// Instructions only — the one credential-shaped act (typing the code) still
+/// happens in the form, which is where its guarantees live.
+private struct GettingStartedPane: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("new here?")
+                .font(Typo.serif(28, weight: .medium))
+                .foregroundStyle(Palette.ink)
+            Text(
+                "Passband is the window. The engine is squelchd, a small daemon that reads your Gmail read-only and runs on any box you own: this Mac, a NAS, a server."
+            )
+            .font(.system(size: 12))
+            .foregroundStyle(Palette.inkFaint)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 8)
+
+            VStack(alignment: .leading, spacing: 16) {
+                GuideStep(
+                    number: 1, title: "run the daemon",
+                    detail: "One public Docker image, amd64 and arm64.",
+                    command: "docker pull ghcr.io/braelyn-ai/squelchd")
+                GuideStep(
+                    number: 2, title: "authorize gmail",
+                    detail: "A one-time Google consent, run where the daemon lives.",
+                    command: "squelchd auth")
+                GuideStep(
+                    number: 3, title: "pair this mac",
+                    detail: "Prints a code. Type it into the form here.",
+                    command: "squelchd pair")
+            }
+            .padding(.top, 20)
+
+            HStack(spacing: 14) {
+                Button("full setup guide") { Opener.open("https://passband.app/self-host") }
+                Button("github") { Opener.open("https://github.com/braelyn-ai/squelch") }
+            }
+            .buttonStyle(.textAction)
+            .padding(.top, 20)
+        }
+        .padding(30)
+        .frame(width: 380)
+        .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTint)
+        .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
+    }
+}
+
+/// One numbered step: what it is, why, and the command to copy.
+private struct GuideStep: View {
+    let number: Int
+    let title: String
+    let detail: String
+    let command: String
+    @State private var copied = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text("\(number)")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Palette.accentInk)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(Palette.accent))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.inkFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                commandRow
+            }
+        }
+    }
+
+    private var commandRow: some View {
+        HStack(spacing: 8) {
+            Text(command)
+                .font(Typo.mono(11))
+                .foregroundStyle(Palette.inkDim)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Button {
+                Clip.copy(command, flashing: $copied)
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(copied ? Palette.positive : Palette.inkFaint)
+            }
+            .buttonStyle(.plain)
+            .help("copy command")
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Palette.canvas.opacity(0.65))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Palette.hairline, lineWidth: 0.75)
+        )
+        .padding(.top, 3)
     }
 }
 
