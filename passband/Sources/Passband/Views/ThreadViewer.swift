@@ -37,6 +37,11 @@ struct ThreadViewer: View {
     /// messageId -> recorded opens of the user's own tracked sends. Only sent,
     /// tracked messages ever have an entry; see `refreshOpens`.
     @State private var opens: [Int: [MessageOpen]] = [:]
+    /// Display indices of the rows on screen right now. The wheel moves what is
+    /// visible without touching the selection, and `refreshInPlace` must not
+    /// treat a wheel reader as "at the newest" just because they never pressed
+    /// `j` — see `anchorId`.
+    @State private var visibleIndices: Set<Int> = []
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -375,6 +380,13 @@ struct ThreadViewer: View {
                                 index = i
                             }
                             .id(i)
+                            .onScrollVisibilityChange(threshold: 0.1) { visible in
+                                if visible {
+                                    visibleIndices.insert(i)
+                                } else {
+                                    visibleIndices.remove(i)
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, Self.columnPadding)
@@ -683,16 +695,36 @@ struct ThreadViewer: View {
     /// the fresh copy anyway, so an empty viewer just lets it.
     private func refreshInPlace() async {
         guard thread != nil else { return }
-        let anchor = index == 0 ? nil : messages[safe: index]?.id
         guard let view = try? await APIClient.shared.getThread(threadId) else { return }
+        // Anchor AFTER the await: a reader who moved while the fetch was in
+        // flight is anchored where they are now, not where they were.
+        let anchor = anchorId
         // Same overwrite as the post-send reload: the cached copy predates the
         // arrival, and reopening this thread must not serve it back.
         ThreadPrefetch.shared.note(threadId, view)
         adopt(view)
+        // `adopt` read the prefetch's repeated-image map, but the warmer that
+        // recomputes it is detached and has not landed — the arrivals have no
+        // entry, and their repeated logos would all render again. Derive it
+        // from the view in hand instead.
+        repeatedImages = ThreadPrefetch.repeatedImages(in: view)
         if let anchor, let found = messages.firstIndex(where: { $0.id == anchor }) {
             index = found
         }
         await refreshOpens()
+    }
+
+    /// The message the reader is actually ON, whether they got there with the
+    /// keys or the wheel. A moved selection wins; failing that, the topmost
+    /// VISIBLE row stands in, because a wheel scroll moves what is on screen
+    /// without ever touching the selection — preserving the selection alone
+    /// would let a background refresh yank a wheel reader back to the top. nil
+    /// means the reader really is sitting on the newest, which is the one case
+    /// a refresh may move them: onto the reply they are waiting for.
+    private var anchorId: Int? {
+        if index != 0 { return messages[safe: index]?.id }
+        guard let top = visibleIndices.min(), top > 0 else { return nil }
+        return messages[safe: top]?.id
     }
 
     // MARK: - queue navigation
@@ -745,6 +777,9 @@ struct ThreadViewer: View {
     // MARK: - data
 
     private func load() async {
+        // A fresh thread mounts fresh rows; what was visible of the LAST one
+        // must not anchor this one.
+        visibleIndices.removeAll()
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {

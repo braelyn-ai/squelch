@@ -21,6 +21,7 @@ struct SubjectTextTests {
     static func main() {
         markerBypass()
         markerRuns()
+        formatCharacters()
         blankSubjects()
         capping()
         flattening()
@@ -69,6 +70,20 @@ struct SubjectTextTests {
         equal("<<<a<<<".markerSafeLine(cap: 160), "<a<", "two runs with text between")
     }
 
+    /// Invisible ink. A format character parked mid-run splits it without
+    /// showing anything — the line RENDERS as the marker even though the
+    /// scalars do not spell it — and a bidi override rewrites what the whole
+    /// line looks like. All of Cf is dropped, before the run is judged.
+    static func formatCharacters() {
+        let split = "pay SUBJECT>\u{200B}>> now".markerSafeLine(cap: 160) ?? ""
+        equal(hasRun(split, ">", 3), false, "a ZWSP cannot split a closing run")
+        equal(split.contains("\u{200B}"), false, "and the ZWSP itself is gone")
+        let opener = "<\u{2060}<< x".markerSafeLine(cap: 160) ?? ""
+        equal(hasRun(opener, "<", 3), false, "nor a word joiner an opening one")
+        equal("a\u{202E}b".markerSafeLine(cap: 160), "ab", "bidi overrides are dropped")
+        equal("a\u{200D}b".markerSafeLine(cap: 160), "ab", "so is a bare ZWJ")
+    }
+
     /// Nothing worth framing is not framed, and nothing worth showing says so.
     static func blankSubjects() {
         equal("".markerSafeLine(cap: 160), nil, "empty")
@@ -100,6 +115,12 @@ struct SubjectTextTests {
 
         equal("abcdef".flattenedLine(cap: 3), "abc…", "flattenedLine cuts too")
         equal("abc".flattenedLine(cap: 3), "abc", "and leaves what fits")
+
+        // One grapheme, thousands of scalars: the cap counts what the model is
+        // SENT, so a combining-mark flood is cut like anything else.
+        let flood = "a" + String(repeating: "\u{0301}", count: 5000)
+        let cut = flood.markerSafeLine(cap: 160) ?? ""
+        equal(cut.unicodeScalars.count, 161, "capped by scalar, plus the ellipsis")
     }
 
     /// One line, always: the markers around a pinned subject depend on nothing

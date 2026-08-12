@@ -43,7 +43,13 @@ extension String {
     }
 
     private static func capped(_ text: String, cap: Int) -> String {
-        text.count <= cap ? text : String(text.prefix(cap)) + "…"
+        // SCALARS, not Characters: the cap bounds what the prompt pays for by
+        // the token, and one grapheme can carry an unbounded pile of combining
+        // marks. A cut mid-cluster costs a preview an accent; an uncut cluster
+        // costs the prompt five thousand scalars per request.
+        let scalars = text.unicodeScalars
+        guard scalars.count > cap else { return text }
+        return String(String.UnicodeScalarView(scalars.prefix(cap))) + "…"
     }
 
     /// Collapse every run of three or more identical `<` or `>` to a single
@@ -72,6 +78,14 @@ extension String {
         }
 
         for scalar in text.unicodeScalars {
+            // Format characters (ZWSP, ZWJ, word joiners, bidi controls) are
+            // invisible ink: parked inside a bracket run they split it without
+            // showing anything, and a line that RENDERS as the marker is close
+            // enough for a model that pattern-matches the frame. All of Cf is
+            // dropped from the prompt line — and dropped WITHOUT flushing, so
+            // the run one tried to split is judged whole. (An emoji family in a
+            // subject loses its joiners here; the prompt can live with that.)
+            if scalar.properties.generalCategory == .format { continue }
             if scalar == "<" || scalar == ">" {
                 if scalar == run {
                     count += 1
