@@ -91,17 +91,19 @@ targets:
           - "App/**"
           # Sparkle. iOS has no sideloaded updater; the App Store is the updater.
           - "Model/Updater.swift"
-          # --- phase 2: the reader ---------------------------------------
-          # WKWebView hosted through an NSViewRepresentable, plus the whole
-          # body-preparation pipeline nested inside it (EmailWebView.Prepared).
+          # The AppKit HALF of the reader, and only that: an NSViewRepresentable
+          # plus the WKWebView subclass that hands the scroll wheel back to the
+          # column. Everything the reader is made of — the body-preparation
+          # pipeline, the sandbox configuration, the measuring bridge, the frame
+          # pool and the SwiftUI EmailWebView itself — lives in
+          # Views/EmailWebCore.swift and compiles here; the UIKit twin is
+          # Sources/PassbandiOS/Views/EmailWebViewiOS.swift.
           - "Views/EmailWebView.swift"
-          # Needs EmailWebView.
-          - "Views/ThreadViewer.swift"
-          - "Views/RevealPanel.swift"
+          # --- phase 3: attachments, composing + the assistant ------------
           # NSSavePanel (Downloads.saveBytes is macOS-fenced) + a PDFView
-          # NSViewRepresentable. iOS saves through a document picker instead.
+          # NSViewRepresentable. iOS saves through a document picker instead, so
+          # the thread viewer's strip stays fenced until there is one.
           - "Views/AttachmentStrip.swift"
-          # --- phase 3: composing + the assistant -------------------------
           # NSTextView representable — the markdown editor the composers use.
           - "Views/MarkdownTextView.swift"
           # Needs MarkdownTextView.
