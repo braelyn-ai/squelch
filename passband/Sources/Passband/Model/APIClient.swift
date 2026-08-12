@@ -53,6 +53,12 @@ actor APIClient {
         config = Config(baseURL: base, token: token)
     }
 
+    /// Forget the configured daemon. After this, requests fail with "client
+    /// not configured" instead of presenting a token the user asked to forget.
+    func deconfigure() {
+        config = nil
+    }
+
     var isConfigured: Bool { config != nil }
 
     private func requireConfig() throws -> Config {

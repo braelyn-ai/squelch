@@ -298,6 +298,9 @@ enum AccountIndex {
     static func sealLegacyIfEmpty() {
         guard load().accounts.isEmpty else { return }
         clearLegacySlots()
+        // A parked migration id would be stranded for good once the flag below
+        // is set — the repair branches that discard it are unreachable after.
+        discardAbandonedMigration()
         defaults.set(true, forKey: migratedKey)
     }
 
@@ -422,8 +425,12 @@ enum AccountIndex {
         //    parked id has done its job the moment the index names it.
         let migrated = AccountIndexState(accounts: [record], activeId: record.id)
         save(migrated)
-        defaults.removeObject(forKey: migratingKey)
+        // Concluded BEFORE the parked id is released: a crash between these two
+        // writes then reads as "done, with litter" (the benign early return
+        // above) rather than "abandoned" — the repair branch must never see an
+        // index that names the parked id.
         defaults.set(true, forKey: migratedKey)
+        defaults.removeObject(forKey: migratingKey)
 
         // 4. Legacy cleanup. A failure here (or a crash before it) leaves
         //    slots and keys that are never read again — the `migratedKey`
@@ -458,6 +465,14 @@ enum AccountIndex {
         guard let raw = defaults.string(forKey: migratingKey),
             let id = UUID(uuidString: raw)
         else { return }
+        // The index naming the parked id means the migration COMMITTED and only
+        // the parked key's removal was lost. Those slots are the live account's
+        // only credentials — the legacy pair is already gone on every path that
+        // reaches here — so deleting them would take both copies of the token.
+        if load().accounts.contains(where: { $0.id == id }) {
+            defaults.removeObject(forKey: migratingKey)
+            return
+        }
         do {
             try SettingsStore.clear(accountId: id)
         } catch {
@@ -506,13 +521,32 @@ final class AccountManager {
     /// `removeAccount`.
     func reload() { adopt(AccountIndex.load()) }
 
-    /// One account's credentials. Off the main actor (a keychain read can
-    /// raise the access panel); a failure and an unwritten account are both
-    /// nil, because a caller can do exactly the same thing about either.
-    func settings(for id: UUID) async -> ConnectionSettings? {
-        guard case .success(let stored) = await SettingsStore.loadAsync(accountId: id) else {
-            return nil
+    /// What a credential read for one account actually found. `missing` means
+    /// the slots are gone (the account is genuinely broken); `unreadable` means
+    /// the keychain refused the read — denied access panel, locked keychain —
+    /// and the slots may be perfectly intact behind the refusal.
+    enum CredentialLoad {
+        case ok(ConnectionSettings)
+        case missing
+        case unreadable
+    }
+
+    /// One account's credentials, with the failure shape preserved. Off the
+    /// main actor (a keychain read can raise the access panel). Callers that
+    /// would tear something down on `missing` must NOT do so on `unreadable`.
+    func credentialLoad(for id: UUID) async -> CredentialLoad {
+        switch await SettingsStore.loadAsync(accountId: id) {
+        case .success(let stored?): return .ok(stored)
+        case .success(nil): return .missing
+        case .failure: return .unreadable
         }
+    }
+
+    /// One account's credentials for callers with nothing to tear down: the
+    /// feed starters, which drop the id and retry on the next `.connected`
+    /// transition either way.
+    func settings(for id: UUID) async -> ConnectionSettings? {
+        guard case .ok(let stored) = await credentialLoad(for: id) else { return nil }
         return stored
     }
 
