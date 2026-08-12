@@ -80,7 +80,12 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID is ABSENT on purpose: litestream 0.3.x creates its
+# generation directories mode 02777 (setgid), and the directive turns that
+# mkdirat into EPERM. This cost tenant #2 their first hour of backups and a
+# long strace session (issue #34). The dirs live under a 0700 root-owned
+# tree, so the setgid bit grants nothing to anyone who could not already
+# read everything.
 RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
