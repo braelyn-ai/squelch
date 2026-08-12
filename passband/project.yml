@@ -100,12 +100,12 @@ targets:
           # Sources/PassbandiOS/Views/EmailWebViewiOS.swift.
           - "Views/EmailWebView.swift"
           # --- phase 4: composing + the assistant -------------------------
-          # NSTextView representable — the markdown editor the composers use.
+          # The AppKit HALF of the markdown editor, and only that: the scanner
+          # (Lib/Markdown.swift) and the span → attributes pass
+          # (Views/MarkdownStyle.swift) compile here, and the UIKit twin is
+          # Sources/PassbandiOS/Views/MarkdownTextViewiOS.swift, which declares
+          # `MarkdownTextView` under the same name so no composer forks.
           - "Views/MarkdownTextView.swift"
-          # Needs MarkdownTextView.
-          - "Views/ComposePane.swift"
-          # Needs MarkdownTextView, ThreadViewer and ComposePane's summary rows.
-          - "Views/InlineReply.swift"
           # Needs ComposePane's ComposeSummaryRow.
           - "Views/AskBar.swift"
           # Needs AskBar. Otherwise portable — the palettes and the tour overlay

@@ -19,6 +19,16 @@
 // the same derivation, so review states the real recipients — but the send never
 // carries them back, and a lookup that fails or is still in flight degrades to
 // naming the daemon as the authority rather than blocking a reply.
+//
+// ON A PHONE IT IS THE SAME BAR, pinned by `.safeAreaInset(edge: .bottom)`
+// instead of by a VStack — so the keyboard lifts it and insets the mail behind
+// it rather than squashing the reader (see ThreadViewer). Two things are fenced.
+// The KEY HINT BAR becomes real buttons, and that is not decoration: the
+// ceremony is driven ENTIRELY by keys on the Mac, so without them a phone could
+// open a reply and have no way on earth to review or send it. And the editor is
+// SHORTER, because 150pt of text view above a raised keyboard leaves nothing of
+// the email you are answering — which is the whole reason this composer is here
+// and not a panel over it.
 
 import SwiftUI
 
@@ -94,16 +104,28 @@ struct InlineReply: View {
                         Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
                     }
                 }
-                .padding(.horizontal, 22)
+                .padding(.horizontal, Self.gutter)
                 .padding(.top, 12)
                 .padding(.bottom, 10)
 
-                KeyHintBar(hints: hints)
+                #if os(macOS)
+                    KeyHintBar(hints: hints)
+                #else
+                    actionBar(compose)
+                #endif
             }
             // The reader's own measure, so the composer sits under the column it
-            // answers rather than sprawling the full window width.
+            // answers rather than sprawling the full window width. A phone is
+            // narrower than the column will ever be, so there it is inert.
             .frame(maxWidth: ThreadViewer.columnWidth, alignment: .leading)
             .frame(maxWidth: .infinity)
+            // A GROUND OF ITS OWN on the phone, and only there. On the Mac this
+            // bar sits INSIDE the reader's own material, at the bottom of its
+            // stack; as a safe-area inset it floats over scrolling mail, and mail
+            // reading through the send button is not a composer.
+            #if !os(macOS)
+                .passbandGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
+            #endif
             .overlay(alignment: .top) { Hairline() }
             // REGISTRATION ORDER IS LOAD-BEARING. Within a context the LATEST
             // registered set wins, and this set mounts with the composer — after
@@ -220,7 +242,7 @@ struct InlineReply: View {
         // bar never left), so Esc out of review would otherwise drop the cursor
         // and hand every letter you typed next to the reader's verbs.
         MarkdownTextView(text: bind(\.body), autofocus: true, disabled: compose.sending)
-            .frame(height: 150)
+            .frame(height: Self.editorHeight)
             .padding(8)
             .background(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -270,7 +292,7 @@ struct InlineReply: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 150)
+            .frame(maxHeight: Self.editorHeight)
             .padding(10)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -281,15 +303,72 @@ struct InlineReply: View {
         }
     }
 
-    private var hints: [KeyHint] {
-        if inReview {
-            var hints = [KeyHint("enter", "send")]
-            if guarded { hints.append(KeyHint("shift+enter", "send anyway")) }
-            hints.append(KeyHint("esc", "back"))
-            return hints
+    /// The composer's own inset. The Mac's is the reader column's 22; a phone is
+    /// narrower and the mail beside it is inset 18, so the reply lines up with
+    /// the message it answers rather than sitting proud of it.
+    #if os(macOS)
+        private static let gutter: CGFloat = 22
+        private static let editorHeight: CGFloat = 150
+    #else
+        private static let gutter: CGFloat = 18
+        /// Short enough that a couple of lines of the email survive above a
+        /// raised keyboard. The editor scrolls itself past that.
+        private static let editorHeight: CGFloat = 104
+    #endif
+
+    #if os(macOS)
+        private var hints: [KeyHint] {
+            if inReview {
+                var hints = [KeyHint("enter", "send")]
+                if guarded { hints.append(KeyHint("shift+enter", "send anyway")) }
+                hints.append(KeyHint("esc", "back"))
+                return hints
+            }
+            return [KeyHint("⌘enter", "review"), KeyHint("esc", "dismiss")]
         }
-        return [KeyHint("⌘enter", "review"), KeyHint("esc", "dismiss")]
-    }
+    #endif
+
+    #if !os(macOS)
+        /// THE PHONE'S HALF OF THE CEREMONY. Same two phases, same single
+        /// `fire(override:)`, same rule that a blocked verdict is the ONLY thing
+        /// that unlocks an override: what changes is that a thumb presses them
+        /// instead of ⌘Enter, Enter and shift+Enter. The layout mirrors the pane
+        /// composer's footer so a reply reads the same wherever it started.
+        @ViewBuilder
+        private func actionBar(_ compose: ComposeState) -> some View {
+            HStack(spacing: 8) {
+                Spacer()
+                if inReview {
+                    Button(ComposeLabels.back) { patch { $0.phase = .edit; $0.error = nil } }
+                        .buttonStyle(.glass)
+                        .disabled(compose.sending)
+                    if guarded {
+                        Button(compose.sending ? "sending…" : "override + send") {
+                            Task { await fire(override: true) }
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.danger)
+                        .disabled(compose.sending)
+                    } else {
+                        Button(compose.sending ? "sending…" : "send") {
+                            Task { await fire(override: false) }
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.accent)
+                        .disabled(compose.sending)
+                    }
+                } else {
+                    Button(ComposeLabels.dismiss) { store.closeInlineReply() }
+                        .buttonStyle(.glass)
+                    Button("review →") { toReview() }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.accent)
+                }
+            }
+            .padding(.horizontal, Self.gutter)
+            .padding(.bottom, 10)
+        }
+    #endif
 
     // MARK: - keymap
 

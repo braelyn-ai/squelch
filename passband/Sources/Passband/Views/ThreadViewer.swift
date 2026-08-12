@@ -95,30 +95,7 @@ struct ThreadViewer: View {
                 .background(.regularMaterial)
                 .ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                header
-                content
-                // UNDER the mail, never over it: the message you are answering
-                // stays readable while you answer it.
-                //
-                // MOUNTED UNCONDITIONALLY, and gated on `store.inlineReply`
-                // INSIDE. Reading the draft from this body instead would make
-                // every keystroke in the reply invalidate the entire reader —
-                // every message card, every sandboxed web frame, a full relayout
-                // of the column — for a change that only ever touches the bar at
-                // the bottom. (`@Observable` tracks the property, not the field,
-                // so there is no way to read the draft's target here cheaply.)
-                //
-                // PHASE 3 ON THE PHONE: the composer is built on MarkdownTextView,
-                // an NSTextView representable with no UIKit twin yet. `r` and the
-                // store's draft slot are untouched — only the bar is missing, so
-                // nothing here has to be re-plumbed when it lands.
-                #if os(macOS)
-                    InlineReply(
-                        messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
-                        onEchoed: { Task { await reloadAfterSend() } })
-                #endif
-            }
+            column
 
             if let debugInfo {
                 TriageDebugOverlay(info: debugInfo) { self.debugInfo = nil }
@@ -153,6 +130,53 @@ struct ThreadViewer: View {
                 ThreadPrefetch.shared.prefetch(next.thread_id)
             }
         }
+    }
+
+    // MARK: - the column
+
+    /// Header, mail, composer — and WHERE the composer attaches is the one thing
+    /// the two platforms disagree about.
+    ///
+    /// The Mac stacks it: a third row of the VStack, under the mail, never over
+    /// it, so the message you are answering stays readable while you answer it.
+    ///
+    /// A phone cannot stack it, because a keyboard is about to take half the
+    /// screen. In a VStack SwiftUI lifts the WHOLE stack clear of the keyboard,
+    /// which shoves the header off the top and leaves the reader scrolled to
+    /// nowhere. As a bottom safe-area inset the composer rides the keyboard on
+    /// its own while the mail behind it merely gains bottom inset — it stays
+    /// where it was, and scrolls under a bar that is now a bar.
+    @ViewBuilder
+    private var column: some View {
+        #if os(macOS)
+            VStack(spacing: 0) {
+                header
+                content
+                composer
+            }
+        #else
+            VStack(spacing: 0) {
+                header
+                content
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) { composer }
+        #endif
+    }
+
+    /// MOUNTED UNCONDITIONALLY, and gated on `store.inlineReply` INSIDE. Reading
+    /// the draft from this body instead would make every keystroke in the reply
+    /// invalidate the entire reader — every message card, every sandboxed web
+    /// frame, a full relayout of the column — for a change that only ever
+    /// touches the bar at the bottom. (`@Observable` tracks the property, not the
+    /// field, so there is no way to read the draft's target here cheaply.)
+    ///
+    /// With no draft open it renders nothing, which as a safe-area inset means
+    /// no inset at all: the reader gets its full height back the moment the
+    /// composer closes.
+    private var composer: some View {
+        InlineReply(
+            messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
+            onEchoed: { Task { await reloadAfterSend() } })
     }
 
     // MARK: - chrome
@@ -238,6 +262,26 @@ struct ThreadViewer: View {
     @ViewBuilder
     private var actions: some View {
         if thread != nil {
+            // REPLY NEEDS A TARGET ON A PHONE. On the Mac `r` is the door and it
+            // is always open; here the only other way in is a leading swipe from
+            // a list, which lands you in this reader with the composer already
+            // up. Without this, a thread opened by tapping it could be read and
+            // never answered. Hidden while a composer IS open — it would be a
+            // button that does nothing (`openInlineReply` refuses to reset a live
+            // draft, and rightly).
+            #if !os(macOS)
+                if store.inlineReply == nil {
+                    Button { openReply() } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrowshape.turn.up.left")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("reply").font(Typo.micro)
+                        }
+                    }
+                    .buttonStyle(.textAction)
+                    .foregroundStyle(Palette.accent)
+                }
+            #endif
             // JUMP TO WHAT SURFACED THE THREAD: shown only while the
             // attention-bearing message is not the selected one — a
             // highlight below the fold helps nobody. Selecting it scrolls
