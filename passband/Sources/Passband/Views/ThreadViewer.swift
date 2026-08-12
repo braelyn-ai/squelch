@@ -121,6 +121,13 @@ struct ThreadViewer: View {
             await refreshOpens()
         }
         .task(id: newestSender) { await refreshUnsub() }
+        // NEW MAIL IN THIS VERY THREAD, from the poll that heard about it.
+        // `onChange` rather than `.task(id:)`: a task keyed on the token would
+        // also fire on mount, refetching the thread `load()` is already
+        // fetching.
+        .onChange(of: store.openThreadRefreshToken) { _, _ in
+            Task { await refreshInPlace() }
+        }
         // Warm the NEXT queued thread while this one is being read, so e/d's
         // done+advance opens it instantly.
         .onAppear {
@@ -387,8 +394,15 @@ struct ThreadViewer: View {
                 // `adopt` sets index to 0, which it already was, so it sees no
                 // change. Unanimated because on the initial load and on a thread
                 // switch this is the starting position, not a movement.
+                //
+                // It scrolls to the SELECTION, not to zero, because the two are
+                // no longer the same thing: `refreshInPlace` puts the selection
+                // back on the message that was on screen, and a hardcoded 0 here
+                // would fire on the same update and undo exactly the position it
+                // just preserved. Every other path into this watcher is sitting
+                // on 0 already.
                 .onChange(of: messages.first?.id) { _, _ in
-                    proxy.scrollTo(0, anchor: .top)
+                    proxy.scrollTo(index, anchor: .top)
                 }
             }
         }
@@ -650,6 +664,34 @@ struct ThreadViewer: View {
         // The echo is a new message id, so the receipt map has nothing for it
         // yet. Nothing has opened it a second after it went out — this is what
         // arms the mark for the poll that eventually finds one.
+        await refreshOpens()
+    }
+
+    /// Refetch because the poller saw a newer message in this thread, WITHOUT
+    /// moving the person reading it. `adopt` lands on the newest, which is right
+    /// when a thread opens and wrong under somebody's eyes: they are three
+    /// messages down reading, and the mail arriving is not a reason to take the
+    /// page away.
+    ///
+    /// So the message on screen is remembered by ID and found again afterwards.
+    /// The stack is newest-first, so everything below the arrivals shifts down
+    /// by however many landed — an index restored as a NUMBER would silently
+    /// mean a different message. Somebody already on the newest DOES follow it
+    /// to the new one: that is the reply they were sitting there waiting for.
+    ///
+    /// Nothing to preserve before the first load lands, and `load()` is bringing
+    /// the fresh copy anyway, so an empty viewer just lets it.
+    private func refreshInPlace() async {
+        guard thread != nil else { return }
+        let anchor = index == 0 ? nil : messages[safe: index]?.id
+        guard let view = try? await APIClient.shared.getThread(threadId) else { return }
+        // Same overwrite as the post-send reload: the cached copy predates the
+        // arrival, and reopening this thread must not serve it back.
+        ThreadPrefetch.shared.note(threadId, view)
+        adopt(view)
+        if let anchor, let found = messages.firstIndex(where: { $0.id == anchor }) {
+            index = found
+        }
         await refreshOpens()
     }
 

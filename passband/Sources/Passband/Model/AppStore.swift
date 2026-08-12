@@ -377,6 +377,17 @@ final class AppStore {
         else { return nil }
         return summary
     }
+    /// Bumped when a sync brings a message NEWER than the one the reader holds
+    /// into the thread on screen — see SitrepPoller.performPull. The viewer
+    /// watches it and refetches without moving the reading position.
+    ///
+    /// A token rather than the mail itself: the poller reads the attention
+    /// bands, which say a thread moved but not what it now contains, and the
+    /// viewer is the one place that knows how to adopt a thread. It is also why
+    /// nothing resets it — a counter only has to CHANGE, so a thread switch
+    /// under a live token is a viewer that simply never hears about the bump it
+    /// no longer cares about.
+    var openThreadRefreshToken = 0
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay

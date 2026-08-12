@@ -282,6 +282,15 @@ final class AssistantSession {
     /// True from `send` until the run ends — including while a confirm card is
     /// parked, because the loop really is still open.
     private(set) var running = false
+    /// The email the LIVE run was asked under, so the bar can say which one it
+    /// is working on rather than which one is behind it. Written by `send` with
+    /// the same value the run pins.
+    ///
+    /// ONLY MEANINGFUL WHILE `running`. The run outlives the bar (see
+    /// `PinnedContext`), so between runs this is just the last question's pin —
+    /// what the NEXT question would carry is the reader's own business, and the
+    /// bar reads it from the store instead.
+    private(set) var activeAskEmail: OpenEmailContext?
     /// Bumped on every streamed delta. The tray follows it to keep the bottom
     /// pinned WITHOUT animating: text growing inside a row is not a change
     /// `onChange` can watch, and animating it would smear the type.
@@ -364,6 +373,7 @@ final class AssistantSession {
             email: openEmail,
             sanitizedSubject: openEmail?.summary?.subject.markerSafeLine(cap: Self.subjectCap),
             switched: switched)
+        activeAskEmail = openEmail
         running = true
         let gen = generation
         runTask = Task { [weak self] in await self?.run(question, pin: pin, gen: gen) }
@@ -396,6 +406,7 @@ final class AssistantSession {
         runTask?.cancel()
         runTask = nil
         running = false
+        activeAskEmail = nil
         transcript.removeAll()
         history.removeAll()
         // A new conversation has no earlier email to have switched away from.
@@ -698,7 +709,16 @@ final class AssistantSession {
             cite: { [weak self] citation in
                 guard let self, self.alive(gen) else { return }
                 if self.cites[citation.threadId] == nil { self.citeOrder.append(citation.threadId) }
-                self.cites[citation.threadId] = citation
+                // LATER READINGS WIN — a get_thread knows more about a thread
+                // than the search hit that found it — except where the newcomer
+                // knows LESS. explain_triage cites from a triage record, which
+                // carries no sender, and a row that already had a face must not
+                // lose it to a reading that never had one.
+                var merged = citation
+                if merged.sender.isEmpty {
+                    merged.sender = self.cites[citation.threadId]?.sender ?? ""
+                }
+                self.cites[citation.threadId] = merged
             },
             show: { [weak self] cards in
                 guard let self, self.alive(gen), !cards.isEmpty else { return }

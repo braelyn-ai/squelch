@@ -96,7 +96,7 @@ enum AgentTools {
             case .searchMail: return try await searchMail(input, cite: cite)
             case .getThread: return try await getThread(input, cite: cite)
             case .getUpdates: return try await getUpdates(input, cite: cite)
-            case .explainTriage: return await explainTriage(input)
+            case .explainTriage: return await explainTriage(input, cite: cite)
             case .getRecords: return try await getRecords(input)
             case .searchContacts: return try await searchContacts(input)
             case .showEmails: return await showEmails(input, show: show)
@@ -143,9 +143,12 @@ enum AgentTools {
     /// along under a card that describes some other message.
     ///
     /// Both ids are required because the client door has no route that returns
-    /// a message BODY by id — /client/triage-debug/{id} answers by message id,
-    /// but with triage metadata, not with the mail — so the proof is a
-    /// membership test through the thread.
+    /// a message BODY by id. /client/triage-debug/{id} answers by message id
+    /// and now names that message's thread, but what it returns is triage
+    /// metadata: no sender, no mail. It can place a message, not describe one,
+    /// and a card that cannot say who sent the thing it is about is not
+    /// informed consent — so the proof stays a membership test through the
+    /// thread.
     @MainActor
     private static func verify(
         _ input: [String: JSONValue], summary: String
@@ -301,7 +304,9 @@ enum AgentTools {
     /// is structurally absent from this door like every other, so it arrives
     /// the same way a wrong id does: a 404.
     @MainActor
-    private static func explainTriage(_ input: [String: JSONValue]) async -> ToolOutcome {
+    private static func explainTriage(
+        _ input: [String: JSONValue], cite: (ToolCitation) -> Void
+    ) async -> ToolOutcome {
         guard let messageId = int(input, "message_id") else {
             return failure("missing message_id", summary: "triage lookup failed")
         }
@@ -317,6 +322,21 @@ enum AgentTools {
         } catch {
             return failure(
                 errText(error, "could not read the triage record"), summary: "triage lookup failed")
+        }
+        // "Why is this here" is an answer ABOUT one email, so it earns a source
+        // the user can open — without one this was the single tool whose answers
+        // arrived with nothing to click. Guarded on non-empty because the
+        // column is TEXT NOT NULL and a row can carry "", and optional because
+        // an older daemon sends no thread_id at all.
+        //
+        // NO SENDER: the triage record has none, and finding one would mean
+        // reading the thread — which this tool's whole contract says it does
+        // not do. The row renders from the subject alone.
+        if let threadId = info.thread_id, !threadId.isEmpty {
+            cite(
+                ToolCitation(
+                    threadId: threadId, subject: info.subject.displaySubject,
+                    sender: "", date: info.surfaced_at ?? info.created_at))
         }
         // The model markers (which stage ran, which model, needs_stage2) are
         // left out: they are the dev inspector's plumbing, and none of them
