@@ -109,6 +109,14 @@ const styles = {
     textAlign: "center",
     padding: "0 1.5rem",
   },
+  cardHalf: {
+    padding: "0.65rem 1.5rem",
+    color: "#111",
+    textDecoration: "none",
+    fontSize: "0.95rem",
+    fontWeight: 500,
+    textAlign: "center",
+  },
   link: {
     color: "#8a8a90",
     fontSize: "1rem",
@@ -203,20 +211,22 @@ export function App() {
         />
         <h1 style={styles.title}>Passband</h1>
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <a
+        <div
           style={{
-            padding: "0.6rem 1.4rem",
-            borderRadius: "0.6rem",
+            display: "flex",
+            borderRadius: "0.7rem",
+            overflow: "hidden",
             background: "#f5f5f7",
-            color: "#111",
-            textDecoration: "none",
-            fontSize: "0.95rem",
-            fontWeight: 500,
           }}
-          href="/download/latest"
         >
-          Download for Mac
-        </a>
+          <a style={styles.cardHalf} href="https://github.com/braelyn-ai/squelch">
+            self-host
+          </a>
+          <div style={{ width: "1px", background: "#c9c9cf" }} />
+          <a style={styles.cardHalf} href="https://signup.passband.app">
+            join waitlist
+          </a>
+        </div>
         <nav style={{ display: "flex", gap: "1.25rem" }}>
           <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
             GitHub
