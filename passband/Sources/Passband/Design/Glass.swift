@@ -69,15 +69,28 @@ extension View {
     /// bounds, and a column's bounds sit AT the card edges — so the material's
     /// intrinsic shadow shears off into a hard-edged dark band down both sides
     /// of the column. Disabling the scroll clip and re-masking wider lets the
-    /// shadow bleed sideways (and off the bottom) while the top stays tight, so
-    /// scrolled-away content still cannot ride up over the chrome above the
-    /// column. Glass shadows are cast downward, so the tight top never shows.
-    func scrollShadowRoom(_ amount: CGFloat = 40) -> some View {
+    /// shadow bleed sideways and off the bottom.
+    ///
+    /// The top cannot be handled the same way: extended, scrolled-away cards
+    /// would ride up over the chrome above the column; tight, a HARD mask edge
+    /// shears the diffuse shadow into a visible line — at rest (the shadow
+    /// projects upward too) and worse mid-scroll, when the shear line slides
+    /// along the card. So the top is a short GRADIENT instead: card and shadow
+    /// fade out together as they leave, and no hard line ever exists. Callers
+    /// must give the scroll content `topFade` of top padding so resting cards
+    /// sit below the fade at full opacity.
+    func scrollShadowRoom(_ amount: CGFloat = 40, topFade: CGFloat = 18) -> some View {
         scrollClipDisabled()
             .mask {
-                Rectangle()
-                    .padding(.horizontal, -amount)
-                    .padding(.bottom, -amount)
+                VStack(spacing: 0) {
+                    LinearGradient(
+                        colors: [.clear, .black], startPoint: .top, endPoint: .bottom
+                    )
+                    .frame(height: topFade)
+                    Color.black
+                }
+                .padding(.horizontal, -amount)
+                .padding(.bottom, -amount)
             }
     }
 

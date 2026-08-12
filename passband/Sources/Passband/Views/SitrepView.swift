@@ -91,9 +91,12 @@ struct SitrepView: View {
             // with one of them and hold still for the other; and "one item needs
             // you today" is the page's standing answer, which is worth keeping on
             // screen rather than scrolling away first.
+            // The 18px gap under the hero lives INSIDE the scroll views as top
+            // padding, not here: scrollShadowRoom's top fade occupies exactly
+            // that band, so resting cards sit below it at full opacity while a
+            // scrolling card fades out through it.
             DashHero(standing: store.sitrep.standing)
                 .padding(.horizontal, 28)
-                .padding(.bottom, 18)
 
             if pageWidth < Self.railBreakpoint {
                 // NARROW: one scroll, records under the work surface. The rail
@@ -106,6 +109,7 @@ struct SitrepView: View {
                         railCards
                         StatusStrip(rulesCount: rulesCount)
                     }
+                    .padding(.top, 18)
                     .padding(.bottom, 28)
                 }
                 .scrollIndicators(.hidden)
@@ -119,6 +123,7 @@ struct SitrepView: View {
                             leftZones(visible: visible, overflow: overflow)
                             StatusStrip(rulesCount: rulesCount)
                         }
+                        .padding(.top, 18)
                         .padding(.bottom, 28)
                     }
                     // No bar on either column. Two of them side by side read as a
@@ -138,6 +143,7 @@ struct SitrepView: View {
                         VStack(spacing: 14) {
                             railZones
                         }
+                        .padding(.top, 18)
                         .padding(.bottom, 28)
                     }
                     .scrollBounceBehavior(.basedOnSize)
