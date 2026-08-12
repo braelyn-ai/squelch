@@ -234,8 +234,9 @@ queryable as normal mail — not even for an instant.
    and individually revocable, effective on the very next request because nothing
    caches the lookup.
 
-**Two unauthenticated routes**, each on its own single-route router merged
-outside the bearer layer so the boundary is visible in `lib.rs`:
+**Surfaces outside the bearer**, each on its own router merged outside the bearer
+layer so the boundary is visible in `lib.rs`. Two are machine-facing, and the
+rest are the console.
 
 - `GET /t/{token}` — the read-tracking pixel (§3). One response, always.
 - `POST /client/pair` — the pairing claim, which has to be unauthenticated: it is
@@ -253,6 +254,67 @@ bearer check is bounded the same way, since any caller can push a `sqd_`-shaped
 guess into it. The pixel bails out when its slots are full (it can answer without
 the store); the claim **waits**, because an answer that varied with load would be
 a signal the uniform 401 exists to remove.
+
+**The console (`/console`).** Server-rendered HTML for the person who owns this
+daemon (`squelch-api/src/console.rs`), on both tiers. **A console session is a
+device token**: signing in claims a pairing code exactly the way `/client/pair` does, and
+the `sqd_` token that comes back is set as a cookie and verified on every later
+request through the same `verify_device_token`. No session table, no signing key,
+no third credential type — so revocation, the audit trail, the one-shot claim and
+the ten-minute TTL are inherited rather than reinvented, and `squelchd token list`
+shows a browser for what it is.
+
+| Route | What gates it |
+|---|---|
+| `GET /console` | nothing. Renders the home page with a valid session cookie and the login page without one |
+| `POST /console/login-code` | a pasted pairing code — the store's own claim: one-shot, ~40 bits, ten minutes, **burns after 5 misses**, queued on the same `PAIR_CONCURRENCY` slots |
+| `GET /console/callback?code=` | the same claim, on a code the control plane minted. Nothing about the hop is trusted here: a code that was burned, replayed, expired or never minted fails exactly like a typo |
+| `POST /console/pair`, `POST /console/revoke/{id}`, `POST /console/logout` | a verified session cookie, checked ahead of the handler |
+
+**Cookie posture.** `HttpOnly`, `SameSite=Strict`, `Path=/`, no `Domain`,
+`Secure` whenever the request arrived over https, 30-day `Max-Age`. Deliberately
+**not** `__Host-` prefixed: the prefix requires `Secure`, a plain-http loopback
+run cannot set it, and a cookie name that only works in production is a name
+whose absence nobody notices until production — so the two properties the prefix
+would buy are set explicitly instead. Sign-out **revokes** the token rather than
+only dropping the cookie, and every refusal of a cookie that would not verify
+clears it on the way out.
+
+**CSRF, two independent controls.** `SameSite=Strict`, plus an
+`Origin`/`Sec-Fetch-Site` check in front of every mutating POST — including the
+*unauthenticated* login POST, so a cross-site page cannot sign a browser into an
+account of the attacker's choosing either. `Sec-Fetch-Site` is believed
+absolutely (page script cannot set it); where it is absent `Origin` is compared
+whole, scheme included; where both are absent the answer is no.
+
+**No CORS layer** on this router, for the reason `/client/pair` has none and more
+so: a bearer is carried by a client that has one, a cookie is carried
+automatically by any browser pointed at us.
+
+**No token on any page, and uniform refusals.** A pairing code renders exactly
+once, on the page that mints it, which is that page's entire purpose; a device
+token appears only in a `Set-Cookie`. Wrong, expired, already claimed, burned and
+"the store could not answer" are one login page with one sentence, byte for byte.
+There is no bare 401 anywhere in the tree, because a person is reading it. Pages
+carry `default-src 'none'; style-src 'unsafe-inline'; form-action 'self';
+frame-ancestors 'none'; base-uri 'none'` and fetch no script, font or image.
+
+**The Google hop is the control plane's, and it is hosted-only.** Google forbids
+wildcard redirect URIs, so a per-tenant hostname cannot run OAuth itself. The
+login page links to `GET /console/auth?tenant=<label>` on `squelch-control`,
+which: is rate-limited on the **signup** budget (the other route that opens a
+server-side session); validates the label and looks the tenant up **before**
+sending anyone to Google; **discovers** the mailbox from Google and compares it
+constant-time against the store's owner for that label, and only then calls the
+warden — so guessing a real label cannot make a pairing code exist, let alone
+show one; and takes **no** `return` or `next` parameter anywhere in the flow, so
+there is no open redirect: the destination is constructed from this deployment's
+own base domain and the validated label. The redirect carrying the live code is
+`Cache-Control: no-store, no-cache` and `Referrer-Policy: no-referrer`. Every
+identity-shaped refusal is one page. The link renders only when
+`SQUELCH_CONSOLE_SSO_URL` is set — hosted tenants get it from the warden
+(`SQUELCH_WARDEN_CONSOLE_SSO_URL`), a self-host never sets it, and without it the
+console is the pasted-code form alone.
 
 **Local drafts (human-door-only table).** `drafts`
 (`squelch-core/src/store/sqlite/drafts.rs`, served only by `/client/drafts`) holds

@@ -146,9 +146,9 @@ unbounded tenant is every other tenant's problem. The daemon's numbers come from
 config; the init container's are fixed and tiny. The namespace-wide ceiling is
 `deploy/hosted/70-tenant-limits.yaml`.
 
-Its environment carries the tenant's mailbox address and the Google OAuth client
-by `secretKeyRef` only, never inline: an address in a pod spec is an address in
-`kubectl get deploy -o yaml`, and so is a client secret.
+Its environment carries the tenant's mailbox address, the Google OAuth client and
+the Anthropic API key by `secretKeyRef` only, never inline: an address in a pod
+spec is an address in `kubectl get deploy -o yaml`, and so is a client secret.
 
 The image's entrypoint is bypassed (`command: /usr/local/bin/squelchd`,
 `args: serve`) because `docker-entrypoint.sh` starts as root to chown the volume
@@ -174,13 +174,34 @@ choice: a Google refresh token only works for the client that minted it, and
 already admits to, and on its own it opens no mailbox. See
 `deploy/hosted/SETUP.md`, "The Google OAuth client".
 
+### The Anthropic key
+
+Stage-2 triage needs one, and hosted tenants get it from a Secret shared by the
+namespace (`SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME`, key `ANTHROPIC_API_KEY`). The
+reference is **optional**: no Secret means the variable is simply unset and that
+tenant runs heuristic-only triage, rather than every pod in the namespace
+wedging in `CreateContainerConfigError`. It is the shared-key bridge production
+already ran as a hand patch, written down; when the relay ships, tenants stop
+holding a key at all.
+
+### The console's Google link
+
+`SQUELCH_WARDEN_CONSOLE_SSO_URL`, an origin, injected as `SQUELCH_CONSOLE_SSO_URL`.
+Google forbids wildcard redirect URIs, so `<label>.<base domain>` cannot run
+OAuth itself; the daemon's `/console` login page instead links to the control
+plane, which authenticates the mailbox, mints a pairing code through this warden
+(`POST /v1/tenants/{label}/pair`), and sends the browser back with it. Unset, and
+the button does not render — which is the self-host posture, and what a hosted
+deploy gets too if nobody configures it. Nothing is trusted on the way back: what
+returns is a pairing code the tenant's own store adjudicates.
+
 ### The agent door
 
-Each tenant's Ingress declares exactly two path prefixes, `/client` and `/t`.
-`/mcp` matches no rule, so the ingress controller answers 404 for it. An
-allowlist rather than a deny rule, because a deny rule has to name every
-spelling of the thing it refuses and fails open when it misses one. The list is
-`HUMAN_DOOR_PREFIXES` in `src/objects.rs`, with a test on it.
+Each tenant's Ingress declares exactly three path prefixes: `/client`,
+`/console` and `/t`. `/mcp` matches no rule, so the ingress controller answers
+404 for it. An allowlist rather than a deny rule, because a deny rule has to
+name every spelling of the thing it refuses and fails open when it misses one.
+The list is `HUMAN_DOOR_PREFIXES` in `src/objects.rs`, with a test on it.
 
 ### The network
 
@@ -221,6 +242,8 @@ step 9 has the procedure and the tenant-to-tenant denial test to run beside it.
 | `SQUELCH_WARDEN_INGRESS_POD_LABEL` | `app.kubernetes.io/name=traefik` | Which pods there may reach a tenant. |
 | `SQUELCH_WARDEN_TLS_SECRET` | `passband-wildcard-tls` | The wildcard certificate, in the tenant namespace. |
 | `SQUELCH_WARDEN_OAUTH_SECRET_NAME` | `google-oauth-client` | Secret holding the web client tenant daemons refresh with. |
+| `SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME` | `anthropic-api-key` | Secret holding the Stage-2 API key, referenced `optional: true`. |
+| `SQUELCH_WARDEN_CONSOLE_SSO_URL` | unset | Control plane origin, passed on as `SQUELCH_CONSOLE_SSO_URL`. Origin only. |
 | `SQUELCH_WARDEN_STORAGE_CLASS` | `local-path` | k3s's built-in provisioner. |
 | `SQUELCH_WARDEN_STORAGE_SIZE` | `10Gi` | Per-tenant volume. |
 | `SQUELCH_WARDEN_CPU_REQUEST` | `100m` | Tenant daemon container. |
@@ -259,6 +282,81 @@ Every apply is a server-side apply, so a retried phase two converges instead of
 duplicating. That is why there is no unwind code: a best-effort teardown running
 on a cluster that is already misbehaving is worse than leaving objects the next
 attempt overwrites.
+
+### What does not reconcile
+
+Kube's control loop keeps each tenant's pod matching the objects the warden
+wrote. **Nothing keeps those objects matching the warden's current code.** A
+tenant's Ingress, NetworkPolicy, Service and Deployment are written once, during
+phase two, and are never revisited unless that tenant is provisioned again.
+
+So a change to the SHAPE of a tenant reaches new tenants only: a path added to
+`HUMAN_DOOR_PREFIXES`, a new environment variable in the pod, a changed
+NetworkPolicy peer. Tenants that already exist keep whatever shape they were
+provisioned with, on an image that may itself be newer, and nothing anywhere
+reports the drift. Deploying a new warden is not a migration.
+
+Two ways to land a shape change on existing tenants today, both by hand:
+
+**1. Apply the object yourself.** Fine for an Ingress or a NetworkPolicy, which
+nothing has to restart to pick up. The Ingress, per tenant, matching what
+`objects.rs::ingress` builds (substitute the label, the base domain, the ingress
+class and the wildcard Secret if yours differ). Server-side, under the warden's
+OWN field manager, because that is how the warden wrote it: a client-side
+`kubectl apply` would leave a second manager owning half the fields and the next
+provision would fight it.
+
+```sh
+kubectl apply --server-side --field-manager=squelch-warden --force-conflicts -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alice
+  namespace: tenants
+  labels:
+    app.kubernetes.io/name: squelchd
+    app.kubernetes.io/instance: alice
+    app.kubernetes.io/managed-by: squelch-warden
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["alice.passband.email"]
+      secretName: passband-wildcard-tls
+  rules:
+    - host: alice.passband.email
+      http:
+        paths:
+          - path: /client
+            pathType: Prefix
+            backend: { service: { name: alice, port: { name: http } } }
+          - path: /console
+            pathType: Prefix
+            backend: { service: { name: alice, port: { name: http } } }
+          - path: /t
+            pathType: Prefix
+            backend: { service: { name: alice, port: { name: http } } }
+EOF
+```
+
+That is hand-written YAML carrying a tenant label, which is exactly what the
+crate's hard rule forbids INSIDE the warden. Outside it, on an operator's
+terminal, with the label already provisioned and in front of a human, it is the
+honest workaround rather than a bug — and it is the strongest argument for the
+reconcile route below.
+
+**2. `DELETE` then `PUT` the credential again.** The general answer, and the only
+one for a change to the pod (a new environment variable, new resources, a new
+image). `DELETE /v1/tenants/{label}` removes the workload and **keeps the data**
+— both Secrets and the volume survive — and a `PUT
+/v1/tenants/{label}/credentials` with the tenant's current sealed blob rebuilds
+every object from today's code. The cost is a recycled pod: that mailbox is down
+for the length of a provision, in-flight requests fail, and the control plane
+must still hold the ciphertext to re-send.
+
+The real fix is a reconcile route on the warden, filed as a design note in
+`deploy/hosted/PRODUCTION.md`'s open items. It is deliberately not in this slice:
+a controller that re-applies to live tenants is a thing that can take every
+tenant down at once, and it wants its own change with its own tests.
 
 ## Logging
 
