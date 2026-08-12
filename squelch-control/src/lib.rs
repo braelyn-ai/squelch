@@ -26,6 +26,7 @@
 //! session ids, cookie MACs, the warden bearer, and access/refresh tokens NEVER
 //! reach a log line. Labels, account emails, statuses, and counts may.
 
+pub mod bifrost;
 pub mod config;
 pub mod cookie;
 pub mod handlers;

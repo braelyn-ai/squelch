@@ -4,10 +4,11 @@
 //! will ever see, and one that guesses its base domain hands out tenant URLs
 //! that resolve to somebody else.
 //!
-//! THREE FIELDS HERE ARE SECRETS — the OAuth client secret, the cookie key, and
-//! the warden bearer — so [`Config`] has a HAND-WRITTEN `Debug` that redacts
-//! them. A derived one would put all three in any `tracing::debug!` that ever
-//! formats the config, and that is exactly the line nobody notices adding.
+//! FOUR FIELDS HERE ARE SECRETS — the OAuth client secret, the cookie key, the
+//! warden bearer, and the Bifrost admin token — so [`Config`] (and
+//! [`BifrostConfig`] inside it) has a HAND-WRITTEN `Debug` that redacts them. A
+//! derived one would put all four in any `tracing::debug!` that ever formats
+//! the config, and that is exactly the line nobody notices adding.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -57,6 +58,20 @@ pub const MIN_COOKIE_KEY_BYTES: usize = 32;
 /// to hold it.
 pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum Bifrost admin-token length, the same bar the warden holds its own
+/// bearer to: below this the token stops being the thing that decides who can
+/// mint unbounded LLM spend.
+pub const MIN_BIFROST_TOKEN_LEN: usize = 32;
+
+/// The monthly spend a tenant's virtual key is minted with when
+/// `SQUELCH_CONTROL_LLM_BUDGET_USD` says nothing.
+pub const DEFAULT_LLM_BUDGET_USD: f64 = 5.00;
+
+/// Ceiling on the configured budget. Same reasoning as the proxy-hop cap: no
+/// tenant's triage costs four figures a month, a larger number is a typo, and
+/// this typo degrades into real money.
+pub const MAX_LLM_BUDGET_USD: f64 = 1_000.0;
+
 /// Why the control plane refused to start.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -105,6 +120,33 @@ pub struct Config {
     pub auth_url: String,
     /// Gmail's profile endpoint, pinned by `from_env` the same way.
     pub profile_url: String,
+    /// The Bifrost LLM gateway, when this deployment has one. `None` means the
+    /// feature is OFF and signup provisions tenants with no LLM key at all;
+    /// a partial trio is a refusal to boot, never a silent off.
+    pub bifrost: Option<BifrostConfig>,
+}
+
+/// The Bifrost governance trio: where the gateway is, the admin bearer that
+/// mints virtual keys, and the monthly budget each tenant's key is minted
+/// with. `admin_token` is a secret; the hand-written `Debug` redacts it.
+#[derive(Clone)]
+pub struct BifrostConfig {
+    /// Base URL of the gateway's governance API, canonical https origin.
+    pub url: String,
+    /// Admin bearer presented on every governance call. Redacted from `Debug`.
+    pub admin_token: String,
+    /// Monthly budget, USD, stamped on every minted virtual key.
+    pub budget_usd: f64,
+}
+
+impl std::fmt::Debug for BifrostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BifrostConfig")
+            .field("url", &self.url)
+            .field("admin_token", &"<redacted>")
+            .field("budget_usd", &self.budget_usd)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -127,6 +169,8 @@ impl std::fmt::Debug for Config {
             .field("token_url", &self.token_url)
             .field("auth_url", &self.auth_url)
             .field("profile_url", &self.profile_url)
+            // BifrostConfig's own Debug redacts the admin token.
+            .field("bifrost", &self.bifrost)
             .finish()
     }
 }
@@ -193,16 +237,12 @@ impl Config {
         // provisioning call instead of sitting in this deployment's environment.
         // One static recipient would have meant one key opening every mailbox.
 
-        let warden_url = canonical_origin(
-            "SQUELCH_CONTROL_WARDEN_URL",
-            &require(
-                "SQUELCH_CONTROL_WARDEN_URL",
-                "the warden's base URL, e.g. https://warden.passband.email",
-            )?,
-        )?;
-        let warden_token = require(
-            "SQUELCH_CONTROL_WARDEN_TOKEN",
-            "the bearer the warden expects; must match SQUELCH_WARDEN_TOKEN in the cluster",
+        let (warden_url, warden_token) = warden_from_env()?;
+
+        let bifrost = bifrost_from(
+            var("SQUELCH_CONTROL_BIFROST_URL"),
+            var("SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN"),
+            var("SQUELCH_CONTROL_LLM_BUDGET_USD"),
         )?;
 
         let trusted_proxy_hops = match var("SQUELCH_CONTROL_TRUSTED_PROXY_HOPS") {
@@ -237,6 +277,7 @@ impl Config {
             token_url: GOOGLE_TOKEN_URL.to_string(),
             auth_url: GOOGLE_AUTH_URL.to_string(),
             profile_url: GMAIL_PROFILE_URL.to_string(),
+            bifrost,
         })
     }
 
@@ -252,6 +293,95 @@ impl Config {
     pub fn is_insecure(&self) -> bool {
         self.public_url.starts_with("http://")
     }
+}
+
+/// The warden pair from the environment, validated. Shared by `serve` (via
+/// [`Config::from_env`]) and the `llm` operator commands, which need a warden
+/// client but must not need an OAuth client or a cookie key to rotate a key.
+pub fn warden_from_env() -> Result<(String, String), ConfigError> {
+    let url = canonical_origin(
+        "SQUELCH_CONTROL_WARDEN_URL",
+        &require(
+            "SQUELCH_CONTROL_WARDEN_URL",
+            "the warden's base URL, e.g. https://warden.passband.email",
+        )?,
+    )?;
+    let token = require(
+        "SQUELCH_CONTROL_WARDEN_TOKEN",
+        "the bearer the warden expects; must match SQUELCH_WARDEN_TOKEN in the cluster",
+    )?;
+    Ok((url, token))
+}
+
+impl BifrostConfig {
+    /// The Bifrost trio from the environment: `Ok(None)` when the feature is
+    /// off, an error when it is half-configured. For the `llm` operator
+    /// commands, which need this and the warden pair and nothing else.
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        bifrost_from(
+            var("SQUELCH_CONTROL_BIFROST_URL"),
+            var("SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN"),
+            var("SQUELCH_CONTROL_LLM_BUDGET_USD"),
+        )
+    }
+}
+
+/// Validate the Bifrost trio, all-or-nothing.
+///
+/// None of the three set means the feature is OFF, which is a legal deployment
+/// (self-host, or hosted before the gateway exists). Some-but-not-all is a
+/// REFUSAL TO BOOT: a control plane that quietly ran without the gateway would
+/// provision every tenant keyless and nobody would notice until the first
+/// triage call failed, weeks of signups later. The budget alone is the one
+/// field with a default, because "the trio is on" is decided by the url and
+/// the token, and a budget without either is still a half-configured feature.
+fn bifrost_from(
+    url: Option<String>,
+    admin_token: Option<String>,
+    budget: Option<String>,
+) -> Result<Option<BifrostConfig>, ConfigError> {
+    if url.is_none() && admin_token.is_none() && budget.is_none() {
+        return Ok(None);
+    }
+    let (Some(url), Some(admin_token)) = (url, admin_token) else {
+        return Err(ConfigError::invalid(
+            "SQUELCH_CONTROL_BIFROST_URL and SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN must be set \
+             together (SQUELCH_CONTROL_LLM_BUDGET_USD is optional); set both or neither",
+        ));
+    };
+    let url = canonical_origin("SQUELCH_CONTROL_BIFROST_URL", &url)?;
+    // https only, no local-dev exception: what rides this connection is an
+    // admin bearer that mints spend and, coming back, a live per-tenant key.
+    if !url.starts_with("https://") {
+        return Err(ConfigError::invalid(format!(
+            "invalid SQUELCH_CONTROL_BIFROST_URL `{url}`: the governance API must be https"
+        )));
+    }
+    if admin_token.len() < MIN_BIFROST_TOKEN_LEN {
+        return Err(ConfigError::invalid(format!(
+            "SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN is {} characters; at least {MIN_BIFROST_TOKEN_LEN} are required",
+            admin_token.len()
+        )));
+    }
+    let budget_usd = match budget {
+        None => DEFAULT_LLM_BUDGET_USD,
+        Some(v) => {
+            let usd: f64 = v.parse().map_err(|e| {
+                ConfigError::invalid(format!("invalid SQUELCH_CONTROL_LLM_BUDGET_USD `{v}`: {e}"))
+            })?;
+            if !usd.is_finite() || usd <= 0.0 || usd > MAX_LLM_BUDGET_USD {
+                return Err(ConfigError::invalid(format!(
+                    "SQUELCH_CONTROL_LLM_BUDGET_USD `{v}` must be a positive amount no larger than {MAX_LLM_BUDGET_USD}"
+                )));
+            }
+            usd
+        }
+    };
+    Ok(Some(BifrostConfig {
+        url,
+        admin_token,
+        budget_usd,
+    }))
 }
 
 /// Parse, validate, and canonicalize an origin (`https://host[:port]`).
@@ -382,6 +512,11 @@ mod tests {
             token_url: GOOGLE_TOKEN_URL.into(),
             auth_url: GOOGLE_AUTH_URL.into(),
             profile_url: GMAIL_PROFILE_URL.into(),
+            bifrost: Some(BifrostConfig {
+                url: "https://bifrost.passband.email".into(),
+                admin_token: "BIFROST-ADMIN-VALUE".into(),
+                budget_usd: DEFAULT_LLM_BUDGET_USD,
+            }),
         }
     }
 
@@ -472,14 +607,62 @@ mod tests {
         assert!(decode_cookie_key(&short).is_err());
     }
 
-    /// The three secrets must not be formattable out of the struct.
+    /// The four secrets must not be formattable out of the struct.
     #[test]
     fn debug_redacts_every_secret() {
         let rendered = format!("{:?}", sample());
         assert!(!rendered.contains("TOP-SECRET-VALUE"), "{rendered}");
         assert!(!rendered.contains("WARDEN-BEARER-VALUE"), "{rendered}");
+        assert!(!rendered.contains("BIFROST-ADMIN-VALUE"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("<32 bytes>"));
+    }
+
+    /// The Bifrost trio is a unit: all set is the feature on, none is off, and
+    /// anything in between is a refusal to boot rather than a silent off.
+    #[test]
+    fn the_bifrost_trio_is_all_or_nothing() {
+        let some = |s: &str| Some(s.to_string());
+        let token = "b".repeat(MIN_BIFROST_TOKEN_LEN);
+
+        assert!(bifrost_from(None, None, None).unwrap().is_none(), "off");
+
+        let on = bifrost_from(some("https://bifrost.example"), some(&token), None)
+            .unwrap()
+            .expect("url + token switches the feature on");
+        assert_eq!(on.url, "https://bifrost.example");
+        assert_eq!(on.budget_usd, DEFAULT_LLM_BUDGET_USD);
+
+        let on = bifrost_from(some("https://bifrost.example"), some(&token), some("12.5"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(on.budget_usd, 12.5);
+
+        // Every partial combination refuses.
+        assert!(bifrost_from(some("https://bifrost.example"), None, None).is_err());
+        assert!(bifrost_from(None, some(&token), None).is_err());
+        assert!(bifrost_from(None, None, some("5")).is_err());
+        assert!(bifrost_from(some("https://bifrost.example"), None, some("5")).is_err());
+        assert!(bifrost_from(None, some(&token), some("5")).is_err());
+    }
+
+    /// The values themselves are held to the same bar the rest of the config
+    /// is: https only, a real token, a budget that is money and not a typo.
+    #[test]
+    fn the_bifrost_trio_is_validated() {
+        let some = |s: &str| Some(s.to_string());
+        let token = "b".repeat(MIN_BIFROST_TOKEN_LEN);
+
+        assert!(bifrost_from(some("http://bifrost.example"), some(&token), None).is_err());
+        assert!(bifrost_from(some("not a url"), some(&token), None).is_err());
+        let short = "b".repeat(MIN_BIFROST_TOKEN_LEN - 1);
+        assert!(bifrost_from(some("https://bifrost.example"), some(&short), None).is_err());
+        for bad in ["nonsense", "0", "-5", "NaN", "inf", "1000000"] {
+            assert!(
+                bifrost_from(some("https://bifrost.example"), some(&token), some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

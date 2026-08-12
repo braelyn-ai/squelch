@@ -13,7 +13,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use crate::config::Config;
+use crate::bifrost::{BifrostClient, BifrostError};
+use crate::config::{BifrostConfig, Config, OUTBOUND_TIMEOUT};
 use crate::ratelimit::{
     CALLBACK_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE, RateLimiter,
     SIGNUP_REQUESTS_PER_MINUTE,
@@ -31,6 +32,11 @@ struct Inner {
     config: Config,
     store: ControlStore,
     warden: Arc<dyn Warden>,
+    /// The LLM gateway's governance client, DERIVED in [`ControlState::new`]
+    /// from `config.bifrost` so it is present exactly when the config trio is
+    /// and can never disagree with it. `None` means signup provisions keyless
+    /// tenants and the `llm mint` operator command backfills them later.
+    bifrost: Option<Arc<BifrostClient>>,
     sessions: Mutex<SessionStore>,
     page_limiter: Mutex<RateLimiter>,
     signup_limiter: Mutex<RateLimiter>,
@@ -39,21 +45,39 @@ struct Inner {
 
 impl ControlState {
     /// Build state from validated config, an open store, and a warden client.
-    /// Infallible: everything that could be refused was refused when the config
-    /// was validated, and the only key material in the flow now arrives per
-    /// signup from the warden.
-    pub fn new(config: Config, store: ControlStore, warden: Arc<dyn Warden>) -> Self {
-        Self {
+    ///
+    /// The Bifrost client is DERIVED here from `config.bifrost`, so the
+    /// feature has exactly one switch: the config trio. A caller cannot hand
+    /// in a client the config does not describe, or forget one it does.
+    /// Fallible only in the one way that derivation is (the HTTP client
+    /// failing to build); everything else that could be refused was refused
+    /// when the config was validated, and the only key material in the flow
+    /// arrives per signup from the warden.
+    pub fn new(
+        config: Config,
+        store: ControlStore,
+        warden: Arc<dyn Warden>,
+    ) -> Result<Self, BifrostError> {
+        let bifrost = config
+            .bifrost
+            .as_ref()
+            .map(|b| {
+                BifrostClient::new(b.url.clone(), b.admin_token.clone(), OUTBOUND_TIMEOUT)
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 store,
                 warden,
+                bifrost,
                 sessions: Mutex::new(SessionStore::new()),
                 page_limiter: Mutex::new(RateLimiter::per_minute(PAGE_REQUESTS_PER_MINUTE)),
                 signup_limiter: Mutex::new(RateLimiter::per_minute(SIGNUP_REQUESTS_PER_MINUTE)),
                 callback_limiter: Mutex::new(RateLimiter::per_minute(CALLBACK_REQUESTS_PER_MINUTE)),
             }),
-        }
+        })
     }
 
     pub fn config(&self) -> &Config {
@@ -66,6 +90,17 @@ impl ControlState {
 
     pub fn warden(&self) -> &dyn Warden {
         self.inner.warden.as_ref()
+    }
+
+    /// The Bifrost governance client and its config, together, when this
+    /// deployment has the gateway. One `Option` for the pair because both
+    /// derive from `config.bifrost` in [`Self::new`]: no caller can see a
+    /// client without its budget, or a budget without its client.
+    pub fn bifrost(&self) -> Option<(&BifrostClient, &BifrostConfig)> {
+        self.inner
+            .bifrost
+            .as_deref()
+            .zip(self.inner.config.bifrost.as_ref())
     }
 
     /// The pending-signup table. Poisoning is RECOVERED rather than propagated:

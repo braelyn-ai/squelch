@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use squelch_control::config::{self, OUTBOUND_TIMEOUT};
-use squelch_control::warden::HttpWarden;
+use squelch_control::bifrost::BifrostClient;
+use squelch_control::config::{self, BifrostConfig, OUTBOUND_TIMEOUT};
+use squelch_control::warden::{HttpWarden, Warden as _};
 use squelch_control::{Config, ControlState, ControlStore, invites, router};
 use tracing_subscriber::EnvFilter;
 
@@ -51,6 +52,29 @@ enum Command {
     },
     /// List provisioned tenants.
     Tenants,
+    /// Mint, install, and revoke tenants' LLM virtual keys.
+    Llm {
+        #[command(subcommand)]
+        command: LlmCommand,
+    },
+}
+
+/// The LLM-key operator commands. Unlike `invite`, these need the Bifrost trio
+/// and the warden pair in the environment as well as the store: minting is a
+/// governance call and installing is a warden call. They still do NOT need the
+/// OAuth client or the cookie key.
+///
+/// The key VALUE follows the same rule as everywhere else: it exists between
+/// the mint and the warden PUT and is never printed, stored, or logged. What
+/// these commands print are IDS.
+#[derive(Subcommand)]
+enum LlmCommand {
+    /// Mint a virtual key for a tenant and install it via the warden. A tenant
+    /// that already has one gets a NEW key; the old one stays live in Bifrost
+    /// until revoked there, and its id is printed as a reminder.
+    Mint { label: String },
+    /// Revoke a tenant's recorded virtual key in Bifrost and forget it.
+    Revoke { label: String },
 }
 
 #[derive(Subcommand)]
@@ -89,6 +113,7 @@ fn main() -> anyhow::Result<()> {
         Command::Serve => serve(),
         Command::Invite { command } => invite(command),
         Command::Tenants => tenants(),
+        Command::Llm { command } => llm(command),
     }
 }
 
@@ -192,6 +217,106 @@ fn stamp(t: chrono::DateTime<chrono::Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn llm(command: LlmCommand) -> anyhow::Result<()> {
+    let Some(llm) = BifrostConfig::from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?
+    else {
+        anyhow::bail!(
+            "the LLM gateway is not configured: set SQUELCH_CONTROL_BIFROST_URL and \
+             SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN (and optionally SQUELCH_CONTROL_LLM_BUDGET_USD)"
+        );
+    };
+    let (warden_url, warden_token) =
+        config::warden_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
+
+    let store = open_store()?;
+    let warden = HttpWarden::new(warden_url, warden_token, OUTBOUND_TIMEOUT)?;
+    let bifrost = BifrostClient::new(llm.url.clone(), llm.admin_token.clone(), OUTBOUND_TIMEOUT)?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        match command {
+            LlmCommand::Mint { label } => {
+                llm_mint(&store, &bifrost, &warden, llm.budget_usd, &label).await
+            }
+            LlmCommand::Revoke { label } => llm_revoke(&store, &bifrost, &label).await,
+        }
+    })
+}
+
+/// Mint -> install -> record, the same order signup uses, but FAIL-LOUD: this
+/// is the command an operator runs to fix a keyless or mis-keyed tenant, so a
+/// half-finished rotation must end in an error naming what to do, not a shrug.
+async fn llm_mint(
+    store: &ControlStore,
+    bifrost: &BifrostClient,
+    warden: &HttpWarden,
+    budget_usd: f64,
+    label: &str,
+) -> anyhow::Result<()> {
+    if !store.label_exists(label)? {
+        anyhow::bail!("no tenant `{label}` in the control store");
+    }
+    let old = store.tenant_vk(label)?;
+
+    let vk = bifrost.mint_virtual_key(label, budget_usd).await?;
+    // Recorded BEFORE the install is attempted: from this moment a key exists
+    // in Bifrost, and whatever happens next, the store must name it so a later
+    // `llm revoke` or `llm mint` can find it. The install failing does not
+    // un-mint it.
+    if !store.set_tenant_vk(label, &vk.id)? {
+        anyhow::bail!(
+            "tenant `{label}` vanished from the store mid-mint; revoke virtual key {} in Bifrost by hand",
+            vk.id
+        );
+    }
+    if let Err(e) = warden.put_llm_key(label, &vk.value).await {
+        if let Some(old) = &old {
+            // The rotation half-failed: the cluster still runs on the OLD key,
+            // which this store no longer tracks. Its id must not scroll away.
+            eprintln!(
+                "squelch-control: the previous virtual key {old} is still installed and live in \
+                 Bifrost; the store now tracks only the new one."
+            );
+        }
+        anyhow::bail!(
+            "minted virtual key {} but the warden did not take it: {e}. The id is recorded; \
+             run `llm mint {label}` again to replace it, or `llm revoke {label}` to back out",
+            vk.id
+        );
+    }
+
+    eprintln!("squelch-control: virtual key {} minted and installed for {label}.", vk.id);
+    if let Some(old) = old.filter(|old| *old != vk.id) {
+        eprintln!(
+            "squelch-control: the PREVIOUS virtual key {old} is still live in Bifrost; revoke it \
+             there. This store now tracks only the new key."
+        );
+    }
+    Ok(())
+}
+
+async fn llm_revoke(
+    store: &ControlStore,
+    bifrost: &BifrostClient,
+    label: &str,
+) -> anyhow::Result<()> {
+    if !store.label_exists(label)? {
+        anyhow::bail!("no tenant `{label}` in the control store");
+    }
+    let Some(id) = store.tenant_vk(label)? else {
+        eprintln!("squelch-control: no virtual key is recorded for {label}; nothing to revoke.");
+        return Ok(());
+    };
+    bifrost.revoke_virtual_key(&id).await?;
+    // Cleared only AFTER Bifrost confirms: a revoke that failed must leave the
+    // pointer in place for the retry.
+    store.clear_tenant_vk(label)?;
+    eprintln!("squelch-control: virtual key {id} revoked and forgotten for {label}.");
+    Ok(())
+}
+
 fn serve() -> anyhow::Result<()> {
     let config = Config::from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -212,7 +337,10 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
         config.warden_token.clone(),
         OUTBOUND_TIMEOUT,
     )?);
-    let state = ControlState::new(config, store, warden);
+    // The Bifrost client is derived inside `ControlState::new` from
+    // `config.bifrost`: signup mints per-tenant LLM keys exactly when the
+    // trio is configured, and half-states were refused at config time.
+    let state = ControlState::new(config, store, warden)?;
     let app = router(state.clone());
 
     let sweeper = state.clone();
