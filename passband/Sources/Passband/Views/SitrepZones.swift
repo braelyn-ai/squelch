@@ -312,9 +312,10 @@ struct ReceiptsZone: View {
 
 // MARK: - newsletters
 
-/// THE RULE-ONBOARDING SURFACE: recurring marketing senders, each governing rule
-/// shown as an editable chip. Clicking opens that sender's latest email with
-/// their whole window as the viewer's h/l queue; `e` while hovering marks it done.
+/// THE RULE-ONBOARDING SURFACE: recurring marketing senders; a ruled sender is
+/// marked only by the card's accent border (rules are edited in the Rules view).
+/// Clicking opens that sender's latest email with their whole window as the
+/// viewer's h/l queue; `e` while hovering marks it done.
 ///
 /// THE FETCH LIVES IN SitrepView, NOT HERE: SwiftUI gives `EmptyView` no
 /// lifetime, so `.task`/`.onAppear` on a view that resolves to nothing never
@@ -433,25 +434,6 @@ private struct NewsletterCard: View {
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    if let rule = newsletter.rule {
-                        // A ruled card keeps its chip as the EDIT affordance.
-                        ChromeChip(help: "edit this rule", action: edit) {
-                            HStack(spacing: 5) {
-                                Text(rule.disposition.label)
-                                    .font(Typo.micro)
-                                    .foregroundStyle(Palette.accent)
-                                if !rule.want_text.isEmpty {
-                                    Text(Newsletters.truncate(rule.want_text, 40))
-                                        .font(Typo.micro)
-                                        .foregroundStyle(Palette.inkFaintest)
-                                        .lineLimit(1)
-                                }
-                                Image(systemName: "pencil")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(Palette.inkFaintest)
-                            }
-                        }
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -483,13 +465,6 @@ private struct NewsletterCard: View {
         store.openThread(newsletter.latestThreadId, queue: newsletter.items)
     }
 
-    /// Re-derive after a save, so the chip/CTA reflects the new rule immediately.
-    private func edit() {
-        guard let rule = newsletter.rule else { return }
-        store.openRuleEditor(
-            RuleEditorRequest(
-                rule: rule, onSaved: { Task { await store.refreshZones(force: true) } }))
-    }
 }
 
 /// Hero thumbnail mined from the latest email's sanitized html via the shared
