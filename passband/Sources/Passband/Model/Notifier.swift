@@ -302,19 +302,20 @@ final class Notifier {
     private func deliver(_ target: TapTarget, accountId: UUID?) {
         // No account on the payload: a banner posted by a build from before
         // notifications carried one, still sitting in Notification Center. The
-        // live account is the only guess available, and it is the same one that
-        // build would have opened it against.
-        guard let accountId, accountId != AccountManager.shared.activeId else {
-            front()
-            open(target)
-            return
-        }
-        // An account that has since been REMOVED. Its ids address a daemon this
-        // install no longer has credentials for, and opening one against
-        // whoever is live would show a stranger's mail — so the tap fronts the
-        // app and stops there, which is the honest whole of what can still be
-        // done about it.
-        guard AccountManager.shared.accounts.contains(where: { $0.id == accountId }) else {
+        // live account is the only guess available — and the guess then walks
+        // the SAME guards as a named account below. "No account" must not be a
+        // wider door than naming one: the old shape opened such a tap straight
+        // through, firing an authenticated request from behind the Connect
+        // gate with whatever credentials the client still held.
+        let resolved = accountId ?? AccountManager.shared.activeId
+        // An account that has since been REMOVED — or nothing named and no
+        // live account to guess. Its ids address a daemon this install no
+        // longer has credentials for, and opening one against whoever is live
+        // would show a stranger's mail — so the tap fronts the app and stops
+        // there, which is the honest whole of what can still be done about it.
+        guard let resolved,
+            AccountManager.shared.accounts.contains(where: { $0.id == resolved })
+        else {
             front()
             return
         }
@@ -327,8 +328,14 @@ final class Notifier {
             front()
             return
         }
+        // The live account's own banner opens in place; no switch to run.
+        guard resolved != AccountManager.shared.activeId else {
+            front()
+            open(target)
+            return
+        }
         Task {
-            await AccountManager.shared.switchTo(accountId)
+            await AccountManager.shared.switchTo(resolved)
             front()
             // The switch is allowed to decline (one already running) and
             // allowed to fail (the credentials behind the record are gone, and
@@ -336,7 +343,7 @@ final class Notifier {
             // on screen, and thread ids are per-daemon: opening one here would
             // show whatever that id happens to name in the wrong account. The
             // Auth view is no safer — it renders the live account's codes.
-            guard AccountManager.shared.activeId == accountId else { return }
+            guard AccountManager.shared.activeId == resolved else { return }
             open(target)
         }
     }

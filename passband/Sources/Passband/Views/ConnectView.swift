@@ -506,7 +506,12 @@ struct ConnectView: View {
         // and gets said out loud before a code is typed at it.
         linkHost = link.isLoopback ? nil : link.displayHost
         linkArmed = true
-        focus = .submit
+        // At the gate the form is the whole screen and Return is the natural
+        // next act. The Add Account sheet is raised OVER whatever the human
+        // was doing, and focusing submit there would let a Return already in
+        // flight claim against the link's chosen host — pairing from a link
+        // while connected takes an explicit click.
+        focus = purpose == .gate ? .submit : nil
     }
 }
 

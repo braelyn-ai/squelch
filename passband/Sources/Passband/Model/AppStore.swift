@@ -451,6 +451,13 @@ final class AppStore {
     ///   the sheet adds an account beside it, it does not replace it.
     func receivePairLink(_ url: URL) {
         guard let link = PairLink(url) else { return }
+        #if os(iOS)
+            // Nothing on the phone presents the Add Account sheet, so a link
+            // arriving while connected would park here forever — and then be
+            // applied, arbitrarily stale, by whatever Connect gate mounts
+            // next. Dropped instead; a link at the gate still fills the form.
+            guard connStatus != .connected else { return }
+        #endif
         pairLink = link
         if connStatus == .connected { addAccountSheetOpen = true }
     }
@@ -1116,32 +1123,42 @@ final class AppStore {
 
     private func performZoneRefresh() async {
         let e = epoch
-        // Five independent endpoints, kicked off together so the first paint does
+        // Six independent fetches, kicked off together so the first paint does
         // not wait on the sum of them.
         async let calendar = APIClient.shared.getCalendar()
         async let shipments = APIClient.shared.getShipments(includeDelivered: true)
         async let banking = APIClient.shared.getBanking()
         async let receipts = APIClient.shared.getReceipts()
         async let rules = APIClient.shared.listRules()
-        let newsletters = await NewsletterFeed.load()
+        async let newsletterRows = NewsletterFeed.load()
 
-        // Collected before ANY of them is written: an account switch landing
-        // between two of these assignments is the one way to get a dashboard
-        // showing half of each mailbox.
-        let calendarRows = try? await calendar
-        let shipmentRows = try? await shipments
-        let bankingRows = try? await banking
-        let receiptRows = try? await receipts
-        let ruleRows = try? await rules
+        // Each zone lands as its endpoint answers — one wedged endpoint riding
+        // out its timeout must not hold every other zone's paint hostage — and
+        // every write is individually fenced on the epoch, so a switch landing
+        // mid-pass cannot show half of each mailbox. A failing endpoint leaves
+        // its own zone's last good rows rather than blanking the column.
+        if let rows = try? await calendar {
+            guard e == epoch else { return }
+            zones.calendar = rows
+        }
+        if let rows = try? await shipments {
+            guard e == epoch else { return }
+            zones.shipments = rows
+        }
+        if let rows = try? await banking {
+            guard e == epoch else { return }
+            zones.banking = rows
+        }
+        if let rows = try? await receipts {
+            guard e == epoch else { return }
+            zones.receipts = rows
+        }
+        if let rows = try? await rules {
+            guard e == epoch else { return }
+            zones.rulesCount = rows.count
+        }
+        let newsletters = await newsletterRows
         guard e == epoch else { return }
-
-        // Each lands on its own: one failing endpoint leaves the OTHER four
-        // zones showing their last good rows rather than blanking the column.
-        if let rows = calendarRows { zones.calendar = rows }
-        if let rows = shipmentRows { zones.shipments = rows }
-        if let rows = bankingRows { zones.banking = rows }
-        if let rows = receiptRows { zones.receipts = rows }
-        if let rows = ruleRows { zones.rulesCount = rows.count }
         if !newsletters.isEmpty || zones.newsletters.isEmpty {
             zones.newsletters = newsletters
         }
