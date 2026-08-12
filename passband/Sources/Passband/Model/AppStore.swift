@@ -271,6 +271,11 @@ struct RuleEditorRequest: Identifiable, Sendable {
     var want: String?
     /// Explicit match_pattern override; wins over deriving from `sender`.
     var pattern: String?
+    /// TAKES THE SAVE OVER. Set, the editor hands it the body it built and
+    /// stops there: no POST, no analytics, no rule. The onboarding tour is the
+    /// only caller — its rule is a demonstration, and a real write would both
+    /// invent a rule nobody asked for and 403 on a read-only daemon.
+    var intercept: (@MainActor @Sendable (CreateRuleBody) -> Void)?
     /// Called after a successful save so the opener re-fetches its list.
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
@@ -355,6 +360,10 @@ final class AppStore {
     /// transcript survives until the user asks for a new chat.
     let assistant = AssistantSession()
     var shortcutsOpen = false
+    /// The first-run tour. Held here for the same reason the assistant is: it
+    /// outlives every view it draws itself in, and the trigger that starts it
+    /// (the first sync of the session) fires from the shell, not from a step.
+    let tour = TourController()
 
     // MARK: undo / toasts
     var undos: [PendingUndo] = []
@@ -630,9 +639,13 @@ final class AppStore {
     /// overlays on one. The reader's `inlineReply` is absent for the same reason:
     /// it is part of the viewer, and blurring the email you are answering would
     /// be absurd.
+    /// The tour joins on `wantsBlur` alone: its three talking steps are modals
+    /// like any other, but its coach marks POINT AT the board, so blurring what
+    /// they are ringing would defeat them.
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
+            || tour.wantsBlur
     }
 
     // MARK: - sitrep zones

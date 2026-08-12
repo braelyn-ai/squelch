@@ -108,7 +108,9 @@ struct SitrepView: View {
                 ScrollView(.vertical) {
                     VStack(spacing: 16) {
                         leftZones(visible: visible, overflow: overflow)
-                        railCards
+                        // Same key as the pinned rail below: whichever layout is
+                        // on screen is the one the tour's ring finds.
+                        railCards.tourTarget(.records)
                         StatusStrip(rulesCount: rulesCount)
                     }
                     .padding(.top, 14)
@@ -152,6 +154,9 @@ struct SitrepView: View {
                     .scrollIndicators(.hidden)
                     .scrollShadowRoom()
                     .frame(width: 306)
+                    // The COLUMN, not its content: a rail taller than the window
+                    // would put the ring's bottom edge off screen.
+                    .tourTarget(.records)
                 }
                 .padding(.horizontal, 24)
             }
@@ -185,11 +190,14 @@ struct SitrepView: View {
     private func leftZones(visible: [AttentionUpdate], overflow: Int) -> some View {
         if !store.sitrep.standing.isEmpty {
             forYourEyes(visible: visible, overflow: overflow)
+                .tourTarget(.eyes)
         }
         NewslettersZone(
             newsletters: Newsletters.prune(
                 store.zones.newsletters, resolved: store.resolvedIds),
-            cursor: cursor)
+            cursor: cursor
+        )
+        .tourTarget(.newsletters)
     }
 
     /// The records zones as the pinned rail shows them: full-width rows.

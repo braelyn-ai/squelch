@@ -23,6 +23,7 @@ struct SettingsView: View {
                             ConnectionSection()
                             AppearanceSection()
                             NotificationsSection()
+                            TourSection()
                             DeveloperSection()
                             YouSection()
                         case .mail:
@@ -387,6 +388,25 @@ private struct NotificationsSection: View {
         player?.stop()
         player = PlatformSound(contentsOf: url, byReference: true)
         player?.play()
+    }
+}
+
+/// The first-run walkthrough, on demand. Replay leaves Settings for the sitrep,
+/// which four of the seven steps are about.
+private struct TourSection: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        SectionCard(label: "Tour") {
+            InlineRow(key: "walkthrough") {
+                Button("replay the tour") { store.tour.replay(store: store) }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+            }
+            SettingsHint(
+                "Seven steps over your own board: what triage filed, where records live, and how to teach it about a sender."
+            )
+        }
     }
 }
 
