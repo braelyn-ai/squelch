@@ -76,10 +76,15 @@ extension View {
     /// shears the diffuse shadow into a visible line — at rest (the shadow
     /// projects upward too) and worse mid-scroll, when the shear line slides
     /// along the card. So the top is a short GRADIENT instead: card and shadow
-    /// fade out together as they leave, and no hard line ever exists. Callers
-    /// must give the scroll content `topFade` of top padding so resting cards
-    /// sit below the fade at full opacity.
-    func scrollShadowRoom(_ amount: CGFloat = 40, topFade: CGFloat = 18) -> some View {
+    /// fade out together as they leave, and no hard line ever exists.
+    ///
+    /// The caller owes the fade its geometry on BOTH sides of the viewport
+    /// edge: `topFade` of top padding INSIDE the scroll content, so resting
+    /// cards sit below the fade at full opacity — and a standoff OUTSIDE the
+    /// scroll view (padding on the chrome above), because the fade reaches
+    /// zero exactly at the viewport top, so whatever gap separates that edge
+    /// from the chrome is all the breathing room scrolling content ever gets.
+    func scrollShadowRoom(_ amount: CGFloat = 40, topFade: CGFloat = 14) -> some View {
         scrollClipDisabled()
             .mask {
                 VStack(spacing: 0) {
