@@ -1226,6 +1226,66 @@ pub async fn delete_draft(
     }
 }
 
+// --- GET /client/sent --------------------------------------------------------
+
+/// One message the user sent. HUMAN DOOR ONLY: the agent door has no sent
+/// surface at all, and every other listing on both doors filters `is_sent = 0`.
+/// Metadata only — the body is reached the way any other message's is, through
+/// `GET /client/thread/{thread_id}`.
+#[derive(Debug, Serialize)]
+struct SentItem {
+    id: i64,
+    thread_id: String,
+    /// Display recipients, `""` when the row predates the recipients backfill.
+    to: String,
+    subject: String,
+    snippet: String,
+    /// `messages.received_at` verbatim: for sent mail, when it went out.
+    sent_at: String,
+    /// Recorded read receipts. Always 0 unless the send was tracked.
+    opens: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SentQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+/// `GET /client/sent` — the user's own outbox, newest first. A plain read: no
+/// surfacing stamp (sent mail is in no attention band) and no audit row, exactly
+/// like the other read-only listings.
+pub async fn get_sent(
+    State(state): State<ApiState>,
+    Query(q): Query<SentQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (limit, offset) = paginate(q.limit, q.cursor.as_deref())?;
+    // sent_listing excludes sealed rows in SQL, failing CLOSED on a missing
+    // triage row.
+    let rows = store_call(&state, move |store, account_id| {
+        store.sent_listing(account_id, limit, offset)
+    })
+    .await?;
+    let items: Vec<SentItem> = rows
+        .into_iter()
+        .map(|m| SentItem {
+            id: m.id,
+            thread_id: m.thread_id,
+            to: m.to,
+            subject: m.subject,
+            snippet: m.snippet,
+            sent_at: m.sent_at,
+            opens: m.opens,
+        })
+        .collect();
+
+    let next = next_cursor(items.len(), limit, offset);
+    Ok(Json(Page {
+        items,
+        next_cursor: next,
+    }))
+}
+
 // --- POST /client/markdown/preview -------------------------------------------
 
 #[derive(Debug, Deserialize)]

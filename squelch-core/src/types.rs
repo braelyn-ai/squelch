@@ -516,6 +516,12 @@ pub struct NewMessage {
     /// door serves flattened `body` text (see docs/SECURITY.md).
     pub body_html: Option<String>,
     pub is_sent: bool,
+    /// Display recipients (To + Cc) of SENT mail, comma-joined `Name <addr>`
+    /// (bare addr when the header carried no display name). `None` for received
+    /// mail, and `None` from any caller that did not parse the headers — the
+    /// upsert treats `None` as "no opinion" and keeps whatever is stored, so a
+    /// re-fetch can fill a row in without a later one blanking it.
+    pub to_addrs: Option<String>,
     /// Raw `List-Unsubscribe` header value (comma-separated `<mailto:…>` /
     /// `<https:…>` entries). Consumed ONLY by the human door's unsubscribe
     /// endpoint; never crosses /mcp.

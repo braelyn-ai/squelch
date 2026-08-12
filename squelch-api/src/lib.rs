@@ -66,6 +66,10 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/banking", get(handlers::get_banking))
         .route("/client/calendar", get(handlers::get_calendar))
         .route("/client/search", get(handlers::search))
+        // The user's own sent mail. Human door only — this is the one listing
+        // that reads `is_sent = 1`, and the agent door gets no such route: what
+        // the user writes is not the agent's to page through.
+        .route("/client/sent", get(handlers::get_sent))
         .route("/client/rules", get(handlers::list_rules))
         .route("/client/rules", post(handlers::create_rule))
         .route("/client/rules/{id}", put(handlers::update_rule))

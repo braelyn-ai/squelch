@@ -62,26 +62,33 @@ let historyCap = 50
 /// Which page the emails tab shows. `inbox` is the flat all-tiers list; `noise`
 /// is the spam-folder equivalent — the same rows and the same verbs, narrowed to
 /// the noise tier BY THE DAEMON so nothing has to be discarded client-side.
+/// `sent` is the odd one out: outbound mail, off its own route, with none of the
+/// triage verbs (nothing triaged it, and nothing can resolve it).
 enum MailMode: String, Sendable, Hashable, CaseIterable {
-    case inbox, noise
+    case inbox, noise, sent
 
     /// The page's name — the header title and the segmented control both.
     var label: String {
         switch self {
         case .inbox: "all mail"
         case .noise: "noise"
+        case .sent: "sent"
         }
     }
 
-    /// Server-side tier filter for the page; nil = every tier.
+    /// Server-side tier filter for the page; nil = every tier. Nil for `sent`
+    /// too, but vacuously: that page never goes to /client/updates at all, so
+    /// there is no tier to narrow.
     var tier: Tier? {
         switch self {
-        case .inbox: nil
+        case .inbox, .sent: nil
         case .noise: .noise
         }
     }
 
-    /// What `n` flips to, so the key is one binding rather than two.
+    /// What `n` flips to, so the key is one binding rather than two. It stays
+    /// the inbox/noise flip from every page: from `sent`, `n` dips into noise
+    /// exactly as it would from the inbox.
     var flipped: MailMode { self == .noise ? .inbox : .noise }
 }
 
@@ -733,6 +740,9 @@ final class AppStore {
 
     /// One page's rows. Never fetched reads as LOADING, so the first paint of a
     /// page shows "loading" rather than claiming it is empty.
+    ///
+    /// INBOX AND NOISE ONLY — `.sent` holds a different wire type and lives in
+    /// `sentPage`; asking here for it answers a permanent "loading".
     func mailPage(_ mode: MailMode) -> Loadable<[AttentionUpdate]> {
         mailPages[mode] ?? .loading
     }
@@ -814,6 +824,63 @@ final class AppStore {
     private static func receivedTS(_ u: AttentionUpdate) -> Double {
         guard let s = u.surfaced_at else { return .greatestFiniteMagnitude }
         return Fmt.date(s)?.timeIntervalSince1970 ?? 0
+    }
+
+    // MARK: - the sent page
+
+    /// The sent page's rows, in their OWN cache rather than a third `mailPages`
+    /// entry. `SentItem` is a different fact: recipients instead of a sender,
+    /// opens instead of a tier, and no status at all — forcing it into
+    /// `AttentionUpdate` would mean inventing triage answers for mail nothing
+    /// triaged. It lives in the store for the same reason the other two pages
+    /// do: `@State` dies on navigate-away, and this list would refetch from
+    /// blank on every visit.
+    private var sentRows: Loadable<[SentItem]> = .loading
+    /// Freshness + in-flight fetch, the sent half of `mailLoadedAt`/`mailRefreshes`.
+    private var sentLoadedAt: Date?
+    private var sentRefresh: Task<Void, Never>?
+
+    var sentPage: Loadable<[SentItem]> { sentRows }
+
+    /// Same TTL-plus-join shape as `refreshMail`, for the same reasons: a
+    /// revisit inside the window is free, and a mount landing on the same tick
+    /// as the poll costs one fetch rather than two.
+    func refreshSent(force: Bool = false) async {
+        if !force, let loadedAt = sentLoadedAt,
+            Date().timeIntervalSince(loadedAt) < Self.mailTTL
+        {
+            return
+        }
+        if let running = sentRefresh {
+            await running.value
+            if !force { return }
+        }
+        let refresh = Task { await performSentRefresh() }
+        sentRefresh = refresh
+        await refresh.value
+        if sentRefresh == refresh { sentRefresh = nil }
+    }
+
+    private func performSentRefresh() async {
+        sentRows.isLoading = true
+        do {
+            let page = try await APIClient.shared.listSent(limit: Self.mailLimit)
+            // THE SERVER'S ORDER IS THE ORDER (received_at DESC, id DESC): no
+            // client-side sort, and no `resolvedIds` subtraction either — sent
+            // mail is a record of what went out, and none of the triage verbs
+            // can take a row off it.
+            //
+            // Assigned only on a real change, like the mail pages: the poll
+            // re-runs this, and an identical assignment re-renders every row.
+            if page.items != sentRows.value { sentRows.value = page.items }
+            sentRows.error = nil
+            sentLoadedAt = Date()
+            ThreadPrefetch.shared.warm(
+                page.items.prefix(Self.mailWarmRows).map(\.thread_id), immediate: 5)
+        } catch {
+            sentRows.error = errText(error, "load failed")
+        }
+        sentRows.isLoading = false
     }
 
     /// Preload the emails behind the records the columns show, so clicking one

@@ -14,7 +14,7 @@ use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
 mod common;
-use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg};
+use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg, sent_msg};
 
 #[tokio::test]
 async fn missing_token_is_401() {
@@ -1042,6 +1042,94 @@ async fn sealed_list_has_no_bodies() {
         "no body field in sealed list"
     );
     assert_eq!(items[0]["kind"], "otp");
+}
+
+#[tokio::test]
+async fn sent_listing_pages_the_outbox_and_hides_sealed_and_received_mail() {
+    // The human door's only `is_sent = 1` listing: the user's own outbox, with
+    // recipients and read receipts, newest first.
+    let Harness { app, .. } = harness(|store, acct| {
+        let seed = |gmail: &str, thread: &str, subject: &str, to: &str, sensitivity| {
+            let id = store
+                .upsert_message(&sent_msg(acct, gmail, thread, subject, to))
+                .unwrap();
+            store
+                .set_triage(id, acct, 0, Tier::Noise, sensitivity, None, "", "", None)
+                .unwrap();
+            id
+        };
+        seed(
+            "s1",
+            "ts1",
+            "first",
+            "Alice <alice@friends.com>",
+            Sensitivity::Normal,
+        );
+        seed(
+            "s2",
+            "ts2",
+            "second",
+            "bob@friends.com",
+            Sensitivity::Normal,
+        );
+        // A sealed outbound copy and ordinary inbound mail: neither is listed.
+        seed(
+            "s3",
+            "ts3",
+            "sealed",
+            "support@bank.com",
+            Sensitivity::Sealed,
+        );
+        store
+            .upsert_message(&msg(acct, "g-in", "t-in", "inbound", "hi"))
+            .unwrap();
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/sent?limit=1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    // Newest first: each fixture stamps its own `now`, so "second" is later.
+    assert_eq!(items[0]["subject"], "second");
+    assert_eq!(items[0]["to"], "bob@friends.com");
+    assert_eq!(items[0]["opens"], 0);
+    assert!(items[0]["sent_at"].as_str().unwrap().contains('T'));
+    assert!(items[0]["thread_id"].as_str().is_some());
+
+    // The cursor pages to the older message, and no sealed or inbound row can
+    // appear on any page.
+    let cursor = json["next_cursor"]
+        .as_str()
+        .expect("next_cursor")
+        .to_string();
+    let resp2 = app
+        .oneshot(authed(
+            "GET",
+            &format!("/client/sent?limit=1&cursor={cursor}"),
+        ))
+        .await
+        .unwrap();
+    let json2 = body_json(resp2).await;
+    let items2 = json2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert_eq!(items2[0]["subject"], "first");
+    assert_eq!(items2[0]["to"], "Alice <alice@friends.com>");
+}
+
+#[tokio::test]
+async fn sent_listing_needs_the_bearer() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let req = Request::builder()
+        .uri("/client/sent")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

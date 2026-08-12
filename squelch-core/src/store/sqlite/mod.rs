@@ -38,9 +38,9 @@ use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, ExtractQueued,
     IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
     MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, SealedBody, SealedMessage,
-    SearchFilter, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides,
-    Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, TrackedMessage, TriageDebug,
-    TriagedMessage,
+    SearchFilter, SentMessage, SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued,
+    Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
+    TrackedMessage, TriageDebug, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -708,6 +708,32 @@ impl Store for SqliteStore {
 
     fn sealed_body(&self, account_id: AccountId, message_id: i64) -> Result<SealedBody> {
         self.sealed_body(account_id, message_id)
+    }
+
+    fn sent_listing(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SentMessage>> {
+        self.sent_listing(account_id, limit, offset)
+    }
+
+    fn sent_missing_recipients(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+    ) -> Result<Vec<SentMissingRecipients>> {
+        self.sent_missing_recipients(account_id, limit)
+    }
+
+    fn set_message_to_addrs(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        to_addrs: &str,
+    ) -> Result<bool> {
+        self.set_message_to_addrs(account_id, message_id, to_addrs)
     }
 
     fn append_audit(&self, account_id: AccountId, entry: &NewAuditEntry) -> Result<i64> {

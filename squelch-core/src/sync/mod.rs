@@ -21,7 +21,9 @@ use crate::config::{Config, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState};
-use crate::sync::ingest::{RawFetched, ingest_with_rules, is_robot_address};
+use crate::sync::ingest::{
+    RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
+};
 use crate::triage::events;
 use crate::triage::extract::{self, banking, marketing};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
@@ -45,6 +47,15 @@ const HISTORY_KEY: &str = "history";
 /// `sync_state` row key for the one-time Sent-contacts harvest's done flag
 /// (`last_uid >= 1` = complete; absent/0 = redo on next daemon start).
 const SENT_CONTACTS_KEY: &str = "sent_contacts";
+
+/// `sync_state` row key for the one-time sent-RECIPIENTS backfill's done flag,
+/// with the same semantics as [`SENT_CONTACTS_KEY`]. Distinct from it because
+/// the two sweeps fill different columns and either can complete alone.
+const SENT_RECIPIENTS_KEY: &str = "sent_recipients";
+
+/// How many rows the recipients backfill claims from the store per batch. Only a
+/// memory bound: the pass loops until the queue is empty.
+const SENT_RECIPIENTS_BATCH: u32 = 500;
 
 /// `wake_budget.thread_id` sentinel for the per-account-per-day Stage-2 budget.
 /// Gmail thread ids are hex, so no real thread can collide with it.
@@ -825,6 +836,109 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             "squelch: sent-contacts harvest complete — {} unique recipients",
             batch.len()
         );
+        Ok(())
+    }
+
+    // ---- Sent-recipients backfill -----------------------------------------
+
+    /// ONE-TIME sweep filling `messages.to_addrs` on sent rows ingested before
+    /// that column existed, so the human door's sent listing can show who each
+    /// message went to instead of a blank. Same shape as
+    /// [`harvest_sent_contacts`](Self::harvest_sent_contacts): `format=metadata`
+    /// with only To/Cc requested (headers, never bodies) on the READ credential,
+    /// and a `sync_state` completion flag so it runs once per install.
+    ///
+    /// BEST-EFFORT AND NON-FATAL by construction: it is spawned beside the sync
+    /// loop, never inside it, and any error returns early with the flag UNSET, so
+    /// the next daemon start simply redoes whatever is still NULL. A message
+    /// Gmail no longer has (404) is not an error — it is written as "" ("looked,
+    /// nobody named"), which is what keeps one deleted message from re-queueing
+    /// the whole pass forever.
+    pub async fn backfill_sent_recipients(&self) -> Result<()> {
+        let done = self
+            .store
+            .sync_state(self.account_id, SENT_RECIPIENTS_KEY)?
+            .map(|s| s.last_uid >= 1)
+            .unwrap_or(false);
+        if done {
+            return Ok(());
+        }
+
+        let mut filled = 0usize;
+        // Per-message failures are SKIPPED, not fatal: one message with a
+        // persistent 4xx quirk must not abort the sweep (or re-run the whole
+        // pass on every daemon start forever). Skipped rows stay NULL and are
+        // filtered out of each batch so the loop still terminates; the done
+        // flag is only set after a pass with zero skips, so they retry on the
+        // next start.
+        let mut skipped: Vec<i64> = Vec::new();
+        loop {
+            let pending = self
+                .store
+                .sent_missing_recipients(self.account_id, SENT_RECIPIENTS_BATCH)?;
+            let pending: Vec<_> = pending
+                .iter()
+                .filter(|r| !skipped.contains(&r.message_id))
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for row in &pending {
+                let url = format!(
+                    "{}/messages/{}?format=metadata\
+                     &metadataHeaders=To&metadataHeaders=Cc",
+                    self.api_base, row.gmail_msg_id
+                );
+                let msg: GmailMessage = match self.get_json(&url).await {
+                    Ok(msg) => msg,
+                    // Gone upstream: record the absence rather than retrying it
+                    // on every daemon start for the life of the install.
+                    Err(CoreError::NotFound) => GmailMessage::default(),
+                    Err(_) => {
+                        skipped.push(row.message_id);
+                        continue;
+                    }
+                };
+                let headers = msg.payload.map(|p| p.headers).unwrap_or_default();
+                // Through mail-parser via header synthesis, so grouped lists,
+                // quoted display names and RFC2047 encoding render exactly as the
+                // ingest path renders them.
+                let blob = synthesize_rfc822_headers(&headers);
+                let mut mailboxes: Vec<(String, Option<String>)> = Vec::new();
+                if let Some(parsed) = mail_parser::MessageParser::default().parse(blob.as_bytes()) {
+                    for list in [parsed.to(), parsed.cc()].into_iter().flatten() {
+                        collect_mailboxes(list, &mut mailboxes);
+                    }
+                }
+                // EVERY row is written, "" included: the store predicate is
+                // `to_addrs IS NULL`, so a row left NULL would be handed back by
+                // the next batch query and loop forever.
+                let to = format_recipients(&mailboxes).unwrap_or_default();
+                self.store
+                    .set_message_to_addrs(self.account_id, row.message_id, &to)?;
+                filled += 1;
+            }
+        }
+
+        if skipped.is_empty() {
+            self.store.set_sync_state(
+                self.account_id,
+                SENT_RECIPIENTS_KEY,
+                &SyncState {
+                    uidvalidity: 1,
+                    last_uid: 1,
+                },
+            )?;
+            if filled > 0 {
+                eprintln!("squelch: sent-recipients backfill complete — {filled} messages filled");
+            }
+        } else {
+            eprintln!(
+                "squelch: sent-recipients backfill left {} of {} unfetched; retrying next start",
+                skipped.len(),
+                skipped.len() + filled
+            );
+        }
         Ok(())
     }
 
@@ -1879,9 +1993,14 @@ pub fn parse_internal_date(s: Option<&str>) -> Option<DateTime<Utc>> {
 fn synthesize_rfc822_headers(headers: &[MessageHeader]) -> String {
     let mut out = String::new();
     for h in headers {
-        // HEADER INJECTION GUARD: Gmail values are single-line, but upstream is
-        // never trusted blindly.
-        if h.value.contains('\r') || h.value.contains('\n') {
+        // HEADER INJECTION GUARD: Gmail names and values are single-line, but
+        // upstream is never trusted blindly — a CR/LF in either would splice a
+        // synthetic header into the blob.
+        if h.name.contains('\r')
+            || h.name.contains('\n')
+            || h.value.contains('\r')
+            || h.value.contains('\n')
+        {
             continue;
         }
         out.push_str(&h.name);
@@ -2882,14 +3001,32 @@ mod tests {
         let mut st = g.0.lock().unwrap();
         st.seen.push(format!("get:{id}"));
         match st.bodies.get(&id) {
+            // Both shapes at once: `raw` for the ingest fetches, and the
+            // `payload.headers` a `format=metadata` caller reads. Gmail sends one
+            // or the other per the requested format; serving both keeps the mock
+            // format-agnostic, and each caller reads only its own field.
             Some(eml) => Json(json!({
                 "id": id,
                 "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml),
+                "payload": { "headers": mock_headers(eml) },
                 "internalDate": Utc::now().timestamp_millis().to_string(),
             }))
             .into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         }
+    }
+
+    /// The header block of an RFC822 fixture as Gmail's `payload.headers[]`.
+    /// Fixtures are single-line headers, so no continuation handling. Values are
+    /// trimmed of the CR the fixtures' CRLF endings leave behind — Gmail's own
+    /// values are bare, and `synthesize_rfc822_headers` drops anything carrying
+    /// one as an injection attempt.
+    fn mock_headers(eml: &str) -> Vec<Value> {
+        eml.lines()
+            .take_while(|l| !l.trim().is_empty())
+            .filter_map(|l| l.split_once(": "))
+            .map(|(name, value)| json!({ "name": name.trim(), "value": value.trim() }))
+            .collect()
     }
 
     async fn mock_profile(State(g): State<MockGmail>) -> Json<Value> {
@@ -3033,6 +3170,124 @@ mod tests {
         // the mail at all.
         assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
         assert_eq!(cursor_of(&store, acct), Some(140));
+    }
+
+    /// A sent row exactly as an install predating `to_addrs` left it: recipients
+    /// NULL, triage row present.
+    fn old_sent_row(store: &SqliteStore, acct: AccountId, gmail: &str) -> i64 {
+        let id = store
+            .upsert_message(&crate::types::NewMessage {
+                account_id: acct,
+                gmail_msg_id: gmail.to_string(),
+                thread_id: format!("t-{gmail}"),
+                from_addr: "me@example.com".to_string(),
+                from_name: Some("Me".to_string()),
+                subject: "lunch thursday".to_string(),
+                received_at: Utc::now(),
+                snippet: String::new(),
+                body: "writing this from the phone app".to_string(),
+                body_html: None,
+                is_sent: true,
+                to_addrs: None,
+                list_unsubscribe: None,
+                list_unsub_one_click: false,
+                auth_pass: None,
+            })
+            .unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                0,
+                Tier::Noise,
+                crate::types::Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn the_sent_recipients_backfill_fills_old_rows_exactly_once() {
+        // Sent mail ingested before `to_addrs` existed has no recipients to show.
+        // The one-shot backfill fetches headers only and fills them, then its
+        // sync_state flag keeps it from ever paying for that walk again.
+        let (store, acct) = store_at_cursor(Some(100));
+        let id = old_sent_row(&store, acct, "g-old");
+
+        let g = MockGmail::default();
+        g.body(
+            "g-old",
+            sent_eml(Utc::now(), "Alice <alice@friends.com>", "lunch thursday"),
+        );
+        let base = serve_mock(g.clone()).await;
+        let eng = engine(store.clone(), acct, &base);
+
+        eng.backfill_sent_recipients().await.unwrap();
+        let listed = store.sent_listing(acct, 10, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].to, "Alice <alice@friends.com>");
+        assert!(store.sent_missing_recipients(acct, 10).unwrap().is_empty());
+
+        // Second run: the flag is set, so not one more Gmail call.
+        let calls = g.calls("get:g-old");
+        eng.backfill_sent_recipients().await.unwrap();
+        assert_eq!(
+            g.calls("get:g-old"),
+            calls,
+            "the sweep runs once per install"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sent_recipients_backfill_records_a_message_gmail_no_longer_has() {
+        // A 404 is an answer, not a failure: the row is marked "looked, nobody
+        // named" so it leaves the queue. Left NULL it would be handed back by the
+        // very next batch query, and the pass would never terminate.
+        let (store, acct) = store_at_cursor(Some(100));
+        old_sent_row(&store, acct, "g-gone");
+
+        let base = serve_mock(MockGmail::default()).await;
+        engine(store.clone(), acct, &base)
+            .backfill_sent_recipients()
+            .await
+            .unwrap();
+
+        assert!(store.sent_missing_recipients(acct, 10).unwrap().is_empty());
+        assert_eq!(store.sent_listing(acct, 10, 0).unwrap()[0].to, "");
+    }
+
+    #[tokio::test]
+    async fn a_failed_sent_recipients_backfill_leaves_the_flag_unset() {
+        // A non-404 error SKIPS the message (its row stays NULL) and the pass
+        // finishes Ok — one message with a persistent 4xx quirk must not abort
+        // the sweep for everything behind it. But the done flag is only set on
+        // a clean pass, so the next daemon start redoes whatever is still NULL.
+        let (store, acct) = store_at_cursor(Some(100));
+        old_sent_row(&store, acct, "g-old");
+
+        // No route at all: every fetch is a transport error, not a 404.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let dead = format!("http://{addr}");
+
+        engine(store.clone(), acct, &dead)
+            .backfill_sent_recipients()
+            .await
+            .unwrap();
+        assert!(
+            store
+                .sync_state(acct, SENT_RECIPIENTS_KEY)
+                .unwrap()
+                .is_none(),
+            "an interrupted sweep must retry on the next start"
+        );
+        assert_eq!(store.sent_missing_recipients(acct, 10).unwrap().len(), 1);
     }
 
     #[tokio::test]

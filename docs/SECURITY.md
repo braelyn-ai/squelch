@@ -271,6 +271,28 @@ no-store`, like the reveal.
   transaction as the seal. `list_drafts` additionally filters a sealed parent
   (`NOT EXISTS` on `triage`, the same shape as `deadlines`) as a belt.
 
+**The sent listing (human-door-only route).** `GET /client/sent`
+(`store::sent_listing`) is the **only** listing in the codebase that reads
+`is_sent = 1`; every other one on both doors filters it out, and the agent door has
+no sent route at all — what the user writes is not the agent's to page through. It
+serves metadata only (recipients, subject, snippet, sent-at, read-receipt count),
+newest first, behind the same bearer as the rest of `/client/*`.
+
+Because the usual `is_sent = 0` filter is what normally keeps this mail out of
+reach, the sealed guard here **fails closed**: an INNER `JOIN triage` *plus*
+`sensitivity != 'sealed'`, so a sent row whose triage row is missing is excluded
+rather than `COALESCE`d to visible. Sent mail is written with its triage row in the
+same transaction, so a missing one is a broken row, not an untriaged one. On top of
+the per-row guard sits a thread-level belt (`NOT EXISTS` over sealed siblings, the
+same shape as `list_drafts`): seal detection is per-message content, so the user's
+own reply in a thread sealed by a sibling commits as `normal` — yet `thread_view`
+404s that thread, and listing the row would leak `Re: <sealed subject>` behind a
+dead click. The
+`messages.to_addrs` column it reads is parsed at ingest from To/Cc and is NULL on
+received mail; the one-shot backfill that fills it for pre-existing sent mail
+(`SyncEngine::backfill_sent_recipients`) runs on the **read** credential and
+fetches `format=metadata` headers only.
+
 **What enforces the split, and what token scope cannot.** The two-door split is
 enforced by three structural facts, none of which involve OAuth scope: the agent
 door exposes **no write tools at all**, the write credential is loaded **only** by
