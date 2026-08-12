@@ -195,6 +195,9 @@ pub struct TriageDebug {
     pub needs_stage2: bool,
     pub extractor_model_used: Option<String>,
     pub created_at: String,
+    /// The Gmail-side thread id, joined from `messages`. APPENDED LAST on
+    /// purpose: an older client decoding this shape must keep working.
+    pub thread_id: String,
 }
 
 /// The stored unsubscribe intent for one NON-SEALED message, resolved by

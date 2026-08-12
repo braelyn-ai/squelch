@@ -825,6 +825,9 @@ struct TriageDebug: Codable, Sendable, Hashable {
     var needs_stage2: Bool
     var extractor_model_used: String?
     var created_at: String
+    /// Optional so a client pointed at a daemon older than the field still
+    /// decodes the page rather than failing the whole read.
+    var thread_id: String?
 }
 
 struct ShredStats: Codable, Sendable, Hashable {
