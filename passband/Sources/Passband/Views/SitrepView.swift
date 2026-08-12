@@ -109,6 +109,7 @@ struct SitrepView: View {
                     .padding(.bottom, 28)
                 }
                 .scrollIndicators(.hidden)
+                .scrollShadowRoom()
                 .padding(.horizontal, 24)
             } else {
                 HStack(alignment: .top, spacing: 18) {
@@ -124,6 +125,7 @@ struct SitrepView: View {
                     // split pane rather than one page, and the left one rides the
                     // column boundary instead of the window edge.
                     .scrollIndicators(.hidden)
+                    .scrollShadowRoom()
                     .frame(maxWidth: .infinity, alignment: .top)
 
                     // THE RECORDS RAIL IS PINNED. These are reference columns you
@@ -140,6 +142,7 @@ struct SitrepView: View {
                     }
                     .scrollBounceBehavior(.basedOnSize)
                     .scrollIndicators(.hidden)
+                    .scrollShadowRoom()
                     .frame(width: 306)
                 }
                 .padding(.horizontal, 24)

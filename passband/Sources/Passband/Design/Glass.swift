@@ -65,6 +65,22 @@ extension View {
         padding(.horizontal, 16).padding(.vertical, 14)
     }
 
+    /// Room for glass shadows in a scrolling column. A ScrollView clips at its
+    /// bounds, and a column's bounds sit AT the card edges — so the material's
+    /// intrinsic shadow shears off into a hard-edged dark band down both sides
+    /// of the column. Disabling the scroll clip and re-masking wider lets the
+    /// shadow bleed sideways (and off the bottom) while the top stays tight, so
+    /// scrolled-away content still cannot ride up over the chrome above the
+    /// column. Glass shadows are cast downward, so the tight top never shows.
+    func scrollShadowRoom(_ amount: CGFloat = 40) -> some View {
+        scrollClipDisabled()
+            .mask {
+                Rectangle()
+                    .padding(.horizontal, -amount)
+                    .padding(.bottom, -amount)
+            }
+    }
+
     /// Selection + hover for a list row: a tinted fill, ONE view identity, and
     /// no material anywhere.
     ///
