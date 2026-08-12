@@ -115,6 +115,20 @@ private struct MobileShell: View {
                     EmailsView()
                         .navigationTitle("Mail")
                         .navigationBarTitleDisplayMode(.inline)
+                        // `c` ON THE MAC IS GLOBAL; here the new-message door is
+                        // ONE door, and it is on the mail. A phone's global verb
+                        // is a tab, and a compose button repeated across five of
+                        // them is five buttons for one composer. Replies do not
+                        // come through here at all — they open in the reader,
+                        // where the thread they answer is.
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button { store.openComposeNew() } label: {
+                                    Image(systemName: "square.and.pencil")
+                                }
+                                .accessibilityLabel("New message")
+                            }
+                        }
                         .threadDestination(active: tab == .mail)
                 }
             }
@@ -178,6 +192,22 @@ private struct MobileShell: View {
                 TriageFixPalette(target: target) { store.closeTriageFix() }
             }
         }
+        // `c` / ⌘N. THE SAME `ComposePane` the Mac opens as a half-window pane,
+        // off THE SAME `store.compose` — which is what makes the draft restore,
+        // the autosave and the send ceremony one code path rather than two. A
+        // pane needs the page beside it to stay live; a phone has no beside, so
+        // it is a full-height sheet.
+        .sheet(isPresented: composeOpen) {
+            ComposePane()
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Palette.canvas)
+                // A drag-down mid-send would leave the request in flight with
+                // nothing on screen to report the verdict to. Every other moment
+                // is dismissable: closing FLUSHES the draft, so nothing is lost.
+                .interactiveDismissDisabled(store.compose?.sending == true)
+                .scrollDismissesKeyboard(.interactively)
+        }
     }
 
     /// Presented-ness derived from the store's own `triageFix`, so dismissing the
@@ -187,6 +217,15 @@ private struct MobileShell: View {
         Binding(
             get: { store.triageFix != nil },
             set: { if !$0 { store.closeTriageFix() } })
+    }
+
+    /// Same contract for the composer: the store owns whether it is open, and a
+    /// dragged-down sheet runs the identical `closeCompose()` the footer's cancel
+    /// does — so the draft is flushed exactly once either way.
+    private var composeOpen: Binding<Bool> {
+        Binding(
+            get: { store.compose != nil },
+            set: { if !$0 { store.closeCompose() } })
     }
 }
 
