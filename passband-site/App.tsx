@@ -148,8 +148,8 @@ function FakeInbox() {
 
     const flick = () => {
       if (cancelled) return;
-      const distance = 40 + Math.random() * 360;
-      const duration = 350 + Math.random() * 900;
+      const distance = 40 + Math.random() * 280;
+      const duration = 800 + Math.random() * 1400;
       const from = offset;
       const start = performance.now();
       const frame = (now: number) => {
@@ -159,7 +159,7 @@ function FakeInbox() {
         const wrap = el.scrollHeight / 2 || 1;
         el.style.transform = `translateY(-${offset % wrap}px)`;
         if (t < 1) raf = requestAnimationFrame(frame);
-        else timer = setTimeout(flick, 250 + Math.random() * 2200);
+        else timer = setTimeout(flick, 150 + Math.random() * 1100);
       };
       raf = requestAnimationFrame(frame);
     };
