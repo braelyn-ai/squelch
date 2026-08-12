@@ -491,12 +491,18 @@ final class AppStore {
             // `AccountManager`, and a first connection is the moment that goes
             // from nothing to something.
             AccountManager.shared.reload()
-            // This account's feed. Arriving from the Connect gate the feeds
-            // are down, so this is a no-op and the `.connected` transition
-            // below is what raises them — the same route the single-account
-            // build took. It is here for the OTHER arrival: a re-connect that
-            // never left `.connected`, where the running stream is holding the
-            // credentials this call just replaced.
+            // The decisions ledger's key derives from the id that just went
+            // live. Without this, a session that removed its last account and
+            // connected a different one would still hold the OLD account's
+            // in-memory verdicts — served under the new daemon's colliding
+            // message ids, and persisted wholesale under the new key on the
+            // first `set`.
+            AuthDecisions.shared.reload()
+            // Arriving from the Connect gate the feeds are down, so this is a
+            // no-op and the `.connected` transition below is what raises them
+            // — the same route the single-account build took. Kept as a
+            // defensive pair with `revalidate`'s, which handles the
+            // stay-connected recredential arrival.
             AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
             connStatus = .connected
@@ -560,6 +566,19 @@ final class AppStore {
         }
     }
 
+    /// Whether a daemon is already one of this install's accounts. Matched on
+    /// host:port, which the index already holds and no keychain read is needed
+    /// for; a different spelling of the same host (localhost for 127.0.0.1)
+    /// slips through, and the cost of that is the duplicate the human
+    /// explicitly asked for. Public because `ConnectView` must ask BEFORE
+    /// claiming a pairing code — a claim mints a device token on the daemon,
+    /// and a duplicate refused after that has already spent the code and
+    /// orphaned the token server-side.
+    func isKnownDaemon(_ serverURL: String) -> Bool {
+        let host = AccountRecord.host(from: serverURL)
+        return AccountManager.shared.accounts.contains { $0.displayHost == host }
+    }
+
     /// Add a SECOND (or fifth) account and switch to it.
     ///
     /// The whole difference from `connect` is what it refuses to touch. This
@@ -577,19 +596,6 @@ final class AppStore {
     ///
     /// Only then is the world torn down, and only through the ordinary switch —
     /// the one place that knows how to do it safely.
-    /// Whether a daemon is already one of this install's accounts. Matched on
-    /// host:port, which the index already holds and no keychain read is needed
-    /// for; a different spelling of the same host (localhost for 127.0.0.1)
-    /// slips through, and the cost of that is the duplicate the human
-    /// explicitly asked for. Public because `ConnectView` must ask BEFORE
-    /// claiming a pairing code — a claim mints a device token on the daemon,
-    /// and a duplicate refused after that has already spent the code and
-    /// orphaned the token server-side.
-    func isKnownDaemon(_ serverURL: String) -> Bool {
-        let host = AccountRecord.host(from: serverURL)
-        return AccountManager.shared.accounts.contains { $0.displayHost == host }
-    }
-
     func addAccount(serverURL: String, apiToken: String, label: String = "") async -> (
         ok: Bool, error: String?
     ) {
@@ -626,9 +632,9 @@ final class AppStore {
     }
 
     /// Forget one account, wherever it sits in the list. THE removal path:
-    /// Settings' per-row Remove, the rail's account menu and the old
-    /// Disconnect button all land here, so there is exactly one answer to
-    /// "what happens to the world when the mailbox on screen goes away".
+    /// Settings' per-row Remove lands here (its last-account form wears the
+    /// old Disconnect label), so there is exactly one answer to "what happens
+    /// to the world when the mailbox on screen goes away".
     ///
     /// `AccountManager.remove` does the durable half — feed down, keychain
     /// cleared (off the main actor, a refusal parked for the boot sweep), index
@@ -662,6 +668,10 @@ final class AppStore {
             assistant.clear()
             wipeAccountState()
             wipeAccountCaches()
+            // No live account, no key — this empties the in-memory ledger, so
+            // a later `connect` cannot inherit (and then persist) the removed
+            // account's verdicts under a new daemon's colliding ids.
+            AuthDecisions.shared.reload()
             settings = nil
             connStatus = .disconnected
             connError = nil
@@ -671,8 +681,11 @@ final class AppStore {
         // that one refuses a switch to the account already marked active, and
         // `AccountIndex.remove` handed `active` to this survivor on its way
         // through. The index has moved on; the store has not, and this is what
-        // moves it — under the gate this function already holds.
-        await performSwitch(to: survivor)
+        // moves it — under the gate this function already holds. Drafts are
+        // NOT flushed on the way: the daemon they would go to is the one the
+        // human just asked to forget, same principle as the last-account
+        // branch above.
+        await performSwitch(to: survivor, flushDrafts: false)
     }
 
     // MARK: - switching accounts
@@ -705,7 +718,12 @@ final class AppStore {
     /// Steps (2)–(9), gate already held. Split out so `removeAccount` — which
     /// holds the same gate across its OWN awaits — can run a switch without
     /// tripping the guard that exists to keep everyone else out.
-    private func performSwitch(to record: AccountRecord) async {
+    ///
+    /// `flushDrafts: false` is the removal path's variant: the daemon those
+    /// drafts would go to is the one being forgotten. The settle still runs —
+    /// a debounced save already in flight must finish before the client is
+    /// reconfigured, whoever it was addressed to.
+    private func performSwitch(to record: AccountRecord, flushDrafts: Bool = true) async {
         // (2) From here, every answer still in flight belongs to the old
         //     account and every writer that captured the old epoch is inert.
         epoch &+= 1
@@ -720,8 +738,10 @@ final class AppStore {
         //     the client underneath an in-flight draft PUT would post what the
         //     human typed into account A into account B's drafts, under an id
         //     that means something else there.
-        DraftSaver.shared.flush(.compose, compose)
-        DraftSaver.shared.flush(.inlineReply, inlineReply)
+        if flushDrafts {
+            DraftSaver.shared.flush(.compose, compose)
+            DraftSaver.shared.flush(.inlineReply, inlineReply)
+        }
         await DraftSaver.shared.settle()
 
         // (5) The ⌘K session: its transcript cites the old account's mail and
@@ -738,6 +758,9 @@ final class AppStore {
             // The slots behind the record are gone or unreadable, and the old
             // world is already torn down — there is nothing to switch into and
             // nothing to go back to, so the Connect gate is the honest answer.
+            // The ledger goes with the world: whoever connects next must not
+            // inherit the torn-down account's verdicts.
+            AuthDecisions.shared.reload()
             settings = nil
             connStatus = .disconnected
             connError = "account settings load failed"

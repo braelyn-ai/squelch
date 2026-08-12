@@ -115,8 +115,6 @@ struct AccountIndexState: Sendable, Equatable {
         guard let activeId else { return nil }
         return accounts.first { $0.id == activeId }
     }
-
-    static let empty = AccountIndexState()
 }
 
 enum AccountIndex {
@@ -504,7 +502,8 @@ final class AccountManager {
     }
 
     /// Re-read the index from disk. For the paths that write it through
-    /// `AccountIndex` directly — `AppStore.connect`, `disconnect`.
+    /// `AccountIndex` directly — `AppStore.connect`, `revalidate`,
+    /// `removeAccount`.
     func reload() { adopt(AccountIndex.load()) }
 
     /// One account's credentials. Off the main actor (a keychain read can
