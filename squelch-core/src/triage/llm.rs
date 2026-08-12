@@ -130,27 +130,22 @@ where
 }
 
 /// Emit a stage's/extractor's production `classify`: the delegation to its own
-/// `classify_at` at the provider's production endpoint. Identical for all four
-/// call sites, so it is written once. Leading doc attributes are forwarded.
+/// `classify_at` at the RESOLVED endpoint — [`crate::config::ResolvedLlm::url`],
+/// which is [`provider_url`] unless the operator routed the Anthropic wire
+/// through a gateway. Identical for all four call sites, so it is written once.
+/// Leading doc attributes are forwarded.
 macro_rules! classify_entrypoint {
     ($(#[$attr:meta])* $cfg:ty, $input:ty, $outcome:ty $(,)?) => {
         $(#[$attr])*
         pub async fn classify(
             http: &reqwest::Client,
+            url: &str,
             api_key: &str,
             cfg: &$cfg,
             provider: $crate::config::Stage2Provider,
             input: &$input,
         ) -> std::result::Result<$outcome, $crate::triage::llm::ClassifyError> {
-            classify_at(
-                http,
-                $crate::triage::llm::provider_url(provider),
-                api_key,
-                cfg,
-                provider,
-                input,
-            )
-            .await
+            classify_at(http, url, api_key, cfg, provider, input).await
         }
     };
 }

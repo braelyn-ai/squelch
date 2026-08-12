@@ -204,23 +204,28 @@ impl RuleInferClient {
         }
     }
 
-    /// Resolve a client from the loaded config, reusing the SAME key/provider
-    /// resolution the triage stages use ([`crate::config::Stage2Config::resolve_key_and_provider`])
+    /// Resolve a client from the loaded config, reusing the SAME key/provider/
+    /// endpoint resolution the triage stages use
+    /// ([`crate::config::Stage2Config::resolve_llm`], gateway override included)
     /// and the Stage-1 model id. `None` when no key is configured, which the
     /// caller turns into `Filtered`. No new config knobs: this call is a Stage-1
     /// call that happens to be triggered by a rule save.
     pub fn from_config(cfg: &Config) -> Option<Self> {
-        let (api_key, provider) = cfg.stage2.resolve_key_and_provider()?;
+        let resolved = cfg.stage2.resolve_llm()?;
+        // Redirects are REFUSED: this client sends the LLM API key on every
+        // request, and reqwest re-sends custom headers (x-api-key) cross-host
+        // on a redirect. Same posture as every credentialed client in the repo.
         let http = reqwest::Client::builder()
             .timeout(INFER_TIMEOUT)
             .connect_timeout(INFER_CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .ok()?;
         Some(Self::new(
             http,
-            llm::provider_url(provider),
-            api_key,
-            provider,
+            resolved.url,
+            resolved.api_key,
+            resolved.provider,
             cfg.stage1.model.clone(),
         ))
     }

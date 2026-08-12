@@ -1660,6 +1660,34 @@ mod tests {
         }
     }
 
+    /// The macro-generated production `classify` posts to the URL it is handed
+    /// (the startup-resolved endpoint), not a baked-in provider constant — the
+    /// contract the hosted gateway override depends on.
+    #[tokio::test]
+    async fn classify_entrypoint_threads_the_resolved_url() {
+        let resp = r#"{
+            "content": [{"type": "text", "text": "{\"importance\":42,\"has_deadline\":false,\"deadline_iso\":null,\"deadline_kind\":null,\"one_line\":\"ok\",\"reason\":\"personal\",\"matches_sender_rule\":null,\"importance_reason\":\"r\",\"deadline_reason\":null}"}],
+            "stop_reason": "end_turn"
+        }"#;
+        let (url, handle) = mock_once(200, resp).await;
+        let http = reqwest::Client::new();
+        let cfg = Stage2Config::default();
+        let q = queued(false, None);
+        let ctx = RowContext::from_queued(&q, 4000);
+
+        let outcome = classify(&http, &url, "sk-test", &cfg, Stage2Provider::Anthropic, &ctx)
+            .await
+            .unwrap();
+        // The mock answered exactly one request — the classify above — so the
+        // URL parameter is the one that was hit.
+        let req = handle.await.unwrap();
+        assert!(req.starts_with("POST "));
+        match outcome {
+            ClassifyOutcome::Ok(out, _) => assert_eq!(out.importance, 42),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn classify_maps_refusal_stop_reason() {
         let resp = r#"{"content": [], "stop_reason": "refusal"}"#;
