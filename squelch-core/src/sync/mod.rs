@@ -10,7 +10,6 @@ pub mod html;
 pub mod ingest;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -237,17 +236,6 @@ struct ProfileResp {
     history_id: String,
 }
 
-/// A Gmail `users.labels.get` resource; only the unread pair is read. Both
-/// default to 0 because Gmail omits the counters on a label with nothing in it.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LabelResp {
-    #[serde(default)]
-    messages_unread: i64,
-    #[serde(default)]
-    threads_unread: i64,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryListResp {
@@ -346,10 +334,6 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// Per-cap-kind last-warned UTC day. In-memory only; a restart re-arms them,
     /// and one fresh notice on restart is acceptable.
     warn_days: std::sync::Mutex<WarnDays>,
-    /// Set while the INBOX unread fetch is failing, so a persistent failure
-    /// (revoked scope, Gmail outage) says so ONCE instead of once per poll. The
-    /// next success re-arms it.
-    unread_warned: AtomicBool,
     /// Scrape-facing counters. Its own registry unless the daemon shares one
     /// via [`SyncEngine::with_metrics`], so an engine built anywhere (tests, the
     /// contacts harvest, `run`) still records rather than branching on absence.
@@ -394,7 +378,6 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             embedder: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
-            unread_warned: AtomicBool::new(false),
             metrics: SyncMetrics::new(),
             api_base: GMAIL_API_BASE.to_string(),
         }
@@ -574,10 +557,6 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             if *shutdown.borrow() {
                 return Ok(());
             }
-            // BEFORE the walk, not after: the walk is what can return Err and
-            // bounce the whole lifecycle, and a mailbox stuck in that retry loop
-            // should still have a fresh unread count for the human door.
-            self.refresh_inbox_unread().await;
             self.poll_once().await?;
             // THE freshness stamp for a healthy daemon: `run()` only records one
             // on its way out, and a mailbox that polls happily for a month never
@@ -1857,44 +1836,6 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// `users.labels.get(INBOX)` -> Gmail's own unread counts, into the store.
-    ///
-    /// The ONLY source for these numbers: the read scope cannot see (or write)
-    /// read state through any other call, and our tables hold just the backfill
-    /// window, so nothing local can answer "how much unread mail is sitting in
-    /// Gmail right now".
-    ///
-    /// Cannot fail a cycle — sync's job is mail, and a stale count is a far
-    /// better outcome than a poll loop that gives up over a cosmetic number. On
-    /// failure the previous row stands (no clearing, no zeroing) and the notice
-    /// is printed once per failing streak rather than every poll.
-    async fn refresh_inbox_unread(&self) {
-        let url = format!("{}/labels/{LABEL_INBOX}", self.api_base);
-        match self.get_json::<LabelResp>(&url).await {
-            Ok(label) => {
-                if let Err(e) = self.store.set_inbox_unread(
-                    self.account_id,
-                    label.messages_unread,
-                    label.threads_unread,
-                ) {
-                    eprintln!("squelch: storing the inbox unread counts failed ({e})");
-                    return;
-                }
-                self.unread_warned.store(false, Ordering::Relaxed);
-            }
-            Err(e) => {
-                // `swap` is the arm-and-test: only the transition into failure
-                // prints. Error strings from this crate carry no secrets.
-                if !self.unread_warned.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "squelch: inbox unread count fetch failed ({e}); keeping the last known counts"
-                    );
-                }
-            }
-        }
-    }
-
-    /// `users.getProfile` -> the account's current historyId.
     async fn fetch_profile_history_id(&self) -> Result<u64> {
         let url = format!("{}/profile", self.api_base);
         let profile: ProfileResp = self.get_json(&url).await?;
@@ -2965,7 +2906,6 @@ mod tests {
         /// labelId -> the `(messagesUnread, threadsUnread)` `labels.get`
         /// answers with. Absent (or `None`) means 500: an unscripted label must
         /// not read as a real zero.
-        labels: HashMap<String, Option<(i64, i64)>>,
         /// `users.getProfile`'s historyId.
         profile_history_id: u64,
         /// Every call this mock served, in order, as `verb:key`.
@@ -2989,16 +2929,6 @@ mod tests {
         }
         fn body(&self, id: &str, eml: String) -> &Self {
             self.0.lock().unwrap().bodies.insert(id.to_string(), eml);
-            self
-        }
-        /// Script `labels.get` for one label: `Some(counts)` answers them,
-        /// `None` answers 500 (the outage the stored counts must survive).
-        fn label(&self, label: &str, unread: Option<(i64, i64)>) -> &Self {
-            self.0
-                .lock()
-                .unwrap()
-                .labels
-                .insert(label.to_string(), unread);
             self
         }
         fn profile(&self, history_id: u64) -> &Self {
@@ -3077,20 +3007,6 @@ mod tests {
         }
     }
 
-    async fn mock_label(State(g): State<MockGmail>, AxumPath(id): AxumPath<String>) -> Response {
-        let mut st = g.0.lock().unwrap();
-        st.seen.push(format!("label:{id}"));
-        match st.labels.get(&id).copied().flatten() {
-            Some((messages, threads)) => Json(json!({
-                "id": id,
-                "messagesUnread": messages,
-                "threadsUnread": threads,
-            }))
-            .into_response(),
-            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
-    }
-
     async fn mock_profile(State(g): State<MockGmail>) -> Json<Value> {
         let st = g.0.lock().unwrap();
         Json(json!({ "historyId": st.profile_history_id.to_string() }))
@@ -3102,7 +3018,6 @@ mod tests {
             .route("/history", get(mock_history))
             .route("/messages", get(mock_messages_list))
             .route("/messages/{id}", get(mock_message_get))
-            .route("/labels/{id}", get(mock_label))
             .route("/profile", get(mock_profile))
             .with_state(g);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3541,37 +3456,5 @@ mod tests {
             .expect("triage row");
         assert_eq!(row.tier, "noise");
         assert_eq!(row.importance, 0);
-    }
-
-    #[tokio::test]
-    async fn the_inbox_unread_counts_refresh_and_survive_a_failed_fetch() {
-        // Gmail owns these numbers: nothing local can be re-derived into them,
-        // so a failed fetch must leave the last known pair standing rather than
-        // clear it or read as "0 unread".
-        let (store, acct) = store_at_cursor(Some(100));
-
-        let g = MockGmail::default();
-        g.label(LABEL_INBOX, Some((214, 190)));
-        let base = serve_mock(g.clone()).await;
-        let engine = engine(store.clone(), acct, &base);
-
-        engine.refresh_inbox_unread().await;
-        let got = store.inbox_unread(acct).unwrap().expect("counts stored");
-        assert_eq!((got.messages, got.threads), (214, 190));
-        assert_eq!(g.calls("label:INBOX"), 1, "one labels.get per refresh");
-
-        // Gmail goes down mid-run: the refresh swallows it (a poll cycle must
-        // not die over a cosmetic number) and the stored pair is untouched.
-        g.label(LABEL_INBOX, None);
-        engine.refresh_inbox_unread().await;
-        let kept = store.inbox_unread(acct).unwrap().expect("last counts kept");
-        assert_eq!((kept.messages, kept.threads), (214, 190));
-        assert_eq!(kept.fetched_at, got.fetched_at, "the stamp did not move");
-
-        // Recovery overwrites with the newer truth.
-        g.label(LABEL_INBOX, Some((3, 3)));
-        engine.refresh_inbox_unread().await;
-        let fresh = store.inbox_unread(acct).unwrap().unwrap();
-        assert_eq!((fresh.messages, fresh.threads), (3, 3));
     }
 }

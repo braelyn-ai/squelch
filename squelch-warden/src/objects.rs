@@ -146,6 +146,18 @@ pub const CREATED_AT_ANNOTATION: &str = "passband.email/created-at";
 /// managed-by label [`labels`] puts on every tenant object.
 pub const MANAGED_SELECTOR: &str = "app.kubernetes.io/managed-by=squelch-warden";
 
+/// Namespace the metrics collectors run in, and the prometheus-agent pod's own
+/// label. The single peer allowed to reach [`METRICS_PORT`].
+///
+/// Hardcoded rather than configured because the pod on the other side is
+/// installed from this repo (`deploy/hosted/80-monitoring.yaml`): these two
+/// values and that manifest's namespace and pod labels are one contract, and a
+/// knob would only let them drift apart in an install nobody tests.
+pub const MONITORING_NAMESPACE: &str = "monitoring";
+/// See [`MONITORING_NAMESPACE`]. The label on the prometheus-agent pod template,
+/// which is also what its own Deployment selects on.
+pub const MONITORING_POD_LABEL: (&str, &str) = ("app.kubernetes.io/name", "prometheus-agent");
+
 /// The only path prefixes an Ingress routes to a tenant daemon.
 ///
 /// **This is how `/mcp` answers 404 at the ingress layer.** The daemon serves
