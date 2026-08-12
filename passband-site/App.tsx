@@ -227,6 +227,17 @@ export function App() {
             join waitlist
           </a>
         </div>
+        <a
+          style={{
+            color: "#b8b8bd",
+            fontSize: "0.95rem",
+            textDecoration: "underline",
+            textUnderlineOffset: "3px",
+          }}
+          href="/download/latest"
+        >
+          Download for Mac
+        </a>
         <nav style={{ display: "flex", gap: "1.25rem" }}>
           <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
             GitHub
