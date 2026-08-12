@@ -106,10 +106,21 @@ final class TourController {
     /// Settings' "replay the tour": bypasses the completed flag AND the
     /// once-a-session rule, and lands on the sitrep first, since four of the
     /// seven steps are about what is on that page.
+    ///
+    /// The start is deferred a beat, and that beat is load-bearing. Leaving
+    /// Settings mounts the sitrep in the same render pass that would mount the
+    /// tour, and two key contexts pushed in one pass stack in whatever order
+    /// SwiftUI runs their onAppear. If the sitrep's push lands on top, every
+    /// tour key is shadowed: Enter, Escape, the nav holds, all dead. On the
+    /// first-run trigger the board is mounted long before the tour, which is
+    /// exactly the ordering this delay recreates.
     func replay(store: AppStore) {
         dismissedThisSession = false
         store.setView(.sitrep)
-        start()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(120))
+            self.start()
+        }
     }
 
     private func start() {

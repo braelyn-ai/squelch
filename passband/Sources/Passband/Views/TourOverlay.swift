@@ -186,7 +186,7 @@ struct TourOverlay: View {
 
             if let numbers = welcomeNumbers {
                 HStack(alignment: .top, spacing: 36) {
-                    statTile(numbers.first.value, numbers.first.label, Palette.danger)
+                    statTile(numbers.first.value, numbers.first.label, Palette.warn)
                     statTile(numbers.noise, "noise", Palette.danger)
                     statTile(numbers.standing, "need you", Palette.positive)
                 }
@@ -493,7 +493,7 @@ struct TourOverlay: View {
             HStack(spacing: 7) {
                 Text(key)
                     .font(Typo.mono(12, weight: .semibold))
-                    .foregroundStyle(Palette.accentInk)
+                    .foregroundStyle(.white)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
