@@ -4,7 +4,6 @@
 // pushing the modal context unconditionally would gate out the whole "list"
 // keymap forever. The thread viewer layers above it, inset by sidePanelWidth.
 
-import AppKit
 import SwiftUI
 
 struct SidePanel: View {
@@ -166,7 +165,11 @@ struct SearchView: View {
         .onChange(of: focused) { _, on in
             guard on, !store.search.query.isEmpty else { return }
             Task { @MainActor in
-                NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+                // Select-all through the responder chain has no UIKit twin worth
+                // shimming; the iOS field selects its text a different way.
+                #if os(macOS)
+                    NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+                #endif
             }
         }
         .task(id: store.search.query) { await runSearch() }

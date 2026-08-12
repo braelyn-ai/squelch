@@ -361,8 +361,8 @@ private struct AppearanceSection: View {
 /// half-second sound from its name alone is not a thing.
 private struct NotificationsSection: View {
     @Environment(Prefs.self) private var prefs
-    /// Held for the duration of playback: NSSound stops when deallocated.
-    @State private var player: NSSound?
+    /// Held for the duration of playback: the sound stops when deallocated.
+    @State private var player: PlatformSound?
 
     var body: some View {
         @Bindable var prefs = prefs
@@ -385,7 +385,7 @@ private struct NotificationsSection: View {
                 forResource: resource, withExtension: "caf", subdirectory: "Sounds")
         else { return }
         player?.stop()
-        player = NSSound(contentsOf: url, byReference: true)
+        player = PlatformSound(contentsOf: url, byReference: true)
         player?.play()
     }
 }

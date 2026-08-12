@@ -120,11 +120,7 @@ extension Color {
 
     /// A dynamic color that resolves per appearance.
     init(light: Color, dark: Color) {
-        self.init(
-            nsColor: NSColor(name: nil) { appearance in
-                let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-                return NSColor(isDark ? dark : light)
-            })
+        self = Platform.dynamicColor(light: light, dark: dark)
     }
 
     init(light: UInt32, dark: UInt32) {

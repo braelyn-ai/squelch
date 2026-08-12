@@ -126,8 +126,7 @@ struct ThemeToggle: View {
         switch prefs.theme {
         case .dark: true
         case .light: false
-        case .system:
-            NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        case .system: Platform.isDarkAppearance
         }
     }
 

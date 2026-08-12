@@ -158,13 +158,13 @@ private struct ShipmentCard: View {
 /// single domain) or a failed fetch.
 private struct CarrierBadge: View {
     let carrier: Carrier
-    @State private var image: NSImage?
+    @State private var image: PlatformImage?
     @State private var failed = false
 
     var body: some View {
         Group {
             if let image, !failed {
-                Image(nsImage: image)
+                Image(platformImage: image)
                     .resizable().interpolation(.high).aspectRatio(contentMode: .fit)
                     .frame(width: 20, height: 20)
             } else {
@@ -552,27 +552,27 @@ private struct NewsletterHero: View {
             // Past `maxAspect`, draw at the capped ratio and let the ENDS crop:
             // `.fill` overflows on the long axis and `.clipped` keeps the middle,
             // which is where the wordmark lives.
-            Image(nsImage: hero.image)
+            Image(platformImage: hero.image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: Self.side, height: Self.side / Self.maxAspect)
                 .clipped()
         } else {
-            Image(nsImage: hero.image)
+            Image(platformImage: hero.image)
                 .resizable()
                 .aspectRatio(contentMode: fit(hero.image))
         }
     }
 
     /// Wider than the cap, and guarded against a zero-height decode.
-    private func ultraWide(_ image: NSImage) -> Bool {
+    private func ultraWide(_ image: PlatformImage) -> Bool {
         image.size.height > 0 && image.size.width > image.size.height * Self.maxAspect
     }
 
     /// Fit by shape: tall/square heroes crop to fill (photos survive a crop),
     /// WIDE art letterboxes — filling a square with a wordmark would leave a
     /// meaningless slice of two letters. Only reached for art within `maxAspect`.
-    private func fit(_ image: NSImage) -> ContentMode {
+    private func fit(_ image: PlatformImage) -> ContentMode {
         image.size.width > image.size.height * 1.2 ? .fit : .fill
     }
 }

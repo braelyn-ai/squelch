@@ -5,7 +5,6 @@
 // moves; `glassEffectID(_:in:)` with a shared `@Namespace` morphs one shape
 // into another instead of cross-fading.
 
-import AppKit
 import SwiftUI
 
 // MARK: - surface vocabulary
@@ -291,40 +290,45 @@ struct ModalCard<Content: View>: View {
 
 // MARK: - native window backdrop
 
-/// The AppKit backdrop the whole glass language sits ON, plus the app's own
-/// tint over it. A non-opaque window over a `.underWindowBackground` visual-
-/// effect view is what lets `.glassEffect` sample real desktop content.
-///
-/// The scrim alphas are tuned against the hard case — a dark, busy wallpaper
-/// behind a light-theme window — because much below these values the backdrop
-/// bleeds through and light mode reads as a muddy dark one; much above and the
-/// wallpaper stops reading through at all.
-struct WindowBackdrop: View {
-    /// THE APP'S TRANSPARENCY KNOBS — lower is more wallpaper. There is a floor:
-    /// far below these the backdrop bleeds through until light mode reads as a
-    /// muddy dark one over a dark wallpaper, which is the case they are tuned
-    /// against. The canvas carries the theme, so it stays denser than the wash.
-    static let canvasTop: Double = 0.54
-    static let canvasBottom: Double = 0.6
-    static let brandWash: Double = 0.44
+// Everything above is the glass vocabulary itself and stays shared. This piece
+// is about the WINDOW — a desktop object — so it is fenced; an iOS shell brings
+// its own ground for the same glass to sit on.
+#if os(macOS)
+    /// The AppKit backdrop the whole glass language sits ON, plus the app's own
+    /// tint over it. A non-opaque window over a `.underWindowBackground` visual-
+    /// effect view is what lets `.glassEffect` sample real desktop content.
+    ///
+    /// The scrim alphas are tuned against the hard case — a dark, busy wallpaper
+    /// behind a light-theme window — because much below these values the backdrop
+    /// bleeds through and light mode reads as a muddy dark one; much above and the
+    /// wallpaper stops reading through at all.
+    struct WindowBackdrop: View {
+        /// THE APP'S TRANSPARENCY KNOBS — lower is more wallpaper. There is a floor:
+        /// far below these the backdrop bleeds through until light mode reads as a
+        /// muddy dark one over a dark wallpaper, which is the case they are tuned
+        /// against. The canvas carries the theme, so it stays denser than the wash.
+        static let canvasTop: Double = 0.54
+        static let canvasBottom: Double = 0.6
+        static let brandWash: Double = 0.44
 
-    var body: some View {
-        ZStack {
-            VisualEffectBackdrop()
-            // The canvas is blue, not neutral: light mode a pale sky deepening
-            // toward the bottom, dark mode a blue-black rather than a true
-            // black, so the accent still has somewhere to sit.
-            LinearGradient(
-                colors: [
-                    Color(light: 0xE6EFFC, dark: 0x0C1420).opacity(Self.canvasTop),
-                    Color(light: 0xD5E5F8, dark: 0x080E19).opacity(Self.canvasBottom),
-                ],
-                startPoint: .top, endPoint: .bottom)
-            // The brand wash on top, so empty window area is passband's too.
-            Palette.glassTint.opacity(Self.brandWash)
+        var body: some View {
+            ZStack {
+                VisualEffectBackdrop()
+                // The canvas is blue, not neutral: light mode a pale sky deepening
+                // toward the bottom, dark mode a blue-black rather than a true
+                // black, so the accent still has somewhere to sit.
+                LinearGradient(
+                    colors: [
+                        Color(light: 0xE6EFFC, dark: 0x0C1420).opacity(Self.canvasTop),
+                        Color(light: 0xD5E5F8, dark: 0x080E19).opacity(Self.canvasBottom),
+                    ],
+                    startPoint: .top, endPoint: .bottom)
+                // The brand wash on top, so empty window area is passband's too.
+                Palette.glassTint.opacity(Self.brandWash)
+            }
         }
     }
-}
+#endif
 
 // MARK: - text actions
 
@@ -350,89 +354,94 @@ extension ButtonStyle where Self == TextActionStyle {
     static var textAction: TextActionStyle { TextActionStyle() }
 }
 
-private struct VisualEffectBackdrop: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .underWindowBackground
-        view.blendingMode = .behindWindow
-        // Stay frosted when the window loses focus: the sitrep is glanceable,
-        // so it has to stay legible in the background.
-        view.state = .active
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
-/// Reaches the hosting NSWindow once, to make it non-opaque (without which the
-/// glass has nothing to sample) and to hide the title bar.
-struct WindowConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            guard let window = view.window else { return }
-            window.isOpaque = false
-            window.backgroundColor = .clear
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.styleMask.insert(.fullSizeContentView)
-            window.isMovableByWindowBackground = true
-            Self.hideTitlebarDecoration(in: window)
+// The two AppKit representables the shell is built from. Both reach for the
+// hosting NSWindow, which has no counterpart to shim: an iOS app has no window
+// to make non-opaque and no titlebar to hide.
+#if os(macOS)
+    private struct VisualEffectBackdrop: NSViewRepresentable {
+        func makeNSView(context: Context) -> NSVisualEffectView {
+            let view = NSVisualEffectView()
+            view.material = .underWindowBackground
+            view.blendingMode = .behindWindow
+            // Stay frosted when the window loses focus: the sitrep is glanceable,
+            // so it has to stay legible in the background.
+            view.state = .active
+            return view
         }
-        return view
+
+        func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
     }
 
-    /// Hide the glass chip macOS 26 paints behind the traffic lights
-    /// (`_NSTitlebarDecorationView`). It samples the backdrop and re-tints it,
-    /// so the title strip reads as a different colour than the page it sits on.
-    /// `titlebarAppearsTransparent` hides the titlebar *background* view but
-    /// not this one, and no public API reaches it, hence the class-name walk.
-    ///
-    /// AppKit builds the decoration lazily — it does not exist yet when the
-    /// window is configured — and can rebuild it on later transitions, so one
-    /// walk is not enough: a few post-launch retries catch the initial build,
-    /// and key/main/occlusion observers catch rebuilds for the window's life.
-    static func hideTitlebarDecoration(in window: NSWindow) {
-        hideDecoration(in: window)
-        for delay in [0.25, 0.75, 2.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                MainActor.assumeIsolated { hideAllDecorations() }
+    /// Reaches the hosting NSWindow once, to make it non-opaque (without which the
+    /// glass has nothing to sample) and to hide the title bar.
+    struct WindowConfigurator: NSViewRepresentable {
+        func makeNSView(context: Context) -> NSView {
+            let view = NSView()
+            DispatchQueue.main.async {
+                guard let window = view.window else { return }
+                window.isOpaque = false
+                window.backgroundColor = .clear
+                window.titlebarAppearsTransparent = true
+                window.titleVisibility = .hidden
+                window.styleMask.insert(.fullSizeContentView)
+                window.isMovableByWindowBackground = true
+                Self.hideTitlebarDecoration(in: window)
+            }
+            return view
+        }
+
+        /// Hide the glass chip macOS 26 paints behind the traffic lights
+        /// (`_NSTitlebarDecorationView`). It samples the backdrop and re-tints it,
+        /// so the title strip reads as a different colour than the page it sits on.
+        /// `titlebarAppearsTransparent` hides the titlebar *background* view but
+        /// not this one, and no public API reaches it, hence the class-name walk.
+        ///
+        /// AppKit builds the decoration lazily — it does not exist yet when the
+        /// window is configured — and can rebuild it on later transitions, so one
+        /// walk is not enough: a few post-launch retries catch the initial build,
+        /// and key/main/occlusion observers catch rebuilds for the window's life.
+        static func hideTitlebarDecoration(in window: NSWindow) {
+            hideDecoration(in: window)
+            for delay in [0.25, 0.75, 2.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    MainActor.assumeIsolated { hideAllDecorations() }
+                }
+            }
+            for name in [
+                NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                NSWindow.didBecomeMainNotification, NSWindow.didResignMainNotification,
+                NSWindow.didChangeOcclusionStateNotification,
+            ] {
+                NotificationCenter.default.addObserver(
+                    forName: name, object: window, queue: .main
+                ) { _ in
+                    MainActor.assumeIsolated { hideAllDecorations() }
+                }
             }
         }
-        for name in [
-            NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
-            NSWindow.didBecomeMainNotification, NSWindow.didResignMainNotification,
-            NSWindow.didChangeOcclusionStateNotification,
-        ] {
-            NotificationCenter.default.addObserver(
-                forName: name, object: window, queue: .main
-            ) { _ in
-                MainActor.assumeIsolated { hideAllDecorations() }
-            }
+
+        /// Re-walk every window. NOTHING IS CAPTURED, deliberately: these closures
+        /// are `@Sendable` and neither NSWindow nor Notification is Sendable, so
+        /// reaching the windows through NSApp at call time is what satisfies the
+        /// concurrency checker without an unchecked-Sendable box. The app has one or
+        /// two windows and this runs only on focus/occlusion changes.
+        @MainActor
+        private static func hideAllDecorations() {
+            for window in NSApp.windows { hideDecoration(in: window) }
         }
-    }
 
-    /// Re-walk every window. NOTHING IS CAPTURED, deliberately: these closures
-    /// are `@Sendable` and neither NSWindow nor Notification is Sendable, so
-    /// reaching the windows through NSApp at call time is what satisfies the
-    /// concurrency checker without an unchecked-Sendable box. The app has one or
-    /// two windows and this runs only on focus/occlusion changes.
-    @MainActor
-    private static func hideAllDecorations() {
-        for window in NSApp.windows { hideDecoration(in: window) }
-    }
-
-    /// One walk of the frame view, hiding any decoration view it finds.
-    @MainActor
-    private static func hideDecoration(in window: NSWindow) {
-        func walk(_ view: NSView) {
-            if String(describing: type(of: view)).contains("TitlebarDecoration") {
-                view.isHidden = true
+        /// One walk of the frame view, hiding any decoration view it finds.
+        @MainActor
+        private static func hideDecoration(in window: NSWindow) {
+            func walk(_ view: NSView) {
+                if String(describing: type(of: view)).contains("TitlebarDecoration") {
+                    view.isHidden = true
+                }
+                view.subviews.forEach(walk)
             }
-            view.subviews.forEach(walk)
+            if let frameView = window.contentView?.superview { walk(frameView) }
         }
-        if let frameView = window.contentView?.superview { walk(frameView) }
-    }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
+        func updateNSView(_ nsView: NSView, context: Context) {}
+    }
+#endif

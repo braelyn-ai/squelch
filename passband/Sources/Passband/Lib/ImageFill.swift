@@ -4,7 +4,7 @@
 // Every failure path returns nil and the card keeps its neutral well; nothing
 // here ever throws to the caller.
 
-import AppKit
+import CoreGraphics
 import SwiftUI
 
 enum ImageFill {

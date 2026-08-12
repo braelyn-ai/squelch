@@ -5,7 +5,6 @@
 // Numbers are always monospaced-digit so columns of amounts, importances and
 // token counts line up rather than jittering as they update.
 
-import AppKit
 import SwiftUI
 
 enum Typo {
@@ -17,7 +16,7 @@ enum Typo {
     /// covers the normal case; this is the fallback when the resources landed
     /// somewhere unexpected in the bundle.
     static func registerBundledFonts() {
-        guard NSFont(name: serifFamily, size: 12) == nil else { return }
+        guard PlatformFont(name: serifFamily, size: 12) == nil else { return }
         for name in ["newsreader-var", "newsreader-italic-var"] {
             guard let url = Bundle.main.url(forResource: name, withExtension: "ttf") else {
                 continue
@@ -28,7 +27,7 @@ enum Typo {
 
     /// The editorial headline. Newsreader when available, New York otherwise.
     static func hero(_ size: CGFloat = 40) -> Font {
-        if NSFont(name: serifFamily, size: size) != nil {
+        if PlatformFont(name: serifFamily, size: size) != nil {
             return .custom(serifFamily, size: size).weight(.medium)
         }
         return .system(size: size, weight: .medium, design: .serif)
@@ -36,7 +35,7 @@ enum Typo {
 
     /// A smaller serif moment (empty states, the connect card's wordmark).
     static func serif(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        if NSFont(name: serifFamily, size: size) != nil {
+        if PlatformFont(name: serifFamily, size: size) != nil {
             return .custom(serifFamily, size: size).weight(weight)
         }
         return .system(size: size, weight: weight, design: .serif)

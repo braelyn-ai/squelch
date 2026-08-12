@@ -5,8 +5,8 @@
 // the authenticated door via APIClient — a bearer token cannot ride an <img src>,
 // and this cache never learns it. The caller picks the bucket.
 
-import AppKit
 import CoreGraphics
+import Foundation
 
 @MainActor
 final class AttachmentThumbs {
@@ -18,7 +18,7 @@ final class AttachmentThumbs {
 
     /// A resolved tile. `.blank` is a real verdict ("this one produces no
     /// art"), not a missing entry, which is what makes the negative cache work.
-    enum Tile { case art(NSImage), blank }
+    enum Tile { case art(PlatformImage), blank }
 
     /// The tile's size in PIXELS: the 38pt square at 2x, retina being the only
     /// display class this app ships on. `nonisolated` for the detached render task.
@@ -64,7 +64,7 @@ final class AttachmentThumbs {
             }
         }.value
 
-        guard let png, let image = NSImage(data: png) else { return .blank }
+        guard let png, let image = PlatformImage(data: png) else { return .blank }
         return .art(image)
     }
 

@@ -6,8 +6,13 @@
 // from posting. On a dev machine the grant resets every recompile: an ad-hoc
 // signature's identity is a hash of the build.
 
-import AppKit
 import UserNotifications
+
+// Fronting the app and finding its window are AppKit-only ideas, and MainWindow
+// itself is a macOS file — the notification half below is what ships everywhere.
+#if os(macOS)
+    import AppKit
+#endif
 
 @MainActor
 final class Notifier {
@@ -186,8 +191,10 @@ final class Notifier {
     /// thread.
     func handleTap(threadId: String?) {
         Analytics.capture("notification_opened", ["has_thread": !(threadId ?? "").isEmpty])
-        NSApp.activate(ignoringOtherApps: true)
-        MainWindow.show()
+        #if os(macOS)
+            NSApp.activate(ignoringOtherApps: true)
+            MainWindow.show()
+        #endif
         guard let threadId, !threadId.isEmpty else { return }
         AppStore.shared.openThread(threadId)
     }
@@ -204,7 +211,13 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter, willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
         let (active, visible) = await MainActor.run {
-            (NSApp.isActive, MainWindow.find()?.isVisible == true)
+            #if os(macOS)
+                (NSApp.isActive, MainWindow.find()?.isVisible == true)
+            #else
+                // Off macOS the banner always wins until there is a real
+                // foreground check: a suppressed notification is a lost one.
+                (false, false)
+            #endif
         }
         return Notifier.presentation(appActive: active, windowVisible: visible)
     }

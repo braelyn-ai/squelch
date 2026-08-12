@@ -14,7 +14,6 @@
 //   * A handler returning false DECLINES the key and dispatch continues to the
 //     next candidate.
 
-import AppKit
 import SwiftUI
 
 /// Which layer is receiving keys. "thread" (the fullscreen viewer) sits ABOVE
@@ -214,85 +213,92 @@ final class KeyRegistry {
     }
 }
 
-// MARK: - NSEvent bridge
+// THE APPKIT EVENT SOURCE. Everything above is pure — the registry, the
+// contexts, the dispatch algorithm — and everything below it is SwiftUI, so
+// the 21 view files that register bindings compile anywhere. Only the source
+// of the events is AppKit, and on a platform without one the registry simply
+// never gets asked: bindings register into the void until a twin exists.
+#if os(macOS)
+    // MARK: - NSEvent bridge
 
-/// Translate an AppKit key event into the browser-style key names bindings are
-/// written against.
-enum KeyNames {
-    static func name(for event: NSEvent) -> String? {
-        // Named keys first, by key code — `characters` for these is a private
-        // Unicode escape, not something bindings can be written against.
-        switch event.keyCode {
-        case 53: return "Escape"
-        case 36, 76: return "Enter"       // Return, keypad Enter
-        case 48: return "Tab"
-        case 49: return "Space"
-        case 51: return "Backspace"
-        case 117: return "Delete"
-        case 123: return "ArrowLeft"
-        case 124: return "ArrowRight"
-        case 125: return "ArrowDown"
-        case 126: return "ArrowUp"
-        case 115: return "Home"
-        case 119: return "End"
-        case 116: return "PageUp"
-        case 121: return "PageDown"
-        default: break
+    /// Translate an AppKit key event into the browser-style key names bindings are
+    /// written against.
+    enum KeyNames {
+        static func name(for event: NSEvent) -> String? {
+            // Named keys first, by key code — `characters` for these is a private
+            // Unicode escape, not something bindings can be written against.
+            switch event.keyCode {
+            case 53: return "Escape"
+            case 36, 76: return "Enter"       // Return, keypad Enter
+            case 48: return "Tab"
+            case 49: return "Space"
+            case 51: return "Backspace"
+            case 117: return "Delete"
+            case 123: return "ArrowLeft"
+            case 124: return "ArrowRight"
+            case 125: return "ArrowDown"
+            case 126: return "ArrowUp"
+            case 115: return "Home"
+            case 119: return "End"
+            case 116: return "PageUp"
+            case 121: return "PageDown"
+            default: break
+            }
+            // Printable characters keep their case — that IS the shift signal for
+            // letters. `charactersIgnoringModifiers` so an Option chord still
+            // reports the base glyph, then shift casing is re-applied.
+            guard let raw = event.charactersIgnoringModifiers, !raw.isEmpty else { return nil }
+            if raw.count == 1, let ch = raw.first, ch.isLetter {
+                return event.modifierFlags.contains(.shift) ? raw.uppercased() : raw.lowercased()
+            }
+            // For non-letters, `characters` reflects the shifted glyph ("?" for
+            // shift+/), which is what the bindings are written against.
+            if let chars = event.characters, !chars.isEmpty, chars.count == 1 { return chars }
+            return raw
         }
-        // Printable characters keep their case — that IS the shift signal for
-        // letters. `charactersIgnoringModifiers` so an Option chord still
-        // reports the base glyph, then shift casing is re-applied.
-        guard let raw = event.charactersIgnoringModifiers, !raw.isEmpty else { return nil }
-        if raw.count == 1, let ch = raw.first, ch.isLetter {
-            return event.modifierFlags.contains(.shift) ? raw.uppercased() : raw.lowercased()
-        }
-        // For non-letters, `characters` reflects the shifted glyph ("?" for
-        // shift+/), which is what the bindings are written against.
-        if let chars = event.characters, !chars.isEmpty, chars.count == 1 { return chars }
-        return raw
-    }
 
-    static func eventLike(_ event: NSEvent) -> KeyEventLike? {
-        guard let key = name(for: event) else { return nil }
-        let f = event.modifierFlags
-        return KeyEventLike(
-            key: key,
-            control: f.contains(.control),
-            option: f.contains(.option),
-            command: f.contains(.command),
-            shift: f.contains(.shift))
-    }
-}
-
-/// Installs the ONE global key monitor. Sits at the app level (PassbandApp) so
-/// there is exactly one listener.
-@MainActor
-final class KeyMonitor {
-    static let shared = KeyMonitor()
-    private var monitor: Any?
-
-    private init() {}
-
-    func install() {
-        guard monitor == nil else { return }
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard let like = KeyNames.eventLike(event) else { return event }
-            // The input guard: typing into a text field suppresses single-letter
-            // bindings unless the binding opts in.
-            let editing = Self.isEditing(event.window)
-            let outcome = KeyRegistry.shared.dispatch(like, editing: editing)
-            // Returning nil consumes the event.
-            return outcome.handled ? nil : event
+        static func eventLike(_ event: NSEvent) -> KeyEventLike? {
+            guard let key = name(for: event) else { return nil }
+            let f = event.modifierFlags
+            return KeyEventLike(
+                key: key,
+                control: f.contains(.control),
+                option: f.contains(.option),
+                command: f.contains(.command),
+                shift: f.contains(.shift))
         }
     }
 
-    /// True when first responder is a text-entry view.
-    private static func isEditing(_ window: NSWindow?) -> Bool {
-        guard let responder = window?.firstResponder else { return false }
-        if let textView = responder as? NSTextView { return textView.isEditable }
-        return responder is NSTextField
+    /// Installs the ONE global key monitor. Sits at the app level (PassbandApp) so
+    /// there is exactly one listener.
+    @MainActor
+    final class KeyMonitor {
+        static let shared = KeyMonitor()
+        private var monitor: Any?
+
+        private init() {}
+
+        func install() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard let like = KeyNames.eventLike(event) else { return event }
+                // The input guard: typing into a text field suppresses single-letter
+                // bindings unless the binding opts in.
+                let editing = Self.isEditing(event.window)
+                let outcome = KeyRegistry.shared.dispatch(like, editing: editing)
+                // Returning nil consumes the event.
+                return outcome.handled ? nil : event
+            }
+        }
+
+        /// True when first responder is a text-entry view.
+        private static func isEditing(_ window: NSWindow?) -> Bool {
+            guard let responder = window?.firstResponder else { return false }
+            if let textView = responder as? NSTextView { return textView.isEditable }
+            return responder is NSTextField
+        }
     }
-}
+#endif
 
 // MARK: - SwiftUI attachment
 

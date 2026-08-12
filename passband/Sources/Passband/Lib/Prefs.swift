@@ -266,8 +266,7 @@ final class Prefs {
         case .light: theme = .dark
         case .dark: theme = .light
         case .system:
-            let isDark = NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            theme = isDark ? .light : .dark
+            theme = Platform.isDarkAppearance ? .light : .dark
         }
     }
 }

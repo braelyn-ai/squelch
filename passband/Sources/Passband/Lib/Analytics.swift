@@ -12,7 +12,6 @@
 // — could only ever leave as a free-form string, so free-form strings cannot
 // leave at all.
 
-import AppKit
 import Foundation
 
 enum Analytics {
@@ -45,16 +44,16 @@ enum Analytics {
         guard let client else { return }
         let nc = NotificationCenter.default
         nc.addObserver(
-            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil
+            forName: Platform.didBecomeActiveNotification, object: nil, queue: nil
         ) { _ in lifecycle("Application Opened") }
         nc.addObserver(
-            forName: NSApplication.didResignActiveNotification, object: nil, queue: nil
+            forName: Platform.didResignActiveNotification, object: nil, queue: nil
         ) { _ in
             lifecycle("Application Backgrounded")
             client.flush()
         }
         nc.addObserver(
-            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+            forName: Platform.willTerminateNotification, object: nil, queue: nil
         ) { _ in client.flushBlocking() }
     }
 

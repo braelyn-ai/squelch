@@ -5,7 +5,6 @@
 // Each band carries its own server-side `band` filter so the buckets match the
 // server's definitions exactly. Sealed is metadata-only — never bodies.
 
-import AppKit
 import Foundation
 
 @MainActor
@@ -42,7 +41,7 @@ final class SitrepPoller {
         guard !resident.isRunning else { return }
         resident.start { [weak self] in await self?.run() }
         focusObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+            forName: Platform.didBecomeActiveNotification, object: nil, queue: .main
         ) { _ in
             Task { @MainActor in await SitrepPoller.shared.pull() }
         }

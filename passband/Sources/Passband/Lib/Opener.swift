@@ -5,7 +5,6 @@
 // failure log carries at most the HOST — mail-derived links routinely carry
 // per-recipient tokens. See docs/SECURITY.md §2.
 
-import AppKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -27,7 +26,7 @@ enum Opener {
     @MainActor
     static func open(_ url: String?) {
         guard let url, !url.isEmpty, isHTTP(url), let parsed = URL(string: url) else { return }
-        if !NSWorkspace.shared.open(parsed) {
+        if !Platform.open(parsed) {
             // A dead button must be diagnosable: static text plus the host only.
             NSLog("openExternal: failed to open external URL (host: %@)", safeHost(url))
         }
@@ -42,9 +41,7 @@ enum Clip {
     @MainActor
     @discardableResult
     static func copy(_ text: String) -> Bool {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        return pb.setString(text, forType: .string)
+        Platform.copyToPasteboard(text)
     }
 
     /// Copy, then hold `flash` true for the confirmation window so a button can
@@ -65,25 +62,30 @@ enum Clip {
 enum Downloads {
     enum Result { case saved, cancelled, failed(String) }
 
-    /// Save raw bytes to a user-chosen path via the standard save panel.
-    @MainActor
-    static func saveBytes(_ bytes: Data, filename: String) async -> Result {
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = filename
-        panel.canCreateDirectories = true
-        panel.isExtensionHidden = false
-        if let ext = filename.split(separator: ".").last.map(String.init),
-            let type = UTType(filenameExtension: ext)
-        {
-            panel.allowedContentTypes = [type]
+    // "Pick a path" is a desktop idea: iOS saves through a document picker or a
+    // share sheet, which is a different flow rather than a different call, so
+    // there is nothing honest to shim here.
+    #if os(macOS)
+        /// Save raw bytes to a user-chosen path via the standard save panel.
+        @MainActor
+        static func saveBytes(_ bytes: Data, filename: String) async -> Result {
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = filename
+            panel.canCreateDirectories = true
+            panel.isExtensionHidden = false
+            if let ext = filename.split(separator: ".").last.map(String.init),
+                let type = UTType(filenameExtension: ext)
+            {
+                panel.allowedContentTypes = [type]
+            }
+            let response = await panel.begin()
+            guard response == .OK, let url = panel.url else { return .cancelled }
+            do {
+                try bytes.write(to: url, options: .atomic)
+                return .saved
+            } catch {
+                return .failed("could not write the file")
+            }
         }
-        let response = await panel.begin()
-        guard response == .OK, let url = panel.url else { return .cancelled }
-        do {
-            try bytes.write(to: url, options: .atomic)
-            return .saved
-        } catch {
-            return .failed("could not write the file")
-        }
-    }
+    #endif
 }

@@ -5,7 +5,6 @@
 // (the encoded thumbnail and three colour components) crossing back. Preloading
 // is just "resolve everything the zone is about to show".
 
-import AppKit
 import SwiftUI
 
 @MainActor
@@ -15,7 +14,7 @@ final class HeroCache {
     /// A resolved hero: art already downsampled to its square, plus the colour
     /// to paint behind it.
     struct Hero {
-        let image: NSImage
+        let image: PlatformImage
         let fill: Color?
     }
 
@@ -91,7 +90,7 @@ final class HeroCache {
             render(bytes, maxPixel: maxPixel)
         }.value
 
-        guard let rendered, let image = NSImage(data: rendered.thumbnail) else { return nil }
+        guard let rendered, let image = PlatformImage(data: rendered.thumbnail) else { return nil }
         return Hero(image: image, fill: rendered.rgb.map(\.color))
     }
 

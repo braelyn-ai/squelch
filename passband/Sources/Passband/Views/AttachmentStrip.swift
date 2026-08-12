@@ -4,7 +4,6 @@
 // attachment stays inert. Tiles resolve through AttachmentThumbs (a card in a
 // LazyVStack would re-download on recycle), authenticated through APIClient.
 
-import AppKit
 import PDFKit
 import SwiftUI
 
@@ -160,7 +159,7 @@ private struct ThumbTile: View {
             case .art(let image)?:
                 // A page keeps its aspect — that shape is what reads as "a
                 // document"; a photo fills the square.
-                Image(nsImage: image)
+                Image(platformImage: image)
                     .resizable()
                     .aspectRatio(contentMode: source == .pdf ? .fit : .fill)
             case .blank?:
@@ -269,19 +268,24 @@ private struct PDFPreview: View {
     }
 }
 
-private struct PDFKitView: NSViewRepresentable {
-    let document: PDFDocument
+// PDFKit itself is cross-platform, but the representable that hosts a PDFView is
+// not: the two platforms spell the protocol differently, down to every method
+// name. The twin lands with the iOS target rather than as a guess here.
+#if os(macOS)
+    private struct PDFKitView: NSViewRepresentable {
+        let document: PDFDocument
 
-    func makeNSView(context: Context) -> PDFView {
-        let view = PDFView()
-        view.autoScales = true
-        view.displayMode = .singlePageContinuous
-        view.backgroundColor = .clear
-        view.document = document
-        return view
-    }
+        func makeNSView(context: Context) -> PDFView {
+            let view = PDFView()
+            view.autoScales = true
+            view.displayMode = .singlePageContinuous
+            view.backgroundColor = .clear
+            view.document = document
+            return view
+        }
 
-    func updateNSView(_ nsView: PDFView, context: Context) {
-        if nsView.document !== document { nsView.document = document }
+        func updateNSView(_ nsView: PDFView, context: Context) {
+            if nsView.document !== document { nsView.document = document }
+        }
     }
-}
+#endif

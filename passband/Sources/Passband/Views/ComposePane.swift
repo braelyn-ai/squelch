@@ -17,7 +17,6 @@
 // MarkdownTextView); the daemon renders the HTML half of what actually goes
 // out from this same source (`body_format: "markdown"`).
 
-import AppKit
 import SwiftUI
 
 struct ComposePane: View {
@@ -234,7 +233,13 @@ struct ComposePane: View {
     /// now (FocusState cannot see into AppKit), and plain Enter there must stay
     /// a newline.
     private var bodyHasFocus: Bool {
-        NSApp.keyWindow?.firstResponder is NSTextView
+        #if os(macOS)
+            NSApp.keyWindow?.firstResponder is NSTextView
+        #else
+            // The body editor has no non-AppKit twin yet, and "not focused" is
+            // the safe answer: Enter reviews instead of inserting a newline.
+            false
+        #endif
     }
 
     private var bindings: [KeyBinding] {
