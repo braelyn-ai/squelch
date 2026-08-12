@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Self-host &middot; Passband</title>
+    <link rel="icon" type="image/png" href="/knob.png" />
+    <style>
+      body {
+        margin: 0;
+        background: #0f0f10;
+        color: #d6d6d9;
+        font-family: system-ui, sans-serif;
+        line-height: 1.65;
+      }
+      main {
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 3rem 1.5rem 5rem;
+      }
+      .home {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.6rem;
+        color: #8a8a90;
+        text-decoration: none;
+        font-size: 0.9rem;
+        margin-bottom: 2rem;
+      }
+      .home img {
+        width: 28px;
+        height: 28px;
+        border-radius: 7px;
+      }
+      h1 {
+        color: #f5f5f7;
+        font-size: 2rem;
+        margin: 0 0 0.25rem;
+      }
+      .sub {
+        color: #8a8a90;
+        margin: 0 0 2.5rem;
+      }
+      h2 {
+        color: #f5f5f7;
+        font-size: 1.15rem;
+        margin: 2.5rem 0 0.75rem;
+      }
+      p {
+        margin: 0.75rem 0;
+      }
+      a {
+        color: #b8b8bd;
+      }
+      pre {
+        background: #17171a;
+        border: 1px solid #26262b;
+        border-radius: 0.6rem;
+        padding: 0.9rem 1.1rem;
+        overflow-x: auto;
+        font-size: 0.85rem;
+        line-height: 1.55;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      p code, li code {
+        background: #17171a;
+        border: 1px solid #26262b;
+        border-radius: 0.3rem;
+        padding: 0.1rem 0.35rem;
+        font-size: 0.85em;
+      }
+      ol {
+        padding-left: 1.4rem;
+      }
+      li {
+        margin: 0.4rem 0;
+      }
+      .note {
+        color: #8a8a90;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <a class="home" href="/"><img src="/knob.png" alt="" />Passband</a>
+      <h1>Self-host</h1>
+      <p class="sub">
+        Run the daemon on your own box, keep your mail on your own disk.
+      </p>
+
+      <p>
+        Passband is two pieces. <strong>squelchd</strong> is the daemon: it
+        syncs your Gmail read-only, triages it, and serves it over a local API.
+        <strong>Passband</strong> is the Mac app that talks to the daemon. You
+        host the daemon; the app connects to wherever it lives.
+      </p>
+
+      <h2>1. Create a Google OAuth client</h2>
+      <ol>
+        <li>Go to <a href="https://console.cloud.google.com">console.cloud.google.com</a> and create a project</li>
+        <li>Enable the <strong>Gmail API</strong></li>
+        <li>Configure the OAuth consent screen (External) and add yourself as a test user</li>
+        <li>Create credentials: OAuth client ID, type <strong>Desktop app</strong></li>
+      </ol>
+
+      <h2>2. Run the daemon</h2>
+      <p>
+        Prebuilt multi-arch images (amd64 + arm64) are public on GHCR, no
+        registry login needed:
+      </p>
+      <pre><code>docker pull ghcr.io/braelyn-ai/squelchd:latest</code></pre>
+      <p>A minimal <code>docker-compose.yml</code>:</p>
+      <pre><code>services:
+  squelchd:
+    image: ghcr.io/braelyn-ai/squelchd:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8848:8848"
+    volumes:
+      - squelch-data:/data
+    environment:
+      SQUELCH_ACCOUNT_EMAIL: you@gmail.com
+      SQUELCH_CLIENT_ID: ${SQUELCH_CLIENT_ID:?set in .env}
+      SQUELCH_CLIENT_SECRET: ${SQUELCH_CLIENT_SECRET:?set in .env}
+
+volumes:
+  squelch-data:</code></pre>
+      <p class="note">
+        The port stays on loopback; front it with
+        <code>tailscale serve --bg 8848</code> or your own proxy to reach it
+        from your Mac. The full environment-variable reference and the OAuth
+        consent flow live in
+        <a href="https://github.com/braelyn-ai/squelch/blob/main/deploy/DOCKER.md">deploy/DOCKER.md</a>,
+        and
+        <a href="https://github.com/braelyn-ai/squelch/blob/main/docs/GETTING-STARTED.md">docs/GETTING-STARTED.md</a>
+        walks a complete setup end to end: daemon in Docker on a NAS, Passband
+        on a Mac.
+      </p>
+
+      <h2>3. Get the app</h2>
+      <p><a href="/download/latest">Download Passband for Mac</a>, or:</p>
+      <pre><code>brew install --cask braelyn-ai/tap/passband</code></pre>
+      <p>
+        Point it at your daemon, pair the device, and you're done. Updates
+        arrive in-app via Sparkle.
+      </p>
+
+      <p class="note">
+        Everything is open source and MIT licensed:
+        <a href="https://github.com/braelyn-ai/squelch">github.com/braelyn-ai/squelch</a>
+      </p>
+    </main>
+  </body>
+</html>
