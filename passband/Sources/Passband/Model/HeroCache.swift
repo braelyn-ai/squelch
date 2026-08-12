@@ -45,6 +45,13 @@ final class HeroCache {
         return entry
     }
 
+    /// Forget every resolved hero. An account switch: thread ids are one
+    /// daemon's, and the art behind them was fetched through that daemon's
+    /// mail — so the whole table is about a mailbox that is no longer on
+    /// screen. The negative entries go with it, or a sender with no art in the
+    /// old account would render as one in the new.
+    func wipe() { memo.clear() }
+
     /// Whether this thread has a VERDICT — art, or a cached "has none". `cached`
     /// flattens both to nil and cannot answer it; a card checks this before
     /// starting a `.task` that would only re-hand it what it already drew.

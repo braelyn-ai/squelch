@@ -371,6 +371,25 @@ final class AppStore {
     /// unconfigured: no toggle anywhere, no receipts fetched.
     var tracking: TrackingConfig?
 
+    // MARK: account switching
+
+    /// Bumped ONCE per account switch. Every async writer of account-scoped
+    /// state captures it before its first await and refuses to write once it
+    /// no longer matches: a request built against account A's daemon can land
+    /// after B is live, and message ids are per-daemon SQLite ints — so a
+    /// stale answer does not read as stale, it reads as B's mail.
+    private(set) var epoch = 0
+
+    /// True for the length of a switch. THE re-entrancy guard: the sequence
+    /// suspends twice (the draft settle, the keychain read) and a second
+    /// switch starting inside one of those windows would configure the client
+    /// out from under the first.
+    private(set) var switching = false
+
+    /// Whether `e` is still the live epoch — the post-await check every
+    /// account-scoped writer outside this file makes.
+    func isCurrent(_ e: Int) -> Bool { epoch == e }
+
     private init() {}
 
     // MARK: - settings
@@ -380,6 +399,9 @@ final class AppStore {
         // pre-multi-account install on the way through. Off the main actor for
         // the same reason the load below is.
         let index = await AccountIndex.loadOrMigrate()
+        // Into the observable mirror before anything reads it: the manager may
+        // have been built — and read a pre-repair index — during boot.
+        AccountManager.shared.adopt(index)
         guard let active = index.active else {
             connStatus = .disconnected
             return
@@ -433,6 +455,11 @@ final class AppStore {
                 accountId: account.id
             ).get()
             AccountIndex.upsert(account)
+            // Into the observable mirror too: everything account-scoped — the
+            // 2FA seen-set, the decisions ledger — derives its storage key
+            // from `AccountManager.activeId`, and a first connection is the
+            // moment that goes from nothing to something.
+            AccountManager.shared.reload()
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             connStatus = .connected
             connError = nil
@@ -465,6 +492,7 @@ final class AppStore {
                 accountId: account.id
             ).get()
             AccountIndex.upsert(account)
+            AccountManager.shared.reload()
             settings = ConnectionSettings(serverURL: serverURL, apiToken: apiToken)
             return (true, nil)
         } catch {
@@ -490,9 +518,24 @@ final class AppStore {
         // Wipe the live account's persisted settings — credentials first, then
         // the index entry that names them — so the next boot lands on the
         // Connect gate.
+        //
+        // A REFUSED KEYCHAIN DELETE IS NOT SWALLOWED. The entry goes either
+        // way (the human asked to disconnect and is entitled to have it
+        // happen), and that entry is the only thing that still names those
+        // slots — so the id is parked for the boot sweep, which keeps
+        // retrying until the token is really gone.
         if let id = AccountIndex.load().activeId {
-            try? SettingsStore.clear(accountId: id)
+            do {
+                try SettingsStore.clear(accountId: id)
+            } catch {
+                AccountIndex.parkOrphan(id)
+            }
             AccountIndex.remove(id)
+            // Disconnecting the last account empties the index, which is the
+            // one shape a boot can still read as a pre-multi-account install
+            // and repair back into existence — see `sealLegacyIfEmpty`.
+            AccountIndex.sealLegacyIfEmpty()
+            AccountManager.shared.reload()
         }
         connStatus = .disconnected
         settings = nil
@@ -505,6 +548,151 @@ final class AppStore {
         sideView = .none
         history = [HistoryEntry(view: .sitrep, selectedId: nil)]
         historyIndex = 0
+    }
+
+    // MARK: - switching accounts
+
+    /// Make `record` the live account: tear the current world down, point the
+    /// client at the new daemon, and start it up again. `connStatus` never
+    /// leaves `.connected`, so the Connect gate does not flash in between —
+    /// the restart at the end is by hand for exactly that reason.
+    ///
+    /// Entered through `AccountManager.switchTo`, which owns the "is this a
+    /// real, different account" half of step (1).
+    ///
+    /// ACCEPTED RESIDUAL RACE, documented rather than fixed: an action Task
+    /// created in the same instant as this one can read `APIClient.shared`'s
+    /// config AFTER step (8) has replaced it, and send account A's verb to
+    /// account B's daemon. The window is the sub-millisecond gap between that
+    /// Task being created and its request being built. Closing it needs a
+    /// generation INSIDE APIClient that every request checks and every caller
+    /// passes — identified, not built, because it touches all 25 call sites.
+    func switchAccount(to record: AccountRecord) async {
+        // (1) Never two at once — the two awaits below are both windows a
+        //     second switch could start in.
+        guard !switching else { return }
+        switching = true
+        // (10) Whichever path we leave by.
+        defer { switching = false }
+
+        // (2) From here, every answer still in flight belongs to the old
+        //     account and every writer that captured the old epoch is inert.
+        epoch &+= 1
+
+        // (3) Stop polling this daemon. The EventStreams keep running: mail
+        //     notifications come from every account, live or not (Phase 3).
+        SitrepPoller.shared.stop()
+
+        // (4) Both composers' last save — and then WAIT for it. Reconfiguring
+        //     the client underneath an in-flight draft PUT would post what the
+        //     human typed into account A into account B's drafts, under an id
+        //     that means something else there.
+        DraftSaver.shared.flush(.compose, compose)
+        DraftSaver.shared.flush(.inlineReply, inlineReply)
+        await DraftSaver.shared.settle()
+
+        // (5) The ⌘K session: its transcript cites the old account's mail and
+        //     its parked tool calls would act on it.
+        assistant.clear()
+
+        // (6) + (7) The world itself, in one synchronous pass so no frame is
+        //     ever painted showing a mix of two mailboxes.
+        wipeAccountState()
+        wipeAccountCaches()
+
+        // (8) The new credentials. This is the only step that can fail.
+        guard let next = await AccountManager.shared.settings(for: record.id) else {
+            // The slots behind the record are gone or unreadable, and the old
+            // world is already torn down — there is nothing to switch into and
+            // nothing to go back to, so the Connect gate is the honest answer.
+            settings = nil
+            connStatus = .disconnected
+            connError = "account settings load failed"
+            return
+        }
+        settings = next
+        await APIClient.shared.configure(baseURL: next.serverURL, token: next.apiToken)
+        AccountManager.shared.markActive(record.id)
+        // AFTER `markActive`, deliberately: the ledger's UserDefaults key is
+        // derived from the live account id, so reloading it with the singletons
+        // in step (7) would have re-read the account that just went away.
+        AuthDecisions.shared.reload()
+
+        // (9) Restart by hand. `connStatus` was never dropped, so the
+        //     `.connected` transition that normally does this never fires.
+        //     Fire-and-forget: a slow daemon must not hold the switch (and so
+        //     the next ⌘number) open for a round trip. Both are epoch-guarded.
+        SitrepPoller.shared.start()
+        Task { await refreshMail(.inbox) }
+        Task { await refreshTrackingConfig() }
+    }
+
+    /// Everything in this store that belongs to ONE account. Message ids are
+    /// per-daemon SQLite ints, so "looks plausible" is precisely the failure
+    /// mode being prevented here: A's row 412 is B's row 412.
+    private func wipeAccountState() {
+        sitrep = SitrepData()
+        zones = SitrepZoneCache()
+        // The parked refresh tasks go too, not just their results: a joiner
+        // arriving after the switch would otherwise wait on — and adopt the
+        // silence of — a pass that has already been disowned.
+        zoneRefresh = nil
+        mailPages = [:]
+        mailLoadedAt = [:]
+        mailRefreshes = [:]
+        search = SearchSession()
+        resolvedIds = []
+        selectedId = nil
+        // A fresh sync history: a `lastRefresh` from the old account must not
+        // make a silent new one look recently synced (the rule `connect` keeps).
+        lastRefresh = nil
+        refreshError = nil
+        // The thread viewer and both composers, by assignment rather than
+        // through `closeThread`/`closeCompose`: those flush drafts, and step
+        // (4) already saved and settled everything there was to save.
+        threadId = nil
+        threadQueue = []
+        pendingReplyMessageId = nil
+        compose = nil
+        inlineReply = nil
+        sideView = .none
+        // Overlays holding an account-scoped id. A rule editor left open
+        // across a switch would save the old account's rule to the new
+        // account's daemon.
+        triageFix = nil
+        ruleEditor = nil
+        // Every revert closure targets the old account's daemon.
+        undos = []
+        authRings = []
+        authQueue = []
+        tracking = nil
+        history = [HistoryEntry(view: .sitrep, selectedId: nil)]
+        historyIndex = 0
+        route(to: .sitrep)
+    }
+
+    /// The per-account caches that live OUTSIDE this store. Every one of them
+    /// is keyed by something a daemon minted — message ids, attachment ids,
+    /// thread ids — so every one of them collides across accounts.
+    ///
+    /// Deliberately NOT wiped: `PreparedBodies` (keyed by a hash of the html
+    /// itself) and `ImageStore`'s files (keyed by sha256 of the url). Both are
+    /// content-addressed, so a cross-account hit is the same bytes. The image
+    /// store's message-id PINS do go ambiguous across accounts, which
+    /// mis-prioritises eviction and nothing else — accepted.
+    private func wipeAccountCaches() {
+        ThreadPrefetch.shared.wipe()
+        HeroCache.shared.wipe()
+        AttachmentThumbs.shared.wipe()
+        FrameHeights.shared.wipeAll()
+        #if os(macOS)
+            // The reader's live-frame pool. `EmailFrames` is its one door from
+            // outside EmailWebView.swift.
+            EmailFrames.wipeAll()
+        #endif
+        ImageWarmer.shared.resetForSwitch()
+        AuthArrival.shared.resetForSwitch()
+        // AuthDecisions.reload() is NOT here — see switchAccount step (8).
     }
 
     // MARK: - routing + history
@@ -697,6 +885,7 @@ final class AppStore {
     private var zoneRefresh: Task<Void, Never>?
 
     private func performZoneRefresh() async {
+        let e = epoch
         // Five independent endpoints, kicked off together so the first paint does
         // not wait on the sum of them.
         async let calendar = APIClient.shared.getCalendar()
@@ -706,13 +895,23 @@ final class AppStore {
         async let rules = APIClient.shared.listRules()
         let newsletters = await NewsletterFeed.load()
 
+        // Collected before ANY of them is written: an account switch landing
+        // between two of these assignments is the one way to get a dashboard
+        // showing half of each mailbox.
+        let calendarRows = try? await calendar
+        let shipmentRows = try? await shipments
+        let bankingRows = try? await banking
+        let receiptRows = try? await receipts
+        let ruleRows = try? await rules
+        guard e == epoch else { return }
+
         // Each lands on its own: one failing endpoint leaves the OTHER four
         // zones showing their last good rows rather than blanking the column.
-        if let rows = try? await calendar { zones.calendar = rows }
-        if let rows = try? await shipments { zones.shipments = rows }
-        if let rows = try? await banking { zones.banking = rows }
-        if let rows = try? await receipts { zones.receipts = rows }
-        if let rows = try? await rules { zones.rulesCount = rows.count }
+        if let rows = calendarRows { zones.calendar = rows }
+        if let rows = shipmentRows { zones.shipments = rows }
+        if let rows = bankingRows { zones.banking = rows }
+        if let rows = receiptRows { zones.receipts = rows }
+        if let rows = ruleRows { zones.rulesCount = rows.count }
         if !newsletters.isEmpty || zones.newsletters.isEmpty {
             zones.newsletters = newsletters
         }
@@ -792,10 +991,15 @@ final class AppStore {
     }
 
     private func performMailRefresh(_ mode: MailMode) async {
+        let e = epoch
         withMailPage(mode) { $0.isLoading = true }
         do {
             let fetched = try await APIClient.shared.getUpdates(
                 UpdatesParams(tier: mode.tier, limit: Self.mailLimit))
+            // The rows belong to the account that asked for them. Both exits
+            // below return rather than fall through, so the `isLoading` write
+            // at the bottom is only ever reached by the live epoch.
+            guard e == epoch else { return }
             // Done/archived mail leaves the inbox (gmail semantics), which also
             // keeps auto-resolved receipts out — they're rail records, not rows.
             let next =
@@ -818,6 +1022,7 @@ final class AppStore {
             ThreadPrefetch.shared.warm(
                 next.prefix(Self.mailWarmRows).map(\.thread_id), immediate: 5)
         } catch {
+            guard e == epoch else { return }
             withMailPage(mode) { $0.error = errText(error, "load failed") }
         }
         withMailPage(mode) { $0.isLoading = false }
@@ -922,9 +1127,12 @@ final class AppStore {
     /// failure: a restore that cannot happen leaves a blank composer, which is
     /// what the reader asked for anyway.
     private func restoreNewMessage() async {
+        let e = epoch
         guard let rows = try? await APIClient.shared.listDrafts(),
             let draft = rows.first(where: { $0.reply_to_message_id == nil })
         else { return }
+        // Another account's drafts are not this composer's to restore.
+        guard e == epoch else { return }
         // Must still be THE blank composer we opened: closed, replaced by a
         // reply, or typed into in the meantime all mean the draft has missed its
         // window, and overwriting live keystrokes is worse than not restoring.
@@ -970,9 +1178,13 @@ final class AppStore {
     /// Body only: a reply carries nothing else — the daemon derives the recipient
     /// and `Re: <subject>` from the parent.
     private func restoreReply(_ messageId: Int) async {
+        let e = epoch
         guard let rows = try? await APIClient.shared.listDrafts(),
             let draft = rows.first(where: { $0.reply_to_message_id == messageId })
         else { return }
+        // Another account's drafts are not this composer's to restore — and
+        // `reply_to_message_id` is a per-daemon id, so one WOULD match.
+        guard e == epoch else { return }
         // Untouched, not empty — the seeded signature must not block the restore.
         guard var next = inlineReply, next.replyToMessageId == messageId, next.draftId == nil,
             Prefs.shared.isBodyUntouched(next.body)
@@ -1002,7 +1214,10 @@ final class AppStore {
     /// nil means the feature simply is not offered this session, which is the
     /// same thing an unconfigured daemon means.
     func refreshTrackingConfig() async {
-        tracking = try? await APIClient.shared.getTrackingConfig()
+        let e = epoch
+        let next = try? await APIClient.shared.getTrackingConfig()
+        guard e == epoch else { return }
+        tracking = next
     }
 
     /// Persist the default for future composers. The response is the daemon's
@@ -1035,6 +1250,7 @@ final class AppStore {
 
     /// Undo the given (or most recent) queued action.
     func fireUndo(_ id: UUID? = nil) async {
+        let e = epoch
         let entry: PendingUndo?
         if let id {
             entry = undos.first { $0.id == id }
@@ -1045,6 +1261,9 @@ final class AppStore {
         undos.removeAll { $0.id == entry.id }
         do {
             try await entry.revert()
+            // The revert landed on the OLD account's daemon; nothing about it
+            // is news the new one's surfaces should be told.
+            guard e == epoch else { return }
             // The message is open again, so it must stop being filtered out of
             // every list that hides resolved ids — otherwise an undo looks like
             // it did nothing until the next poll. Harmless for undo kinds that
@@ -1056,6 +1275,7 @@ final class AppStore {
             // to 10s out — pull now, or the undo reads as broken on the sitrep.
             await SitrepPoller.shared.pull()
         } catch {
+            guard e == epoch else { return }
             pushToast("undo failed: \(entry.label)", .error)
         }
     }

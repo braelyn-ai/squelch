@@ -16,8 +16,13 @@
 // written to be re-runnable: every step that can fail leaves the legacy state
 // untouched, so a denied keychain prompt or a crash simply means the next boot
 // tries again.
+//
+// `AccountManager` at the bottom is the live, observable view of all that — the
+// list the UI renders, the id everything account-scoped derives its keys from,
+// and the entry point to a switch.
 
 import Foundation
+import Observation
 
 /// One account the client can talk to. IDENTITY ONLY — the server URL and
 /// token live in the keychain under `id`. `label` is the human's name for it
@@ -56,6 +61,22 @@ enum AccountIndex {
     /// The two UserDefaults keys the index itself occupies.
     private static let accountsKey = "passband.accounts"
     private static let activeKey = "passband.accounts.active"
+
+    /// The migration's own bookkeeping, none of it state the app reads:
+    ///
+    /// - `migratedKey` — the repair has RUN to a conclusion. An empty index
+    ///   after that means the human removed their last account, not that they
+    ///   never had one, so the legacy slots must not be looked at again.
+    /// - `migratingKey` — the account id an in-progress repair committed to,
+    ///   parked before the first keychain write so a retry reuses it.
+    /// - `orphansKey` — ids whose keychain slots outlived their index entry
+    ///   because the delete failed. Retried at every boot.
+    /// - `legacyOrphanKey` — the same thing for the LEGACY slots, minus the
+    ///   id: there is only ever one pair of them, so a flag says it.
+    private static let migratedKey = "passband.accounts.migrated"
+    private static let migratingKey = "passband.accounts.migrating"
+    private static let orphansKey = "passband.accounts.orphans"
+    private static let legacyOrphanKey = "passband.accounts.orphan-legacy"
 
     /// UserDefaults state that belongs to ONE ACCOUNT rather than to the
     /// install: the SSE cursor, the 2FA seen-set and the code-reveal
@@ -146,6 +167,13 @@ enum AccountIndex {
         save(state)
     }
 
+    /// Make one account live, touching NOTHING else. This is a switch's commit
+    /// point, and a switch has no business reordering the list or rewriting a
+    /// record on its way through.
+    static func setActive(_ id: UUID) {
+        defaults.set(id.uuidString, forKey: activeKey)
+    }
+
     /// Forget one account: drop the record, hand `active` to the first
     /// survivor (nil when that was the last one — the Connect gate), and clear
     /// its scoped UserDefaults so a later re-pair of the same daemon does not
@@ -169,14 +197,86 @@ enum AccountIndex {
         }
     }
 
+    // MARK: - orphaned keychain slots
+
+    /// Remember an account id whose keychain slots we FAILED to delete. The
+    /// index entry that named them is going away regardless — the human asked
+    /// to disconnect and is entitled to have it happen — and a slot no entry
+    /// names is a live API token nothing will ever address again. Parked here,
+    /// `sweepOrphans` retries the delete at every boot until it takes.
+    static func parkOrphan(_ id: UUID) {
+        var ids = defaults.stringArray(forKey: orphansKey) ?? []
+        guard !ids.contains(id.uuidString) else { return }
+        ids.append(id.uuidString)
+        defaults.set(ids, forKey: orphansKey)
+    }
+
+    /// Delete the legacy single-account slots, parking a refusal for the boot
+    /// sweep. Every caller is a point past which those slots are never READ
+    /// again, so a failed delete leaves a live API token nothing addresses —
+    /// exactly the problem `parkOrphan` exists for.
+    private static func clearLegacySlots() {
+        do {
+            try SettingsStore.clearLegacy()
+            defaults.removeObject(forKey: legacyOrphanKey)
+        } catch {
+            defaults.set(true, forKey: legacyOrphanKey)
+        }
+    }
+
+    /// Close the pre-multi-account question for good, when the index goes
+    /// EMPTY — a Disconnect, or removing the last account.
+    ///
+    /// An empty index is precisely the shape `migrate` reads as "possibly a
+    /// single-account install", and `migratedKey` is the only thing between
+    /// that reading and resurrecting the account the human just removed. Every
+    /// path that concludes the repair sets that flag — but a repair whose
+    /// legacy READ was denied never reached one: it leaves the flag unset and
+    /// the slots full, and the removal above hands the next boot an empty
+    /// index to find them from. So both are done here, at the moment the last
+    /// account goes: the slots deleted, the question marked answered.
+    static func sealLegacyIfEmpty() {
+        guard load().accounts.isEmpty else { return }
+        clearLegacySlots()
+        defaults.set(true, forKey: migratedKey)
+    }
+
+    /// Retry every parked delete, keeping the ones that fail again. Called
+    /// only from `loadOrMigrate`, which is already off the main actor — these
+    /// are keychain calls and can raise the access panel.
+    private static func sweepOrphans() {
+        if defaults.bool(forKey: legacyOrphanKey) { clearLegacySlots() }
+        let ids = defaults.stringArray(forKey: orphansKey) ?? []
+        guard !ids.isEmpty else { return }
+        var left: [String] = []
+        for raw in ids {
+            // An unparseable entry names no slots; dropping it is the only
+            // thing that can be done about it.
+            guard let id = UUID(uuidString: raw) else { continue }
+            do {
+                try SettingsStore.clear(accountId: id)
+            } catch {
+                left.append(raw)
+            }
+        }
+        if left.isEmpty {
+            defaults.removeObject(forKey: orphansKey)
+        } else {
+            defaults.set(left, forKey: orphansKey)
+        }
+    }
+
     // MARK: - migration
 
-    /// Read the index, first repairing a pre-multi-account install. Off the
-    /// main actor because the repair reads and writes the keychain, which can
-    /// raise the system's "allow access?" panel and block until the human
-    /// answers (see `offMain`).
+    /// Read the index, first sweeping any failed deletes and repairing a
+    /// pre-multi-account install. Off the main actor because both touch the
+    /// keychain, which can raise the system's "allow access?" panel and block
+    /// until the human answers (see `offMain`).
     static func loadOrMigrate() async -> AccountIndexState {
-        await offMain { migrate() }
+        await offMain {
+            sweepOrphans()
+            return migrate()
+        }
     }
 
     /// The one-time repair, in commit order. Each early return leaves the
@@ -186,18 +286,58 @@ enum AccountIndex {
         let state = load()
         // Already indexed — the ordinary path on every boot after the first,
         // including installs that were never single-account.
-        guard state.accounts.isEmpty else { return state }
+        guard state.accounts.isEmpty else {
+            // Conclude the repair if some earlier boot could not. An install
+            // holding accounts IS multi-account, and the legacy slots are
+            // already unreachable from here — a migration into a non-empty
+            // index would mint a duplicate account, so this code never does
+            // one. Leaving the question open instead lets a later "remove the
+            // last account" reopen it and resurrect one from those slots, so
+            // they are cleared rather than left holding a live token.
+            if !defaults.bool(forKey: migratedKey) {
+                clearLegacySlots()
+                discardAbandonedMigration()
+                defaults.set(true, forKey: migratedKey)
+            }
+            return state
+        }
+        // ALREADY CONCLUDED ONCE. An empty index past this point means the
+        // human removed their last account, not that they never had one:
+        // without this flag a Disconnect whose legacy cleanup had failed (step
+        // 4 is best-effort) would be undone by the very next boot, which would
+        // find those slots and resurrect the account from them.
+        guard !defaults.bool(forKey: migratedKey) else { return state }
 
-        // Nothing to carry across: no legacy credentials (a fresh install), or
-        // the read failed / was denied. Both mean "leave everything alone";
-        // deleting nothing loses nothing.
-        guard let legacy = try? SettingsStore.loadLegacy() else { return state }
+        let legacy: ConnectionSettings?
+        do {
+            legacy = try SettingsStore.loadLegacy()
+        } catch {
+            // The read failed or was denied. Leave everything alone, conclude
+            // nothing, and try again next boot — deleting nothing loses
+            // nothing, and marking the repair done here would lose an install.
+            return state
+        }
+        guard let legacy else {
+            // Nothing to carry across: a fresh install (or one whose legacy
+            // slots a previous run already took). Conclude the repair so no
+            // later boot reads those slots — and so a Disconnect cannot be
+            // undone by one.
+            discardAbandonedMigration()
+            defaults.set(true, forKey: migratedKey)
+            return state
+        }
 
-        let record = AccountRecord()
+        // The id this repair commits under, MINTED ONCE and parked before the
+        // keychain is touched. A crash between the slot write below and the
+        // index commit would otherwise leave a second copy of the token under
+        // an id nothing names; reusing the parked id means the retry overwrites
+        // those very slots instead of stranding them.
+        let record = AccountRecord(id: pendingMigrationId())
 
         // 1. Credentials into the suffixed slots. Both or neither: a partial
-        //    write is rolled back so the retry does not strand a lone slot
-        //    under an id nothing will ever name again.
+        //    write is rolled back so the retry does not strand a lone slot.
+        //    The parked id SURVIVES the rollback — that is what makes the
+        //    retry address the same two slots.
         do {
             try SettingsStore.save(legacy, accountId: record.id)
         } catch {
@@ -213,17 +353,163 @@ enum AccountIndex {
         }
 
         // 3. The index. THIS is the commit point: from here the install is
-        //    multi-account and everything left below is litter, not state.
+        //    multi-account and everything left below is litter, not state. The
+        //    parked id has done its job the moment the index names it.
         let migrated = AccountIndexState(accounts: [record], activeId: record.id)
         save(migrated)
+        defaults.removeObject(forKey: migratingKey)
+        defaults.set(true, forKey: migratedKey)
 
-        // 4. Legacy cleanup, best-effort. A failure here (or a crash before
-        //    it) leaves slots and keys that are simply never read again.
-        try? SettingsStore.clearLegacy()
+        // 4. Legacy cleanup. A failure here (or a crash before it) leaves
+        //    slots and keys that are never read again — the `migratedKey`
+        //    above is what guarantees the "never" — so this is about the token
+        //    still sitting in them, which is why a refused delete is parked
+        //    for the boot sweep rather than shrugged off.
+        clearLegacySlots()
         for base in scopedDefaultsKeys {
             defaults.removeObject(forKey: base)
         }
 
         return migrated
+    }
+
+    /// The id a (possibly retried) migration commits under. Parked BEFORE the
+    /// first keychain write and reused until the index commit clears it.
+    private static func pendingMigrationId() -> UUID {
+        if let raw = defaults.string(forKey: migratingKey), let id = UUID(uuidString: raw) {
+            return id
+        }
+        let id = UUID()
+        defaults.set(id.uuidString, forKey: migratingKey)
+        return id
+    }
+
+    /// A parked migration id with no legacy credentials left to migrate: an
+    /// earlier attempt wrote the suffixed slots and then lost its source before
+    /// the index commit. Nothing will ever name that id, so its slots are
+    /// deleted here rather than left holding a live token — and a refused
+    /// delete goes to the orphan sweep, which is exactly this problem.
+    private static func discardAbandonedMigration() {
+        guard let raw = defaults.string(forKey: migratingKey),
+            let id = UUID(uuidString: raw)
+        else { return }
+        do {
+            try SettingsStore.clear(accountId: id)
+        } catch {
+            parkOrphan(id)
+        }
+        defaults.removeObject(forKey: migratingKey)
+    }
+}
+
+// MARK: - the live account list
+
+/// The observable face of the index: the accounts the UI lists, which one is
+/// live, and the operations that change either. ONE instance — the index it
+/// mirrors is a single UserDefaults record, so a second copy would be a second
+/// opinion about which mailbox the app is showing.
+///
+/// Every mutation writes the index FIRST and re-reads it into the mirror
+/// second, so the published list is never the optimistic version of a write
+/// that did not happen.
+@MainActor
+@Observable
+final class AccountManager {
+    static let shared = AccountManager()
+
+    /// The accounts, in index order — which is switching order, so the UI's
+    /// numbering comes straight from the array.
+    private(set) var accounts: [AccountRecord] = []
+    /// The live one. nil is the Connect gate: first run, or the last account
+    /// removed.
+    private(set) var activeId: UUID?
+
+    var active: AccountRecord? { accounts.first { $0.id == activeId } }
+
+    private init() { adopt(AccountIndex.load()) }
+
+    /// Mirror an ALREADY-PERSISTED index. `AppStore.loadSettings` hands the
+    /// migration's result here, because this singleton may well have been
+    /// built (and read an empty index) before the repair ran.
+    func adopt(_ state: AccountIndexState) {
+        accounts = state.accounts
+        activeId = state.activeId
+    }
+
+    /// Re-read the index from disk. For the paths that write it through
+    /// `AccountIndex` directly — `AppStore.connect`, `disconnect`.
+    func reload() { adopt(AccountIndex.load()) }
+
+    /// One account's credentials. Off the main actor (a keychain read can
+    /// raise the access panel); a failure and an unwritten account are both
+    /// nil, because a caller can do exactly the same thing about either.
+    func settings(for id: UUID) async -> ConnectionSettings? {
+        guard case .success(let stored) = await SettingsStore.loadAsync(accountId: id) else {
+            return nil
+        }
+        return stored
+    }
+
+    /// Record a NEW account: credentials into the keychain first, then the
+    /// index entry that names them — an entry whose slots are empty would read
+    /// as an account with nothing behind it. nil when the keychain refused.
+    ///
+    /// NOT activated. Making an account live is `switchTo`, a whole-world
+    /// change, and not something that should fall out of saving a token.
+    @discardableResult
+    func add(label: String = "", settings: ConnectionSettings) async -> AccountRecord? {
+        let record = AccountRecord(label: label)
+        guard case .success = await SettingsStore.saveAsync(settings, accountId: record.id) else {
+            // Roll a partial write back for the same reason the migration
+            // does: a lone slot under an id nothing names is unreachable.
+            _ = await offMain { Result { try SettingsStore.clear(accountId: record.id) } }
+            return nil
+        }
+        AccountIndex.upsert(record, activate: false)
+        reload()
+        return record
+    }
+
+    /// Rename one account. Label only — an id is identity and the position in
+    /// the list is the human's switching number, so neither may move.
+    func rename(_ id: UUID, to label: String) {
+        guard var record = accounts.first(where: { $0.id == id }) else { return }
+        record.label = label
+        AccountIndex.upsert(record, activate: false)
+        reload()
+    }
+
+    /// Forget one account, credentials first. A refused keychain delete parks
+    /// the id for the boot sweep rather than being swallowed: the index entry
+    /// is about to go, and it is the only thing that still names those slots.
+    func remove(_ id: UUID) async {
+        let cleared = await offMain { Result { try SettingsStore.clear(accountId: id) } }
+        if case .failure = cleared { AccountIndex.parkOrphan(id) }
+        AccountIndex.remove(id)
+        // The LAST one leaves an empty index, which is the one shape a boot
+        // can still read as a pre-multi-account install — see
+        // `sealLegacyIfEmpty`. Off the main actor with the delete above it,
+        // being the same kind of call.
+        await offMain { AccountIndex.sealLegacyIfEmpty() }
+        reload()
+    }
+
+    /// Commit a switch: persist the live id and mirror it. Called by
+    /// `AppStore.switchAccount` at the point the new client is configured, so
+    /// that everything deriving a key from `activeId` (the 2FA seen-set, the
+    /// decisions ledger) flips in the same breath as the connection does.
+    func markActive(_ id: UUID) {
+        AccountIndex.setActive(id)
+        activeId = id
+    }
+
+    /// Make another account the live one.
+    ///
+    /// Step (1) of the switch sequence — is this a real, different account —
+    /// lives here; `AppStore.switchAccount` is the rest of it, because the
+    /// state being torn down is that store's own and half of it is private.
+    func switchTo(_ id: UUID) async {
+        guard let record = accounts.first(where: { $0.id == id }), id != activeId else { return }
+        await AppStore.shared.switchAccount(to: record)
     }
 }
