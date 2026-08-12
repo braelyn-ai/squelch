@@ -58,24 +58,11 @@ struct EmailsView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        if mode == .sent { sentList } else { mailList }
-                    }
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 10)
-                }
-                .onChange(of: index) { _, i in
-                    // Follow the KEYBOARD selection only. Both pages key their
-                    // rows on the message id, so one scroll target serves both.
-                    guard kbActive, let id = rowId(at: i) else { return }
-                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(id, anchor: .center) }
-                }
-            }
-            .onContinuousHover { phase in
-                if case .ended = phase { hovering = false }
-            }
+            #if os(macOS)
+                desktopList
+            #else
+                phoneList
+            #endif
         }
         .keyBindings(.list, bindings)
         // Fires on mount, on each 10s poll AND on a mode switch — only the page
@@ -118,11 +105,13 @@ struct EmailsView: View {
 
     // MARK: - the lists
 
-    /// The inbox / noise rows. Every note is gated on having NO rows at all: a
-    /// reload keeps the last page on screen, so a revisit — or a failure while
-    /// offline — updates underneath what you are already reading instead of
-    /// replacing it with a word.
-    @ViewBuilder private var mailList: some View {
+    /// The three inline notes for the mail / noise pages, shared by both
+    /// layouts. Each is gated on having NO rows at all: a reload keeps the last
+    /// page on screen, so a revisit — or a failure while offline — updates
+    /// underneath what you are already reading instead of replacing it with a
+    /// word. The sent page carries its own notes inside `sentList`.
+    @ViewBuilder
+    private var note: some View {
         if let error = page.error, page.value == nil {
             BandNote(error)
         } else if page.value == nil {
@@ -131,23 +120,6 @@ struct EmailsView: View {
             // The window the daemon answers with is 30 days, so an empty noise
             // page says so rather than implying "ever".
             BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
-        } else {
-            ForEach(Array(rows.enumerated()), id: \.element.id) { i, u in
-                UpdateRow(
-                    update: u,
-                    selected: kbActive && i == index,
-                    onHover: {
-                        // A hover must NOT follow-scroll: a row near the
-                        // viewport edge would jump the list out from under
-                        // the cursor.
-                        hovering = true
-                        kbActive = false
-                        index = i
-                    },
-                    onOpen: { store.openThread(u.thread_id, queue: rows) }
-                )
-                .id(u.id)
-            }
         }
     }
 
@@ -181,6 +153,94 @@ struct EmailsView: View {
     private func rowId(at i: Int) -> Int? {
         mode == .sent ? sent[safe: i]?.id : rows[safe: i]?.id
     }
+
+    private var hasRows: Bool { page.value != nil && page.error == nil && !rows.isEmpty }
+
+    #if os(macOS)
+        private var desktopList: some View {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 1) {
+                        if mode == .sent {
+                            sentList
+                        } else if !hasRows {
+                            note
+                        } else {
+                            ForEach(Array(rows.enumerated()), id: \.element.id) { i, u in
+                                UpdateRow(
+                                    update: u,
+                                    selected: kbActive && i == index,
+                                    onHover: {
+                                        // A hover must NOT follow-scroll: a row near
+                                        // the viewport edge would jump the list out
+                                        // from under the cursor.
+                                        hovering = true
+                                        kbActive = false
+                                        index = i
+                                    },
+                                    onOpen: { store.openThread(u.thread_id, queue: rows) }
+                                )
+                                .id(u.id)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                }
+                .onChange(of: index) { _, i in
+                    // Follow the KEYBOARD selection only. Both pages key their
+                    // rows on the message id, so one scroll target serves both.
+                    guard kbActive, let id = rowId(at: i) else { return }
+                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(id, anchor: .center) }
+                }
+            }
+            .onContinuousHover { phase in
+                if case .ended = phase { hovering = false }
+            }
+        }
+    #endif
+
+    #if !os(macOS)
+        /// A REAL `List` on the phone, and only on the phone. Everything else in
+        /// this app draws its rows into a LazyVStack because the Mac's lists are
+        /// keyboard surfaces that need a cursor, an anchor and a scroll-to; none
+        /// of that survives contact with a thumb, and what a thumb wants instead —
+        /// `swipeActions`, full-swipe commit, the rubber-band, the system's own
+        /// timing — is something only `List` can hand over. Reimplementing it
+        /// would be a worse copy of a control the OS ships.
+        ///
+        /// The design skin survives intact: plain style, no separators, clear row
+        /// backgrounds, and the app's own `UpdateRow` inside. What the List
+        /// contributes is the gesture, not the look.
+        private var phoneList: some View {
+            List {
+                if mode == .sent {
+                    // Sent rows carry no triage, so no swipe verbs — the row is
+                    // a door to the thread and nothing else (`triageable` says
+                    // the same thing to the keyboard).
+                    sentList.plainRow()
+                } else if !hasRows {
+                    note.plainRow()
+                } else {
+                    ForEach(rows) { u in
+                        let verbs = UpdateVerbs(update: u, queue: rows)
+                        UpdateRow(
+                            update: u,
+                            selected: false,
+                            onHover: {},
+                            onOpen: verbs.open
+                        )
+                        .plainRow()
+                        .swipeVerbs(verbs)
+                        .updateContextMenu(verbs)
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .environment(\.defaultMinListRowHeight, 0)
+        }
+    #endif
 
     // MARK: - header
 

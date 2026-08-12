@@ -3,15 +3,32 @@
 // the file bucket, and the SERVER decides Content-Type, so a mislabeled
 // attachment stays inert. Tiles resolve through AttachmentThumbs (a card in a
 // LazyVStack would re-download on recycle), authenticated through APIClient.
+//
+// THE CARDS ARE SHARED; THE TWO VERBS ARE NOT. Saving is a save panel on one
+// platform and a document picker on the other, and previewing is a PDFView in a
+// modal card here and QuickLook there — different objects, not a different
+// spelling of one, so each is fenced and neither pretends to be the other. See
+// Sources/PassbandiOS/Views/AttachmentPreviewiOS.swift for the phone's half.
 
 import PDFKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct AttachmentStrip: View {
     let attachments: [Attachment]
 
     @Environment(AppStore.self) private var store
-    @State private var preview: Attachment?
+    #if os(macOS)
+        @State private var preview: Attachment?
+    #else
+        /// The bytes staged on disk for QuickLook, and the export the document
+        /// picker is holding. Both are one-at-a-time by construction: a phone
+        /// shows one sheet.
+        @State private var staged: StagedAttachment?
+        @State private var exporting: AttachmentFile?
+        @State private var exportName = "attachment"
+        @State private var opening: Int?
+    #endif
 
     /// Images above this show the glyph card instead — a 10MB photo for a 120px
     /// thumb is silly bandwidth.
@@ -44,7 +61,7 @@ struct AttachmentStrip: View {
                         attachment: att,
                         onDownload: { Task { await download(att) } },
                         onPreview: Self.isPDF(att.mime) && att.downloadable
-                            ? { preview = att } : nil)
+                            ? { openPreview(att) } : nil)
                 }
             }
             .padding(.top, 4)
@@ -52,26 +69,95 @@ struct AttachmentStrip: View {
             // A SHEET, not an overlay: an overlay is laid out against the strip's
             // 38pt frame deep inside the thread's ScrollView, so it hangs off the
             // window edge and scrolls away with the content.
-            .sheet(item: $preview) { att in
-                PDFPreview(
-                    attachment: att,
-                    onDownload: { Task { await download(att) } },
-                    onClose: { preview = nil })
-            }
+            #if os(macOS)
+                .sheet(item: $preview) { att in
+                    PDFPreview(
+                        attachment: att,
+                        onDownload: { Task { await download(att) } },
+                        onClose: { preview = nil })
+                }
+            #else
+                .sheet(item: $staged) { file in
+                    QuickLookPreview(url: file.url)
+                        .ignoresSafeArea()
+                        // The bytes leave the disk with the sheet — nothing an
+                        // attachment contained outlives looking at it.
+                        .onDisappear { file.cleanUp() }
+                }
+                .fileExporter(
+                    isPresented: Binding(
+                        get: { exporting != nil }, set: { if !$0 { exporting = nil } }),
+                    document: exporting,
+                    contentType: .data,
+                    defaultFilename: exportName
+                ) { result in
+                    switch result {
+                    case .success:
+                        store.pushToast("saved \(exportName)", .success)
+                    case .failure(let error):
+                        store.pushToast(errText(error, "save failed"), .error)
+                    }
+                }
+            #endif
         }
     }
 
-    private func download(_ att: Attachment) async {
-        do {
-            let fetched = try await APIClient.shared.fetchAttachment(
-                att.id, fallbackName: att.filename)
-            if case .saved = await Downloads.saveBytes(fetched.bytes, filename: fetched.filename) {
-                store.pushToast("saved \(fetched.filename)", .success)
+    // MARK: - preview
+
+    #if os(macOS)
+        private func openPreview(_ att: Attachment) { preview = att }
+    #else
+        /// QuickLook reads a FILE, so the bytes are fetched and staged before the
+        /// sheet opens rather than behind a spinner inside it. The staging
+        /// directory belongs to the sheet and is removed on dismiss.
+        private func openPreview(_ att: Attachment) {
+            guard opening == nil else { return }
+            opening = att.id
+            Task {
+                defer { opening = nil }
+                do {
+                    let fetched = try await APIClient.shared.fetchAttachment(
+                        att.id, fallbackName: att.filename)
+                    staged = try StagedAttachment.stage(
+                        id: att.id, bytes: fetched.bytes, filename: fetched.filename)
+                } catch {
+                    store.pushToast(errText(error, "preview failed"), .error)
+                }
             }
-        } catch {
-            store.pushToast(errText(error, "download failed"), .error)
         }
-    }
+    #endif
+
+    // MARK: - save
+
+    #if os(macOS)
+        private func download(_ att: Attachment) async {
+            do {
+                let fetched = try await APIClient.shared.fetchAttachment(
+                    att.id, fallbackName: att.filename)
+                if case .saved = await Downloads.saveBytes(
+                    fetched.bytes, filename: fetched.filename)
+                {
+                    store.pushToast("saved \(fetched.filename)", .success)
+                }
+            } catch {
+                store.pushToast(errText(error, "download failed"), .error)
+            }
+        }
+    #else
+        /// Fetch, then hand the bytes to the document picker. The toast waits for
+        /// the picker's verdict — a save the human cancelled did not happen.
+        private func download(_ att: Attachment) async {
+            do {
+                let fetched = try await APIClient.shared.fetchAttachment(
+                    att.id, fallbackName: att.filename)
+                exportName = fetched.filename
+                exporting = AttachmentFile(bytes: fetched.bytes)
+            } catch {
+                store.pushToast(errText(error, "download failed"), .error)
+            }
+        }
+    #endif
+
 }
 
 private struct AttachmentCard: View {
@@ -174,6 +260,13 @@ private struct ThumbTile: View {
     }
 }
 
+// THE MAC'S PREVIEW, and only the Mac's. A scrim, a fixed card sized to fit
+// macOS's sheet clamp, key hints, and a PDFView representable inside it: four
+// desktop shapes in one view. The phone's answer to the same tap is QuickLook,
+// which brings its own everything — so this stays here rather than growing a
+// second layout it would only ever draw on one platform.
+#if os(macOS)
+
 /// PDF preview. Own "modal" KeyContext so Esc closes it without leaking to the
 /// thread keys underneath. Native PDFKit — no webview, no blob URL.
 private struct PDFPreview: View {
@@ -268,24 +361,27 @@ private struct PDFPreview: View {
     }
 }
 
-// PDFKit itself is cross-platform, but the representable that hosts a PDFView is
-// not: the two platforms spell the protocol differently, down to every method
-// name. The twin lands with the iOS target rather than as a guess here.
-#if os(macOS)
-    private struct PDFKitView: NSViewRepresentable {
-        let document: PDFDocument
+/// The PDFView host. No UIKit twin, deliberately: the phone previews through
+/// QLPreviewController, which renders PDFs (and everything else) with a page
+/// scrubber, pinch zoom and a share sheet already attached. A hand-built
+/// UIViewRepresentable around PDFView would be a strictly worse version of a
+/// control the OS ships, and it would exist only to keep this one name
+/// cross-platform.
+private struct PDFKitView: NSViewRepresentable {
+    let document: PDFDocument
 
-        func makeNSView(context: Context) -> PDFView {
-            let view = PDFView()
-            view.autoScales = true
-            view.displayMode = .singlePageContinuous
-            view.backgroundColor = .clear
-            view.document = document
-            return view
-        }
-
-        func updateNSView(_ nsView: PDFView, context: Context) {
-            if nsView.document !== document { nsView.document = document }
-        }
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.backgroundColor = .clear
+        view.document = document
+        return view
     }
-#endif
+
+    func updateNSView(_ nsView: PDFView, context: Context) {
+        if nsView.document !== document { nsView.document = document }
+    }
+}
+
+#endif  // os(macOS) — PDFPreview + PDFKitView

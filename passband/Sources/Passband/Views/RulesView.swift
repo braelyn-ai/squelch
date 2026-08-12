@@ -457,6 +457,16 @@ struct RuleEditor: View {
         return options
     }
 
+    /// The cancel button doubles as the Escape hint on a Mac; a phone dismisses
+    /// by tapping off the card and has no key to name.
+    private var cancelLabel: String {
+        #if os(macOS)
+            "esc cancel"
+        #else
+            "cancel"
+        #endif
+    }
+
     @ViewBuilder
     private var advancedSection: some View {
         Button(action: toggleAdvanced) {
@@ -464,7 +474,9 @@ struct RuleEditor: View {
                 Image(systemName: advanced ? "chevron.down" : "chevron.right")
                     .font(.system(size: 8, weight: .semibold))
                 Text("advanced").font(Typo.micro)
-                Kbd("⌘d")
+                #if os(macOS)
+                    Kbd("⌘d")
+                #endif
                 Spacer()
             }
             .foregroundStyle(Palette.inkFaint)
@@ -486,20 +498,25 @@ struct RuleEditor: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 4) {
-                // Taught only while it does something: tab is a focus key
-                // everywhere else in the app.
-                if advanced {
-                    KeyHint("tab", "disposition")
+            // A row of keycaps for four keys a phone does not have. The editor is
+            // reachable there now (tune is a row swipe), so the hints are fenced
+            // rather than shown as instructions nobody can follow.
+            #if os(macOS)
+                HStack(spacing: 4) {
+                    // Taught only while it does something: tab is a focus key
+                    // everywhere else in the app.
+                    if advanced {
+                        KeyHint("tab", "disposition")
+                        Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    }
+                    KeyHint("⌘d", "advanced")
                     Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    KeyHint("⌥↵", "new line")
+                    Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    KeyHint("↵", "save")
+                    Spacer()
                 }
-                KeyHint("⌘d", "advanced")
-                Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                KeyHint("⌥↵", "new line")
-                Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                KeyHint("↵", "save")
-                Spacer()
-            }
+            #endif
             HStack(spacing: 8) {
                 if let blocked {
                     Text(blocked)
@@ -508,7 +525,7 @@ struct RuleEditor: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
-                Button("esc cancel", action: onClose).buttonStyle(.glass)
+                Button(cancelLabel, action: onClose).buttonStyle(.glass)
                 Button(saving ? "saving…" : (mode == .edit ? "update rule" : "save rule")) {
                     Task { await save() }
                 }

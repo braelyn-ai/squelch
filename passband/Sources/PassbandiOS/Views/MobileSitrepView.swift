@@ -45,9 +45,11 @@ struct MobileSitrepView: View {
             VStack(alignment: .leading, spacing: 16) {
                 hero
                 bandStrip
+                processButton
                 if !ranked.isEmpty {
                     forYourEyes(visible: visible, overflow: overflow, queue: ranked)
                 }
+                MobileAuthZone()
                 NewslettersZone(
                     newsletters: Newsletters.prune(
                         store.zones.newsletters, resolved: store.resolvedIds),
@@ -141,23 +143,66 @@ struct MobileSitrepView: View {
         }
     }
 
+    // MARK: - process mode
+
+    /// `p`, as a thumb-sized door. The Mac hides the deck behind a letter because
+    /// a Mac user has both hands on the keys; a phone user has one thumb and a
+    /// queue, and the deck is the single best thing this app does with that.
+    /// Shown only when there is a deck to walk — the queue it snapshots on entry
+    /// is `new + open`, so the button counts exactly what it will hand over.
+    @ViewBuilder
+    private var processButton: some View {
+        let waiting = store.sitrep.new.count + store.sitrep.open.count
+        if waiting > 0 {
+            Button {
+                store.processModeOpen = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "rectangle.stack")
+                        .font(.system(size: 14, weight: .medium))
+                    Text("Process \(waiting) item\(waiting == 1 ? "" : "s")")
+                        .font(.system(size: 15, weight: .medium))
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Palette.inkFaintest)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 13)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Palette.accent)
+            .passbandGlass(.pane, cornerRadius: 14, tint: Palette.accentSoft, interactive: true)
+        }
+    }
+
     // MARK: - for your eyes
 
     /// The standing band, ranked. Tapping a row opens the reader with the WHOLE
     /// ranked list as its queue, which is what the Mac's list rows hand over —
     /// the dashboard's own rows pass no queue there because h/l is a keyboard
     /// walk, and a thumb has no such walk to protect.
+    ///
+    /// The rows swipe. They cannot use SwiftUI's `swipeActions` the way the mail
+    /// tab does — a `List` inside this ScrollView would be two scrollers fighting
+    /// — so `SwipeRow` draws the same rails by hand, off the same verb arrays, and
+    /// the long press carries the rest of the keymap on both.
     private func forYourEyes(visible: [AttentionUpdate], overflow: Int, queue: [AttentionUpdate])
         -> some View
     {
         ZoneCard(symbol: "eye", title: "For your eyes", count: store.sitrep.standing.count) {
             VStack(spacing: 2) {
                 ForEach(Array(visible.enumerated()), id: \.element.id) { _, u in
-                    UpdateRow(
-                        update: u,
-                        selected: false,
-                        onHover: {},
-                        onOpen: { store.openThread(u.thread_id, queue: queue) })
+                    let verbs = UpdateVerbs(update: u, queue: queue)
+                    SwipeRow(leading: verbs.leadingVerbs, trailing: verbs.trailingVerbs) {
+                        UpdateRow(
+                            update: u,
+                            selected: false,
+                            onHover: {},
+                            onOpen: verbs.open)
+                    }
+                    .updateContextMenu(verbs)
                 }
                 if overflow > 0 {
                     Button {

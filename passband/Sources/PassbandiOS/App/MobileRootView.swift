@@ -13,6 +13,13 @@
 // by the SAME `store.threadId`, so every surface that opens mail (a list row, a
 // record zone, a newsletter card) opens it through the identical store call and
 // leaving nils the identical state.
+//
+// THE ACTION LAYER, MINUS THE PARTS THAT ARE FURNITURE. `Views/ActionLayer.swift`
+// is excluded from this target because it hosts the ⌘K ask bar, not because its
+// contents are desktop-shaped: the toasts, the rule editor, the deck, the 2FA
+// modal and the triage palette are all state on AppStore, and this shell mounts
+// the same views off the same flags. Nothing below owns a flag of its own —
+// every one of them is written by the verbs in Model/Actions.swift.
 
 import SwiftUI
 
@@ -81,10 +88,13 @@ private struct MobileLoadingGate: View {
 // MARK: - the tab shell
 
 private struct MobileShell: View {
+    @Environment(AppStore.self) private var store
     @State private var tab: MobileTab = .sitrep
 
     var body: some View {
-        TabView(selection: $tab) {
+        @Bindable var store = store
+
+        return TabView(selection: $tab) {
             Tab("Sitrep", systemImage: MainView.sitrep.symbol, value: MobileTab.sitrep) {
                 NavigationStack {
                     MobileSitrepView()
@@ -134,6 +144,49 @@ private struct MobileShell: View {
         // the way up: a mail list is a reading surface first. All three tabs that own
         // one are a real ScrollView/List, so both drive it.
         .tabBarMinimizeBehavior(.onScrollDown)
+        // Toasts ride ABOVE the tab bar, where the Mac's stack rides above the
+        // rail. The offset clears the bar at rest; when the bar minimizes on
+        // scroll the stack simply sits a little higher than it needs to, which is
+        // the harmless direction to be wrong in.
+        .overlay(alignment: .bottom) {
+            MobileToastHost()
+                .padding(.bottom, 68)
+        }
+        // The two modals the Mac stacks in its action layer, mounted here on the
+        // same store flags. Overlays rather than sheets: both are their own scrim
+        // already (OverlayScrim), both dismiss by tapping off, and a sheet would
+        // put a second card shape around a card.
+        .overlay {
+            if let request = store.ruleEditor {
+                RuleEditor(request: request) { store.closeRuleEditor() }
+            }
+        }
+        .overlay {
+            if !store.authQueue.isEmpty { AuthCodeModal() }
+        }
+        // `p` on the Mac. A deck is the whole screen on a phone — there is no
+        // board behind it worth dimming — so it covers rather than floats.
+        .fullScreenCover(isPresented: $store.processModeOpen) {
+            ProcessMode { store.processModeOpen = false }
+        }
+        // `v`. A SHEET here and a top-anchored command bar there, for one reason:
+        // the palette autofocuses a text field, and a phone answers that by
+        // raising the keyboard over the bottom half of the screen. A sheet is the
+        // only presentation that gets out of its way.
+        .sheet(isPresented: triageFixOpen) {
+            if let target = store.triageFix {
+                TriageFixPalette(target: target) { store.closeTriageFix() }
+            }
+        }
+    }
+
+    /// Presented-ness derived from the store's own `triageFix`, so dismissing the
+    /// sheet by dragging it down runs the same `closeTriageFix()` the palette's
+    /// cancel does and the state can never disagree with what is on screen.
+    private var triageFixOpen: Binding<Bool> {
+        Binding(
+            get: { store.triageFix != nil },
+            set: { if !$0 { store.closeTriageFix() } })
     }
 }
 
