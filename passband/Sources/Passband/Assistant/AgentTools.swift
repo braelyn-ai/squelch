@@ -183,7 +183,7 @@ enum AgentTools {
         return .ok(
             VerifiedTarget(
                 messageId: messageId, threadId: view.thread_id,
-                subject: view.subject.isEmpty ? "(no subject)" : view.subject,
+                subject: view.subject.displaySubject,
                 sender: senderLine(message)))
     }
 
@@ -209,7 +209,7 @@ enum AgentTools {
             cite(
                 ToolCitation(
                     threadId: hit.thread_id,
-                    subject: hit.subject.isEmpty ? "(no subject)" : hit.subject,
+                    subject: hit.subject.displaySubject,
                     sender: hit.from_name ?? hit.from_addr, date: hit.received_at))
             return row([
                 "thread_id": hit.thread_id,
@@ -234,7 +234,7 @@ enum AgentTools {
             cite(
                 ToolCitation(
                     threadId: view.thread_id,
-                    subject: view.subject.isEmpty ? "(no subject)" : view.subject,
+                    subject: view.subject.displaySubject,
                     sender: first.from_name ?? first.from_addr, date: first.received_at))
         }
         let messages = view.messages.map { message in
@@ -380,7 +380,7 @@ enum AgentTools {
                 cards.append(
                     EmailCard(
                         threadId: view.thread_id,
-                        subject: view.subject.isEmpty ? "(no subject)" : view.subject,
+                        subject: view.subject.displaySubject,
                         sender: latest.from_name ?? latest.from_addr,
                         date: latest.received_at,
                         snippet: snippet(latest.content)))
@@ -406,8 +406,7 @@ enum AgentTools {
 
     /// A card-sized preview off the top of a message body.
     private static func snippet(_ text: String, limit: Int = 180) -> String {
-        let flat = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        return flat.count <= limit ? flat : String(flat.prefix(limit)) + "…"
+        text.flattenedLine(cap: limit)
     }
 
     @MainActor

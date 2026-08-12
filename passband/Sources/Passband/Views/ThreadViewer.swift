@@ -743,11 +743,13 @@ struct ThreadViewer: View {
         // — `newest` so the agent targets exactly what `u`, `e` and the triage
         // inspector already do. Guarded because a slow fetch can land after the
         // user moved on: openThread(B) cleared the summary, and A's late adopt
-        // must not put A's subject and message id back under B's thread id.
+        // must not put A's subject and message id back under B's thread id. The
+        // id rides along regardless, so a reader can check rather than trust —
+        // see AppStore.currentThreadSummary.
         if store.threadId == threadId {
             store.openThreadSummary = newest.map {
                 OpenThreadSummary(
-                    subject: view.subject.isEmpty ? "(no subject)" : view.subject,
+                    threadId: threadId, subject: view.subject.displaySubject,
                     newestMessageId: $0.id)
             }
         }

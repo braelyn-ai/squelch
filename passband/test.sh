@@ -35,3 +35,10 @@ run_suite pairing \
   Sources/Passband/Lib/Sessions.swift \
   Sources/Passband/Model/Pairing.swift \
   Tests/PairingTests.swift
+
+# One file, no dependencies at all — SubjectText is kept that way on purpose.
+# The marker sanitizer is what lets a stranger's subject line sit inside the
+# assistant's system prompt, so it gets asserted rather than reasoned about.
+run_suite subject-text \
+  Sources/Passband/Model/SubjectText.swift \
+  Tests/SubjectTextTests.swift

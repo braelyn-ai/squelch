@@ -31,17 +31,14 @@ struct AskBar: View {
     private var session: AssistantSession { store.assistant }
 
     /// The email behind the bar, as the agent should hear about it — nil when
-    /// the bar was opened from a list. The subject and the message id land a
-    /// beat after the thread id does (the viewer writes them when the thread
-    /// arrives), so a question asked in that gap still pins the thread: which
-    /// email is meant is the part that matters, and get_thread recovers the
-    /// rest.
+    /// the bar was opened from a list. The summary lands a beat after the
+    /// thread id does (the viewer writes it when the thread arrives), and it is
+    /// read through `currentThreadSummary` so it is only ever this thread's: a
+    /// question asked in that gap still pins the thread, which is the part that
+    /// matters, and get_thread recovers the rest.
     private var openEmail: OpenEmailContext? {
         guard let threadId = store.threadId else { return nil }
-        let summary = store.openThreadSummary
-        return OpenEmailContext(
-            threadId: threadId, subject: summary?.subject,
-            newestMessageId: summary?.newestMessageId)
+        return OpenEmailContext(threadId: threadId, summary: store.currentThreadSummary)
     }
 
     /// Scroll target pinned to the bottom of the log.
@@ -72,11 +69,6 @@ struct AskBar: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "close", allowInInput: true) { onClose() }
         ])
-        // NO PIN HERE. `submit` pins immediately before every send, which is
-        // the only place the session reads it, so an appear-time write says
-        // nothing the next question won't say for itself — and the bar appears
-        // freely over other threads while a run is still streaming (Escape
-        // closes it without cancelling anything). One writer, at ask time.
         .onAppear { focused = true }
         // STRUCTURE ONLY. Animating anything that changes per token would smear
         // the streaming text; the count changes once per row.
@@ -98,7 +90,7 @@ struct AskBar: View {
             // bar is opened over the reader often enough that "this email"
             // should look like it means something. Shown only once the thread
             // has landed — a subject is the only thing here worth naming.
-            if let subject = store.openThreadSummary?.subject {
+            if let subject = store.currentThreadSummary?.subject {
                 Text("in: \(subject)")
                     .font(Typo.micro)
                     .foregroundStyle(Palette.inkDim)
@@ -161,11 +153,9 @@ struct AskBar: View {
         guard canSubmit else { return }
         let text = question.trimmed
         question = ""
-        // PINNED PER QUESTION, and only here. Every place that opens the bar
-        // would otherwise have to remember to, and the one that forgot would
-        // hand the agent an email the user had already walked away from.
-        session.pin(openEmail)
-        session.send(text)
+        // The email goes WITH the question — read here, at ask time, so it can
+        // never name a thread the user has since walked away from.
+        session.send(text, openEmail: openEmail)
     }
 
     // MARK: - the tray

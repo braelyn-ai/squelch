@@ -293,6 +293,10 @@ struct RuleEditorRequest: Identifiable, Sendable {
 /// an `@Observable` property, and lifted out of the viewer because the ask bar
 /// is a modal ABOVE it with no other way to see what it holds.
 struct OpenThreadSummary: Sendable, Equatable {
+    /// WHICH THREAD THIS DESCRIBES. Carried so a reader can check the summary
+    /// against the thread actually open rather than trust that the last writer
+    /// won — a slow fetch lands whenever it lands. See `currentThreadSummary`.
+    var threadId: String
     var subject: String
     /// The NEWEST message in the thread — see ThreadViewer's `newest`.
     var newestMessageId: Int
@@ -358,10 +362,21 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
-    /// What that thread IS, once it has landed — written by the viewer, read by
-    /// the ask bar's pin. nil while a thread is loading, which the pin handles:
-    /// the thread id alone is still enough to say which email is meant.
+    /// What that thread IS, once it has landed — written by the viewer. nil
+    /// while a thread is loading. READ IT THROUGH `currentThreadSummary`: this
+    /// is the raw last write, and the writer is a network callback.
     var openThreadSummary: OpenThreadSummary?
+    /// The summary ONLY IF it describes the thread that is open. The viewer
+    /// writes it from a fetch callback, so a slow load can land after the user
+    /// has moved on; `openThread` clears the stale one on the way out, and this
+    /// is the second lock on the same door — the ask bar pins what it reads
+    /// here into a prompt, where a subject and a message id belonging to
+    /// another email would be a lie told confidently.
+    var currentThreadSummary: OpenThreadSummary? {
+        guard let threadId, let summary = openThreadSummary, summary.threadId == threadId
+        else { return nil }
+        return summary
+    }
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
