@@ -396,51 +396,124 @@ struct ConnectView: View {
     }
 }
 
+/// Which way of getting a daemon the guide is describing.
+private enum GuideTab: Hashable { case hosted, selfHost }
+
 /// What a fresh install needs to hear before the connect form makes any sense:
-/// the app is a window onto a daemon the user runs, and here is how to get one.
+/// the app is a window onto a daemon, and here are the two ways to have one.
 /// Instructions only — the one credential-shaped act (typing the code) still
 /// happens in the form, which is where its guarantees live.
+///
+/// Hosted leads because it is the path that needs no terminal; the tab order is
+/// the pitch. Self-host keeps the full three commands.
 private struct GettingStartedPane: View {
+    @State private var tab: GuideTab = .hosted
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("new here?")
                 .font(Typo.serif(28, weight: .medium))
                 .foregroundStyle(Palette.ink)
+
+            GlassSegmented(
+                options: [(GuideTab.hosted, "hosted"), (.selfHost, "self-host")],
+                selection: $tab)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 14)
+
+            switch tab {
+            case .hosted: hosted
+            case .selfHost: selfHost
+            }
+        }
+        .padding(30)
+        .frame(width: 380)
+        .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTint)
+        .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
+    }
+
+    private var hosted: some View {
+        VStack(alignment: .leading, spacing: 18) {
             Text(
-                "Passband is the window. The engine is squelchd, a small daemon that reads your Gmail read-only and runs on any box you own: this Mac, a NAS, a server."
+                "We run the daemon for you, on your own sealed account. No server, no terminal."
             )
             .font(.system(size: 12))
             .foregroundStyle(Palette.inkFaint)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.top, 8)
 
-            VStack(alignment: .leading, spacing: 16) {
-                GuideStep(
-                    number: 1, title: "run the daemon",
-                    detail: "One public Docker image, amd64 and arm64.",
-                    command: "docker pull ghcr.io/braelyn-ai/squelchd")
-                GuideStep(
-                    number: 2, title: "authorize gmail",
-                    detail: "A one-time Google consent, run where the daemon lives.",
-                    command: "squelchd auth")
-                GuideStep(
-                    number: 3, title: "pair this mac",
-                    detail: "Prints a code. Type it into the form here.",
-                    command: "squelchd pair")
-            }
-            .padding(.top, 20)
+            GuideOption(
+                title: "have a pairing code?",
+                detail: "Type it into the form here and you are in.")
+            GuideOption(
+                title: "have an invite code?",
+                detail: "Account setup takes a minute and ends with a pairing code.",
+                linkLabel: "set up your account",
+                linkURL: "https://signup.passband.app")
+            GuideOption(
+                title: "neither yet?",
+                detail: "Hosted is invite-only while we grow.",
+                linkLabel: "join the waitlist",
+                linkURL: "https://passband.app")
+        }
+        .padding(.top, 16)
+    }
+
+    private var selfHost: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(
+                "The engine is squelchd, a small daemon that reads your Gmail read-only and runs on any box you own: this Mac, a NAS, a server."
+            )
+            .font(.system(size: 12))
+            .foregroundStyle(Palette.inkFaint)
+            .fixedSize(horizontal: false, vertical: true)
+
+            GuideStep(
+                number: 1, title: "run the daemon",
+                detail: "One public Docker image, amd64 and arm64.",
+                command: "docker pull ghcr.io/braelyn-ai/squelchd")
+            GuideStep(
+                number: 2, title: "authorize gmail",
+                detail: "A one-time Google consent, run where the daemon lives.",
+                command: "squelchd auth")
+            GuideStep(
+                number: 3, title: "pair this mac",
+                detail: "Prints a code. Type it into the form here.",
+                command: "squelchd pair")
 
             HStack(spacing: 14) {
                 Button("full setup guide") { Opener.open("https://passband.app/self-host") }
                 Button("github") { Opener.open("https://github.com/braelyn-ai/squelch") }
             }
             .buttonStyle(.textAction)
-            .padding(.top, 20)
+            .padding(.top, 4)
         }
-        .padding(30)
-        .frame(width: 380)
-        .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTint)
-        .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
+        .padding(.top, 16)
+    }
+}
+
+/// One either/or row on the hosted tab: a question, the one-line answer, and
+/// where to go if the answer is elsewhere.
+private struct GuideOption: View {
+    let title: String
+    let detail: String
+    var linkLabel: String?
+    var linkURL: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+            Text(detail)
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.inkFaint)
+                .fixedSize(horizontal: false, vertical: true)
+            if let linkLabel, let linkURL {
+                Button(linkLabel) { Opener.open(linkURL) }
+                    .buttonStyle(.textAction)
+                    .padding(.top, 2)
+            }
+        }
     }
 }
 
