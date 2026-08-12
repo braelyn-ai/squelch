@@ -949,8 +949,10 @@ enum AgentTools {
                 sender rule that decided it, if one did. This is the tool for "why \
                 is this in my inbox", "why was this flagged past due", "why did you \
                 call this noise". Takes a message_id (the newest message of the \
-                thread on screen, or one from an earlier result); it reads no mail \
-                and changes nothing.
+                thread on screen, or one from an earlier result). It opens no \
+                message body and changes nothing: the subject and one-line summary \
+                it returns come from the stored triage verdict, so reach for \
+                get_thread when the question is about what the message SAYS.
                 """,
             input_schema: .init(
                 properties: [

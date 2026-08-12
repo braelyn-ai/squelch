@@ -72,10 +72,12 @@ struct AskBar: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "close", allowInInput: true) { onClose() }
         ])
-        .onAppear {
-            focused = true
-            session.pin(openEmail)
-        }
+        // NO PIN HERE. `submit` pins immediately before every send, which is
+        // the only place the session reads it, so an appear-time write says
+        // nothing the next question won't say for itself — and the bar appears
+        // freely over other threads while a run is still streaming (Escape
+        // closes it without cancelling anything). One writer, at ask time.
+        .onAppear { focused = true }
         // STRUCTURE ONLY. Animating anything that changes per token would smear
         // the streaming text; the count changes once per row.
         .animation(.smooth(duration: 0.25), value: session.transcript.count)

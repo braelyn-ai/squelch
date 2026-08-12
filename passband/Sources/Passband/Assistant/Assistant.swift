@@ -254,6 +254,21 @@ struct OpenEmailContext: Sendable, Equatable {
     var newestMessageId: Int?
 }
 
+/// The pin as ONE RUN sees it, fixed when its question was sent.
+///
+/// THE RUN OUTLIVES THE BAR. Escape closes the ask bar without cancelling
+/// anything (only `clear()` does that), so the user can walk to another thread
+/// and reopen while a run is still streaming — or answer a confirm card from
+/// there. The system block is rebuilt for every request in the tool loop, and
+/// one that re-read the live pin would tell the model "this email" means a
+/// thread the pending question never saw. A copy taken at send time cannot
+/// drift out from under the question it belongs to.
+private struct PinnedContext: Sendable {
+    var email: OpenEmailContext?
+    /// Whether the transcript above this run was asked under another pin.
+    var switched: Bool
+}
+
 // MARK: - the session
 
 @MainActor
@@ -273,14 +288,19 @@ final class AssistantSession {
     /// follow-up is a real follow-up.
     private var history: [Wire.MessageParam] = []
 
-    /// The email on screen behind the bar, restated in the system block of
-    /// every request. Only `pin` writes it.
+    /// The email on screen behind the bar. Only `pin` writes it, and only
+    /// `send` reads it — a run carries its own copy (see `PinnedContext`).
     private(set) var openEmail: OpenEmailContext?
     /// Set the first time a QUESTION goes out under a different pin than the
     /// last one, and true for the rest of the transcript. The turns above
     /// really are about another email, and nothing else in the request can tell
     /// the model so — the system block is rebuilt per request and only ever
     /// describes the CURRENT one.
+    ///
+    /// ONE-WAY ON PURPOSE. Walking back to the first email does not un-mix the
+    /// conversation: the turns asked under the other one are still sitting in
+    /// `history`, so the note is still true, and dropping it there would let
+    /// the model read "this" further up as the thread now on screen.
     private var pinSwitched = false
     /// The pin the last question was asked under, so `send` can see the move.
     private var lastAskedThreadId: String?
@@ -331,16 +351,20 @@ final class AssistantSession {
         // about.
         if !history.isEmpty, openEmail?.threadId != lastAskedThreadId { pinSwitched = true }
         lastAskedThreadId = openEmail?.threadId
+        // The pin the question was asked under, handed to the run so no later
+        // move can rewrite what this one is about.
+        let pin = PinnedContext(email: openEmail, switched: pinSwitched)
         running = true
         let gen = generation
-        runTask = Task { [weak self] in await self?.run(question, gen: gen) }
+        runTask = Task { [weak self] in await self?.run(question, pin: pin, gen: gen) }
     }
 
     /// Pin the email the user is looking at (nil when the reader is closed).
-    /// Called per question rather than wherever the bar is opened, so the pin
-    /// can never name a thread they have since walked away from. Whether the
-    /// move counts as a SWITCH is `send`'s call, not this one's — only a
-    /// question asked under the new pin makes it part of the conversation.
+    /// Called immediately before each question rather than wherever the bar is
+    /// opened, so the pin can never name a thread they have since walked away
+    /// from. Whether the move counts as a SWITCH is `send`'s call, not this
+    /// one's — only a question asked under the new pin makes it part of the
+    /// conversation.
     func pin(_ email: OpenEmailContext?) {
         openEmail = email
     }
@@ -404,7 +428,7 @@ final class AssistantSession {
 
     // MARK: - the run
 
-    private func run(_ question: String, gen: Int) async {
+    private func run(_ question: String, pin: PinnedContext, gen: Int) async {
         // THE RUN OWNS THE BUSY FLAG. Every exit below is a bare `return`, and
         // one that forgot to clear this would wedge the bar for the rest of the
         // session. A stale generation means `clear()` already did it.
@@ -461,7 +485,7 @@ final class AssistantSession {
             do {
                 body = try encoder.encode(
                     Wire.Request(
-                        model: model.rawValue, max_tokens: Self.maxTokens, system: system(),
+                        model: model.rawValue, max_tokens: Self.maxTokens, system: system(pin),
                         tools: AgentTools.definitions, messages: history))
             } catch {
                 fail(errorText(error))
@@ -825,10 +849,10 @@ final class AssistantSession {
     // MARK: - system prompt
 
     /// Built per request, because the date is part of it: an agent that thinks
-    /// it is still last month reads "due Friday" wrong. An INSTANCE method for
-    /// the same reason — the email on screen is part of it too, and it can
-    /// change between one question and the next.
-    private func system() -> String {
+    /// it is still last month reads "due Friday" wrong. The email on screen is
+    /// part of it too, but it arrives as the RUN's copy rather than off the
+    /// live property — the pin may move between requests, the question may not.
+    private func system(_ pin: PinnedContext) -> String {
         let today = Date().formatted(.dateTime.month(.wide).day().year())
         return """
             You are the user's personal inbox assistant, embedded in a macOS app called \
@@ -882,7 +906,7 @@ final class AssistantSession {
             - create_sender_rule writes only Passband's local triage rules, never the
               mailbox. It changes what gets surfaced from here on; it moves no mail.
             - When the user asks you to write but not send, use save_draft.
-            \(openEmailBlock())
+            \(openEmailBlock(pin))
             """
     }
 
@@ -893,8 +917,8 @@ final class AssistantSession {
     /// under the Trust rules, which is what makes "the email I'm looking at"
     /// safe to answer: the model learns WHICH thread from the id, and reads the
     /// subject as a stranger's sentence rather than as part of this prompt.
-    private func openEmailBlock() -> String {
-        guard let email = openEmail else { return "" }
+    private func openEmailBlock(_ pin: PinnedContext) -> String {
+        guard let email = pin.email else { return "" }
         var lines = [
             "",
             "The email on screen:",
@@ -923,7 +947,7 @@ final class AssistantSession {
                     "  SUBJECT>>>",
                 ])
         }
-        if pinSwitched {
+        if pin.switched {
             lines.append(
                 "- Earlier turns in this conversation were about a different email (or about no "
                     + "email at all). Don't assume \"this\" meant this thread further up.")
