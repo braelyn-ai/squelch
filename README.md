@@ -22,7 +22,7 @@ squelch reads your Gmail (read-only), decides what actually deserves attention, 
 
 ---
 
-The name comes from the radio control that mutes everything below a signal threshold. Same idea here: noise stays below the squelch line, signal comes through.
+The name comes from the radio control that mutes everything below a signal threshold. Same idea here: noise stays below the squelch line, signal (the passband) comes through.
 
 ## Features
 
@@ -30,7 +30,7 @@ The name comes from the radio control that mutes everything below a signal thres
 | --- | --- |
 | 🚪 **Two doors, one daemon** | Agents get `/mcp`: ranked reads, no send/archive/delete. Humans get `/client`: bearer-authed search, threads, rules, and gated actions. |
 | 🔐 **Sealed auth mail** | 2FA codes, password resets, and login alerts are sealed at ingest. They never reach an LLM, an MCP response, or a list endpoint. |
-| ⚖️ **Deterministic first, models second** | Seal detection, then your sender rules, then heuristics. LLMs only refine what determinism can't settle, under daily budget caps. |
+| ⚖️ **Deterministic first, models second** | Seal detection, then your sender rules, then heuristics. LLMs only refine. |
 | 💬 **Natural-language sender rules** | "only tell me about school closures" is a rule. Your words are passed to the model verbatim, in either polarity. |
 | 📅 **Bills, deadlines, shipments** | Extracted during triage and queryable as first-class tools. |
 | 🖥️ **Native clients** | Passband, a native macOS app over the human door, plus a ratatui TUI for setup and debugging. |
@@ -55,6 +55,14 @@ flowchart LR
 - **Two doors**: agents connect to `/mcp` and get ranked summaries, and they cannot send, archive, delete, or see auth-related mail. Your own clients connect to `/client` with a bearer token and get search, threads, sender rules, the sitrep lifecycle, and gated actions (archive, label, send) backed by a separate write-scoped credential that only the action handlers can load.
 
 ## Quickstart
+
+One-click start with our hosted service: [passband.app](https://passband.app)
+
+Download the client and follow the instructions.
+
+## Self-Hosting
+
+Email is sensitive. Don't want to give it to us? Self-hosting has first-class support. Everything available in the hosted version is available to self-host.
 
 > 🐳 **Prefer Docker?** Prebuilt images live at `ghcr.io/braelyn-ai/squelchd` (amd64 + arm64). [`deploy/DOCKER.md`](deploy/DOCKER.md) is the compose-file-and-env-vars path, no toolchain needed. And [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) walks a full setup end to end: daemon in Docker on a NAS, Passband on a Mac.
 
@@ -173,6 +181,8 @@ Seven tools, no mailbox writes, sealed mail structurally absent:
 Sender rules are the one thing an agent can write, and they only shape triage inside squelch's own database. Nothing an agent does can touch your actual mailbox.
 
 ## Passband, the macOS client
+
+[Download here](https://passband.app)
 
 Passband is the native macOS client over the human door: the sitrep, threaded reading, compose with live markdown that sends as proper multipart HTML, contacts autocomplete, per-send read-receipt opt-in, sender rule tuning, sealed-mail reveal with an audit trail, and budget/usage dashboards.
 
