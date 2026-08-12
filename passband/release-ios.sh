@@ -12,7 +12,8 @@
 #
 # The build number is the UTC minute: unique, monotonic, and derived from the
 # clock instead of a state file some other checkout would fork. The marketing
-# version stays project.yml's MARKETING_VERSION.
+# version is project.yml's MARKETING_VERSION unless SQUELCH_IOS_VERSION says
+# otherwise — CI passes the ios-v* tag's version through it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -22,18 +23,34 @@ OUT="build/testflight"
 ARCHIVE="$OUT/PassbandiOS.xcarchive"
 EXPORT_PLIST="$OUT/export-options.plist"
 
+# On a signed-in Mac, -allowProvisioningUpdates rides Xcode's session. Headless
+# (CI), the same flag needs the App Store Connect API key handed to xcodebuild
+# itself — cloud signing then mints/uses a managed distribution cert with no
+# keychain on the runner.
+AUTH=()
+if [ -n "${SQUELCH_ASC_KEY_ID:-}" ] && [ -f "${SQUELCH_ASC_KEY_PATH:-}" ]; then
+  AUTH=(-authenticationKeyPath "$(cd "$(dirname "$SQUELCH_ASC_KEY_PATH")" && pwd)/$(basename "$SQUELCH_ASC_KEY_PATH")"
+        -authenticationKeyID "$SQUELCH_ASC_KEY_ID"
+        -authenticationKeyIssuerID "$SQUELCH_ASC_KEY_ISSUER")
+fi
+
+VERSION_OVERRIDE=()
+if [ -n "${SQUELCH_IOS_VERSION:-}" ]; then
+  VERSION_OVERRIDE=(MARKETING_VERSION="$SQUELCH_IOS_VERSION")
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
 echo "==> xcodegen"
 xcodegen generate >/dev/null
 
-echo "==> archiving build $BUILD"
+echo "==> archiving ${SQUELCH_IOS_VERSION:-\$(project.yml)} build $BUILD"
 xcodebuild -project Passband.xcodeproj -scheme PassbandiOS \
   -configuration Release -destination 'generic/platform=iOS' \
   archive -archivePath "$ARCHIVE" \
-  CURRENT_PROJECT_VERSION="$BUILD" \
-  -allowProvisioningUpdates -quiet
+  CURRENT_PROJECT_VERSION="$BUILD" ${VERSION_OVERRIDE[@]+"${VERSION_OVERRIDE[@]}"} \
+  -allowProvisioningUpdates ${AUTH[@]+"${AUTH[@]}"} -quiet
 
 cat > "$EXPORT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -51,7 +68,7 @@ PLIST
 echo "==> exporting"
 xcodebuild -exportArchive -archivePath "$ARCHIVE" \
   -exportOptionsPlist "$EXPORT_PLIST" -exportPath "$OUT" \
-  -allowProvisioningUpdates -quiet
+  -allowProvisioningUpdates ${AUTH[@]+"${AUTH[@]}"} -quiet
 
 # Named for CFBundleDisplayName (Passband.ipa), not the target — glob so a
 # rename never breaks the pipeline silently.
@@ -65,11 +82,12 @@ fi
 
 if [ -n "${SQUELCH_ASC_KEY_ID:-}" ] && [ -n "${SQUELCH_ASC_KEY_ISSUER:-}" ] && [ -f "${SQUELCH_ASC_KEY_PATH:-}" ]; then
   echo "==> uploading build $BUILD"
-  # altool wants the key under ./private_keys or a few blessed dirs; point it
-  # at the key's own directory instead of copying a credential around.
+  # altool takes no key path — it searches a few blessed directories for
+  # AuthKey_<id>.p8, so place a copy where it looks.
+  mkdir -p "$HOME/.appstoreconnect/private_keys"
+  cp -f "$SQUELCH_ASC_KEY_PATH" "$HOME/.appstoreconnect/private_keys/AuthKey_${SQUELCH_ASC_KEY_ID}.p8"
   xcrun altool --upload-app -f "$IPA" -t ios \
-    --apiKey "$SQUELCH_ASC_KEY_ID" --apiIssuer "$SQUELCH_ASC_KEY_ISSUER" \
-    --private-key-path "$SQUELCH_ASC_KEY_PATH"
+    --apiKey "$SQUELCH_ASC_KEY_ID" --apiIssuer "$SQUELCH_ASC_KEY_ISSUER"
   echo "==> uploaded; App Store Connect processes it in ~10-30 min"
 else
   echo "==> $IPA"
