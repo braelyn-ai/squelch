@@ -140,6 +140,10 @@ targets:
         buildPhase: resources
       - path: Sources/Passband/Resources/newsreader-italic-var.ttf
         buildPhase: resources
+      # The same Icon Composer document the Mac ships. Its squares are
+      # "shared", so actool renders the one design for both platforms.
+      - path: Passband.icon
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.passband.client.ios
@@ -171,6 +175,7 @@ targets:
         DEVELOPMENT_TEAM: AAT39BQ9LV
         CODE_SIGN_IDENTITY[sdk=iphoneos*]: "Apple Development"
         CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]: "Apple Development"
+        ASSETCATALOG_COMPILER_APPICON_NAME: Passband
     dependencies:
       - sdk: WebKit.framework
       - sdk: Security.framework

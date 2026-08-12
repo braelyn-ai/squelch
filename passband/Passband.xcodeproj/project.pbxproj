@@ -123,6 +123,7 @@
 		A252756AF0D9655F2C1477B7 /* Ranking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7079893CCCC8806D2B5099D8 /* Ranking.swift */; };
 		A4DAE234F5C7BDED52D12A55 /* ConnectionHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FCD987D800267801D7B4DFE /* ConnectionHealth.swift */; };
 		A59188FDC250262DEBA28AAE /* ImageSchemeHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05270E444AAA1678F50EC0F0 /* ImageSchemeHandler.swift */; };
+		A6F7ADCEE7CF788F562C7C3E /* Passband.icon in Resources */ = {isa = PBXBuildFile; fileRef = C9CC93E238228B2BA4D4569A /* Passband.icon */; };
 		AA1FDE44601AF70AA151D912 /* AttachmentStrip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15D14DE02E72E63FE53D5C8D /* AttachmentStrip.swift */; };
 		AAA858868EA8B291080277ED /* Trackers.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEFA34554013DFB615774309 /* Trackers.swift */; };
 		AB169C9A19D62418DBAD4C3D /* ThreadPrefetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F62561CEB4911BA0E72FEDD /* ThreadPrefetch.swift */; };
@@ -693,6 +694,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A6F7ADCEE7CF788F562C7C3E /* Passband.icon in Resources */,
 				911E2DC6E6549AECE86FFBAA /* Sounds in Resources */,
 				78F890FF424189B1CDC6C501 /* newsreader-italic-var.ttf in Resources */,
 				0A7C428163BED54C681D2CD8 /* newsreader-var.ttf in Resources */,
@@ -909,7 +911,7 @@
 		4C262313ABCF23A19F63DCDE /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Passband;
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				"CODE_SIGN_IDENTITY[config=Release]" = "-";
@@ -1029,7 +1031,7 @@
 		BCFB8BCC8F084F480F8E5C00 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Passband;
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				"CODE_SIGN_IDENTITY[config=Release]" = "-";
