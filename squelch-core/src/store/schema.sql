@@ -206,6 +206,24 @@ CREATE TABLE IF NOT EXISTS shipments (
     -- the join back to `shipment_orders`, so a tracking-bearing email can absorb
     -- the staged order it belongs to. NULL when no order reference was found.
     order_ref       TEXT,
+    -- The MERCHANT NAMESPACE for `order_ref`: the registrable domain of the
+    -- feeding message's sender, lowercased. An order reference is only unique
+    -- WITHIN a merchant — "Order #1042" from two shops is two purchases — so
+    -- every order_ref lookup is scoped by this column. NULL alongside a NULL
+    -- order_ref, and on rows written before the column existed.
+    order_merchant  TEXT,
+    -- IMMUTABLE PROVENANCE: the message that CREATED this row, written once on
+    -- INSERT and never updated. `last_message_id` moves to whichever mail most
+    -- recently advanced the row, so it answers "who touched this last", not
+    -- "who minted this" — and the extractor's phantom reaping must only ever
+    -- reach rows the message in hand actually created.
+    created_by_message_id INTEGER,
+    -- Which message's extraction supplied the CURRENT `item_name`. Usually
+    -- `last_message_id`, but three paths DONATE a name onto a row another mail
+    -- feeds (staged-order promotion, the order-ref-only adoption, the thread
+    -- adoption), and sealing a message must scrub the text it contributed
+    -- wherever it landed. NULL when no name, or on pre-column rows.
+    item_name_msg   INTEGER,
     UNIQUE(account_id, tracking_number)
 );
 
@@ -217,24 +235,36 @@ CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status)
 
 -- ORDERS STAGING. A purchase the shipments extractor recognized but that carries
 -- NO TRACKING NUMBER yet (the order confirmation arrives days before the ship
--- notice). Keyed by (account, order_ref) instead of a tracking number, so it
--- cannot live in `shipments` — that table's identity IS the tracking number.
--- When the ship notice lands with both the order reference and a number, the
--- staged row is promoted into `shipments` and deleted here.
+-- notice). Keyed by (account, merchant, order_ref) instead of a tracking number,
+-- so it cannot live in `shipments` — that table's identity IS the tracking
+-- number. When the ship notice lands with both the order reference and a number,
+-- the staged row is promoted into `shipments` and deleted here.
+--
+-- The MERCHANT is part of the key on purpose: "Order #1042" is unique only
+-- within the shop that issued it, and an unnamespaced key lets one retailer's
+-- confirmation donate its product name onto another retailer's package.
+-- `order_merchant` is NOT NULL (defaulting to '' for an underivable sender)
+-- because SQLite treats every NULL in a UNIQUE index as distinct, which would
+-- silently disable the staging upsert's ON CONFLICT.
 --
 -- SECURITY: written only from the shipments extractor, whose queue gates on
 -- sensitivity='normal', so this table has no sealed rows BY CONSTRUCTION.
--- Sealing a message still deletes the rows it fed, and so does a re-triage.
+-- Sealing a message still deletes the rows it fed and scrubs the names it merely
+-- donated (`item_name_msg`), and so does a re-triage.
 CREATE TABLE IF NOT EXISTS shipment_orders (
     id INTEGER PRIMARY KEY,
     account_id INTEGER NOT NULL,
     order_ref TEXT NOT NULL,
+    order_merchant TEXT NOT NULL DEFAULT '',
     item_name TEXT NOT NULL DEFAULT '',
     thread_id TEXT NOT NULL DEFAULT '',
     last_message_id INTEGER,
+    -- Which message's extraction supplied the CURRENT `item_name` — the pointer
+    -- above moves to the latest feeder, so it cannot answer that on its own.
+    item_name_msg INTEGER,
     first_seen TEXT NOT NULL,
     last_update TEXT NOT NULL,
-    UNIQUE(account_id, order_ref)
+    UNIQUE(account_id, order_merchant, order_ref)
 );
 
 CREATE INDEX IF NOT EXISTS idx_shipment_orders_msg ON shipment_orders(account_id, last_message_id);

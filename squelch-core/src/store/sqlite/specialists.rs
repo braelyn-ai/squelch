@@ -31,6 +31,39 @@ fn delivered_ts(status: crate::triage::ShipmentStatus, ts: &str) -> Option<Strin
     (status == crate::triage::ShipmentStatus::Delivered).then(|| ts.to_string())
 }
 
+/// `app_settings` key recording that the one-shot shipment re-detect
+/// ([`SqliteStore::shipments_redetect_cleanup`]) has run for an account. Written
+/// inside the same transaction as the pass's deletions, so "the flag is set" and
+/// "the deletions happened" are one fact.
+const SHIPMENTS_REDETECT_FLAG: &str = "shipments_redetect_v1";
+
+/// The MERCHANT NAMESPACE an order reference lives in: the registrable domain of
+/// the sender that supplied it, lowercased, or `""` when the address yields none.
+///
+/// An order reference is unique only WITHIN the shop that issued it — "Order
+/// #1042" from two retailers is two purchases — so `order_ref` alone is not an
+/// identity and every lookup pairs it with this. Reuses
+/// [`receipt_match::registrable_domain`](crate::triage::receipt_match::registrable_domain),
+/// the codebase's one definition of merchant identity, rather than adding a
+/// second domain parser that would drift from it.
+pub(super) fn merchant_key(from_addr: &str) -> String {
+    crate::triage::receipt_match::registrable_domain(from_addr).unwrap_or_default()
+}
+
+/// The merchant namespace for one message: [`merchant_key`] over its sender.
+/// `""` when the message is gone or its address has no derivable domain — a
+/// namespace of its own, matching only other unattributable rows.
+fn message_merchant(conn: &Connection, account_id: AccountId, message_id: i64) -> Result<String> {
+    let from_addr: Option<String> = conn
+        .query_row(
+            "SELECT from_addr FROM messages WHERE account_id = ?1 AND id = ?2",
+            params![account_id, message_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(from_addr.as_deref().map(merchant_key).unwrap_or_default())
+}
+
 /// Upsert a shipment keyed by `(account_id, tracking_number)` in the caller's
 /// transaction. A repeat applies the no-regress status state machine
 /// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
@@ -38,6 +71,25 @@ fn delivered_ts(status: crate::triage::ShipmentStatus, ts: &str) -> Option<Strin
 /// specific than "unknown". `last_update`/`last_message_id` advance only when
 /// the merge accepts the incoming status, so a stale duplicate never becomes
 /// the row's click target.
+///
+/// PROVENANCE. `created_by_message_id` is written ONCE, on the INSERT, and never
+/// updated: it is the only column that answers "which mail minted this row",
+/// which the phantom reaping keys on. `item_name_msg` follows the name — it
+/// moves to `message_id` exactly when this message's name is adopted — so
+/// sealing a message can scrub the text it contributed wherever that landed.
+///
+/// AN ACCEPTED UPDATE UN-RETIRES THE ROW: `poll_failures` goes back to 0
+/// alongside `last_message_id`. A carrier answering "no such number" retires a
+/// shipment permanently — it leaves the poll queue AND, for an ambiguous number
+/// shape, the client lists — and until this, a successful poll was the only
+/// thing that could ever bring it back, which a retired row can no longer
+/// produce. Mail is the other witness: another message that the no-regress state
+/// machine BELIEVES is fresh evidence this parcel is real, so the count of
+/// consecutive carrier rejections starts over. It is gated on `accepted` rather
+/// than written on every upsert so a stale duplicate — the late "shipped" after
+/// a delivery, which is exactly the mail the merge just rejected — cannot
+/// resurrect a genuine phantom. A re-ingest of the SAME message also resets,
+/// which costs at most one more retirement cycle for a number that deserved it.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 pub(super) fn upsert_shipment_conn(
@@ -73,8 +125,8 @@ pub(super) fn upsert_shipment_conn(
             conn.execute(
                 "INSERT INTO shipments(account_id, tracking_number, carrier, item_name,
                      status, tracking_url, last_message_id, first_seen, last_update,
-                     delivered_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
+                     delivered_at, created_by_message_id, item_name_msg)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?7,?10)",
                 params![
                     account_id,
                     s.tracking_number,
@@ -85,6 +137,7 @@ pub(super) fn upsert_shipment_conn(
                     message_id,
                     ts,
                     delivered_ts(s.status, &ts),
+                    (!s.item_name.is_empty()).then_some(message_id),
                 ],
             )?;
             let id: i64 = conn.query_row(
@@ -99,10 +152,12 @@ pub(super) fn upsert_shipment_conn(
                 ShipmentStatus::parse(&cur_status_s).unwrap_or(ShipmentStatus::Shipped);
             let merged = ShipmentStatus::merge(cur_status, s.status);
 
-            // Prefer a more informative item name.
-            let item_name = if !s.item_name.is_empty()
-                && (cur_item.is_empty() || s.item_name.len() > cur_item.len())
-            {
+            // Prefer a more informative item name. `adopt_name` also carries the
+            // name's PROVENANCE across: the stored name is this message's only
+            // when this message's name won.
+            let adopt_name = !s.item_name.is_empty()
+                && (cur_item.is_empty() || s.item_name.len() > cur_item.len());
+            let item_name = if adopt_name {
                 s.item_name.clone()
             } else {
                 cur_item
@@ -128,7 +183,9 @@ pub(super) fn upsert_shipment_conn(
                          tracking_url=?4,
                          last_message_id = CASE WHEN ?5 THEN ?6 ELSE last_message_id END,
                          last_update     = CASE WHEN ?5 THEN ?7 ELSE last_update END,
-                         delivered_at    = COALESCE(delivered_at, ?9)
+                         poll_failures   = CASE WHEN ?5 THEN 0 ELSE poll_failures END,
+                         delivered_at    = COALESCE(delivered_at, ?9),
+                         item_name_msg   = CASE WHEN ?10 THEN ?6 ELSE item_name_msg END
                      WHERE id=?8",
                     params![
                         merged.as_str(),
@@ -140,6 +197,7 @@ pub(super) fn upsert_shipment_conn(
                         ts,
                         id,
                         delivered_ts(merged, &ts),
+                        adopt_name,
                     ],
                 )?;
             } else {
@@ -148,7 +206,9 @@ pub(super) fn upsert_shipment_conn(
                     "UPDATE shipments SET status=?1, item_name=?2,
                          last_message_id = CASE WHEN ?3 THEN ?4 ELSE last_message_id END,
                          last_update     = CASE WHEN ?3 THEN ?5 ELSE last_update END,
-                         delivered_at    = COALESCE(delivered_at, ?7)
+                         poll_failures   = CASE WHEN ?3 THEN 0 ELSE poll_failures END,
+                         delivered_at    = COALESCE(delivered_at, ?7),
+                         item_name_msg   = CASE WHEN ?8 THEN ?4 ELSE item_name_msg END
                      WHERE id=?6",
                     params![
                         merged.as_str(),
@@ -158,6 +218,7 @@ pub(super) fn upsert_shipment_conn(
                         ts,
                         id,
                         delivered_ts(merged, &ts),
+                        adopt_name,
                     ],
                 )?;
             }
@@ -385,9 +446,15 @@ pub(super) fn auto_close_bill_for_receipt_conn(
     Ok(Some(bill_id))
 }
 
-/// The `(id, tracking_number)` of every shipment row THIS message currently
-/// feeds — the ONLY rows a shipments-extractor apply is allowed to delete. Read
-/// before any write, so the upsert below can never delete the row it just wrote.
+/// The `(id, tracking_number)` of every shipment row THIS message CREATED — the
+/// ONLY rows a shipments-extractor apply is allowed to delete. Read before any
+/// write, so the upsert below can never delete the row it just wrote.
+///
+/// Keyed on `created_by_message_id`, NOT `last_message_id`. The latter MOVES to
+/// whichever mail most recently advanced the row, so a second email covering two
+/// packages would make the first email's weeks-old package look like this
+/// message's to reap — order reference, ETA, delivery stamp, poll state and all.
+/// Provenance is immutable; the pointer is not.
 fn shipments_fed_by(
     conn: &Connection,
     account_id: AccountId,
@@ -395,7 +462,7 @@ fn shipments_fed_by(
 ) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT id, tracking_number FROM shipments
-         WHERE account_id = ?1 AND last_message_id = ?2",
+         WHERE account_id = ?1 AND created_by_message_id = ?2",
     )?;
     let out = stmt
         .query_map(params![account_id, message_id], |r| {
@@ -411,6 +478,16 @@ fn shipments_fed_by(
 /// digit-runs can be phantoms of a retailer's item or order id in the first
 /// place (see
 /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape)).
+///
+/// CALLED ONLY ON POSITIVE EVIDENCE that a fed row is a phantom: the model
+/// returned a DIFFERENT tracking number for this mail, or said it is not a
+/// shipment at all. An extraction that simply names no number is silence, not a
+/// verdict — see [`SqliteStore::shipments_extract_apply`].
+///
+/// CARRIER EVIDENCE OVERRULES BOTH. A row a carrier has answered about
+/// (`carrier_status_raw`) or been asked about (`last_polled_at`) is a real
+/// package whatever a model or a regex now thinks of its shape, so the delete
+/// refuses it in SQL rather than trusting every caller to remember.
 fn delete_fed_phantoms(
     conn: &Connection,
     account_id: AccountId,
@@ -423,7 +500,9 @@ fn delete_fed_phantoms(
         }
         if crate::triage::is_ambiguous_tracking_shape(number) {
             conn.execute(
-                "DELETE FROM shipments WHERE account_id = ?1 AND id = ?2",
+                "DELETE FROM shipments
+                 WHERE account_id = ?1 AND id = ?2
+                   AND carrier_status_raw IS NULL AND last_polled_at IS NULL",
                 params![account_id, id],
             )?;
         }
@@ -441,12 +520,50 @@ fn shipment_item_name(conn: &Connection, shipment_id: i64) -> Result<String> {
     Ok(name)
 }
 
-fn set_shipment_item_name(conn: &Connection, shipment_id: i64, name: &str) -> Result<()> {
+/// Write an item name AND the message whose extraction supplied it.
+///
+/// `name_msg` is NOT always the message being applied: a promoted staged order
+/// donates a name the ORDER CONFIRMATION wrote, and sealing that confirmation
+/// has to scrub it from wherever it was donated. A wrong id here silently makes
+/// sealing a no-op for that text, so the provenance is a REQUIRED argument
+/// rather than something a caller can forget to update.
+fn set_shipment_item_name(
+    conn: &Connection,
+    shipment_id: i64,
+    name: &str,
+    name_msg: Option<i64>,
+) -> Result<()> {
     conn.execute(
-        "UPDATE shipments SET item_name = ?2 WHERE id = ?1",
-        params![shipment_id, name],
+        "UPDATE shipments SET item_name = ?2, item_name_msg = ?3 WHERE id = ?1",
+        params![shipment_id, name, name_msg],
     )?;
     Ok(())
+}
+
+/// The shipments carrying `(merchant, order_ref)`, capped at TWO — the caller
+/// only needs to tell none from one from several.
+///
+/// Multiplicity is legitimate: an order that splits into two boxes puts the same
+/// reference on both. It is also exactly when an item name must not be donated —
+/// the earlier `query_row` silently took whichever row SQLite handed back first,
+/// so half the time the name landed on the wrong package.
+fn shipments_by_order_ref(
+    conn: &Connection,
+    account_id: AccountId,
+    merchant: &str,
+    order_ref: &str,
+) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, item_name FROM shipments
+         WHERE account_id = ?1 AND order_merchant = ?2 AND order_ref = ?3
+         LIMIT 2",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id, merchant, order_ref], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// The projection every shipment read shares, in [`shipment_row`]'s order.
@@ -518,13 +635,17 @@ impl SqliteStore {
             return Ok(false);
         }
 
-        // The blast radius of this apply: rows THIS message currently feeds.
-        // Every delete below is bounded to it, so one mail's verdict can never
-        // reach a package another mail is tracking.
+        // The blast radius of this apply: rows THIS message CREATED. Every delete
+        // below is bounded to it, so one mail's verdict can never reach a package
+        // another mail established.
         let fed = shipments_fed_by(&tx, a.account_id, a.message_id)?;
+        // The namespace this mail's order reference lives in — its sender's
+        // registrable domain. Read once; every order_ref read and write pairs it.
+        let merchant = message_merchant(&tx, a.account_id, a.message_id)?;
 
         // NEGATIVE VERDICT: the model read the mail and says it is not an inbound
-        // package. Retire the phantoms this message minted; keep everything else.
+        // package. That IS positive evidence about the rows it minted, so retire
+        // its phantoms; keep everything else.
         if !a.is_shipment {
             delete_fed_phantoms(&tx, a.account_id, &fed, None)?;
             tx.commit()?;
@@ -533,7 +654,8 @@ impl SqliteStore {
 
         let wrote = if let Some(tn) = a.tracking_number.as_deref() {
             // IDENTITY: a carrier tracking number. Any OTHER ambiguous row this
-            // message fed was the regex detector reading an order id as a number.
+            // message created was the regex detector reading an order id as a
+            // number — the model named which number this mail is really about.
             delete_fed_phantoms(&tx, a.account_id, &fed, Some(tn))?;
             let info = ShipmentInfo {
                 carrier: a.carrier.clone(),
@@ -552,30 +674,34 @@ impl SqliteStore {
             // keeps junk like "package now with its carrier!" over the model's
             // "Anker USB-C charger" purely because it is longer.
             if let Some(name) = a.item_name.as_deref() {
-                set_shipment_item_name(&tx, ship_id, name)?;
+                set_shipment_item_name(&tx, ship_id, name, Some(a.message_id))?;
             }
 
             if let Some(oref) = a.order_ref.as_deref() {
                 tx.execute(
-                    "UPDATE shipments SET order_ref = ?2 WHERE id = ?1",
-                    params![ship_id, oref],
+                    "UPDATE shipments SET order_ref = ?2, order_merchant = ?3 WHERE id = ?1",
+                    params![ship_id, oref, merchant],
                 )?;
                 // PROMOTION: the order confirmation that arrived days earlier
                 // staged a row under this reference. Donate its name if we have
                 // none, then delete it — the purchase now has a real identity.
-                let staged: Option<(i64, String)> = tx
+                // The staged row's own name PROVENANCE rides along: the donated
+                // text belongs to the mail that wrote it, not to this ship
+                // notice, and sealing that mail must still scrub it.
+                let staged: Option<(i64, String, Option<i64>)> = tx
                     .query_row(
-                        "SELECT id, item_name FROM shipment_orders
-                         WHERE account_id = ?1 AND order_ref = ?2",
-                        params![a.account_id, oref],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        "SELECT id, item_name, COALESCE(item_name_msg, last_message_id)
+                         FROM shipment_orders
+                         WHERE account_id = ?1 AND order_merchant = ?2 AND order_ref = ?3",
+                        params![a.account_id, merchant, oref],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
-                if let Some((staged_id, staged_name)) = staged {
+                if let Some((staged_id, staged_name, staged_name_msg)) = staged {
                     if shipment_item_name(&tx, ship_id)?.trim().is_empty()
                         && !staged_name.trim().is_empty()
                     {
-                        set_shipment_item_name(&tx, ship_id, &staged_name)?;
+                        set_shipment_item_name(&tx, ship_id, &staged_name, staged_name_msg)?;
                     }
                     tx.execute(
                         "DELETE FROM shipment_orders WHERE id = ?1",
@@ -585,48 +711,53 @@ impl SqliteStore {
             }
             true
         } else if let Some(oref) = a.order_ref.as_deref() {
-            // IDENTITY: an order reference and NO tracking number. The model read
-            // the whole mail and found no carrier number, so any ambiguous row
-            // this message fed is a regex phantom OF that order id.
-            delete_fed_phantoms(&tx, a.account_id, &fed, None)?;
-            let existing: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT id, item_name FROM shipments
-                     WHERE account_id = ?1 AND order_ref = ?2",
-                    params![a.account_id, oref],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            match existing {
+            // IDENTITY: an order reference and NO tracking number. NOTHING IS
+            // DELETED HERE — see the rule on `shipments_extract_apply`: the model
+            // naming no number is silence, and the row this message minted may be
+            // a real package whose number the extractor merely echoed into the
+            // order field.
+            match shipments_by_order_ref(&tx, a.account_id, &merchant, oref)?.as_slice() {
                 // The shipment already landed under this reference: the only
                 // thing an order mail can still add is the item's name.
-                Some((ship_id, cur_name)) => match a.item_name.as_deref() {
+                [(ship_id, cur_name)] => match a.item_name.as_deref() {
                     Some(name) if cur_name.trim().is_empty() => {
-                        set_shipment_item_name(&tx, ship_id, name)?;
+                        set_shipment_item_name(&tx, *ship_id, name, Some(a.message_id))?;
                         true
                     }
                     _ => false,
                 },
+                // SEVERAL packages carry this reference — the order shipped in
+                // more than one box. Naming one of them would be a coin flip, and
+                // the purchase is already tracked, so this mail writes nothing at
+                // all: not a name, not a fresh staging row.
+                [_, _, ..] => false,
                 // No tracking number anywhere yet: STAGE the purchase, keyed by
-                // the retailer's reference, until a ship notice promotes it.
-                None => {
+                // the retailer's reference IN ITS MERCHANT'S NAMESPACE, until a
+                // ship notice promotes it.
+                [] => {
                     let ts = a.received_at.to_rfc3339();
+                    let name = a.item_name.clone().unwrap_or_default();
                     tx.execute(
-                        "INSERT INTO shipment_orders(account_id, order_ref, item_name, thread_id,
-                             last_message_id, first_seen, last_update)
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                         ON CONFLICT(account_id, order_ref) DO UPDATE SET
+                        "INSERT INTO shipment_orders(account_id, order_ref, order_merchant,
+                             item_name, thread_id, last_message_id, item_name_msg,
+                             first_seen, last_update)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                         ON CONFLICT(account_id, order_merchant, order_ref) DO UPDATE SET
                              item_name = CASE WHEN excluded.item_name != ''
                                               THEN excluded.item_name ELSE item_name END,
+                             item_name_msg = CASE WHEN excluded.item_name != ''
+                                              THEN excluded.item_name_msg ELSE item_name_msg END,
                              thread_id = excluded.thread_id,
                              last_message_id = excluded.last_message_id,
                              last_update = excluded.last_update",
                         params![
                             a.account_id,
                             oref,
-                            a.item_name.clone().unwrap_or_default(),
+                            merchant,
+                            name,
                             a.thread_id,
                             a.message_id,
+                            (!name.is_empty()).then_some(a.message_id),
                             ts,
                         ],
                     )?;
@@ -635,9 +766,9 @@ impl SqliteStore {
             }
         } else {
             // NO IDENTITY AT ALL — a shipping mail naming neither a number nor an
-            // order. Conservative by construction: retire this message's phantoms,
-            // then adopt a name onto the thread's ONE shipment if it has none.
-            delete_fed_phantoms(&tx, a.account_id, &fed, None)?;
+            // order. Conservative by construction, and DELETING NOTHING for the
+            // same reason as the branch above: adopt a name onto the thread's ONE
+            // shipment if it has none, and otherwise leave the world alone.
             let survivors: Vec<(i64, String)> = {
                 let mut stmt = tx.prepare(
                     "SELECT s.id, s.item_name FROM shipments s
@@ -656,7 +787,7 @@ impl SqliteStore {
             // a mail with no identity has no claim on a row's lifecycle.
             match (survivors.as_slice(), a.item_name.as_deref()) {
                 ([(ship_id, cur_name)], Some(name)) if cur_name.trim().is_empty() => {
-                    set_shipment_item_name(&tx, *ship_id, name)?;
+                    set_shipment_item_name(&tx, *ship_id, name, Some(a.message_id))?;
                     true
                 }
                 _ => false,
@@ -706,26 +837,55 @@ impl SqliteStore {
     /// One-shot repair: re-run the (tightened) detector over each shipment row's
     /// FEEDER MESSAGE and delete the row when that message no longer yields that
     /// tracking number — the phantom rows a looser detector minted from eBay item
-    /// ids and marketing digit-runs. Returns the number of rows deleted.
+    /// ids and marketing digit-runs. Returns the number of rows deleted, and 0
+    /// once the pass has already run for this account.
     ///
-    /// A row whose `last_message_id` is NULL is LEFT ALONE: there is no evidence
-    /// to re-judge it on (an older daemon wrote it, or only a carrier poll has
-    /// touched it), and deleting on absent evidence would drop live shipments.
+    /// ATOMIC WITH ITS OWN DONE-FLAG. The deletions and the `app_settings` flag
+    /// that records them commit in ONE transaction, so the pass can never
+    /// complete unrecorded — with the flag written by the caller afterwards, a
+    /// crash or an unwritable settings row meant the whole thing ran AGAIN next
+    /// start, and by then the extractor had written rows the regex cannot
+    /// reproduce. The store owns both halves for that reason; callers just call.
+    ///
+    /// ONLY REGEX PHANTOMS ARE IN SCOPE. The keep test is "does the regex
+    /// detector still yield this number", which extractor-written rows fail BY
+    /// CONSTRUCTION — the model found what the regex could not. So a row with
+    /// carrier evidence (`carrier_status_raw` / `last_polled_at`) or extractor
+    /// evidence (`order_ref`) is never judged at all.
+    ///
+    /// A row whose `last_message_id` is NULL is LEFT ALONE too: there is no
+    /// evidence to re-judge it on (an older daemon wrote it, or only a carrier
+    /// poll has touched it), and deleting on absent evidence drops live packages.
     ///
     /// SECURITY: the detector never runs on sealed mail, so the join skips any
     /// feeder whose triage row is not `sensitivity='normal'` — those rows keep
     /// the structural guarantee they already have (sealing deletes the shipment).
     pub(super) fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
+        let done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
+                params![account_id, SHIPMENTS_REDETECT_FLAG],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if done.as_deref() == Some("done") {
+            return Ok(0);
+        }
+
+        let tx = conn.transaction()?;
         let rows: Vec<(i64, String, String, String, String)> = {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT s.id, s.tracking_number, m.from_addr, m.subject, m.body
                  FROM shipments s
                  JOIN messages m
                    ON m.id = s.last_message_id AND m.account_id = s.account_id
                  LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
                  WHERE s.account_id = ?1
-                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                   AND COALESCE(t.sensitivity, 'normal') = 'normal'
+                   AND s.carrier_status_raw IS NULL
+                   AND s.last_polled_at IS NULL
+                   AND s.order_ref IS NULL",
             )?;
             stmt.query_map(params![account_id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -742,12 +902,20 @@ impl SqliteStore {
             let still_detected = crate::triage::detect_shipment(&from_addr, &subject, &body)
                 .is_some_and(|s| s.tracking_number == tracking_number);
             if !still_detected {
-                deleted += conn.execute(
+                deleted += tx.execute(
                     "DELETE FROM shipments WHERE account_id=?1 AND id=?2",
                     params![account_id, id],
                 )? as u64;
             }
         }
+
+        tx.execute(
+            "INSERT INTO app_settings(account_id, key, value)
+             VALUES(?1, ?2, 'done')
+             ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value",
+            params![account_id, SHIPMENTS_REDETECT_FLAG],
+        )?;
+        tx.commit()?;
         Ok(deleted)
     }
 

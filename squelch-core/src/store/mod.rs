@@ -736,6 +736,11 @@ pub trait Store: Send + Sync {
     /// refreshing `last_update`/`last_message_id` and adopting a longer
     /// `item_name`.
     ///
+    /// An update the state machine ACCEPTS also resets `poll_failures` to 0 —
+    /// mail is the second witness that un-retires a shipment the carrier has
+    /// been rejecting, since the only other one (a successful poll) is
+    /// unreachable once the row has left the poll queue.
+    ///
     /// SECURITY: callers run this ONLY for non-sealed mail, so `shipments` holds
     /// no sealed rows by construction and reads need no sealed join.
     fn upsert_shipment(
@@ -751,7 +756,7 @@ pub trait Store: Send + Sync {
     /// Sealed rows are structurally absent, so no sealed filter is required.
     ///
     /// `suppress_failed_ambiguous_at` hides rows whose tracking number is an
-    /// AMBIGUOUS SHAPE (a bare digit-run — see
+    /// AMBIGUOUS SHAPE (anything that does not identify its own carrier — see
     /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape))
     /// AND which the carrier has permanently rejected that many times: a number
     /// no carrier will acknowledge, in a shape a retailer item/order id shares,
@@ -768,9 +773,19 @@ pub trait Store: Send + Sync {
 
     /// ONE-SHOT REPAIR: re-run shipment detection over every shipment row's
     /// feeder message and delete the rows the current detector no longer yields
-    /// that number from, returning how many were deleted. Rows with no feeder
-    /// message are left alone. Idempotent — a second run over a repaired store
-    /// deletes nothing.
+    /// that number from, returning how many were deleted.
+    ///
+    /// EXACTLY ONCE PER ACCOUNT, and the store enforces it: the pass records its
+    /// own done-flag in the SAME TRANSACTION as its deletions, and every later
+    /// call returns 0 without judging anything. Callers do not gate it. The
+    /// atomicity matters because the keep test is the REGEX detector — rows the
+    /// shipments extractor wrote are precisely the ones it cannot reproduce, so a
+    /// pass that ran but went unrecorded would reap them on the next start.
+    ///
+    /// Rows with no feeder message are left alone, as are rows carrying carrier
+    /// evidence (a raw status or any poll attempt) or extractor evidence (an
+    /// order reference): the one-shot exists to reap pre-tightening regex
+    /// phantoms and nothing else.
     fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64>;
 
     /// Shipments worth a carrier-API poll: not yet delivered, on a carrier that
@@ -811,6 +826,13 @@ pub trait Store: Send + Sync {
     /// advances (so the shipment rotates through the queue); `poll_failures`
     /// bumps only for a PERMANENT failure — an unknown or expired tracking
     /// number, not a transient network or rate-limit error.
+    ///
+    /// EVERY ANSWERED ATTEMPT IS RECORDED HERE, permanent or not. A row asked
+    /// about and then left unstamped keeps the head of a queue that sorts
+    /// never-polled first, so it is polled again, and again, ahead of everything
+    /// behind it — one deterministically-failing number would own a carrier's
+    /// entire throughput. Whether the failure counts is the caller's judgment
+    /// (see [`crate::carriers::poller`]); that it happened is not.
     fn record_poll_outcome(
         &self,
         account_id: AccountId,
@@ -904,21 +926,31 @@ pub trait Store: Send + Sync {
     /// NOTHING derived from it and returns `Ok(false)` — the same TOCTOU rule as
     /// [`Store::stage1_apply`].
     ///
-    /// Every DELETE is bounded to rows THIS message currently feeds
-    /// (`shipments.last_message_id = message_id`) and to AMBIGUOUS tracking
-    /// SHAPES only (see
+    /// DELETION RULE — a row is deleted ONLY on POSITIVE EVIDENCE that it is a
+    /// phantom: the extractor named a DIFFERENT tracking number for this mail, or
+    /// declared it not a shipment at all. An extraction that names NO number is
+    /// silence, not a verdict, and deletes nothing — the detector that minted the
+    /// row already passed a carrier-signal gate, a tracking-label context gate and
+    /// an item/order hard negative, while the extractor drops a number it sees
+    /// echoed in the order field.
+    ///
+    /// Every delete is then bounded three ways: to rows THIS message CREATED
+    /// (`shipments.created_by_message_id`, immutable — `last_message_id` moves to
+    /// the latest feeder and would put another mail's package in range), to
+    /// AMBIGUOUS tracking SHAPES only (see
     /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape)),
     /// so a model false negative can never destroy a real `1Z…` / `TBA…` / IMpb
-    /// package, and one mail's verdict can never reach another mail's shipment.
-    /// Then, by which identity the model found:
+    /// package, and NEVER to a row a carrier has answered about or been polled
+    /// for. Then, by which identity the model found:
     ///
     /// * TRACKING NUMBER — upsert the shipment (status still flows through
     ///   [`ShipmentStatus::merge`](crate::triage::ShipmentStatus::merge), so a
     ///   delivered package never walks back), overwrite `item_name` with the
     ///   extractor's (it beats the upsert's longer-name-wins heuristic, which
-    ///   otherwise keeps regex junk), record `order_ref`, and PROMOTE any staged
-    ///   `shipment_orders` row under that reference — donating its item name if
-    ///   the shipment has none — then delete it.
+    ///   otherwise keeps regex junk), record `order_ref` with its merchant, and
+    ///   PROMOTE any staged `shipment_orders` row under that reference — donating
+    ///   its item name, and that name's PROVENANCE, if the shipment has none —
+    ///   then delete it.
     /// * ORDER REFERENCE ONLY — adopt the item name onto the shipment already
     ///   carrying that reference, or STAGE the purchase in `shipment_orders`
     ///   until a ship notice arrives with a number.
@@ -927,8 +959,17 @@ pub trait Store: Send + Sync {
     ///   `last_update` are never touched: a mail with no identity has no claim on
     ///   a row's lifecycle.
     ///
-    /// `last_message_id` is only ever set by the tracking-number upsert, always
-    /// to a real message id — the seal-time delete keys on it.
+    /// ORDER REFERENCES ARE MERCHANT-SCOPED. "Order #1042" is unique only within
+    /// the shop that issued it, so both the `shipments` lookup and the staging key
+    /// pair it with `order_merchant`, the registrable domain of the feeding
+    /// message's sender. Where several rows still match (an order that split into
+    /// two packages), the name is donated to NEITHER — ambiguous identity does not
+    /// guess.
+    ///
+    /// `last_message_id` is only ever set by the tracking-number upsert, always to
+    /// a real message id — the seal-time delete keys on it — and every item-name
+    /// write stamps `item_name_msg`, so sealing scrubs a donated name even from a
+    /// row another message feeds.
     fn shipments_extract_apply(&self, applied: &ShipmentsApplied) -> Result<bool>;
 
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows

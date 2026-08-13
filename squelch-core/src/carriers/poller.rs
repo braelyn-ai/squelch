@@ -8,13 +8,24 @@
 //! carrier calls are strictly sequential and spaced; across carriers they
 //! interleave on one task, so a five-second DHL floor never blocks a UPS row.
 //!
-//! A SKIPPED ROW IS NOT A POLLED ROW. `last_polled_at` is the queue's rotation
-//! key, so it is stamped only by a call that actually reached the carrier — a
-//! row dropped because its carrier was rate limited, unauthorized or flapping
-//! keeps its old stamp and is first in line on the next pass. Only
-//! [`TrackError::NotFound`] counts against a shipment (see
-//! [`crate::store::Store::record_poll_outcome`]); the rest are the carrier's
-//! problem, not the parcel's.
+//! A SKIPPED ROW IS NOT A POLLED ROW — BUT AN ANSWERED ONE IS, HOWEVER IT
+//! ANSWERED. `last_polled_at` is the queue's rotation key, so every call the
+//! carrier actually answered stamps it: a track, a 404, and a transient failure
+//! alike. Only a row DROPPED WITHOUT A CALL — its carrier gated by a 429 or a
+//! rejected credential, so nothing was asked about this parcel — keeps its old
+//! stamp and stays first in line. The distinction is service, not success: the
+//! queue sorts never-polled first, so a row that is asked about and then left
+//! unstamped is the permanent head of its carrier's queue, and ONE such row can
+//! starve every other parcel behind it. Only [`TrackError::NotFound`] counts
+//! AGAINST a shipment (see [`crate::store::Store::record_poll_outcome`]); the
+//! rest are the carrier's problem, not the parcel's.
+//!
+//! A BAD ROW IS NOT A BAD CARRIER. Some transient failures are deterministic per
+//! tracking number — a 200 whose body will not parse, a shipment-level warning
+//! with no status — so one of them is evidence about that row, not about the
+//! API. A single transient answer therefore moves on to the next row; only
+//! [`TRANSIENT_TOLERANCE`] of them in a row, with nothing answered in between,
+//! is evidence about the carrier and earns the carrier-wide backoff.
 //!
 //! ALL PACING STATE IS IN MEMORY and resets on restart — cooldowns, the transient
 //! backoff ladder, and the DHL/USPS budget windows. That is accepted: the
@@ -54,6 +65,30 @@ const STARTUP_DELAY_SPAN_SECS: u64 = 90;
 /// Transient-failure ladder, the same shape [`crate::tracking`] uses.
 const BACKOFF_BASE: Duration = Duration::from_secs(5);
 const BACKOFF_CAP: Duration = Duration::from_secs(300);
+
+/// Consecutive transient answers from one carrier — with no track and no 404 in
+/// between — before the CARRIER is judged to be in trouble and cooled down.
+///
+/// One is not evidence: `Transient` is also what a single unparseable body or a
+/// single shipment-level warning produces, deterministically, for one number.
+/// Cooling the whole carrier on it hands one poison row a veto over every other
+/// parcel. Three in a row with nothing answered between them is a different
+/// claim, and cheap to be wrong about: the cost of the extra two calls is two
+/// calls, paced by `min_interval` and charged to the budget like any other.
+const TRANSIENT_TOLERANCE: u32 = 3;
+
+/// How long after a shipment is first seen a `NotFound` is read as PRE-MANIFEST
+/// rather than as evidence the number is fiction.
+///
+/// A retailer routinely emails a waybill before handing the parcel over: DHL
+/// 404s and FedEx answers `TRACKINGNUMBER.NOTFOUND` until the first scan, which
+/// on a Friday-evening label is the whole weekend away. At the default cadence
+/// the retirement cap is reached in ~30 hours, well inside that window, and
+/// retirement is not just "stop polling" — the same counter suppresses ambiguous
+/// rows from the client lists — so a live parcel would vanish before its first
+/// scan. Three days covers a weekend; past it, a number no carrier will
+/// acknowledge is a number nobody shipped, and the cap does its real job.
+const NOT_FOUND_GRACE_HOURS: i64 = 72;
 
 /// Floor under an honored `Retry-After`. A carrier that says "one second" while
 /// answering 429 is describing its token bucket, not its opinion of us; coming
@@ -151,6 +186,10 @@ struct Knobs {
     /// Stop polling a shipment this long after it was first seen.
     max_age: Delta,
     max_failures: u32,
+    /// A `NotFound` on a row younger than this is PRE-MANIFEST: the attempt is
+    /// stamped, but it does not count toward retirement. See
+    /// [`NOT_FOUND_GRACE_HOURS`].
+    not_found_grace: Delta,
     /// DHL calls per 24h. 0 means DHL is budgeted to a standstill — the operator
     /// asked for no DHL traffic without removing the key.
     dhl_daily_cap: u32,
@@ -163,49 +202,62 @@ impl Knobs {
             ofd_interval: Delta::minutes(cfg.ofd_poll_interval_mins as i64),
             max_age: Delta::days(cfg.max_age_days as i64),
             max_failures: cfg.max_failures,
+            not_found_grace: Delta::hours(NOT_FOUND_GRACE_HOURS),
             dhl_daily_cap: cfg.dhl.as_ref().map_or(0, |d| d.daily_cap),
         }
     }
 }
 
-/// A rolling call budget: `limit` calls per `window`, refilled whole when the
-/// window rolls. Not a token bucket — carrier quotas are published as "N per
-/// day", and spending them evenly is not a requirement, only not exceeding them.
+/// A ROLLING call budget: at most `limit` calls in ANY `window`-long stretch.
+///
+/// Not a token bucket — carrier quotas are published as "N per day", and
+/// spending them evenly is not a requirement, only never exceeding them. But
+/// "refill on the boundary" is how a published ceiling gets served twice over: a
+/// burst at the end of one window and another at the start of the next both sit
+/// inside one rolling window, and the carrier counts rolling. So each spend is
+/// remembered as its own instant and frees its slot only when IT ages out the
+/// back of the window. At most `limit` instants are live (200 for DHL's day, 60
+/// for USPS's hour), which is cheaper than the schema migration a persisted
+/// clock would cost.
 #[derive(Debug)]
 struct Budget {
     limit: u32,
     window: Duration,
-    used: u32,
-    started: Instant,
+    /// The instants of the spends still inside the window, oldest first.
+    spent: VecDeque<Instant>,
 }
 
 impl Budget {
     fn new(limit: u32, window: Duration) -> Self {
-        Self::started_at(limit, window, Instant::now())
-    }
-
-    fn started_at(limit: u32, window: Duration, started: Instant) -> Self {
         Self {
             limit,
             window,
-            used: 0,
-            started,
+            spent: VecDeque::new(),
         }
     }
 
-    /// Roll the window if it has elapsed, then answer whether a call fits.
-    /// Takes `now` rather than reading the clock so the roll is testable without
-    /// sitting through a window.
+    /// Drop the spends that have fallen out the back of the window. Takes `now`
+    /// rather than reading the clock so the roll is testable without sitting
+    /// through a window.
+    fn expire(&mut self, now: Instant) {
+        while self
+            .spent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= self.window)
+        {
+            self.spent.pop_front();
+        }
+    }
+
+    /// Whether a call fits right now.
     fn available(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.started) >= self.window {
-            self.started = now;
-            self.used = 0;
-        }
-        self.used < self.limit
+        self.expire(now);
+        self.spent.len() < self.limit as usize
     }
 
-    fn spend(&mut self) {
-        self.used = self.used.saturating_add(1);
+    fn spend(&mut self, now: Instant) {
+        self.expire(now);
+        self.spent.push_back(now);
     }
 }
 
@@ -221,6 +273,10 @@ struct CarrierState {
     cooldown_until: Option<Instant>,
     /// Transient ladder, reset by any answered call.
     backoff: Option<Duration>,
+    /// Transient answers since the last one the carrier answered properly. The
+    /// counter is what separates a poison ROW from a broken CARRIER; see
+    /// [`TRANSIENT_TOLERANCE`].
+    transient_run: u32,
     /// Quota window, for the carriers that have one.
     budget: Option<Budget>,
     /// Whether the CURRENT auth cooldown already printed its line. Without this
@@ -234,6 +290,7 @@ impl CarrierState {
             next_call: Instant::now(),
             cooldown_until: None,
             backoff: None,
+            transient_run: 0,
             budget,
             auth_reported: false,
         }
@@ -260,9 +317,24 @@ impl CarrierState {
         self.cooldown_until = Some(Instant::now() + delay);
     }
 
-    fn spend(&mut self) {
+    /// A call the carrier ANSWERED about a parcel — a track or a 404. Either way
+    /// the API is up and serving, which is the only thing the transient ladder
+    /// and its run counter were ever measuring.
+    fn answered(&mut self) {
+        self.backoff = None;
+        self.transient_run = 0;
+    }
+
+    /// One transient answer. Reports whether the run has reached the point where
+    /// the CARRIER, rather than the row, is the likely problem.
+    fn transient(&mut self) -> bool {
+        self.transient_run += 1;
+        self.transient_run >= TRANSIENT_TOLERANCE
+    }
+
+    fn spend(&mut self, now: Instant) {
         if let Some(budget) = self.budget.as_mut() {
-            budget.spend();
+            budget.spend(now);
         }
     }
 }
@@ -368,6 +440,11 @@ impl ShipmentPoller {
                 ofd_interval: Delta::zero(),
                 max_age: Delta::days(3650),
                 max_failures: 5,
+                // No pre-manifest grace: a `NotFound` counts immediately, so a
+                // test drives the retirement cap without inventing a row that
+                // was first seen three days ago. A test that wants the grace
+                // sets it.
+                not_found_grace: Delta::zero(),
                 // Effectively no ceiling: a test that wants one sets it.
                 dhl_daily_cap: u32::MAX,
             },
@@ -389,6 +466,14 @@ impl ShipmentPoller {
     #[doc(hidden)]
     pub fn with_max_failures(mut self, max_failures: u32) -> Self {
         self.knobs.max_failures = max_failures;
+        self
+    }
+
+    /// TEST HOOK: the pre-manifest window in which a `NotFound` is stamped but
+    /// not counted.
+    #[doc(hidden)]
+    pub fn with_not_found_grace(mut self, grace: Delta) -> Self {
+        self.knobs.not_found_grace = grace;
         self
     }
 
@@ -502,10 +587,10 @@ impl ShipmentPoller {
         state: &mut CarrierState,
         shipment: &Shipment,
     ) {
+        let started = Instant::now();
         // The gate already confirmed a slot; take it before the call so a
         // failure still counts against the quota — the carrier metered it.
-        state.spend();
-        let started = Instant::now();
+        state.spend(started);
         let result = client.track(&shipment.tracking_number).await;
         // Spacing is measured from the START of the call: `min_interval` is the
         // carrier's rate limit, not a cooldown to serve after our own latency.
@@ -527,7 +612,7 @@ impl ShipmentPoller {
 
         match result {
             Ok(track) => {
-                state.backoff = None;
+                state.answered();
                 // Stamps `last_polled_at`, resets `poll_failures`, and leaves
                 // `last_message_id` alone; see the store's own doc comment.
                 match self.store.apply_carrier_track(
@@ -543,19 +628,36 @@ impl ShipmentPoller {
                     }
                 }
             }
-            // The only per-SHIPMENT verdict: this number does not exist, and no
-            // amount of retrying invents it. Counted so the row retires.
+            // The only per-SHIPMENT verdict: this number does not exist. The
+            // carrier answered, so the carrier is fine — but the answer only
+            // counts against the ROW once the pre-manifest window has passed,
+            // because "not found yet" is what every carrier says about a label
+            // its shipper has not handed over.
             Err(TrackError::NotFound) => {
-                if let Err(e) =
-                    self.store
-                        .record_poll_outcome(self.account_id, shipment.id, Utc::now(), true)
-                {
-                    eprintln!("squelch: shipment poll could not record a failure: {e}");
+                state.answered();
+                let age = Utc::now() - shipment.first_seen;
+                self.record_attempt(shipment.id, age >= self.knobs.not_found_grace);
+            }
+            // A transient answer is about THIS ROW until proven otherwise: it is
+            // what an unparseable body or a shipment-level warning produces,
+            // deterministically, for one number. So the attempt is stamped (the
+            // row rotates to the back of the queue instead of holding the head
+            // of it forever) without counting as a failure, and the pass moves
+            // on to the next row. Only a RUN of them with nothing answered in
+            // between is evidence about the carrier, and that earns the ladder.
+            Err(TrackError::Transient) => {
+                self.record_attempt(shipment.id, false);
+                if state.transient() {
+                    let delay = next_backoff(state.backoff);
+                    state.backoff = Some(delay);
+                    state.transient_run = 0;
+                    state.cool_down(delay);
                 }
             }
-            // The rest are CARRIER verdicts. The row is left unstamped on
-            // purpose: it was not polled, it was skipped, and it should be first
-            // in line next pass.
+            // The rest are CARRIER verdicts about no parcel in particular:
+            // nothing was asked about this number, so the row is left unstamped
+            // on purpose — it was skipped, not polled, and it should be first in
+            // line when the carrier reopens.
             Err(TrackError::RateLimited { retry_after }) => {
                 let delay = match retry_after {
                     Some(delay) => delay,
@@ -568,6 +670,13 @@ impl ShipmentPoller {
                 state.cool_down(delay.max(RATE_LIMIT_FLOOR));
             }
             Err(TrackError::Auth) => {
+                // DROP THE REJECTED CREDENTIAL FIRST. The cached token outlives
+                // this cooldown (UPS's is four hours, USPS's eight), so without
+                // this the carrier reopens in an hour, replays the exact token
+                // it already refused, and prints the same line — for as long as
+                // the TTL lasts. Re-minting costs one token call and is the only
+                // way an operator's corrected key is ever picked up.
+                client.invalidate_auth().await;
                 if !state.auth_reported {
                     // The CARRIER ONLY. No url, no key, no tracking number: an
                     // auth error body routinely quotes the credential back, and
@@ -580,11 +689,21 @@ impl ShipmentPoller {
                 }
                 state.cool_down(AUTH_COOLDOWN);
             }
-            Err(TrackError::Transient) => {
-                let delay = next_backoff(state.backoff);
-                state.backoff = Some(delay);
-                state.cool_down(delay);
-            }
+        }
+    }
+
+    /// Stamp a poll ATTEMPT that produced no track, counting it against the row
+    /// only when it was permanent. A store error here is reported and dropped:
+    /// the next pass re-polls the row, which is the same thing the failed write
+    /// would have arranged.
+    fn record_attempt(&self, shipment_id: i64, permanent_failure: bool) {
+        if let Err(e) = self.store.record_poll_outcome(
+            self.account_id,
+            shipment_id,
+            Utc::now(),
+            permanent_failure,
+        ) {
+            eprintln!("squelch: shipment poll could not record an attempt: {e}");
         }
     }
 }
@@ -621,6 +740,17 @@ fn next_up(
 mod tests {
     use super::*;
     use crate::store::SqliteStore;
+    use crate::triage::CarrierTrack;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A FIXED wall clock for every date-sensitive assertion. `Utc::now()` makes
+    /// "is this ETA today?" a test that fails for the two hours before UTC
+    /// midnight; noon is the middle of a day in every direction.
+    fn noon() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-03-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
 
     fn shipment(id: i64, status: ShipmentStatus) -> Shipment {
         Shipment {
@@ -632,8 +762,8 @@ mod tests {
             status: status.as_str().to_string(),
             tracking_url: None,
             thread_id: None,
-            first_seen: Utc::now(),
-            last_update: Utc::now(),
+            first_seen: noon(),
+            last_update: noon(),
             carrier_status_raw: None,
             eta: None,
             delivered_at: None,
@@ -650,7 +780,7 @@ mod tests {
 
     #[test]
     fn a_never_polled_shipment_is_always_due() {
-        let now = Utc::now();
+        let now = noon();
         let mut s = shipment(1, ShipmentStatus::Shipped);
         assert!(is_due(&s, now, &knobs()));
         // …and stops being due the moment it is stamped.
@@ -660,7 +790,7 @@ mod tests {
 
     #[test]
     fn the_baseline_cadence_is_the_configured_interval_give_or_take_the_jitter() {
-        let now = Utc::now();
+        let now = noon();
         let knobs = knobs(); // 6h baseline
         let mut s = shipment(1, ShipmentStatus::Shipped);
 
@@ -674,9 +804,13 @@ mod tests {
 
     /// The fast lane is entered by the status OR by an ETA of today, and it is
     /// the ONLY thing that makes a 90-minute-old poll due again.
+    ///
+    /// Every timestamp here is built from a FIXED noon rather than derived from
+    /// `Utc::now()`: `now + 2h` is only "today" if the run does not start within
+    /// two hours of UTC midnight, which made this test fail nightly.
     #[test]
     fn the_fast_lane_covers_out_for_delivery_and_an_eta_today() {
-        let now = Utc::now();
+        let now = noon();
         let knobs = knobs(); // 60m out-for-delivery cadence
         let hour_and_a_half = Some(now - Delta::minutes(90));
 
@@ -736,31 +870,71 @@ mod tests {
     // ---- budgets ---------------------------------------------------------
 
     #[test]
-    fn a_budget_spends_down_then_refills_when_its_window_rolls() {
+    fn a_budget_spends_down_then_frees_each_slot_as_it_ages_out() {
         let start = Instant::now();
         let window = Duration::from_secs(3600);
-        let mut budget = Budget::started_at(2, window, start);
+        let mut budget = Budget::new(2, window);
 
         assert!(budget.available(start));
-        budget.spend();
+        budget.spend(start);
         assert!(budget.available(start));
-        budget.spend();
+        budget.spend(start);
         assert!(
             !budget.available(start),
             "the ceiling holds inside a window"
         );
-        // Still inside it a moment before the roll.
+        // Still spent a moment before those two calls age out.
         assert!(!budget.available(start + window - Duration::from_secs(1)));
-        // …and whole again after.
+        // …and both slots are free a window after they were taken.
         assert!(budget.available(start + window));
-        budget.spend();
+        budget.spend(start + window);
         assert!(budget.available(start + window));
+    }
+
+    /// The bug a fixed window has: two calls at the end of one window and two at
+    /// the start of the next are four calls inside one rolling `window`, which
+    /// is what the carrier is actually counting. Each slot must come back a
+    /// window after IT was spent, not when a shared boundary rolls.
+    #[test]
+    fn the_budget_cannot_be_exceeded_across_a_window_boundary() {
+        let start = Instant::now();
+        let window = Duration::from_secs(3600);
+        let mut budget = Budget::new(2, window);
+
+        // Both calls at the tail of the first hour.
+        let tail = start + window - Duration::from_secs(60);
+        budget.spend(tail);
+        budget.spend(tail);
+
+        // A fixed window refilled at `start + window` would allow two more here,
+        // i.e. four calls in a two-minute span against a cap of two per hour.
+        let head = start + window + Duration::from_secs(60);
+        assert!(
+            !budget.available(head),
+            "the ceiling was doubled across the boundary"
+        );
+        // The slots come back only once the calls that took them are a full
+        // window old.
+        assert!(!budget.available(tail + window - Duration::from_secs(1)));
+        assert!(budget.available(tail + window));
+
+        // …and it holds for any rolling window, not just the one boundary: after
+        // spending both again, no `now` inside the next window admits a call.
+        let mut budget = Budget::new(2, window);
+        budget.spend(start);
+        budget.spend(start + Duration::from_secs(1));
+        for offset in [1u64, 60, 1800, 3599] {
+            assert!(
+                !budget.available(start + Duration::from_secs(offset)),
+                "a third call fit {offset}s into the window"
+            );
+        }
     }
 
     #[test]
     fn a_zero_cap_stops_the_carrier_dead() {
         let start = Instant::now();
-        let mut budget = Budget::started_at(0, DHL_WINDOW, start);
+        let mut budget = Budget::new(0, DHL_WINDOW);
         assert!(!budget.available(start));
         assert!(!budget.available(start + DHL_WINDOW));
     }
@@ -809,9 +983,9 @@ mod tests {
     #[test]
     fn an_exhausted_budget_gates_the_carrier_without_a_cooldown() {
         let start = Instant::now();
-        let mut state = CarrierState::new(Some(Budget::started_at(1, USPS_WINDOW, start)));
+        let mut state = CarrierState::new(Some(Budget::new(1, USPS_WINDOW)));
         assert!(!state.gated(start));
-        state.spend();
+        state.spend(start);
         assert!(state.gated(start));
         assert!(
             state.cooldown_until.is_none(),
@@ -826,6 +1000,242 @@ mod tests {
         assert_eq!(next_backoff(Some(BACKOFF_BASE)), BACKOFF_BASE * 2);
         assert_eq!(next_backoff(Some(BACKOFF_CAP)), BACKOFF_CAP);
         assert_eq!(next_backoff(Some(BACKOFF_CAP * 2)), BACKOFF_CAP);
+    }
+
+    // ---- what one answer does to the row and to the carrier ---------------
+
+    /// What a track call answers. Spelled out because this crate's `Result`
+    /// alias fixes the error half to `CoreError`.
+    type Tracked = std::result::Result<CarrierTrack, TrackError>;
+
+    /// A carrier client that answers the same thing every time and counts what
+    /// the poller asked of it — including the credential invalidation, which
+    /// leaves no other trace.
+    struct Mock {
+        answer: Tracked,
+        calls: AtomicUsize,
+        invalidated: AtomicUsize,
+    }
+
+    impl Mock {
+        fn new(answer: Tracked) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                calls: AtomicUsize::new(0),
+                invalidated: AtomicUsize::new(0),
+            })
+        }
+
+        fn invalidated(&self) -> usize {
+            self.invalidated.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CarrierClient for Mock {
+        fn carrier(&self) -> &'static str {
+            "ups"
+        }
+
+        fn min_interval(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        async fn track(&self, _tracking_number: &str) -> Tracked {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.answer.clone()
+        }
+
+        async fn invalidate_auth(&self) {
+            self.invalidated.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// One stored shipment, a poller that will only ever talk to the mock, and
+    /// the mock. `first_seen` is explicit because the pre-manifest grace is
+    /// measured from it.
+    fn harness(
+        answer: Tracked,
+        first_seen: DateTime<Utc>,
+    ) -> (Arc<SqliteStore>, ShipmentPoller, Arc<Mock>, Shipment) {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account_id = store.ensure_account("me@example.com").unwrap();
+        store
+            .upsert_shipment(
+                account_id,
+                1,
+                &crate::triage::ShipmentInfo {
+                    carrier: "ups".to_string(),
+                    tracking_number: "1Z999AA10123456784".to_string(),
+                    item_name: "Socks".to_string(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                first_seen,
+            )
+            .unwrap();
+        let mock = Mock::new(answer);
+        let mut registry = CarrierRegistry::new();
+        registry.insert("ups".to_string(), mock.clone() as Arc<dyn CarrierClient>);
+        let poller =
+            ShipmentPoller::for_test(store.clone() as Arc<dyn Store>, account_id, registry);
+        let row = stored(&store, account_id);
+        (store, poller, mock, row)
+    }
+
+    fn stored(store: &SqliteStore, account_id: AccountId) -> Shipment {
+        store
+            .list_shipments(account_id, true, u32::MAX)
+            .unwrap()
+            .remove(0)
+    }
+
+    /// DEFECT: a transient answer used to write NOTHING. The row kept its NULL
+    /// `last_polled_at`, which sorts first in the poll queue forever, so one
+    /// deterministically-failing number (an unparseable 200 is transient) was
+    /// re-polled ahead of every other parcel on that carrier until it aged out.
+    #[tokio::test]
+    async fn a_transient_attempt_is_stamped_but_not_counted_as_a_failure() {
+        let (store, poller, mock, row) = harness(Err(TrackError::Transient), noon());
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+        poller.poll_one(&client, &mut state, &row).await;
+
+        let after = stored(&store, poller.account_id);
+        assert!(
+            after.last_polled_at.is_some(),
+            "the attempt reached the carrier and must rotate the row"
+        );
+        assert_eq!(
+            after.poll_failures, 0,
+            "a transient failure is not the parcel's fault"
+        );
+    }
+
+    /// The other half of the same defect: one bad row must not shut the carrier.
+    /// (`carrier_poll.rs` proves the consequence end to end, through the queue.)
+    #[tokio::test]
+    async fn a_transient_answer_does_not_cool_the_whole_carrier() {
+        let (_store, poller, mock, row) = harness(Err(TrackError::Transient), noon());
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+
+        poller.poll_one(&client, &mut state, &row).await;
+        assert!(
+            !state.gated(Instant::now()),
+            "one poison number cooled down the whole carrier"
+        );
+        assert_eq!(state.transient_run, 1);
+
+        // Any answered call clears the run: a carrier that is serving other rows
+        // never climbs toward the cooldown at all.
+        state.answered();
+        assert_eq!(state.transient_run, 0);
+        assert_eq!(state.backoff, None);
+    }
+
+    /// …but a carrier that answers nothing else IS the problem, and still earns
+    /// the ladder — at [`TRANSIENT_TOLERANCE`] calls, not at one.
+    #[tokio::test]
+    async fn a_run_of_transients_still_cools_the_carrier_down() {
+        let (_store, poller, mock, row) = harness(Err(TrackError::Transient), noon());
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+
+        for _ in 1..TRANSIENT_TOLERANCE {
+            poller.poll_one(&client, &mut state, &row).await;
+            assert!(!state.gated(Instant::now()));
+        }
+        poller.poll_one(&client, &mut state, &row).await;
+        assert!(state.gated(Instant::now()), "a dead carrier must go quiet");
+        assert_eq!(state.backoff, Some(BACKOFF_BASE));
+        assert_eq!(state.transient_run, 0, "the run restarts after a cooldown");
+    }
+
+    /// DEFECT: the auth cooldown left the rejected token in the client's cache,
+    /// so the carrier reopened an hour later and replayed the same dead
+    /// credential until its full TTL expired.
+    #[tokio::test]
+    async fn an_auth_rejection_drops_the_cached_token_before_the_cooldown() {
+        let (store, poller, mock, row) = harness(Err(TrackError::Auth), noon());
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+        poller.poll_one(&client, &mut state, &row).await;
+
+        assert_eq!(mock.invalidated(), 1, "the rejected token must be dropped");
+        assert!(state.gated(Instant::now()), "and the carrier goes quiet");
+        assert_eq!(
+            stored(&store, poller.account_id).last_polled_at,
+            None,
+            "nothing was asked about this parcel, so it keeps its place"
+        );
+    }
+
+    /// A 429 is the same shape of verdict: no parcel was judged, so the row it
+    /// was holding stays unstamped and first in line.
+    #[tokio::test]
+    async fn a_rate_limited_row_keeps_its_place_in_the_queue() {
+        let (store, poller, mock, row) =
+            harness(Err(TrackError::RateLimited { retry_after: None }), noon());
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+        poller.poll_one(&client, &mut state, &row).await;
+
+        let after = stored(&store, poller.account_id);
+        assert_eq!(after.last_polled_at, None);
+        assert_eq!(after.poll_failures, 0);
+        assert_eq!(mock.invalidated(), 0, "a quota is not a credential problem");
+    }
+
+    /// PRE-MANIFEST. A carrier 404s a waybill its shipper has not handed over
+    /// yet, for hours or a weekend. Counting those against the retirement cap
+    /// retires live parcels — five of them is ~30 hours at the default cadence —
+    /// so inside the grace window the attempt is stamped and nothing else.
+    #[tokio::test]
+    async fn a_not_found_inside_the_grace_period_does_not_retire_a_young_row() {
+        let (store, poller, mock, row) = harness(Err(TrackError::NotFound), Utc::now());
+        let poller = poller.with_not_found_grace(Delta::hours(NOT_FOUND_GRACE_HOURS));
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+        poller.poll_one(&client, &mut state, &row).await;
+
+        let after = stored(&store, poller.account_id);
+        assert!(after.last_polled_at.is_some(), "the attempt still rotates");
+        assert_eq!(
+            after.poll_failures, 0,
+            "a label the carrier has not scanned yet is not a phantom"
+        );
+    }
+
+    /// Past the window, the cap does its real job again.
+    #[tokio::test]
+    async fn a_not_found_past_the_grace_period_counts_against_the_row() {
+        let old = Utc::now() - Delta::hours(NOT_FOUND_GRACE_HOURS + 1);
+        let (store, poller, mock, row) = harness(Err(TrackError::NotFound), old);
+        let poller = poller.with_not_found_grace(Delta::hours(NOT_FOUND_GRACE_HOURS));
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+        poller.poll_one(&client, &mut state, &row).await;
+
+        let after = stored(&store, poller.account_id);
+        assert!(after.last_polled_at.is_some());
+        assert_eq!(after.poll_failures, 1);
+    }
+
+    /// A 404 is an ANSWER: whatever it says about the parcel, it proves the API
+    /// is up, so it clears a transient run rather than adding to it.
+    #[tokio::test]
+    async fn an_answered_call_clears_the_transient_ladder() {
+        let (_store, poller, mock, row) = harness(Err(TrackError::NotFound), noon());
+        let client: Arc<dyn CarrierClient> = mock.clone();
+        let mut state = CarrierState::new(None);
+        state.transient_run = TRANSIENT_TOLERANCE - 1;
+        state.backoff = Some(BACKOFF_CAP);
+
+        poller.poll_one(&client, &mut state, &row).await;
+        assert_eq!(state.transient_run, 0);
+        assert_eq!(state.backoff, None);
+        assert!(!state.gated(Instant::now()));
     }
 
     // ---- construction ----------------------------------------------------

@@ -429,3 +429,187 @@ fn correcting_an_unknown_message_is_none_not_an_error() {
             .is_none()
     );
 }
+
+// ---- sealing scrubs the text a message DONATED elsewhere ----------------
+
+use crate::triage::extract::shipments::ShipmentsApplied;
+use crate::types::Sensitivity;
+
+/// A shipments-extractor verdict carrying nothing — the fields each test needs
+/// are filled in over the top.
+fn ship_verdict(acct: AccountId, mid: i64, thread: &str) -> ShipmentsApplied {
+    ShipmentsApplied {
+        message_id: mid,
+        account_id: acct,
+        thread_id: thread.into(),
+        is_shipment: true,
+        tracking_number: None,
+        order_ref: None,
+        item_name: None,
+        carrier: "unknown".into(),
+        status: None,
+        received_at: Utc::now(),
+        extractor_model_used: "claude-haiku-4-5".into(),
+    }
+}
+
+/// A message queued for the shipments extractor, from a chosen sender.
+fn ship_msg(store: &SqliteStore, acct: AccountId, gmail: &str, thread: &str, from: &str) -> i64 {
+    triaged_row(acct, gmail, thread, None, false, Sensitivity::Normal)
+        .from(from)
+        .ship_extract(true)
+        .ingest(store)
+}
+
+/// The one shipment row's `(item_name, item_name_msg)`.
+fn shipment_name(store: &SqliteStore, acct: AccountId) -> (String, Option<i64>) {
+    let conn = store.lock().unwrap();
+    conn.query_row(
+        "SELECT item_name, item_name_msg FROM shipments WHERE account_id=?1",
+        params![acct],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn sealing_clears_an_item_name_donated_to_another_messages_row() {
+    // The seal DELETE only reaches rows whose latest feeder is the sealed
+    // message. The thread-adoption path writes an item name onto a row a
+    // DIFFERENT message feeds, so without a name-provenance scrub the sealed
+    // mail's words keep rendering on the Sitrep card the delete never saw.
+    let (store, acct) = store();
+    let feeder = ship_msg(&store, acct, "g-feed", "t-solo", "ship@ups.com");
+    store
+        .upsert_shipment(
+            acct,
+            feeder,
+            &crate::triage::ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: String::new(),
+                status: crate::triage::ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    // A follow-up in the same thread donates the name onto the feeder's row.
+    let donor = ship_msg(&store, acct, "g-donor", "t-solo", "pharmacy@rx.com");
+    assert!(
+        store
+            .shipments_extract_apply(&ShipmentsApplied {
+                item_name: Some("Prescription refill".into()),
+                ..ship_verdict(acct, donor, "t-solo")
+            })
+            .unwrap()
+    );
+    assert_eq!(shipment_name(&store, acct).0, "Prescription refill");
+
+    // The human seals the DONOR, not the feeder.
+    store
+        .correct_triage(acct, donor, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .unwrap()
+        .unwrap();
+
+    let listed = store
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the package itself is not the donor's to delete");
+    assert_eq!(
+        shipment_name(&store, acct),
+        (String::new(), None),
+        "sealed-derived text leaves the row it was donated to"
+    );
+}
+
+#[test]
+fn promotion_carries_the_staged_messages_provenance_so_sealing_it_still_scrubs() {
+    // A promoted staged order donates a name the ORDER CONFIRMATION wrote onto a
+    // row the SHIP NOTICE feeds. Stamping the promotion with the ship notice
+    // would make the confirmation's own seal a no-op.
+    let (store, acct) = store();
+    let order = ship_msg(&store, acct, "g-order", "t-ord", "orders@rx.com");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            order_ref: Some("ORD-9".into()),
+            item_name: Some("Prescription refill".into()),
+            ..ship_verdict(acct, order, "t-ord")
+        })
+        .unwrap();
+
+    // Same merchant, so the promotion finds the staged row.
+    let ship = ship_msg(&store, acct, "g-ship", "t-ord", "orders@rx.com");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            tracking_number: Some("1Z999AA10123456784".into()),
+            order_ref: Some("ORD-9".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, ship, "t-ord")
+        })
+        .unwrap();
+    assert_eq!(
+        shipment_name(&store, acct),
+        ("Prescription refill".to_string(), Some(order)),
+        "the donated name still belongs to the order mail"
+    );
+
+    // Sealing the ORDER mail leaves the package (the ship notice feeds it) but
+    // takes back the words the order mail contributed.
+    store
+        .correct_triage(acct, order, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(shipment_name(&store, acct), (String::new(), None));
+}
+
+#[test]
+fn sealing_scrubs_a_name_donated_to_a_staged_order_another_message_feeds() {
+    // Same hole one table over: the staging upsert MOVES `last_message_id` to the
+    // latest mail about that order, so the delete misses a name an earlier mail
+    // wrote. Sealing has to reach it by provenance.
+    let (store, acct) = store();
+    let namer = ship_msg(&store, acct, "g-namer", "t-ord", "orders@rx.com");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            order_ref: Some("ORD-9".into()),
+            item_name: Some("Prescription refill".into()),
+            ..ship_verdict(acct, namer, "t-ord")
+        })
+        .unwrap();
+    // A second, nameless mail about the same order moves the row's pointer.
+    let later = ship_msg(&store, acct, "g-later", "t-ord", "orders@rx.com");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            order_ref: Some("ORD-9".into()),
+            ..ship_verdict(acct, later, "t-ord")
+        })
+        .unwrap();
+
+    store
+        .correct_triage(acct, namer, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .unwrap()
+        .unwrap();
+
+    let conn = store.lock().unwrap();
+    let (name, name_msg): (String, Option<i64>) = conn
+        .query_row(
+            "SELECT item_name, item_name_msg FROM shipment_orders WHERE account_id=?1",
+            params![acct],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (name.as_str(), name_msg),
+        ("", None),
+        "the sealed mail's product name leaves the staged row"
+    );
+}

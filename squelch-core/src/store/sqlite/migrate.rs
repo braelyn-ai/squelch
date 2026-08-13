@@ -164,6 +164,95 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // pre-existing DB grows new TABLES there with no seam. Only new columns on
     // an existing table — and anything that references one — need this function.
 
+    // SHIPMENT IDENTITY PROVENANCE. Three columns, each fixing a different way
+    // mail-derived state used to be attributed to the wrong message.
+    //
+    // `created_by_message_id` — IMMUTABLE. `last_message_id` moves to whichever
+    // mail most recently advanced the row, so the extractor's phantom reaping,
+    // keyed on it, could delete a package established weeks earlier by another
+    // email. Backfilled to `last_message_id`: for a historical row that is the
+    // best available truth (often the only message the row ever saw).
+    if add_column_if_missing(conn, "shipments", "created_by_message_id", "INTEGER")? {
+        conn.execute(
+            "UPDATE shipments SET created_by_message_id = last_message_id
+             WHERE created_by_message_id IS NULL",
+            [],
+        )?;
+    }
+    // `item_name_msg` — which message's extraction supplied the CURRENT name.
+    // Sealing scrubs by this, so a name donated onto a row another mail feeds
+    // cannot outlive the seal of the mail it came from. Backfilled to
+    // `last_message_id` wherever a name exists — again the best truth available,
+    // and the pointer sealing already used.
+    if add_column_if_missing(conn, "shipments", "item_name_msg", "INTEGER")? {
+        conn.execute(
+            "UPDATE shipments SET item_name_msg = last_message_id
+             WHERE item_name_msg IS NULL AND COALESCE(item_name, '') != ''",
+            [],
+        )?;
+    }
+    // `order_merchant` — the namespace `order_ref` was always missing. Backfilled
+    // in Rust below (it needs the registrable-domain rule, not a SQL expression);
+    // a row left NULL simply matches no future order mail, which is the safe
+    // direction — a missed name donation, never a cross-merchant one.
+    let added_order_merchant = add_column_if_missing(conn, "shipments", "order_merchant", "TEXT")?;
+    if tables_exist(conn, &["shipments"])? {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shipments_order_merchant
+             ON shipments(account_id, order_merchant, order_ref)",
+            [],
+        )?;
+    }
+    if added_order_merchant {
+        backfill_order_merchant(conn)?;
+    }
+
+    // `shipment_orders` GREW ITS UNIQUE KEY: (account_id, order_ref) became
+    // (account_id, order_merchant, order_ref). ALTER ADD COLUMN cannot change a
+    // unique index, and the staging upsert's ON CONFLICT names the new triple, so
+    // an old table must be REBUILT or every staging write fails.
+    //
+    // DROP + CREATE, discarding rows, rather than a copy: staging is write-only
+    // scaffolding introduced in the same unreleased slice as this migration
+    // (nothing has shipped that writes it), an un-namespaced row cannot be
+    // assigned a merchant after the fact, and a staged order is pure
+    // mail-derived content that the next order mail from that seller recreates.
+    // Guarded on the column being absent, so it runs at most once per DB. The
+    // DROP takes the table's indexes with it, hence the re-CREATE — schema.sql
+    // already ran this open and will not run again.
+    if tables_exist(conn, &["shipment_orders"])?
+        && !has_columns(conn, "shipment_orders", &["order_merchant"])?
+    {
+        conn.execute_batch(
+            "DROP TABLE shipment_orders;
+             CREATE TABLE shipment_orders (
+                 id INTEGER PRIMARY KEY,
+                 account_id INTEGER NOT NULL,
+                 order_ref TEXT NOT NULL,
+                 order_merchant TEXT NOT NULL DEFAULT '',
+                 item_name TEXT NOT NULL DEFAULT '',
+                 thread_id TEXT NOT NULL DEFAULT '',
+                 last_message_id INTEGER,
+                 item_name_msg INTEGER,
+                 first_seen TEXT NOT NULL,
+                 last_update TEXT NOT NULL,
+                 UNIQUE(account_id, order_merchant, order_ref)
+             );
+             CREATE INDEX IF NOT EXISTS idx_shipment_orders_msg
+                 ON shipment_orders(account_id, last_message_id);",
+        )?;
+    }
+    // A `shipment_orders` that already carries `order_merchant` but predates
+    // `item_name_msg` still needs the column (and the same name-provenance
+    // backfill as `shipments`).
+    if add_column_if_missing(conn, "shipment_orders", "item_name_msg", "INTEGER")? {
+        conn.execute(
+            "UPDATE shipment_orders SET item_name_msg = last_message_id
+             WHERE item_name_msg IS NULL AND COALESCE(item_name, '') != ''",
+            [],
+        )?;
+    }
+
     // Recipient-autocomplete columns. NULL is fine on old rows: the Sent
     // harvest fills both for all of history, and ongoing seeding stamps
     // last_sent_at from then on.
@@ -248,6 +337,45 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
            )",
         [],
     )?;
+    Ok(())
+}
+
+/// ONE-SHOT at the `order_merchant` introduction: stamp each order-bearing
+/// shipment with the registrable domain of the message that CREATED it, so
+/// pre-existing rows stay reachable by a later order mail from the same shop.
+///
+/// Runs in Rust rather than SQL because the merchant key is the shared
+/// registrable-domain rule ([`super::specialists::merchant_key`]) — a second,
+/// drifting definition in SQL is exactly the bug the namespacing exists to stop.
+/// Rows whose creator is unknown or has no derivable domain are LEFT NULL: they
+/// then match no order mail at all, which loses a name donation but can never
+/// bind one merchant's product to another's package.
+fn backfill_order_merchant(conn: &Connection) -> Result<()> {
+    if !has_columns(
+        conn,
+        "shipments",
+        &["order_ref", "order_merchant", "created_by_message_id"],
+    )? || !has_columns(conn, "messages", &["from_addr"])?
+    {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT s.id, m.from_addr FROM shipments s
+             JOIN messages m ON m.id = s.created_by_message_id AND m.account_id = s.account_id
+             WHERE s.order_ref IS NOT NULL AND s.order_merchant IS NULL",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (id, from_addr) in rows {
+        let merchant = super::specialists::merchant_key(&from_addr);
+        if !merchant.is_empty() {
+            conn.execute(
+                "UPDATE shipments SET order_merchant = ?2 WHERE id = ?1",
+                params![id, merchant],
+            )?;
+        }
+    }
     Ok(())
 }
 

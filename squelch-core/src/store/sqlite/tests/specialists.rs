@@ -1097,6 +1097,102 @@ fn record_poll_outcome_stamps_every_attempt_but_counts_only_permanent_failures()
     assert_eq!(shipment_internals(&store, sid).1, 2);
 }
 
+/// DEFECT: retirement was a one-way door. `poll_failures` was zeroed ONLY by a
+/// successful poll — which a retired row can never have, because the cap is
+/// exactly what keeps it out of the poll queue. Pre-manifest 404s are ordinary
+/// (a retailer mails the waybill before the handover), so a LIVE parcel could
+/// cross the cap, leave the queue AND the client lists, and never come back:
+/// not on a later email, not on the delivery notice, not on a retriage.
+///
+/// Mail is the second witness. An update the no-regress state machine ACCEPTS
+/// is fresh evidence the number is real, so the failure count starts over.
+#[test]
+fn a_new_email_revives_a_retired_shipment() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let first = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+    // An AMBIGUOUS shape, so this also exercises the read-side suppression the
+    // same counter drives: a retired row of this shape is invisible to both
+    // doors, not merely unpolled.
+    let sid = store
+        .upsert_shipment(
+            acct,
+            first,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+    fail_polls(&store, acct, sid, 5);
+    assert!(
+        store
+            .list_pollable_shipments(acct, t0 - chrono::Duration::days(30), 5)
+            .unwrap()
+            .is_empty(),
+        "retired out of the poll queue"
+    );
+    assert!(
+        store.list_shipments(acct, false, 5).unwrap().is_empty(),
+        "and out of the lists"
+    );
+
+    // The parcel was real all along, and here is the mail that says so.
+    let second = store
+        .upsert_message(&triaged(acct, "g2", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            second,
+            &shipped("fedex", "123456789012", ShipmentStatus::OutForDelivery),
+            t0 + chrono::Duration::hours(1),
+        )
+        .unwrap();
+
+    assert_eq!(
+        shipment_internals(&store, sid).1,
+        0,
+        "an accepted email clears the carrier's rejections"
+    );
+    assert!(
+        store
+            .list_pollable_shipments(acct, t0 - chrono::Duration::days(30), 5)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == sid),
+        "the revived row is pollable again"
+    );
+    assert_eq!(store.list_shipments(acct, false, 5).unwrap().len(), 1);
+
+    // A REJECTED update is not evidence: a stale "shipped" arriving after the
+    // delivery is exactly the mail the merge threw away, and it must not
+    // resurrect a genuine phantom.
+    store
+        .upsert_shipment(
+            acct,
+            second,
+            &shipped("fedex", "123456789012", ShipmentStatus::Delivered),
+            t0 + chrono::Duration::hours(2),
+        )
+        .unwrap();
+    fail_polls(&store, acct, sid, 5);
+    store
+        .upsert_shipment(
+            acct,
+            first,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            t0 + chrono::Duration::hours(3),
+        )
+        .unwrap();
+    assert_eq!(
+        shipment_internals(&store, sid).1,
+        5,
+        "a regress the state machine rejected is not evidence of anything"
+    );
+}
+
 #[test]
 fn delivered_at_is_stamped_by_either_path_and_never_overwritten() {
     use crate::triage::{CarrierTrack, ShipmentStatus};
@@ -1495,6 +1591,21 @@ use crate::triage::extract::shipments::ShipmentsApplied;
 /// A message + triage row queued for the shipments extractor.
 fn ship_queued_msg(store: &SqliteStore, acct: AccountId, gmail: &str, thread: &str) -> i64 {
     triaged_row(acct, gmail, thread, None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(store)
+}
+
+/// The same, from a named SENDER — the merchant namespace an order reference
+/// lives in is that sender's registrable domain.
+fn ship_queued_from(
+    store: &SqliteStore,
+    acct: AccountId,
+    gmail: &str,
+    thread: &str,
+    from: &str,
+) -> i64 {
+    triaged_row(acct, gmail, thread, None, false, Sensitivity::Normal)
+        .from(from)
         .ship_extract(true)
         .ingest(store)
 }
@@ -1941,4 +2052,359 @@ fn ship_extract_apply_order_only_names_the_shipment_that_already_landed() {
         staged_orders(&store, acct).is_empty(),
         "a tracked purchase is never re-staged"
     );
+}
+
+// ---- the reaping bounds: provenance, carrier evidence, positive evidence --
+
+#[test]
+fn a_second_email_moving_the_pointer_does_not_make_the_first_rows_package_a_phantom() {
+    // `last_message_id` MOVES to the newest mail that advances a row, so keying
+    // the reaping on it puts weeks-old packages in a later mail's blast radius.
+    // Day 1: a real FedEx number (12 digits — an AMBIGUOUS shape, so the shape
+    // gate does not save it). Day 4: a second notice covering both packages
+    // re-upserts it, moving the pointer, and the extractor names the OTHER one.
+    let (store, acct) = store();
+    let day1 = ship_queued_msg(&store, acct, "g-day1", "t-ship");
+    store
+        .upsert_shipment(
+            acct,
+            day1,
+            &detected("fedex", "123456789012", "Standing desk"),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let day4 = ship_queued_msg(&store, acct, "g-day4", "t-ship");
+    store
+        .upsert_shipment(
+            acct,
+            day4,
+            &detected("fedex", "123456789012", "Standing desk"),
+            Utc::now(),
+        )
+        .unwrap();
+
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("987654321098".into()),
+            carrier: "fedex".into(),
+            ..ship_verdict(acct, day4, "t-ship")
+        })
+        .unwrap();
+
+    let numbers: Vec<String> = shipment_rows(&store, acct)
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    assert!(
+        numbers.contains(&"123456789012".to_string()),
+        "day 1's package is not day 4's phantom: {numbers:?}"
+    );
+    assert!(numbers.contains(&"987654321098".to_string()));
+}
+
+#[test]
+fn a_carrier_confirmed_row_is_never_reaped_as_a_phantom() {
+    // A number a carrier ANSWERED about is a real package whatever the model now
+    // says about the mail — even a flat "not a shipment" verdict on the very
+    // message that created the row.
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-fedex", "t1");
+    let sid = store
+        .upsert_shipment(acct, mid, &detected("fedex", "123456789012", ""), Utc::now())
+        .unwrap();
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    store
+        .shipments_extract_apply(&ship_verdict(acct, mid, "t1"))
+        .unwrap();
+    assert_eq!(
+        shipment_rows(&store, acct).len(),
+        1,
+        "carrier evidence outranks a model verdict"
+    );
+}
+
+#[test]
+fn an_extraction_with_no_tracking_number_deletes_nothing() {
+    // ABSENCE OF EVIDENCE IS NOT EVIDENCE OF ABSENCE. "Shipped via FedEx, Order
+    // #1042, Tracking number 123456789012" — the model puts the number in BOTH
+    // fields and the extractor's contradiction rule drops it, leaving an
+    // order-ref-only verdict. The row the detector minted is REAL, so neither
+    // the order-ref branch nor the no-identity branch may touch it.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-fedex", "t-ship");
+    store
+        .upsert_shipment(acct, mid, &detected("fedex", "123456789012", ""), Utc::now())
+        .unwrap();
+
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            order_ref: Some("1042".into()),
+            ..ship_verdict(acct, mid, "t-ship")
+        })
+        .unwrap();
+    assert_eq!(
+        shipment_rows(&store, acct).len(),
+        1,
+        "an order-ref-only verdict deletes nothing"
+    );
+
+    // And the same for a verdict carrying no identity at all.
+    let follow_up = ship_queued_msg(&store, acct, "g-follow", "t-ship");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            ..ship_verdict(acct, follow_up, "t-ship")
+        })
+        .unwrap();
+    assert_eq!(
+        shipment_rows(&store, acct).len(),
+        1,
+        "a no-identity verdict deletes nothing"
+    );
+}
+
+// ---- order references are merchant-scoped -------------------------------
+
+#[test]
+fn two_merchants_sharing_an_order_number_do_not_bind_to_one_package() {
+    // "Order #1042" is unique only inside the shop that issued it. Without a
+    // merchant namespace, shop B's confirmation renames shop A's in-flight
+    // package — the user's desk becomes a cat bed.
+    let (store, acct) = store();
+    let a_ship = ship_queued_from(&store, acct, "g-a", "t-a", "orders@shopa.com");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            order_ref: Some("1042".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, a_ship, "t-a")
+        })
+        .unwrap();
+
+    let b_order = ship_queued_from(&store, acct, "g-b", "t-b", "orders@shopb.com");
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            order_ref: Some("1042".into()),
+            item_name: Some("Cat bed".into()),
+            ..ship_verdict(acct, b_order, "t-b")
+        })
+        .unwrap();
+
+    assert!(wrote, "shop B's purchase is staged under its own merchant");
+    assert_eq!(
+        shipment_rows(&store, acct)[0].1,
+        "",
+        "shop A's package keeps its own (absent) name"
+    );
+    assert_eq!(
+        staged_orders(&store, acct),
+        vec![("1042".to_string(), "Cat bed".to_string(), Some(b_order))],
+        "shop B stages instead of donating"
+    );
+}
+
+#[test]
+fn an_ambiguous_order_ref_match_donates_to_neither_row() {
+    // One order, two boxes: both packages carry reference 1042. A later order
+    // mail naming the item cannot say WHICH box it means, and the previous
+    // `query_row` silently took whichever row SQLite handed back first.
+    let (store, acct) = store();
+    for (gmail, number) in [
+        ("g-box1", "1Z999AA10123456784"),
+        ("g-box2", "1Z12345E0205271688"),
+    ] {
+        let mid = ship_queued_from(&store, acct, gmail, "t-split", "orders@shopa.com");
+        store
+            .shipments_extract_apply(&ShipmentsApplied {
+                is_shipment: true,
+                tracking_number: Some(number.into()),
+                order_ref: Some("1042".into()),
+                carrier: "ups".into(),
+                ..ship_verdict(acct, mid, "t-split")
+            })
+            .unwrap();
+    }
+
+    let order_msg = ship_queued_from(&store, acct, "g-ord", "t-ord", "orders@shopa.com");
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            order_ref: Some("1042".into()),
+            item_name: Some("Anker USB-C charger".into()),
+            ..ship_verdict(acct, order_msg, "t-ord")
+        })
+        .unwrap();
+
+    assert!(!wrote, "an ambiguous reference writes nothing");
+    assert!(
+        shipment_rows(&store, acct).iter().all(|r| r.1.is_empty()),
+        "neither box may be named"
+    );
+    assert!(
+        staged_orders(&store, acct).is_empty(),
+        "an already-tracked purchase is not re-staged either"
+    );
+}
+
+// ---- the re-detect one-shot: evidence and atomicity ---------------------
+
+/// The re-detect done-flag as the store records it.
+fn redetect_flag(store: &SqliteStore, acct: AccountId) -> Option<String> {
+    store
+        .get_app_setting(acct, "shipments_redetect_v1")
+        .unwrap()
+}
+
+/// A mail whose text yields NO tracking number at all, so any row hung off it
+/// fails the re-detect keep test.
+fn undetectable_mail(acct: AccountId, gmail: &str) -> TriagedBuilder {
+    triaged(acct, gmail, &format!("t-{gmail}"))
+        .from("ebay@ebay.com")
+        .subject("Your package is now with its carrier!")
+        .body("Your package is now with its carrier! See https://www.ebay.com/itm/123456789012.")
+}
+
+#[test]
+fn the_redetect_one_shot_spares_extractor_and_carrier_evidence() {
+    // The keep test is the REGEX detector, and extractor-written rows are
+    // exactly what it cannot reproduce. So the one-shot judges only rows with no
+    // evidence of their own: a carrier answer (or even a poll attempt) and an
+    // order reference both put a row out of reach.
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+
+    let plain = shipment_over_mail(
+        &store,
+        acct,
+        &undetectable_mail(acct, "g-plain").msg(),
+        "fedex",
+        "123456789012",
+    );
+    let polled = shipment_over_mail(
+        &store,
+        acct,
+        &undetectable_mail(acct, "g-polled").msg(),
+        "fedex",
+        "223456789012",
+    );
+    let ordered = shipment_over_mail(
+        &store,
+        acct,
+        &undetectable_mail(acct, "g-ordered").msg(),
+        "fedex",
+        "323456789012",
+    );
+    store
+        .apply_carrier_track(
+            acct,
+            polled,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::Shipped),
+                carrier_status_raw: "In Transit".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE shipments SET order_ref='1042', order_merchant='shopa.com' WHERE id=?1",
+            params![ordered],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.shipments_redetect_cleanup(acct).unwrap(),
+        1,
+        "only the evidence-free phantom is reaped"
+    );
+    let surviving: Vec<i64> = store
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert!(!surviving.contains(&plain));
+    assert!(surviving.contains(&polled), "carrier evidence is spared");
+    assert!(surviving.contains(&ordered), "extractor evidence is spared");
+}
+
+#[test]
+fn the_redetect_flag_and_its_deletions_commit_together() {
+    // The pass CANNOT complete without being recorded: flag and deletions are
+    // one transaction, and the store owns both. With the flag written by the
+    // caller afterwards, a crash or an unwritable settings row meant a re-run —
+    // and by then the extractor has written rows the regex cannot reproduce, so
+    // the second pass would eat them.
+    let (store, acct) = store();
+    assert_eq!(redetect_flag(&store, acct), None);
+
+    shipment_over_mail(
+        &store,
+        acct,
+        &undetectable_mail(acct, "g-phantom").msg(),
+        "fedex",
+        "123456789012",
+    );
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 1);
+    assert_eq!(
+        redetect_flag(&store, acct).as_deref(),
+        Some("done"),
+        "the pass records itself in the same transaction as its deletions"
+    );
+
+    // An extractor-written row lands afterwards: one the regex will never yield.
+    // The recorded completion is what stands between it and the reaper.
+    let extracted = shipment_over_mail(
+        &store,
+        acct,
+        &undetectable_mail(acct, "g-extracted").msg(),
+        "fedex",
+        "223456789012",
+    );
+    assert_eq!(
+        store.shipments_redetect_cleanup(acct).unwrap(),
+        0,
+        "the one-shot is over"
+    );
+    assert!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == extracted),
+        "a recorded pass never runs again"
+    );
+}
+
+#[test]
+fn the_redetect_one_shot_records_itself_even_when_it_deletes_nothing() {
+    // A pass with nothing to reap still HAPPENED. Leaving the flag unwritten
+    // would arm the reaper for the next start, over a store the extractor has
+    // been writing to since.
+    let (store, acct) = store();
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
+    assert_eq!(redetect_flag(&store, acct).as_deref(), Some("done"));
 }

@@ -632,3 +632,123 @@ fn migrate_adds_order_ref_and_init_creates_the_orders_staging_table() {
         .unwrap();
     assert_eq!(staged, 0, "the staging table exists on an upgraded DB");
 }
+
+#[test]
+fn migrate_adds_shipment_provenance_and_backfills_it_from_the_pointer() {
+    // An install predating the provenance columns. `created_by_message_id` and
+    // `item_name_msg` are both backfilled to `last_message_id` — for a
+    // historical row that is the best available truth, and it is the pointer
+    // sealing and reaping already (wrongly) relied on. `order_merchant` is
+    // backfilled from the creating message's sender domain.
+    register_vec_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '',
+             from_addr TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL DEFAULT '',
+             is_sent INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO messages(id, account_id, gmail_msg_id, from_addr)
+             VALUES(7, 1, 'g7', 'orders@mail.shopa.com');
+         CREATE TABLE shipments (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             tracking_number TEXT NOT NULL, carrier TEXT NOT NULL,
+             item_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'shipped',
+             tracking_url TEXT, last_message_id INTEGER, order_ref TEXT,
+             first_seen TEXT NOT NULL, last_update TEXT NOT NULL,
+             UNIQUE(account_id, tracking_number));
+         INSERT INTO shipments(id, account_id, tracking_number, carrier, item_name,
+                               last_message_id, order_ref, first_seen, last_update)
+             VALUES(1, 1, '1Z999AA10123456784', 'ups', 'Standing desk', 7, '1042', '', ''),
+                   (2, 1, '9400111899223817428490', 'usps', '', 7, NULL, '', '');",
+    )
+    .unwrap();
+
+    let store = SqliteStore::init(conn).unwrap();
+    let conn = store.lock().unwrap();
+    let row = |id: i64| -> (Option<i64>, Option<i64>, Option<String>) {
+        conn.query_row(
+            "SELECT created_by_message_id, item_name_msg, order_merchant
+             FROM shipments WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        row(1),
+        (Some(7), Some(7), Some("shopa.com".to_string())),
+        "provenance backfills from the pointer, merchant from the sender"
+    );
+    assert_eq!(
+        row(2),
+        (Some(7), None, None),
+        "no name and no order reference means nothing to attribute"
+    );
+}
+
+#[test]
+fn migrate_rebuilds_the_staging_table_onto_the_merchant_scoped_key() {
+    // `shipment_orders` grew its UNIQUE key from (account, order_ref) to
+    // (account, merchant, order_ref). ALTER cannot change a unique index, and the
+    // staging upsert's ON CONFLICT names the new triple, so an un-namespaced
+    // table must be rebuilt or every staging write fails outright.
+    register_vec_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipment_orders (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             order_ref TEXT NOT NULL, item_name TEXT NOT NULL DEFAULT '',
+             thread_id TEXT NOT NULL DEFAULT '', last_message_id INTEGER,
+             first_seen TEXT NOT NULL, last_update TEXT NOT NULL,
+             UNIQUE(account_id, order_ref));
+         INSERT INTO shipment_orders(account_id, order_ref, item_name, first_seen, last_update)
+             VALUES(1, '1042', 'Cat bed', '', '');",
+    )
+    .unwrap();
+
+    let store = SqliteStore::init(conn).unwrap();
+    let conn = store.lock().unwrap();
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(shipment_orders)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "order_merchant"));
+    assert!(cols.iter().any(|c| c == "item_name_msg"));
+
+    // Two shops CAN now stage the same reference — the point of the rebuild —
+    // which the old unique key made impossible.
+    for merchant in ["shopa.com", "shopb.com"] {
+        conn.execute(
+            "INSERT INTO shipment_orders(account_id, order_ref, order_merchant,
+                                         first_seen, last_update)
+             VALUES(1, '1042', ?1, '', '')
+             ON CONFLICT(account_id, order_merchant, order_ref) DO NOTHING",
+            params![merchant],
+        )
+        .unwrap();
+    }
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shipment_orders WHERE order_ref = '1042'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "the rebuilt key namespaces by merchant");
+
+    // The index the DROP took with it is back.
+    let idx: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index' AND name='idx_shipment_orders_msg'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "the rebuild re-creates the dropped index");
+}

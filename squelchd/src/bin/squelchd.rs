@@ -1787,31 +1787,20 @@ fn cmd_serve(
         // every existing row is re-judged against its own feeder message ONCE and
         // the ones the detector no longer produces are deleted. Store-only and
         // fast, so it runs inline on a blocking thread rather than on a delay —
-        // no network, no Gmail quota. The done flag is set only after a
-        // successful pass, so a failure simply retries on the next start.
+        // no network, no Gmail quota.
+        //
+        // The ONCE is the store's job, not this call site's: it checks and writes
+        // its own done-flag in the SAME TRANSACTION as the deletions, so the pass
+        // cannot complete without being recorded. A re-run that skipped an
+        // unrecorded pass would reap the rows the extractor has since written,
+        // which no regex can reproduce. A failure here simply retries next start.
         {
             let store = store.clone();
             tokio::task::spawn_blocking(move || {
-                const FLAG: &str = "shipments_redetect_v1";
-                match store.get_app_setting(account_id, FLAG) {
-                    Ok(Some(v)) if v == "done" => return,
-                    Ok(_) => {}
-                    // Unreadable settings row: skip this start rather than risk
-                    // re-running a pass whose completion we cannot record.
-                    Err(_) => {
-                        eprintln!("squelchd: shipment re-detect skipped (settings unreadable)");
-                        return;
-                    }
-                }
                 match store.shipments_redetect_cleanup(account_id) {
                     // Count only — a tracking number is never logged.
                     Ok(n) => {
-                        eprintln!("squelchd: shipment re-detect removed {n} stale shipment row(s)");
-                        if store.set_app_setting(account_id, FLAG, "done").is_err() {
-                            eprintln!(
-                                "squelchd: shipment re-detect flag not stored (reruns next start)"
-                            );
-                        }
+                        eprintln!("squelchd: shipment re-detect removed {n} stale shipment row(s)")
                     }
                     Err(_) => eprintln!("squelchd: shipment re-detect failed (retries next start)"),
                 }

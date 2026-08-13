@@ -39,6 +39,11 @@ enum Mode {
     NotFound,
     /// 429, optionally with a `Retry-After` in seconds.
     RateLimited(Option<u64>),
+    /// ONE POISON NUMBER: that number gets a 200 whose body will not parse (a
+    /// `TrackError::Transient`, deterministically, forever), every other number
+    /// gets a normal track. This is the real shape of the failure — a carrier
+    /// that is up and answering, about a row it will never answer usefully.
+    PoisonOne(&'static str),
 }
 
 #[derive(Clone)]
@@ -80,10 +85,18 @@ async fn track(
         .unwrap()
         .push(query.get("trackingNumber").cloned().unwrap_or_default());
 
+    let asked = query.get("trackingNumber").cloned().unwrap_or_default();
     let mode = carrier.mode.lock().unwrap().clone();
     match mode {
         Mode::Track(code, description) => Json(json!({
             "shipments": [{ "status": { "statusCode": code, "description": description } }]
+        }))
+        .into_response(),
+        Mode::PoisonOne(number) if asked == number => {
+            (StatusCode::OK, "{ this is not the response you ordered").into_response()
+        }
+        Mode::PoisonOne(_) => Json(json!({
+            "shipments": [{ "status": { "statusCode": "transit", "description": "In transit" } }]
         }))
         .into_response(),
         Mode::NotFound => StatusCode::NOT_FOUND.into_response(),
@@ -367,6 +380,55 @@ async fn a_rate_limited_carrier_goes_quiet_and_the_row_is_not_stamped() {
             "a skipped row must not be stamped as polled"
         );
     }
+}
+
+/// DEFECT: one poison number used to starve its carrier's whole queue. A
+/// transient answer wrote NOTHING to the row — no stamp, no counter — and cooled
+/// the WHOLE carrier down, ending the pass. Because the queue sorts never-polled
+/// first, the unstamped row was still the head of it next pass: the poller spent
+/// every pass, forever, on the one number that could not work, and the parcels
+/// behind it were never called at all.
+///
+/// The poison row is landed FIRST here precisely so it holds that head position.
+#[tokio::test]
+async fn a_transient_row_does_not_deny_service_to_the_rest_of_the_queue() {
+    let (base, carrier) = spawn_carrier(Mode::PoisonOne(NUMBER)).await;
+    let (store, acct, message_id) = seeded();
+    for number in [NUMBER, OTHER, THIRD] {
+        land(&store, acct, message_id, number, ShipmentStatus::Shipped);
+    }
+
+    let poller = ShipmentPoller::for_test(
+        store.clone() as Arc<dyn Store>,
+        acct,
+        registry(&base, Duration::ZERO),
+    )
+    .with_tick_interval(Duration::from_millis(10));
+    let running = start(poller);
+
+    let s = store.clone();
+    wait_for("the rows queued behind the poison one", move || {
+        [OTHER, THIRD]
+            .iter()
+            .all(|n| row(&s, acct, n).last_polled_at.is_some())
+    })
+    .await;
+    running.stop().await;
+
+    let poisoned = row(&store, acct, NUMBER);
+    assert!(
+        poisoned.last_polled_at.is_some(),
+        "the attempt reached the carrier: stamp it, or this row owns the queue head forever"
+    );
+    assert_eq!(
+        poisoned.poll_failures, 0,
+        "a transient failure is the carrier's problem, not the parcel's"
+    );
+    assert!(
+        carrier.asked().iter().any(|n| n == OTHER),
+        "the queue behind the poison row was never served: {:?}",
+        carrier.asked()
+    );
 }
 
 /// Delivered is terminal. The store's own filter is what enforces it, and this
