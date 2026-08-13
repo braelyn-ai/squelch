@@ -42,6 +42,12 @@ pub const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth"
 /// `gmail.readonly` permits it.
 pub const GMAIL_PROFILE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 
+/// OpenID Connect's userinfo endpoint: what names the mailbox behind an
+/// `openid email` token, which is all a console login ever holds. Pinned for the
+/// same reason as the rest: this answer decides WHO somebody is, so the host it
+/// comes from must not be an environment variable.
+pub const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+
 /// Ceiling on `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS`. Same reasoning as the
 /// broker's: nobody stacks eight proxies, a larger number is a typo, and a typo
 /// degrades silently into one shared rate-limit bucket for the whole internet.
@@ -130,6 +136,9 @@ pub struct Config {
     pub auth_url: String,
     /// Gmail's profile endpoint, pinned by `from_env` the same way.
     pub profile_url: String,
+    /// OIDC's userinfo endpoint, pinned by `from_env` the same way. The console
+    /// login reads it; the signup flow never touches it.
+    pub userinfo_url: String,
     /// The Bifrost LLM gateway, when this deployment has one. `None` means the
     /// feature is OFF and signup provisions tenants with no LLM key at all;
     /// a partial configuration is a refusal to boot, never a silent off.
@@ -185,6 +194,7 @@ impl std::fmt::Debug for Config {
             .field("token_url", &self.token_url)
             .field("auth_url", &self.auth_url)
             .field("profile_url", &self.profile_url)
+            .field("userinfo_url", &self.userinfo_url)
             // BifrostConfig's own Debug redacts the admin token.
             .field("bifrost", &self.bifrost)
             .finish()
@@ -294,6 +304,7 @@ impl Config {
             token_url: GOOGLE_TOKEN_URL.to_string(),
             auth_url: GOOGLE_AUTH_URL.to_string(),
             profile_url: GMAIL_PROFILE_URL.to_string(),
+            userinfo_url: GOOGLE_USERINFO_URL.to_string(),
             bifrost,
         })
     }
@@ -583,6 +594,7 @@ mod tests {
             token_url: GOOGLE_TOKEN_URL.into(),
             auth_url: GOOGLE_AUTH_URL.into(),
             profile_url: GMAIL_PROFILE_URL.into(),
+            userinfo_url: GOOGLE_USERINFO_URL.into(),
             bifrost: Some(BifrostConfig {
                 url: "https://bifrost.passband.email".into(),
                 admin_token: "admin:BIFROST-ADMIN-VALUE".into(),

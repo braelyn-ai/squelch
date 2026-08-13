@@ -64,6 +64,19 @@ pub struct SyncState {
     pub last_uid: u64,
 }
 
+/// Gmail's own unread counts for INBOX, as the sync loop last saw them.
+///
+/// This is the mailbox's truth, not ours: nothing local tracks reads (the read
+/// scope cannot write them), and the ingest window covers only a slice of the
+/// inbox, so these numbers can only come from Gmail. `fetched_at` says how stale
+/// they are — a fetch failure keeps the previous row rather than clearing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxUnread {
+    pub messages: i64,
+    pub threads: i64,
+    pub fetched_at: DateTime<Utc>,
+}
+
 /// One Sent-derived contact, as both the autocomplete hit shape and the
 /// Sent-history harvest's merge input (same fields either way).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +195,9 @@ pub struct TriageDebug {
     pub needs_stage2: bool,
     pub extractor_model_used: Option<String>,
     pub created_at: String,
+    /// The Gmail-side thread id, joined from `messages`. APPENDED LAST on
+    /// purpose: an older client decoding this shape must keep working.
+    pub thread_id: String,
 }
 
 /// The stored unsubscribe intent for one NON-SEALED message, resolved by
@@ -615,6 +631,34 @@ pub struct SealedMessage {
     pub sealed_kind: Option<String>,
 }
 
+/// One row of the user's OWN sent mail, for the human door's sent listing
+/// ([`Store::sent_listing`]). HUMAN-DOOR ONLY: the agent door has no sent
+/// surface, and every other listing filters `is_sent = 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub id: i64,
+    pub thread_id: String,
+    /// Display recipients, comma-joined `Name <addr>`; `""` when the row predates
+    /// the recipients backfill or its headers named nobody.
+    pub to: String,
+    pub subject: String,
+    pub snippet: String,
+    /// `messages.received_at` VERBATIM — the stored RFC3339 string, not a
+    /// re-formatted parse of it.
+    pub sent_at: String,
+    /// Recorded read receipts for this message (`message_opens` through
+    /// `send_trackers`). 0 for an untracked send, which is the default.
+    pub opens: i64,
+}
+
+/// A sent message still missing its display recipients, for the one-shot
+/// recipients backfill. Carries only what the Gmail metadata fetch needs.
+#[derive(Debug, Clone)]
+pub struct SentMissingRecipients {
+    pub message_id: i64,
+    pub gmail_msg_id: String,
+}
+
 /// The squelch local store. Implemented by [`SqliteStore`].
 ///
 /// SECURITY: every method that can feed the MCP surface (`ranked_updates`,
@@ -865,6 +909,17 @@ pub trait Store: Send + Sync {
     fn set_sync_state(&self, account_id: AccountId, mailbox: &str, state: &SyncState)
     -> Result<()>;
 
+    /// The last Gmail INBOX unread counts the sync loop stored, or `None` when
+    /// none were ever fetched (old DB, or every fetch so far has failed). `None`
+    /// is NOT zero and callers must keep the distinction: zero unread is a real
+    /// answer, "we do not know" is not.
+    fn inbox_unread(&self, account_id: AccountId) -> Result<Option<InboxUnread>>;
+
+    /// Overwrite this account's Gmail INBOX unread counts, stamping `fetched_at`
+    /// now. Only ever called with numbers that came back from Gmail, so a failed
+    /// fetch leaves the previous row in place.
+    fn set_inbox_unread(&self, account_id: AccountId, messages: i64, threads: i64) -> Result<()>;
+
     /// LOCAL-ONLY (TUI): list sealed messages. This is the ONLY method that
     /// exposes sealed content and must never be reachable from MCP.
     fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>>;
@@ -952,6 +1007,42 @@ pub trait Store: Send + Sync {
     /// BEFORE calling this and answers `no-store`. `NotFound` when the message
     /// does not exist or is not sealed.
     fn sealed_body(&self, account_id: AccountId, message_id: i64) -> Result<SealedBody>;
+
+    /// HUMAN-DOOR-ONLY (`GET /client/sent`): the user's own sent mail, newest
+    /// first (`received_at DESC, id DESC`), `limit`/`offset` paginating exactly
+    /// as [`Store::search`] does. MUST NOT be reachable from MCP — the agent
+    /// door has no sent surface at all.
+    ///
+    /// SECURITY: this is the one listing that reads `is_sent = 1`, so its sealed
+    /// guard FAILS CLOSED — the triage join is an INNER join AND requires
+    /// `sensitivity != 'sealed'`, which excludes a sent row missing its triage
+    /// row rather than defaulting it to visible.
+    fn sent_listing(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SentMessage>>;
+
+    /// Up to `limit` sent messages with no `to_addrs` yet, newest-first: the
+    /// queue for the one-shot recipients backfill (rows ingested before the
+    /// column existed).
+    fn sent_missing_recipients(
+        &self,
+        account_id: AccountId,
+        limit: u32,
+    ) -> Result<Vec<SentMissingRecipients>>;
+
+    /// Set one SENT message's display recipients; `false` when no such sent row
+    /// exists. `""` is a legitimate value — it records that the headers were read
+    /// and named nobody, which is what takes the row out of the backfill queue.
+    /// Received mail is never touched (`is_sent = 1` is in the predicate).
+    fn set_message_to_addrs(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        to_addrs: &str,
+    ) -> Result<bool>;
 
     /// Append a row to the human-door audit log. Returns the new row id.
     fn append_audit(&self, account_id: AccountId, entry: &NewAuditEntry) -> Result<i64>;

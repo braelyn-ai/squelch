@@ -474,6 +474,14 @@ struct Stage2Stats: Codable, Sendable, Hashable {
     var est_cost_usd_today: Double?
 }
 
+/// Gmail's own INBOX unread counters, as the daemon last saw them. NOT a
+/// passband number: it is what the mailbox says before triage has an opinion,
+/// which is the only honest way to say how much mail was waiting.
+struct InboxUnread: Codable, Sendable, Hashable {
+    var messages: Int
+    var threads: Int
+}
+
 struct StoreStats: Codable, Sendable, Hashable {
     var tier_counts: [String: Int]
     var total: Int
@@ -482,6 +490,10 @@ struct StoreStats: Codable, Sendable, Hashable {
     var bands: BandCounts
     var last_surfaced_at: String?
     var stage2: Stage2Stats?
+    /// ABSENT on a daemon too old to fetch it, and absent for as long as the
+    /// first fetch has not landed — so nil means "we do not know", never zero.
+    /// Callers must have copy for both.
+    var inbox_unread: InboxUnread?
 }
 
 // MARK: - usage
@@ -813,6 +825,9 @@ struct TriageDebug: Codable, Sendable, Hashable {
     var needs_stage2: Bool
     var extractor_model_used: String?
     var created_at: String
+    /// Optional so a client pointed at a daemon older than the field still
+    /// decodes the page rather than failing the whole read.
+    var thread_id: String?
 }
 
 struct ShredStats: Codable, Sendable, Hashable {
@@ -861,6 +876,29 @@ struct MarketingOffer: Codable, Sendable, Hashable {
     var code: String?
     var expires_at: String?
     var received_at: String
+}
+
+// MARK: - sent
+
+/// One row of GET /client/sent — mail the user WROTE, newest first (the daemon
+/// orders on received_at DESC, id DESC and the page renders that order as-is).
+///
+/// A deliberately different shape from `AttentionUpdate`: outbound mail has no
+/// tier, no importance and no triage status, because nothing triaged it. What it
+/// has instead is `to` (the display recipient list, comma-joined "Name <addr>",
+/// EMPTY when the header carried nothing usable) and `opens` — the count of
+/// recorded read receipts, which is 0 both for a send nobody opened and for a
+/// send that never armed the pixel. Those two are the same silence by design;
+/// see ReadReceipt.swift.
+struct SentItem: Codable, Sendable, Identifiable, Hashable {
+    /// The local message id, so a row keys and prefetches like any other.
+    var id: Int
+    var thread_id: String
+    var to: String
+    var subject: String
+    var snippet: String
+    var sent_at: String
+    var opens: Int
 }
 
 // MARK: - query params

@@ -121,6 +121,16 @@ final class SitrepPoller {
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
             if next != store.sitrep { store.sitrep = next }
+            // A REPLY THAT LANDED IN THE THREAD ON SCREEN. The reader holds the
+            // copy it fetched when it opened, and this poll is the only thing in
+            // the app that hears about new mail — without this, an answer to the
+            // email somebody is sitting on shows up when they leave and come
+            // back. Deliberately NOT gated on `next` having changed: a refetch
+            // that failed leaves the summary where it was, so the next poll asks
+            // again, and the ask stops the moment the viewer adopts the newer id.
+            if let open = store.currentThreadSummary, brings(next, newMailTo: open) {
+                store.openThreadRefreshToken &+= 1
+            }
             if store.refreshError != nil {
                 store.refreshError = nil
                 // Transition only — a healthy poll every 10s is not an event.
@@ -168,6 +178,18 @@ final class SitrepPoller {
             }
             return false
         }
+    }
+
+    /// Whether a freshly pulled read model holds a message in the open thread
+    /// that the reader has not got. Ids are the store's own row ids, so newer
+    /// really is greater — and the compare is what keeps this quiet: the same
+    /// rows sit in the bands for as long as they are unresolved, and only one
+    /// that outranks the summary's newest is news.
+    private func brings(_ data: SitrepData, newMailTo open: OpenThreadSummary) -> Bool {
+        func newer(_ rows: [AttentionUpdate]) -> Bool {
+            rows.contains { $0.thread_id == open.threadId && $0.id > open.newestMessageId }
+        }
+        return newer(data.standing) || newer(data.new) || newer(data.open)
     }
 
     /// Manual refresh: poke the daemon to poll Gmail now, then re-pull so fresh

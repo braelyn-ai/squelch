@@ -106,6 +106,7 @@ final class Prefs {
         static let settingsSection = "passband.pref.settingsSection"
         static let rankWeight = "passband.pref.rankWeight"
         static let developerMode = "passband.pref.developerMode"
+        static let tourCompleted = "passband.pref.tourCompleted"
         static let theme = "passband.pref.theme"
         static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
@@ -120,6 +121,7 @@ final class Prefs {
             Key.settingsSection: SettingsSection.general.rawValue,
             Key.rankWeight: defaultRankWeight,
             Key.developerMode: false,
+            Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
@@ -130,6 +132,7 @@ final class Prefs {
             ?? .general
         _rankWeight = defaults.double(forKey: Key.rankWeight)
         _developerMode = defaults.bool(forKey: Key.developerMode)
+        _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
         _notificationSound =
             NotificationSound(rawValue: defaults.string(forKey: Key.notificationSound) ?? "")
@@ -181,6 +184,18 @@ final class Prefs {
         set {
             _developerMode = newValue
             defaults.set(newValue, forKey: Key.developerMode)
+        }
+    }
+
+    /// Whether the first-run tour has been seen. Set by finishing OR skipping
+    /// it: both are answers, and re-asking somebody who said no is worse than
+    /// never asking. Settings' replay ignores it.
+    private var _tourCompleted: Bool
+    var tourCompleted: Bool {
+        get { _tourCompleted }
+        set {
+            _tourCompleted = newValue
+            defaults.set(newValue, forKey: Key.tourCompleted)
         }
     }
 

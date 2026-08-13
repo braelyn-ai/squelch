@@ -1,0 +1,60 @@
+# Every ios-v* tag archives the iOS client and uploads it to TestFlight.
+# Separate namespace from the daemon's v* tags on purpose: shipping a phone
+# build must never rebuild three Docker images, and vice versa.
+#
+# The runner holds NO signing material: passband/release-ios.sh hands the App
+# Store Connect API key to xcodebuild, and cloud signing mints a managed
+# distribution certificate per run. The three secrets are the whole setup:
+#
+#   ASC_KEY_ID         App Store Connect API key id
+#   ASC_KEY_ISSUER_ID  issuer id (App Store Connect > Users and Access > Keys)
+#   ASC_KEY_P8         the AuthKey_<id>.p8 file's contents, verbatim
+#
+# The key needs the App Manager role — cloud signing refuses to mint
+# certificates for anything weaker.
+name: release-ios
+
+on:
+  push:
+    tags: ["ios-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-ios
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: xcodegen
+        run: brew install xcodegen
+
+      # The macOS target's vendored framework. This job never builds that
+      # target, but xcodegen resolves the whole project spec, so the path has
+      # to exist. The script pins version + sha256 and fails loudly on drift.
+      - name: vendor Sparkle
+        run: ./passband/vendor/fetch-sparkle.sh
+
+      - name: write ASC key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          umask 077
+          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+
+      # ios-v1.0.1 tags the build 1.0.1; the build number is the UTC minute,
+      # stamped inside the script.
+      - name: archive, export, upload
+        env:
+          SQUELCH_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          SQUELCH_ASC_KEY_ISSUER: ${{ secrets.ASC_KEY_ISSUER_ID }}
+          SQUELCH_ASC_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          SQUELCH_IOS_VERSION: ${{ github.ref_name }}
+        run: |
+          SQUELCH_IOS_VERSION="${SQUELCH_IOS_VERSION#ios-v}" ./passband/release-ios.sh

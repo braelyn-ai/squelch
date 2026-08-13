@@ -54,7 +54,7 @@ use axum::{
 
 /// Build the control-plane router.
 ///
-/// Three surfaces, three budgets, because a 429 costs a different thing on each
+/// Four surfaces, four budgets, because a 429 costs a different thing on each
 /// (the shape is stolen from `squelch-broker`, which learned it the same way):
 ///
 /// - `GET /` is a page. Browsers prefetch it and link scanners fetch it, and
@@ -62,9 +62,14 @@ use axum::{
 /// - `POST /signup` is tight. It validates an invite code, so it is the one
 ///   route where a stranger can guess at a secret, and a real human posts it
 ///   once.
+/// - `GET /console/auth` is TIGHTER, in its OWN bucket. It is the only route
+///   that opens a server-side session with nothing presented at all, so it is
+///   the cheapest thing here to loop; a real human hits it once per sign in, and
+///   anything sustained above it is somebody walking the label space. It used to
+///   share signup's budget, which meant console traffic could spend it.
 /// - `GET /oauth/callback` is the most generous. Refusing it destroys a consent
 ///   the user has ALREADY granted at Google, which they cannot grant twice
-///   without walking the whole flow again.
+///   without walking the whole flow again. Both flows come back through it.
 ///
 /// `/healthz` sits outside every layer so liveness answers while a client is
 /// throttled.
@@ -86,6 +91,14 @@ pub fn router(state: ControlState) -> Router {
         ))
         .with_state(state.clone());
 
+    let console = Router::new()
+        .route("/console/auth", get(handlers::console_auth))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_console_auth,
+        ))
+        .with_state(state.clone());
+
     let callback = Router::new()
         .route("/oauth/callback", get(handlers::oauth_callback))
         .layer(middleware::from_fn_with_state(
@@ -98,5 +111,6 @@ pub fn router(state: ControlState) -> Router {
         .route("/healthz", get(handlers::healthz))
         .merge(form)
         .merge(signup)
+        .merge(console)
         .merge(callback)
 }

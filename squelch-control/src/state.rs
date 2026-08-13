@@ -16,8 +16,8 @@ use std::time::Instant;
 use crate::bifrost::{BifrostClient, BifrostError};
 use crate::config::{BifrostConfig, Config, OUTBOUND_TIMEOUT};
 use crate::ratelimit::{
-    CALLBACK_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE, RateLimiter,
-    SIGNUP_REQUESTS_PER_MINUTE,
+    CALLBACK_REQUESTS_PER_MINUTE, CONSOLE_AUTH_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE,
+    RateLimiter, SIGNUP_REQUESTS_PER_MINUTE,
 };
 use crate::sessions::SessionStore;
 use crate::store::ControlStore;
@@ -41,6 +41,10 @@ struct Inner {
     sessions: Mutex<SessionStore>,
     page_limiter: Mutex<RateLimiter>,
     signup_limiter: Mutex<RateLimiter>,
+    /// `GET /console/auth`'s own bucket. Separate from signup's so console
+    /// traffic cannot spend the budget a signup needs, and tighter, because
+    /// opening a console session costs a stranger nothing to ask for.
+    console_auth_limiter: Mutex<RateLimiter>,
     callback_limiter: Mutex<RateLimiter>,
 }
 
@@ -81,6 +85,9 @@ impl ControlState {
                 sessions: Mutex::new(SessionStore::new()),
                 page_limiter: Mutex::new(RateLimiter::per_minute(PAGE_REQUESTS_PER_MINUTE)),
                 signup_limiter: Mutex::new(RateLimiter::per_minute(SIGNUP_REQUESTS_PER_MINUTE)),
+                console_auth_limiter: Mutex::new(RateLimiter::per_minute(
+                    CONSOLE_AUTH_REQUESTS_PER_MINUTE,
+                )),
                 callback_limiter: Mutex::new(RateLimiter::per_minute(CALLBACK_REQUESTS_PER_MINUTE)),
             }),
         })
@@ -134,6 +141,10 @@ impl ControlState {
 
     pub(crate) fn check_signup_rate(&self, ip: IpAddr) -> bool {
         self.charge(&self.inner.signup_limiter, ip)
+    }
+
+    pub(crate) fn check_console_auth_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.console_auth_limiter, ip)
     }
 
     pub(crate) fn check_callback_rate(&self, ip: IpAddr) -> bool {

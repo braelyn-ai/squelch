@@ -30,6 +30,31 @@ struct AskBar: View {
     /// The conversation outlives this view — see AppStore.assistant.
     private var session: AssistantSession { store.assistant }
 
+    /// The email behind the bar, as the agent should hear about it — nil when
+    /// the bar was opened from a list. The summary lands a beat after the
+    /// thread id does (the viewer writes it when the thread arrives), and it is
+    /// read through `currentThreadSummary` so it is only ever this thread's: a
+    /// question asked in that gap still pins the thread, which is the part that
+    /// matters, and get_thread recovers the rest.
+    private var openEmail: OpenEmailContext? {
+        guard let threadId = store.threadId else { return nil }
+        return OpenEmailContext(threadId: threadId, summary: store.currentThreadSummary)
+    }
+
+    /// What the "in:" chip names, which is not the same email at every moment.
+    ///
+    /// While a run is open it names the email THAT RUN was asked under: the bar
+    /// can be reopened over another thread mid-answer, and a chip that followed
+    /// the reader would then claim the working question is about an email it has
+    /// never heard of. Idle, it names what the NEXT question would carry, which
+    /// is the reader's own thread. nil either way means no chip: a run asked
+    /// with nothing open has no email in it, whatever is behind the bar now.
+    private var chipSubject: String? {
+        session.running
+            ? session.activeAskEmail?.summary?.subject
+            : store.currentThreadSummary?.subject
+    }
+
     /// Scroll target pinned to the bottom of the log.
     private static let bottomAnchor = "askbar.bottom"
 
@@ -75,6 +100,25 @@ struct AskBar: View {
                 .font(Typo.sectionLabel)
                 .foregroundStyle(Palette.inkFaint)
                 .textCase(.uppercase)
+            // WHAT THE AGENT CAN SEE, said before the question is asked: the
+            // bar is opened over the reader often enough that "this email"
+            // should look like it means something. Shown only once the thread
+            // has landed — a subject is the only thing here worth naming — and
+            // it follows the RUN once one is open; see `chipSubject`.
+            if let subject = chipSubject {
+                Text("in: \(subject)")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkDim)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 230, alignment: .leading)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(Palette.hairline))
+                    .help(
+                        session.running
+                            ? "The assistant is working on a question about this email"
+                            : "This email is part of the question")
+            }
             Spacer()
             if !session.transcript.isEmpty {
                 Button {
@@ -127,7 +171,9 @@ struct AskBar: View {
         guard canSubmit else { return }
         let text = question.trimmed
         question = ""
-        session.send(text)
+        // The email goes WITH the question — read here, at ask time, so it can
+        // never name a thread the user has since walked away from.
+        session.send(text, openEmail: openEmail)
     }
 
     // MARK: - the tray

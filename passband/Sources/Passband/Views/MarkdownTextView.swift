@@ -9,6 +9,12 @@
 // setter, so the DraftSaver hook there keeps arming autosaves. Plain Enter
 // stays a newline (the ceremony's Enter binding declines in edit phase and the
 // event falls through to this view).
+//
+// THE APPKIT HALF, AND ONLY THAT. The span → attributes pass lives in
+// Views/MarkdownStyle.swift and is literally the same code on both platforms;
+// the UIKit twin is Sources/PassbandiOS/Views/MarkdownTextViewiOS.swift, which
+// declares `MarkdownTextView` under this exact name so no composer forks on
+// which OS it is running.
 
 import AppKit
 import SwiftUI
@@ -106,79 +112,5 @@ final class HighlightingTextView: NSTextView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         rehighlight()
-    }
-}
-
-/// Span kind → NSAttributedString attributes, shared by the live editor and
-/// the review preview so "what you typed" and "what you're about to send"
-/// cannot drift apart.
-@MainActor
-enum MarkdownStyle {
-    static let baseFont = NSFont.systemFont(ofSize: 13)
-
-    static var base: [NSAttributedString.Key: Any] {
-        [
-            .font: baseFont,
-            .foregroundColor: NSColor(Palette.ink),
-        ]
-    }
-
-    static func apply(_ span: MarkdownSpan, to storage: NSMutableAttributedString) {
-        let range = span.range
-        switch span.kind {
-        case .bold:
-            addTraits(.bold, storage, range)
-        case .italic:
-            addTraits(.italic, storage, range)
-        case .code, .codeBlock:
-            storage.addAttributes(
-                [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                    .backgroundColor: NSColor(Palette.hairline).withAlphaComponent(0.5),
-                ], range: range)
-        case .heading(let level):
-            let size: CGFloat = level == 1 ? 17 : (level == 2 ? 15 : 13.5)
-            storage.addAttribute(
-                .font, value: NSFont.systemFont(ofSize: size, weight: .semibold), range: range)
-        case .listMarker, .blockquoteMarker:
-            storage.addAttribute(.foregroundColor, value: NSColor(Palette.accent), range: range)
-        case .linkText:
-            storage.addAttributes(
-                [
-                    .foregroundColor: NSColor(Palette.accent),
-                    .underlineStyle: NSUnderlineStyle.single.rawValue,
-                ], range: range)
-        case .linkURL:
-            storage.addAttribute(
-                .foregroundColor, value: NSColor(Palette.inkFaintest), range: range)
-        case .marker:
-            storage.addAttribute(
-                .foregroundColor, value: NSColor(Palette.inkFaint), range: range)
-        }
-    }
-
-    /// The whole styled body as one attributed string — the review preview.
-    static func attributed(_ text: String) -> AttributedString {
-        let styled = NSMutableAttributedString(string: text, attributes: base)
-        for span in Markdown.spans(of: text) {
-            guard span.range.location + span.range.length <= styled.length else { continue }
-            apply(span, to: styled)
-        }
-        return AttributedString(styled)
-    }
-
-    /// Layer a symbolic trait onto whatever font the range already carries, so
-    /// bold inside a heading stays heading-sized.
-    private static func addTraits(
-        _ trait: NSFontDescriptor.SymbolicTraits, _ storage: NSMutableAttributedString,
-        _ range: NSRange
-    ) {
-        storage.enumerateAttribute(.font, in: range) { value, sub, _ in
-            let current = (value as? NSFont) ?? baseFont
-            let descriptor = current.fontDescriptor.withSymbolicTraits(
-                current.fontDescriptor.symbolicTraits.union(trait))
-            let font = NSFont(descriptor: descriptor, size: current.pointSize) ?? current
-            storage.addAttribute(.font, value: font, range: sub)
-        }
     }
 }

@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: app.passband
   deploymentTarget:
     macOS: "26.0"
+    iOS: "26.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -65,11 +66,136 @@ targets:
       - framework: vendor/Sparkle/Sparkle.framework
         embed: true
 
+  # The phone client. SAME Sources/Passband — the store, the wire types, the
+  # design tokens and the pairing flow are one codebase, and the only thing
+  # Sources/PassbandiOS adds is the shell shape (a tab bar instead of a window
+  # with a rail). Everything that cannot cross yet is named in `excludes` below,
+  # each with the phase that brings it over.
+  PassbandiOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Sources/Passband
+        excludes:
+          - "Resources/**"
+          # The Mac bundle's own plist and entitlements. XcodeGen only spares
+          # THIS target's INFOPLIST_FILE from the resources phase, so left in
+          # they would be copied over the iOS plist inside the same bundle.
+          - "Info.plist"
+          - "Passband.entitlements"
+          # The macOS app shell: NSApplicationDelegate, the window, the menu
+          # commands. PassbandiOSApp is its twin. RoutedHeader/RoutedHost live
+          # in RootView.swift, which is why the three routed views below cannot
+          # come over yet.
+          - "App/**"
+          # Sparkle. iOS has no sideloaded updater; the App Store is the updater.
+          - "Model/Updater.swift"
+          # The AppKit HALF of the reader, and only that: an NSViewRepresentable
+          # plus the WKWebView subclass that hands the scroll wheel back to the
+          # column. Everything the reader is made of — the body-preparation
+          # pipeline, the sandbox configuration, the measuring bridge, the frame
+          # pool and the SwiftUI EmailWebView itself — lives in
+          # Views/EmailWebCore.swift and compiles here; the UIKit twin is
+          # Sources/PassbandiOS/Views/EmailWebViewiOS.swift.
+          - "Views/EmailWebView.swift"
+          # --- phase 4: composing + the assistant -------------------------
+          # The AppKit HALF of the markdown editor, and only that: the scanner
+          # (Lib/Markdown.swift) and the span → attributes pass
+          # (Views/MarkdownStyle.swift) compile here, and the UIKit twin is
+          # Sources/PassbandiOS/Views/MarkdownTextViewiOS.swift, which declares
+          # `MarkdownTextView` under the same name so no composer forks.
+          - "Views/MarkdownTextView.swift"
+          # Needs ComposePane's ComposeSummaryRow.
+          - "Views/AskBar.swift"
+          # Needs AskBar. Otherwise portable — the palettes and the tour overlay
+          # it hosts all compile here already, and its TOAST half is re-laid-out
+          # for a thumb (over the tab bar, undo as a button) in
+          # Sources/PassbandiOS/Views/MobileToastHost.swift, off the same
+          # store.toasts / store.undos state.
+          - "Views/ActionLayer.swift"
+          # --- phase 4: the remaining destinations ------------------------
+          # The rail is the Mac's navigation model; the phone's is the tab bar.
+          - "Views/SidebarRail.swift"
+          # All three render inside RoutedHeader, which lives in the excluded
+          # App/RootView.swift. Nothing else about them is macOS-only.
+          - "Views/AuthView.swift"
+          - "Views/UsageView.swift"
+          - "Views/SettingsView.swift"
+      - path: Sources/PassbandiOS
+      # The same fonts and chimes the Mac ships, but NOT as one `Resources`
+      # folder reference the way the macOS target takes them. An iOS bundle is
+      # FLAT — its root IS the resources directory — and a folder literally
+      # named `Resources` at that root makes CFBundle read the bundle in the
+      # macOS layout and look for Info.plist inside it. installd then rejects
+      # the app with the memorable non-sequitur "Missing bundle ID".
+      #
+      # So: the chimes keep a `Sounds/` subdirectory, because Notifier looks
+      # them up by exactly that name, and the two font files sit at the root
+      # where Info.plist's UIAppFonts (and Typo's Bundle lookup) name them.
+      - path: Sources/Passband/Resources/Sounds
+        type: folder
+        buildPhase: resources
+      - path: Sources/Passband/Resources/newsreader-var.ttf
+        buildPhase: resources
+      - path: Sources/Passband/Resources/newsreader-italic-var.ttf
+        buildPhase: resources
+      # The same Icon Composer document the Mac ships. Its squares are
+      # "shared", so actool renders the one design for both platforms.
+      - path: Passband.icon
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.passband.client.ios
+        # NO PRODUCT_NAME override, so the bundle is PassbandiOS.app: XcodeGen
+        # derives a scheme's BuildableName from the TARGET name, and a product
+        # named otherwise leaves the scheme pointing at a file that never
+        # exists. The app still reads "Passband" everywhere a human sees it —
+        # CFBundleDisplayName and CFBundleName both say so in Info.plist.
+        #
+        # Hand-maintained, exactly as the Mac's is — see the note on the macOS
+        # target above. CFBundleURLTypes (passband://) lives there, not here.
+        INFOPLIST_FILE: Sources/PassbandiOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOS/PassbandiOS.entitlements
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        # iPhone only. The iPad layout is a different design, not a stretch.
+        TARGETED_DEVICE_FAMILY: "1"
+        # Overrides of macOS-shaped base settings. "Developer ID Application"
+        # does not exist on iOS and the hardened runtime is a macOS concept, so
+        # both are restated here for Release too; simulator builds sign ad-hoc.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_IDENTITY[config=Release]: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_HARDENED_RUNTIME[config=Release]: NO
+        # A physical iPhone refuses ad-hoc signatures, so device builds (and
+        # only device builds — the sdk pattern spares the simulator) sign as
+        # Apple Development under the team, and Xcode mints the certificate
+        # and profile on first run to a device.
+        DEVELOPMENT_TEAM: AAT39BQ9LV
+        CODE_SIGN_IDENTITY[sdk=iphoneos*]: "Apple Development"
+        CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]: "Apple Development"
+        ASSETCATALOG_COMPILER_APPICON_NAME: Passband
+    dependencies:
+      - sdk: WebKit.framework
+      - sdk: Security.framework
+      - sdk: UserNotifications.framework
+      # NO Sparkle: see the Updater.swift exclusion above.
+
 schemes:
   Passband:
     build:
       targets:
         Passband: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
+  PassbandiOS:
+    build:
+      targets:
+        PassbandiOS: all
     run:
       config: Debug
     archive:

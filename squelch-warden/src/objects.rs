@@ -137,6 +137,16 @@ pub const OAUTH_CLIENT_ID_KEY: &str = "client_id";
 /// See [`OAUTH_CLIENT_ID_KEY`].
 pub const OAUTH_CLIENT_SECRET_KEY: &str = "client_secret";
 
+/// Data key in the shared Anthropic key Secret
+/// ([`crate::config::Config::anthropic_secret_name`]). Named for the variable it
+/// becomes, so `kubectl create secret generic anthropic-api-key
+/// --from-literal=ANTHROPIC_API_KEY=...` is the whole command.
+///
+/// The reference is OPTIONAL (see [`daemon_env`]): a cluster with no such Secret
+/// starts every tenant pod anyway, and those daemons run heuristic-only triage
+/// rather than failing to boot.
+pub const ANTHROPIC_API_KEY_KEY: &str = "ANTHROPIC_API_KEY";
+
 /// Annotation on the pod template carrying the SHA-256 of the credential
 /// ciphertext this pod was rolled for.
 ///
@@ -168,6 +178,28 @@ pub const CREATED_AT_ANNOTATION: &str = "passband.email/created-at";
 /// managed-by label [`labels`] puts on every tenant object.
 pub const MANAGED_SELECTOR: &str = "app.kubernetes.io/managed-by=squelch-warden";
 
+/// The only path prefixes an Ingress routes to a tenant daemon.
+///
+/// **This is how `/mcp` answers 404 at the ingress layer.** The daemon serves
+/// four trees: `/client/*` (the human door's API), `/console/*` (the tenant's
+/// own browser console), `/t/*` (the read-tracking pixel), and `/mcp` (the
+/// agent door). Hosted publishes the human door only, so the Ingress declares
+/// the human-door prefixes and nothing else. A request for `/mcp`, or for
+/// anything else on a tenant vhost, matches no rule and the ingress controller
+/// answers its own 404 (both Traefik and ingress-nginx do).
+///
+/// An allowlist, not a deny rule, and deliberately: a deny rule has to name
+/// every spelling of the thing it is refusing, and it fails open when it misses
+/// one. This fails closed. The cost is that a new unauthenticated route in
+/// `squelch-api` needs a line here, which is a compile-time-visible list rather
+/// than a controller annotation nobody reads. `/console` is that cost being
+/// paid for the first time.
+pub const HUMAN_DOOR_PREFIXES: &[&str] = &["/client", "/console", "/t"];
+
+/// Namespace CoreDNS runs in on k3s. The one egress peer every tenant needs
+/// before it can resolve anything.
+pub const DNS_NAMESPACE: &str = "kube-system";
+
 /// Namespace the metrics collectors run in, and the prometheus-agent pod's own
 /// label. The single peer allowed to reach [`METRICS_PORT`].
 ///
@@ -179,26 +211,6 @@ pub const MONITORING_NAMESPACE: &str = "monitoring";
 /// See [`MONITORING_NAMESPACE`]. The label on the prometheus-agent pod template,
 /// which is also what its own Deployment selects on.
 pub const MONITORING_POD_LABEL: (&str, &str) = ("app.kubernetes.io/name", "prometheus-agent");
-
-/// The only path prefixes an Ingress routes to a tenant daemon.
-///
-/// **This is how `/mcp` answers 404 at the ingress layer.** The daemon serves
-/// exactly three trees: `/client/*` (the human door), `/t/*` (the read-tracking
-/// pixel), and `/mcp` (the agent door). Hosted publishes the human door only,
-/// so the Ingress declares the human-door prefixes and nothing else. A request
-/// for `/mcp`, or for anything else on a tenant vhost, matches no rule and the
-/// ingress controller answers its own 404 (both Traefik and ingress-nginx do).
-///
-/// An allowlist, not a deny rule, and deliberately: a deny rule has to name
-/// every spelling of the thing it is refusing, and it fails open when it misses
-/// one. This fails closed. The cost is that a new unauthenticated route in
-/// `squelch-api` needs a line here, which is a compile-time-visible list rather
-/// than a controller annotation nobody reads.
-pub const HUMAN_DOOR_PREFIXES: &[&str] = &["/client", "/t"];
-
-/// Namespace CoreDNS runs in on k3s. The one egress peer every tenant needs
-/// before it can resolve anything.
-pub const DNS_NAMESPACE: &str = "kube-system";
 
 /// The auto-applied label Kubernetes puts on every namespace, which is how a
 /// `namespaceSelector` names one without the warden needing to label it.
@@ -514,6 +526,15 @@ pub fn ingress(config: &Config, name: &TenantName) -> Ingress {
                             path_type: "Prefix".to_string(),
                             backend: backend.clone(),
                         })
+                        // The bare root, EXACT on purpose: it serves one
+                        // redirect to /console and nothing else. A Prefix "/"
+                        // would match EVERY path — including /mcp — and turn
+                        // this allowlist into decoration.
+                        .chain(std::iter::once(HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Exact".to_string(),
+                            backend: backend.clone(),
+                        }))
                         .collect(),
                 }),
             }]),
@@ -976,10 +997,10 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         }),
         ..Default::default()
     };
-    // Like `from_secret`, but the Secret is allowed to not exist yet. Required
-    // references make a missing Secret a pod that never starts; the one place
-    // this variant is used, that would be wrong (see the LLM block below).
-    let from_secret_optional = |key: &str, secret: String, data_key: &str| EnvVar {
+    // The same, but `optional: true`: the kubelet leaves the variable unset when
+    // the Secret or the key is missing instead of holding the pod in
+    // `CreateContainerConfigError` forever.
+    let from_optional_secret = |key: &str, secret: String, data_key: &str| EnvVar {
         name: key.to_string(),
         value_from: Some(EnvVarSource {
             secret_key_ref: Some(SecretKeySelector {
@@ -1033,9 +1054,35 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
             config.oauth_secret_name.clone(),
             OAUTH_CLIENT_SECRET_KEY,
         ),
+        // Stage-2 triage, from a Secret the cluster may simply not have. See
+        // [`ANTHROPIC_API_KEY_KEY`]: optional on purpose, because a tenant with
+        // no model triage is a working tenant and a tenant that will not start
+        // is not. The relay replaces this arrangement; until then it is the one
+        // production runs by hand. When both are present the daemon prefers
+        // SQUELCH_STAGE2_API_KEY (the relay's virtual key, below) over this
+        // var, so a minted tenant is already off the shared key. NOTE the two
+        // do not compose the other way: once the gateway base URL is set, an
+        // UNMINTED tenant presents this raw key to the gateway, which only
+        // accepts virtual keys — triage degrades to per-call 401s until the
+        // tenant is minted. Mint promptly; the stopgap Secret's deletion is
+        // part of the same rollout.
+        from_optional_secret(
+            "ANTHROPIC_API_KEY",
+            config.anthropic_secret_name.clone(),
+            ANTHROPIC_API_KEY_KEY,
+        ),
     ];
+
+    // The control plane's origin, behind the console's "Continue with Google"
+    // link. ABSENT when the operator did not configure one, rather than empty:
+    // the daemon treats a blank value as unset anyway, but an empty env var in a
+    // pod spec reads like a setting somebody meant to fill in.
+    if let Some(url) = &config.console_sso_url {
+        env.push(plain("SQUELCH_CONSOLE_SSO_URL", url));
+    }
+
     // The LLM gateway block, present only when the operator configured one.
-    // With it absent the vec above is byte-identical to what a warden without
+    // With it absent the env above is byte-identical to what a warden without
     // the feature built, which is the env-contract tests' whole claim.
     if let Some(base_url) = &config.llm_base_url {
         env.push(plain("SQUELCH_ANTHROPIC_BASE_URL", base_url));
@@ -1046,9 +1093,9 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         env.push(plain("SQUELCH_STAGE2_PROVIDER", "anthropic"));
         // The virtual key, from the Secret, never inline — and OPTIONAL: a
         // tenant whose key was never minted must still boot. The daemon
-        // fail-softs triage when the var is absent, which is a degraded tenant
-        // rather than a pod stuck in CreateContainerConfigError.
-        env.push(from_secret_optional(
+        // fail-softs triage when no key resolves at all; see the stopgap note
+        // above for what an unminted tenant does while that Secret lingers.
+        env.push(from_optional_secret(
             "SQUELCH_STAGE2_API_KEY",
             name.llm_secret(),
             LLM_API_KEY_KEY,
@@ -1452,6 +1499,85 @@ mod tests {
         assert_eq!(refs, vec!["passband-oauth", "passband-oauth"]);
     }
 
+    /// The console's Google half is dead without this: the daemon renders the
+    /// sign-in link only when `SQUELCH_CONSOLE_SSO_URL` is set, and nothing else
+    /// in the hosted path sets it.
+    #[test]
+    fn the_console_sso_url_reaches_the_daemon_when_it_is_configured() {
+        let mut c = test_config();
+        c.console_sso_url = Some("https://signup.passband.app".to_string());
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let var = pod.containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "SQUELCH_CONSOLE_SSO_URL")
+            .expect("SQUELCH_CONSOLE_SSO_URL is missing from the tenant pod");
+        // Plain, not a secretKeyRef: it is an origin that ends up in a public
+        // page, so there is nothing here to keep out of a pod spec.
+        assert_eq!(var.value.as_deref(), Some("https://signup.passband.app"));
+    }
+
+    /// Unset means ABSENT, not empty. A self-host daemon's console is the
+    /// pasted-code form alone, and a hosted deploy that has not configured the
+    /// control plane's origin gets the same page rather than a broken link.
+    #[test]
+    fn no_console_sso_url_means_no_variable_at_all() {
+        let c = test_config();
+        assert!(c.console_sso_url.is_none());
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        assert!(
+            !pod.containers[0]
+                .env
+                .clone()
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "SQUELCH_CONSOLE_SSO_URL")
+        );
+    }
+
+    /// The Stage-2 key, from a Secret that may not exist. `optional: true` is the
+    /// whole point: without it, a cluster that has not created the Secret holds
+    /// every tenant pod in `CreateContainerConfigError`.
+    #[test]
+    fn the_anthropic_key_is_an_optional_secret_reference() {
+        let c = test_config();
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let var = pod.containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ANTHROPIC_API_KEY")
+            .expect("ANTHROPIC_API_KEY is missing from the tenant pod");
+        assert!(var.value.is_none(), "the API key is inline in the pod spec");
+        let from = var.value_from.unwrap().secret_key_ref.unwrap();
+        assert_eq!(from.name, "anthropic-api-key");
+        assert_eq!(from.key, "ANTHROPIC_API_KEY");
+        assert_eq!(from.optional, Some(true));
+    }
+
+    #[test]
+    fn the_anthropic_secret_can_be_renamed() {
+        let mut c = test_config();
+        c.anthropic_secret_name = "passband-llm".to_string();
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let from = pod.containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ANTHROPIC_API_KEY")
+            .unwrap()
+            .value_from
+            .unwrap()
+            .secret_key_ref
+            .unwrap();
+        assert_eq!(from.name, "passband-llm");
+        assert_eq!(from.optional, Some(true));
+    }
+
     /// Every container bounded, and the one writable scratch volume bounded
     /// too. An unbounded tenant is every other tenant's problem.
     #[test]
@@ -1709,9 +1835,16 @@ mod tests {
 
         let paths = rules[0].http.clone().unwrap().paths;
         let declared: Vec<&str> = paths.iter().map(|p| p.path.as_deref().unwrap()).collect();
-        assert_eq!(declared, vec!["/client", "/t"]);
+        // The human door is the API, the browser console, the pixel, and the
+        // bare root's redirect. The agent door is not on this list and that is
+        // the whole point.
+        assert_eq!(declared, vec!["/client", "/console", "/t", "/"]);
         for path in &paths {
-            assert_eq!(path.path_type, "Prefix");
+            // "/" is Exact and everything else is Prefix: an Exact root
+            // matches one path in the universe, a Prefix root would match all
+            // of them.
+            let expected = if path.path.as_deref() == Some("/") { "Exact" } else { "Prefix" };
+            assert_eq!(path.path_type, expected, "{:?}", path.path);
             assert_eq!(
                 path.backend.service.as_ref().unwrap().name,
                 "alice",
@@ -1719,11 +1852,27 @@ mod tests {
             );
         }
         // The load-bearing assertion: nothing routes the agent door, under any
-        // spelling a Prefix match could reach.
-        for spelling in ["/mcp", "/mcp/", "/mcp/messages", "/"] {
+        // spelling. Prefix paths are checked as string prefixes (coarser than
+        // Kubernetes' element-wise match, so passing here passes there); the
+        // Exact root matches only a literal "/", which none of these are.
+        let prefixes: Vec<&str> = paths
+            .iter()
+            .filter(|p| p.path_type == "Prefix")
+            .map(|p| p.path.as_deref().unwrap())
+            .collect();
+        for spelling in ["/mcp", "/mcp/", "/mcp/messages", "/mcp/sse"] {
             assert!(
-                !declared.iter().any(|p| spelling.starts_with(*p)),
+                !prefixes.iter().any(|p| spelling.starts_with(*p)),
                 "{spelling} would be routed to the daemon"
+            );
+            assert_ne!(spelling, "/", "an Exact root cannot match {spelling}");
+        }
+        // ...and the new prefix reaches the console and stops there.
+        assert!(declared.contains(&"/console"));
+        for spelling in ["/console", "/console/callback", "/console/pair"] {
+            assert!(
+                declared.iter().any(|p| spelling.starts_with(*p)),
+                "{spelling} would 404 at the ingress"
             );
         }
     }
@@ -1902,12 +2051,19 @@ mod tests {
                 })
             );
         }
-        let declared: Vec<&str> = paths.iter().map(|p| p.path.as_deref().unwrap()).collect();
+        // Prefix paths are checked as string prefixes; the Exact root matches
+        // only a literal "/", which /metrics is not.
+        let prefixes: Vec<&str> = paths
+            .iter()
+            .filter(|p| p.path_type == "Prefix")
+            .map(|p| p.path.as_deref().unwrap())
+            .collect();
         for spelling in ["/metrics", "/metrics/"] {
             assert!(
-                !declared.iter().any(|p| spelling.starts_with(*p)),
+                !prefixes.iter().any(|p| spelling.starts_with(*p)),
                 "{spelling} would be routed to the daemon"
             );
+            assert_ne!(spelling, "/", "an Exact root cannot match {spelling}");
         }
     }
 

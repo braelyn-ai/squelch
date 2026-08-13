@@ -17,6 +17,11 @@ struct ActionLayer: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
+            // FIRST, so everything else in this layer stacks above it: the
+            // undo chip the tour teaches has to be visible over the tour's own
+            // scrim, and the rule editor it opens has to cover its card.
+            if store.tour.active { TourOverlay() }
+
             // Toast stack, bottom-left above every fullscreen surface. The
             // Spacers + fixedSize are load-bearing: a GlassEffectContainer
             // expands to the size it is offered, so an unconstrained one here

@@ -1,7 +1,22 @@
-# Every version tag (v*) builds the squelchd image for amd64 + arm64 and
-# pushes it to GHCR, so self-hosting is `docker compose up` + env vars — no
-# Rust toolchain on the box. The Dockerfile cross-compiles the non-native arch
-# (see squelchd/Dockerfile), so one amd64 runner covers both without QEMU.
+# Every version tag (v*) builds three images and pushes them to GHCR: squelchd
+# (self-hosting is `docker compose up` + env vars, no Rust toolchain on the
+# box), squelch-warden and squelch-control (the hosted planes, so a rebuilt node
+# pulls a tag instead of a human rebuilding it by hand — see
+# deploy/hosted/PRODUCTION.md).
+#
+# ARCHITECTURES DIFFER PER IMAGE, on purpose:
+#
+# - squelchd is amd64 + arm64. Its Dockerfile cross-compiles the non-native arch
+#   (see squelchd/Dockerfile), so one amd64 runner covers both and no emulation
+#   is involved.
+# - squelch-warden and squelch-control are amd64 ONLY. Their Dockerfiles build
+#   natively for the runner's arch, so a second platform would mean QEMU, and
+#   under emulation these compile the ONNX tree — plausibly past the six-hour
+#   job ceiling, in a job that holds a registry-write token the whole time. The
+#   one box that runs them (`carrier`) is amd64, so the foreign half was
+#   building nothing anybody deploys. arm64 comes back when there is a native
+#   arm runner or a cross-compiling Dockerfile of squelchd's shape — not by
+#   re-adding binfmt.
 name: release
 
 on:
@@ -47,3 +62,82 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The in-cluster tenant provisioner. Published so replacing the k3s node is a
+  # pull rather than a hand-build on the box, which is what PRODUCTION.md's
+  # registry gap was.
+  warden-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same scheme as squelchd: v0.2.0 => 0.2.0, 0.2, latest; a non-semver tag
+      # falls back to its literal name via type=ref.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/squelch-warden
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.warden
+          # amd64 only; see the header. Dockerfile.warden builds natively, and
+          # emulating the ONNX build is not worth an arch nothing runs.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # A named scope, unlike squelchd's default: three jobs sharing one
+          # GHA cache scope evict each other's layers on every tag.
+          cache-from: type=gha,scope=warden
+          cache-to: type=gha,mode=max,scope=warden
+
+  # The hosted signup plane. Railway builds its own image from this repo, so
+  # this tag is for reproducibility and for anyone running the control plane
+  # somewhere Railway is not.
+  control-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/squelch-control
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.control
+          # amd64 only, for the reason the warden job gives.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=control
+          cache-to: type=gha,mode=max,scope=control

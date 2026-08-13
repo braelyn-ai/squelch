@@ -59,6 +59,35 @@ fn migrate_adds_auth_pass_null_to_a_preexisting_messages_table() {
 }
 
 #[test]
+fn migrate_adds_to_addrs_null_so_old_sent_mail_enters_the_backfill_queue() {
+    // An install predating the display-recipients column. The migration adds it,
+    // every historical row rests at NULL — which IS the backfill queue predicate
+    // (`is_sent=1 AND to_addrs IS NULL`), since only a network pass can fill it.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, body TEXT, is_sent INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO messages(id, account_id, gmail_msg_id, body, is_sent)
+             VALUES (1, 1, 'g1', 'old', 1);",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)").unwrap();
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "to_addrs"));
+    let existing: Option<String> = conn
+        .query_row("SELECT to_addrs FROM messages WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(existing, None, "old sent mail is queued, never invented");
+}
+
+#[test]
 fn migrate_adds_field_reasons_to_a_preexisting_triage_table() {
     // An install whose `triage` has no field_reasons. `model_used`/`status`
     // are present because the two-stage backfill in migrate() reads them.

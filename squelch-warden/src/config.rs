@@ -52,6 +52,15 @@ pub const DEFAULT_TLS_SECRET: &str = "passband-wildcard-tls";
 /// boot. See `deploy/hosted/SETUP.md`, "The Google OAuth client".
 pub const DEFAULT_OAUTH_SECRET_NAME: &str = "google-oauth-client";
 
+/// Secret holding the Anthropic API key tenant daemons run Stage-2 triage with.
+///
+/// One Secret, shared by every tenant, in the tenant namespace, and the
+/// `secretKeyRef` that reads it is OPTIONAL: a cluster with no such Secret still
+/// starts every tenant pod, and those daemons run heuristic-only triage. This is
+/// the bridge arrangement production already runs by hand (issue #33); when the
+/// relay ships, the key stops living in the cluster at all.
+pub const DEFAULT_ANTHROPIC_SECRET_NAME: &str = "anthropic-api-key";
+
 /// k3s's built-in dynamic provisioner.
 pub const DEFAULT_STORAGE_CLASS: &str = "local-path";
 
@@ -176,6 +185,20 @@ pub struct Config {
     /// refreshes with, in [`Config::namespace`]. See
     /// [`DEFAULT_OAUTH_SECRET_NAME`].
     pub oauth_secret_name: String,
+    /// Secret holding the Anthropic API key tenant daemons read, in
+    /// [`Config::namespace`]. See [`DEFAULT_ANTHROPIC_SECRET_NAME`]: the
+    /// reference is optional, so a missing Secret is a tenant without model
+    /// triage rather than a tenant that will not start.
+    pub anthropic_secret_name: String,
+    /// The control plane's origin, injected into every tenant daemon as
+    /// `SQUELCH_CONSOLE_SSO_URL`. Optional, and the whole hosted/self-host split
+    /// of the console login page: set it and each tenant's console renders a
+    /// "Continue with Google" link back to the control plane, leave it unset and
+    /// the console offers the pasted-code form only.
+    ///
+    /// A LINK TARGET and nothing more. No trust flows from it: what comes back
+    /// from that hop is a pairing code the tenant's own store adjudicates.
+    pub console_sso_url: Option<String>,
     pub storage_class: String,
     pub storage_size: String,
     /// Bounds on the tenant daemon container.
@@ -247,6 +270,8 @@ impl std::fmt::Debug for Config {
             .field("ingress_class", &self.ingress_class)
             .field("tls_secret", &self.tls_secret)
             .field("oauth_secret_name", &self.oauth_secret_name)
+            .field("anthropic_secret_name", &self.anthropic_secret_name)
+            .field("console_sso_url", &self.console_sso_url)
             .field("storage_class", &self.storage_class)
             .field("storage_size", &self.storage_size)
             .field("daemon_resources", &self.daemon_resources)
@@ -486,6 +511,11 @@ impl Config {
             Some(raw) => Some(canonical_cidr(&raw)?),
         };
 
+        let console_sso_url = match var(get, "SQUELCH_WARDEN_CONSOLE_SSO_URL") {
+            None => None,
+            Some(raw) => Some(canonical_origin(&raw)?),
+        };
+
         let llm_base_url = match var(get, "SQUELCH_WARDEN_LLM_BASE_URL") {
             None => None,
             Some(raw) => Some(canonical_llm_base_url(&raw)?),
@@ -541,6 +571,12 @@ impl Config {
                 "SQUELCH_WARDEN_OAUTH_SECRET_NAME",
                 DEFAULT_OAUTH_SECRET_NAME,
             )?,
+            anthropic_secret_name: name_var(
+                get,
+                "SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME",
+                DEFAULT_ANTHROPIC_SECRET_NAME,
+            )?,
+            console_sso_url,
             storage_class: name_var(get, "SQUELCH_WARDEN_STORAGE_CLASS", DEFAULT_STORAGE_CLASS)?,
             storage_size: quantity_var(get, "SQUELCH_WARDEN_STORAGE_SIZE", DEFAULT_STORAGE_SIZE)?,
             daemon_resources: Resources {
@@ -659,6 +695,54 @@ fn canonical_image(raw: &str) -> Result<String, ConfigError> {
         ));
     }
     Ok(image.to_string())
+}
+
+/// Validate the console SSO origin: a scheme, a host, and nothing after them.
+///
+/// It rides into every tenant pod and out again as the `href` on the console's
+/// sign-in link, so the failure modes are a browser's rather than an API
+/// server's. A value with no scheme would resolve RELATIVE to the tenant's own
+/// origin, which is a link that sends the user back to the page they are already
+/// on; a path or a query on the end would be silently overwritten, because the
+/// daemon builds the whole URL itself from this origin plus the tenant label.
+///
+/// The daemon applies the same rule in `squelch-api`'s `with_console_sso_url`,
+/// where an unusable value is simply dropped and the button does not render.
+/// Here it is a refusal to boot instead, because an operator who set it meant to
+/// have console SSO and a silently missing button is not a thing anyone notices.
+fn canonical_origin(raw: &str) -> Result<String, ConfigError> {
+    let url = raw.trim().trim_end_matches('/');
+    if url.len() > 512 {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_CONSOLE_SSO_URL is longer than 512 characters",
+        ));
+    }
+    let lower = url.to_ascii_lowercase();
+    let host = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .ok_or_else(|| {
+            ConfigError::invalid(
+                "SQUELCH_WARDEN_CONSOLE_SSO_URL must start with https:// or http:// (e.g. https://signup.passband.app)",
+            )
+        })?;
+    if host.is_empty() {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_CONSOLE_SSO_URL has a scheme and no host",
+        ));
+    }
+    // Origin only: the daemon appends the route and the tenant label itself.
+    if host.contains('/') || host.contains('?') || host.contains('#') {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_CONSOLE_SSO_URL must be an origin with no path, query or fragment (e.g. https://signup.passband.app)",
+        ));
+    }
+    if url.contains(char::is_whitespace) {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_CONSOLE_SSO_URL contains whitespace",
+        ));
+    }
+    Ok(url.to_string())
 }
 
 /// Validate the node CIDR: an address and a prefix length, both parsed.
@@ -811,6 +895,7 @@ mod tests {
         assert_eq!(c.ingress_class, "traefik");
         assert_eq!(c.tls_secret, "passband-wildcard-tls");
         assert_eq!(c.oauth_secret_name, "google-oauth-client");
+        assert_eq!(c.anthropic_secret_name, "anthropic-api-key");
         assert_eq!(c.storage_class, "local-path");
         assert_eq!(c.storage_size, "10Gi");
         assert_eq!(c.daemon_resources.cpu_request, "100m");
@@ -828,6 +913,7 @@ mod tests {
         assert!(c.node_cidr.is_none());
         assert!(c.model_pvc.is_none());
         assert!(c.pull_secret.is_none());
+        assert!(c.console_sso_url.is_none());
         // The LLM env feature is off unless the operator turns it on.
         assert!(c.llm_base_url.is_none());
         assert!(c.llm_stage1_model.is_none());
@@ -863,6 +949,7 @@ mod tests {
             ("SQUELCH_WARDEN_INGRESS_NAMESPACE", "kube system"),
             ("SQUELCH_WARDEN_TLS_SECRET", "Wildcard"),
             ("SQUELCH_WARDEN_OAUTH_SECRET_NAME", "oauth_client"),
+            ("SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME", "Anthropic_Key"),
             ("SQUELCH_WARDEN_MODEL_PVC", "Models"),
             ("SQUELCH_WARDEN_IMAGE_PULL_SECRET", "GHCR"),
             // The ingress peer, which is a label rather than a name.
@@ -899,6 +986,23 @@ mod tests {
             ("SQUELCH_WARDEN_NODE_CIDR", "10.0.0.5/33"),
             ("SQUELCH_WARDEN_NODE_CIDR", "0.0.0.0/0"),
             ("SQUELCH_WARDEN_NODE_CIDR", "the node"),
+            // The console SSO origin, which becomes an href in a browser.
+            // Schemeless would resolve against the tenant's own origin.
+            ("SQUELCH_WARDEN_CONSOLE_SSO_URL", "signup.passband.app"),
+            (
+                "SQUELCH_WARDEN_CONSOLE_SSO_URL",
+                "https://signup.passband.app/console/auth",
+            ),
+            (
+                "SQUELCH_WARDEN_CONSOLE_SSO_URL",
+                "https://signup.passband.app?tenant=alice",
+            ),
+            ("SQUELCH_WARDEN_CONSOLE_SSO_URL", "https://"),
+            (
+                "SQUELCH_WARDEN_CONSOLE_SSO_URL",
+                "https://signup passband.app",
+            ),
+            ("SQUELCH_WARDEN_CONSOLE_SSO_URL", "javascript:alert(1)"),
             // The gateway URL: https or nothing, and always with a host.
             ("SQUELCH_WARDEN_LLM_BASE_URL", "http://llm.internal"),
             ("SQUELCH_WARDEN_LLM_BASE_URL", "llm.internal"),
@@ -952,6 +1056,31 @@ mod tests {
                 .unwrap()
                 .oauth_secret_name,
             "passband-oauth"
+        );
+        assert_eq!(
+            with("SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME", "passband-llm")
+                .unwrap()
+                .anthropic_secret_name,
+            "passband-llm"
+        );
+        // Trimmed, and the trailing slash removed: the daemon appends the route.
+        assert_eq!(
+            with(
+                "SQUELCH_WARDEN_CONSOLE_SSO_URL",
+                " https://signup.passband.app/ "
+            )
+            .unwrap()
+            .console_sso_url
+            .as_deref(),
+            Some("https://signup.passband.app")
+        );
+        // http for a local control plane, and a port is part of an origin.
+        assert_eq!(
+            with("SQUELCH_WARDEN_CONSOLE_SSO_URL", "http://localhost:8853")
+                .unwrap()
+                .console_sso_url
+                .as_deref(),
+            Some("http://localhost:8853")
         );
     }
 

@@ -16,6 +16,16 @@
 // The body is markdown, styled LIVE with the markers kept visible (see
 // MarkdownTextView); the daemon renders the HTML half of what actually goes
 // out from this same source (`body_format: "markdown"`).
+//
+// ON A PHONE THE PANE IS A SHEET, and that is the only structural difference:
+// MobileRootView presents this same view at `.large` off the same
+// `store.compose`, so opening, restoring, autosaving and sending are one code
+// path on both platforms. What is fenced below is the DESKTOP FURNITURE only —
+// the key hints (there is no Esc to promise), the pane's glass edge and its
+// leftward shadow (a sheet brings its own ground), and the labels that named
+// keys. The ceremony itself, both phases of it, is shared and untouched: a
+// phone drives it with the footer buttons that were always there beside the
+// hints.
 
 import SwiftUI
 
@@ -51,8 +61,16 @@ struct ComposePane: View {
                 footer(compose)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .passbandGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
-            .shadow(color: .black.opacity(0.24), radius: 40, x: -14)
+            // A pane is an EDGE in a window: glass, and a shadow thrown left
+            // over the page it half-covers. A sheet is neither — it has its own
+            // presented shape and nothing beside it to cast onto — so the phone
+            // takes the plain canvas the rest of its surfaces stand on.
+            #if os(macOS)
+                .passbandGlass(.pane, cornerRadius: 0, tint: Palette.glassTintStrong)
+                .shadow(color: .black.opacity(0.24), radius: 40, x: -14)
+            #else
+                .background(Palette.canvas)
+            #endif
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
             .onAppear { if !inReview { focusedField = .to } }
@@ -61,18 +79,33 @@ struct ComposePane: View {
 
     private func header(_ compose: ComposeState) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(inReview ? "review · confirm send" : "compose")
-                .font(Typo.sectionLabel)
-                .foregroundStyle(Palette.ink)
-                .textCase(.uppercase)
+            // THE SERIF MOMENT. On the Mac this line is one engraved label among
+            // the rail, the zone heads and the page chrome, and a second display
+            // face there would be wallpaper. A sheet has no chrome around it —
+            // it IS the screen — so the phone spends Newsreader here, once, on
+            // the word that names what you are doing.
+            #if os(macOS)
+                Text(inReview ? "review · confirm send" : "compose")
+                    .font(Typo.sectionLabel)
+                    .foregroundStyle(Palette.ink)
+                    .textCase(.uppercase)
+            #else
+                Text(inReview ? "review" : "compose")
+                    .font(Typo.serif(24, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+            #endif
             Text(compose.replyToMessageId != nil ? "reply" : "new message")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
             Spacer()
-            HStack(spacing: 4) {
-                Kbd("Esc")
-                Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            }
+            // The key chip is the Mac's promise that a key does this. A phone
+            // closes the sheet by dragging it or by the footer's own button.
+            #if os(macOS)
+                HStack(spacing: 4) {
+                    Kbd("Esc")
+                    Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                }
+            #endif
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
@@ -81,10 +114,12 @@ struct ComposePane: View {
 
     private func footer(_ compose: ComposeState) -> some View {
         HStack(spacing: 8) {
-            hint
+            #if os(macOS)
+                hint
+            #endif
             Spacer()
             if inReview {
-                Button("esc back") { patch { $0.phase = .edit; $0.error = nil } }
+                Button(ComposeLabels.back) { patch { $0.phase = .edit; $0.error = nil } }
                     .buttonStyle(.glass)
                 if guarded {
                     Button(compose.sending ? "sending…" : "override + send") {
@@ -106,7 +141,7 @@ struct ComposePane: View {
                 // is up, and a switch beside the send button is a switch nobody
                 // meant to touch.
                 TrackerToggle(on: bindFlag(\.includeTracker))
-                Button("esc cancel") { store.closeCompose() }
+                Button(ComposeLabels.cancel) { store.closeCompose() }
                     .buttonStyle(.glass)
                 Button("review →") { toReview() }
                     .buttonStyle(.glassProminent)
@@ -132,9 +167,11 @@ struct ComposePane: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
                     Text("body").font(Typo.micro).foregroundStyle(Palette.inkFaint)
-                    Text("markdown — **bold**, *italic*, `code`, [links](url)")
+                    Text("markdown: **bold**, *italic*, `code`, [links](url)")
                         .font(Typo.micro)
                         .foregroundStyle(Palette.inkFaintest)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                 }
                 MarkdownTextView(text: bind(\.body))
                     .frame(maxHeight: .infinity)
@@ -192,9 +229,16 @@ struct ComposePane: View {
                 HStack(spacing: 4) {
                     Text("outbound guard: not yet checked ·")
                         .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    Kbd("enter")
-                    Text("submits for the verdict")
-                        .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    // Which act fetches the verdict, named as the reader's own
+                    // surface offers it: a key on the Mac, the button on a phone.
+                    #if os(macOS)
+                        Kbd("enter")
+                        Text("submits for the verdict")
+                            .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    #else
+                        Text("send submits for the verdict")
+                            .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    #endif
                 }
             } else {
                 GuardVerdictBox(kinds: compose.guardKinds)
@@ -229,16 +273,21 @@ struct ComposePane: View {
 
     // MARK: - keymap
 
-    /// True while the caret sits in the body editor. The body is an NSTextView
-    /// now (FocusState cannot see into AppKit), and plain Enter there must stay
-    /// a newline.
+    /// True while the caret sits in the body editor. The body is a platform text
+    /// view (FocusState cannot see into AppKit or UIKit), and plain Enter there
+    /// must stay a newline.
+    ///
+    /// `@FocusState` is deliberately NOT the answer on either side: it tracks
+    /// the SwiftUI fields above (to, subject) and has no opinion about a
+    /// representable's first responder. AppKit is asked directly; UIKit
+    /// publishes no current-responder API, so the editors report themselves into
+    /// `MarkdownFocus` and this reads that. Same fact, same freshness — dynamic
+    /// on every evaluation, never a flag someone has to remember to clear.
     private var bodyHasFocus: Bool {
         #if os(macOS)
             NSApp.keyWindow?.firstResponder is NSTextView
         #else
-            // The body editor has no non-AppKit twin yet, and "not focused" is
-            // the safe answer: Enter reviews instead of inserting a newline.
-            false
+            MarkdownFocus.shared.isEditing
         #endif
     }
 
@@ -372,6 +421,25 @@ struct ComposePane: View {
             }
         }
     }
+}
+
+// MARK: - labels
+
+/// The two buttons whose LABEL names a key. Both composers say them, and on a
+/// phone the key half is a promise nothing can keep — there is no Esc — so the
+/// verb stands alone rather than teaching a shortcut that does not exist.
+enum ComposeLabels {
+    #if os(macOS)
+        static let back = "esc back"
+        static let cancel = "esc cancel"
+        static let dismiss = "esc dismiss"
+    #else
+        static let back = "back"
+        static let cancel = "cancel"
+        // "dismiss", never "discard": closing a composer FLUSHES its draft, so
+        // the reply is kept and restored next time, not thrown away.
+        static let dismiss = "dismiss"
+    #endif
 }
 
 // MARK: - shared review chrome

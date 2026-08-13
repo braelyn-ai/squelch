@@ -7,6 +7,11 @@
 // TWO PAGES, one list: the inbox and the noise bin (`n`, or the header's noise
 // count). Only the DATA SOURCE differs — every verb, the queue handed to the
 // reader and the cursor behave identically on noise rows.
+//
+// A THIRD PAGE, `sent`, shares the chrome and the cursor but not the verbs: it
+// holds outbound mail, which nothing triaged and no verb here can resolve. So
+// the rows are SentRows, j/k/Enter work exactly as they do everywhere else, and
+// r/e/d/v/f are inert rather than acting on a row they have no meaning for.
 
 import SwiftUI
 
@@ -20,8 +25,10 @@ struct EmailsView: View {
     @State private var hovering = false
 
     private var mode: MailMode { store.mailMode }
-    /// The cached page for whichever mode is showing.
+    /// The cached page for whichever INBOX-shaped mode is showing (sent has its
+    /// own wire type and its own cache — see `sentPage`).
     private var page: Loadable<[AttentionUpdate]> { store.mailPage(mode) }
+    private var sentPage: Loadable<[SentItem]> { store.sentPage }
 
     /// The cached page MINUS anything resolved since it was fetched: the page
     /// only reloads on the 10s `store.lastRefresh` poll, so without this filter
@@ -29,28 +36,135 @@ struct EmailsView: View {
     private var rows: [AttentionUpdate] {
         (page.value ?? []).filter { !store.resolvedIds.contains($0.id) }
     }
+    /// Sent rows are NOT filtered against `resolvedIds`: a resolve is an inbox
+    /// verdict, and it must never delete a record of something you sent.
+    private var sent: [SentItem] { sentPage.value ?? [] }
+
     private var selected: AttentionUpdate? { rows[safe: index] }
+    private var selectedSent: SentItem? { sent[safe: index] }
+    /// However many rows the page on screen has — the cursor's only bound.
+    private var rowCount: Int { mode == .sent ? sent.count : rows.count }
+    /// The row under the cursor as the two things every page can answer: the
+    /// message id (a `.task` key, and the scroll target) and the thread to warm.
+    private var cursorRow: (id: Int, threadId: String)? {
+        if mode == .sent { return selectedSent.map { ($0.id, $0.thread_id) } }
+        return selected.map { ($0.id, $0.thread_id) }
+    }
     /// Action keys are inert unless something is actually highlighted.
     private var actionable: Bool { kbActive || hovering }
+    /// The triage verbs on top of that: sent mail has no triage to act on.
+    private var triageable: Bool { actionable && mode != .sent }
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            #if os(macOS)
+                desktopList
+            #else
+                phoneList
+            #endif
+        }
+        .keyBindings(.list, bindings)
+        // Fires on mount, on each 10s poll AND on a mode switch — only the page
+        // being shown is refreshed, so the noise page costs nothing until you go
+        // there. The store's short TTL is what makes the mount half free when a
+        // tick just landed; the tick half always outruns it and refreshes for real.
+        .task(id: RefreshKey(tick: store.lastRefresh, mode: mode)) {
+            if mode == .sent {
+                await store.refreshSent()
+            } else {
+                await store.refreshMail(mode)
+            }
+        }
+        // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
+        // a 500-row list fires one request for the row you stop on rather than
+        // one per row you pass. Covers everything past the bounded head-warm.
+        .task(id: cursorRow?.id) {
+            guard let row = cursorRow else { return }
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            ThreadPrefetch.shared.prefetch(row.threadId)
+        }
+        .onChange(of: rowCount) { _, count in
+            index = max(0, min(index, count - 1))
+        }
+        // A mode switch replaces every row, so the cursor cannot keep its index —
+        // it would land on an unrelated email, and the verbs act on the highlight.
+        .onChange(of: mode) { _, _ in
+            index = 0
+            kbActive = false
+            hovering = false
+        }
+        // Jump to (and highlight) a hand-off target from the sitrep rails.
+        .onChange(of: store.selectedId) { _, id in
+            guard let id, let i = rows.firstIndex(where: { $0.id == id }) else { return }
+            kbActive = true
+            index = i
+        }
+    }
+
+    // MARK: - the lists
+
+    /// The three inline notes for the mail / noise pages, shared by both
+    /// layouts. Each is gated on having NO rows at all: a reload keeps the last
+    /// page on screen, so a revisit — or a failure while offline — updates
+    /// underneath what you are already reading instead of replacing it with a
+    /// word. The sent page carries its own notes inside `sentList`.
+    @ViewBuilder
+    private var note: some View {
+        if let error = page.error, page.value == nil {
+            BandNote(error)
+        } else if page.value == nil {
+            BandNote(mode == .noise ? "loading noise…" : "loading mail…")
+        } else if rows.isEmpty {
+            // The window the daemon answers with is 30 days, so an empty noise
+            // page says so rather than implying "ever".
+            BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
+        }
+    }
+
+    /// The sent rows, same three gated notes. The reader opens with NO queue:
+    /// "done + next" walks a triage list, and there is nothing to finish here.
+    @ViewBuilder private var sentList: some View {
+        if let error = sentPage.error, sentPage.value == nil {
+            BandNote(error)
+        } else if sentPage.value == nil {
+            BandNote("loading sent…")
+        } else if sent.isEmpty {
+            BandNote("Nothing sent yet.")
+        } else {
+            ForEach(Array(sent.enumerated()), id: \.element.id) { i, item in
+                SentRow(
+                    item: item,
+                    selected: kbActive && i == index,
+                    onHover: {
+                        hovering = true
+                        kbActive = false
+                        index = i
+                    },
+                    onOpen: { store.openThread(item.thread_id) }
+                )
+                .id(item.id)
+            }
+        }
+    }
+
+    /// The scroll target for a row position on whichever page is showing.
+    private func rowId(at i: Int) -> Int? {
+        mode == .sent ? sent[safe: i]?.id : rows[safe: i]?.id
+    }
+
+    private var hasRows: Bool { page.value != nil && page.error == nil && !rows.isEmpty }
+
+    #if os(macOS)
+        private var desktopList: some View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 1) {
-                        // Both notes are gated on having NO rows at all. A reload
-                        // keeps the last page on screen, so a revisit — or a
-                        // failure while offline — updates underneath what you are
-                        // already reading instead of replacing it with a word.
-                        if let error = page.error, page.value == nil {
-                            BandNote(error)
-                        } else if page.value == nil {
-                            BandNote(mode == .noise ? "loading noise…" : "loading mail…")
-                        } else if rows.isEmpty {
-                            // The window the daemon answers with is 30 days, so an
-                            // empty noise page says so rather than implying "ever".
-                            BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
+                        if mode == .sent {
+                            sentList
+                        } else if !hasRows {
+                            note
                         } else {
                             ForEach(Array(rows.enumerated()), id: \.element.id) { i, u in
                                 UpdateRow(
@@ -74,53 +188,113 @@ struct EmailsView: View {
                     .padding(.vertical, 10)
                 }
                 .onChange(of: index) { _, i in
-                    // Follow the KEYBOARD selection only.
-                    guard kbActive, let u = rows[safe: i] else { return }
-                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(u.id, anchor: .center) }
+                    // Follow the KEYBOARD selection only. Both pages key their
+                    // rows on the message id, so one scroll target serves both.
+                    guard kbActive, let id = rowId(at: i) else { return }
+                    withAnimation(Motion.scrollFollow) { proxy.scrollTo(id, anchor: .center) }
                 }
             }
             .onContinuousHover { phase in
                 if case .ended = phase { hovering = false }
             }
         }
-        .keyBindings(.list, bindings)
-        // Fires on mount, on each 10s poll AND on a mode switch — only the page
-        // being shown is refreshed, so the noise page costs nothing until you go
-        // there. The store's short TTL is what makes the mount half free when a
-        // tick just landed; the tick half always outruns it and refreshes for real.
-        .task(id: RefreshKey(tick: store.lastRefresh, mode: mode)) {
-            await store.refreshMail(mode)
+    #endif
+
+    #if !os(macOS)
+        /// A REAL `List` on the phone, and only on the phone. Everything else in
+        /// this app draws its rows into a LazyVStack because the Mac's lists are
+        /// keyboard surfaces that need a cursor, an anchor and a scroll-to; none
+        /// of that survives contact with a thumb, and what a thumb wants instead —
+        /// `swipeActions`, full-swipe commit, the rubber-band, the system's own
+        /// timing — is something only `List` can hand over. Reimplementing it
+        /// would be a worse copy of a control the OS ships.
+        ///
+        /// The design skin survives intact: plain style, no separators, clear row
+        /// backgrounds, and the app's own `UpdateRow` inside. What the List
+        /// contributes is the gesture, not the look.
+        private var phoneList: some View {
+            List {
+                if mode == .sent {
+                    // Sent rows carry no triage, so no swipe verbs — the row is
+                    // a door to the thread and nothing else (`triageable` says
+                    // the same thing to the keyboard).
+                    sentList.plainRow()
+                } else if !hasRows {
+                    note.plainRow()
+                } else {
+                    ForEach(rows) { u in
+                        let verbs = UpdateVerbs(update: u, queue: rows)
+                        UpdateRow(
+                            update: u,
+                            selected: false,
+                            onHover: {},
+                            onOpen: verbs.open
+                        )
+                        .plainRow()
+                        .swipeVerbs(verbs)
+                        .updateContextMenu(verbs)
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .environment(\.defaultMinListRowHeight, 0)
         }
-        // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
-        // a 500-row list fires one request for the row you stop on rather than
-        // one per row you pass. Covers everything past the bounded head-warm.
-        .task(id: selected?.id) {
-            guard let u = selected else { return }
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled else { return }
-            ThreadPrefetch.shared.prefetch(u.thread_id)
-        }
-        .onChange(of: rows.count) { _, count in
-            index = max(0, min(index, count - 1))
-        }
-        // A mode switch replaces every row, so the cursor cannot keep its index —
-        // it would land on an unrelated email, and the verbs act on the highlight.
-        .onChange(of: mode) { _, _ in
-            index = 0
-            kbActive = false
-            hovering = false
-        }
-        // Jump to (and highlight) a hand-off target from the sitrep rails.
-        .onChange(of: store.selectedId) { _, id in
-            guard let id, let i = rows.firstIndex(where: { $0.id == id }) else { return }
-            kbActive = true
-            index = i
-        }
-    }
+    #endif
 
     // MARK: - header
 
+    /// A Mac's page header is also the app's chrome bar: wordmark, counts, the
+    /// freshness stamp, and the doors to auth / audit / shortcuts / theme. A
+    /// phone has a navigation bar for the name and a tab bar for the doors, so
+    /// all that is left up here is the one thing this page owns — which of the
+    /// two lists you are looking at, and how much is in the other one.
+    @ViewBuilder
     private var header: some View {
+        #if os(macOS)
+            desktopHeader
+        #else
+            phoneHeader
+        #endif
+    }
+
+    #if !os(macOS)
+        private var phoneHeader: some View {
+            @Bindable var store = store
+            let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
+
+            return HStack(spacing: 10) {
+                GlassSegmented(
+                    options: MailMode.allCases.map { ($0, $0.label) },
+                    selection: $store.mailMode)
+                Spacer(minLength: 8)
+                if let err = store.refreshError {
+                    Text("offline")
+                        .font(Typo.micro).foregroundStyle(Palette.warn)
+                        .help(err.message)
+                } else if mode == .inbox, noise > 0 {
+                    // The count is the door to the page it counts, same as on the
+                    // Mac — just without the word "signal" beside it, because the
+                    // list underneath is already the signal.
+                    Button { store.mailMode = .noise } label: {
+                        HStack(spacing: 6) {
+                            Text("\(noise)")
+                                .font(Typo.num(12, weight: .bold))
+                                .foregroundStyle(Palette.inkFaint)
+                            Text("noise").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+        }
+    #endif
+
+    #if os(macOS)
+    private var desktopHeader: some View {
         @Bindable var store = store
         let signal = store.sitrep.standing.count + store.sitrep.new.count + store.sitrep.open.count
         let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
@@ -191,6 +365,7 @@ struct EmailsView: View {
         .padding(.bottom, 12)
         .overlay(alignment: .bottom) { Hairline() }
     }
+    #endif
 
     // MARK: - keymap
 
@@ -201,26 +376,34 @@ struct EmailsView: View {
             KeyBinding("ArrowDown", "next") { moveByKey(+1) },
             KeyBinding("ArrowUp", "prev") { moveByKey(-1) },
             // A LADDER, the same shape as the reader closing over a still-open
-            // side panel: from the noise page Escape steps back to the inbox, and
-            // only a second press leaves the tab.
+            // side panel: from any page that is not the inbox Escape steps back
+            // to it, and only a second press leaves the tab.
             KeyBinding("Escape", "back") {
-                if mode == .noise {
+                if mode != .inbox {
                     store.mailMode = .inbox
                 } else {
                     store.setView(.sitrep)
                 }
             },
             // One key both ways — noise is a page you dip into, not a mode you
-            // have to remember you are in.
+            // have to remember you are in. It stays the inbox/noise flip from
+            // the sent page too; `sent` is reached by the segments.
             KeyBinding("n", "noise / back") { store.mailMode = mode.flipped },
             KeyBinding("Enter", "drill in") {
-                guard actionable, let u = selected else { return }
-                // The ordered rows become the viewer's queue, so "done + next"
-                // (e/d) can advance in place.
-                store.openThread(u.thread_id, queue: rows)
+                guard actionable else { return }
+                if mode == .sent {
+                    guard let item = selectedSent else { return }
+                    // No queue: "done + next" walks a triage list, and sent mail
+                    // has nothing to finish.
+                    store.openThread(item.thread_id)
+                } else if let u = selected {
+                    // The ordered rows become the viewer's queue, so "done + next"
+                    // (e/d) can advance in place.
+                    store.openThread(u.thread_id, queue: rows)
+                }
             },
             KeyBinding("v", "fix triage") {
-                guard actionable, let u = selected else { return }
+                guard triageable, let u = selected else { return }
                 store.openTriageFix(
                     TriageFixTarget(
                         messageId: u.id, sender: u.sender, subject: u.one_line,
@@ -229,14 +412,15 @@ struct EmailsView: View {
             // Reply opens the email and composes in it, so it hands over the same
             // queue Enter does — done + next keeps working from inside the reader.
             KeyBinding("r", "reply") {
-                guard actionable, let u = selected else { return }
+                guard triageable, let u = selected else { return }
                 Actions.reply(u, queue: rows)
             },
             // `sender` IS the address on this wire type (see AttentionUpdate's
             // SenderStringConvertible note) — the display name would search the
-            // body text of unrelated mail.
+            // body text of unrelated mail. Inert on the sent page, where the
+            // sender is the reader and the seed would find their whole archive.
             KeyBinding("f", "search this sender") {
-                guard actionable, let u = selected else { return }
+                guard triageable, let u = selected else { return }
                 store.openSearch(seed: "from:\(u.sender)")
             },
             KeyBinding("e", "done") { resolveSelected() },
@@ -259,11 +443,11 @@ struct EmailsView: View {
 
     private func moveByKey(_ delta: Int) {
         kbActive = true
-        index = max(0, min(rows.count - 1, index + delta))
+        index = max(0, min(rowCount - 1, index + delta))
     }
 
     private func resolveSelected() {
-        guard actionable, let u = selected else { return }
+        guard triageable, let u = selected else { return }
         Task { await Actions.done(u) }
         // `rows` already filters on resolvedIds, so the row leaves on the next
         // frame regardless; this keeps it out of the cached page too, so the

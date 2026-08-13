@@ -1379,10 +1379,10 @@ starts and stops.
 
 ## The agent door is not served
 
-Hosted publishes the human door only. Each tenant's Ingress declares exactly two
-path prefixes, `/client` and `/t`, and nothing else. `/mcp` matches no rule, so
-Traefik answers its own 404 for it, as it does for every other path on a tenant
-vhost.
+Hosted publishes the human door only. Each tenant's Ingress declares exactly
+three path prefixes, `/client`, `/console` and `/t`, and nothing else. `/mcp`
+matches no rule, so Traefik answers its own 404 for it, as it does for every
+other path on a tenant vhost.
 
 That is an allowlist, not a deny rule, and deliberately so: a deny rule has to
 enumerate every spelling of the thing it is refusing and fails open when it

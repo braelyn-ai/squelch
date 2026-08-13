@@ -283,6 +283,34 @@ pub struct MetricsConfig {
     pub bind: Option<String>,
 }
 
+/// The tenant CONSOLE, the browser-facing half of the human door.
+///
+/// `sso_url` IS THE FEATURE FLAG for the Google sign-in button: absent (the
+/// default, and the whole self-host posture), the console renders the
+/// pasted-code form alone. It is a LINK TARGET and nothing more, so no trust
+/// flows from it; whatever comes back is a pairing code the store adjudicates on
+/// its own terms.
+///
+/// `allow_insecure_cookie` IS AN ESCAPE HATCH and is documented as one where it
+/// is read (`squelch-api`'s console): it drops `Secure` from the session cookie
+/// on a non-loopback origin, which means the cookie (a live device token) can
+/// cross a network in the clear. It exists for the self-host who serves the
+/// console over plain http on a LAN and cannot front it with TLS. Default off,
+/// and the login page says so out loud when it is on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConsoleConfig {
+    /// The control plane's origin behind the console's "Continue with Google"
+    /// link (e.g. `https://signup.passband.email`).
+    /// Env: `SQUELCH_CONSOLE_SSO_URL`. `None` => no button.
+    pub sso_url: Option<String>,
+    /// Allow the console session cookie WITHOUT `Secure` off loopback.
+    /// Env: `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`, spelled exactly `true`.
+    /// Anything else (including `1` and `yes`) leaves it off: an operator who
+    /// mistypes this one gets the safe answer.
+    pub allow_insecure_cookie: bool,
+}
+
 /// Default embedding-weights cache dir, a sibling of the sqlite db under the
 /// XDG data dir; CWD-relative only when `HOME` is unset.
 pub fn default_embed_cache_dir() -> PathBuf {
@@ -804,6 +832,9 @@ pub struct Config {
     /// Prometheus scrape endpoint. Absent `bind` means the listener is never
     /// opened.
     pub metrics: MetricsConfig,
+    /// The tenant console. Absent `sso_url` means no Google sign-in button,
+    /// which is the self-host posture.
+    pub console: ConsoleConfig,
 }
 
 impl Default for Config {
@@ -825,6 +856,7 @@ impl Default for Config {
             pusher: PusherConfig::default(),
             tracking: TrackingConfig::default(),
             metrics: MetricsConfig::default(),
+            console: ConsoleConfig::default(),
         }
     }
 }
@@ -916,6 +948,10 @@ impl Config {
             // Same rule again: an exported-but-empty var leaves the listener
             // closed rather than trying to bind an empty address.
             ("SQUELCH_METRICS_BIND", &mut self.metrics.bind),
+            // ---- The tenant console ----------------------------------------
+            // Same rule again: an exported-but-empty var leaves the Google
+            // button off the page rather than rendering one that points at "".
+            ("SQUELCH_CONSOLE_SSO_URL", &mut self.console.sso_url),
         ] {
             if let Ok(v) = std::env::var(name) {
                 let v = v.trim();
@@ -924,6 +960,13 @@ impl Config {
                 }
             }
         }
+        // The console's plain-http escape hatch. A BOOL, so it takes the same
+        // lenient parse the other flags do and an unreadable value leaves the
+        // setting where it was, which is off.
+        env_override(
+            "SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE",
+            &mut self.console.allow_insecure_cookie,
+        );
 
         // Lenient enum parse (trim + lowercase, unknown value keeps the current
         // one), so not the strict `FromStr` helper.
@@ -1435,6 +1478,56 @@ backfill_days = 90
 
         unsafe {
             std::env::remove_var("SQUELCH_METRICS_BIND");
+        }
+    }
+
+    /// The console block is config-file-first with an env override, the same
+    /// shape as tracking and metrics, and both of its settings FAIL CLOSED on
+    /// anything unusable: a blank URL leaves the Google button off, and a knob
+    /// that is not exactly `true` leaves the cookie `Secure`.
+    #[test]
+    fn console_env_overrides_match_the_tracking_block() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SQUELCH_CONSOLE_SSO_URL");
+            std::env::remove_var("SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.console.sso_url, None, "unset => no sign-in button");
+        assert!(!c.console.allow_insecure_cookie, "the hatch is shut");
+
+        unsafe {
+            std::env::set_var("SQUELCH_CONSOLE_SSO_URL", "  ");
+            std::env::set_var("SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE", "yes please");
+        }
+        let mut c = Config::default();
+        c.console.sso_url = Some("https://from-file.example".to_string());
+        c.apply_env_overrides();
+        assert_eq!(
+            c.console.sso_url.as_deref(),
+            Some("https://from-file.example"),
+            "a blank env value does not clobber the file"
+        );
+        assert!(
+            !c.console.allow_insecure_cookie,
+            "an unparseable knob is not an opt-in"
+        );
+
+        unsafe {
+            std::env::set_var("SQUELCH_CONSOLE_SSO_URL", " https://signup.example ");
+            std::env::set_var("SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE", "true");
+        }
+        let mut c = Config::default();
+        c.console.sso_url = Some("https://from-file.example".to_string());
+        c.apply_env_overrides();
+        assert_eq!(c.console.sso_url.as_deref(), Some("https://signup.example"));
+        assert!(c.console.allow_insecure_cookie);
+
+        unsafe {
+            std::env::remove_var("SQUELCH_CONSOLE_SSO_URL");
+            std::env::remove_var("SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE");
         }
     }
 

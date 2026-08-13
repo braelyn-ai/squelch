@@ -349,6 +349,28 @@ impl ControlStore {
             .optional()?)
     }
 
+    /// The mailbox that owns the ACTIVE tenant with this label, if there is one.
+    ///
+    /// The console login's whole question, asked twice: once before the user is
+    /// sent to Google (does this tenant exist?) and once on the way back (is the
+    /// Google account that came back the one that owns it?). Asked of the STORE
+    /// both times rather than carried through the session, because a tenant that
+    /// was torn down or changed hands while somebody was at Google must not be
+    /// signed in to on the strength of a ten-minute-old lookup.
+    ///
+    /// `status = 'active'` is part of the question, not a filter on the answer: a
+    /// row that is not active is not a mailbox anybody may sign in to.
+    pub fn active_tenant_email(&self, label: &str) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT account_email FROM tenants WHERE label = ?1 AND status = ?2",
+                params![label, STATUS_ACTIVE],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Record a provisioned tenant. Both unique constraints are mapped to
     /// their own errors rather than surfacing a SQLite message: these two races
     /// are expected (two tabs, two signups) and the pages above say different
@@ -863,6 +885,28 @@ mod tests {
         assert_eq!(s.tenant_vk("ada").unwrap(), None, "migrated, keyless");
         assert!(s.set_tenant_vk("ada", "vk-1").unwrap());
         assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-1".to_string()));
+    }
+
+    /// What a console login asks the store, both times it asks: the label's
+    /// mailbox, in the one spelling the column holds, and nothing at all for a
+    /// label that was never provisioned.
+    #[test]
+    fn a_label_names_the_mailbox_that_owns_it() {
+        let s = store();
+        s.insert_tenant("ada", "Ada@Example.com").unwrap();
+        assert_eq!(
+            s.active_tenant_email("ada").unwrap().as_deref(),
+            Some("ada@example.com")
+        );
+        assert_eq!(s.active_tenant_email("grace").unwrap(), None);
+        // A row that is not active is not a mailbox anybody signs in to.
+        s.lock()
+            .execute(
+                "UPDATE tenants SET status = 'stopped' WHERE label = 'ada'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.active_tenant_email("ada").unwrap(), None);
     }
 
     /// One mailbox, one daemon, however the address is capitalized.

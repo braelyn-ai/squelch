@@ -150,12 +150,22 @@ ClusterIssuer in `40-wildcard-certificate.yaml`.
 
 ## Images
 
-| Image | Built by | Where it lives |
-|---|---|---|
-| `ghcr.io/braelyn-ai/squelchd:v0.2.0` | CI, `.github/workflows/release.yml` on every `v*` tag, multi-arch amd64+arm64 | GHCR |
-| `ghcr.io/braelyn-ai/squelch-warden:v0.2.0` | **by hand, on `carrier`** | nowhere — only this node's containerd |
+Every `v*` tag builds all three from `.github/workflows/release.yml` and pushes
+them to GHCR:
 
-> **REGISTRY GAP.** The warden image was built natively on the box and loaded
+| Image | Arch | Built by |
+|---|---|---|
+| `ghcr.io/braelyn-ai/squelchd:<tag>` | amd64 + arm64 | `squelchd-image`; the Dockerfile cross-compiles, so no emulation |
+| `ghcr.io/braelyn-ai/squelch-warden:<tag>` | **amd64 only** | `warden-image`; builds natively, and emulating the ONNX build risks the six-hour job ceiling |
+| `ghcr.io/braelyn-ai/squelch-control:<tag>` | **amd64 only** | `control-image`; same reason. Railway still builds its own copy from source, so this tag is for reproducibility and for running the plane elsewhere |
+
+`carrier` is amd64, so the two amd64-only images cover everything hosted
+actually runs. Moving the hosted planes to an arm box means giving those
+Dockerfiles a cross-compiling shape first, or getting a native arm runner — not
+turning binfmt back on.
+
+> **The registry gap is closed in CI, and not yet on this node.** The warden
+> image running here is still the one built by hand on `carrier` and loaded
 > straight into containerd:
 >
 > ```sh
@@ -163,15 +173,50 @@ ClusterIssuer in `40-wildcard-certificate.yaml`.
 > docker save ghcr.io/braelyn-ai/squelch-warden:v0.2.0 | k3s ctr images import -
 > ```
 >
-> It carries a GHCR name it has never been pushed to. Consequences, in order of
-> how much they will hurt: reimaging or replacing this node loses the image and
-> the rebuild is manual; nothing can roll back to a previous warden; and the tag
-> is a promise no registry is keeping. The fix is a warden job in the release
-> workflow next to the squelchd one. Until then, do not delete this image from
-> containerd and do not assume `imagePullPolicy` will save you.
+> That tag carries a GHCR name nothing has ever pushed, and adding the CI job
+> does not retroactively publish it. So: do not delete this image from
+> containerd, and do not assume `imagePullPolicy` will save you, until the next
+> `v*` tag is cut and `20-warden.yaml` is repointed at a tag the registry
+> actually has. From that point on, replacing this node is a pull.
 
-Both tags are pinned in `20-warden.yaml`. The warden refuses to start with an
-untagged tenant image.
+The squelchd and warden tags are both pinned in `20-warden.yaml`. The warden
+refuses to start with an untagged tenant image.
+
+## Shipping a tenant-shape change (there is no reconcile)
+
+**Rolling out a new warden does not change tenants that already exist.** Each
+tenant's Ingress, NetworkPolicy, Service and Deployment are written once, at
+provision time, and the warden never looks at them again. Kube reconciles a
+tenant's pod against those objects; nothing reconciles those objects against the
+warden's current code.
+
+So anything that changes the SHAPE of a tenant — a new Ingress path prefix, a new
+environment variable in the pod (`SQUELCH_CONSOLE_SSO_URL` and `ANTHROPIC_API_KEY`
+are both this), a changed NetworkPolicy peer, new resource bounds — lands on new
+signups and on nobody else, silently. Check what a live tenant actually has
+before assuming a deploy reached it:
+
+```sh
+kubectl -n tenants get ingress alice -o yaml
+kubectl -n tenants get deploy alice -o jsonpath='{.spec.template.spec.containers[0].env}'
+```
+
+Two ways to catch an existing tenant up, both manual, and `squelch-warden/README.md`
+("What does not reconcile") has the full Ingress body to apply:
+
+1. **`kubectl apply` the one object**, for an Ingress or a NetworkPolicy, which
+   needs no restart. It means hand-writing YAML with a tenant label in it, which
+   the warden itself is forbidden to do; on an operator's terminal, for a label
+   that is already provisioned, that is the accepted workaround.
+2. **`DELETE` then `PUT` the credential again** through the warden API, for
+   anything that touches the pod. `DELETE /v1/tenants/{label}` keeps both Secrets
+   and the volume, and the `PUT` rebuilds every object from today's code. It
+   recycles the pod, so that mailbox is down for the length of a provision, and
+   the control plane has to still hold the sealed blob to re-send.
+
+Until the reconcile route below exists, a tenant-shape change is a manual pass
+over the tenant list, and it is worth doing at the moment it ships rather than
+discovering months later that half the fleet is a shape nobody remembers.
 
 ## Cluster secrets
 
@@ -182,6 +227,7 @@ a chat window.
 |---|---|---|---|
 | `warden` | `squelch-warden` | `token` | operator (`openssl rand -base64 32`); the same value is `SQUELCH_CONTROL_WARDEN_TOKEN` on Railway |
 | `tenants` | `google-oauth-client` | `client_id`, `client_secret` | operator; the confidential **web** client, the same one the control plane consents with |
+| `tenants` | `anthropic-api-key` | `ANTHROPIC_API_KEY` | operator; one shared key every tenant daemon runs Stage-2 triage with. Referenced `optional: true`, so its absence is heuristic-only triage rather than a fleet that will not start. The bridge until the relay ships (issue #33) |
 | `cert-manager` | `acme-dns-token` | `api-token` | operator; Cloudflare token scoped to the `passband.email` zone, DNS:Edit |
 
 Managed by the cluster, listed so an inventory sweep does not mistake them for
@@ -324,12 +370,28 @@ would happily stream over the real history.
   `kubectl -n tenants get secret -o yaml` and copy the key file. Litestream does
   not touch Secrets and never will, and it certainly does not back up its own
   key into the bucket that key opens.
-- **Warden image in CI** — a release-workflow job that publishes
-  `squelch-warden` the way `squelchd` is already published. Closes the registry
-  gap above.
+- **Cut a tag that publishes the warden** — the release workflow now has the
+  job (see "Images"), but this node still runs the hand-built image. The item
+  closes when `20-warden.yaml` points at a tag GHCR actually holds.
+- **Tenant reconcile: `POST /v1/tenants/{label}/reconcile`.** The warden
+  re-applies the typed objects for one already-provisioned tenant, on demand,
+  from its current code — the same server-side applies phase two runs, minus the
+  identity mint and the credential seal, reading the sealed blob from the Secret
+  it already holds rather than taking one on the wire. On demand and per label,
+  not a controller: a loop that re-applies to every tenant is a loop that can
+  take the whole fleet down on one bad deploy, whereas a route the operator
+  drives can be run against one tenant, verified, and then walked across the
+  list. It needs the same 404/409 shape the other routes have, an answer for the
+  case where the change rolls the pod (an env or image change does, an Ingress or
+  NetworkPolicy change does not), and it should refuse a tenant that is not
+  `active`. **Needed the first time any tenant-shape change ships after tenants
+  exist** — which is now: `SQUELCH_CONSOLE_SSO_URL` and the optional
+  `ANTHROPIC_API_KEY` reference both reach new tenants only, and "Shipping a
+  tenant-shape change" above is the manual stand-in.
 - **`/mcp` bearer auth** — the hosted MVP routes around it (tenant Ingresses
-  publish `/client` and `/t` only). Real auth is required before the agent door
-  is ever served from the internet.
+  publish `/client`, `/console` and `/t` only). Real auth is required before the
+  agent door is ever served from the internet, and until then the console's MCP
+  section says so instead of offering a URL that 404s.
 - **Google verification + CASA Tier 2** — the restricted-scope cap is 100 users.
   This gates user 101 and has the longest lead time of anything on this list.
 - **Public Suffix List entry for `passband.email`** — a PR to `publicsuffix/list`

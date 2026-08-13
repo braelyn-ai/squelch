@@ -17,6 +17,15 @@
 
 import Foundation
 
+// Only for the device name below. Kept to a fenced import rather than routed
+// through Platform.swift on purpose: the pairing test suite compiles this file
+// with Sessions.swift and nothing else (see test.sh), so a reference to the
+// shim would take the suite's whole point — a pure, app-free decoder test —
+// away with it.
+#if !os(macOS)
+    import UIKit
+#endif
+
 /// A `passband://pair?url=…&code=…` deep link. `squelchd pair` prints one so a
 /// click carries both halves of the pairing across from the terminal.
 struct PairLink: Equatable, Sendable {
@@ -146,14 +155,23 @@ enum Pairing {
     /// ("Braelyn's MacBook Pro") is what a person recognises; the hostname is
     /// the fallback, minus the `.local` that Bonjour hangs off it.
     static func defaultDeviceName() -> String {
-        let sharing = Host.current().localizedName ?? ""
-        if !sharing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return clampDeviceName(sharing)
-        }
-        var host = ProcessInfo.processInfo.hostName
-        if host.hasSuffix(".local") { host.removeLast(6) }
-        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        return clampDeviceName(trimmed.isEmpty ? "Mac" : trimmed)
+        #if os(macOS)
+            let sharing = Host.current().localizedName ?? ""
+            if !sharing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return clampDeviceName(sharing)
+            }
+            var host = ProcessInfo.processInfo.hostName
+            if host.hasSuffix(".local") { host.removeLast(6) }
+            let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            return clampDeviceName(trimmed.isEmpty ? "Mac" : trimmed)
+        #else
+            // `Host` is AppKit-era Foundation and does not exist here. UIDevice's
+            // name is the equivalent answer — the user-assigned device name when
+            // the app is entitled to it, the model name ("iPhone") otherwise,
+            // which is still a row a human can recognise in `squelchd token list`.
+            let trimmed = UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return clampDeviceName(trimmed.isEmpty ? "iPhone" : trimmed)
+        #endif
     }
 
     /// Trim and cap a device name to what the daemon will accept.

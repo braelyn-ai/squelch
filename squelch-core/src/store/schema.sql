@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS messages (
     -- storage is fine, serving is guarded.
     body_html   TEXT,
     is_sent     INTEGER NOT NULL DEFAULT 0,
+    -- DISPLAY RECIPIENTS of mail the user SENT: the To + Cc mailboxes as the
+    -- headers spelled them, comma-joined `Name <addr>` (bare addr with no
+    -- display name). NULL on received mail — a message the user did not send
+    -- has no "to" worth showing — and NULL on sent rows ingested before this
+    -- column existed, which the one-shot recipients backfill fills in. Empty
+    -- string means "looked, and the headers named nobody". Consumed ONLY by the
+    -- human door's sent listing; the agent door has no sent surface at all.
+    to_addrs    TEXT,
     -- Raw `List-Unsubscribe` header value, NULL when absent. Consumed ONLY by
     -- the human door's unsubscribe endpoint.
     list_unsubscribe TEXT,
@@ -378,6 +386,21 @@ CREATE TABLE IF NOT EXISTS sync_state (
     uidvalidity INTEGER NOT NULL,
     last_uid    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(account_id, mailbox)
+);
+
+-- GMAIL-SIDE INBOX UNREAD COUNTS (labels/INBOX messagesUnread/threadsUnread),
+-- refreshed once per sync cycle. One row per account, overwritten each fetch:
+-- this mirrors Gmail's current state, it is not a history. Sync's own tables
+-- cannot answer it — they hold only what the backfill window ingested, and
+-- nothing here ever learns that Gmail marked a message read.
+--
+-- NO ROW MEANS NEVER FETCHED, which readers must serve as absence: zero unread
+-- is a real and different answer.
+CREATE TABLE IF NOT EXISTS inbox_unread (
+    account_id INTEGER NOT NULL PRIMARY KEY,
+    messages   INTEGER NOT NULL,
+    threads    INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL
 );
 
 -- STAGE-2 BUDGET (circuit breaker). model_calls counts API attempts, incremented

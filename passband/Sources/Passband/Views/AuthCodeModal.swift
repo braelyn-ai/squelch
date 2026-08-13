@@ -72,7 +72,14 @@ struct AuthCodeModal: View {
                     }
                     .frame(height: 2)
                 }
-                .frame(width: 420)
+                // A ceiling on the phone, not a measure: 420 is wider than the
+                // screen it would have to fit on. See ModalCard's note.
+                #if os(macOS)
+                    .frame(width: 420)
+                #else
+                    .frame(maxWidth: 420)
+                    .padding(.horizontal, 14)
+                #endif
                 .passbandGlass(.pane, cornerRadius: 22, tint: Palette.lockSoft.opacity(0.9))
                 .shadow(color: .black.opacity(0.34), radius: 50, y: 22)
             }
@@ -123,7 +130,12 @@ struct AuthCodeModal: View {
                     HStack(spacing: 6) {
                         Image(systemName: copied ? "checkmark" : "doc.on.doc")
                         Text(copied ? "copied" : "copy")
-                        Kbd("c")
+                        // A keycap beside a button on a device with no keyboard
+                        // is a control that does not exist. The button is the
+                        // whole affordance there.
+                        #if os(macOS)
+                            Kbd("c")
+                        #endif
                     }
                     .font(.system(size: 12, weight: .medium))
                     .padding(.horizontal, 12).padding(.vertical, 5)
@@ -147,7 +159,9 @@ struct AuthCodeModal: View {
             } label: {
                 HStack(spacing: 6) {
                     Text("dismiss")
-                    Kbd("esc")
+                    #if os(macOS)
+                        Kbd("esc")
+                    #endif
                 }
                 .font(.system(size: 12))
                 .padding(.horizontal, 10).padding(.vertical, 5)

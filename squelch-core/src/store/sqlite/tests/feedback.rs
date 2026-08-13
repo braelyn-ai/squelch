@@ -239,6 +239,27 @@ fn sealing_by_hand_discards_the_reply_draft() {
 }
 
 #[test]
+fn triage_debug_carries_the_thread_id() {
+    // The debug read joins `messages` already; the thread id rides along so a
+    // client holding one triage row can ask for the whole conversation without
+    // a second lookup.
+    let (store, acct) = store();
+    let t0 = Utc::now();
+    let id = inbound_triaged(acct, "g1", "thread-abc", "alice@x.com", t0, false).ingest(&store);
+
+    let debug = store.triage_debug(acct, id).unwrap().expect("triage row");
+    assert_eq!(debug.message_id, id);
+    assert_eq!(debug.thread_id, "thread-abc");
+
+    // Sealed rows stay out of this door, thread id or not.
+    store
+        .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+        .unwrap()
+        .unwrap();
+    assert!(store.triage_debug(acct, id).unwrap().is_none());
+}
+
+#[test]
 fn correcting_an_unknown_message_is_none_not_an_error() {
     let (store, acct) = store();
     let t0 = Utc::now();
