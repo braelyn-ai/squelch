@@ -667,10 +667,24 @@ impl Warden {
             .cluster
             .apply_deployment_dry_run(rendered)
             .await
-            // A dry run the API server will not answer is this cluster failing
-            // to answer a question, not this tenant being broken. The shape of
-            // the refusal is in this pod's log.
-            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+            // A dry run the API server REFUSES is a finding, not an outage: it
+            // means today's render can no longer be applied to this tenant at
+            // all - an immutable field the render moved, an admission webhook
+            // that rejects it - and "the cluster is unavailable" would send the
+            // operator looking at the wrong thing entirely. A 4xx is the API
+            // server answering; anything else is it failing to.
+            .map_err(|e| {
+                let reason = match &e {
+                    ClusterError::Api { source, .. } => match source.as_ref() {
+                        kube::Error::Api(response) if (400..500).contains(&response.code) => {
+                            "render_rejected"
+                        }
+                        _ => "cluster_unavailable",
+                    },
+                    _ => "cluster_unavailable",
+                };
+                fail(name.as_str(), reason, &e)
+            })?;
 
         let foreign = drift::foreign_managers(&live);
         let changes = drift::diff_spec(
@@ -832,19 +846,31 @@ impl Warden {
             .await
             .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
         let outcome = match live.as_ref().map(drift::foreign_managers) {
-            // A Deployment that was there when the status was read and is not
-            // there now: a DELETE landed in between. Applying is the same thing
-            // the reconcile would have done anyway, and saying `created` rather
-            // than `converged` keeps the answer true.
-            None => "created",
+            // The Deployment was there when the status was read and is gone
+            // now, so something deleted it while this ran - and the only thing
+            // that deletes a live tenant's workload is a cancellation. Re-check
+            // before rebuilding it: `delete` takes the Service first, so a
+            // Service that has also gone means this is a teardown in progress
+            // and applying would race a cancellation back onto the internet.
+            None => {
+                if !self.interrupted(&name).await? {
+                    tracing::warn!(
+                        tenant = %name,
+                        "the workload was deleted while reconciling; refusing to rebuild it"
+                    );
+                    return Err(WardenError::NotReconcilable);
+                }
+                "created"
+            }
             Some(foreign) if !foreign.is_empty() => {
+                // COUNT, not names. A `fieldManager` is chosen by whoever wrote
+                // the field, it may carry a newline, and this formatter writes
+                // one line per event - so a name here would let the owner of
+                // the drift forge log lines about it. The names are in the
+                // drift report, which is structured and escaped.
                 tracing::warn!(
                     tenant = %name,
-                    managers = %foreign
-                        .iter()
-                        .map(|f| f.manager.as_str())
-                        .collect::<Vec<_>>()
-                        .join(","),
+                    managers = foreign.len(),
                     "recreating a Deployment other field managers own fields on"
                 );
                 self.cluster
@@ -856,6 +882,26 @@ impl Warden {
                     .pods_gone(&objects::pod_selector(&name), self.config.ready_timeout)
                     .await
                     .map_err(|e| fail(name.as_str(), "pods_not_gone", &e))?;
+                // The delete is Background, so the name is free the moment the
+                // API server answers. A Deployment still standing here is one
+                // somebody else's finalizer is holding, and applying onto an
+                // object mid-deletion would write a spec the collector is about
+                // to throw away - leaving the tenant with no workload and this
+                // route reporting success.
+                if self
+                    .cluster
+                    .get_deployment(name.as_str())
+                    .await
+                    .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+                    .is_some()
+                {
+                    tracing::error!(
+                        tenant = %name,
+                        reason = "workload_still_deleting",
+                        "the Deployment outlived its own delete; a finalizer is holding it"
+                    );
+                    return Err(WardenError::cluster("workload_still_deleting"));
+                }
                 "recreated"
             }
             Some(_) => "converged",

@@ -26,7 +26,9 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams, PropagationPolicy,
+};
 use kube::client::UpgradeConnectionError;
 use kube::{Api, Client, Resource};
 use tokio::io::AsyncReadExt;
@@ -465,7 +467,26 @@ impl Cluster for KubeCluster {
     }
 
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
-        let params = DeleteParams::default();
+        // BACKGROUND, explicitly, and the Deployment is why.
+        //
+        // With no `propagationPolicy` on the wire the API server falls back to
+        // the resource's own default, and `apps/v1` Deployment's default is
+        // foreground: the DELETE returns at once, but the object STAYS, wearing
+        // a `deletionTimestamp` and a `foregroundDeletion` finalizer, until the
+        // ReplicaSet and the pods behind it have been collected. An update to
+        // an object in that state is still accepted, so
+        // [`crate::Warden::reconcile`] could re-apply onto the corpse, watch
+        // the collector finish a moment later, and be left with no Deployment
+        // at all and a purge that purged nothing.
+        //
+        // Background deletion removes the object immediately and collects the
+        // dependents behind it, so a name that answered a DELETE is a name the
+        // next apply creates fresh, with an ownership ledger that starts empty.
+        // That is the entire point of the recreate path.
+        let params = DeleteParams {
+            propagation_policy: Some(PropagationPolicy::Background),
+            ..Default::default()
+        };
         let op = "delete";
         macro_rules! delete {
             ($api:expr) => {{ optional($api.delete(name, &params).await, op).map(|_| ()) }};

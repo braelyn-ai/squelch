@@ -25,10 +25,20 @@
 //! in [`crate::provision::Warden::drift`], which is what makes every shape
 //! below testable against a fixture rather than against a cluster.
 //!
-//! PRIVACY: a Deployment spec holds no secret material. Secrets reach a tenant
-//! pod as REFERENCES by name, mounted or projected by the kubelet, so a field
-//! value quoted in one of these reports is a name, an image, a path or a
-//! resource quantity. Nothing here may be pointed at a Secret's contents.
+//! PRIVACY: nothing the WARDEN renders into a Deployment is secret. Every
+//! credential reaches a tenant pod as a REFERENCE by name - mounted or
+//! projected by the kubelet - including the mailbox address, so the `rendered`
+//! side of a report is always a name, an image, a path or a quantity, and
+//! nothing here may ever be pointed at a Secret's contents.
+//!
+//! The `live` side is whatever the object actually carries, which is not the
+//! same promise. A field somebody else wrote holds bytes somebody else chose,
+//! and if they wrote a literal where the warden would have written a reference
+//! then that literal is what a report quotes back. That is acceptable rather
+//! than accidental: placing it took write access to the tenant namespace, and
+//! reading it back takes the warden bearer, which is strictly the higher
+//! privilege of the two. It is still the reason a report is for an operator
+//! and not for a tenant.
 
 use k8s_openapi::api::apps::v1::Deployment;
 use serde::Serialize;
@@ -97,10 +107,24 @@ const REVISION_PATH: &str = "metadata.annotations.deployment.kubernetes.io/revis
 
 /// The roots a report keeps.
 ///
-/// `status` is the controller's to write and `metadata` is mostly the API
+/// `status` is the controller's to write and most of `metadata` is the API
 /// server's; what a person can break by hand is the spec, the labels this
 /// warden selects on, and the annotations that decide when a pod rolls.
-const REPORTED_ROOTS: [&str; 3] = ["spec", "metadata.labels", "metadata.annotations"];
+///
+/// `finalizers` and `ownerReferences` are here because they are the two
+/// metadata fields that can END a tenant. A foreign finalizer wedges the
+/// Deployment mid-deletion, which is precisely what stops
+/// [`crate::Warden::reconcile`]'s recreate from completing, and a foreign
+/// ownerReference hands the garbage collector a reason to remove the workload
+/// when something entirely unrelated is deleted. Neither shows up in the spec,
+/// so without these roots the report would call a doomed tenant clean.
+const REPORTED_ROOTS: [&str; 5] = [
+    "spec",
+    "metadata.labels",
+    "metadata.annotations",
+    "metadata.finalizers",
+    "metadata.ownerReferences",
+];
 
 /// Every field manager other than the warden that owns part of this object.
 ///
@@ -540,6 +564,36 @@ mod tests {
                 "spec.finalizers[=\"keep\"]",
                 "spec.ports[{\"name\":\"http\",\"protocol\":\"TCP\"}]",
                 "spec.strange",
+            ]
+        );
+    }
+
+    /// The two metadata fields that can end a tenant without touching its
+    /// spec. A finalizer stops the recreate half of a reconcile from ever
+    /// completing; an ownerReference gives the collector a reason to take the
+    /// workload out when something unrelated goes. Both are reported.
+    #[test]
+    fn the_metadata_that_can_kill_a_tenant_is_reported() {
+        let deployment = managed(vec![entry(
+            "some-policy-controller",
+            "Update",
+            json!({
+                "f:metadata": {
+                    "f:finalizers": { "v:\"example.com/protect\"": {} },
+                    "f:ownerReferences": { "k:{\"uid\":\"abc\"}": {} },
+                    // Still dropped: the deployment controller writes this on
+                    // every rollout and it belongs to nobody.
+                    "f:annotations": {
+                        "f:deployment.kubernetes.io/revision": {}
+                    }
+                }
+            }),
+        )]);
+        assert_eq!(
+            foreign_managers(&deployment)[0].paths,
+            vec![
+                "metadata.finalizers[=\"example.com/protect\"]",
+                "metadata.ownerReferences[{\"uid\":\"abc\"}]",
             ]
         );
     }
