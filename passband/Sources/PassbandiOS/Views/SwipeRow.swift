@@ -273,8 +273,17 @@ private struct RailPan: UIGestureRecognizerRepresentable {
         /// cannot also drag the page along under it.
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
+            // Velocity first, translation as the tiebreak. The refusal here is
+            // final for the whole touch, and velocity is a smoothed instant
+            // that can come back zero or dead-equal when the sampler has no
+            // usable deltas — the accumulated translation always has a
+            // direction by the time UIKit asks.
             let velocity = pan.velocity(in: pan.view)
-            return abs(velocity.x) > abs(velocity.y)
+            if velocity != .zero, abs(velocity.x) != abs(velocity.y) {
+                return abs(velocity.x) > abs(velocity.y)
+            }
+            let translation = pan.translation(in: pan.view)
+            return abs(translation.x) > abs(translation.y)
         }
     }
 }

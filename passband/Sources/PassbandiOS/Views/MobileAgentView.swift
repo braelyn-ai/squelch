@@ -80,8 +80,14 @@ struct MobileAgentView: View {
             // has already been looked at once. Re-reading on every appearance is
             // what lets walking back in turn the agent on.
             .onAppear {
-                Task { await refreshKeyStatus() }
-                sendInitialQuestion()
+                // SEQUENCED, not parallel: the auto-send must not race the
+                // keychain. Firing before the key status lands would spend the
+                // first visit of every keyless install on a provider error row,
+                // painted moments before the key gate swaps in beneath it.
+                Task {
+                    await refreshKeyStatus()
+                    sendInitialQuestion()
+                }
             }
     }
 
@@ -693,6 +699,14 @@ struct MobileAgentView: View {
     private func sendInitialQuestion() {
         guard !asked, let text = initialQuestion?.trimmed, !text.isEmpty else { return }
         asked = true
+        // No key means no call: the words park in the composer under the key
+        // gate, and the moment a key is pasted in Account they are still there
+        // to send. onAppear awaits the keychain before calling this, so
+        // `keyMissing` is a real answer here, not the optimistic nil default.
+        guard !keyMissing else {
+            question = text
+            return
+        }
         // A run is still open from the last visit: `send` would drop this on the
         // floor, so it lands in the composer instead and the Send button lights
         // up the moment the answer finishes. Losing a typed question silently is

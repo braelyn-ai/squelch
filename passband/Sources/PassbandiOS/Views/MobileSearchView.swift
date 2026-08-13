@@ -88,10 +88,14 @@ struct MobileSearchView: View {
             // SwiftUI cancels this on the next edit, which IS the debounce.
             .task(id: store.search.query) { await runSearch() }
             // Return is the send, and only in agent mode: under four spaces it
-            // is the search that has already run behind the debounce.
+            // is the search that has already run behind the debounce. The
+            // submit path CLEARS the field where the ask row does not: there
+            // were never results underneath a return-submitted question, so
+            // popping back onto the "press return" placeholder would read as
+            // the ask never happening — and return would fire it again.
             .onSubmit(of: .search) {
                 guard agentMode else { return }
-                askAgent()
+                askAgent(clearingField: true)
             }
             // The chat is a PUSH, not a tab: back lands on the results that were
             // underneath the question, and the transcript survives either way
@@ -277,13 +281,17 @@ struct MobileSearchView: View {
 
     // MARK: - the agent
 
-    /// Push the chat with these words. The field KEEPS them: back is a real
-    /// destination here, and finding an emptied search after asking a question
-    /// would mean the results you were reading are gone too.
-    private func askAgent() {
+    /// Push the chat with these words. From the ask ROW the field keeps them:
+    /// back is a real destination there, and finding an emptied search after
+    /// asking a question would mean the results you were reading are gone too.
+    /// From RETURN in agent mode the field clears instead — there was nothing
+    /// underneath but the placeholder, so back should land on the tab at rest
+    /// rather than on a screen mid-sentence about a question already asked.
+    private func askAgent(clearingField: Bool = false) {
         let question = term
         guard !question.isEmpty else { return }
         ask = AgentAsk(text: question)
+        if clearingField { store.search.query = "" }
     }
 
     // MARK: - fetching

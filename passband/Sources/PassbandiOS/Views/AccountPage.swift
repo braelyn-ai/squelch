@@ -180,7 +180,7 @@ struct AccountPage: View {
 
     private func blurb(_ section: SettingsSection) -> String {
         switch section {
-        case .general: "connection, theme, chime, tour, your name"
+        case .general: "connection, theme, chime, your name"
         case .mail: "images, signature, read tracking"
         case .triage: "how it works, daily caps, ranking"
         case .assistant: "your own api key, and which model"
