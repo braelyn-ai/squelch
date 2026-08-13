@@ -226,28 +226,31 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
     }
 
     if let Some(old) = row.invite_id {
-        // Asked BEFORE the revoke, because a revoke cannot be taken back: the
-        // hold means somebody is at Google's consent screen with that code, and
-        // deleting it fails their signup after they have already granted it.
-        match state.store().invite_is_held(old, Utc::now()) {
-            Ok(true) => return dashboard(&state, Some(INVITE_HELD)),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(id, error = %e, "reading the replaced invite failed");
-                return dashboard(&state, Some(STORE_TROUBLE));
-            }
-        }
-        match state.store().revoke_invite(old) {
+        // The reservation check travels WITH the delete. Asking first and
+        // deleting second releases the lock in between, and that gap is long
+        // enough for a signup to take the hold the check just said was absent:
+        // the code would then be deleted out from under somebody who has
+        // already granted Google consent they cannot grant twice.
+        match state.store().revoke_unheld_invite(old, Utc::now()) {
             Ok(true) => {}
-            // SPENT is a refusal: somebody set a mailbox up with that code, and
-            // minting a second is a tenant nobody approved.
-            Ok(false) if invite_is_spent(&state, old) => {
-                return dashboard(&state, Some(INVITE_SPENT));
+            // Why it declined, asked only now that nothing destructive is left
+            // to do: a race here changes the sentence, not the outcome.
+            Ok(false) => {
+                // A store that will not answer counts as held, which is the
+                // closed direction: refusing costs a click, and guessing wrong
+                // the other way costs somebody their signup.
+                if state.store().invite_is_held(old, Utc::now()).unwrap_or(true) {
+                    return dashboard(&state, Some(INVITE_HELD));
+                }
+                // SPENT is a refusal: somebody set a mailbox up with that code,
+                // and minting a second is a tenant nobody approved.
+                if invite_is_spent(&state, old) {
+                    return dashboard(&state, Some(INVITE_SPENT));
+                }
+                // GONE is not. An operator who revoked the code from the CLI
+                // leaves a row pointing at nothing, and refusing that too would
+                // strand the person waiting behind a message that is not true.
             }
-            // GONE is not. An operator who revoked the code from the CLI leaves
-            // a row pointing at nothing, and refusing that too would strand the
-            // person waiting behind a message that is not even true.
-            Ok(false) => {}
             Err(e) => {
                 tracing::error!(id, error = %e, "revoking the replaced invite failed");
                 return dashboard(&state, Some(STORE_TROUBLE));
@@ -333,11 +336,23 @@ async fn mint_and_send(
         .await
     {
         Ok(()) => {
-            if let Err(e) = state.store().mark_waitlist_notified(id, Utc::now()) {
-                tracing::error!(id, error = %e, "stamping the waitlist row as notified failed");
-                return None;
+            match state
+                .store()
+                .mark_waitlist_notified(id, invite_id, Utc::now())
+            {
+                // The row moved to a newer code while this send was in flight,
+                // so the delivery this stamp would claim is not the one the row
+                // is waiting on. The newer send stamps its own.
+                Ok(false) => {
+                    tracing::info!(id, "an invite was delivered after its row moved on");
+                    return None;
+                }
+                Ok(true) => tracing::info!(id, "waitlist invite sent"),
+                Err(e) => {
+                    tracing::error!(id, error = %e, "stamping the waitlist row as notified failed");
+                    return None;
+                }
             }
-            tracing::info!(id, "waitlist invite sent");
         }
         // The row stays approved with no stamp, which is the badge and the
         // button. The provider's own words are not in this error type.
@@ -356,11 +371,11 @@ fn discard(state: &ControlState, id: i64, invite_id: i64) {
 
 /// Whether an invite row is there and has been SPENT.
 ///
-/// Asked only when [`crate::store::ControlStore::revoke_invite`] answered
-/// false, which it does for two causes that must not be treated alike: a code
-/// somebody redeemed, and a row that is not there at all. The listing is a
-/// scan, and it is affordable here because this runs once per press of a button
-/// a human presses.
+/// Asked only when [`crate::store::ControlStore::revoke_unheld_invite`]
+/// answered false, which it does for three causes that must not be treated
+/// alike: a code somebody redeemed, a code somebody is holding, and a row that
+/// is not there at all. The listing is a scan, and it is affordable here
+/// because this runs once per press of a button a human presses.
 ///
 /// A store that will not answer counts as spent. That is the closed direction:
 /// the worst case is an operator sending themselves a CLI code, rather than this

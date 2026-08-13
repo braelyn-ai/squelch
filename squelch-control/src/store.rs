@@ -384,13 +384,38 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
-    /// Whether a signup session is holding this code RIGHT NOW.
+    /// Revoke an unspent code UNLESS a signup is holding it right now.
     ///
     /// [`Self::revoke_invite`] deliberately ignores reservations, because an
     /// operator running the CLI is overriding on purpose. The admin page is not:
     /// a re-send that revokes a held code destroys a signup that has already
     /// reached Google consent, and the person loses a grant they cannot give
-    /// twice without walking the whole flow again. So the button asks first.
+    /// twice without walking the whole flow again.
+    ///
+    /// ONE STATEMENT, and that is the whole point of it existing. Asking
+    /// [`Self::invite_is_held`] first and deleting second is two statements with
+    /// the lock released in between, which is exactly long enough for a signup
+    /// to take the hold the check just said was absent. The condition has to
+    /// travel WITH the delete.
+    ///
+    /// `false` covers spent, held, and never-there alike. The caller may then
+    /// ask which, because by then nothing destructive is left to do and a race
+    /// only changes the sentence the operator reads.
+    pub fn revoke_unheld_invite(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+        let changed = self.lock().execute(
+            "DELETE FROM invite_codes
+              WHERE id = ?1 AND used_at IS NULL
+                AND (reserved_until IS NULL OR reserved_until <= ?2)",
+            params![id, stamp(now)],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Whether a signup session is holding this code RIGHT NOW.
+    ///
+    /// Diagnosis only, for the sentence the dashboard shows after
+    /// [`Self::revoke_unheld_invite`] declined. NEVER a guard in front of a
+    /// delete: see that method for why the condition has to travel with it.
     pub fn invite_is_held(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
         Ok(self
             .lock()
@@ -662,11 +687,24 @@ impl ControlStore {
     }
 
     /// Stamp the moment the provider accepted the invite email. Returns whether
-    /// there was a row to stamp.
-    pub fn mark_waitlist_notified(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+    /// this stamp was the one the row wanted.
+    ///
+    /// NAMES THE INVITE IT IS STAMPING FOR. The send is awaited, so the row can
+    /// move while a request is in flight: a second re-send can replace the
+    /// pointer and start its own send, and a bare stamp by row id would let the
+    /// FIRST request's success mark the SECOND request's code as delivered.
+    /// The row would then read "invited" for an email that may still fail, and
+    /// the badge that would have told the operator to press the button again is
+    /// the one thing this page cannot afford to get wrong.
+    pub fn mark_waitlist_notified(
+        &self,
+        id: i64,
+        invite_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
         let changed = self.lock().execute(
-            "UPDATE waitlist SET notified_at = ?2 WHERE id = ?1",
-            params![id, stamp(now)],
+            "UPDATE waitlist SET notified_at = ?3 WHERE id = ?1 AND invite_id = ?2",
+            params![id, invite_id, stamp(now)],
         )?;
         Ok(changed == 1)
     }
@@ -1203,7 +1241,7 @@ mod tests {
         assert_eq!(row.invite_id, Some(7));
         assert_eq!(row.notified_at, None, "nothing sent yet");
 
-        assert!(s.mark_waitlist_notified(id, now).unwrap());
+        assert!(s.mark_waitlist_notified(id, 7, now).unwrap());
         assert_eq!(
             s.waitlist_entry(id).unwrap().unwrap().notified_at,
             Some(now)
@@ -1215,11 +1253,47 @@ mod tests {
         assert_eq!(row.invite_id, Some(9));
         assert_eq!(row.notified_at, None, "the old delivery is not this one");
 
+        // A send for the code the row has MOVED OFF stamps nothing: its
+        // delivery is not the one this row is waiting on.
+        assert!(!s.mark_waitlist_notified(id, 7, now).unwrap());
+        assert_eq!(
+            s.waitlist_entry(id).unwrap().unwrap().notified_at,
+            None,
+            "the row still wants to hear about the code it names"
+        );
+        assert!(s.mark_waitlist_notified(id, 9, now).unwrap());
+
         assert!(
             !s.set_waitlist_invite(id + 1, 7, None).unwrap(),
             "no such row"
         );
-        assert!(!s.mark_waitlist_notified(id + 1, now).unwrap());
+        assert!(!s.mark_waitlist_notified(id + 1, 7, now).unwrap());
+    }
+
+    /// The reservation check has to travel WITH the delete, because two
+    /// statements leave a gap a signup can take the hold in.
+    #[test]
+    fn a_held_invite_survives_the_admin_revoke() {
+        let s = store();
+        let now = now();
+        let id = s
+            .insert_invite("a".repeat(64).as_str(), now + days(30))
+            .unwrap();
+
+        // Held by a signup that is off at Google right now.
+        assert!(
+            s.reserve_invite(&"a".repeat(64), "holder", now, now + days(1))
+                .is_ok()
+        );
+        assert!(
+            !s.revoke_unheld_invite(id, now).unwrap(),
+            "the hold refuses the delete"
+        );
+        assert!(s.invite_is_held(id, now).unwrap(), "and it is still there");
+
+        // Once the hold lapses, the same call takes it.
+        assert!(s.revoke_unheld_invite(id, now + days(2)).unwrap());
+        assert!(s.list_invites().unwrap().is_empty());
     }
 
     /// The compare-and-swap that decides which of two racing sends gets to mail
