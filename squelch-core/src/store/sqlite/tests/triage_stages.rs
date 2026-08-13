@@ -69,7 +69,7 @@ fn extract_bump_usage_records_its_own_ledger_category() {
             acct,
             "2026-07-23",
             "extract_banking",
-            UsageTokens::new(500, 20, 700, 3000),
+            UsageTokens { input: 500, output: 20, cache_creation: 700, cache_read: 3000 },
         )
         .unwrap();
     store
@@ -77,7 +77,7 @@ fn extract_bump_usage_records_its_own_ledger_category() {
             acct,
             "2026-07-23",
             "extract_banking",
-            UsageTokens::new(300, 10, 300, 1000),
+            UsageTokens { input: 300, output: 10, cache_creation: 300, cache_read: 1000 },
         )
         .unwrap();
     let conn = store.lock().unwrap();
@@ -241,10 +241,10 @@ fn stage1_mark_processed_preserves_needs_stage2_seed() {
 fn stage1_usage_ledger_is_a_separate_category() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", UsageTokens::new(100, 20, 40, 900))
+        .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 20, cache_creation: 40, cache_read: 900 })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens::new(500, 90, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 500, output: 90, ..Default::default() })
         .unwrap();
 
     let s1 = store.stage1_usage_since(acct, "2026-07-01").unwrap();
@@ -272,10 +272,10 @@ fn stage1_usage_ledger_is_a_separate_category() {
 fn list_usage_by_category_surfaces_extractors_nobody_named() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", UsageTokens::new(100, 20, 0, 0))
+        .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 20, ..Default::default() })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens::new(500, 90, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 500, output: 90, ..Default::default() })
         .unwrap();
     // An extractor category, and a category invented right here: the point of
     // enumerating is that a ledger writer added LATER still reports, without
@@ -285,7 +285,7 @@ fn list_usage_by_category_surfaces_extractors_nobody_named() {
             acct,
             "2026-07-09",
             "extract_banking",
-            UsageTokens::new(40, 8, 0, 0),
+            UsageTokens { input: 40, output: 8, ..Default::default() },
         )
         .unwrap();
     store
@@ -293,7 +293,7 @@ fn list_usage_by_category_surfaces_extractors_nobody_named() {
             acct,
             "2026-07-10",
             "extract_something_new",
-            UsageTokens::new(7, 3, 0, 0),
+            UsageTokens { input: 7, output: 3, ..Default::default() },
         )
         .unwrap();
 
@@ -620,10 +620,10 @@ fn stage2_usage_ledger_bumps_and_reads() {
     assert_eq!(z, Stage2Usage::default());
 
     store
-        .stage2_bump_usage(acct, day, UsageTokens::new(1200, 60, 500, 4000))
+        .stage2_bump_usage(acct, day, UsageTokens { input: 1200, output: 60, cache_creation: 500, cache_read: 4000 })
         .unwrap();
     store
-        .stage2_bump_usage(acct, day, UsageTokens::new(800, 40, 100, 2000))
+        .stage2_bump_usage(acct, day, UsageTokens { input: 800, output: 40, cache_creation: 100, cache_read: 2000 })
         .unwrap();
     let u = store.stage2_usage_today(acct, day).unwrap();
     assert_eq!(u.calls, 2);
@@ -647,16 +647,16 @@ fn list_usage_returns_recent_days_newest_first() {
     assert!(store.list_usage(acct, 30).unwrap().is_empty());
 
     store
-        .stage2_bump_usage(acct, "2026-07-07", UsageTokens::new(100, 10, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-07", UsageTokens { input: 100, output: 10, ..Default::default() })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens::new(200, 20, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 200, output: 20, ..Default::default() })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens::new(300, 30, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 300, output: 30, ..Default::default() })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens::new(100, 10, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 10, ..Default::default() })
         .unwrap();
 
     // Newest-first, sparse (only days with a row).
@@ -807,13 +807,13 @@ fn stage2_usage_since_sums_window_inclusively() {
     );
 
     store
-        .stage2_bump_usage(acct, "2026-07-05", UsageTokens::new(100, 10, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-05", UsageTokens { input: 100, output: 10, ..Default::default() })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens::new(200, 20, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 200, output: 20, ..Default::default() })
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens::new(300, 30, 0, 0))
+        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 300, output: 30, ..Default::default() })
         .unwrap();
 
     // since_day <= earliest => everything summed (2 days, 3 calls).
