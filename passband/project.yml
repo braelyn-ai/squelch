@@ -165,7 +165,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOS/PassbandiOS.entitlements
         # The passband-ios-* tag overrides this in CI; it exists so an untagged local
         # build never claims a version ahead of what TestFlight actually has.
-        MARKETING_VERSION: "0.0.1"
+        MARKETING_VERSION: "0.0.2"
         CURRENT_PROJECT_VERSION: "1"
         # iPhone only. The iPad layout is a different design, not a stretch.
         TARGETED_DEVICE_FAMILY: "1"
