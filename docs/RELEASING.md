@@ -176,6 +176,33 @@ Post-rollout verification, per tenant:
   Ready pod only proves something started; this proves it is the thing this
   release renders.
 
+**The first time `drift` is ever run against this cluster, treat its output as
+unproven.** Its whole test suite runs against a mock with no server-side-apply
+merge in it, so four things are only assertions until a real API server has
+answered them. Check them once, on one tenant, and then trust the command:
+
+1. **A freshly provisioned tenant reports zero changes.** Both sides of the
+   diff come back from the API server, so defaulting should cancel out — but
+   `Quantity` canonicalization (`1Gi` vs `1073741824`), `creationTimestamp:
+   null` on the pod template, and defaulted `protocol` / `dnsPolicy` /
+   `schedulerName` are the candidates for a permanent false positive. If one
+   shows up on every tenant, that field wants filtering, not reconciling.
+2. **A hand edit lands in `foreign` and NOT in `changes`.** `kubectl set env`
+   something harmless onto a scratch tenant. The field survives the dry-run
+   merge on both sides, so the ledger is the only half that should see it. If
+   it shows up in `changes` instead, the dry run is not merging and the whole
+   two-detector split needs rethinking.
+3. **An overwrite of a field the warden DOES declare lands in `changes`.**
+   `kubectl set image` on the same scratch tenant: expect `live` = the hand-set
+   tag, `rendered` = `SQUELCH_WARDEN_IMAGE`, and no `409` out of the dry run.
+4. **A recreate really does empty the ledger.** After a `reconcile` that
+   answers `recreated`, `kubectl -n tenants get deploy <label> --show-managed-
+   fields -o yaml` should carry exactly one manager entry, `squelch-warden`.
+   That is the claim the entire route rests on.
+
+Then delete the scratch tenant. Doing this on a tenant with real mail in it is
+how a verification becomes an incident.
+
 ## Surface 3: Passband for Mac (`passband-mac-*` tag)
 
 The canonical path is the tag; CI (`release-passband-mac.yml`) builds, signs,

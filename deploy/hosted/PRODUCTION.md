@@ -263,10 +263,15 @@ identity and the sealed credential never moved.
 **The fallback, for what reconcile refuses.** A `pending` tenant, and a
 `stopped` one that was genuinely cancelled (its Service is gone too), come back
 as `409 not_reconcilable`; starting either back up is a different transition,
-not a shape repair. There the answer is `DELETE /v1/tenants/{label}` — which
-keeps both Secrets and the volume — then `PUT /v1/tenants/{label}/credentials`
-with the tenant's current sealed blob, which rebuilds every object from today's
-code. The control plane must still hold the ciphertext to re-send, and the
+not a shape repair.
+
+Reopening one is **re-consent, not a re-`PUT`**. Nothing outside the tenant's
+own Secret holds a copy of that ciphertext: `squelch-control`'s schema carries
+no tokens and no ciphertext by design, and the refresh token it seals exists in
+memory for the length of one signup request. So the person signs in again, the
+control plane seals a fresh credential to the recipient the warden still holds,
+and `PUT /v1/tenants/{label}/credentials` rebuilds every object from today's
+code. The volume, the identity and the old sealed blob were never touched; the
 mailbox is down for the length of a provision.
 
 > **Standing rule: no hand edits on a tenant Deployment. Ever.** Not

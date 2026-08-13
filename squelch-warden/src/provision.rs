@@ -2254,20 +2254,19 @@ mod tests {
                 "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].valueFrom.secretKeyRef.name",
             ]
         );
-        // And the diff names the field, with the reference that goes fatal the
-        // day the Secret behind it is deleted.
-        assert_eq!(report.changes.len(), 1);
-        assert_eq!(
-            report.changes[0].path,
-            "spec.template.spec.initContainers[seed].env"
-        );
-        assert_eq!(report.changes[0].rendered, serde_json::Value::Null);
-        assert!(
-            report.changes[0]
-                .live
-                .to_string()
-                .contains("squelch-anthropic")
-        );
+        // The ledger is the ONLY place this finding is guaranteed to appear,
+        // and that is the whole reason `foreign_managers` exists.
+        //
+        // Nothing is asserted about `changes` here, deliberately. A real API
+        // server answers a dry-run apply with a MERGE, and a field the warden
+        // does not declare survives that merge exactly as it survives a real
+        // one - so on a cluster this env var is identical on both sides and
+        // cancels out of the diff entirely. `MockCluster` answers with the bare
+        // render instead, so it would show up here as a change against `null`;
+        // asserting on that would be pinning the mock's simplification and
+        // teaching the next reader that the diff catches foreign fields, which
+        // is the one thing it cannot do. `diff_spec` is held to its real
+        // contract by its own unit tests in `drift`.
 
         // Read-only: the dry run is not an apply and not a store.
         assert_eq!(h.cluster.applied().len(), applied);
@@ -2463,7 +2462,10 @@ mod tests {
         else {
             panic!("no deployment");
         };
-        assert!(deployment.metadata.managed_fields.is_none());
+        // No foreign owner survived. The mock stores what it is handed, so an
+        // absent ledger is what a fresh object looks like here; on a cluster
+        // the same assertion is "exactly one entry, and it is the warden".
+        assert!(drift::foreign_managers(&deployment).is_empty());
         let seed = &deployment
             .spec
             .unwrap()

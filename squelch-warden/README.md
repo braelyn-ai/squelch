@@ -387,6 +387,37 @@ and the LLM key are read back only to re-derive the two SHA-256 annotations on
 the pod template, so the render is the one that tenant is entitled to rather
 than a new one, and a re-render on its own does not roll the pod.
 
+### What the report still cannot see
+
+Worth knowing before the answer "clean" is trusted too far.
+
+**`status: active` in a reconcile's answer is weaker than it sounds.** It means
+a pod matching the tenant's selector reported Ready, not that the pod running
+the new spec did. On the converged path the old pod is often still Ready while
+`Recreate` is terminating it, so a reconcile onto a render that cannot start —
+an image tag GHCR does not hold is the easy way to do this — can answer
+`200 converged` and then sit in `ImagePullBackOff`. Watch the pod after a
+reconcile that changed the image or the env; do not take the answer for it.
+
+**Duplicate names in a keyed list hide behind the first one.** `diff_spec`
+aligns containers, env vars, volumes and ports by `name` and takes the first
+match, so a second `env` entry with a name already present is invisible to the
+diff. PodSpec validation permits it (last one wins at runtime) and a hand edit
+is the likeliest way to get one. The ledger still names the manager that wrote
+it, so the tenant is not silently clean — but the value is not shown.
+
+**The fleet walk only knows tenants the control store knows.** `drift` with no
+label enumerates the control plane's rows, and a tenant provisioned into the
+cluster without a row — which `squelch-control`'s own signup path can produce
+and logs as `PROVISIONED BUT NOT RECORDED` — is invisible to it forever. Per
+label it works fine. A cluster-side enumeration by `MANAGED_SELECTOR`, the way
+the pending sweep already lists, is what would close that.
+
+**The walk is one request per tenant against a 120/minute bucket** shared by
+everything reaching the warden through that ingress. Somewhere above a hundred
+tenants a full sweep will start meeting its own rate limit, and a 429 is
+reported as "could not be checked" rather than as drift.
+
 ## Logging
 
 Counts, statuses, and the tenant label. Never a mailbox address, never a
