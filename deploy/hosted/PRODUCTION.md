@@ -150,8 +150,14 @@ ClusterIssuer in `40-wildcard-certificate.yaml`.
 
 ## Images
 
-Every `v*` tag builds all three from `.github/workflows/release.yml` and pushes
-them to GHCR:
+Every `daemon-X.Y.Z` tag builds all three from
+`.github/workflows/release-daemon.yml` and pushes them to GHCR. The image tag is
+the git tag verbatim — `ghcr.io/braelyn-ai/squelchd:daemon-0.0.1`, plus a moving
+`latest`. There are no bare numeric tags any more, deliberately: GHCR tags are
+mutable and this node pulls `IfNotPresent`, so a recycled number would pin a
+stale image with nothing to show for it. The old numeric tags (`0.2.x`,
+`v0.2.6`) are frozen history; anything still pinned to one keeps working until
+it is repointed.
 
 | Image | Arch | Built by |
 |---|---|---|
@@ -174,13 +180,14 @@ turning binfmt back on.
 > ```
 >
 > That tag carries a GHCR name nothing has ever pushed, and adding the CI job
-> does not retroactively publish it. So: do not delete this image from
-> containerd, and do not assume `imagePullPolicy` will save you, until the next
-> `v*` tag is cut and `20-warden.yaml` is repointed at a tag the registry
+> does not retroactively publish it — `v0.2.0` is also from the retired
+> numbering, so nothing ever will. So: do not delete this image from
+> containerd, and do not assume `imagePullPolicy` will save you, until a
+> `daemon-*` tag is cut and `20-warden.yaml` is repointed at a tag the registry
 > actually has. From that point on, replacing this node is a pull.
 
-The squelchd and warden tags are both pinned in `20-warden.yaml`. The warden
-refuses to start with an untagged tenant image.
+The squelchd and warden tags are both pinned in `20-warden.yaml`, at
+`daemon-*` tags. The warden refuses to start with an untagged tenant image.
 
 ## Shipping a tenant-shape change (there is no reconcile)
 
@@ -393,9 +400,9 @@ would happily stream over the real history.
   `kubectl -n tenants get secret -o yaml` and copy the key file. Litestream does
   not touch Secrets and never will, and it certainly does not back up its own
   key into the bucket that key opens.
-- **Cut a tag that publishes the warden** — the release workflow now has the
-  job (see "Images"), but this node still runs the hand-built image. The item
-  closes when `20-warden.yaml` points at a tag GHCR actually holds.
+- **Cut a `daemon-*` tag that publishes the warden** — the release workflow now
+  has the job (see "Images"), but this node still runs the hand-built image. The
+  item closes when `20-warden.yaml` points at a tag GHCR actually holds.
 - **Tenant reconcile: `POST /v1/tenants/{label}/reconcile`.** The warden
   re-applies the typed objects for one already-provisioned tenant, on demand,
   from its current code — the same server-side applies phase two runs, minus the

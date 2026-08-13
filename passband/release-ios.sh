@@ -13,7 +13,7 @@
 # The build number is the UTC minute: unique, monotonic, and derived from the
 # clock instead of a state file some other checkout would fork. The marketing
 # version is project.yml's MARKETING_VERSION unless SQUELCH_IOS_VERSION says
-# otherwise — CI passes the ios-v* tag's version through it.
+# otherwise — CI passes the passband-ios-* tag's version through it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
