@@ -414,6 +414,13 @@ final class AppStore {
     /// mid-answer — every time the bar closed. Living in the store, the
     /// transcript survives until the user asks for a new chat.
     let assistant = AssistantSession()
+    /// A question typed on one surface and meant for the agent on another: the
+    /// phone's search tab hands its text to the agent tab through this, because
+    /// a tab switch is not a call anyone can make on the other tab's behalf.
+    /// ONE-SHOT and a DRAFT, never a send — the agent view puts it in the input
+    /// field, focuses it, and clears this. Nothing on the Mac writes it: there
+    /// the ask bar is a chord away from wherever you already are.
+    var agentSeed: String?
     var shortcutsOpen = false
     /// The first-run tour. Held here for the same reason the assistant is: it
     /// outlives every view it draws itself in, and the trigger that starts it

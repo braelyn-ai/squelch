@@ -5,7 +5,7 @@
 //
 // What differs is only the shape. A Mac gets a rail and a routed page; a phone
 // gets a tab bar, which is a different navigation model rather than a smaller
-// one, so the rail's seven destinations collapse to four and the rest arrive as
+// one, so the rail's seven destinations collapse to five and the rest arrive as
 // the tabs that own them grow up.
 //
 // AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
@@ -30,7 +30,7 @@
 
 import SwiftUI
 
-/// The five phone destinations. Sitrep is the landing surface, matching the Mac.
+/// The six phone destinations. Sitrep is the landing surface, matching the Mac.
 ///
 /// RECORDS IS A TAB HERE AND A RAIL THERE. On the Mac the record zones are
 /// pinned beside the work surface, read WHILE working it; a phone has no room to
@@ -42,7 +42,7 @@ import SwiftUI
 /// material records and renaming the symbol would churn all of it to relabel one
 /// tab.
 private enum MobileTab: Hashable {
-    case sitrep, records, mail, search, settings
+    case sitrep, records, mail, agent, search, settings
 
     /// Left-to-right position in the tab bar. Only the slide direction reads it:
     /// a tab further right has to arrive from the right. Search is highest
@@ -53,8 +53,9 @@ private enum MobileTab: Hashable {
         case .sitrep: 0
         case .records: 1
         case .mail: 2
-        case .settings: 3
-        case .search: 4
+        case .agent: 3
+        case .settings: 4
+        case .search: 5
         }
     }
 }
@@ -167,6 +168,18 @@ private struct MobileShell: View {
                         .threadDestination(active: tab == .mail)
                 }
                 .tabSlide(.mail, selection: tab)
+            }
+            // THE ⌘K AGENT, GIVEN A PLACE. On the Mac the assistant is a chord
+            // over whatever you are doing; a phone has no chords, so the same
+            // `store.assistant` session becomes a destination you walk into. It
+            // KEEPS a thread destination because the agent answers with email
+            // cards, and a card you cannot open is a footnote.
+            Tab("Agent", systemImage: "sparkles", value: MobileTab.agent) {
+                NavigationStack {
+                    MobileAgentView()
+                        .threadDestination(active: tab == .agent)
+                }
+                .tabSlide(.agent, selection: tab)
             }
             // NO `threadDestination` ON THIS ONE, and that is deliberate: every
             // other tab can put mail on screen, and settings is the tab you are

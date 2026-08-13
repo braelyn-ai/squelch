@@ -149,6 +149,7 @@
 		BBE3AD0E42A5038B4013E5BB /* Palette.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF7F148E013D8BCCE2BAA598 /* Palette.swift */; };
 		BD58A1B90A390D639D6D0AEB /* Format.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5883BA424612265657845246 /* Format.swift */; };
 		BDE91DE1BD59B4CD5D50F21D /* Chrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0E547B2A7CA1DA951D255C /* Chrome.swift */; };
+		BE9C340C64913DE9154BDCF0 /* MobileAgentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C12A5AFBCED3C55DA7A5D8 /* MobileAgentView.swift */; };
 		BF2AD4F3EB9857AB051753D0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
 		BF8200741E7C70B75C705CF5 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D19065EB7E9BFE9E846675B /* Keychain.swift */; };
 		BFBC16B9E116B690313D1B5C /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 613B9741AD84024778FA8204 /* APIClient.swift */; };
@@ -255,6 +256,7 @@
 		3484EC544E0909F3D7A88E26 /* ProcessMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessMode.swift; sourceTree = "<group>"; };
 		356A38CCAAFCC056126A2978 /* MobileRecordsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRecordsView.swift; sourceTree = "<group>"; };
 		35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposeSubmit.swift; sourceTree = "<group>"; };
+		35C12A5AFBCED3C55DA7A5D8 /* MobileAgentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAgentView.swift; sourceTree = "<group>"; };
 		37716282CFABFF5910677BBC /* APIError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIError.swift; sourceTree = "<group>"; };
 		37AEAA24984488DA00EBD6C4 /* Platform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Platform.swift; sourceTree = "<group>"; };
 		389673F8FDDB51FC4830D9D2 /* PassbandApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassbandApp.swift; sourceTree = "<group>"; };
@@ -521,6 +523,7 @@
 				5A1CE9442DCA54FF7863D7C5 /* AttachmentPreviewiOS.swift */,
 				1DD489E941E602E585098D3F /* EmailWebViewiOS.swift */,
 				A9FAE568A595DDCE359FFA33 /* MarkdownTextViewiOS.swift */,
+				35C12A5AFBCED3C55DA7A5D8 /* MobileAgentView.swift */,
 				3E64ABDBDFD538453A620415 /* MobileAuthZone.swift */,
 				356A38CCAAFCC056126A2978 /* MobileRecordsView.swift */,
 				27049607B9176B6FC238E8E0 /* MobileSettingsView.swift */,
@@ -887,6 +890,7 @@
 				063C1CF09D6E7CE57C547486 /* Markdown.swift in Sources */,
 				84F6860CDCC32C143703EF41 /* MarkdownStyle.swift in Sources */,
 				E4B1EE75A584D999AA58B0E2 /* MarkdownTextViewiOS.swift in Sources */,
+				BE9C340C64913DE9154BDCF0 /* MobileAgentView.swift in Sources */,
 				D320C5110BA8A2AD35DB883B /* MobileAuthZone.swift in Sources */,
 				EB3A6A193AE3E0C7EDD7E459 /* MobileRecordsView.swift in Sources */,
 				7C0A7FD2599738D2B4A2C152 /* MobileRootView.swift in Sources */,
