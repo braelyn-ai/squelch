@@ -37,9 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # No-arg install reads rust-toolchain.toml — the pinned channel and its
+      # clippy/rustfmt components — so the workflow never states a version the
+      # toml would then fight. A floating `stable` here broke the very first
+      # run: its newer clippy knew lints the local toolchain does not.
+      - name: toolchain
+        run: rustup toolchain install
 
       # Caches ~/.cargo and target/ keyed on the lockfile; the ONNX (ort)
       # build under fastembed is the expensive part, and this is what keeps

@@ -1,0 +1,9 @@
+# Pins the toolchain so local builds and CI lint with the SAME clippy. The ci
+# workflow gates on `-D warnings`, and a floating `stable` means every six-week
+# release can grow a lint that fails PRs which touched nothing (the first CI run
+# did exactly that: the runner's newer clippy flagged `question_mark` sites the
+# local 1.94 does not). Bump this deliberately, fixing whatever the new clippy
+# flags in the same commit.
+[toolchain]
+channel = "1.94"
+components = ["clippy", "rustfmt"]
