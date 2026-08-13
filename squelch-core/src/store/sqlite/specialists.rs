@@ -23,6 +23,14 @@ fn select_row_id(
     Ok(id)
 }
 
+/// The `delivered_at` binding for a status the email path just accepted: the
+/// seen-at stamp once it lands Delivered, else NULL. Every write pairs it with
+/// `COALESCE(delivered_at, ?)`, so a NULL is a no-op and an existing stamp
+/// (from an earlier email or a carrier poll) is never overwritten.
+fn delivered_ts(status: crate::triage::ShipmentStatus, ts: &str) -> Option<String> {
+    (status == crate::triage::ShipmentStatus::Delivered).then(|| ts.to_string())
+}
+
 /// Upsert a shipment keyed by `(account_id, tracking_number)` in the caller's
 /// transaction. A repeat applies the no-regress status state machine
 /// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
@@ -64,8 +72,9 @@ pub(super) fn upsert_shipment_conn(
         None => {
             conn.execute(
                 "INSERT INTO shipments(account_id, tracking_number, carrier, item_name,
-                     status, tracking_url, last_message_id, first_seen, last_update)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+                     status, tracking_url, last_message_id, first_seen, last_update,
+                     delivered_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
                 params![
                     account_id,
                     s.tracking_number,
@@ -75,6 +84,7 @@ pub(super) fn upsert_shipment_conn(
                     s.tracking_url,
                     message_id,
                     ts,
+                    delivered_ts(s.status, &ts),
                 ],
             )?;
             let id: i64 = conn.query_row(
@@ -117,7 +127,8 @@ pub(super) fn upsert_shipment_conn(
                     "UPDATE shipments SET status=?1, item_name=?2, carrier=?3,
                          tracking_url=?4,
                          last_message_id = CASE WHEN ?5 THEN ?6 ELSE last_message_id END,
-                         last_update     = CASE WHEN ?5 THEN ?7 ELSE last_update END
+                         last_update     = CASE WHEN ?5 THEN ?7 ELSE last_update END,
+                         delivered_at    = COALESCE(delivered_at, ?9)
                      WHERE id=?8",
                     params![
                         merged.as_str(),
@@ -128,6 +139,7 @@ pub(super) fn upsert_shipment_conn(
                         message_id,
                         ts,
                         id,
+                        delivered_ts(merged, &ts),
                     ],
                 )?;
             } else {
@@ -135,9 +147,18 @@ pub(super) fn upsert_shipment_conn(
                 conn.execute(
                     "UPDATE shipments SET status=?1, item_name=?2,
                          last_message_id = CASE WHEN ?3 THEN ?4 ELSE last_message_id END,
-                         last_update     = CASE WHEN ?3 THEN ?5 ELSE last_update END
+                         last_update     = CASE WHEN ?3 THEN ?5 ELSE last_update END,
+                         delivered_at    = COALESCE(delivered_at, ?7)
                      WHERE id=?6",
-                    params![merged.as_str(), item_name, accepted, message_id, ts, id],
+                    params![
+                        merged.as_str(),
+                        item_name,
+                        accepted,
+                        message_id,
+                        ts,
+                        id,
+                        delivered_ts(merged, &ts),
+                    ],
                 )?;
             }
             Ok(id)
@@ -364,6 +385,35 @@ pub(super) fn auto_close_bill_for_receipt_conn(
     Ok(Some(bill_id))
 }
 
+/// The projection every shipment read shares, in [`shipment_row`]'s order.
+/// LEFT JOIN: a NULL `last_message_id` (a row written by an older daemon, or one
+/// only a carrier poll has touched) leaves the shipment standing, just with
+/// nowhere to jump to.
+const SHIPMENT_SELECT: &str = "SELECT s.id, s.account_id, s.tracking_number, s.carrier,
+            s.item_name, s.status, s.tracking_url, s.first_seen, s.last_update,
+            m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at
+     FROM shipments s
+     LEFT JOIN messages m ON m.id = s.last_message_id AND m.account_id = s.account_id";
+
+fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipment> {
+    Ok(crate::types::Shipment {
+        id: r.get(0)?,
+        account_id: r.get(1)?,
+        tracking_number: r.get(2)?,
+        carrier: r.get(3)?,
+        item_name: r.get(4)?,
+        status: r.get(5)?,
+        tracking_url: r.get(6)?,
+        first_seen: dt(r, 7)?,
+        last_update: dt(r, 8)?,
+        thread_id: r.get(9)?,
+        carrier_status_raw: r.get(10)?,
+        eta: dt_opt(r, 11)?,
+        delivered_at: dt_opt(r, 12)?,
+        last_polled_at: dt_opt(r, 13)?,
+    })
+}
+
 impl SqliteStore {
     pub(super) fn upsert_shipment(
         &self,
@@ -384,37 +434,144 @@ impl SqliteStore {
         let conn = self.lock()?;
         // No sealed rows: detection never runs on sealed mail, and sealing an
         // already-extracted message deletes its shipment row (correct_triage).
-        // LEFT JOIN: a NULL last_message_id (row written by an older daemon)
-        // leaves the shipment standing, just with nowhere to jump to.
-        let mut sql = String::from(
-            "SELECT s.id, s.account_id, s.tracking_number, s.carrier, s.item_name, s.status,
-                    s.tracking_url, s.first_seen, s.last_update, m.thread_id
-             FROM shipments s
-             LEFT JOIN messages m ON m.id = s.last_message_id AND m.account_id = s.account_id
-             WHERE s.account_id=?1",
-        );
+        let mut sql = format!("{SHIPMENT_SELECT} WHERE s.account_id=?1");
         if !include_delivered {
             sql.push_str(" AND s.status != 'delivered'");
         }
         sql.push_str(" ORDER BY s.last_update DESC");
         let mut stmt = conn.prepare(&sql)?;
         let out = stmt
-            .query_map(params![account_id], |r| {
-                Ok(crate::types::Shipment {
-                    id: r.get(0)?,
-                    account_id: r.get(1)?,
-                    tracking_number: r.get(2)?,
-                    carrier: r.get(3)?,
-                    item_name: r.get(4)?,
-                    status: r.get(5)?,
-                    tracking_url: r.get(6)?,
-                    first_seen: dt(r, 7)?,
-                    last_update: dt(r, 8)?,
-                    thread_id: r.get(9)?,
-                })
-            })?
+            .query_map(params![account_id], shipment_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    pub(super) fn list_pollable_shipments(
+        &self,
+        account_id: AccountId,
+        min_first_seen: DateTime<Utc>,
+        max_failures: u32,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        let conn = self.lock()?;
+        // Amazon and "unknown" are excluded by the carrier list: neither has an
+        // API to poll. Ordered never-polled first, then least-recently-polled,
+        // so a caller taking a prefix spreads its budget evenly.
+        let mut stmt = conn.prepare(&format!(
+            "{SHIPMENT_SELECT}
+             WHERE s.account_id=?1
+               AND s.status != 'delivered'
+               AND s.carrier IN ('ups','usps','fedex','dhl')
+               AND s.first_seen >= ?2
+               AND s.poll_failures < ?3
+             ORDER BY s.last_polled_at IS NOT NULL, s.last_polled_at, s.id"
+        ))?;
+        let out = stmt
+            .query_map(
+                params![account_id, min_first_seen.to_rfc3339(), max_failures],
+                shipment_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    pub(super) fn apply_carrier_track(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        track: &crate::triage::CarrierTrack,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        use crate::triage::ShipmentStatus;
+        let conn = self.lock()?;
+
+        // Read the row so reconciliation and the visible-change test run in Rust
+        // rather than a SQL CASE.
+        let existing: Option<(String, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT status, carrier_status_raw, eta FROM shipments
+                 WHERE account_id=?1 AND id=?2",
+                params![account_id, shipment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((cur_status_s, cur_raw, cur_eta)) = existing else {
+            return Ok(false);
+        };
+        let cur_status = ShipmentStatus::parse(&cur_status_s).unwrap_or(ShipmentStatus::Shipped);
+        // A status the carrier's vocabulary could not map leaves the
+        // email-inferred one alone; the raw string still lands.
+        let status = match track.status {
+            Some(carrier) => ShipmentStatus::reconcile_carrier(cur_status, carrier),
+            None => cur_status,
+        };
+
+        let eta = track.eta.map(|t| t.to_rfc3339());
+        let status_changed = status != cur_status;
+        // `last_update` is the Sitrep sort key, so it advances ONLY on a change
+        // the user can see — a poll that confirms what the row already says must
+        // not churn the card order.
+        let visible_change = status_changed
+            || cur_raw.as_deref() != Some(track.carrier_status_raw.as_str())
+            || cur_eta != eta;
+        // The carrier's own delivery timestamp when it gave one, else the poll
+        // clock; COALESCE keeps whatever an earlier email or poll recorded.
+        let delivered_at = (status == ShipmentStatus::Delivered)
+            .then(|| track.delivered_at.unwrap_or(polled_at).to_rfc3339());
+
+        // NEVER touches `last_message_id`: no message backs a poll, so the row's
+        // click target stays the last accepted email. The sealing delete in
+        // feedback.rs is keyed on `last_message_id`, so a poll-advanced row that
+        // dropped its pointer would survive the seal of the mail that fed it.
+        conn.execute(
+            "UPDATE shipments
+                SET status             = ?3,
+                    carrier_status_raw = ?4,
+                    eta                = ?5,
+                    delivered_at       = COALESCE(delivered_at, ?6),
+                    last_polled_at     = ?7,
+                    poll_failures      = 0,
+                    last_update        = CASE WHEN ?8 THEN ?7 ELSE last_update END
+              WHERE account_id=?1 AND id=?2",
+            params![
+                account_id,
+                shipment_id,
+                status.as_str(),
+                track.carrier_status_raw,
+                eta,
+                delivered_at,
+                polled_at.to_rfc3339(),
+                visible_change,
+            ],
+        )?;
+        Ok(status_changed)
+    }
+
+    pub(super) fn record_poll_outcome(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        polled_at: DateTime<Utc>,
+        permanent_failure: bool,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        // The ATTEMPT is always stamped, so a shipment the carrier keeps
+        // rejecting still rotates through the poll queue. Only a PERMANENT
+        // failure counts toward the retirement cap — a transient network or
+        // rate-limit error must not retire a live shipment — and a successful
+        // poll ([`SqliteStore::apply_carrier_track`]) resets the counter.
+        conn.execute(
+            "UPDATE shipments
+                SET last_polled_at = ?3,
+                    poll_failures  = poll_failures + CASE WHEN ?4 THEN 1 ELSE 0 END
+              WHERE account_id=?1 AND id=?2",
+            params![
+                account_id,
+                shipment_id,
+                polled_at.to_rfc3339(),
+                permanent_failure,
+            ],
+        )?;
+        Ok(())
     }
 
     pub(super) fn upsert_receipt(

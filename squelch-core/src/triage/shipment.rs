@@ -12,6 +12,7 @@
 
 use crate::triage::text::rx;
 use crate::types::str_enum;
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -32,6 +33,24 @@ pub struct ShipmentInfo {
     /// Tracking URL with the number substituted; `None` for a carrier with no
     /// public tracking URL (Amazon) or an unknown one.
     pub tracking_url: Option<String>,
+}
+
+/// One carrier-API tracking result for an already-known shipment: the same
+/// subject as [`ShipmentInfo`], sourced from the carrier instead of an email.
+/// Carries no tracking number or carrier — the caller polled a specific row and
+/// already knows both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarrierTrack {
+    /// The carrier's status mapped onto our ladder. `None` when the carrier's
+    /// vocabulary maps to nothing we model: the raw string is still recorded,
+    /// but the shipment's status is left alone rather than guessed at.
+    pub status: Option<ShipmentStatus>,
+    /// The carrier's status string, verbatim.
+    pub carrier_status_raw: String,
+    /// Carrier-estimated delivery; `None` when the carrier gives none.
+    pub eta: Option<DateTime<Utc>>,
+    /// Carrier-reported delivery time; `None` until the carrier reports one.
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 str_enum! {
@@ -89,6 +108,24 @@ impl ShipmentStatus {
         match (existing.rank(), incoming.rank()) {
             (Some(e), Some(i)) if i > e => incoming,
             _ => existing,
+        }
+    }
+
+    /// Reconcile a CARRIER-API status onto the stored one. The carrier is ground
+    /// truth, so unlike [`merge`](ShipmentStatus::merge) it REPLACES rather than
+    /// ratchets: it may clear an exception the mail announced, and it may walk
+    /// out_for_delivery back to shipped when a scan says the package missed its
+    /// truck. Email statuses are inferences from marketing copy; carrier scans
+    /// are the record.
+    ///
+    /// The one exception is Delivered, which stays terminal: carrier scan data
+    /// can lag a delivery the user already got an email about, and a card that
+    /// un-delivers itself reads as a bug.
+    pub fn reconcile_carrier(existing: ShipmentStatus, carrier: ShipmentStatus) -> ShipmentStatus {
+        if existing == ShipmentStatus::Delivered {
+            ShipmentStatus::Delivered
+        } else {
+            carrier
         }
     }
 }
@@ -661,6 +698,81 @@ mod tests {
             ShipmentStatus::OutForDelivery,
             "out-for-delivery resolves the exception forward"
         );
+    }
+
+    // ---- carrier reconciliation: replace, not ratchet ---------------------
+
+    #[test]
+    fn carrier_replaces_upward() {
+        assert_eq!(
+            ShipmentStatus::reconcile_carrier(
+                ShipmentStatus::Shipped,
+                ShipmentStatus::OutForDelivery
+            ),
+            ShipmentStatus::OutForDelivery
+        );
+        assert_eq!(
+            ShipmentStatus::reconcile_carrier(ShipmentStatus::Ordered, ShipmentStatus::Shipped),
+            ShipmentStatus::Shipped
+        );
+    }
+
+    #[test]
+    fn carrier_replaces_downward() {
+        // Where `merge` would refuse the regression, the carrier's scan wins:
+        // a package that missed its truck really is back to shipped.
+        assert_eq!(
+            ShipmentStatus::merge(ShipmentStatus::OutForDelivery, ShipmentStatus::Shipped),
+            ShipmentStatus::OutForDelivery
+        );
+        assert_eq!(
+            ShipmentStatus::reconcile_carrier(
+                ShipmentStatus::OutForDelivery,
+                ShipmentStatus::Shipped
+            ),
+            ShipmentStatus::Shipped
+        );
+    }
+
+    #[test]
+    fn carrier_clears_an_exception() {
+        // A resolved delay is the carrier's to report, at any stage — including
+        // one `merge` would keep the exception flag through.
+        assert_eq!(
+            ShipmentStatus::reconcile_carrier(ShipmentStatus::Exception, ShipmentStatus::Shipped),
+            ShipmentStatus::Shipped
+        );
+        assert_eq!(
+            ShipmentStatus::reconcile_carrier(ShipmentStatus::Exception, ShipmentStatus::Ordered),
+            ShipmentStatus::Ordered
+        );
+    }
+
+    #[test]
+    fn carrier_raises_an_exception() {
+        assert_eq!(
+            ShipmentStatus::reconcile_carrier(ShipmentStatus::Shipped, ShipmentStatus::Exception),
+            ShipmentStatus::Exception
+        );
+    }
+
+    #[test]
+    fn delivered_is_terminal_against_any_carrier_status() {
+        // Carrier scan data lags an email-announced delivery, so nothing the
+        // carrier says walks a delivered row back.
+        for carrier in [
+            ShipmentStatus::Ordered,
+            ShipmentStatus::Shipped,
+            ShipmentStatus::OutForDelivery,
+            ShipmentStatus::Delivered,
+            ShipmentStatus::Exception,
+        ] {
+            assert_eq!(
+                ShipmentStatus::reconcile_carrier(ShipmentStatus::Delivered, carrier),
+                ShipmentStatus::Delivered,
+                "carrier: {carrier:?}"
+            );
+        }
     }
 
     // ---- item-name stripping ---------------------------------------------

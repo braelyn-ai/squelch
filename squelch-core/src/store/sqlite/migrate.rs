@@ -118,6 +118,20 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "contacts", "last_sent_at", "TEXT")?;
     add_column_if_missing(conn, "contacts", "display_name", "TEXT")?;
 
+    // Carrier-polling columns. NULL/0 is correct history and needs no backfill:
+    // a pre-existing row has never been polled, so nothing beyond what its mail
+    // said is known about it, and it owes zero failures.
+    add_column_if_missing(conn, "shipments", "carrier_status_raw", "TEXT")?;
+    add_column_if_missing(conn, "shipments", "eta", "TEXT")?;
+    add_column_if_missing(conn, "shipments", "delivered_at", "TEXT")?;
+    add_column_if_missing(conn, "shipments", "last_polled_at", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "shipments",
+        "poll_failures",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
     // Adding `stage1_model_used` leaves it NULL on every historical row — exactly
     // the Stage-1 queue predicate — so without this backfill the whole mailbox
     // re-classifies through the paid model. Rows already classified or already

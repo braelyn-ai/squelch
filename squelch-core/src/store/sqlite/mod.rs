@@ -486,6 +486,35 @@ impl Store for SqliteStore {
         self.list_shipments(account_id, include_delivered)
     }
 
+    fn list_pollable_shipments(
+        &self,
+        account_id: AccountId,
+        min_first_seen: DateTime<Utc>,
+        max_failures: u32,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        self.list_pollable_shipments(account_id, min_first_seen, max_failures)
+    }
+
+    fn apply_carrier_track(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        track: &crate::triage::CarrierTrack,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.apply_carrier_track(account_id, shipment_id, track, polled_at)
+    }
+
+    fn record_poll_outcome(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        polled_at: DateTime<Utc>,
+        permanent_failure: bool,
+    ) -> Result<()> {
+        self.record_poll_outcome(account_id, shipment_id, polled_at, permanent_failure)
+    }
+
     fn upsert_receipt(
         &self,
         account_id: AccountId,

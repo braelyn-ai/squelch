@@ -169,6 +169,25 @@ CREATE TABLE IF NOT EXISTS shipments (
     last_message_id INTEGER,
     first_seen      TEXT NOT NULL,
     last_update     TEXT NOT NULL,
+    -- CARRIER POLLING. Everything below is filled by the carrier API, never by
+    -- mail, and NULL/0 until the first poll. The carrier is ground truth for
+    -- `status` (see `triage::shipment::ShipmentStatus::reconcile_carrier`), but
+    -- a poll NEVER moves `last_message_id` — no message backs it.
+    --
+    -- The carrier's own latest status string, verbatim. Recorded even when it
+    -- maps to no `status` value, so the client can show what the carrier said.
+    carrier_status_raw TEXT,
+    -- Carrier-estimated delivery; NULL when the carrier gives none.
+    eta             TEXT,
+    -- When the package landed, stamped by whichever path saw it first (a
+    -- delivered email or a poll) and never overwritten after.
+    delivered_at    TEXT,
+    -- Last poll ATTEMPT, success or permanent failure. NULL = never polled.
+    last_polled_at  TEXT,
+    -- Consecutive PERMANENT poll failures (an unknown/expired number), the
+    -- retirement cap for the poll queue. Transient errors do not count, and a
+    -- successful poll resets it to 0.
+    poll_failures   INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, tracking_number)
 );
 

@@ -127,6 +127,55 @@ fn sealing_by_hand_deletes_the_shipment_the_message_fed() {
 }
 
 #[test]
+fn sealing_by_hand_deletes_a_poll_advanced_shipment_too() {
+    // The delete is keyed on `last_message_id`, and carrier polls deliberately
+    // never touch that pointer — so a row the carrier has since advanced still
+    // seals with the mail that fed it. If a poll ever adopted the pointer (or
+    // nulled it), this row would survive the seal carrying sealed-derived
+    // content on a Sitrep card.
+    use crate::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
+    let (store, acct) = store();
+    let t0 = Utc::now();
+    let id = inbound_triaged(acct, "g1", "t1", "pharmacy@rx.com", t0, false).ingest(&store);
+
+    let sid = store
+        .upsert_shipment(
+            acct,
+            id,
+            &ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: "Prescription refill".into(),
+                status: ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            t0,
+        )
+        .unwrap();
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            t0 + chrono::Duration::minutes(5),
+        )
+        .unwrap();
+    assert_eq!(store.list_shipments(acct, true).unwrap().len(), 1);
+
+    store
+        .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+        .unwrap()
+        .unwrap();
+
+    assert!(store.list_shipments(acct, true).unwrap().is_empty());
+}
+
+#[test]
 fn sealing_by_hand_retracts_the_notification_event() {
     // A message can notify FIRST and be sealed by hand after, so sealing has
     // to retract the pre-seal snapshot every client cursor replays forever.

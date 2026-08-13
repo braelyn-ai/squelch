@@ -665,3 +665,533 @@ fn list_shipments_serves_thread_and_left_join_keeps_pointerless_rows() {
     assert_eq!(listed.len(), 1, "pointerless rows must still list");
     assert_eq!(listed[0].thread_id, None);
 }
+
+// ---- carrier polling ---------------------------------------------------
+
+/// A shipment on `carrier` with a distinct tracking number, at `status`.
+fn shipped(
+    carrier: &str,
+    number: &str,
+    status: crate::triage::ShipmentStatus,
+) -> crate::triage::ShipmentInfo {
+    crate::triage::ShipmentInfo {
+        carrier: carrier.into(),
+        tracking_number: number.into(),
+        item_name: "Headphones".into(),
+        status,
+        tracking_url: None,
+    }
+}
+
+/// `(last_message_id, poll_failures)` straight from the row — neither is on the
+/// wire type.
+fn shipment_internals(store: &SqliteStore, id: i64) -> (Option<i64>, i64) {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT last_message_id, poll_failures FROM shipments WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn carrier_track_advances_status_and_leaves_the_click_target_alone() {
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+
+    let eta = t0 + chrono::Duration::hours(4);
+    let polled = t0 + chrono::Duration::minutes(5);
+    let changed = store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: Some(eta),
+                delivered_at: None,
+            },
+            polled,
+        )
+        .unwrap();
+    assert!(changed, "shipped -> out_for_delivery is a status change");
+
+    let listed = store.list_shipments(acct, false).unwrap();
+    assert_eq!(listed[0].status, "out_for_delivery");
+    assert_eq!(
+        listed[0].carrier_status_raw.as_deref(),
+        Some("Out For Delivery")
+    );
+    assert_eq!(listed[0].eta, Some(eta));
+    assert_eq!(listed[0].last_polled_at, Some(polled));
+    assert_eq!(listed[0].last_update, polled, "a visible change moves it");
+
+    // A poll has NO message behind it, so the click target stays the last
+    // accepted email — and the sealing delete keys on exactly that pointer.
+    assert_eq!(listed[0].thread_id.as_deref(), Some("t1"));
+    assert_eq!(shipment_internals(&store, sid).0, Some(mid));
+}
+
+#[test]
+fn carrier_replaces_the_email_inferred_status_in_both_directions() {
+    // The carrier is ground truth, so unlike the email merge it may regress —
+    // both of these are moves `ShipmentStatus::merge` would refuse.
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+
+    let track = |status, raw: &str| CarrierTrack {
+        status: Some(status),
+        carrier_status_raw: raw.into(),
+        eta: None,
+        delivered_at: None,
+    };
+
+    // A delay the mail announced, cleared by the carrier's own scan.
+    let excepted = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Exception),
+            t0,
+        )
+        .unwrap();
+    store
+        .apply_carrier_track(
+            acct,
+            excepted,
+            &track(ShipmentStatus::Shipped, "In Transit"),
+            t0,
+        )
+        .unwrap();
+
+    // A package that missed its truck, walked back to shipped.
+    let ofd = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped(
+                "usps",
+                "9400111899223817428490",
+                ShipmentStatus::OutForDelivery,
+            ),
+            t0,
+        )
+        .unwrap();
+    store
+        .apply_carrier_track(acct, ofd, &track(ShipmentStatus::Shipped, "In Transit"), t0)
+        .unwrap();
+
+    let by_id: std::collections::HashMap<i64, String> = store
+        .list_shipments(acct, true)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.id, s.status))
+        .collect();
+    assert_eq!(by_id[&excepted], "shipped", "carrier clears the exception");
+    assert_eq!(
+        by_id[&ofd], "shipped",
+        "carrier walks out_for_delivery back"
+    );
+}
+
+#[test]
+fn a_delivered_shipment_survives_any_carrier_status() {
+    // Carrier scan data lags an email-announced delivery, so Delivered stays
+    // terminal against a poll too.
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Delivered),
+            t0,
+        )
+        .unwrap();
+
+    let changed = store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::Shipped),
+                carrier_status_raw: "In Transit".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            t0 + chrono::Duration::minutes(1),
+        )
+        .unwrap();
+    assert!(!changed, "delivered is terminal, so nothing changed");
+    assert_eq!(
+        store.list_shipments(acct, true).unwrap()[0].status,
+        "delivered"
+    );
+}
+
+#[test]
+fn an_unmappable_carrier_status_records_the_raw_string_only() {
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+
+    let changed = store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: None,
+                carrier_status_raw: "Held At Customs".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            t0 + chrono::Duration::minutes(1),
+        )
+        .unwrap();
+    assert!(!changed);
+    let listed = store.list_shipments(acct, false).unwrap();
+    assert_eq!(
+        listed[0].status, "shipped",
+        "an unmapped status is not guessed at"
+    );
+    assert_eq!(
+        listed[0].carrier_status_raw.as_deref(),
+        Some("Held At Customs"),
+        "what the carrier said is still recorded"
+    );
+}
+
+#[test]
+fn a_poll_with_nothing_new_advances_last_polled_at_but_not_last_update() {
+    // last_update is the Sitrep sort key: polling every en-route shipment must
+    // not reshuffle the cards.
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+
+    let track = CarrierTrack {
+        status: Some(ShipmentStatus::Shipped),
+        carrier_status_raw: "In Transit".into(),
+        eta: None,
+        delivered_at: None,
+    };
+    let first = t0 + chrono::Duration::minutes(1);
+    store.apply_carrier_track(acct, sid, &track, first).unwrap();
+    let after_first = store.list_shipments(acct, false).unwrap().remove(0);
+    assert_eq!(after_first.last_update, first, "the raw string was new");
+
+    // Same answer an hour later: nothing the user can see moved.
+    let second = t0 + chrono::Duration::hours(1);
+    let changed = store
+        .apply_carrier_track(acct, sid, &track, second)
+        .unwrap();
+    assert!(!changed);
+    let after_second = store.list_shipments(acct, false).unwrap().remove(0);
+    assert_eq!(
+        after_second.last_update, first,
+        "an unchanged poll must not churn the sort order"
+    );
+    assert_eq!(
+        after_second.last_polled_at,
+        Some(second),
+        "the attempt still lands"
+    );
+}
+
+#[test]
+fn list_pollable_shipments_filters_delivered_carrier_age_and_failures() {
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::days(30);
+
+    let land = |carrier: &str, number: &str, status, seen| {
+        store
+            .upsert_shipment(acct, mid, &shipped(carrier, number, status), seen)
+            .unwrap()
+    };
+    let live = land("ups", "1Z999AA10123456784", ShipmentStatus::Shipped, now);
+    land("ups", "1Z999AA10123456785", ShipmentStatus::Delivered, now);
+    land("amazon", "TBA303392911000", ShipmentStatus::Shipped, now);
+    land("unknown", "555000111222", ShipmentStatus::Shipped, now);
+    let stale = land(
+        "fedex",
+        "123456789012",
+        ShipmentStatus::Shipped,
+        now - chrono::Duration::days(45),
+    );
+    let failing = land("dhl", "1234567890", ShipmentStatus::Shipped, now);
+
+    // Three permanent failures retires it at a cap of 3.
+    for i in 1..=3 {
+        store
+            .record_poll_outcome(acct, failing, now + chrono::Duration::minutes(i), true)
+            .unwrap();
+    }
+
+    let pollable: Vec<i64> = store
+        .list_pollable_shipments(acct, cutoff, 3)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(
+        pollable,
+        vec![live],
+        "delivered, API-less carriers, over-age and failure-capped rows are all out"
+    );
+
+    // Widening the window readmits the stale one; raising the cap readmits the
+    // failing one — proving each exclusion was its own predicate.
+    let widened: Vec<i64> = store
+        .list_pollable_shipments(acct, now - chrono::Duration::days(60), 4)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert!(widened.contains(&stale) && widened.contains(&failing));
+
+    // A carrier answer resets the counter, so the retired row polls again.
+    store
+        .apply_carrier_track(
+            acct,
+            failing,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::Shipped),
+                carrier_status_raw: "In Transit".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            now + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    assert_eq!(shipment_internals(&store, failing).1, 0);
+    assert!(
+        store
+            .list_pollable_shipments(acct, cutoff, 3)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == failing),
+        "a success un-retires the shipment"
+    );
+}
+
+#[test]
+fn record_poll_outcome_stamps_every_attempt_but_counts_only_permanent_failures() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+
+    // A transient error rotates the row through the queue without spending a
+    // life against the retirement cap.
+    let transient = t0 + chrono::Duration::minutes(1);
+    store
+        .record_poll_outcome(acct, sid, transient, false)
+        .unwrap();
+    assert_eq!(shipment_internals(&store, sid).1, 0);
+    let listed = store.list_shipments(acct, false).unwrap();
+    assert_eq!(listed[0].last_polled_at, Some(transient));
+    assert_eq!(
+        listed[0].last_update, t0,
+        "a failed poll shows the user nothing"
+    );
+
+    store
+        .record_poll_outcome(acct, sid, t0 + chrono::Duration::minutes(2), true)
+        .unwrap();
+    store
+        .record_poll_outcome(acct, sid, t0 + chrono::Duration::minutes(3), true)
+        .unwrap();
+    assert_eq!(shipment_internals(&store, sid).1, 2);
+}
+
+#[test]
+fn delivered_at_is_stamped_by_either_path_and_never_overwritten() {
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now();
+
+    // POLL PATH: the carrier's own timestamp wins over the poll clock.
+    let polled = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+    let carrier_stamp = t0 + chrono::Duration::hours(2);
+    store
+        .apply_carrier_track(
+            acct,
+            polled,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::Delivered),
+                carrier_status_raw: "Delivered".into(),
+                eta: None,
+                delivered_at: Some(carrier_stamp),
+            },
+            t0 + chrono::Duration::hours(3),
+        )
+        .unwrap();
+
+    // POLL PATH, no carrier timestamp: the poll clock is the fallback.
+    let fallback = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("usps", "9400111899223817428490", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+    let fallback_poll = t0 + chrono::Duration::hours(4);
+    store
+        .apply_carrier_track(
+            acct,
+            fallback,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::Delivered),
+                carrier_status_raw: "Delivered".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            fallback_poll,
+        )
+        .unwrap();
+
+    // EMAIL PATH: a delivered email stamps it too.
+    let emailed = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+    let email_stamp = t0 + chrono::Duration::hours(5);
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("fedex", "123456789012", ShipmentStatus::Delivered),
+            email_stamp,
+        )
+        .unwrap();
+
+    let stamped = |id: i64| {
+        store
+            .list_shipments(acct, true)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .delivered_at
+    };
+    assert_eq!(stamped(polled), Some(carrier_stamp));
+    assert_eq!(stamped(fallback), Some(fallback_poll));
+    assert_eq!(stamped(emailed), Some(email_stamp));
+
+    // A later poll re-reporting the delivery must not move the stamp.
+    store
+        .apply_carrier_track(
+            acct,
+            polled,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::Delivered),
+                carrier_status_raw: "Delivered, Front Door".into(),
+                eta: None,
+                delivered_at: Some(t0 + chrono::Duration::hours(9)),
+            },
+            t0 + chrono::Duration::hours(9),
+        )
+        .unwrap();
+    assert_eq!(
+        stamped(polled),
+        Some(carrier_stamp),
+        "the first stamp holds"
+    );
+}
+
+#[test]
+fn a_shipment_carries_no_poll_state_until_it_is_polled() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    let s = store.list_shipments(acct, false).unwrap().remove(0);
+    assert_eq!(s.carrier_status_raw, None);
+    assert_eq!(s.eta, None);
+    assert_eq!(s.delivered_at, None);
+    assert_eq!(s.last_polled_at, None, "NULL means never polled");
+}

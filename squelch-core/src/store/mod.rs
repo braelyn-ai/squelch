@@ -11,7 +11,7 @@ pub use search_query::{SearchFilter, parse_search_query};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
-use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
+use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, Receipt,
@@ -745,6 +745,52 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         include_delivered: bool,
     ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// Shipments worth a carrier-API poll: not yet delivered, on a carrier that
+    /// HAS an API ("ups" | "usps" | "fedex" | "dhl" — Amazon and "unknown" have
+    /// none), first seen at or after `min_first_seen`, and under `max_failures`
+    /// permanent poll failures. Never-polled rows come first, then the
+    /// least-recently-polled, so a caller taking a prefix spends its budget
+    /// evenly. Sealed rows are structurally absent, as for every shipment read.
+    fn list_pollable_shipments(
+        &self,
+        account_id: AccountId,
+        min_first_seen: DateTime<Utc>,
+        max_failures: u32,
+    ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// Apply one carrier-API result to a shipment, returning whether `status`
+    /// changed (`false` for an unknown id). The carrier is ground truth, so the
+    /// status is REPLACED through
+    /// [`ShipmentStatus::reconcile_carrier`](crate::triage::ShipmentStatus::reconcile_carrier)
+    /// rather than ratcheted — except when `track.status` is `None`, which
+    /// leaves it untouched. `carrier_status_raw`/`eta` always take the carrier's
+    /// values, `last_polled_at` always advances, and `poll_failures` resets;
+    /// `delivered_at` fills once and is never overwritten. `last_update` moves
+    /// ONLY when something user-visible changed, so polling does not churn the
+    /// Sitrep sort order.
+    ///
+    /// `last_message_id` is NEVER touched — no message backs a poll, so the
+    /// row's click target stays the last accepted email.
+    fn apply_carrier_track(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        track: &CarrierTrack,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// Record a poll attempt that produced no track. `last_polled_at` always
+    /// advances (so the shipment rotates through the queue); `poll_failures`
+    /// bumps only for a PERMANENT failure — an unknown or expired tracking
+    /// number, not a transient network or rate-limit error.
+    fn record_poll_outcome(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        polled_at: DateTime<Utc>,
+        permanent_failure: bool,
+    ) -> Result<()>;
 
     /// Upsert a receipt keyed by `(account_id, message_id)` — a re-ingest of the
     /// same message updates in place (idempotent).
