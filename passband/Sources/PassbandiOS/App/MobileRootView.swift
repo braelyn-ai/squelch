@@ -168,14 +168,14 @@ private struct MobileShell: View {
                 }
                 .tabSlide(.mail, selection: tab)
             }
+            // NO `threadDestination` ON THIS ONE, and that is deliberate: every
+            // other tab can put mail on screen, and settings is the tab you are
+            // in precisely when you are not reading. Nothing here calls
+            // `openThread`, so a destination would only be a stack this tab
+            // could be pushed onto from somewhere else.
             Tab("Settings", systemImage: MainView.settings.symbol, value: MobileTab.settings) {
                 NavigationStack {
-                    PlaceholderTab(
-                        title: "Settings",
-                        symbol: MainView.settings.symbol,
-                        line:
-                            "Connection, theme, signature and telemetry move over with the settings pane."
-                    )
+                    MobileSettingsView()
                 }
                 .tabSlide(.settings, selection: tab)
             }
