@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS messages (
     -- storage is fine, serving is guarded.
     body_html   TEXT,
     is_sent     INTEGER NOT NULL DEFAULT 0,
+    -- DISPLAY RECIPIENTS of mail the user SENT: the To + Cc mailboxes as the
+    -- headers spelled them, comma-joined `Name <addr>` (bare addr with no
+    -- display name). NULL on received mail — a message the user did not send
+    -- has no "to" worth showing — and NULL on sent rows ingested before this
+    -- column existed, which the one-shot recipients backfill fills in. Empty
+    -- string means "looked, and the headers named nobody". Consumed ONLY by the
+    -- human door's sent listing; the agent door has no sent surface at all.
+    to_addrs    TEXT,
     -- Raw `List-Unsubscribe` header value, NULL when absent. Consumed ONLY by
     -- the human door's unsubscribe endpoint.
     list_unsubscribe TEXT,

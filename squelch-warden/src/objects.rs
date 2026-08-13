@@ -483,6 +483,15 @@ pub fn ingress(config: &Config, name: &TenantName) -> Ingress {
                             path_type: "Prefix".to_string(),
                             backend: backend.clone(),
                         })
+                        // The bare root, EXACT on purpose: it serves one
+                        // redirect to /console and nothing else. A Prefix "/"
+                        // would match EVERY path — including /mcp — and turn
+                        // this allowlist into decoration.
+                        .chain(std::iter::once(HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Exact".to_string(),
+                            backend: backend.clone(),
+                        }))
                         .collect(),
                 }),
             }]),
@@ -1582,11 +1591,16 @@ mod tests {
 
         let paths = rules[0].http.clone().unwrap().paths;
         let declared: Vec<&str> = paths.iter().map(|p| p.path.as_deref().unwrap()).collect();
-        // The human door is the API, the browser console, and the pixel. The
-        // agent door is not on this list and that is the whole point.
-        assert_eq!(declared, vec!["/client", "/console", "/t"]);
+        // The human door is the API, the browser console, the pixel, and the
+        // bare root's redirect. The agent door is not on this list and that is
+        // the whole point.
+        assert_eq!(declared, vec!["/client", "/console", "/t", "/"]);
         for path in &paths {
-            assert_eq!(path.path_type, "Prefix");
+            // "/" is Exact and everything else is Prefix: an Exact root
+            // matches one path in the universe, a Prefix root would match all
+            // of them.
+            let expected = if path.path.as_deref() == Some("/") { "Exact" } else { "Prefix" };
+            assert_eq!(path.path_type, expected, "{:?}", path.path);
             assert_eq!(
                 path.backend.service.as_ref().unwrap().name,
                 "alice",
@@ -1594,13 +1608,20 @@ mod tests {
             );
         }
         // The load-bearing assertion: nothing routes the agent door, under any
-        // spelling a Prefix match could reach. A string prefix is coarser than
-        // Kubernetes' element-wise Prefix match, so passing this passes there.
-        for spelling in ["/mcp", "/mcp/", "/mcp/messages", "/mcp/sse", "/"] {
+        // spelling. Prefix paths are checked as string prefixes (coarser than
+        // Kubernetes' element-wise match, so passing here passes there); the
+        // Exact root matches only a literal "/", which none of these are.
+        let prefixes: Vec<&str> = paths
+            .iter()
+            .filter(|p| p.path_type == "Prefix")
+            .map(|p| p.path.as_deref().unwrap())
+            .collect();
+        for spelling in ["/mcp", "/mcp/", "/mcp/messages", "/mcp/sse"] {
             assert!(
-                !declared.iter().any(|p| spelling.starts_with(*p)),
+                !prefixes.iter().any(|p| spelling.starts_with(*p)),
                 "{spelling} would be routed to the daemon"
             );
+            assert_ne!(spelling, "/", "an Exact root cannot match {spelling}");
         }
         // ...and the new prefix reaches the console and stops there.
         assert!(declared.contains(&"/console"));
@@ -1786,12 +1807,19 @@ mod tests {
                 })
             );
         }
-        let declared: Vec<&str> = paths.iter().map(|p| p.path.as_deref().unwrap()).collect();
+        // Prefix paths are checked as string prefixes; the Exact root matches
+        // only a literal "/", which /metrics is not.
+        let prefixes: Vec<&str> = paths
+            .iter()
+            .filter(|p| p.path_type == "Prefix")
+            .map(|p| p.path.as_deref().unwrap())
+            .collect();
         for spelling in ["/metrics", "/metrics/"] {
             assert!(
-                !declared.iter().any(|p| spelling.starts_with(*p)),
+                !prefixes.iter().any(|p| spelling.starts_with(*p)),
                 "{spelling} would be routed to the daemon"
             );
+            assert_ne!(spelling, "/", "an Exact root cannot match {spelling}");
         }
     }
 

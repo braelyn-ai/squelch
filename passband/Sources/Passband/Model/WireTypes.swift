@@ -878,6 +878,29 @@ struct MarketingOffer: Codable, Sendable, Hashable {
     var received_at: String
 }
 
+// MARK: - sent
+
+/// One row of GET /client/sent — mail the user WROTE, newest first (the daemon
+/// orders on received_at DESC, id DESC and the page renders that order as-is).
+///
+/// A deliberately different shape from `AttentionUpdate`: outbound mail has no
+/// tier, no importance and no triage status, because nothing triaged it. What it
+/// has instead is `to` (the display recipient list, comma-joined "Name <addr>",
+/// EMPTY when the header carried nothing usable) and `opens` — the count of
+/// recorded read receipts, which is 0 both for a send nobody opened and for a
+/// send that never armed the pixel. Those two are the same silence by design;
+/// see ReadReceipt.swift.
+struct SentItem: Codable, Sendable, Identifiable, Hashable {
+    /// The local message id, so a row keys and prefetches like any other.
+    var id: Int
+    var thread_id: String
+    var to: String
+    var subject: String
+    var snippet: String
+    var sent_at: String
+    var opens: Int
+}
+
 // MARK: - query params
 
 struct UpdatesParams: Sendable {

@@ -555,6 +555,221 @@ fn a_received_sighting_pins_is_sent_to_zero_across_re_upserts() {
     assert_eq!(is_sent_of(id3), 1, "sent-only mail stays sent");
 }
 
+// ---- the sent listing (human door) --------------------------------------
+
+/// A sent message with its display recipients and a seeded triage row — what
+/// every real ingest of outbound mail lands.
+fn sent(
+    store: &SqliteStore,
+    acct: AccountId,
+    gmail: &str,
+    to: &str,
+    received: DateTime<Utc>,
+) -> i64 {
+    triaged(acct, gmail, &format!("t-{gmail}"))
+        .is_sent(true)
+        .to_addrs(to)
+        .subject("Re: Lunch?")
+        .received_at(received)
+        .seed(store)
+}
+
+#[test]
+fn sent_listing_shows_only_sent_mail_newest_first_with_recipients_and_opens() {
+    let (store, acct) = store();
+    let t0 = Utc::now() - chrono::Duration::days(3);
+
+    // Two sent messages a day apart, plus ordinary inbound mail.
+    let older = sent(&store, acct, "s-old", "Alice <alice@friends.com>", t0);
+    let newer = sent(
+        &store,
+        acct,
+        "s-new",
+        "Bob <bob@friends.com>, carol@friends.com",
+        t0 + chrono::Duration::days(1),
+    );
+    triaged(acct, "g-in", "t-in")
+        .received_at(t0 + chrono::Duration::days(2))
+        .seed(&store);
+
+    // One recorded open against the newer message's tracker.
+    store
+        .insert_send_tracker(acct, "tok-1", None, 1_000)
+        .unwrap();
+    assert!(
+        store
+            .set_send_tracker_message(acct, "tok-1", newer)
+            .unwrap()
+    );
+    assert!(
+        store
+            .record_open(acct, "tok-1", 1_100, Some("Apple Mail/16.0"), "unknown")
+            .unwrap()
+    );
+
+    let rows = store.sent_listing(acct, 50, 0).unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![newer, older],
+        "sent mail only, newest first — inbound mail is never listed here"
+    );
+    assert_eq!(rows[0].to, "Bob <bob@friends.com>, carol@friends.com");
+    assert_eq!(rows[0].opens, 1, "read receipts ride along");
+    assert_eq!(rows[1].to, "Alice <alice@friends.com>");
+    assert_eq!(rows[1].opens, 0, "an untracked send has no opens");
+    assert_eq!(rows[0].thread_id, "t-s-new");
+    assert_eq!(rows[0].subject, "Re: Lunch?");
+    assert_eq!(
+        rows[0].sent_at,
+        (t0 + chrono::Duration::days(1)).to_rfc3339(),
+        "received_at is served verbatim"
+    );
+
+    // Paging is the same offset window every other listing uses.
+    let page = store.sent_listing(acct, 1, 0).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, newer);
+    let next = store.sent_listing(acct, 1, 1).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(
+        next[0].id, older,
+        "no row is dropped or repeated across pages"
+    );
+}
+
+#[test]
+fn sent_listing_fails_closed_on_sealed_and_untriaged_rows() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    // A sealed outbound copy: excluded, exactly as on every other listing.
+    triaged(acct, "s-sealed", "t-sealed")
+        .is_sent(true)
+        .to_addrs("support@bank.com")
+        .received_at(now)
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+
+    // A sent row with NO triage row at all (an interrupted ingest). The sealed
+    // guard FAILS CLOSED, so it is excluded rather than assumed harmless.
+    triaged(acct, "s-orphan", "t-orphan")
+        .is_sent(true)
+        .to_addrs("alice@friends.com")
+        .received_at(now)
+        .upsert(&store);
+
+    // The user's own reply in a thread sealed by a SIBLING message: the reply
+    // itself commits as 'normal' (seal detection is per-message content), but
+    // `thread_view` 404s the whole thread, so the thread-level belt excludes
+    // the row rather than leak "Re: <sealed subject>" behind a dead click.
+    triaged(acct, "g-seal-sibling", "t-mixed")
+        .sealed(SealedKind::Otp)
+        .received_at(now)
+        .seed(&store);
+    triaged(acct, "s-in-sealed-thread", "t-mixed")
+        .is_sent(true)
+        .to_addrs("alice@friends.com")
+        .received_at(now)
+        .seed(&store);
+
+    // The one well-formed row is all that surfaces.
+    let ok = sent(&store, acct, "s-ok", "alice@friends.com", now);
+    let rows = store.sent_listing(acct, 50, 0).unwrap();
+    assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ok]);
+}
+
+#[test]
+fn sent_listing_is_account_scoped_and_reads_missing_recipients_as_empty() {
+    let (store, acct) = store();
+    let theirs = store.ensure_account("other@example.com").unwrap();
+    let now = Utc::now();
+
+    // A pre-backfill row: is_sent with to_addrs still NULL.
+    let bare = triaged(acct, "s-bare", "t-bare")
+        .is_sent(true)
+        .received_at(now)
+        .seed(&store);
+    sent(&store, theirs, "s-theirs", "them@elsewhere.com", now);
+
+    let rows = store.sent_listing(acct, 50, 0).unwrap();
+    assert_eq!(rows.len(), 1, "another account's sent mail is not visible");
+    assert_eq!(rows[0].id, bare);
+    assert_eq!(rows[0].to, "", "NULL recipients read as empty, never NULL");
+}
+
+// ---- the recipients backfill queue --------------------------------------
+
+#[test]
+fn recipients_backfill_queue_drains_as_rows_are_filled() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let pending = triaged(acct, "s-pending", "t-pending")
+        .is_sent(true)
+        .received_at(now)
+        .seed(&store);
+    // Already filled, and received mail: neither is ever in the queue.
+    sent(&store, acct, "s-filled", "alice@friends.com", now);
+    triaged(acct, "g-in", "t-in").received_at(now).seed(&store);
+
+    let queue = store.sent_missing_recipients(acct, 50).unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].message_id, pending);
+    assert_eq!(queue[0].gmail_msg_id, "s-pending");
+
+    // Writing "" ("looked, nobody named") is what takes a row OUT of the queue,
+    // so one headerless message cannot re-queue the pass forever.
+    assert!(store.set_message_to_addrs(acct, pending, "").unwrap());
+    assert!(store.sent_missing_recipients(acct, 50).unwrap().is_empty());
+    assert_eq!(store.sent_listing(acct, 50, 0).unwrap().len(), 2);
+}
+
+#[test]
+fn set_message_to_addrs_refuses_received_mail() {
+    let (store, acct) = store();
+    let inbound = triaged(acct, "g-in", "t-in").seed(&store);
+    assert!(
+        !store
+            .set_message_to_addrs(acct, inbound, "someone@example.com")
+            .unwrap(),
+        "recipients are a property of mail the user SENT"
+    );
+    let stored: Option<String> = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT to_addrs FROM messages WHERE id=?1",
+            [inbound],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, None);
+}
+
+#[test]
+fn upsert_keeps_stored_recipients_when_a_later_write_has_none() {
+    // Only the sent path parses recipients, so a writer with no opinion must
+    // not blank a column the backfill (or an earlier ingest) already filled.
+    let (store, acct) = store();
+    let id = triaged(acct, "s-keep", "t-keep")
+        .is_sent(true)
+        .to_addrs("Alice <alice@friends.com>")
+        .upsert(&store);
+    triaged(acct, "s-keep", "t-keep")
+        .is_sent(true)
+        .upsert(&store);
+
+    let stored: Option<String> = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT to_addrs FROM messages WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("Alice <alice@friends.com>"));
+}
+
 #[test]
 fn inbox_unread_counts_round_trip_and_overwrite_one_row() {
     // The human door serves absence differently from zero, so the never-fetched

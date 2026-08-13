@@ -81,6 +81,37 @@ enum SenderID {
         parse(sender).addr.lowercased()
     }
 
+    /// Split a comma-joined recipient list into its individual entries, each
+    /// still in the "Name <addr>" shape `parse` expects.
+    ///
+    /// QUOTE- AND BRACKET-AWARE, because a display name is allowed to hold a
+    /// comma: a plain `split(separator: ",")` turns `"Doe, John" <j@x.com>`
+    /// into two nonsense recipients, and the sent page would name a person
+    /// after the punctuation in their own address book entry.
+    static func recipients(_ list: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var inQuotes = false
+        var inAngle = false
+        for ch in list {
+            switch ch {
+            case "\"" where !inAngle: inQuotes.toggle()
+            case "<" where !inQuotes: inAngle = true
+            case ">" where !inQuotes: inAngle = false
+            case "," where !inQuotes && !inAngle:
+                let token = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !token.isEmpty { out.append(token) }
+                current = ""
+                continue
+            default: break
+            }
+            current.append(ch)
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { out.append(tail) }
+        return out
+    }
+
     /// Up to two initials for a sender. THE SOURCE IS NEVER THE FULL ADDRESS —
     /// the domain leaks in otherwise ("bboynton97@gmail.com" -> "BC"). Order: a
     /// real display name, then the brand/robot label (so a row labelled
