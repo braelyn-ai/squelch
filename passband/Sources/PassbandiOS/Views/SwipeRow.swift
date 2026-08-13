@@ -5,10 +5,15 @@
 // fighting. So the same rail is drawn by hand here, to the same measurements and
 // the same tints, and both surfaces read as one gesture.
 //
-// WHAT MAKES IT COEXIST WITH THE SCROLL. The gesture takes a 14pt minimum and
-// then decides, once, on the first delta past it: a drag whose vertical
-// component leads is REFUSED for its whole duration, so the page keeps
-// scrolling under the finger and no rail ever peeks out mid-scroll. That
+// WHAT MAKES IT COEXIST WITH THE SCROLL. The drag is attached SIMULTANEOUSLY,
+// so it recognizes alongside the enclosing ScrollView instead of winning the
+// row away from it. A plain `.gesture` claimed every drag past the minimum —
+// including the vertical ones that were only ever meant to scroll the page —
+// and the finger would drag a dead card while the sitrep refused to move.
+// Sharing recognition is safe because the row still refuses those drags itself:
+// past a 14pt minimum it decides, once, on the first delta, and a drag whose
+// vertical component leads is REFUSED for its whole duration, so the page
+// scrolls under a row that never budges and no rail peeks out mid-scroll. That
 // decision is latched (`verdict`) rather than re-evaluated per frame, which is
 // what stops a curved swipe from flickering between the two.
 //
@@ -101,7 +106,7 @@ struct SwipeRow<Content: View>: View {
                 }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .gesture(swipe)
+        .simultaneousGesture(swipe)
         .onChange(of: armed) { _, nowArmed in
             // Felt, not watched: the rail is past its commit point.
             if nowArmed, !wasArmed { Haptics.armed() }

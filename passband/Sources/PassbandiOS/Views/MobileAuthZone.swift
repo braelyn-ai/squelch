@@ -1,7 +1,10 @@
-// LOGIN CODES, ON THE DASHBOARD. The Mac puts auth mail behind a rail icon with
-// a countdown ring on it and a whole page (`g`) behind that; a phone has neither,
-// and a login code is the single most time-critical thing in an inbox — you are
-// standing at a login form holding the phone that has the code on it.
+// LOGIN CODES, AT THE HEAD OF QUICK LOOK. The Mac puts auth mail behind a rail
+// icon with a countdown ring on it and a whole page (`g`) behind that; a phone
+// has neither, and a login code is the single most time-critical thing in an
+// inbox — you are standing at a login form holding the phone that has the code
+// on it. It sits on Quick Look rather than the dashboard because it is not an
+// obligation: a code is something the app pulled out of your mail and is holding
+// for you to look up, which is that tab's whole thesis.
 //
 // PRESENT, DON'T READ, exactly as the Mac does it. This zone renders sealed
 // METADATA only — who it is from, what kind, how long ago. No body is fetched to
@@ -24,9 +27,9 @@ struct MobileAuthZone: View {
     /// Newer than this heads the zone and keeps its live ring. Same window the
     /// Mac's auth page calls "last hour".
     private static let liveWindow: TimeInterval = 60 * 60
-    /// How many rows before the zone stops growing. A dashboard zone is a
-    /// glance; the backlog is the auth page's job, and the phone has no auth
-    /// page yet, so this is deliberately a little longer than the Mac's rail.
+    /// How many rows before the zone stops growing. A zone is a glance and the
+    /// backlog is the auth page's job, but the phone has no auth page, so this
+    /// is deliberately a little longer than the Mac's rail.
     private static let maxRows = 5
 
     @State private var busy: Int?

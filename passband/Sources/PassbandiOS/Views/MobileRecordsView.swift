@@ -1,16 +1,22 @@
-// THE RECORDS TAB — the desktop sitrep's pinned right rail, given a phone
-// destination of its own. Calendar / Shipments / Banking / Receipts are the
-// SAME components the Mac's rail is built from (Views/SitrepZones.swift), and
-// their own header says why they are a place rather than a feed: these are
-// RECORDS, not actions. They are auto-resolved out of the attention bands at
-// ingest, so this screen is their only surface, and each one renders empty
-// state and all — a column that comes and goes as mail arrives is one you stop
-// trusting.
+// THE QUICK LOOK TAB — the desktop sitrep's pinned right rail, given a phone
+// destination of its own, plus the login codes. Calendar / Shipments / Banking
+// / Receipts are the SAME components the Mac's rail is built from
+// (Views/SitrepZones.swift), and their own header says why they are a place
+// rather than a feed: these are RECORDS, not actions. They are auto-resolved
+// out of the attention bands at ingest, so this screen is their only surface,
+// and each one renders empty state and all — a column that comes and goes as
+// mail arrives is one you stop trusting.
 //
-// A Mac can pin them beside the work surface and a phone cannot, so what is one
-// glance there is one tab here. Tapping a row opens the underlying email through
-// `store.openThread`, exactly as it does on the Mac; the push itself is the
-// shell's, bound to the same `store.threadId`.
+// The auth zone heads the tab because it is the same kind of thing: something
+// the app pulled out of your mail and is holding for you to look up, never
+// something to answer. That is the tab's whole thesis, and it is why the name
+// is Quick Look rather than Records — you come here to READ ONE FACT (the code,
+// the flight time, the tracking number) and leave.
+//
+// A Mac can pin all of this beside the work surface and a phone cannot, so what
+// is one glance there is one tab here. Tapping a row opens the underlying email
+// through `store.openThread`, exactly as it does on the Mac; the push itself is
+// the shell's, bound to the same `store.threadId`.
 
 import SwiftUI
 
@@ -21,6 +27,11 @@ struct MobileRecordsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 masthead
+                // FIRST, above everything. A login code is the most
+                // time-critical thing in an inbox — you are standing at a login
+                // form holding the phone that has the code on it — so it gets
+                // the one position that never costs a scroll.
+                MobileAuthZone()
                 CalendarZone()
                 ShipmentsZone()
                 BankingZone()
@@ -30,7 +41,7 @@ struct MobileRecordsView: View {
             .padding(.bottom, 28)
         }
         .background(Palette.canvas)
-        .navigationTitle("Records")
+        .navigationTitle("Quick Look")
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refreshZones(force: true) }
         // Each zone asks for this too and the store joins the in-flight pass, so
@@ -40,11 +51,13 @@ struct MobileRecordsView: View {
     }
 
     /// THE ONE SERIF LINE ON THIS SCREEN, and the only thing on it that is not a
-    /// zone: what these four cards have in common, said once, so the tab reads as
-    /// a place rather than as four unrelated widgets.
+    /// zone: what these cards have in common, said once, so the tab reads as a
+    /// place rather than as five unrelated widgets. Still true with the codes
+    /// here — a login code is pulled out of your mail and kept exactly the way a
+    /// tracking number is.
     private var masthead: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("records")
+            Text("quick look")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.accent)
                 .textCase(.uppercase)

@@ -15,6 +15,14 @@
 // destinations this phase does not have. And every keyboard cursor the Mac's
 // dashboard carries is a hover/j-k concept with no thumb equivalent: a tap
 // opens the mail, and that is the whole interaction.
+//
+// THREE THINGS THIS SCREEN USED TO CARRY AND NO LONGER DOES. The band-count
+// strip (standing / new / open) was a dashboard metric on a screen whose whole
+// argument is that it names obligations in words, not numbers. The process deck
+// is gone from the phone entirely — a card-at-a-time queue wants a keyboard and
+// a session, and neither is what a phone is for. And the login-code zone moved
+// to the Quick Look tab, where the rest of the pulled-out-of-your-mail material
+// lives, so this screen stays one thing: what needs you.
 
 import SwiftUI
 
@@ -29,8 +37,9 @@ struct MobileSitrepView: View {
     @State private var cursor = SitrepCursor()
 
     /// How many ranked standing items show before the "{n} more" expander —
-    /// shorter than the Mac's ten, because a phone's fold is shorter.
-    private static let eyesVisible = 6
+    /// four, well short of the Mac's ten, because a phone's fold is shorter and
+    /// four ranked rows plus the expander still fit under it with the hero.
+    private static let eyesVisible = 4
     @State private var expanded = false
 
     var body: some View {
@@ -44,12 +53,9 @@ struct MobileSitrepView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 hero
-                bandStrip
-                processButton
                 if !ranked.isEmpty {
                     forYourEyes(visible: visible, overflow: overflow, queue: ranked)
                 }
-                MobileAuthZone()
                 NewslettersZone(
                     newsletters: Newsletters.prune(
                         store.zones.newsletters, resolved: store.resolvedIds),
@@ -131,52 +137,6 @@ struct MobileSitrepView: View {
         return "You're all clear."
     }
 
-    // MARK: - band counts
-
-    /// The three bands as one strip. `nil` stats means the first stats call has
-    /// not landed — an em-dash, never a zero, because zero is a claim.
-    private var bandStrip: some View {
-        HStack(spacing: 9) {
-            BandTile(label: "standing", count: store.sitrep.stats?.bands.standing)
-            BandTile(label: "new", count: store.sitrep.stats?.bands.new)
-            BandTile(label: "open", count: store.sitrep.stats?.bands.open)
-        }
-    }
-
-    // MARK: - process mode
-
-    /// `p`, as a thumb-sized door. The Mac hides the deck behind a letter because
-    /// a Mac user has both hands on the keys; a phone user has one thumb and a
-    /// queue, and the deck is the single best thing this app does with that.
-    /// Shown only when there is a deck to walk — the queue it snapshots on entry
-    /// is `new + open`, so the button counts exactly what it will hand over.
-    @ViewBuilder
-    private var processButton: some View {
-        let waiting = store.sitrep.new.count + store.sitrep.open.count
-        if waiting > 0 {
-            Button {
-                store.processModeOpen = true
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "rectangle.stack")
-                        .font(.system(size: 14, weight: .medium))
-                    Text("Process \(waiting) item\(waiting == 1 ? "" : "s")")
-                        .font(.system(size: 15, weight: .medium))
-                    Spacer(minLength: 4)
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Palette.inkFaintest)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 13)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Palette.accent)
-            .passbandGlass(.pane, cornerRadius: 14, tint: Palette.accentSoft, interactive: true)
-        }
-    }
-
     // MARK: - for your eyes
 
     /// The standing band, ranked. Tapping a row opens the reader with the WHOLE
@@ -248,27 +208,5 @@ struct MobileSitrepView: View {
         guard let last = store.lastRefresh else { return "waiting for the first sync…" }
         let age = Fmt.relAge(last)
         return (age.isEmpty || age == "now") ? "synced just now" : "synced \(age) ago"
-    }
-}
-
-/// One band's count. Monospaced digits, so three tiles side by side stay a row
-/// of numbers rather than three differently-shaped words.
-private struct BandTile: View {
-    let label: String
-    let count: Int?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(count.map(String.init) ?? "—")
-                .font(Typo.num(22, weight: .medium))
-                .foregroundStyle(Palette.ink)
-            Text(label)
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaint)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .passbandGlass(.pane, cornerRadius: 14)
     }
 }

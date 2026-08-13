@@ -16,10 +16,17 @@
 //
 // THE ACTION LAYER, MINUS THE PARTS THAT ARE FURNITURE. `Views/ActionLayer.swift`
 // is excluded from this target because it hosts the ⌘K ask bar, not because its
-// contents are desktop-shaped: the toasts, the rule editor, the deck, the 2FA
-// modal and the triage palette are all state on AppStore, and this shell mounts
-// the same views off the same flags. Nothing below owns a flag of its own —
-// every one of them is written by the verbs in Model/Actions.swift.
+// contents are desktop-shaped: the toasts, the rule editor, the 2FA modal and
+// the triage palette are all state on AppStore, and this shell mounts the same
+// views off the same flags. Nothing below owns a flag of its own — every one of
+// them is written by the verbs in Model/Actions.swift.
+//
+// THE PROCESS DECK IS DESKTOP-ONLY. `p` opens a card deck on the Mac, where it
+// floats over a board you can still see; a phone had to give it the whole screen,
+// which made it a mode rather than a pass — and a mode you enter from a tab bar,
+// leave through a full-screen cover, and cannot see your mail behind. The phone
+// works the same queue through the surfaces it already has, so `processModeOpen`
+// is now a flag no phone code writes or reads.
 
 import SwiftUI
 
@@ -29,8 +36,27 @@ import SwiftUI
 /// pinned beside the work surface, read WHILE working it; a phone has no room to
 /// pin anything, and stacking them under the obligations would put reference
 /// material behind a scroll past everything you owe. So they get a destination.
+///
+/// `.records` READS "QUICK LOOK" ON THE BAR. The user-facing name changed; the
+/// case did not, because the store, the Mac and every zone type still call this
+/// material records and renaming the symbol would churn all of it to relabel one
+/// tab.
 private enum MobileTab: Hashable {
     case sitrep, records, mail, search, settings
+
+    /// Left-to-right position in the tab bar. Only the slide direction reads it:
+    /// a tab further right has to arrive from the right. Search is highest
+    /// because its `.search` role parks it at the trailing end of the bar,
+    /// after settings.
+    var index: Int {
+        switch self {
+        case .sitrep: 0
+        case .records: 1
+        case .mail: 2
+        case .settings: 3
+        case .search: 4
+        }
+    }
 }
 
 struct MobileRootView: View {
@@ -96,24 +122,28 @@ private struct MobileShell: View {
     @Environment(AppStore.self) private var store
     @State private var tab: MobileTab = .sitrep
 
+    // No `@Bindable` shadow here: every modal below is presented off a derived
+    // Binding that funnels dismissal through the store's own close verb, so
+    // nothing needs to write a store flag directly.
     var body: some View {
-        @Bindable var store = store
-
-        return TabView(selection: $tab) {
+        TabView(selection: $tab) {
             Tab("Sitrep", systemImage: MainView.sitrep.symbol, value: MobileTab.sitrep) {
                 NavigationStack {
                     MobileSitrepView()
                         .threadDestination(active: tab == .sitrep)
                 }
+                .tabSlide(.sitrep, selection: tab)
             }
-            // `archivebox` and not `tray.full`: a tray is an inbox, and the tab
-            // beside this one already IS the inbox. These are the things kept out
-            // of it.
-            Tab("Records", systemImage: "archivebox", value: MobileTab.records) {
+            // `square.grid.2x2` and not a box: the tab is a grid of glanceable
+            // cards, one per zone, and the icon should say the shape of what is
+            // behind it. `archivebox` promised storage — a place things go to be
+            // put away — which is the opposite of a surface you check in passing.
+            Tab("Quick Look", systemImage: "square.grid.2x2", value: MobileTab.records) {
                 NavigationStack {
                     MobileRecordsView()
                         .threadDestination(active: tab == .records)
                 }
+                .tabSlide(.records, selection: tab)
             }
             Tab("Mail", systemImage: MainView.emails.symbol, value: MobileTab.mail) {
                 NavigationStack {
@@ -136,6 +166,7 @@ private struct MobileShell: View {
                         }
                         .threadDestination(active: tab == .mail)
                 }
+                .tabSlide(.mail, selection: tab)
             }
             Tab("Settings", systemImage: MainView.settings.symbol, value: MobileTab.settings) {
                 NavigationStack {
@@ -146,6 +177,7 @@ private struct MobileShell: View {
                             "Connection, theme, signature and telemetry move over with the settings pane."
                     )
                 }
+                .tabSlide(.settings, selection: tab)
             }
             // The search role parks this tab apart from the others in iOS 26's
             // tab bar, next to the minimize affordance, which is where a phone
@@ -157,6 +189,7 @@ private struct MobileShell: View {
                         symbol: "magnifyingglass",
                         line: "Full-text search over the mail the daemon has ingested.")
                 }
+                .tabSlide(.search, selection: tab)
             }
         }
         // Scrolling down surrenders the bar to the content and brings it back on
@@ -182,11 +215,6 @@ private struct MobileShell: View {
         }
         .overlay {
             if !store.authQueue.isEmpty { AuthCodeModal() }
-        }
-        // `p` on the Mac. A deck is the whole screen on a phone — there is no
-        // board behind it worth dimming — so it covers rather than floats.
-        .fullScreenCover(isPresented: $store.processModeOpen) {
-            ProcessMode { store.processModeOpen = false }
         }
         // `v`. A SHEET here and a top-anchored command bar there, for one reason:
         // the palette autofocuses a text field, and a phone answers that by
@@ -231,6 +259,71 @@ private struct MobileShell: View {
         Binding(
             get: { store.compose != nil },
             set: { if !$0 { store.closeCompose() } })
+    }
+}
+
+// MARK: - directional tab slide
+
+/// The arriving tab's content enters from the side its tab sits on: a tab further
+/// right in the bar slides in from the right, further left from the left. The bar
+/// is a row and the tabs are positions along it, so a switch should read as travel
+/// between two places rather than as one screen being swapped for another.
+///
+/// THE NATIVE `TabView` STAYS. Hand-rolling a pager would buy this transition and
+/// cost everything only the real control has: iOS 26's `.search`-role placement
+/// (the parked trailing tab beside the minimize affordance), the
+/// `tabBarMinimizeBehavior` surrender on scroll, and a live NavigationStack per
+/// tab. So selection stays the bar's business and only the CONTENT moves — a
+/// modifier on each tab's stack, not a new container around all of them.
+///
+/// FIRST VISIT DOES NOT SLIDE, and that is the honest behavior rather than a
+/// gap: a TabView builds a tab's content the moment you first select it, and
+/// `onChange` does not fire for the change that mounted the view. Every later
+/// switch has the content already alive to move.
+private struct TabSlide: ViewModifier {
+    let tab: MobileTab
+    let selection: MobileTab
+    /// Travel as a FRACTION of the content's own width, not points: -1 is parked
+    /// off the leading edge, +1 off the trailing one, 0 is home. Storing the trip
+    /// this way is what lets the offset be applied without anyone measuring a
+    /// screen — see `visualEffect` below.
+    @State private var parked: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content
+            // `visualEffect` and not `.offset(x:)` over a GeometryReader: it hands
+            // over the proxy for the view's OWN size at draw time, so the shift
+            // costs no layout pass and no extra wrapper around each tab's stack.
+            // Asking `UIScreen` for the width instead would be a guess that the
+            // content is screen-wide, and iOS 26 deprecated the main-screen
+            // accessor for exactly that reason.
+            .visualEffect { effect, proxy in
+                effect.offset(x: parked * proxy.size.width)
+            }
+            .onChange(of: selection) { old, new in
+                // Only the tab being switched TO moves, and only when it really
+                // was a switch — reselecting the current tab is a no-op, not a
+                // slide of zero distance.
+                guard new == tab, old != tab else { return }
+                // Park the content off the correct edge with animation OFF, then
+                // fly it home on the next turn of the loop. Both writes in one
+                // pass would collapse into a single render at zero and nothing
+                // would move at all.
+                var jump = Transaction()
+                jump.disablesAnimations = true
+                withTransaction(jump) {
+                    parked = new.index > old.index ? 1 : -1
+                }
+                Task { @MainActor in
+                    withAnimation(Motion.tabSlide) { parked = 0 }
+                }
+            }
+    }
+}
+
+extension View {
+    fileprivate func tabSlide(_ tab: MobileTab, selection: MobileTab) -> some View {
+        modifier(TabSlide(tab: tab, selection: selection))
     }
 }
 
