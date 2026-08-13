@@ -5,8 +5,9 @@
 //
 // What differs is only the shape. A Mac gets a rail and a routed page; a phone
 // gets a tab bar, which is a different navigation model rather than a smaller
-// one, so the rail's seven destinations collapse to five and the rest arrive as
-// the tabs that own them grow up.
+// one, so the rail's seven destinations collapse to six, and each of the six is
+// now a real surface rather than a stub — the last placeholder went when search
+// landed.
 //
 // AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
 // that covers the window; here it is a NavigationStack destination — but driven
@@ -195,12 +196,22 @@ private struct MobileShell: View {
             // The search role parks this tab apart from the others in iOS 26's
             // tab bar, next to the minimize affordance, which is where a phone
             // user reaches for it.
+            //
+            // IT KEEPS A THREAD DESTINATION because a hit is mail and a hit you
+            // cannot open is a citation. And it can HAND ITSELF OFF: a question
+            // typed into the field goes to the agent instead, seeded but not
+            // sent (MobileAgentView.consumeSeed). The seed is written BEFORE the
+            // tab changes so the agent has the words the moment it is asked for
+            // them, and nothing is wrapped in `withAnimation` — `tabSlide` owns
+            // the transition already, and a second animation on the same change
+            // would fight it.
             Tab(value: MobileTab.search, role: .search) {
                 NavigationStack {
-                    PlaceholderTab(
-                        title: "Search",
-                        symbol: "magnifyingglass",
-                        line: "Full-text search over the mail the daemon has ingested.")
+                    MobileSearchView(switchToAgent: { text in
+                        store.agentSeed = text
+                        tab = .agent
+                    })
+                    .threadDestination(active: tab == .search)
                 }
                 .tabSlide(.search, selection: tab)
             }
@@ -382,35 +393,5 @@ private struct ThreadDestination: ViewModifier {
 extension View {
     fileprivate func threadDestination(active: Bool) -> some View {
         modifier(ThreadDestination(active: active))
-    }
-}
-
-// MARK: - placeholders
-
-/// An honest stub: says what belongs here and does not pretend to hold it.
-private struct PlaceholderTab: View {
-    let title: String
-    let symbol: String
-    let line: String
-
-    var body: some View {
-        VStack(spacing: 10) {
-            Image(systemName: symbol)
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(Palette.inkFaintest)
-            Text(title.lowercased())
-                .font(Typo.serif(24, weight: .medium))
-                .foregroundStyle(Palette.ink)
-            Text(line)
-                .font(Typo.rowSub)
-                .foregroundStyle(Palette.inkFaint)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 300)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Palette.canvas)
-        .navigationTitle(title)
-        .navigationBarTitleDisplayMode(.inline)
     }
 }

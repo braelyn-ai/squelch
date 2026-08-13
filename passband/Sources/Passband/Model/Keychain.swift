@@ -10,9 +10,12 @@
 // and `revealAsync()` is the one deliberate hole, for Settings'
 // human-initiated Show / Edit.
 //
-// Both LLMProxy entry points hold that line: `complete()` and `stream()` each
-// read the key inside themselves and hand back only provider output — the key
-// is never a parameter, a returned/yielded value, or anything an error carries.
+// Every LLMProxy entry point holds that line: `complete()` (both shapes) and
+// `stream()` each read the key inside themselves and hand back only provider
+// output — the key is never a parameter, a returned/yielded value, or anything
+// an error carries. That is also why a caller wanting a one-shot answer gets an
+// overload HERE rather than building its own request somewhere else: the moment
+// a second file constructs the header, the key has to leave this one.
 
 import Foundation
 import Security
@@ -365,6 +368,39 @@ enum LLMProxy {
         return LLMResponse(status: http.statusCode, json: data)
     }
 
+    /// The SAME one-shot call, for a caller that holds its request as a
+    /// dictionary and wants only the model's words back. Same key access and
+    /// same headers as `stream()` — it goes through `complete(body:)` above, so
+    /// there is exactly one place that builds the request — minus the two
+    /// things that make a call a stream: no `Accept: text/event-stream`, and
+    /// the caller must NOT set `"stream": true` in `body`.
+    ///
+    /// Anthropic's response shape, deliberately: this exists for the small
+    /// classifier calls the app makes on its own behalf, which name a Claude
+    /// model, and a caller pointing it at an OpenAI key would get "" back. Ask
+    /// `AssistantKeyStore.status()` for the provider before spending a call.
+    static func complete(body: [String: Any]) async throws -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+            throw LLMError.nonJSON
+        }
+        let response = try await complete(body: data)
+        guard response.status == 200 else {
+            throw LLMError.provider(
+                status: response.status, message: errorMessage(inJSON: response.json))
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: response.json) as? [String: Any],
+            let content = object["content"] as? [[String: Any]]
+        else { return "" }
+        // The first block that CARRIES text, not literally block zero: a
+        // response that opens with a thinking or tool_use block would otherwise
+        // read as an empty answer, which is a silent wrong result rather than a
+        // visible failure.
+        for block in content {
+            if let text = block["text"] as? String { return text }
+        }
+        return ""
+    }
+
     /// Make ONE streaming call and yield each SSE frame's `data:` payload as it
     /// arrives. `body` is a fully-formed Anthropic request body MINUS auth, with
     /// `"stream": true` already set by the caller.
@@ -464,7 +500,14 @@ enum LLMProxy {
         } catch {
             // A body that died mid-read is still worth parsing.
         }
-        let json = try? JSONSerialization.jsonObject(with: Data(raw))
+        return errorMessage(inJSON: Data(raw))
+    }
+
+    /// The dig itself, shared by the streamed and the buffered paths so both
+    /// quote the provider the same way. Returns nil for anything unparseable;
+    /// never surfaces headers or the key.
+    private static func errorMessage(inJSON data: Data) -> String? {
+        let json = try? JSONSerialization.jsonObject(with: data)
         guard let object = json as? [String: Any],
             let error = object["error"] as? [String: Any],
             let message = error["message"] as? String, !message.isEmpty

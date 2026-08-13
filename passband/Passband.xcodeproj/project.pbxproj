@@ -55,6 +55,7 @@
 		42B14F1B7A46FE2A0B7E9772 /* PassbandApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389673F8FDDB51FC4830D9D2 /* PassbandApp.swift */; };
 		42D3E80C99FEE7FA7C6D3CF0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
 		4836A3C84F0310D8E5E60FCB /* UpdateVerbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6895E072B54D7FEA646D6903 /* UpdateVerbs.swift */; };
+		48E6A19646CCEF224A50080E /* QueryClassifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BABEEDE28D809C2F736A636 /* QueryClassifier.swift */; };
 		4A484A26530C0131828B0A16 /* Loadable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A74374DEAEE21CDF9A5067D /* Loadable.swift */; };
 		4A6FA53C127DAD99FB5AF300 /* SenderIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */; };
 		4AC6AF18555B3DB2FE69CC91 /* ConnectionHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FCD987D800267801D7B4DFE /* ConnectionHealth.swift */; };
@@ -86,6 +87,7 @@
 		6F3982A3598CCC296C35C2E6 /* WireTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C9F46E8DA615783DD2BEAF6 /* WireTypes.swift */; };
 		6FFB126258C28AC3F2E63D01 /* Motion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30406C6A67318CD0CE71C1FF /* Motion.swift */; };
 		7212E886802DBD6F6E869BD0 /* MainWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00D13052ED3A4D60224B1B18 /* MainWindow.swift */; };
+		72CE3BD39D4FA8820AFBE15C /* MobileSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F82499FD36351898E386644C /* MobileSearchView.swift */; };
 		7379C8366D649A8F25C27826 /* Prefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 163BEF63DE1359294AD2ADD8 /* Prefs.swift */; };
 		73E0BC73D984621141CA2296 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78527CBD27E00907F26B9E79 /* Security.framework */; };
 		7613233831674BFA6CE84C42 /* RevealPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10D75BA4192F5F1B8977E9 /* RevealPanel.swift */; };
@@ -238,6 +240,7 @@
 		168312D5219614E1F658480C /* Resources */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Resources; path = Sources/Passband/Resources; sourceTree = SOURCE_ROOT; };
 		1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthCodeModal.swift; sourceTree = "<group>"; };
 		1A74374DEAEE21CDF9A5067D /* Loadable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Loadable.swift; sourceTree = "<group>"; };
+		1BABEEDE28D809C2F736A636 /* QueryClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueryClassifier.swift; sourceTree = "<group>"; };
 		1D19065EB7E9BFE9E846675B /* Keychain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Keychain.swift; sourceTree = "<group>"; };
 		1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Haptics.swift; sourceTree = "<group>"; };
 		1DD489E941E602E585098D3F /* EmailWebViewiOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmailWebViewiOS.swift; sourceTree = "<group>"; };
@@ -346,6 +349,7 @@
 		F2BD37CBEFEA8CEB215E3247 /* ThreadViewer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadViewer.swift; sourceTree = "<group>"; };
 		F538ABF63F676ADB2910AE59 /* Sounds */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Sounds; path = Sources/Passband/Resources/Sounds; sourceTree = SOURCE_ROOT; };
 		F714235A8E6F4742ABF772B3 /* PassbandiOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassbandiOSApp.swift; sourceTree = "<group>"; };
+		F82499FD36351898E386644C /* MobileSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileSearchView.swift; sourceTree = "<group>"; };
 		FDDBA0B71BDDC46E844D2856 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		FE241E317BA5B3B4D25B892E /* AuthArrival.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthArrival.swift; sourceTree = "<group>"; };
 		FF2D98A36AEF64366DD338AB /* MarkdownTextView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextView.swift; sourceTree = "<group>"; };
@@ -513,6 +517,7 @@
 			isa = PBXGroup;
 			children = (
 				1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */,
+				1BABEEDE28D809C2F736A636 /* QueryClassifier.swift */,
 			);
 			path = Lib;
 			sourceTree = "<group>";
@@ -526,6 +531,7 @@
 				35C12A5AFBCED3C55DA7A5D8 /* MobileAgentView.swift */,
 				3E64ABDBDFD538453A620415 /* MobileAuthZone.swift */,
 				356A38CCAAFCC056126A2978 /* MobileRecordsView.swift */,
+				F82499FD36351898E386644C /* MobileSearchView.swift */,
 				27049607B9176B6FC238E8E0 /* MobileSettingsView.swift */,
 				E61AF9A237CA524B89126810 /* MobileSitrepView.swift */,
 				D0318A22219D3A1E36429C76 /* MobileToastHost.swift */,
@@ -894,6 +900,7 @@
 				D320C5110BA8A2AD35DB883B /* MobileAuthZone.swift in Sources */,
 				EB3A6A193AE3E0C7EDD7E459 /* MobileRecordsView.swift in Sources */,
 				7C0A7FD2599738D2B4A2C152 /* MobileRootView.swift in Sources */,
+				72CE3BD39D4FA8820AFBE15C /* MobileSearchView.swift in Sources */,
 				D58BB07AC9D47B0218FB2429 /* MobileSettingsView.swift in Sources */,
 				02A2C5770523B244425499D5 /* MobileSitrepView.swift in Sources */,
 				4BF112500D334A129834AAEB /* MobileToastHost.swift in Sources */,
@@ -907,6 +914,7 @@
 				B36D0542B36A1421D26CA968 /* Platform.swift in Sources */,
 				7379C8366D649A8F25C27826 /* Prefs.swift in Sources */,
 				334CF29FAF59FE56B41E581B /* ProcessMode.swift in Sources */,
+				48E6A19646CCEF224A50080E /* QueryClassifier.swift in Sources */,
 				79BB8595545903AE279A319C /* Quotes.swift in Sources */,
 				A252756AF0D9655F2C1477B7 /* Ranking.swift in Sources */,
 				F19396496FB9FFA6061B7E1A /* Raster.swift in Sources */,
