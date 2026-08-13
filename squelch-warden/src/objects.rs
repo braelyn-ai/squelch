@@ -127,6 +127,18 @@ pub const CREDENTIAL_KEY: &str = "credentials.json";
 /// world-readable pod spec.
 pub const LLM_API_KEY_KEY: &str = "api-key";
 
+/// Data key holding the tenant's assistant relay virtual key, beside
+/// [`LLM_API_KEY_KEY`] in `<label>-llm`.
+///
+/// The second credential the same Secret can carry: the key the daemon uses to
+/// proxy the Passband assistant through the gateway. Present only once the
+/// control plane has minted one — a tenant keyed before the assistant era has
+/// a Secret without this entry, and its pod boots anyway because the env
+/// reference is optional (see [`daemon_env`]). Same posture as the triage key:
+/// never logged, never returned on the wire, only its part of the combined
+/// hash ([`llm_keys_hash`]) lands on the pod spec.
+pub const ASSISTANT_API_KEY_KEY: &str = "assistant-api-key";
+
 /// Data keys in the shared Google OAuth client Secret
 /// ([`crate::config::Config::oauth_secret_name`]).
 ///
@@ -322,6 +334,29 @@ pub fn credential_hash(ciphertext: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The pod-roll hash for the LLM Secret, over BOTH of the keys it can carry.
+///
+/// [`LLM_KEY_HASH_ANNOTATION`] must move when EITHER credential in
+/// `<label>-llm` changes, or rotating one would leave the pod running on the
+/// stale pair. A hash of hashes joined by a newline rather than a hash of
+/// concatenated keys, so no choice of key bytes can make two different pairs
+/// read as one (the inner digests are fixed-width hex, which no boundary
+/// shift survives). An absent slot — either slot: a half-failed mint can
+/// leave the Secret holding only one of the two — contributes the empty
+/// string, distinct from every minted key's digest, and unambiguous because
+/// [`crate::validate::validate_llm_api_key`] refuses an empty key, so
+/// "absent" and "empty" are the same state by construction.
+///
+/// Both computations of this hash — `set_llm_key` with the keys in hand, and
+/// `set_credentials` reading them back out of the stored Secret — go through
+/// this one function so they cannot diverge and spuriously roll (or fail to
+/// roll) a pod.
+pub fn llm_keys_hash(api_key: Option<&str>, assistant_api_key: Option<&str>) -> String {
+    let triage = api_key.map(credential_hash).unwrap_or_default();
+    let assistant = assistant_api_key.map(credential_hash).unwrap_or_default();
+    credential_hash(&format!("{triage}\n{assistant}"))
+}
+
 /// Labels every object of a tenant carries.
 pub fn labels(name: &TenantName) -> BTreeMap<String, String> {
     let mut labels = selector_labels(name);
@@ -416,23 +451,37 @@ pub fn credential_secret(config: &Config, name: &TenantName, ciphertext: &str) -
     }
 }
 
-/// The tenant's LLM Secret: the gateway virtual key the control plane minted
-/// for this tenant, verbatim.
+/// The tenant's LLM Secret: the gateway virtual keys the control plane minted
+/// for this tenant, verbatim — whichever of the triage and assistant relay
+/// slots exist, and at least one (see [`ASSISTANT_API_KEY_KEY`]).
 ///
-/// Unlike the credential blob, this one is plaintext to the warden: it is
+/// Unlike the credential blob, these are plaintext to the warden: they are
 /// embedded in this Secret object and read back to be hashed for the roll
-/// annotation ([`LLM_KEY_HASH_ANNOTATION`]). What holds instead: the key is
-/// never logged, never returned on the wire, and only its hash lands on the
-/// world-readable pod spec — the daemon gets the key itself as a
-/// `secretKeyRef` (see [`daemon_env`]).
-pub fn llm_secret(config: &Config, name: &TenantName, api_key: &str) -> Secret {
+/// annotation ([`LLM_KEY_HASH_ANNOTATION`]). What holds instead: neither key
+/// is ever logged or returned on the wire, and only the combined hash lands on
+/// the world-readable pod spec — the daemon gets the keys themselves as
+/// `secretKeyRef`s (see [`daemon_env`]).
+pub fn llm_secret(
+    config: &Config,
+    name: &TenantName,
+    api_key: Option<&str>,
+    assistant_api_key: Option<&str>,
+) -> Secret {
+    // Only the slots that exist: the apply force-owns this Secret, so a data
+    // key rendered here is the whole set that survives. The caller
+    // ([`crate::provision::Warden::set_llm_key`]) always passes the union of
+    // the request and what was stored, and at least one slot.
+    let mut string_data = BTreeMap::new();
+    if let Some(api_key) = api_key {
+        string_data.insert(LLM_API_KEY_KEY.to_string(), api_key.to_string());
+    }
+    if let Some(assistant) = assistant_api_key {
+        string_data.insert(ASSISTANT_API_KEY_KEY.to_string(), assistant.to_string());
+    }
     Secret {
         metadata: meta(config, name, name.llm_secret()),
         type_: Some("Opaque".to_string()),
-        string_data: Some(BTreeMap::from([(
-            LLM_API_KEY_KEY.to_string(),
-            api_key.to_string(),
-        )])),
+        string_data: Some(string_data),
         ..Default::default()
     }
 }
@@ -1073,6 +1122,16 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
             name.llm_secret(),
             LLM_API_KEY_KEY,
         ));
+        // The assistant relay credential, and OPTIONAL for a second reason on
+        // top of the triage key's: a tenant minted before the assistant era
+        // has an LLM Secret with no such data key at all, and it must still
+        // boot — the daemon's assistant route answers unavailable until the
+        // control plane mints the key.
+        env.push(from_optional_secret(
+            "SQUELCH_ASSISTANT_API_KEY",
+            name.llm_secret(),
+            ASSISTANT_API_KEY_KEY,
+        ));
         if let Some(model) = &config.llm_stage1_model {
             env.push(plain("SQUELCH_STAGE1_MODEL", model));
         }
@@ -1295,6 +1354,7 @@ mod tests {
             "SQUELCH_ANTHROPIC_BASE_URL",
             "SQUELCH_STAGE2_PROVIDER",
             "SQUELCH_STAGE2_API_KEY",
+            "SQUELCH_ASSISTANT_API_KEY",
             "SQUELCH_STAGE1_MODEL",
             "SQUELCH_MODEL",
             "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
@@ -1336,6 +1396,19 @@ mod tests {
         let from = key.value_from.clone().unwrap().secret_key_ref.unwrap();
         assert_eq!(from.name, "alice-llm");
         assert_eq!(from.key, "api-key");
+        assert_eq!(from.optional, Some(true));
+
+        // The assistant relay credential, same Secret, same optional shape: a
+        // tenant minted before the assistant era has no such data key and its
+        // pod must still boot.
+        let assistant = env
+            .iter()
+            .find(|e| e.name == "SQUELCH_ASSISTANT_API_KEY")
+            .unwrap();
+        assert!(assistant.value.is_none());
+        let from = assistant.value_from.clone().unwrap().secret_key_ref.unwrap();
+        assert_eq!(from.name, "alice-llm");
+        assert_eq!(from.key, "assistant-api-key");
         assert_eq!(from.optional, Some(true));
 
         // The base URL alone pins no model and no cap: those are separate
@@ -1415,13 +1488,57 @@ mod tests {
     #[test]
     fn the_llm_secret_is_the_key_verbatim_under_the_one_data_key() {
         let c = test_config();
-        let secret = llm_secret(&c, &name(), "sk-vk-abc123");
+        let secret = llm_secret(&c, &name(), Some("sk-vk-abc123"), None);
         assert_eq!(secret.metadata.name.as_deref(), Some("alice-llm"));
         assert_eq!(secret.metadata.namespace.as_deref(), Some("tenants"));
         assert_eq!(secret.type_.as_deref(), Some("Opaque"));
         let data = secret.string_data.unwrap();
         assert_eq!(data[LLM_API_KEY_KEY], "sk-vk-abc123");
         assert_eq!(data.len(), 1);
+    }
+
+    /// The assistant key rides in the SAME Secret under its own data key, and
+    /// only when one was minted: the no-assistant shape stays byte-identical
+    /// to what the pre-assistant warden wrote.
+    #[test]
+    fn the_llm_secret_carries_the_assistant_key_only_when_minted() {
+        let c = test_config();
+        let secret = llm_secret(&c, &name(), Some("sk-vk-abc123"), Some("sk-vk-assistant"));
+        let data = secret.string_data.unwrap();
+        assert_eq!(data[LLM_API_KEY_KEY], "sk-vk-abc123");
+        assert_eq!(data[ASSISTANT_API_KEY_KEY], "sk-vk-assistant");
+        assert_eq!(data.len(), 2);
+
+        // The other half-failed-mint shape: assistant alone, no triage entry.
+        let secret = llm_secret(&c, &name(), None, Some("sk-vk-assistant"));
+        let data = secret.string_data.unwrap();
+        assert_eq!(data[ASSISTANT_API_KEY_KEY], "sk-vk-assistant");
+        assert_eq!(data.len(), 1);
+    }
+
+    /// The combined roll hash: rotating EITHER key moves it, the same pair is
+    /// the same hash, and the no-assistant shape is distinct from every keyed
+    /// one. This is the single helper both provisioning sites go through.
+    #[test]
+    fn the_combined_llm_hash_moves_when_either_key_does() {
+        let bare = llm_keys_hash(Some("triage-one"), None);
+        assert_eq!(bare, llm_keys_hash(Some("triage-one"), None));
+        assert_ne!(bare, llm_keys_hash(Some("triage-two"), None));
+
+        let keyed = llm_keys_hash(Some("triage-one"), Some("assist-one"));
+        assert_ne!(bare, keyed, "minting the assistant key must move the hash");
+        assert_eq!(keyed, llm_keys_hash(Some("triage-one"), Some("assist-one")));
+        assert_ne!(keyed, llm_keys_hash(Some("triage-one"), Some("assist-two")));
+        assert_ne!(keyed, llm_keys_hash(Some("triage-two"), Some("assist-one")));
+
+        // Either slot alone is its own shape, distinct from the pair.
+        let assistant_only = llm_keys_hash(None, Some("assist-one"));
+        assert_ne!(assistant_only, keyed);
+        assert_ne!(assistant_only, llm_keys_hash(Some("assist-one"), None));
+
+        // Still a bare hex digest: it lands in a world-readable annotation.
+        assert_eq!(keyed.len(), 64);
+        assert!(keyed.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
     /// Without these the daemon exits at boot: `Config::oauth_client` is
