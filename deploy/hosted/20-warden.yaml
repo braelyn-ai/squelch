@@ -46,7 +46,7 @@ spec:
       containers:
         - name: warden
           # 1. EDIT ME
-          image: ghcr.io/braelyn-ai/squelch-warden:v0.2.4
+          image: ghcr.io/braelyn-ai/squelch-warden:v0.2.5
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -59,7 +59,7 @@ spec:
             # image would silently upgrade every tenant's daemon on any pod
             # restart. The warden refuses to start without one.
             - name: SQUELCH_WARDEN_IMAGE
-              value: ghcr.io/braelyn-ai/squelchd:v0.2.4
+              value: ghcr.io/braelyn-ai/squelchd:v0.2.5
             - name: SQUELCH_WARDEN_TOKEN
               valueFrom:
                 secretKeyRef:
