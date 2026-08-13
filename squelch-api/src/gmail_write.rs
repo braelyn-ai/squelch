@@ -398,7 +398,7 @@ fn truncate_at_injected_header(value: &str) -> &str {
 /// Case-insensitive membership over a list of already-lowercased addresses.
 fn contains_addr(seen: &[String], addr: &str) -> bool {
     let lower = addr.to_ascii_lowercase();
-    seen.iter().any(|s| *s == lower)
+    seen.contains(&lower)
 }
 
 /// Who a reply to `headers` should address.

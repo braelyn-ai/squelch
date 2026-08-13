@@ -59,15 +59,15 @@ impl SearchFilter {
                 return false;
             }
         }
-        if let Some(after) = self.after {
-            if hit.received_at < after {
-                return false;
-            }
+        if let Some(after) = self.after
+            && hit.received_at < after
+        {
+            return false;
         }
-        if let Some(before) = self.before {
-            if hit.received_at >= before {
-                return false;
-            }
+        if let Some(before) = self.before
+            && hit.received_at >= before
+        {
+            return false;
         }
         true
     }

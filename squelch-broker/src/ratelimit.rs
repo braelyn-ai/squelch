@@ -521,7 +521,7 @@ mod tests {
     /// that allocates hundreds of requests a minute of headroom.
     #[test]
     fn registration_is_metered_far_tighter_than_polling() {
-        assert!(REGISTER_REQUESTS_PER_MINUTE * 10.0 < CLAIM_REQUESTS_PER_MINUTE);
+        const { assert!(REGISTER_REQUESTS_PER_MINUTE * 10.0 < CLAIM_REQUESTS_PER_MINUTE) };
 
         let mut l = RateLimiter::per_minute(REGISTER_REQUESTS_PER_MINUTE);
         let t = Instant::now();
@@ -539,8 +539,8 @@ mod tests {
     /// have to grant again, so this bucket is the largest one.
     #[test]
     fn the_callback_bucket_is_the_most_forgiving() {
-        assert!(CALLBACK_REQUESTS_PER_MINUTE > PAGE_REQUESTS_PER_MINUTE);
-        assert!(CALLBACK_REQUESTS_PER_MINUTE >= CLAIM_REQUESTS_PER_MINUTE);
+        const { assert!(CALLBACK_REQUESTS_PER_MINUTE > PAGE_REQUESTS_PER_MINUTE) };
+        const { assert!(CALLBACK_REQUESTS_PER_MINUTE >= CLAIM_REQUESTS_PER_MINUTE) };
     }
 
     /// The map stays bounded against a client that never reuses an address —

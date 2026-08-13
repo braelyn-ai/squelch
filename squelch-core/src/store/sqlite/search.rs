@@ -233,10 +233,10 @@ impl SqliteStore {
                 if !filter.matches(&hit) {
                     continue;
                 }
-                if from_fts.contains(&id) {
-                    if let Some(window) = self.fts_snippet(account_id, id, query_text)? {
-                        hit.snippet = window;
-                    }
+                if from_fts.contains(&id)
+                    && let Some(window) = self.fts_snippet(account_id, id, query_text)?
+                {
+                    hit.snippet = window;
                 }
                 out.push(hit);
             }
@@ -312,10 +312,10 @@ impl SqliteStore {
         let window_full = ids.len() == k;
         let mut out = Vec::with_capacity(ids.len());
         for (id, _dist) in ids {
-            if let Some(hit) = self.search_hit_by_id(account_id, id)? {
-                if filter.matches(&hit) {
-                    out.push(hit);
-                }
+            if let Some(hit) = self.search_hit_by_id(account_id, id)?
+                && filter.matches(&hit)
+            {
+                out.push(hit);
             }
         }
         Ok((out, window_full))

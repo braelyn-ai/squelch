@@ -2775,10 +2775,12 @@ mod tests {
 
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
         let account_id = store.ensure_account("me@localhost").expect("account");
-        let mut config = Config::default();
-        // A path that does not exist: the db-size gauges must report 0 rather
-        // than measuring whatever sits at the developer's default db path.
-        config.db_path = std::env::temp_dir().join("squelch-metrics-door-test.db");
+        let config = Config {
+            // A path that does not exist: the db-size gauges must report 0 rather
+            // than measuring whatever sits at the developer's default db path.
+            db_path: std::env::temp_dir().join("squelch-metrics-door-test.db"),
+            ..Config::default()
+        };
         let app = build_metrics_router(MetricsState {
             metrics: squelch_core::metrics::SyncMetrics::new(),
             store,

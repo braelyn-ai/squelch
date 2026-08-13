@@ -822,6 +822,8 @@ mod tests {
     /// it is served there, and the match is what makes a new kind a compile
     /// error rather than a silent yes.
     #[test]
+    // One kind exists today; the single-element loop is the tripwire itself.
+    #[allow(clippy::single_element_loop)]
     fn every_session_kind_decides_whether_polling_may_claim_it() {
         for kind in [SessionKind::SelfHost] {
             let expected = match kind {
