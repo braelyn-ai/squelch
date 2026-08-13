@@ -17,6 +17,7 @@
 
 pub mod banking;
 pub mod marketing;
+pub mod shipments;
 
 use chrono::{DateTime, Utc};
 
