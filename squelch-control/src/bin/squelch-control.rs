@@ -222,7 +222,8 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
     else {
         anyhow::bail!(
             "the LLM gateway is not configured: set SQUELCH_CONTROL_BIFROST_URL and \
-             SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN (and optionally SQUELCH_CONTROL_LLM_BUDGET_USD)"
+             SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN, the gateway admin's username:password \
+             (and optionally SQUELCH_CONTROL_LLM_BUDGET_USD and SQUELCH_CONTROL_LLM_MODELS)"
         );
     };
     let (warden_url, warden_token) =
@@ -230,7 +231,12 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
 
     let store = open_store()?;
     let warden = HttpWarden::new(warden_url, warden_token, OUTBOUND_TIMEOUT)?;
-    let bifrost = BifrostClient::new(llm.url.clone(), llm.admin_token.clone(), OUTBOUND_TIMEOUT)?;
+    let bifrost = BifrostClient::new(
+        llm.url.clone(),
+        llm.admin_token.clone(),
+        llm.models.clone(),
+        OUTBOUND_TIMEOUT,
+    )?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

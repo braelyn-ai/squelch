@@ -88,8 +88,9 @@ struct Recorder {
     llm_key_puts: Vec<(String, String)>,
     /// Bodies posted to the mock Bifrost's mint route.
     bifrost_mint_bodies: Vec<Value>,
-    /// Bearers the mock Bifrost saw.
-    bifrost_bearers: Vec<String>,
+    /// Authorization headers the mock Bifrost saw, on every route. The live
+    /// gateway takes HTTP Basic with the admin `username:password`.
+    bifrost_auths: Vec<String>,
     /// Bearer values the warden saw, on every route.
     warden_bearers: Vec<String>,
     /// Labels asked about via `GET /v1/tenants/{label}`.
@@ -329,9 +330,38 @@ async fn spawn_warden(rec: Shared) -> String {
 const VK_VALUE: &str = "sk-bf-THE-VIRTUAL-KEY-VALUE";
 const VK_ID: &str = "vk-mock-1";
 
-/// A mock Bifrost: the one governance route signup uses.
+/// The Bifrost admin credential the harness configures: `username:password`,
+/// sent by the client as HTTP Basic on every governance call.
+const BIFROST_ADMIN: &str = "bifrost-admin:the-basic-password";
+
+/// The provider key id the mock gateway lists, mirroring the one the live
+/// gateway auto-detects.
+const PROVIDER_KEY_ID: &str = "ANTHROPIC_API_KEY_auto_detected";
+
+fn bifrost_basic_auth() -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(BIFROST_ADMIN)
+    )
+}
+
+/// A mock Bifrost: the two routes a mint speaks (the provider-key listing and
+/// the governance create), answering the LIVE gateway's shapes — the mint echo
+/// carries the attached `budgets` and `provider_configs`, which the client
+/// refuses to trust a key without.
 async fn spawn_bifrost(rec: Shared) -> String {
     let app = Router::new()
+        .route(
+            "/api/providers/anthropic/keys",
+            get(
+                |AxumState(rec): AxumState<Shared>, headers: HeaderMap| async move {
+                    let mut r = rec.lock().unwrap();
+                    r.bifrost_auths.push(bearer_of(&headers));
+                    Json(json!({ "keys": [{ "id": PROVIDER_KEY_ID, "models": [] }] }))
+                        .into_response()
+                },
+            ),
+        )
         .route(
             "/api/governance/virtual-keys",
             post(
@@ -339,12 +369,17 @@ async fn spawn_bifrost(rec: Shared) -> String {
                     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let mut r = rec.lock().unwrap();
                     r.bifrost_mint_bodies.push(parsed);
-                    r.bifrost_bearers.push(bearer_of(&headers));
+                    r.bifrost_auths.push(bearer_of(&headers));
                     (
-                        StatusCode::CREATED,
+                        StatusCode::OK,
                         Json(json!({
                             "message": "Virtual key created successfully",
-                            "virtual_key": { "id": VK_ID, "value": VK_VALUE },
+                            "virtual_key": {
+                                "id": VK_ID,
+                                "value": VK_VALUE,
+                                "budgets": [{ "max_limit": DEFAULT_LLM_BUDGET_USD, "reset_duration": "1M" }],
+                                "provider_configs": [{ "provider": "anthropic", "weight": 1 }],
+                            },
                         })),
                     )
                         .into_response()
@@ -421,8 +456,9 @@ impl Harness {
             // here; `from_env` is where https is enforced.
             bifrost: bifrost_url.map(|url| BifrostConfig {
                 url,
-                admin_token: "bifrost-admin-bearer".into(),
+                admin_token: BIFROST_ADMIN.into(),
                 budget_usd: DEFAULT_LLM_BUDGET_USD,
+                models: vec!["claude-haiku-4-5".into(), "claude-sonnet-5".into()],
             }),
         };
 
@@ -1230,17 +1266,29 @@ async fn signup_mints_and_installs_a_tenant_llm_key() {
     assert!(!body.contains(VK_VALUE), "the key value must never reach a page");
 
     let rec = h.rec.lock().unwrap();
-    // ONE mint, carrying the admin bearer, the tenant-named key, the budget,
-    // and the monthly reset.
+    // TWO governance requests — the provider-key listing, then the one mint —
+    // both carrying HTTP Basic with the admin `username:password`.
     assert_eq!(
-        rec.bifrost_bearers,
-        vec!["Bearer bifrost-admin-bearer".to_string()]
+        rec.bifrost_auths,
+        vec![bifrost_basic_auth(), bifrost_basic_auth()]
     );
     let mint = &rec.bifrost_mint_bodies[0];
     assert_eq!(mint["name"], "tenant-ada");
-    assert_eq!(mint["budget"]["max_limit"], DEFAULT_LLM_BUDGET_USD);
-    assert_eq!(mint["budget"]["reset_duration"], "1M");
+    // `budgets` is an ARRAY on the live gateway; a singular `budget` object
+    // is silently ignored and mints an unbudgeted key.
+    assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
+    assert_eq!(mint["budgets"][0]["max_limit"], DEFAULT_LLM_BUDGET_USD);
+    assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
     assert_eq!(mint["is_active"], true);
+    // The provider config pins the listed key ids and a non-empty model
+    // allow-list; without both the key cannot serve inference.
+    let pc = &mint["provider_configs"][0];
+    assert_eq!(pc["provider"], "anthropic");
+    assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
+    assert_eq!(
+        pc["allowed_models"],
+        json!(["claude-haiku-4-5", "claude-sonnet-5"])
+    );
     // The VALUE went to the warden, once, for this tenant.
     assert_eq!(
         rec.llm_key_puts,

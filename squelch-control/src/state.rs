@@ -33,9 +33,10 @@ struct Inner {
     store: ControlStore,
     warden: Arc<dyn Warden>,
     /// The LLM gateway's governance client, DERIVED in [`ControlState::new`]
-    /// from `config.bifrost` so it is present exactly when the config trio is
-    /// and can never disagree with it. `None` means signup provisions keyless
-    /// tenants and the `llm mint` operator command backfills them later.
+    /// from `config.bifrost` so it is present exactly when the config says the
+    /// gateway is and can never disagree with it. `None` means signup
+    /// provisions keyless tenants and the `llm mint` operator command
+    /// backfills them later.
     bifrost: Option<Arc<BifrostClient>>,
     sessions: Mutex<SessionStore>,
     page_limiter: Mutex<RateLimiter>,
@@ -47,7 +48,7 @@ impl ControlState {
     /// Build state from validated config, an open store, and a warden client.
     ///
     /// The Bifrost client is DERIVED here from `config.bifrost`, so the
-    /// feature has exactly one switch: the config trio. A caller cannot hand
+    /// feature has exactly one switch: the config. A caller cannot hand
     /// in a client the config does not describe, or forget one it does.
     /// Fallible only in the one way that derivation is (the HTTP client
     /// failing to build); everything else that could be refused was refused
@@ -62,8 +63,13 @@ impl ControlState {
             .bifrost
             .as_ref()
             .map(|b| {
-                BifrostClient::new(b.url.clone(), b.admin_token.clone(), OUTBOUND_TIMEOUT)
-                    .map(Arc::new)
+                BifrostClient::new(
+                    b.url.clone(),
+                    b.admin_token.clone(),
+                    b.models.clone(),
+                    OUTBOUND_TIMEOUT,
+                )
+                .map(Arc::new)
             })
             .transpose()?;
         Ok(Self {
