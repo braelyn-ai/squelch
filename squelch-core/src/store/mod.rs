@@ -1329,6 +1329,7 @@ pub trait Store: Send + Sync {
     /// Bump a SPECIALIST-EXTRACTOR usage line for `(account_id, day, category)`.
     /// `category` is the extractor's own ledger label (e.g. `extract_banking`),
     /// kept separate from `stage1`/`stage2` so per-specialist cost stays visible.
+    #[allow(clippy::too_many_arguments)]
     fn extract_bump_usage(
         &self,
         account_id: AccountId,
