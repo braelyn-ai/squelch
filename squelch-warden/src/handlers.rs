@@ -1,4 +1,4 @@
-//! The control-plane wire: seven routes and a health check.
+//! The control-plane wire: eight routes and a health check.
 //!
 //! ```text
 //! POST   /v1/tenants                     -> 201 { recipient }
@@ -6,6 +6,7 @@
 //! PUT    /v1/tenants/{label}/llm-key     -> 200 {}
 //! GET    /v1/tenants/{label}             -> 200 { status } | 404
 //! GET    /v1/tenants/{label}/drift       -> 200 { status, deployment_present, foreign, changes }
+//! POST   /v1/tenants/{label}/reconcile   -> 200 { deployment, status } | 409
 //! POST   /v1/tenants/{label}/pair        -> 200 { pair_code, pair_url, deep_link }
 //! DELETE /v1/tenants/{label}             -> 204
 //! GET    /healthz                        -> 200 ok
@@ -82,6 +83,10 @@ fn error_response(e: &WardenError) -> Response {
         WardenError::NoKeys => (StatusCode::UNPROCESSABLE_ENTITY, "no_keys", None),
         WardenError::Conflict => (StatusCode::CONFLICT, "label_exists", None),
         WardenError::NotFound => (StatusCode::NOT_FOUND, "not_found", None),
+        // 409 rather than 404: the tenant is real, and it is its state that
+        // has no workload to converge. The control plane's answer is a
+        // different call (finish the signup, or re-consent), not a retry.
+        WardenError::NotReconcilable => (StatusCode::CONFLICT, "not_reconcilable", None),
         // 503, not 422: the request was fine, this deployment is what lacks
         // the LLM gateway. The control plane should not be calling here at all.
         WardenError::LlmNotConfigured => {
@@ -269,6 +274,19 @@ pub async fn get_tenant(State(state): State<WardenState>, Path(label): Path<Stri
 pub async fn get_drift(State(state): State<WardenState>, Path(label): Path<String>) -> Response {
     match state.warden().drift(&label).await {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /v1/tenants/{label}/reconcile` - put a running tenant back onto
+/// today's render, deleting and recreating its Deployment if another field
+/// manager owns part of it. No body: the tenant is the whole request.
+pub async fn reconcile_tenant(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+) -> Response {
+    match state.warden().reconcile(&label).await {
+        Ok(reconciled) => (StatusCode::OK, Json(reconciled)).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -675,6 +693,70 @@ mod tests {
         assert_eq!(body["error"], "invalid_label");
     }
 
+    /// The reconcile route on the wire: the two words the control plane reads,
+    /// and the recreate that a hand edit forces.
+    #[tokio::test]
+    async fn the_reconcile_route_converges_and_then_recreates() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({ "deployment": "converged", "status": "active" })
+        );
+        assert!(h.cluster.deleted().is_empty());
+
+        hand_edit_the_deployment(&h).await;
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deployment"], "recreated");
+        assert_eq!(body["status"], "active");
+        // The body is two fixed words. Nothing about this tenant's person, and
+        // nothing about this cluster.
+        assert!(!body.to_string().contains("example.com"));
+    }
+
+    /// A tenant with no workload is a 409, not a 404: the tenant is real, and
+    /// what it needs is a different call.
+    #[tokio::test]
+    async fn the_reconcile_route_refuses_a_tenant_with_nothing_running() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({ "error": "not_reconcilable" }));
+
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+        call(&h, authed("DELETE", "/v1/tenants/alice", "")).await;
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_reconcilable");
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/-nope-/reconcile", "")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "invalid_label");
+    }
+
     #[tokio::test]
     async fn unknown_tenants_404_except_on_delete() {
         let h = Harness::new();
@@ -683,6 +765,10 @@ mod tests {
         assert_eq!(body["error"], "not_found");
 
         let (status, body) = call(&h, authed("GET", "/v1/tenants/nobody/drift", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/nobody/reconcile", "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
 
@@ -757,6 +843,7 @@ mod tests {
             ("PUT", "/v1/tenants/alice/llm-key"),
             ("GET", "/v1/tenants/alice"),
             ("GET", "/v1/tenants/alice/drift"),
+            ("POST", "/v1/tenants/alice/reconcile"),
             ("DELETE", "/v1/tenants/alice"),
             ("POST", "/v1/tenants/alice/pair"),
         ];

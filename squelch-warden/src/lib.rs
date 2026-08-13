@@ -3,9 +3,10 @@
 //! One single-node k3s cluster runs one squelchd pod per tenant, each with its
 //! own volume, its own age identity, its own NetworkPolicy, and its own
 //! subdomain. The warden is the small in-cluster service that makes that
-//! happen: the control plane (`squelch-control`, on Railway) calls five JSON
-//! routes here, and the warden does the two things kube cannot do for itself,
-//! which are minting a tenant's key and rendering a tenant's manifests.
+//! happen: the control plane (`squelch-control`, on Railway) calls the JSON
+//! routes in [`handlers`], and the warden does the two things kube cannot do
+//! for itself, which are minting a tenant's key and rendering a tenant's
+//! manifests.
 //!
 //! ## What the warden is trusted with, and what it is not
 //!
@@ -38,7 +39,8 @@
 //!   YAML is rendered anywhere in this crate.**
 //! - [`cluster`] - the one trait every Kubernetes call goes through, and the
 //!   kube-rs implementation of it.
-//! - [`provision`] - the two-phase sequence, and the pending sweep.
+//! - [`provision`] - the two-phase sequence, the reconcile that repairs a
+//!   tenant somebody edited, and the pending sweep.
 //! - [`drift`] - reading a live tenant back: who else owns part of it, and what
 //!   an apply of today's render would change.
 //! - [`pair`] - reading `squelchd pair`'s output back.
@@ -77,7 +79,7 @@ pub use cluster::{Cluster, KubeCluster};
 pub use config::{Config, ConfigError};
 pub use drift::{DriftReport, FieldChange, ForeignManager};
 pub use pair::Pairing;
-pub use provision::{Created, TenantStatus, Warden, WardenError};
+pub use provision::{Created, Reconciled, TenantStatus, Warden, WardenError};
 
 /// State threaded through the router. Cheap to clone (one `Arc`).
 #[derive(Clone)]
@@ -162,6 +164,10 @@ pub fn router(state: WardenState) -> Router {
         )
         .route("/v1/tenants/{label}/llm-key", put(handlers::set_llm_key))
         .route("/v1/tenants/{label}/drift", get(handlers::get_drift))
+        .route(
+            "/v1/tenants/{label}/reconcile",
+            post(handlers::reconcile_tenant),
+        )
         .route("/v1/tenants/{label}/pair", post(handlers::repair_tenant))
         .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
         .layer(middleware::from_fn_with_state(

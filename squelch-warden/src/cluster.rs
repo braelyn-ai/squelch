@@ -7,8 +7,8 @@
 //! how the suite runs with no cluster, no kubeconfig, and no network.
 //!
 //! The trait is deliberately narrow. It is not a Kubernetes client: it is the
-//! eight verbs a tenant lifecycle needs, over the six kinds a tenant is made
-//! of. Anything wider would be surface the warden's RBAC does not grant anyway.
+//! few verbs a tenant lifecycle needs, over the six kinds a tenant is made of.
+//! Anything wider would be surface the warden's RBAC does not grant anyway.
 //!
 //! ## The second gate
 //!
@@ -222,6 +222,24 @@ pub trait Cluster: Send + Sync {
     /// Block until a pod matching `selector` reports Ready, and return its
     /// name. [`ClusterError::Timeout`] after `within`.
     async fn ready_pod(&self, selector: &str, within: Duration) -> Result<String, ClusterError>;
+
+    /// Block until NO pod matches `selector`. [`ClusterError::Timeout`] after
+    /// `within`.
+    ///
+    /// The tenant's data volume is `ReadWriteOnce` and the daemon behind it is
+    /// one SQLite file, so exactly one pod may hold it at a time. Inside a
+    /// single Deployment the `Recreate` strategy is what guarantees that: the
+    /// old pod is gone before the new one is scheduled. Deleting a Deployment
+    /// and applying a fresh one steps outside that guarantee, because the two
+    /// objects are two rollouts and neither controller waits for the other.
+    /// This is the same promise, made by hand across that boundary, and the
+    /// [`crate::provision::Warden::reconcile`] path is not allowed to apply
+    /// until it holds.
+    ///
+    /// "Gone" means the list is EMPTY, not that nothing in it is Ready: a pod
+    /// in Terminating still has the volume mounted, and a second writer
+    /// starting against it is the corruption this waits out.
+    async fn pods_gone(&self, selector: &str, within: Duration) -> Result<(), ClusterError>;
 
     /// Run `argv` inside `pod` and collect both streams.
     async fn exec(&self, pod: &str, argv: &[String]) -> Result<ExecOutput, ClusterError>;
@@ -470,6 +488,30 @@ impl Cluster for KubeCluster {
                 .and_then(|p| p.metadata.name.clone())
             {
                 return Ok(name);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClusterError::Timeout(within));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn pods_gone(&self, selector: &str, within: Duration) -> Result<(), ClusterError> {
+        let pods: Api<Pod> = self.api();
+        let params = ListParams::default().labels(selector);
+        // Polled on the same cadence as `ready_pod`, and for the same reason:
+        // this runs once, bounded, and the question is a list length.
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let list = pods
+                .list(&params)
+                .await
+                .map_err(|source| ClusterError::Api {
+                    op: "list pods",
+                    source: Box::new(source),
+                })?;
+            if list.items.is_empty() {
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClusterError::Timeout(within));

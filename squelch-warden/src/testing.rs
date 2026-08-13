@@ -130,6 +130,8 @@ struct MockInner {
     exec_ok: bool,
     /// Whether an applied Deployment comes up.
     ready: bool,
+    /// Whether a deleted Deployment's pods hang around holding the volume.
+    pods_linger: bool,
     /// Whether reads answer at all.
     reads_ok: bool,
     /// Whether the next `create` loses a race with a concurrent one.
@@ -181,6 +183,14 @@ impl MockCluster {
     /// Every read fails, as a partitioned API server would.
     pub fn break_reads(&self) {
         self.lock().reads_ok = false;
+    }
+
+    /// A deleted Deployment's pod never goes: `pods_gone` times out, the way a
+    /// pod wedged in Terminating on a stuck unmount does. The state that must
+    /// stop a recreate dead, because the volume is `ReadWriteOnce` and the pod
+    /// still has it.
+    pub fn pods_linger(&self) {
+        self.lock().pods_linger = true;
     }
 
     /// The next `create` loses a race, the way a second signup for one label
@@ -373,6 +383,16 @@ impl Cluster for MockCluster {
             .find_map(|part| part.strip_prefix("app.kubernetes.io/instance="))
             .ok_or(ClusterError::NoPod)?;
         Ok(format!("{instance}-abc123"))
+    }
+
+    /// The mock keeps no pods, so a deleted Deployment has taken its pod with
+    /// it by the time anyone asks: the ordinary case, answered immediately.
+    /// [`MockCluster::pods_linger`] is the other one.
+    async fn pods_gone(&self, _selector: &str, within: Duration) -> Result<(), ClusterError> {
+        if self.lock().pods_linger {
+            return Err(ClusterError::Timeout(within));
+        }
+        Ok(())
     }
 
     async fn exec(&self, pod: &str, argv: &[String]) -> Result<ExecOutput, ClusterError> {
