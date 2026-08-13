@@ -99,6 +99,10 @@ impl CarrierClient for FedexClient {
         MIN_INTERVAL
     }
 
+    async fn invalidate_auth(&self) {
+        self.token.invalidate().await;
+    }
+
     async fn track(&self, tracking_number: &str) -> Result<CarrierTrack, TrackError> {
         let token = self.access_token().await?;
         // `includeDetailedScans: false` is the whole scan history we do NOT

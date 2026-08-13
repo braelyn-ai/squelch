@@ -93,6 +93,17 @@ pub trait CarrierClient: Send + Sync {
     /// status vocabulary is reported as [`CarrierTrack::status`] `None` with the
     /// raw string preserved, not guessed at.
     async fn track(&self, tracking_number: &str) -> Result<CarrierTrack, TrackError>;
+
+    /// Throw away any cached credential, because the carrier just refused it.
+    ///
+    /// The poller calls this on [`TrackError::Auth`] BEFORE it cools the carrier
+    /// down: a cached token outlives that cooldown (UPS's lasts four hours,
+    /// USPS's eight), so a client that keeps a rejected token replays it every
+    /// time the gate lifts and never picks up a corrected key without a restart.
+    /// The default is a no-op, which is correct for a carrier holding no token
+    /// (DHL is a bare API key); the OAuth clients override it to clear their
+    /// [`oauth::TokenCache`].
+    async fn invalidate_auth(&self) {}
 }
 
 /// Enabled carriers by slug. Absence means "not configured", which is exactly

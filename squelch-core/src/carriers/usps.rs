@@ -351,6 +351,10 @@ impl CarrierClient for UspsClient {
         MIN_INTERVAL
     }
 
+    async fn invalidate_auth(&self) {
+        self.token.invalidate().await;
+    }
+
     async fn track(&self, tracking_number: &str) -> Result<CarrierTrack, TrackError> {
         // The number lands in the URL PATH. It reaches us from mail text, so a
         // `/` or `?` in one would reshape the request into a different endpoint;

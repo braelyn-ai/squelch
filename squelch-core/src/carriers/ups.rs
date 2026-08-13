@@ -96,6 +96,10 @@ impl CarrierClient for UpsClient {
         MIN_INTERVAL
     }
 
+    async fn invalidate_auth(&self) {
+        self.token.invalidate().await;
+    }
+
     async fn track(&self, tracking_number: &str) -> Result<CarrierTrack, TrackError> {
         // The number is spliced into the PATH, so a stored value that is not
         // the shape UPS issues is refused here rather than escaped and sent: a
