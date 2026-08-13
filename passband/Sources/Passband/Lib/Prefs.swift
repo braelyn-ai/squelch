@@ -112,6 +112,7 @@ final class Prefs {
         static let userName = "passband.name"
         static let signature = "passband.pref.signature"
         static let assistantModel = "passband.assistant.model"
+        static let assistantTransport = "passband.assistant.transport"
         static let telemetry = TelemetryLevel.prefKey
     }
 
@@ -144,6 +145,9 @@ final class Prefs {
         _assistantModel =
             AssistantModel(rawValue: defaults.string(forKey: Key.assistantModel) ?? "")
             ?? .haiku
+        _assistantTransport =
+            AssistantTransport(rawValue: defaults.string(forKey: Key.assistantTransport) ?? "")
+            ?? .relay
     }
 
     /// Load remote (network) images in email HTML automatically. When false,
@@ -274,6 +278,19 @@ final class Prefs {
         }
     }
 
+    /// WHAT THE USER PICKED, not what runs. The effective transport is relay
+    /// only when this says relay AND the daemon advertises `assistant_relay`
+    /// (see `AssistantSession.run`); on a self-host daemon that never does, the
+    /// relay default is inert and every ask is BYOK regardless.
+    private var _assistantTransport: AssistantTransport
+    var assistantTransport: AssistantTransport {
+        get { _assistantTransport }
+        set {
+            _assistantTransport = newValue
+            defaults.set(newValue.rawValue, forKey: Key.assistantTransport)
+        }
+    }
+
     /// Flip light <-> dark. `system` resolves against the current appearance
     /// first so the toggle always visibly changes something.
     func flipTheme() {
@@ -310,6 +327,23 @@ enum AssistantModel: String, CaseIterable, Sendable {
         switch self {
         case .haiku: (1, 5)
         case .opus: (5, 25)
+        }
+    }
+}
+
+/// Where a ⌘K ask travels: through the user's own daemon (the hosted relay) or
+/// straight to the provider with their own key. `relay` is the default because
+/// on hosted the relay IS the product, and BYOK users flip the switch once and
+/// it sticks. Harmless on self-host: a daemon that never advertises the
+/// capability never runs relay whatever this says.
+enum AssistantTransport: String, CaseIterable, Sendable {
+    case relay = "relay"
+    case byok = "byok"
+
+    var label: String {
+        switch self {
+        case .relay: "Passband relay"
+        case .byok: "My own key"
         }
     }
 }
