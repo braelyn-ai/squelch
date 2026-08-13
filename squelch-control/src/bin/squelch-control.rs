@@ -71,7 +71,11 @@ enum Command {
         label: Option<String>,
     },
     /// Converge ONE tenant's workload back onto the warden's render.
-    Reconcile { label: String },
+    Reconcile {
+        /// The tenant to converge. One at a time, on purpose: verify it before
+        /// you walk the next one.
+        label: String,
+    },
 }
 
 /// The LLM-key operator commands. Unlike `invite`, these need the Bifrost trio
