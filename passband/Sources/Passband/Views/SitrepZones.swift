@@ -24,7 +24,7 @@ struct CalendarZone: View {
                 VStack(spacing: 1) {
                     ForEach(rows) { c in
                         Button {
-                            open(c)
+                            store.openRecord(thread: c.thread_id, message: c.message_id)
                         } label: {
                             HStack(spacing: 7) {
                                 Text(c.event_title ?? c.organizer ?? "calendar event")
@@ -56,16 +56,6 @@ struct CalendarZone: View {
         kind == .cancellation ? Palette.danger : Palette.inkFaint
     }
 
-    /// An older daemon sends calendar rows with no thread_id; fall back to the
-    /// emails-page jump so the click always does SOMETHING.
-    private func open(_ c: CalendarUpdate) {
-        if let tid = c.thread_id, !tid.isEmpty {
-            store.openThread(tid)
-        } else {
-            store.viewInEmails(c.message_id)
-        }
-    }
-
     private func when(_ c: CalendarUpdate) -> String {
         guard c.starts_at != nil else { return "" }
         return Fmt.isToday(c.starts_at) ? Fmt.timeOfDay(c.starts_at) : Fmt.shortDate(c.starts_at)
@@ -75,7 +65,7 @@ struct CalendarZone: View {
 // MARK: - shipments
 
 /// Still-active shipments plus anything delivered TODAY; older deliveries drop
-/// out. View-only: no j/k, but each card's Track button is real.
+/// out. No j/k, but each card opens its email and the Track chip is real.
 struct ShipmentsZone: View {
     @Environment(AppStore.self) private var store
     private var shipments: [Shipment] { store.zones.shipments }
@@ -101,7 +91,10 @@ struct ShipmentsZone: View {
 }
 
 private struct ShipmentCard: View {
+    @Environment(AppStore.self) private var store
     let shipment: Shipment
+
+    @State private var hovering = false
 
     private var title: String {
         let trimmed = shipment.item_name.trimmingCharacters(in: .whitespaces)
@@ -119,7 +112,19 @@ private struct ShipmentCard: View {
         }
     }
 
+    /// Where the card jumps: the feeding email's thread. `nil` on a row from an
+    /// older daemon that sent no thread_id — then the card is inert and never
+    /// paints the hover invitation it can't honor.
+    private var target: String? {
+        guard let tid = shipment.thread_id, !tid.isEmpty else { return nil }
+        return tid
+    }
+
     var body: some View {
+        // The whole card opens the email; the Track chip is a real Button inside
+        // it. The card is a tap gesture, not an outer Button, because a Button
+        // beats a gesture in hit-testing — the chip keeps its clicks by
+        // construction (AttachmentStrip's card + download button, same shape).
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 CarrierBadge(carrier: shipment.carrier)
@@ -148,8 +153,11 @@ private struct ShipmentCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Palette.hairline.opacity(0.5))
+                .fill(Palette.hairline.opacity(hovering && target != nil ? 0.85 : 0.5))
         )
+        .contentShape(Rectangle())
+        .onTapGesture { if let target { store.openThread(target) } }
+        .onHover { hovering = $0 }
         .opacity(shipment.status == .delivered ? 0.65 : 1)
     }
 }
@@ -210,7 +218,7 @@ struct BankingZone: View {
                 VStack(spacing: 1) {
                     ForEach(rows) { r in
                         Button {
-                            open(r)
+                            store.openRecord(thread: r.thread_id, message: r.message_id)
                         } label: {
                             HStack(spacing: 7) {
                                 Text(institutionLabel(r))
@@ -242,15 +250,6 @@ struct BankingZone: View {
         return r.account_hint.map { "\(base) \($0)" } ?? base
     }
 
-    /// An older daemon sends banking rows with no thread_id; fall back to the
-    /// emails-page jump so the click always does SOMETHING.
-    private func open(_ r: BankingRecord) {
-        if let tid = r.thread_id, !tid.isEmpty {
-            store.openThread(tid)
-        } else {
-            store.viewInEmails(r.message_id)
-        }
-    }
 }
 
 // MARK: - receipts
@@ -273,7 +272,7 @@ struct ReceiptsZone: View {
                 VStack(spacing: 1) {
                     ForEach(rows) { r in
                         Button {
-                            open(r)
+                            store.openRecord(thread: r.thread_id, message: r.message_id)
                         } label: {
                             HStack(spacing: 7) {
                                 Text(SenderCache.resolved(r.senderString).displayName)
@@ -298,14 +297,6 @@ struct ReceiptsZone: View {
             }
         }
         .task { await store.refreshZones() }
-    }
-
-    private func open(_ r: Receipt) {
-        if let tid = r.thread_id, !tid.isEmpty {
-            store.openThread(tid)
-        } else {
-            store.viewInEmails(r.message_id)
-        }
     }
 
 }

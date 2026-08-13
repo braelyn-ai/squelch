@@ -90,6 +90,43 @@ fn sealing_by_hand_clears_the_category_and_specialist_rows() {
 }
 
 #[test]
+fn sealing_by_hand_deletes_the_shipment_the_message_fed() {
+    // Shipments are keyed by tracking number, not message, so the generic
+    // specialist scrub misses them — sealing the row's latest feeder must
+    // delete the shipment outright, or its item name and thread keep serving
+    // sealed-derived content on the Sitrep card.
+    use crate::triage::{ShipmentInfo, ShipmentStatus};
+    let (store, acct) = store();
+    let t0 = Utc::now();
+    let id = inbound_triaged(acct, "g1", "t1", "pharmacy@rx.com", t0, false).ingest(&store);
+
+    store
+        .upsert_shipment(
+            acct,
+            id,
+            &ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: "Prescription refill".into(),
+                status: ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            t0,
+        )
+        .unwrap();
+    assert_eq!(store.list_shipments(acct, true).unwrap().len(), 1);
+
+    // The human says: actually this is auth.
+    store
+        .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+        .unwrap()
+        .unwrap();
+
+    // The shipment row is gone from every listing, delivered included.
+    assert!(store.list_shipments(acct, true).unwrap().is_empty());
+}
+
+#[test]
 fn sealing_by_hand_retracts_the_notification_event() {
     // A message can notify FIRST and be sealed by hand after, so sealing has
     // to retract the pre-seal snapshot every client cursor replays forever.

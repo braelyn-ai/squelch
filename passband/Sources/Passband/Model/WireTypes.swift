@@ -289,6 +289,9 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     var item_name: String
     var status: ShipmentStatus
     var tracking_url: String?
+    /// Thread of the latest email whose status stuck; absent from an older
+    /// daemon, and then the card simply isn't clickable.
+    var thread_id: String?
     var first_seen: String
     var last_update: String
 }

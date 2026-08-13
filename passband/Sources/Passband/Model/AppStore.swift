@@ -1064,6 +1064,17 @@ final class AppStore {
         pushHistory(HistoryEntry(view: .emails, selectedId: id))
     }
 
+    /// The record zones' shared click routing: open the row's thread, falling
+    /// back to the emails-page jump when an older daemon sent no thread_id —
+    /// the click always does SOMETHING.
+    func openRecord(thread: String?, message: Int) {
+        if let thread, !thread.isEmpty {
+            openThread(thread)
+        } else {
+            viewInEmails(message)
+        }
+    }
+
     var canGoBack: Bool { historyIndex > 0 }
     var canGoForward: Bool { historyIndex < history.count - 1 }
 
@@ -1444,6 +1455,7 @@ final class AppStore {
     /// opens instantly.
     private func warmZoneThreads() {
         ThreadPrefetch.shared.warm(zones.banking.prefix(6).compactMap(\.thread_id), immediate: 2)
+        ThreadPrefetch.shared.warm(zones.shipments.prefix(6).compactMap(\.thread_id), immediate: 2)
         // Receipts rotate at local midnight, so match the cache TTL to that.
         let midnight =
             Calendar.current.nextDate(
