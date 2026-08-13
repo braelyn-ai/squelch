@@ -27,7 +27,7 @@ use crate::sync::ingest::{
     RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
 };
 use crate::triage::events;
-use crate::triage::extract::{self, banking, marketing};
+use crate::triage::extract::{self, banking, marketing, shipping};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
@@ -1608,8 +1608,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
 
             // A row whose category has no handler is marked processed so it
-            // cannot loop.
-            if !banking::CATEGORIES.contains(&row.category.as_str()) {
+            // cannot loop. Checked against the FULL extractable set — the
+            // per-specialist routing happens below.
+            if !categories.contains(&row.category.as_str()) {
                 let _ = self.store.extract_mark_processed(
                     self.account_id,
                     row.message_id,
@@ -1666,6 +1667,56 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                     Ok(marketing::ExtractOutcome::Refused)
                     | Ok(marketing::ExtractOutcome::Failed(_)) => {
+                        let _ = self.store.extract_mark_processed(
+                            self.account_id,
+                            row.message_id,
+                            "extract-failed",
+                        );
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("squelch: extract {e}; row stays queued");
+                    }
+                }
+                continue;
+            }
+
+            if shipping::CATEGORIES.contains(&row.category.as_str()) {
+                match shipping::classify(&self.http, url, api_key, cfg, provider, row).await {
+                    Ok(shipping::ExtractOutcome::Ok(out, usage)) => {
+                        if let Some(u) = usage {
+                            in_tok += u.input_tokens;
+                            out_tok += u.output_tokens;
+                            if let Err(e) = self.store.extract_bump_usage(
+                                self.account_id,
+                                &day,
+                                shipping::LEDGER_CATEGORY,
+                                u.input_tokens,
+                                u.output_tokens,
+                                u.cache_creation_input_tokens,
+                                u.cache_read_input_tokens,
+                            ) {
+                                eprintln!("squelch: extract usage ledger bump failed ({e})");
+                            }
+                        }
+                        let applied = shipping::apply_result(row, &out, &cfg.model);
+                        if let Err(e) = self.store.shipping_apply(&applied) {
+                            // The call is already paid for: mark processed rather
+                            // than re-buying it every cycle.
+                            eprintln!(
+                                "squelch: shipping apply failed ({e}); row marked apply-failed"
+                            );
+                            let _ = self.store.extract_mark_processed(
+                                self.account_id,
+                                row.message_id,
+                                "apply-failed",
+                            );
+                        } else {
+                            extracted += 1;
+                        }
+                    }
+                    Ok(shipping::ExtractOutcome::Refused)
+                    | Ok(shipping::ExtractOutcome::Failed(_)) => {
                         let _ = self.store.extract_mark_processed(
                             self.account_id,
                             row.message_id,

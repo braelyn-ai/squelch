@@ -132,7 +132,7 @@ where
 /// Emit a stage's/extractor's production `classify`: the delegation to its own
 /// `classify_at` at the RESOLVED endpoint — [`crate::config::ResolvedLlm::url`],
 /// which is [`provider_url`] unless the operator routed the Anthropic wire
-/// through a gateway. Identical for all four call sites, so it is written once.
+/// through a gateway. Identical for all five call sites, so it is written once.
 /// Leading doc attributes are forwarded.
 macro_rules! classify_entrypoint {
     ($(#[$attr:meta])* $cfg:ty, $input:ty, $outcome:ty $(,)?) => {

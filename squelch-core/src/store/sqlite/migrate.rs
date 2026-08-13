@@ -112,6 +112,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "triage", "category", "TEXT")?;
     add_column_if_missing(conn, "triage", "extractor_model_used", "TEXT")?;
 
+    // Item-name provenance for shipments. 'regex' is correct history: every
+    // pre-existing name came from the ingest detector, so the LLM shipping
+    // specialist may replace any of them.
+    add_column_if_missing(
+        conn,
+        "shipments",
+        "item_name_source",
+        "TEXT NOT NULL DEFAULT 'regex'",
+    )?;
+
     // Recipient-autocomplete columns. NULL is fine on old rows: the Sent
     // harvest fills both for all of history, and ongoing seeding stamps
     // last_sent_at from then on.

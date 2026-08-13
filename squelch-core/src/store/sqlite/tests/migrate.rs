@@ -363,6 +363,38 @@ fn migrate_adds_category_and_extractor_columns_to_preexisting_triage() {
 }
 
 #[test]
+fn migrate_adds_item_name_source_with_regex_default_to_preexisting_shipments() {
+    // A `shipments` table predating item-name provenance. The additive
+    // migration adds the column and every historical row reads 'regex' — every
+    // pre-existing name came from the ingest detector, so the LLM specialist
+    // may replace any of them. Idempotent on re-open.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             tracking_number TEXT NOT NULL, carrier TEXT NOT NULL,
+             item_name TEXT NOT NULL DEFAULT '',
+             status TEXT NOT NULL DEFAULT 'shipped',
+             first_seen TEXT NOT NULL, last_update TEXT NOT NULL);
+         INSERT INTO shipments(id, account_id, tracking_number, carrier, item_name,
+                               first_seen, last_update)
+             VALUES (1, 1, '1Z999AA10123456784', 'ups', 'Shipped Allbirds!',
+                     '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+    let src: String = conn
+        .query_row(
+            "SELECT item_name_source FROM shipments WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(src, "regex", "historical names read as regex-sourced");
+}
+
+#[test]
 fn init_upgrades_old_db_with_banking_table_and_extract_flow() {
     // OLD-shape triage (no category / extractor_model_used) and NO banking
     // table. init() applies SCHEMA (creates the banking table IF NOT EXISTS)

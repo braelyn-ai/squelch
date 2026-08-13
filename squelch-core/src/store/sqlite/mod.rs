@@ -38,9 +38,9 @@ use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, ExtractQueued,
     InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
     MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, SealedBody, SealedMessage,
-    SearchFilter, SentMessage, SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued,
-    Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
-    TrackedMessage, TriageDebug, TriagedMessage,
+    SearchFilter, SentMessage, SentMissingRecipients, ShippingApplied, SitrepBand, Stage1Applied,
+    Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay,
+    Store, SyncState, TrackedMessage, TriageDebug, TriagedMessage,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -542,6 +542,10 @@ impl Store for SqliteStore {
 
     fn marketing_apply(&self, applied: &MarketingApplied) -> Result<()> {
         self.marketing_apply(applied)
+    }
+
+    fn shipping_apply(&self, applied: &ShippingApplied) -> Result<()> {
+        self.shipping_apply(applied)
     }
 
     fn marketing_offers(

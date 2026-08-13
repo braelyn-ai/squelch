@@ -164,6 +164,10 @@ CREATE TABLE IF NOT EXISTS shipments (
     tracking_number TEXT NOT NULL,
     carrier         TEXT NOT NULL,
     item_name       TEXT NOT NULL DEFAULT '',
+    -- Where item_name came from: 'regex' (the ingest detector) or 'llm' (the
+    -- shipping specialist). An llm name replaces a regex one; a regex name
+    -- never replaces an llm one; within a source, longer-wins.
+    item_name_source TEXT NOT NULL DEFAULT 'regex',
     status          TEXT NOT NULL DEFAULT 'shipped',
     tracking_url    TEXT,
     last_message_id INTEGER,

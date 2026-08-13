@@ -590,8 +590,8 @@ str_enum! {
     pub enum TriageAxis {
         /// `triage.tier` — past_due | deadline | signal | noise.
         Tier => "tier",
-        /// `triage.category` — general | marketing | invoice | autopay_bill |
-        /// banking_statement | transaction_alert.
+        /// `triage.category` — general | marketing | shipping | invoice |
+        /// autopay_bill | banking_statement | transaction_alert.
         Category => "category",
         /// `triage.sensitivity` — normal | sealed. Corrections matter in BOTH
         /// directions: under-sealing let a code into the normal inbox, over-sealing
@@ -609,6 +609,7 @@ impl TriageAxis {
             TriageAxis::Category => &[
                 "general",
                 "marketing",
+                "shipping",
                 "invoice",
                 "autopay_bill",
                 "banking_statement",

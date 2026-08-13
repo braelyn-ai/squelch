@@ -17,6 +17,7 @@
 
 pub mod banking;
 pub mod marketing;
+pub mod shipping;
 
 use crate::error::{CoreError, Result};
 use crate::store::ExtractQueued;
@@ -30,6 +31,7 @@ use crate::types::Sensitivity;
 pub fn extractable_categories() -> Vec<&'static str> {
     let mut out = banking::CATEGORIES.to_vec();
     out.extend_from_slice(marketing::CATEGORIES);
+    out.extend_from_slice(shipping::CATEGORIES);
     out
 }
 
@@ -159,11 +161,12 @@ mod tests {
     }
 
     #[test]
-    fn extractable_categories_cover_banking_and_marketing() {
+    fn extractable_categories_cover_banking_marketing_and_shipping() {
         let cats = extractable_categories();
         assert!(cats.contains(&"banking_statement"));
         assert!(cats.contains(&"transaction_alert"));
         assert!(cats.contains(&"marketing"));
+        assert!(cats.contains(&"shipping"));
         assert!(
             !cats.contains(&"invoice"),
             "invoice has no extractor -> stays standing"

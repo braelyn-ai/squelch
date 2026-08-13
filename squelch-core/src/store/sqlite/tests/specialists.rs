@@ -591,7 +591,12 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
     // Deliver it.
     let delivered_at = t0 + chrono::Duration::minutes(2);
     store
-        .upsert_shipment(acct, mid, &ship(ShipmentStatus::Delivered, ""), delivered_at)
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship(ShipmentStatus::Delivered, ""),
+            delivered_at,
+        )
         .unwrap();
     // A LATE stale "shipped" email (from another thread) must NOT regress the
     // delivered shipment — and must not become the row's click target or bump
@@ -624,6 +629,296 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
         all[0].last_update, delivered_at,
         "a rejected status must not bump last_update"
     );
+}
+
+// ---- item-name provenance (regex vs llm) --------------------------------
+
+/// Read (item_name, item_name_source) straight off a shipments row.
+fn shipment_item(store: &SqliteStore, acct: AccountId, tracking: &str) -> (String, String) {
+    let conn = store.lock().unwrap();
+    conn.query_row(
+        "SELECT item_name, item_name_source FROM shipments
+         WHERE account_id=?1 AND tracking_number=?2",
+        params![acct, tracking],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+fn ship(item: &str, status: crate::triage::ShipmentStatus) -> crate::triage::ShipmentInfo {
+    crate::triage::ShipmentInfo {
+        carrier: "ups".into(),
+        tracking_number: "1Z999AA10123456784".into(),
+        item_name: item.into(),
+        status,
+        tracking_url: Some("https://www.ups.com/track?tracknum=1Z999AA10123456784".into()),
+    }
+}
+
+fn shipping_applied(
+    acct: AccountId,
+    message_id: i64,
+    item_name: Option<&str>,
+    tracking_number: Option<&str>,
+) -> ShippingApplied {
+    ShippingApplied {
+        message_id,
+        account_id: acct,
+        item_name: item_name.map(Into::into),
+        tracking_number: tracking_number.map(Into::into),
+        extractor_model_used: "claude-haiku-4-5".into(),
+    }
+}
+
+#[test]
+fn regex_names_keep_longer_wins_within_their_own_source() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship("Headphones", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Headphones".into(), "regex".into()),
+        "first regex name lands with regex provenance"
+    );
+
+    // A longer regex name is adopted; a shorter one is not.
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship("Wireless Headphones", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784").0,
+        "Wireless Headphones"
+    );
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship("Buds", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Wireless Headphones".into(), "regex".into()),
+        "shorter regex name never displaces a longer one"
+    );
+}
+
+#[test]
+fn llm_name_replaces_regex_even_when_shorter() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = triaged_row(acct, "g-ship1", "t-s1", None, false, Sensitivity::Normal)
+        .category("shipping")
+        .ingest(&store);
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            // The exact real-world junk this feature exists to displace.
+            &ship("package with its carrier", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+
+    store
+        .shipping_apply(&shipping_applied(
+            acct,
+            mid,
+            Some("Allbirds"),
+            Some("1Z999AA10123456784"),
+        ))
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Allbirds".into(), "llm".into()),
+        "an llm name replaces a regex name regardless of length"
+    );
+
+    // The marker stamped, so the row left the extract queue; NOT resolved
+    // (shipping does not auto-resolve).
+    let (status, _, marker) = triage_extract_status(&store, mid);
+    assert_eq!(marker.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(status, "new");
+    assert!(
+        store
+            .extract_queue(acct, &["shipping"], 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn regex_status_update_never_displaces_an_llm_name() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = triaged_row(acct, "g-ship2", "t-s2", None, false, Sensitivity::Normal)
+        .category("shipping")
+        .ingest(&store);
+    store
+        .upsert_shipment(acct, mid, &ship("", ShipmentStatus::Shipped), Utc::now())
+        .unwrap();
+    store
+        .shipping_apply(&shipping_applied(
+            acct,
+            mid,
+            Some("Allbirds Wool Runners"),
+            Some("1Z999AA10123456784"),
+        ))
+        .unwrap();
+
+    // A later delivery email re-runs the regex path with a longer junk name:
+    // the status must advance, the llm name must survive.
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship(
+                "package with its carrier arriving twenty sixth",
+                ShipmentStatus::Delivered,
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+    let all = store.list_shipments(acct, true).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, "delivered", "status still advances");
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Allbirds Wool Runners".into(), "llm".into()),
+        "a regex name never replaces an llm name"
+    );
+}
+
+#[test]
+fn llm_name_yields_only_to_a_more_informative_llm_name() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = triaged_row(acct, "g-ship3", "t-s3", None, false, Sensitivity::Normal)
+        .category("shipping")
+        .ingest(&store);
+    store
+        .upsert_shipment(acct, mid, &ship("", ShipmentStatus::Shipped), Utc::now())
+        .unwrap();
+
+    let tn = Some("1Z999AA10123456784");
+    store
+        .shipping_apply(&shipping_applied(acct, mid, Some("Wool Runners"), tn))
+        .unwrap();
+    // A shorter llm answer does not displace the standing one...
+    store
+        .shipping_apply(&shipping_applied(acct, mid, Some("Shoes"), tn))
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784").0,
+        "Wool Runners"
+    );
+    // ...but a longer (more informative) one does.
+    store
+        .shipping_apply(&shipping_applied(
+            acct,
+            mid,
+            Some("Allbirds Wool Runners"),
+            tn,
+        ))
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Allbirds Wool Runners".into(), "llm".into())
+    );
+}
+
+#[test]
+fn shipping_apply_falls_back_to_last_message_id_linkage() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = triaged_row(acct, "g-ship4", "t-s4", None, false, Sensitivity::Normal)
+        .category("shipping")
+        .ingest(&store);
+    store
+        .upsert_shipment(acct, mid, &ship("", ShipmentStatus::Shipped), Utc::now())
+        .unwrap();
+
+    // No re-detected tracking number: the row this message last touched is
+    // found through its last_message_id pointer.
+    store
+        .shipping_apply(&shipping_applied(acct, mid, Some("Espresso Machine"), None))
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Espresso Machine".into(), "llm".into())
+    );
+}
+
+#[test]
+fn shipping_apply_with_no_resolvable_row_drops_silently_but_stamps() {
+    let (store, acct) = store();
+    let mid = triaged_row(acct, "g-ship5", "t-s5", None, false, Sensitivity::Normal)
+        .category("shipping")
+        .ingest(&store);
+    // NO shipment row exists for this message at all.
+    store
+        .shipping_apply(&shipping_applied(acct, mid, Some("Orphan Name"), None))
+        .unwrap();
+
+    let n: i64 = {
+        let conn = store.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM shipments", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(n, 0, "no orphan shipment row is ever created");
+    // The marker still lands so the row cannot loop in the queue.
+    let (_, _, marker) = triage_extract_status(&store, mid);
+    assert_eq!(marker.as_deref(), Some("claude-haiku-4-5"));
+}
+
+#[test]
+fn shipping_apply_null_name_leaves_the_row_untouched() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = triaged_row(acct, "g-ship6", "t-s6", None, false, Sensitivity::Normal)
+        .category("shipping")
+        .ingest(&store);
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship("Headphones", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+
+    store
+        .shipping_apply(&shipping_applied(
+            acct,
+            mid,
+            None,
+            Some("1Z999AA10123456784"),
+        ))
+        .unwrap();
+    assert_eq!(
+        shipment_item(&store, acct, "1Z999AA10123456784"),
+        ("Headphones".into(), "regex".into()),
+        "a null llm answer changes nothing"
+    );
+    let (_, _, marker) = triage_extract_status(&store, mid);
+    assert_eq!(marker.as_deref(), Some("claude-haiku-4-5"), "still stamped");
 }
 
 #[test]

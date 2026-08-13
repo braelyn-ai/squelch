@@ -86,11 +86,14 @@ specialist. Choose the single best fit:
 - marketing = a promotional or bulk send: a sale, an offer, a newsletter, a \
 product announcement, an event promo, a digest. The test is INTENT, not tone: \
 the sender is broadcasting to a list to get you to buy, read, or attend, rather \
-than telling you something about YOUR OWN account. A shipping notice, receipt, \
-security alert, or anything about an order or account you already have is NOT \
-marketing, even when the sender also markets to you. When a promotional email \
-also carries a genuine transactional fact about your account, the transactional \
-category wins.
+than telling you something about YOUR OWN account. A receipt, security alert, \
+or anything about an order or account you already have is NOT marketing, even \
+when the sender also markets to you. When a promotional email also carries a \
+genuine transactional fact about your account, the transactional category wins.
+- shipping = a shipment or delivery status notification for a PHYSICAL order \
+the user placed: shipped, out for delivery, delivered, arriving, delayed, or a \
+tracking-number update. The sender is reporting where the user's own order is, \
+so it is never marketing, even when the same email also promotes products.
 - invoice = a bill or invoice that NEEDS PAYING (an action). It stays in the \
 attention bands so the user does not miss it.
 - autopay_bill = a bill the email EXPLICITLY says will be paid automatically: \
@@ -170,7 +173,7 @@ pub fn output_schema() -> serde_json::Value {
             "confident": { "type": "boolean" },
             "category": {
                 "type": "string",
-                "enum": ["general", "marketing", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
+                "enum": ["general", "marketing", "shipping", "invoice", "autopay_bill", "banking_statement", "transaction_alert"]
             },
             "exception": { "type": "boolean" }
         }
@@ -216,6 +219,7 @@ pub fn default_category() -> String {
 pub const CATEGORIES: &[&str] = &[
     "general",
     "marketing",
+    "shipping",
     "invoice",
     "autopay_bill",
     "banking_statement",
@@ -492,12 +496,13 @@ mod tests {
         ] {
             assert!(req.iter().any(|v| v == k), "missing required {k}");
         }
-        // The category property is a closed enum of exactly the six routes.
+        // The category property is a closed enum of exactly the seven routes.
         let en = s["properties"]["category"]["enum"].as_array().unwrap();
         assert_eq!(en.len(), CATEGORIES.len());
         for c in [
             "general",
             "marketing",
+            "shipping",
             "invoice",
             "autopay_bill",
             "banking_statement",

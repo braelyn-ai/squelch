@@ -547,6 +547,26 @@ pub struct MarketingOffer {
     pub received_at: DateTime<Utc>,
 }
 
+/// The store-facing outcome of the shipping specialist extractor: a best-effort
+/// `item_name` improvement on the message's EXISTING `shipments` row plus the
+/// extractor marker. Creates no rows — a message resolving to no shipment row
+/// drops the name silently.
+#[derive(Debug, Clone)]
+pub struct ShippingApplied {
+    pub message_id: i64,
+    pub account_id: AccountId,
+    /// Laundered product name, or `None` (the row's name is left untouched;
+    /// only the extractor marker is stamped).
+    pub item_name: Option<String>,
+    /// The tracking number the deterministic detector re-derives from the SAME
+    /// message — the `shipments` dedupe key, so the strongest linkage. `None`
+    /// falls back to the row whose `last_message_id` is this message.
+    pub tracking_number: Option<String>,
+    /// Stamped onto `triage.extractor_model_used` so the queue stops selecting
+    /// the row. Like marketing, this write does NOT resolve the triage row.
+    pub extractor_model_used: String,
+}
+
 /// The store-facing outcome of the banking specialist extractor: a `banking`
 /// row upsert plus the extractor marker and (for records) an auto-resolve.
 pub struct BankingApplied {
@@ -1145,6 +1165,17 @@ pub trait Store: Send + Sync {
     /// Upsert one extracted promotion + stamp `triage.extractor_model_used`.
     /// Unlike [`Store::banking_apply`] this does NOT resolve the triage row.
     fn marketing_apply(&self, applied: &MarketingApplied) -> Result<()>;
+
+    /// Apply a shipping extraction IN ONE TRANSACTION: improve `item_name` on
+    /// the shipment row this message belongs to (matched by the re-detected
+    /// tracking number, else by `last_message_id`) and stamp
+    /// `triage.extractor_model_used`. PROVENANCE RULE: the write lands as
+    /// `item_name_source='llm'`; an llm name replaces a regex one, never the
+    /// reverse, and an existing llm name only yields to a more informative llm
+    /// name. A `None` name or an unresolvable shipment row is a silent no-op on
+    /// `shipments` — the marker is still stamped so the row leaves the queue.
+    /// Does NOT resolve the triage row.
+    fn shipping_apply(&self, applied: &ShippingApplied) -> Result<()>;
 
     /// Extracted promotions, newest first, received within the last `days`,
     /// capped at `limit`. Structurally sealed-free.

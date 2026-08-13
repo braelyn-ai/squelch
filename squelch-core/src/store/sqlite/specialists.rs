@@ -26,10 +26,11 @@ fn select_row_id(
 /// Upsert a shipment keyed by `(account_id, tracking_number)` in the caller's
 /// transaction. A repeat applies the no-regress status state machine
 /// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
-/// walked back — and adopts a more informative `item_name` or a carrier more
-/// specific than "unknown". `last_update`/`last_message_id` advance only when
-/// the merge accepts the incoming status, so a stale duplicate never becomes
-/// the row's click target.
+/// walked back — and adopts a more informative `item_name` (never over an
+/// LLM-sourced one; see `item_name_source`) or a carrier more specific than
+/// "unknown". `last_update`/`last_message_id` advance only when the merge
+/// accepts the incoming status, so a stale duplicate never becomes the row's
+/// click target.
 ///
 /// SECURITY: callers gate on non-sealed mail; there is no sealed row to guard.
 pub(super) fn upsert_shipment_conn(
@@ -44,9 +45,9 @@ pub(super) fn upsert_shipment_conn(
     let ts = seen_at.to_rfc3339();
 
     // Read any existing row so the merge runs in Rust rather than a SQL CASE.
-    let existing: Option<(i64, String, String, String)> = conn
+    let existing: Option<(i64, String, String, String, String)> = conn
         .query_row(
-            "SELECT id, status, item_name, carrier FROM shipments
+            "SELECT id, status, item_name, item_name_source, carrier FROM shipments
              WHERE account_id=?1 AND tracking_number=?2",
             params![account_id, s.tracking_number],
             |r| {
@@ -55,6 +56,7 @@ pub(super) fn upsert_shipment_conn(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             },
         )
@@ -84,13 +86,18 @@ pub(super) fn upsert_shipment_conn(
             )?;
             Ok(id)
         }
-        Some((id, cur_status_s, cur_item, cur_carrier)) => {
+        Some((id, cur_status_s, cur_item, cur_item_source, cur_carrier)) => {
             let cur_status =
                 ShipmentStatus::parse(&cur_status_s).unwrap_or(ShipmentStatus::Shipped);
             let merged = ShipmentStatus::merge(cur_status, s.status);
 
-            // Prefer a more informative item name.
-            let item_name = if !s.item_name.is_empty()
+            // Prefer a more informative item name — but a regex-extracted name
+            // NEVER replaces an LLM-extracted one (the LLM path is
+            // `shipping_apply`, which stamps item_name_source='llm'). This path
+            // never changes the source column: a kept llm name stays 'llm', a
+            // regex adoption stays 'regex'.
+            let item_name = if cur_item_source != "llm"
+                && !s.item_name.is_empty()
                 && (cur_item.is_empty() || s.item_name.len() > cur_item.len())
             {
                 s.item_name.clone()
@@ -522,6 +529,71 @@ impl SqliteStore {
         )?;
         // Stamp the extractor marker so the row leaves the queue. NO status
         // change: marketing does not auto-resolve. The sensitivity='normal' guard
+        // keeps a sealed row from ever being mutated here.
+        tx.execute(
+            "UPDATE triage SET extractor_model_used = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.extractor_model_used
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn shipping_apply(&self, applied: &ShippingApplied) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        if let Some(name) = applied.item_name.as_deref().filter(|n| !n.is_empty()) {
+            // Find the shipment row this message belongs to. The tracking
+            // number re-detected from the SAME message is the row's dedupe key,
+            // so it wins; a message the detector cannot re-key falls back to
+            // the row it last touched. Neither matching drops the name
+            // SILENTLY — an item name with no shipment row is an orphan.
+            let read = |sql: &str, key: &dyn rusqlite::ToSql| {
+                tx.query_row(sql, params![applied.account_id, key], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .optional()
+            };
+            let mut row: Option<(i64, String, String)> = None;
+            if let Some(tn) = applied.tracking_number.as_deref() {
+                row = read(
+                    "SELECT id, item_name, item_name_source FROM shipments
+                     WHERE account_id=?1 AND tracking_number=?2",
+                    &tn,
+                )?;
+            }
+            if row.is_none() {
+                row = read(
+                    "SELECT id, item_name, item_name_source FROM shipments
+                     WHERE account_id=?1 AND last_message_id=?2",
+                    &applied.message_id,
+                )?;
+            }
+            if let Some((id, cur_item, cur_source)) = row {
+                // PROVENANCE MERGE: an llm name replaces a regex name outright;
+                // an existing llm name only yields to a MORE INFORMATIVE llm
+                // name (same longer-wins rule as the regex path uses within
+                // its own source).
+                let write =
+                    cur_source != "llm" || cur_item.is_empty() || name.len() > cur_item.len();
+                if write {
+                    tx.execute(
+                        "UPDATE shipments SET item_name=?1, item_name_source='llm' WHERE id=?2",
+                        params![name, id],
+                    )?;
+                }
+            }
+        }
+        // Stamp the extractor marker so the row leaves the queue. NO status
+        // change: shipping does not auto-resolve. The sensitivity='normal' guard
         // keeps a sealed row from ever being mutated here.
         tx.execute(
             "UPDATE triage SET extractor_model_used = ?3

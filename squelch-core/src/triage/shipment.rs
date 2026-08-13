@@ -157,10 +157,16 @@ fn detector() -> &'static Detector {
             rx(r"\bhas shipped\b"),
             rx(r"\bhave shipped\b"),
             rx(r"\bhas been shipped\b"),
+            // Bare "shipped" LAST of the shipped-family, so the fuller phrases
+            // above documented the intent; it also catches the "Shipped <X>!"
+            // subject style the phrases above miss.
+            rx(r"\bshipped\b"),
             rx(r"\bis on its way\b"),
-            rx(r"\bon the way\b"),
+            rx(r"\bon the way( to you)?\b"),
+            rx(r"\bwith its carrier\b"),
             rx(r"\bout for delivery\b"),
             rx(r"\barriving today\b"),
+            rx(r"\barriving soon\b"),
             rx(r"\bhas been delivered\b"),
             rx(r"\bwas delivered\b"),
             rx(r"\bhas been delivered\b"),
@@ -305,8 +311,9 @@ fn extract_item_name_from_body(body: &str) -> String {
 }
 
 /// Strip tracking-number/url noise and carrier names from a candidate item
-/// phrase, collapse whitespace, and cap length.
-fn clean_item_phrase(s: &str) -> String {
+/// phrase, collapse whitespace, and cap length. `pub(crate)` so the LLM
+/// shipping specialist runs model output through the SAME laundering.
+pub(crate) fn clean_item_phrase(s: &str) -> String {
     static TRACK: OnceLock<Regex> = OnceLock::new();
     let track =
         TRACK.get_or_init(|| rx(r"\b1Z[0-9A-Z]{16}\b|\bTBA\d{9,}\b|\b\d{10,}\b|https?://\S+"));
@@ -326,13 +333,30 @@ fn clean_item_phrase(s: &str) -> String {
         .to_string()
 }
 
-/// Is `s` a generic placeholder ("Package", "Your order", …) rather than a real
-/// item? Such a leftover is no better than the client's own fallback label.
-fn is_generic_item(s: &str) -> bool {
+/// Is `s` a generic placeholder ("Package", "Your order", …) or carrier-filler
+/// status prose ("package is with its carrier") rather than a real item? Such a
+/// leftover is no better than the client's own fallback label. Guards BOTH the
+/// subject and the body extraction layers, so a filler phrase a body regex
+/// captured whole is refused too.
+pub(crate) fn is_generic_item(s: &str) -> bool {
     let l = s.trim().to_lowercase();
     matches!(
         l.as_str(),
-        "" | "package" | "your order" | "order" | "shipment" | "parcel" | "item" | "your package"
+        "" | "package"
+            | "your order"
+            | "order"
+            | "shipment"
+            | "parcel"
+            | "item"
+            | "your package"
+            | "with its carrier"
+            | "package with its carrier"
+            | "package is with its carrier"
+            | "your package is with its carrier"
+            | "on the way"
+            | "on the way to you"
+            | "out for delivery"
+            | "arriving soon"
     )
 }
 
@@ -375,9 +399,12 @@ pub fn extract_item_name(subject: &str) -> String {
         .map(|c| if "|:–—-•·".contains(c) { ' ' } else { c })
         .collect();
     let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = joined.trim_matches(|c: char| c == ',' || c == '.' || c.is_whitespace());
-    // A one-or-two-char residue ("s", "of") is noise, not an item.
-    if trimmed.chars().count() < 3 {
+    let trimmed =
+        joined.trim_matches(|c: char| matches!(c, ',' | '.' | '!' | '?') || c.is_whitespace());
+    // A one-or-two-char residue ("s", "of") is noise, not an item; so is a
+    // generic/carrier-filler leftover ("package with its carrier") — empty lets
+    // the client show its own "Package via <carrier>" fallback instead.
+    if trimmed.chars().count() < 3 || is_generic_item(trimmed) {
         String::new()
     } else {
         trimmed.to_string()
@@ -682,6 +709,50 @@ mod tests {
         assert_eq!(extract_item_name("Your order has shipped"), "");
         assert_eq!(extract_item_name("Shipping confirmation"), "");
         assert_eq!(extract_item_name("Tracking number update"), "");
+    }
+
+    #[test]
+    fn bare_shipped_is_stripped_not_stored() {
+        // Real-world junk header: "Shipped Allbirds!" was stored verbatim
+        // because only the "has/have shipped" phrases were stripped. The bare
+        // strip leaves the brand, which is a real item name.
+        assert_eq!(extract_item_name("Shipped Allbirds!"), "Allbirds");
+        // And a subject that is ONLY status residue strips to empty.
+        assert_eq!(extract_item_name("Shipped!"), "");
+    }
+
+    #[test]
+    fn carrier_filler_phrases_never_become_the_item_name() {
+        // Real-world junk header: "package with its carrier" survived the strip
+        // and beat the empty name via longer-wins. Filler prose must yield an
+        // EMPTY name so the client's "Package via <carrier>" fallback shows.
+        assert_eq!(extract_item_name("Your package is with its carrier"), "");
+        assert_eq!(extract_item_name("Your package is on the way to you"), "");
+        assert_eq!(extract_item_name("Arriving soon"), "");
+        for phrase in [
+            "with its carrier",
+            "package is with its carrier",
+            "on the way",
+            "on the way to you",
+            "out for delivery",
+            "arriving soon",
+        ] {
+            assert!(is_generic_item(phrase), "{phrase:?} must read as generic");
+        }
+    }
+
+    #[test]
+    fn carrier_filler_email_yields_empty_item_end_to_end() {
+        // The full detect path: subject and body are all status filler, so the
+        // shipment lands with an EMPTY item name, never the filler prose.
+        let s = detect_shipment(
+            "mcinfo@ups.com",
+            "Your package is with its carrier",
+            "Your package is with its carrier and on the way to you. \
+             Tracking 1Z999AA10123456784.",
+        )
+        .expect("ups shipment");
+        assert_eq!(s.item_name, "", "filler prose must not be stored");
     }
 
     // ---- sealed-shaped mail never produces a shipment --------------------
