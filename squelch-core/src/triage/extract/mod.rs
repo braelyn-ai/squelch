@@ -18,6 +18,8 @@
 pub mod banking;
 pub mod marketing;
 
+use chrono::{DateTime, Utc};
+
 use crate::error::{CoreError, Result};
 use crate::store::ExtractQueued;
 use crate::triage::text::truncate_flagged;
@@ -31,6 +33,61 @@ pub fn extractable_categories() -> Vec<&'static str> {
     let mut out = banking::CATEGORIES.to_vec();
     out.extend_from_slice(marketing::CATEGORIES);
     out
+}
+
+/// The specialist that owns a triage category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryExtractor {
+    Banking,
+    Marketing,
+}
+
+/// The specialist that owns a triage category, if any. SINGLE SOURCE OF TRUTH
+/// for dispatch: [`extractable_categories`] decides what gets QUEUED and this
+/// decides what RUNS, so both read the same per-module `CATEGORIES` slices and
+/// cannot drift. A category queued here but unhandled there is the bug that
+/// silently killed the marketing extractor.
+pub fn extractor_for_category(category: &str) -> Option<CategoryExtractor> {
+    if banking::CATEGORIES.contains(&category) {
+        Some(CategoryExtractor::Banking)
+    } else if marketing::CATEGORIES.contains(&category) {
+        Some(CategoryExtractor::Marketing)
+    } else {
+        None
+    }
+}
+
+/// What the extract pass should do with one queued row, decided ahead of any
+/// budget spend or model call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    /// Sealed row that slipped past the queue's SQL exclusion: refuse it.
+    Sealed,
+    /// Older than the pass's stale cutoff: mark processed without a model call.
+    Stale,
+    /// No specialist owns this category: mark processed so it cannot loop.
+    NoExtractor,
+    /// Hand the row to this specialist.
+    Run(CategoryExtractor),
+}
+
+/// The per-row decision for the extract pass, as ONE ordered expression:
+/// sealed guard first, then the stale skip, then the extractor lookup. Pure, so
+/// the ordering is unit-testable without an LLM or a store — and so a new
+/// specialist can never be added behind a guard that does not know about it.
+pub fn route_extract_row(row: &ExtractQueued, stale_cutoff: DateTime<Utc>) -> RowAction {
+    // SEALED FIRST, unconditionally: a sealed row must be refused even when it
+    // is also stale, so the stale skip can never stamp it processed.
+    if extract_sealed_guard(row).is_err() {
+        return RowAction::Sealed;
+    }
+    if row.received_at < stale_cutoff {
+        return RowAction::Stale;
+    }
+    match extractor_for_category(&row.category) {
+        Some(extractor) => RowAction::Run(extractor),
+        None => RowAction::NoExtractor,
+    }
 }
 
 /// The SEALED GUARD for the extractor pass: a REAL release-mode check behind the
@@ -132,7 +189,7 @@ pub fn build_extract_user_message(ctx: &ExtractContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::Duration;
 
     fn queued(sensitivity: Sensitivity) -> ExtractQueued {
         ExtractQueued {
@@ -169,6 +226,108 @@ mod tests {
             "invoice has no extractor -> stays standing"
         );
         assert!(!cats.contains(&"general"));
+    }
+
+    #[test]
+    fn extractor_for_category_maps_every_stage1_category() {
+        use crate::triage::stage1_llm::{CATEGORIES as STAGE1, RECORD_CATEGORIES};
+
+        for cat in RECORD_CATEGORIES {
+            assert_eq!(
+                extractor_for_category(cat),
+                Some(CategoryExtractor::Banking),
+                "record category {cat} belongs to the banking specialist"
+            );
+        }
+        assert_eq!(
+            extractor_for_category("marketing"),
+            Some(CategoryExtractor::Marketing)
+        );
+        assert_eq!(extractor_for_category("general"), None);
+        assert_eq!(extractor_for_category("invoice"), None);
+        assert_eq!(extractor_for_category("not_a_category"), None);
+
+        // Every stage-1 category is accounted for, so adding one to the enum
+        // without deciding its owner fails here.
+        assert_eq!(STAGE1.len(), 6, "six stage-1 categories");
+        assert_eq!(
+            STAGE1
+                .iter()
+                .filter(|c| extractor_for_category(c).is_some())
+                .count(),
+            4,
+            "four of the six have a specialist"
+        );
+    }
+
+    #[test]
+    fn queued_categories_and_dispatch_cannot_drift() {
+        for cat in extractable_categories() {
+            assert!(
+                extractor_for_category(cat).is_some(),
+                "category {cat} is queued for extraction but nothing dispatches it"
+            );
+        }
+    }
+
+    /// REGRESSION: the dispatch guard used to test `banking::CATEGORIES` only,
+    /// so every marketing row was stamped `skip-no-extractor` and the marketing
+    /// extractor never ran in production.
+    #[test]
+    fn a_marketing_row_routes_to_the_marketing_extractor_not_the_skip_marker() {
+        let mut row = queued(Sensitivity::Normal);
+        row.category = "marketing".into();
+        let action = route_extract_row(&row, Utc::now() - Duration::days(30));
+        assert_eq!(action, RowAction::Run(CategoryExtractor::Marketing));
+        assert_ne!(action, RowAction::NoExtractor);
+    }
+
+    #[test]
+    fn route_extract_row_runs_banking_skips_unowned_categories() {
+        let cutoff = Utc::now() - Duration::days(30);
+        let mut row = queued(Sensitivity::Normal);
+        for cat in ["banking_statement", "transaction_alert", "autopay_bill"] {
+            row.category = cat.into();
+            assert_eq!(
+                route_extract_row(&row, cutoff),
+                RowAction::Run(CategoryExtractor::Banking)
+            );
+        }
+        for cat in ["general", "invoice"] {
+            row.category = cat.into();
+            assert_eq!(route_extract_row(&row, cutoff), RowAction::NoExtractor);
+        }
+    }
+
+    #[test]
+    fn route_extract_row_refuses_sealed_and_skips_stale() {
+        let cutoff = Utc::now() - Duration::days(30);
+        assert_eq!(
+            route_extract_row(&queued(Sensitivity::Sealed), cutoff),
+            RowAction::Sealed
+        );
+
+        let mut old = queued(Sensitivity::Normal);
+        old.received_at = cutoff - Duration::hours(1);
+        assert_eq!(route_extract_row(&old, cutoff), RowAction::Stale);
+
+        // The boundary is `<` cutoff, exactly as the pass reads it.
+        let mut at_cutoff = queued(Sensitivity::Normal);
+        at_cutoff.received_at = cutoff;
+        assert_eq!(
+            route_extract_row(&at_cutoff, cutoff),
+            RowAction::Run(CategoryExtractor::Banking)
+        );
+    }
+
+    #[test]
+    fn the_stale_skip_never_preempts_the_sealed_guard() {
+        // A sealed AND stale row must be refused, not stamped processed: the
+        // sealed guard is unconditionally first.
+        let mut row = queued(Sensitivity::Sealed);
+        let cutoff = Utc::now() - Duration::days(30);
+        row.received_at = cutoff - Duration::days(400);
+        assert_eq!(route_extract_row(&row, cutoff), RowAction::Sealed);
     }
 
     #[test]

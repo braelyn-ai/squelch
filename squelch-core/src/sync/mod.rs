@@ -27,7 +27,7 @@ use crate::sync::ingest::{
     RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
 };
 use crate::triage::events;
-use crate::triage::extract::{self, banking, marketing};
+use crate::triage::extract::{self, CategoryExtractor, RowAction, banking, marketing};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
@@ -1588,36 +1588,43 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut out_tok = 0u64;
 
         for row in &queued {
-            // SEALED GUARD: the queue already excludes sealed rows in SQL (they
-            // carry a NULL category); re-check anyway (docs/SECURITY.md).
-            if let Err(e) = extract::extract_sealed_guard(row) {
-                eprintln!("squelch: extract sealed guard tripped ({e}); skipping row");
-                continue;
-            }
-
-            // SKIP-STALE: mark extracted WITHOUT a model call, so an old row
-            // neither spends budget nor sits queued forever.
-            if row.received_at < stale_cutoff {
-                let _ = self.store.extract_mark_processed(
-                    self.account_id,
-                    row.message_id,
-                    STALE_SKIP_MODEL,
-                );
-                skipped += 1;
-                continue;
-            }
-
-            // A row whose category has no handler is marked processed so it
-            // cannot loop.
-            if !banking::CATEGORIES.contains(&row.category.as_str()) {
-                let _ = self.store.extract_mark_processed(
-                    self.account_id,
-                    row.message_id,
-                    "skip-no-extractor",
-                );
-                skipped += 1;
-                continue;
-            }
+            // ONE ORDERED DECISION per row — sealed guard (the queue already
+            // excludes sealed rows in SQL; re-check anyway, docs/SECURITY.md),
+            // then the stale skip, then the extractor lookup. It lives in
+            // `route_extract_row` so a new specialist cannot be added behind a
+            // guard that does not know about it.
+            let extractor = match extract::route_extract_row(row, stale_cutoff) {
+                RowAction::Sealed => {
+                    // Re-run the guard purely to log its redacted message.
+                    if let Err(e) = extract::extract_sealed_guard(row) {
+                        eprintln!("squelch: extract sealed guard tripped ({e}); skipping row");
+                    }
+                    continue;
+                }
+                // SKIP-STALE: mark extracted WITHOUT a model call, so an old row
+                // neither spends budget nor sits queued forever.
+                RowAction::Stale => {
+                    let _ = self.store.extract_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        STALE_SKIP_MODEL,
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                // A row whose category has no handler is marked processed so it
+                // cannot loop.
+                RowAction::NoExtractor => {
+                    let _ = self.store.extract_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        "skip-no-extractor",
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                RowAction::Run(extractor) => extractor,
+            };
 
             // SHARED Stage-1 global budget. Once hit, every remaining row this
             // cycle stays queued, unstamped.
@@ -1630,105 +1637,111 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
             // ROUTE BY CATEGORY: each specialist owns its own prompt, schema and
             // ledger line, so the row's category decides which one runs.
-            if marketing::CATEGORIES.contains(&row.category.as_str()) {
-                match marketing::classify(&self.http, url, api_key, cfg, provider, row).await {
-                    Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
-                        if let Some(u) = usage {
-                            in_tok += u.input_tokens;
-                            out_tok += u.output_tokens;
-                            if let Err(e) = self.store.extract_bump_usage(
-                                self.account_id,
-                                &day,
-                                marketing::LEDGER_CATEGORY,
-                                u.input_tokens,
-                                u.output_tokens,
-                                u.cache_creation_input_tokens,
-                                u.cache_read_input_tokens,
-                            ) {
-                                eprintln!("squelch: extract usage ledger bump failed ({e})");
+            match extractor {
+                CategoryExtractor::Marketing => {
+                    match marketing::classify(&self.http, url, api_key, cfg, provider, row).await {
+                        Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
+                            if let Some(u) = usage {
+                                in_tok += u.input_tokens;
+                                out_tok += u.output_tokens;
+                                if let Err(e) = self.store.extract_bump_usage(
+                                    self.account_id,
+                                    &day,
+                                    marketing::LEDGER_CATEGORY,
+                                    u.input_tokens,
+                                    u.output_tokens,
+                                    u.cache_creation_input_tokens,
+                                    u.cache_read_input_tokens,
+                                ) {
+                                    eprintln!("squelch: extract usage ledger bump failed ({e})");
+                                }
+                            }
+                            let applied = marketing::apply_result(row, &out, &cfg.model);
+                            if let Err(e) = self.store.marketing_apply(&applied) {
+                                // The call is already paid for: mark processed rather
+                                // than re-buying it every cycle.
+                                eprintln!(
+                                    "squelch: marketing apply failed ({e}); row marked apply-failed"
+                                );
+                                let _ = self.store.extract_mark_processed(
+                                    self.account_id,
+                                    row.message_id,
+                                    "apply-failed",
+                                );
+                            } else {
+                                extracted += 1;
                             }
                         }
-                        let applied = marketing::apply_result(row, &out, &cfg.model);
-                        if let Err(e) = self.store.marketing_apply(&applied) {
-                            // The call is already paid for: mark processed rather
-                            // than re-buying it every cycle.
-                            eprintln!(
-                                "squelch: marketing apply failed ({e}); row marked apply-failed"
-                            );
+                        Ok(marketing::ExtractOutcome::Refused)
+                        | Ok(marketing::ExtractOutcome::Failed(_)) => {
                             let _ = self.store.extract_mark_processed(
                                 self.account_id,
                                 row.message_id,
-                                "apply-failed",
+                                "extract-failed",
                             );
-                        } else {
-                            extracted += 1;
+                            skipped += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("squelch: extract {e}; row stays queued");
                         }
                     }
-                    Ok(marketing::ExtractOutcome::Refused)
-                    | Ok(marketing::ExtractOutcome::Failed(_)) => {
-                        let _ = self.store.extract_mark_processed(
-                            self.account_id,
-                            row.message_id,
-                            "extract-failed",
-                        );
-                        skipped += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("squelch: extract {e}; row stays queued");
-                    }
                 }
-                continue;
-            }
-
-            let outcome = banking::classify(&self.http, url, api_key, cfg, provider, row).await;
-            match outcome {
-                Ok(banking::ExtractOutcome::Ok(out, usage)) => {
-                    if let Some(u) = usage {
-                        in_tok += u.input_tokens;
-                        out_tok += u.output_tokens;
-                        if let Err(e) = self.store.extract_bump_usage(
-                            self.account_id,
-                            &day,
-                            banking::LEDGER_CATEGORY,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
-                        ) {
-                            eprintln!("squelch: extract usage ledger bump failed ({e})");
+                CategoryExtractor::Banking => {
+                    let outcome =
+                        banking::classify(&self.http, url, api_key, cfg, provider, row).await;
+                    match outcome {
+                        Ok(banking::ExtractOutcome::Ok(out, usage)) => {
+                            if let Some(u) = usage {
+                                in_tok += u.input_tokens;
+                                out_tok += u.output_tokens;
+                                if let Err(e) = self.store.extract_bump_usage(
+                                    self.account_id,
+                                    &day,
+                                    banking::LEDGER_CATEGORY,
+                                    u.input_tokens,
+                                    u.output_tokens,
+                                    u.cache_creation_input_tokens,
+                                    u.cache_read_input_tokens,
+                                ) {
+                                    eprintln!("squelch: extract usage ledger bump failed ({e})");
+                                }
+                            }
+                            let applied = banking::apply_result(row, &out, &cfg.model);
+                            if let Err(e) = self.store.banking_apply(&applied) {
+                                // Failure sentinel rather than a re-queue: the call is
+                                // already paid for, a store failure is unlikely to heal
+                                // on a retry, and leaving the row queued would re-buy a
+                                // call every cycle. Only the Banking record is lost — the
+                                // email itself is still in the inbox.
+                                eprintln!(
+                                    "squelch: banking apply failed ({e}); row marked apply-failed"
+                                );
+                                let _ = self.store.extract_mark_processed(
+                                    self.account_id,
+                                    row.message_id,
+                                    "apply-failed",
+                                );
+                            } else {
+                                extracted += 1;
+                            }
+                        }
+                        Ok(banking::ExtractOutcome::Refused)
+                        | Ok(banking::ExtractOutcome::Failed(_)) => {
+                            // Mark processed so the row cannot loop; no specialist row is
+                            // written, so nothing appears in the Banking zone.
+                            let _ = self.store.extract_mark_processed(
+                                self.account_id,
+                                row.message_id,
+                                "extract-failed",
+                            );
+                            skipped += 1;
+                        }
+                        Err(e) => {
+                            // Retryable class exhausted / transport error: leave the row
+                            // queued (extractor_model_used stays NULL) for a later cycle.
+                            eprintln!("squelch: extract {e}; row stays queued");
                         }
                     }
-                    let applied = banking::apply_result(row, &out, &cfg.model);
-                    if let Err(e) = self.store.banking_apply(&applied) {
-                        // Failure sentinel rather than a re-queue: the call is
-                        // already paid for, a store failure is unlikely to heal
-                        // on a retry, and leaving the row queued would re-buy a
-                        // call every cycle. Only the Banking record is lost — the
-                        // email itself is still in the inbox.
-                        eprintln!("squelch: banking apply failed ({e}); row marked apply-failed");
-                        let _ = self.store.extract_mark_processed(
-                            self.account_id,
-                            row.message_id,
-                            "apply-failed",
-                        );
-                    } else {
-                        extracted += 1;
-                    }
-                }
-                Ok(banking::ExtractOutcome::Refused) | Ok(banking::ExtractOutcome::Failed(_)) => {
-                    // Mark processed so the row cannot loop; no specialist row is
-                    // written, so nothing appears in the Banking zone.
-                    let _ = self.store.extract_mark_processed(
-                        self.account_id,
-                        row.message_id,
-                        "extract-failed",
-                    );
-                    skipped += 1;
-                }
-                Err(e) => {
-                    // Retryable class exhausted / transport error: leave the row
-                    // queued (extractor_model_used stays NULL) for a later cycle.
-                    eprintln!("squelch: extract {e}; row stays queued");
                 }
             }
         }
