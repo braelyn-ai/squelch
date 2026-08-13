@@ -177,6 +177,10 @@ The `/client/*` surface is implemented in `Model/APIClient.swift`, with
 `refresh`, `retriage`, `shredder` (GET/POST), `shredder/run`, `triage-feedback`
 (GET/POST), `messages/{id}/opens`, `tracking-config` (GET/POST).
 
+Version skew runs both ways: fields a newer daemon appends are declared
+optional on the client, so a build pointed at an older daemon still decodes the
+page. `TriageDebug.thread_id` is the current one.
+
 Hardening: 15s request timeout (30s for attachments), the token
 only ever in an `Authorization` header, and error messages that never echo the
 token or URL. Every wire enum decodes leniently, so a newer daemon adding a

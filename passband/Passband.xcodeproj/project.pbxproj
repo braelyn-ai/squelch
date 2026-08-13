@@ -152,6 +152,7 @@
 		C208912136BEEE63FE2DBF28 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BE1E84810E523707C4E2CC5 /* SettingsView.swift */; };
 		C2102B9052FF6E97DAAA2AB4 /* ImageProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39D5C019641DC37B55D7D922 /* ImageProxy.swift */; };
 		C3DD204EC3377648F4153546 /* Analytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A46105028AEB554882E2D72 /* Analytics.swift */; };
+		C47E10D8934D830B5018DC8B /* SubjectText.swift in Sources */ = {isa = PBXBuildFile; fileRef = E645BA6EC9A8686D95460095 /* SubjectText.swift */; };
 		C58CC1F4A47B52230CEDC9A3 /* TourController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5283FAB3FFAED5F77BF41F71 /* TourController.swift */; };
 		C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = C465B24E00D0436CD5704294 /* SwipeRow.swift */; };
 		CDD154C0CEFB4D530E29DD34 /* Format.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5883BA424612265657845246 /* Format.swift */; };
@@ -184,6 +185,7 @@
 		E4B1EE75A584D999AA58B0E2 /* MarkdownTextViewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9FAE568A595DDCE359FFA33 /* MarkdownTextViewiOS.swift */; };
 		E5DC83A762609363C2ED15CB /* Actions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10544C7DF8CDBA851AF0D9D8 /* Actions.swift */; };
 		E796A08FD35B6AFC987CF6A6 /* HTMLImg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 579ABC2B7707848B4AED6F18 /* HTMLImg.swift */; };
+		EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */ = {isa = PBXBuildFile; fileRef = E645BA6EC9A8686D95460095 /* SubjectText.swift */; };
 		EA82308C99D5B6C590E73289 /* AgentTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E7DFB379AF677D44E393FF /* AgentTools.swift */; };
 		EB3A6A193AE3E0C7EDD7E459 /* MobileRecordsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 356A38CCAAFCC056126A2978 /* MobileRecordsView.swift */; };
 		EC28A617F2EBC9CFCA992B82 /* ImageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2569BA5D1461BBA2A95D77F3 /* ImageStore.swift */; };
@@ -321,6 +323,7 @@
 		E5B001C6ABDDB051E2B57205 /* InlineReply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineReply.swift; sourceTree = "<group>"; };
 		E5B07DD7DA6133E705610323 /* Passband.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Passband.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E61AF9A237CA524B89126810 /* MobileSitrepView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileSitrepView.swift; sourceTree = "<group>"; };
+		E645BA6EC9A8686D95460095 /* SubjectText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubjectText.swift; sourceTree = "<group>"; };
 		E6D39F14D1F28EEB5D9E86FE /* AuditView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditView.swift; sourceTree = "<group>"; };
 		E8D7384FAFC16891C369CFA8 /* UsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageView.swift; sourceTree = "<group>"; };
 		E949BF41848E8F43B63C7AB7 /* AnthropicStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicStream.swift; sourceTree = "<group>"; };
@@ -474,6 +477,7 @@
 				B13A2C48EBA35F12689998E3 /* Notifier.swift */,
 				5512C13F456F49B6DF7B182B /* Pairing.swift */,
 				A31EE886D87910F0348A94AB /* SitrepPoller.swift */,
+				E645BA6EC9A8686D95460095 /* SubjectText.swift */,
 				5F62561CEB4911BA0E72FEDD /* ThreadPrefetch.swift */,
 				5283FAB3FFAED5F77BF41F71 /* TourController.swift */,
 				D179CAC9853B13A5FBFD968E /* Updater.swift */,
@@ -798,6 +802,7 @@
 				FB0306D6A270C6C086EF253F /* SitrepPoller.swift in Sources */,
 				22511E51CB7D38C82320FE21 /* SitrepView.swift in Sources */,
 				61E6D7AA7EB53F8AEE04063C /* SitrepZones.swift in Sources */,
+				EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */,
 				AB169C9A19D62418DBAD4C3D /* ThreadPrefetch.swift in Sources */,
 				764A73259735A815192E7EE0 /* ThreadViewer.swift in Sources */,
 				C58CC1F4A47B52230CEDC9A3 /* TourController.swift in Sources */,
@@ -895,6 +900,7 @@
 				811AE61DFEA4A6D99E9AFE40 /* SitrepPoller.swift in Sources */,
 				DBAF51D466CF5A747261E363 /* SitrepView.swift in Sources */,
 				B6F86A1B7C9CECBF25C347FA /* SitrepZones.swift in Sources */,
+				C47E10D8934D830B5018DC8B /* SubjectText.swift in Sources */,
 				C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */,
 				40E611424100EA3551AB3477 /* ThreadPrefetch.swift in Sources */,
 				4B52BE6DB257F23A493F4B02 /* ThreadViewer.swift in Sources */,

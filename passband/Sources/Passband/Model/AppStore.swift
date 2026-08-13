@@ -287,6 +287,21 @@ struct RuleEditorRequest: Identifiable, Sendable {
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
 
+/// The open thread, reduced to what the ⌘K agent needs to be told about it:
+/// which email the person is looking at, and the id every thread-level verb in
+/// the reader already targets. A named struct rather than a tuple because it is
+/// an `@Observable` property, and lifted out of the viewer because the ask bar
+/// is a modal ABOVE it with no other way to see what it holds.
+struct OpenThreadSummary: Sendable, Equatable {
+    /// WHICH THREAD THIS DESCRIBES. Carried so a reader can check the summary
+    /// against the thread actually open rather than trust that the last writer
+    /// won — a slow fetch lands whenever it lands. See `currentThreadSummary`.
+    var threadId: String
+    var subject: String
+    /// The NEWEST message in the thread — see ThreadViewer's `newest`.
+    var newestMessageId: Int
+}
+
 // MARK: - the store
 
 /// The read model the SitrepView renders: updates bucketed by band.
@@ -347,6 +362,32 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
+    /// What that thread IS, once it has landed — written by the viewer. nil
+    /// while a thread is loading. READ IT THROUGH `currentThreadSummary`: this
+    /// is the raw last write, and the writer is a network callback.
+    var openThreadSummary: OpenThreadSummary?
+    /// The summary ONLY IF it describes the thread that is open. The viewer
+    /// writes it from a fetch callback, so a slow load can land after the user
+    /// has moved on; `openThread` clears the stale one on the way out, and this
+    /// is the second lock on the same door — the ask bar pins what it reads
+    /// here into a prompt, where a subject and a message id belonging to
+    /// another email would be a lie told confidently.
+    var currentThreadSummary: OpenThreadSummary? {
+        guard let threadId, let summary = openThreadSummary, summary.threadId == threadId
+        else { return nil }
+        return summary
+    }
+    /// Bumped when a sync brings a message NEWER than the one the reader holds
+    /// into the thread on screen — see SitrepPoller.performPull. The viewer
+    /// watches it and refetches without moving the reading position.
+    ///
+    /// A token rather than the mail itself: the poller reads the attention
+    /// bands, which say a thread moved but not what it now contains, and the
+    /// viewer is the one place that knows how to adopt a thread. It is also why
+    /// nothing resets it — a counter only has to CHANGE, so a thread switch
+    /// under a live token is a viewer that simply never hears about the bump it
+    /// no longer cares about.
+    var openThreadRefreshToken = 0
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
@@ -614,6 +655,12 @@ final class AppStore {
                 "via_reply": replyTo != nil,
                 "from_noise": activeView == .emails && mailMode == .noise,
             ])
+        // A DIFFERENT thread drops the summary NOW rather than when the new one
+        // lands: in that gap the reader is showing thread B while this still
+        // described A, and the ask bar would pin B's id under A's subject and
+        // A's message id. Same-thread reopens keep it — the viewer is already
+        // mounted and may never re-adopt.
+        if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
         self.threadQueue = queue
         // HERE, not in the search panel's open path: the reader can be opened
@@ -634,6 +681,7 @@ final class AppStore {
     func closeThread() {
         threadId = nil
         threadQueue = []
+        openThreadSummary = nil
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
