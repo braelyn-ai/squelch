@@ -5,23 +5,32 @@
 // fighting. So the same rail is drawn by hand here, to the same measurements and
 // the same tints, and both surfaces read as one gesture.
 //
-// WHAT MAKES IT COEXIST WITH THE SCROLL. The drag is attached SIMULTANEOUSLY,
-// so it recognizes alongside the enclosing ScrollView instead of winning the
-// row away from it. A plain `.gesture` claimed every drag past the minimum —
-// including the vertical ones that were only ever meant to scroll the page —
-// and the finger would drag a dead card while the sitrep refused to move.
-// Sharing recognition is safe because the row still refuses those drags itself:
-// past a 14pt minimum it decides, once, on the first delta, and a drag whose
-// vertical component leads is REFUSED for its whole duration, so the page
-// scrolls under a row that never budges and no rail peeks out mid-scroll. That
-// decision is latched (`verdict`) rather than re-evaluated per frame, which is
-// what stops a curved swipe from flickering between the two.
+// WHAT MAKES IT COEXIST WITH THE SCROLL: UIKIT DECIDES, NOT SWIFTUI. The pan is
+// a `UIPanGestureRecognizer` hung on the row through
+// `UIGestureRecognizerRepresentable`, and its delegate answers one question
+// before the gesture is allowed to start — is the finger moving sideways faster
+// than it is moving up? If it is not, `gestureRecognizerShouldBegin` says no,
+// the recognizer never leaves `.possible`, and the enclosing ScrollView's own
+// pan carries the touch as though this row had no gesture on it at all.
+//
+// Two SwiftUI shapes of this failed before it. A plain `.gesture` claimed every
+// drag past its minimum, so the finger dragged a dead card while the sitrep
+// refused to scroll. A `.simultaneousGesture` judging direction on its first
+// delta still had to be HANDED the drag before it could refuse it, and a
+// refusal the ScrollView never hears about is not a refusal: the page stayed
+// stuck. UIKit arbitration happens before anyone owns the touch, which is why
+// native list swipes and scrolling have never had this fight.
+//
+// Once the pan does begin, the row owns it outright. Nothing here allows
+// simultaneous recognition, so the page under a swiping row stays exactly where
+// it was, the way a UITableView row action behaves.
 //
 // The rails are painted UNDER the row and revealed by moving the row, not built
 // as a stack that grows: one clip, one offset, and the row's own glass never
 // changes identity.
 
 import SwiftUI
+import UIKit
 
 struct SwipeRow<Content: View>: View {
     var leading: [SwipeVerb] = []
@@ -37,14 +46,12 @@ struct SwipeRow<Content: View>: View {
 
     /// Where the row is resting between gestures (0, or a rail's width).
     @State private var resting: CGFloat = 0
-    /// Live drag on top of `resting`.
+    /// Live drag on top of `resting`. The recognizer's translation is measured
+    /// from where the pan started, not from where the row sits, so the two stay
+    /// separate and `offset` adds them.
     @State private var drag: CGFloat = 0
-    /// Latched once per gesture: nil until the first delta past the minimum.
-    @State private var verdict: Verdict?
     /// Edge-detects the commit threshold so the "you are past it" tap fires once.
     @State private var wasArmed = false
-
-    private enum Verdict { case swipe, refused }
 
     private var offset: CGFloat { resting + drag }
     private var open: Bool { resting != 0 }
@@ -106,7 +113,7 @@ struct SwipeRow<Content: View>: View {
                 }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .simultaneousGesture(swipe)
+        .gesture(RailPan(handle: pan))
         .onChange(of: armed) { _, nowArmed in
             // Felt, not watched: the rail is past its commit point.
             if nowArmed, !wasArmed { Haptics.armed() }
@@ -151,64 +158,123 @@ struct SwipeRow<Content: View>: View {
 
     // MARK: - gesture
 
-    private var swipe: some Gesture {
-        DragGesture(minimumDistance: 14)
-            .onChanged { value in
-                if verdict == nil {
-                    // ONE decision, on the first delta that clears the minimum.
-                    // A vertical lead means the page is scrolling and this row is
-                    // out of the conversation until the finger lifts.
-                    verdict =
-                        abs(value.translation.width) > abs(value.translation.height)
-                        ? .swipe : .refused
-                }
-                guard verdict == .swipe else { return }
-                let raw = value.translation.width
-                // Rubber-band an edge with no verbs so the row never slides off
-                // into empty space.
-                if raw > 0, leading.isEmpty { drag = raw * 0.12 } else if raw < 0,
-                    trailing.isEmpty
-                {
-                    drag = raw * 0.12
-                } else {
-                    drag = raw
-                }
-            }
-            .onEnded { value in
-                defer {
-                    verdict = nil
-                    wasArmed = false
-                }
-                guard verdict == .swipe else {
-                    drag = 0
-                    return
-                }
-                let landed = resting + value.translation.width
-                let verbs = landed < 0 ? trailing : leading
-                let width = railWidth(verbs)
-                guard !verbs.isEmpty else {
-                    settle(0)
-                    return
-                }
-                let distance = abs(landed)
-                if distance > width + Self.commitOverrun, let verb = primary(verbs) {
-                    Haptics.commit()
-                    settle(0)
-                    verb.run()
-                } else if distance > width / 2 {
-                    settle(landed < 0 ? -width : width)
-                } else {
-                    settle(0)
-                }
-            }
+    /// The recognizer's whole state machine, in one place. There is no direction
+    /// test here and no latch holding one: by the time this sees `.began` the
+    /// delegate has already ruled the pan horizontal, and a vertical one is
+    /// never reported at all.
+    private func pan(_ recognizer: UIPanGestureRecognizer) {
+        let raw = recognizer.translation(in: recognizer.view).x
+        switch recognizer.state {
+        case .began, .changed:
+            drag = banded(raw)
+        case .ended:
+            release(raw)
+        case .cancelled, .failed:
+            // Something else took the touch, or the pan never resolved. A cancel
+            // is not a decision, so the row goes back to where it was RESTING
+            // rather than closing a rail the finger never let go of.
+            settle(resting)
+        default:
+            break
+        }
     }
 
+    /// Rubber-band an edge with no verbs so the row never slides off into empty
+    /// space, while still moving enough to say the swipe was heard.
+    private func banded(_ raw: CGFloat) -> CGFloat {
+        if raw > 0, leading.isEmpty { return raw * 0.12 }
+        if raw < 0, trailing.isEmpty { return raw * 0.12 }
+        return raw
+    }
+
+    /// Where the finger left the row decides between committing the edge's
+    /// primary verb, resting the rail open, and closing. Measured off the raw
+    /// translation, not the banded one, so an empty edge lands on the
+    /// no-verbs path instead of a distance the band shrank.
+    private func release(_ raw: CGFloat) {
+        let landed = resting + raw
+        let verbs = landed < 0 ? trailing : leading
+        let width = railWidth(verbs)
+        guard !verbs.isEmpty else {
+            settle(0)
+            return
+        }
+        let distance = abs(landed)
+        if distance > width + Self.commitOverrun, let verb = primary(verbs) {
+            Haptics.commit()
+            settle(0)
+            verb.run()
+        } else if distance > width / 2 {
+            settle(landed < 0 ? -width : width)
+        } else {
+            settle(0)
+        }
+    }
+
+    /// Every way a gesture can end runs through here, which is also why the
+    /// armed edge is re-cocked here and nowhere else.
     private func settle(_ to: CGFloat) {
         drag = 0
+        wasArmed = false
         withAnimation(Motion.railSettle) { resting = to }
     }
 
     private func close() {
         settle(0)
+    }
+}
+
+// MARK: - the recognizer
+
+/// The row's pan, as UIKit sees it. Declared outside `SwipeRow` on purpose: a
+/// class nested in a generic type is itself generic, and a generic NSObject
+/// subclass cannot carry the `@objc` witnesses an ObjC delegate protocol needs.
+@MainActor
+private struct RailPan: UIGestureRecognizerRepresentable {
+    /// Called for `.began`, `.changed`, `.ended`, `.cancelled` and `.failed`.
+    var handle: (UIPanGestureRecognizer) -> Void
+
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+        let pan = UIPanGestureRecognizer()
+        // One thumb. A second finger on a row belongs to whatever the page is
+        // doing, not to the rail.
+        pan.minimumNumberOfTouches = 1
+        pan.maximumNumberOfTouches = 1
+        pan.delegate = context.coordinator
+        return pan
+    }
+
+    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        // Re-seated on every update, not just at make. The recognizer is
+        // SwiftUI's to keep and re-attach, the delegate reference is weak, and
+        // the one thing this row cannot survive is losing the seat that holds
+        // the direction verdict. A pointer write is cheap insurance.
+        recognizer.delegate = context.coordinator
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        handle(recognizer)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        /// THE VERDICT, and the only one. Velocity at the moment UIKit is ready
+        /// to start the pan says which way the finger is really going; a
+        /// vertical lead means the page is scrolling and this row never enters
+        /// the conversation, so the ScrollView keeps a touch it never had to
+        /// win back.
+        ///
+        /// Deliberately no `shouldRecognizeSimultaneouslyWith`: the default
+        /// refusal is what makes a begun swipe exclusive, so a horizontal pull
+        /// cannot also drag the page along under it.
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
+            let velocity = pan.velocity(in: pan.view)
+            return abs(velocity.x) > abs(velocity.y)
+        }
     }
 }

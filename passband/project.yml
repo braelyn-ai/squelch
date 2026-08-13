@@ -123,9 +123,9 @@ targets:
           # SettingsView is NOT on this list any more. Its desktop chrome — the
           # routed header and the 158pt sub-nav column — is fenced behind
           # #if os(macOS), and the fifteen section structs it declares are now
-          # internal, so Sources/PassbandiOS/Views/MobileSettingsView.swift
-          # composes THE SAME sections behind a navigation list. Settings that
-          # forked into two implementations would drift within a week.
+          # internal, so Sources/PassbandiOS/Views/AccountPage.swift composes
+          # THE SAME sections behind a navigation list. Settings that forked
+          # into two implementations would drift within a week.
           - "Views/AuthView.swift"
           - "Views/UsageView.swift"
       - path: Sources/PassbandiOS

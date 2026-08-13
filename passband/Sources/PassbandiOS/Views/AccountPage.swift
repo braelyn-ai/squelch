@@ -1,4 +1,20 @@
-// THE SETTINGS TAB — the desktop's settings, re-navigated for a thumb.
+// THE ACCOUNT PAGE — the phone's you-space, behind the person glyph at the top
+// left of the sitrep. Everything about the person using the app and the install
+// they are using it on lives here: which mailboxes this install knows first, and
+// then the six settings panes under that.
+//
+// WHY THE SETTINGS LIVE UNDER THE PERSON AND NOT BESIDE THE MAIL. A phone settles
+// settings behind whoever is signed in — it is where every other app on the
+// device has trained a thumb to look, and it is honest about the relationship:
+// the switches are the account's, not the inbox's. Spending one of a phone's
+// three tabs on a screen you visit twice a month would have been the trade going
+// the other way.
+//
+// ACCOUNT SWITCHING WILL LAND HERE, and nothing below builds it yet. The Mac's
+// multi-account shell (one active world, N background ears, ⌘1..⌘9) has no phone
+// equivalent, and when it gets one this is the surface it appears on, above the
+// panes, which is why the Account row already sits first rather than last in the
+// Mac's order.
 //
 // The panes here hold THE SAME STRUCTS the Mac's Views/SettingsView.swift lays
 // out: ConnectionSection, SignatureSection, TriageBudgetSection and the rest are
@@ -22,7 +38,17 @@
 
 import SwiftUI
 
-struct MobileSettingsView: View {
+struct AccountPage: View {
+    /// The panes, in the order a PHONE wants them: the account first, because
+    /// this page is entered through a person icon and the row that answers
+    /// "who am I signed in as" should not be the sixth one down. The Mac's
+    /// sub-nav keeps its own order — `SettingsSection.allCases` — since a rail
+    /// beside the pane is a map, and a map you can read at a glance has no
+    /// reason to lead with anything.
+    private static let order: [SettingsSection] = [
+        .account, .general, .mail, .triage, .assistant, .privacy,
+    ]
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -33,7 +59,7 @@ struct MobileSettingsView: View {
             .padding(.bottom, 28)
         }
         .background(Palette.canvas)
-        .navigationTitle("Settings")
+        .navigationTitle("Account")
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -41,12 +67,12 @@ struct MobileSettingsView: View {
     /// rows have in common so the screen reads as a place, not a menu.
     private var masthead: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("settings")
+            Text("account")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.accent)
                 .textCase(.uppercase)
                 .tracking(0.6)
-            Text("How this one behaves.")
+            Text("You, and how this one behaves.")
                 .font(Typo.hero(26))
                 .foregroundStyle(Palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
@@ -59,10 +85,10 @@ struct MobileSettingsView: View {
     /// built out of the app's own material rather than the system's.
     private var index: some View {
         VStack(spacing: 0) {
-            ForEach(SettingsSection.allCases, id: \.self) { section in
+            ForEach(Self.order, id: \.self) { section in
                 NavigationLink { pane(section) } label: { row(section) }
                     .buttonStyle(.plain)
-                if section != SettingsSection.allCases.last { Hairline() }
+                if section != Self.order.last { Hairline() }
             }
         }
         .padding(.vertical, 4)
@@ -96,9 +122,9 @@ struct MobileSettingsView: View {
         .contentShape(Rectangle())
     }
 
-    /// THE PANES, and the one place the mapping lives. Same grouping and same
-    /// order as the Mac's sub-nav, because a user who has seen both should find
-    /// the read-tracking switch under Mail either way.
+    /// THE PANES, and the one place the mapping lives. Same grouping as the
+    /// Mac's sub-nav, because a user who has seen both should find the
+    /// read-tracking switch under Mail either way.
     @ViewBuilder private func pane(_ section: SettingsSection) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {

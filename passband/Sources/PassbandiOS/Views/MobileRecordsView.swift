@@ -1,17 +1,22 @@
 // THE QUICK LOOK TAB — the desktop sitrep's pinned right rail, given a phone
-// destination of its own, plus the login codes. Calendar / Shipments / Banking
-// / Receipts are the SAME components the Mac's rail is built from
-// (Views/SitrepZones.swift), and their own header says why they are a place
-// rather than a feed: these are RECORDS, not actions. They are auto-resolved
-// out of the attention bands at ingest, so this screen is their only surface,
-// and each one renders empty state and all — a column that comes and goes as
-// mail arrives is one you stop trusting.
+// destination of its own. Calendar / Shipments / Banking / Receipts are the SAME
+// components the Mac's rail is built from (Views/SitrepZones.swift), and their
+// own header says why they are a place rather than a feed: these are RECORDS,
+// not actions. They are auto-resolved out of the attention bands at ingest, so
+// this screen is their only surface, and each one renders empty state and all —
+// a column that comes and goes as mail arrives is one you stop trusting.
 //
-// The auth zone heads the tab because it is the same kind of thing: something
-// the app pulled out of your mail and is holding for you to look up, never
-// something to answer. That is the tab's whole thesis, and it is why the name
-// is Quick Look rather than Records — you come here to READ ONE FACT (the code,
-// the flight time, the tracking number) and leave.
+// Everything here is something the app pulled out of your mail and is holding
+// for you to look up, never something to answer. That is the tab's whole thesis,
+// and it is why the name is Quick Look rather than Records — you come here to
+// READ ONE FACT (the flight time, the tracking number) and leave.
+//
+// THE LOGIN CODES USED TO HEAD THIS COLUMN and now live behind the key in the
+// sitrep's navigation bar (Views/MobileAuthView.swift). Same kind of material,
+// wrong latency: the other four are things you go looking for, and a code is
+// something you need in the ten seconds a login form is waiting on you. Making
+// that a tab hop plus a scroll was charging the most urgent row on the phone the
+// highest price to reach.
 //
 // A Mac can pin all of this beside the work surface and a phone cannot, so what
 // is one glance there is one tab here. Tapping a row opens the underlying email
@@ -27,11 +32,6 @@ struct MobileRecordsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 masthead
-                // FIRST, above everything. A login code is the most
-                // time-critical thing in an inbox — you are standing at a login
-                // form holding the phone that has the code on it — so it gets
-                // the one position that never costs a scroll.
-                MobileAuthZone()
                 CalendarZone()
                 ShipmentsZone()
                 BankingZone()
@@ -43,10 +43,10 @@ struct MobileRecordsView: View {
         .background(Palette.canvas)
         .navigationTitle("Quick Look")
         .navigationBarTitleDisplayMode(.inline)
-        // The sealed list rides the sitrep pull, not the zones fetch — and this
-        // tab now hosts the login codes, whose whole point is "the code you are
-        // waiting for, now". A pull-to-refresh that could not fetch a
-        // just-arrived code would betray the surface's one promise.
+        // Both halves, because a record can arrive either way: the zones come
+        // from the zones fetch, and the resolution that MOVED a mail into one of
+        // them rides the sitrep pull. Pulling only the zones would leave the
+        // bands claiming an item this screen has already taken over.
         .refreshable {
             _ = await SitrepPoller.shared.pull()
             await store.refreshZones(force: true)
@@ -59,9 +59,7 @@ struct MobileRecordsView: View {
 
     /// THE ONE SERIF LINE ON THIS SCREEN, and the only thing on it that is not a
     /// zone: what these cards have in common, said once, so the tab reads as a
-    /// place rather than as five unrelated widgets. Still true with the codes
-    /// here — a login code is pulled out of your mail and kept exactly the way a
-    /// tracking number is.
+    /// place rather than as four unrelated widgets.
     private var masthead: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text("quick look")

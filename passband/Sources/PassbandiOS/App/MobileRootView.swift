@@ -5,9 +5,17 @@
 //
 // What differs is only the shape. A Mac gets a rail and a routed page; a phone
 // gets a tab bar, which is a different navigation model rather than a smaller
-// one, so the rail's seven destinations collapse to six, and each of the six is
-// now a real surface rather than a stub — the last placeholder went when search
-// landed.
+// one: a rail is a directory you read, and a tab bar is three or four places you
+// LIVE in. So the rail's seven destinations land here as three tabs — sitrep,
+// quick look, mail — plus the search role parked at the trailing end.
+//
+// WHAT CAME OFF THE BAR, and where it went. Settings and the login codes are not
+// places anyone lives; they are reference surfaces you visit off the dashboard
+// and leave, so they hang from the sitrep's navigation bar (a person glyph
+// leading, a key trailing) instead of each spending permanent bar width. The
+// agent's own tab is gone too, and the next pass folds the assistant into the
+// search surface — one text field per screen is what a phone actually has, and
+// two doors for "ask me something" was one too many.
 //
 // AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
 // that covers the window; here it is a NavigationStack destination — but driven
@@ -31,7 +39,13 @@
 
 import SwiftUI
 
-/// The six phone destinations. Sitrep is the landing surface, matching the Mac.
+/// The phone's four destinations: three tabs, plus search parked at the end of
+/// the bar. Sitrep is the landing surface, matching the Mac.
+///
+/// THREE, BECAUSE A TAB IS A CLAIM. Every tab says "you will be here often", and
+/// a bar that makes that claim six times has stopped ranking anything. What is
+/// left is the three surfaces a day actually alternates between: what needs you,
+/// what was pulled out of your mail, and the mail itself.
 ///
 /// RECORDS IS A TAB HERE AND A RAIL THERE. On the Mac the record zones are
 /// pinned beside the work surface, read WHILE working it; a phone has no room to
@@ -43,20 +57,18 @@ import SwiftUI
 /// material records and renaming the symbol would churn all of it to relabel one
 /// tab.
 private enum MobileTab: Hashable {
-    case sitrep, records, mail, agent, search, settings
+    case sitrep, records, mail, search
 
     /// Left-to-right position in the tab bar. Only the slide direction reads it:
     /// a tab further right has to arrive from the right. Search is highest
     /// because its `.search` role parks it at the trailing end of the bar,
-    /// after settings.
+    /// after mail.
     var index: Int {
         switch self {
         case .sitrep: 0
         case .records: 1
         case .mail: 2
-        case .agent: 3
-        case .settings: 4
-        case .search: 5
+        case .search: 3
         }
     }
 }
@@ -154,10 +166,10 @@ private struct MobileShell: View {
                         .navigationBarTitleDisplayMode(.inline)
                         // `c` ON THE MAC IS GLOBAL; here the new-message door is
                         // ONE door, and it is on the mail. A phone's global verb
-                        // is a tab, and a compose button repeated across five of
-                        // them is five buttons for one composer. Replies do not
-                        // come through here at all — they open in the reader,
-                        // where the thread they answer is.
+                        // is a tab, and a compose button repeated across every
+                        // one of them is four buttons for one composer. Replies
+                        // do not come through here at all — they open in the
+                        // reader, where the thread they answer is.
                         .toolbar {
                             ToolbarItem(placement: .topBarTrailing) {
                                 Button { store.openComposeNew() } label: {
@@ -170,55 +182,29 @@ private struct MobileShell: View {
                 }
                 .tabSlide(.mail, selection: tab)
             }
-            // THE ⌘K AGENT, GIVEN A PLACE. On the Mac the assistant is a chord
-            // over whatever you are doing; a phone has no chords, so the same
-            // `store.assistant` session becomes a destination you walk into. It
-            // KEEPS a thread destination because the agent answers with email
-            // cards, and a card you cannot open is a footnote.
-            Tab("Agent", systemImage: "sparkles", value: MobileTab.agent) {
-                NavigationStack {
-                    MobileAgentView()
-                        .threadDestination(active: tab == .agent)
-                }
-                .tabSlide(.agent, selection: tab)
-            }
-            // NO `threadDestination` ON THIS ONE, and that is deliberate: every
-            // other tab can put mail on screen, and settings is the tab you are
-            // in precisely when you are not reading. Nothing here calls
-            // `openThread`, so a destination would only be a stack this tab
-            // could be pushed onto from somewhere else.
-            Tab("Settings", systemImage: MainView.settings.symbol, value: MobileTab.settings) {
-                NavigationStack {
-                    MobileSettingsView()
-                }
-                .tabSlide(.settings, selection: tab)
-            }
             // The search role parks this tab apart from the others in iOS 26's
             // tab bar, next to the minimize affordance, which is where a phone
             // user reaches for it.
             //
             // IT KEEPS A THREAD DESTINATION because a hit is mail and a hit you
-            // cannot open is a citation. And it can HAND ITSELF OFF: a question
-            // typed into the field goes to the agent instead, seeded but not
-            // sent (MobileAgentView.consumeSeed). The seed is written BEFORE the
-            // tab changes so the agent has the words the moment it is asked for
-            // them, and nothing is wrapped in `withAnimation` — `tabSlide` owns
-            // the transition already, and a second animation on the same change
-            // would fight it.
+            // cannot open is a citation.
             Tab(value: MobileTab.search, role: .search) {
                 NavigationStack {
-                    MobileSearchView(switchToAgent: { text in
-                        store.agentSeed = text
-                        tab = .agent
-                    })
-                    .threadDestination(active: tab == .search)
+                    // WAVE-2: the handoff has nowhere to land. The agent's tab
+                    // is gone, so a question QueryClassifier spots falls through
+                    // to plain search for now; the next pass folds the assistant
+                    // into this surface and gives the closure a real answer to
+                    // carry the words to. Left wired rather than removed so that
+                    // change is a body, not a signature.
+                    MobileSearchView(switchToAgent: { _ in })
+                        .threadDestination(active: tab == .search)
                 }
                 .tabSlide(.search, selection: tab)
             }
         }
         // Scrolling down surrenders the bar to the content and brings it back on
-        // the way up: a mail list is a reading surface first. All three tabs that own
-        // one are a real ScrollView/List, so both drive it.
+        // the way up: a mail list is a reading surface first. Every tab here is a
+        // real ScrollView or List, so all of them drive it.
         .tabBarMinimizeBehavior(.onScrollDown)
         // Toasts ride ABOVE the tab bar, where the Mac's stack rides above the
         // rail. The offset clears the bar at rest; when the bar minimizes on
@@ -364,7 +350,7 @@ extension View {
 /// queue and the pending reply are cleared the same way rather than left behind.
 ///
 /// THE READER BELONGS TO THE TAB THAT OPENED IT. A TabView keeps every visited
-/// tab's stack mounted, and all six destinations watch the same store field; if
+/// tab's stack mounted, and all four destinations watch the same store field; if
 /// each simply presented `store.threadId` whenever it was frontmost, switching
 /// tabs mid-read would re-push the same reader onto the new tab's stack (the
 /// tab bar stays tappable under a pushed reader). So each destination keeps its

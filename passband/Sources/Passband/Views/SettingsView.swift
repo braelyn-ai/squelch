@@ -6,7 +6,8 @@
 //
 // `SettingsView` ITSELF IS THE MAC'S SHELL — a fixed nav column beside a scroll
 // pane, which is a window shape and only a window shape. The phone's shell is
-// Sources/PassbandiOS/Views/MobileSettingsView.swift. What crosses is everything
+// Sources/PassbandiOS/Views/AccountPage.swift, which files these panes under the
+// person rather than beside the mail. What crosses is everything
 // BELOW this struct: the section cards, which compile for both and are composed
 // by whichever shell is on screen. So this file still has to build for iOS, and
 // the two lines that cannot (the routed header) are fenced rather than moved.
@@ -284,7 +285,7 @@ struct InlineRow<Content: View>: View {
 
 // EVERY SECTION BELOW IS INTERNAL, NOT private, AND THAT IS THE POINT. Two
 // shells compose them — the Mac's sub-nav column above, the phone's navigation
-// list in Sources/PassbandiOS/Views/MobileSettingsView.swift — off one set of
+// list in Sources/PassbandiOS/Views/AccountPage.swift — off one set of
 // structs, so a fix to what a switch writes or what a hint promises lands on
 // both at once. The shells own the ARRANGEMENT (which pane holds what, how you
 // get to it); the sections own the behavior, and behavior cannot fork.
