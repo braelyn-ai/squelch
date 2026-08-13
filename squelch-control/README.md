@@ -142,6 +142,9 @@ squelch-control invite revoke <id>        # revoke an unused code
 squelch-control tenants                   # what has been provisioned
 squelch-control llm mint <label>          # mint + install a Bifrost virtual key (also rotates)
 squelch-control llm revoke <label>        # revoke the recorded key and forget it
+squelch-control drift                     # what has been changed on every tenant's workload
+squelch-control drift <label>             # ...on one. Exits 1 when anything has drifted
+squelch-control reconcile <label>         # converge ONE tenant back onto the warden's render
 ```
 
 Invite codes are Crockford `XXXX-XXXX-XXXX-XXXX` (80 bits), stored only as a
@@ -162,6 +165,26 @@ a retry does not have to wait it out.
 The invite commands talk to the store directly and need none of the serving
 configuration, so codes can be minted on a box with no OAuth client in its
 environment.
+
+`drift` and `reconcile` need the **warden pair** and, for a fleet-wide `drift`,
+the store; no Bifrost trio, no OAuth client, no cookie key.
+
+The warden writes every tenant object by server-side apply, which owns **fields,
+not objects**. A `kubectl set env` against a tenant therefore takes ownership of
+that field, and no apply the warden makes afterwards will report it or take it
+back — it converges around the edit forever, and the edit detonates whenever
+something unrelated makes it fatal. `drift` is how that gets seen first: it asks
+the warden which other field managers own part of a tenant's Deployment and what
+an apply of today's render would move. The report is data on **stdout**; the
+exit code is the finding (`0` clean, `1` drifted), so a periodic run needs
+nobody to read it.
+
+`reconcile` is the repair, and it takes exactly one label on purpose. Taking a
+field back from another manager means deleting the Deployment and applying it
+fresh, so it rolls that tenant's pod and their mailbox is offline until it
+returns. Converge one, verify it, then walk the list; a command that swept the
+fleet would turn one bad render into a fleet-wide outage at the speed an
+operator can press return.
 
 The `llm` commands need the Bifrost trio, the warden pair, and the store — but
 still no OAuth client or cookie key. `llm mint` backfills a tenant that signed

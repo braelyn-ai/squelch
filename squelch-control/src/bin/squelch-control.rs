@@ -1,4 +1,5 @@
-//! The control-plane binary: `serve`, and the invite-code operator commands.
+//! The control-plane binary: `serve`, and the operator commands — invites,
+//! tenants, LLM keys, and the pair that reads and repairs a tenant's workload.
 //!
 //! The invite subcommands talk to the STORE directly, exactly as `squelchd
 //! token` does: they are operator commands run at a shell, and requiring a
@@ -6,6 +7,12 @@
 //! circle. They also deliberately need NONE of the serving config, so an
 //! operator can issue codes on a box that has no OAuth client and no warden
 //! bearer in its environment.
+//!
+//! `drift` and `reconcile` are the cluster pair and the only commands here that
+//! reach past the store into what is running. `drift` READS — it asks the warden
+//! what is on a tenant's Deployment that the warden did not put there — and its
+//! EXIT CODE carries the finding (0 clean, 1 drifted) so a periodic run needs
+//! nobody to read its output. `reconcile` writes, and takes ONE label.
 //!
 //! NOTHING HERE PRINTS SECRET MATERIAL EXCEPT THE ONE LINE THAT IS SUPPOSED TO:
 //! `invite issue` prints each code once, on stdout, alone, so
@@ -22,8 +29,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use squelch_control::bifrost::BifrostClient;
 use squelch_control::config::{self, BifrostConfig, OUTBOUND_TIMEOUT};
-use squelch_control::warden::{HttpWarden, Warden as _};
-use squelch_control::{Config, ControlState, ControlStore, invites, router};
+use squelch_control::warden::{DriftReport, HttpWarden, Warden as _};
+use squelch_control::{Config, ControlState, ControlStore, invites, labels, router};
 use tracing_subscriber::EnvFilter;
 
 /// How often expired signup sessions are swept. Taking a session already
@@ -57,6 +64,14 @@ enum Command {
         #[command(subcommand)]
         command: LlmCommand,
     },
+    /// Report what is on tenants' workloads that the warden did not put there.
+    /// Exits 1 when anything has drifted.
+    Drift {
+        /// One tenant. Omit it to walk every tenant in the store.
+        label: Option<String>,
+    },
+    /// Converge ONE tenant's workload back onto the warden's render.
+    Reconcile { label: String },
 }
 
 /// The LLM-key operator commands. Unlike `invite`, these need the Bifrost trio
@@ -116,6 +131,8 @@ fn main() -> anyhow::Result<()> {
         Command::Invite { command } => invite(command),
         Command::Tenants => tenants(),
         Command::Llm { command } => llm(command),
+        Command::Drift { label } => drift(label),
+        Command::Reconcile { label } => reconcile(label),
     }
 }
 
@@ -392,6 +409,176 @@ async fn llm_revoke(
         anyhow::bail!(
             "not everything was revoked ({}); the ids stay recorded, run `llm revoke {label}` again",
             failed.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// The cluster commands need the warden pair, and a fleet-wide `drift` needs
+/// the store to know who the fleet is. NOT the Bifrost trio, NOT the OAuth
+/// client, NOT the cookie key: asking what a tenant's workload looks like has
+/// nothing to do with minting keys or signing anybody in, and an operator
+/// answering a page should not have to assemble a signup environment first.
+fn warden_client() -> anyhow::Result<HttpWarden> {
+    let (url, token) =
+        config::warden_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
+    Ok(HttpWarden::new(url, token, OUTBOUND_TIMEOUT)?)
+}
+
+/// A label an operator typed, held to the same allowlist the signup form
+/// applies. The warden refuses one it would not have built too, but a typo at a
+/// shell should read as a typo rather than as the cluster refusing something.
+fn operator_label(label: String) -> anyhow::Result<String> {
+    match labels::validate(&label) {
+        Ok(_) => Ok(label),
+        Err(e) => anyhow::bail!("invalid label `{label}`: {}", e.message()),
+    }
+}
+
+/// What is on tenants' Deployments that the warden did not write.
+///
+/// Server-side apply owns FIELDS, so a hand edit against a tenant is invisible
+/// to every apply the warden will ever make: it survives, the pod carries it,
+/// and it detonates whenever something unrelated makes it fatal. This command is
+/// how that gets seen before then.
+///
+/// The walk is SEQUENTIAL. Each report costs the warden a couple of reads and
+/// one dry-run apply, the warden meters at 120 requests a minute, and the hosted
+/// tier is capped in the low hundreds of tenants, so a whole-fleet walk is
+/// seconds. A concurrent fan-out would buy that back and could meter itself out
+/// halfway through.
+fn drift(label: Option<String>) -> anyhow::Result<()> {
+    let warden = warden_client()?;
+    let labels: Vec<String> = match label {
+        Some(one) => vec![operator_label(one)?],
+        None => open_store()?
+            .list_tenants()?
+            .into_iter()
+            .map(|t| t.label)
+            .collect(),
+    };
+    if labels.is_empty() {
+        eprintln!("squelch-control: no tenants have been provisioned.");
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (drifted, failed) = runtime.block_on(async {
+        let mut drifted = 0usize;
+        let mut failed = 0usize;
+        for label in &labels {
+            match warden.drift(label).await {
+                Ok(report) => {
+                    if !report.is_clean() {
+                        drifted += 1;
+                    }
+                    print_drift(label, &report);
+                }
+                // The walk continues: one unreachable tenant must not hide the
+                // drift on the twenty after it. The run still ends in an error.
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("squelch-control: {label}: {e}");
+                }
+            }
+        }
+        (drifted, failed)
+    });
+
+    let total = labels.len();
+    let word = tenant_word(total);
+    if failed > 0 {
+        anyhow::bail!("{failed} of {total} {word} could not be checked");
+    }
+    if drifted == 0 {
+        eprintln!("squelch-control: {total} {word} checked, nothing has drifted.");
+        return Ok(());
+    }
+    eprintln!(
+        "squelch-control: drift found on {drifted} of {total} {word}. Reconcile one tenant at a \
+         time, verifying each before the next."
+    );
+    // The report is the output, so the drift itself leaves by the exit code
+    // rather than as an error: nothing failed here, and a caller that only wants
+    // the answer should not have to parse a message for it. Stdout is flushed by
+    // hand because `exit` runs no destructors.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(1);
+}
+
+/// `1 tenant`, `3 tenants`. A summary that says "1 tenants" reads as a bug in
+/// the thing that reports bugs.
+fn tenant_word(n: usize) -> &'static str {
+    if n == 1 { "tenant" } else { "tenants" }
+}
+
+/// One tenant's report on stdout. A clean tenant is a single line, so a fleet
+/// walk reads as a list with the findings standing out of it.
+fn print_drift(label: &str, report: &DriftReport) {
+    let summary = if !report.deployment_present {
+        // Not a finding: pending and stopped tenants have no workload to have
+        // drifted, and the status word is the thing to read instead.
+        "no deployment".to_string()
+    } else if report.is_clean() {
+        "clean".to_string()
+    } else {
+        format!(
+            "{} foreign, {} to change",
+            report.foreign.len(),
+            report.changes.len()
+        )
+    };
+    println!("{label:<32}  {:<10}  {summary}", report.status);
+    for f in &report.foreign {
+        println!("  foreign  {} ({})", f.manager, f.operation);
+        for path in &f.paths {
+            println!("    {path}");
+        }
+    }
+    for c in &report.changes {
+        println!(
+            "  change   {}: {} -> {}",
+            c.path,
+            json(&c.live),
+            json(&c.rendered)
+        );
+    }
+}
+
+/// A drift value on one line. Printed as JSON rather than bare: a spec field
+/// holds no secret material, but it holds strings this process did not write,
+/// and JSON escaping is what keeps one of them from being read as anything but
+/// a value.
+fn json(v: &serde_json::Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "<unprintable>".to_string())
+}
+
+/// Put ONE tenant's workload back onto the warden's render.
+///
+/// One label per invocation, deliberately. A reconcile can delete and recreate
+/// the Deployment — nothing gentler takes a field back from another manager —
+/// so it rolls the pod and that tenant's mailbox is offline until it returns.
+/// The runbook is therefore: converge one, verify it, then walk the list. A
+/// command that swept the fleet would turn one bad render into a fleet-wide
+/// outage at the speed an operator can press return.
+fn reconcile(label: String) -> anyhow::Result<()> {
+    let label = operator_label(label)?;
+    let warden = warden_client()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let outcome = runtime.block_on(warden.reconcile(&label))?;
+
+    eprintln!(
+        "squelch-control: {label}: deployment {}, tenant {}.",
+        outcome.deployment, outcome.status
+    );
+    if outcome.deployment == "recreated" {
+        eprintln!(
+            "squelch-control: that Deployment was deleted and applied fresh, because another \
+             field manager owned part of it. Run `drift {label}` to confirm nothing is left."
         );
     }
     Ok(())
