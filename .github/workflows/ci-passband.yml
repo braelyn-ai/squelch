@@ -1,0 +1,40 @@
+# Passband's pure-source Swift suites (stream decoder, pairing). test.sh
+# compiles each suite with bare swiftc — no xcodegen, no signing, no
+# simulator — which is the only Passband testing cheap enough to run per-PR
+# on a macOS runner.
+#
+# Path-filtered at the workflow level so a Rust-only PR never spins up a
+# 10x-billed macOS runner at all. Consequence: do NOT mark this check
+# required in branch protection — a path-skipped workflow reports no status,
+# and a required-but-absent check leaves non-client PRs stuck on "expected".
+
+name: ci-passband
+
+on:
+  pull_request:
+    paths:
+      - "passband/**"
+      - ".github/workflows/ci-passband.yml"
+  push:
+    branches: [main]
+    paths:
+      - "passband/**"
+      - ".github/workflows/ci-passband.yml"
+
+concurrency:
+  group: ci-passband-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macos-26 defaults to Xcode 26.x — the same major the project builds with
+    # locally. macos-15 tops out at Xcode 16 / Swift 6.1 and is too old.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: test
+        run: ./passband/test.sh

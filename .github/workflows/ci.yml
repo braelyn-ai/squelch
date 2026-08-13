@@ -1,0 +1,53 @@
+# PR gate: build + test the Rust workspace on every PR and on main, and run
+# the Passband swiftc test suites when the client changes. Release publishing
+# stays in release.yml / release-ios.yml; this workflow never pushes anything.
+#
+# WHAT IS DELIBERATELY ABSENT:
+#
+# - `cargo fmt --check`. The tree is not fmt-clean today (~120 diffs across
+#   squelch-api/control/tui/warden/squelchd/mcp), and several feature branches
+#   are in flight; a repo-wide reformat now would drop merge conflicts under
+#   all of them. Add the gate (plus the one-time `cargo fmt` commit) once the
+#   branch backlog lands.
+# - The embedding-model E2E. squelch-core's real-fastembed tests gate
+#   themselves behind SQUELCH_EMBED_E2E precisely so CI does not download the
+#   model on every run; leave that env var unset here.
+# - The Passband suites. Those live in ci-passband.yml, path-filtered to
+#   passband/**, so a Rust-only PR never spins up a 10x-billed macOS runner.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A force-push or rapid follow-up commit obsoletes the previous run; cancel it
+# rather than queue behind it. On main, never cancel — every merge gets a run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Caches ~/.cargo and target/ keyed on the lockfile; the ONNX (ort)
+      # build under fastembed is the expensive part, and this is what keeps
+      # it from recompiling on every PR.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
