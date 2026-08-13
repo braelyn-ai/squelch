@@ -111,7 +111,7 @@ enum Analytics {
             "tier", "category", "sensitivity",
             "past_due", "deadline", "signal", "noise",
             "invoice", "autopay_bill", "banking_statement", "transaction_alert",
-            "marketing", "general", "sealed", "normal", "unset",
+            "marketing", "shipping", "general", "sealed", "normal", "unset",
             // rule_created dispositions
             "surface", "squelch", "filtered",
             // assistant_asked models

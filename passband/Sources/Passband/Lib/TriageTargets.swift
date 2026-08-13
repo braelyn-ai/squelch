@@ -108,6 +108,12 @@ enum TriageTargets {
                 "offer", "deal",
             ]),
         TriageTarget(
+            axis: .category, value: "shipping", label: "Shipping",
+            hint: "a shipment or delivery status notice",
+            aliases: [
+                "shipping", "shipment", "shipped", "package", "parcel", "delivery", "tracking",
+            ]),
+        TriageTarget(
             axis: .category, value: "general", label: "General",
             hint: "none of the money categories",
             aliases: ["general", "none", "other", "plain"]),
