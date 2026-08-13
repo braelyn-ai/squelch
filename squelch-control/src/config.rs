@@ -85,6 +85,18 @@ pub const MAX_LLM_BUDGET_USD: f64 = 1_000.0;
 /// unreliable, so "no list" must mean "the product's list", not "nothing".
 pub const DEFAULT_LLM_MODELS: &str = "claude-haiku-4-5,claude-sonnet-5";
 
+/// The monthly spend a tenant's ASSISTANT key is minted with when
+/// `SQUELCH_CONTROL_ASSISTANT_BUDGET_USD` says nothing. Higher than triage's:
+/// the assistant answers a person's own questions on demand, so its ceiling is
+/// theirs to spend, not the product's background hum.
+pub const DEFAULT_ASSISTANT_BUDGET_USD: f64 = 10.00;
+
+/// The models allowed on every minted ASSISTANT key when
+/// `SQUELCH_CONTROL_ASSISTANT_MODELS` says nothing. Never empty, for the same
+/// deny-all reason as the triage list; a different set because the assistant
+/// wants a frontier model where triage wants a cheap one.
+pub const DEFAULT_ASSISTANT_MODELS: &str = "claude-haiku-4-5,claude-opus-4-8";
+
 /// Ceiling on one configured model name. Real ids are ~30 characters; a
 /// larger one is a paste accident.
 pub const MAX_LLM_MODEL_LEN: usize = 128;
@@ -188,10 +200,14 @@ pub struct BifrostConfig {
     /// every governance call (session bearers expire after 30 days; Basic
     /// works statically on `/api/*`). Redacted from `Debug`.
     pub admin_token: String,
-    /// Monthly budget, USD, stamped on every minted virtual key.
+    /// Monthly budget, USD, stamped on every minted TRIAGE virtual key.
     pub budget_usd: f64,
-    /// `allowed_models` for every minted virtual key. Never empty.
+    /// `allowed_models` for every minted triage virtual key. Never empty.
     pub models: Vec<String>,
+    /// Monthly budget, USD, stamped on every minted ASSISTANT virtual key.
+    pub assistant_budget_usd: f64,
+    /// `allowed_models` for every minted assistant virtual key. Never empty.
+    pub assistant_models: Vec<String>,
 }
 
 impl std::fmt::Debug for BifrostConfig {
@@ -201,6 +217,8 @@ impl std::fmt::Debug for BifrostConfig {
             .field("admin_token", &"<redacted>")
             .field("budget_usd", &self.budget_usd)
             .field("models", &self.models)
+            .field("assistant_budget_usd", &self.assistant_budget_usd)
+            .field("assistant_models", &self.assistant_models)
             .finish()
     }
 }
@@ -341,6 +359,8 @@ impl Config {
             var("SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN"),
             var("SQUELCH_CONTROL_LLM_BUDGET_USD"),
             var("SQUELCH_CONTROL_LLM_MODELS"),
+            var("SQUELCH_CONTROL_ASSISTANT_BUDGET_USD"),
+            var("SQUELCH_CONTROL_ASSISTANT_MODELS"),
         )?;
 
         let waitlist = waitlist_from(
@@ -430,34 +450,44 @@ impl BifrostConfig {
             var("SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN"),
             var("SQUELCH_CONTROL_LLM_BUDGET_USD"),
             var("SQUELCH_CONTROL_LLM_MODELS"),
+            var("SQUELCH_CONTROL_ASSISTANT_BUDGET_USD"),
+            var("SQUELCH_CONTROL_ASSISTANT_MODELS"),
         )
     }
 }
 
 /// Validate the Bifrost settings, all-or-nothing.
 ///
-/// None of the four set means the feature is OFF, which is a legal deployment
+/// None of the six set means the feature is OFF, which is a legal deployment
 /// (self-host, or hosted before the gateway exists). Some-but-not-all is a
 /// REFUSAL TO BOOT: a control plane that quietly ran without the gateway would
 /// provision every tenant keyless and nobody would notice until the first
-/// triage call failed, weeks of signups later. The budget and the model list
-/// are the two fields with defaults, because "the feature is on" is decided
-/// by the url and the credential, and either of the others without both of
+/// triage call failed, weeks of signups later. The budgets and the model lists
+/// are the four fields with defaults, because "the feature is on" is decided
+/// by the url and the credential, and any of the others without both of
 /// those is still a half-configured feature.
 fn bifrost_from(
     url: Option<String>,
     admin_token: Option<String>,
     budget: Option<String>,
     models: Option<String>,
+    assistant_budget: Option<String>,
+    assistant_models: Option<String>,
 ) -> Result<Option<BifrostConfig>, ConfigError> {
-    if url.is_none() && admin_token.is_none() && budget.is_none() && models.is_none() {
+    if url.is_none()
+        && admin_token.is_none()
+        && budget.is_none()
+        && models.is_none()
+        && assistant_budget.is_none()
+        && assistant_models.is_none()
+    {
         return Ok(None);
     }
     let (Some(url), Some(admin_token)) = (url, admin_token) else {
         return Err(ConfigError::invalid(
             "SQUELCH_CONTROL_BIFROST_URL and SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN must be set \
-             together (SQUELCH_CONTROL_LLM_BUDGET_USD and SQUELCH_CONTROL_LLM_MODELS are \
-             optional); set both or neither",
+             together (the SQUELCH_CONTROL_LLM_* and SQUELCH_CONTROL_ASSISTANT_* budget and \
+             model variables are optional); set both or neither",
         ));
     };
     let url = canonical_origin("SQUELCH_CONTROL_BIFROST_URL", &url)?;
@@ -488,26 +518,27 @@ fn bifrost_from(
              expires and does not belong here",
         ));
     }
-    let budget_usd = match budget {
-        None => DEFAULT_LLM_BUDGET_USD,
-        Some(v) => {
-            let usd: f64 = v.parse().map_err(|e| {
-                ConfigError::invalid(format!("invalid SQUELCH_CONTROL_LLM_BUDGET_USD `{v}`: {e}"))
-            })?;
-            if !usd.is_finite() || usd <= 0.0 || usd > MAX_LLM_BUDGET_USD {
-                return Err(ConfigError::invalid(format!(
-                    "SQUELCH_CONTROL_LLM_BUDGET_USD `{v}` must be a positive amount no larger than {MAX_LLM_BUDGET_USD}"
-                )));
-            }
-            usd
-        }
-    };
-    let models = parse_models(&models.unwrap_or_else(|| DEFAULT_LLM_MODELS.to_string()))?;
+    let budget_usd = parse_budget("SQUELCH_CONTROL_LLM_BUDGET_USD", budget, DEFAULT_LLM_BUDGET_USD)?;
+    let models = parse_models(
+        "SQUELCH_CONTROL_LLM_MODELS",
+        &models.unwrap_or_else(|| DEFAULT_LLM_MODELS.to_string()),
+    )?;
+    let assistant_budget_usd = parse_budget(
+        "SQUELCH_CONTROL_ASSISTANT_BUDGET_USD",
+        assistant_budget,
+        DEFAULT_ASSISTANT_BUDGET_USD,
+    )?;
+    let assistant_models = parse_models(
+        "SQUELCH_CONTROL_ASSISTANT_MODELS",
+        &assistant_models.unwrap_or_else(|| DEFAULT_ASSISTANT_MODELS.to_string()),
+    )?;
     Ok(Some(BifrostConfig {
         url,
         admin_token,
         budget_usd,
         models,
+        assistant_budget_usd,
+        assistant_models,
     }))
 }
 
@@ -589,14 +620,33 @@ fn waitlist_from(
     }))
 }
 
-/// Parse the comma-separated model allow-list. Empty segments (a trailing
+/// Parse one monthly budget: money, positive, and no bigger than the typo
+/// ceiling. One function for both keys' budgets so the bar cannot drift.
+fn parse_budget(name: &str, raw: Option<String>, default: f64) -> Result<f64, ConfigError> {
+    match raw {
+        None => Ok(default),
+        Some(v) => {
+            let usd: f64 = v
+                .parse()
+                .map_err(|e| ConfigError::invalid(format!("invalid {name} `{v}`: {e}")))?;
+            if !usd.is_finite() || usd <= 0.0 || usd > MAX_LLM_BUDGET_USD {
+                return Err(ConfigError::invalid(format!(
+                    "{name} `{v}` must be a positive amount no larger than {MAX_LLM_BUDGET_USD}"
+                )));
+            }
+            Ok(usd)
+        }
+    }
+}
+
+/// Parse a comma-separated model allow-list. Empty segments (a trailing
 /// comma) are tolerated; what remains must be at least one name, each held to
 /// the same allowlist bar as every other value that lands in an outbound
 /// request: model ids are made of letters, digits, `-`, `_`, `.` and nothing
 /// that could restructure JSON or a log line. An EMPTY list is refused rather
 /// than passed through, because on the live gateway empty `allowed_models` is
 /// deny-all.
-fn parse_models(raw: &str) -> Result<Vec<String>, ConfigError> {
+fn parse_models(name: &str, raw: &str) -> Result<Vec<String>, ConfigError> {
     let ok = |m: &str| {
         m.len() <= MAX_LLM_MODEL_LEN
             && m.bytes()
@@ -610,13 +660,13 @@ fn parse_models(raw: &str) -> Result<Vec<String>, ConfigError> {
         .collect();
     if models.is_empty() {
         return Err(ConfigError::invalid(format!(
-            "invalid SQUELCH_CONTROL_LLM_MODELS `{raw}`: at least one model is required (an empty \
+            "invalid {name} `{raw}`: at least one model is required (an empty \
              allow-list would deny every call)"
         )));
     }
     if let Some(bad) = models.iter().find(|m| !ok(m)) {
         return Err(ConfigError::invalid(format!(
-            "invalid SQUELCH_CONTROL_LLM_MODELS entry `{bad}`: expected a model id made of \
+            "invalid {name} entry `{bad}`: expected a model id made of \
              letters, digits, `-`, `_`, `.`"
         )));
     }
@@ -757,6 +807,8 @@ mod tests {
                 admin_token: "admin:BIFROST-ADMIN-VALUE".into(),
                 budget_usd: DEFAULT_LLM_BUDGET_USD,
                 models: vec!["claude-haiku-4-5".into()],
+                assistant_budget_usd: DEFAULT_ASSISTANT_BUDGET_USD,
+                assistant_models: vec!["claude-opus-4-8".into()],
             }),
             waitlist: Some(WaitlistConfig {
                 admin_token: "ADMIN-PAGE-TOKEN-VALUE".into(),
@@ -870,45 +922,60 @@ mod tests {
 
     /// The Bifrost settings are a unit: url + credential is the feature on,
     /// none set is off, and anything in between is a refusal to boot rather
-    /// than a silent off. The budget and the model list are the two fields
+    /// than a silent off. The budgets and the model lists are the four fields
     /// with defaults.
     #[test]
     fn the_bifrost_settings_are_all_or_nothing() {
         let some = |s: &str| Some(s.to_string());
         let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
 
-        assert!(bifrost_from(None, None, None, None).unwrap().is_none(), "off");
+        assert!(
+            bifrost_from(None, None, None, None, None, None).unwrap().is_none(),
+            "off"
+        );
 
-        let on = bifrost_from(some("https://bifrost.example"), some(&token), None, None)
+        let on = bifrost_from(some("https://bifrost.example"), some(&token), None, None, None, None)
             .unwrap()
             .expect("url + credential switches the feature on");
         assert_eq!(on.url, "https://bifrost.example");
         assert_eq!(on.budget_usd, DEFAULT_LLM_BUDGET_USD);
-        // The default model list is the product's, and never empty.
+        // The default model lists are the product's, and never empty.
         assert_eq!(on.models, vec!["claude-haiku-4-5", "claude-sonnet-5"]);
+        // The assistant key gets its own defaults: a bigger budget and a
+        // frontier model where triage runs a cheap one.
+        assert_eq!(on.assistant_budget_usd, DEFAULT_ASSISTANT_BUDGET_USD);
+        assert_eq!(on.assistant_models, vec!["claude-haiku-4-5", "claude-opus-4-8"]);
 
         let on = bifrost_from(
             some("https://bifrost.example"),
             some(&token),
             some("12.5"),
             some("claude-opus-4-1, claude-haiku-4-5,"),
+            some("25"),
+            some("claude-opus-4-8,"),
         )
         .unwrap()
         .unwrap();
         assert_eq!(on.budget_usd, 12.5);
         assert_eq!(on.models, vec!["claude-opus-4-1", "claude-haiku-4-5"]);
+        assert_eq!(on.assistant_budget_usd, 25.0);
+        assert_eq!(on.assistant_models, vec!["claude-opus-4-8"]);
 
         // Every partial combination refuses.
-        assert!(bifrost_from(some("https://bifrost.example"), None, None, None).is_err());
-        assert!(bifrost_from(None, some(&token), None, None).is_err());
-        assert!(bifrost_from(None, None, some("5"), None).is_err());
-        assert!(bifrost_from(None, None, None, some("claude-haiku-4-5")).is_err());
-        assert!(bifrost_from(some("https://bifrost.example"), None, some("5"), None).is_err());
-        assert!(bifrost_from(None, some(&token), some("5"), None).is_err());
+        assert!(bifrost_from(some("https://bifrost.example"), None, None, None, None, None).is_err());
+        assert!(bifrost_from(None, some(&token), None, None, None, None).is_err());
+        assert!(bifrost_from(None, None, some("5"), None, None, None).is_err());
+        assert!(bifrost_from(None, None, None, some("claude-haiku-4-5"), None, None).is_err());
+        assert!(bifrost_from(some("https://bifrost.example"), None, some("5"), None, None, None).is_err());
+        assert!(bifrost_from(None, some(&token), some("5"), None, None, None).is_err());
         assert!(
-            bifrost_from(None, some(&token), None, some("claude-haiku-4-5")).is_err(),
+            bifrost_from(None, some(&token), None, some("claude-haiku-4-5"), None, None).is_err(),
             "models without the url is still a half-configured feature"
         );
+        // The assistant knobs are held to the same unit: alone, each is a
+        // half-configured feature, not a silent off.
+        assert!(bifrost_from(None, None, None, None, some("10"), None).is_err());
+        assert!(bifrost_from(None, None, None, None, None, some("claude-opus-4-8")).is_err());
     }
 
     /// The values themselves are held to the same bar the rest of the config
@@ -919,10 +986,10 @@ mod tests {
         let some = |s: &str| Some(s.to_string());
         let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
 
-        assert!(bifrost_from(some("http://bifrost.example"), some(&token), None, None).is_err());
-        assert!(bifrost_from(some("not a url"), some(&token), None, None).is_err());
+        assert!(bifrost_from(some("http://bifrost.example"), some(&token), None, None, None, None).is_err());
+        assert!(bifrost_from(some("not a url"), some(&token), None, None, None, None).is_err());
         let short = format!("a:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN - 3));
-        assert!(bifrost_from(some("https://bifrost.example"), some(&short), None, None).is_err());
+        assert!(bifrost_from(some("https://bifrost.example"), some(&short), None, None, None, None).is_err());
         // The credential is Basic material: `username:password`, exactly one
         // colon, both halves nonempty. A pasted session bearer (no colon)
         // must fail at boot, not as a 401 weeks later.
@@ -933,24 +1000,36 @@ mod tests {
             format!("a:b:{}", "c".repeat(MIN_BIFROST_TOKEN_LEN)), // two colons
         ] {
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&bad), None, None).is_err(),
+                bifrost_from(some("https://bifrost.example"), some(&bad), None, None, None, None)
+                    .is_err(),
                 "{bad:?}"
             );
         }
+        // Both budgets are held to the same money-not-a-typo bar.
         for bad in ["nonsense", "0", "-5", "NaN", "inf", "1000000"] {
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&token), some(bad), None)
+                bifrost_from(some("https://bifrost.example"), some(&token), some(bad), None, None, None)
                     .is_err(),
                 "{bad:?}"
+            );
+            assert!(
+                bifrost_from(some("https://bifrost.example"), some(&token), None, None, some(bad), None)
+                    .is_err(),
+                "assistant: {bad:?}"
             );
         }
         // A model list that is empty once parsed, or carries a name that
-        // could restructure a request, refuses to boot.
+        // could restructure a request, refuses to boot — either list.
         for bad in ["", " , ,", "claude haiku", "claude/../x", "mod\"el"] {
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&token), None, some(bad))
+                bifrost_from(some("https://bifrost.example"), some(&token), None, some(bad), None, None)
                     .is_err(),
                 "{bad:?}"
+            );
+            assert!(
+                bifrost_from(some("https://bifrost.example"), some(&token), None, None, None, some(bad))
+                    .is_err(),
+                "assistant: {bad:?}"
             );
         }
     }

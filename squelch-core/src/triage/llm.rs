@@ -306,6 +306,19 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
 }
 
+/// The ledger records exactly the split the API reports, so a usage block maps
+/// field-for-field onto the store's bump-usage argument.
+impl From<Usage> for crate::store::UsageTokens {
+    fn from(u: Usage) -> Self {
+        Self {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_creation: u.cache_creation_input_tokens,
+            cache_read: u.cache_read_input_tokens,
+        }
+    }
+}
+
 // ===========================================================================
 // Provider paths.
 // ===========================================================================

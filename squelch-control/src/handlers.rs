@@ -746,39 +746,69 @@ pub async fn oauth_callback(
     };
     drop(grant.token);
 
-    // THE LLM KEY, when this deployment fronts a Bifrost gateway: minted here,
-    // between call 1 and call 2, so the key is installed before the workload
-    // is applied and the pod is born with it instead of being rolled onto it.
+    // THE LLM KEYS — triage and assistant — when this deployment fronts a
+    // Bifrost gateway: minted here, between call 1 and call 2, so the keys are
+    // installed before the workload is applied and the pod is born with them
+    // instead of being rolled onto them.
     //
     // FAIL-SOFT, deliberately, and unlike everything around it: triage is not
-    // mail custody. A Bifrost outage must cost a tenant its LLM key — which
+    // mail custody. A Bifrost outage must cost a tenant its LLM keys — which
     // `squelch-control llm mint` backfills — and never the signup itself, so
-    // every failure in this block is one loud line and a shrug. The key VALUE
-    // exists only inside this block; the id is recorded once the tenant row
-    // exists below, and until then it rides in `vk_id`.
+    // every failure in this block is one loud line and a shrug. The two mints
+    // fail independently: a gateway that refuses one key still gets the other
+    // minted and installed, and the single warden PUT carries whichever
+    // succeeded. The key VALUES exist only inside this block; the ids are
+    // recorded once the tenant row exists below, and until then they ride in
+    // `vk_id` / `assistant_vk_id`.
     let mut vk_id: Option<String> = None;
+    let mut assistant_vk_id: Option<String> = None;
     if let Some((bifrost, llm)) = state.bifrost() {
-        match bifrost.mint_virtual_key(&label, llm.budget_usd).await {
+        // The ids are kept EVEN IF the install below fails, so the record can
+        // name the keys a revoke or a re-mint must find.
+        let triage_value = match bifrost.mint_virtual_key(&label, llm.budget_usd).await {
             Ok(vk) => {
-                // The id is kept EVEN IF the install below fails, so the
-                // record can name the key a revoke or a re-mint must find.
                 vk_id = Some(vk.id);
-                if let Err(e) = state.warden().put_llm_key(&label, &vk.value).await {
-                    tracing::error!(
-                        error = %e,
-                        label = %label,
-                        vk_id = vk_id.as_deref().unwrap_or_default(),
-                        "LLM KEY NOT INSTALLED: minted but the warden did not take it; run `squelch-control llm mint` to replace it (which prints the old id to revoke)"
-                    );
-                }
+                Some(vk.value)
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     label = %label,
-                    "LLM KEY NOT MINTED: this tenant will run keyless until `squelch-control llm mint` backfills it"
+                    "LLM KEY NOT MINTED: this tenant will run without a triage key until `squelch-control llm mint` backfills it"
                 );
+                None
             }
+        };
+        let assistant_value = match bifrost
+            .mint_assistant_key(&label, &llm.assistant_models, llm.assistant_budget_usd)
+            .await
+        {
+            Ok(vk) => {
+                assistant_vk_id = Some(vk.id);
+                Some(vk.value)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    label = %label,
+                    "ASSISTANT KEY NOT MINTED: this tenant will run without an assistant key until `squelch-control llm mint` backfills it"
+                );
+                None
+            }
+        };
+        if (triage_value.is_some() || assistant_value.is_some())
+            && let Err(e) = state
+                .warden()
+                .put_llm_key(&label, triage_value.as_deref(), assistant_value.as_deref())
+                .await
+        {
+            tracing::error!(
+                error = %e,
+                label = %label,
+                vk_id = vk_id.as_deref().unwrap_or_default(),
+                assistant_vk_id = assistant_vk_id.as_deref().unwrap_or_default(),
+                "LLM KEYS NOT INSTALLED: minted but the warden did not take them; run `squelch-control llm mint` to replace them (which prints the old ids to revoke)"
+            );
         }
     }
 
@@ -790,7 +820,7 @@ pub async fn oauth_callback(
         Ok(p) => p,
         Err(WardenError::AlreadyProvisioned) => {
             release();
-            log_orphaned_vk(&label, vk_id.as_deref());
+            log_orphaned_vks(&label, vk_id.as_deref(), assistant_vk_id.as_deref());
             return done(pages::problem(
                 StatusCode::CONFLICT,
                 "That mailbox is already set up",
@@ -802,7 +832,7 @@ pub async fn oauth_callback(
             // The page tells this user to start again with the SAME code, so the
             // hold has to go back now rather than in ten minutes.
             release();
-            log_orphaned_vk(&label, vk_id.as_deref());
+            log_orphaned_vks(&label, vk_id.as_deref(), assistant_vk_id.as_deref());
             return done(incomplete_problem());
         }
     };
@@ -821,7 +851,7 @@ pub async fn oauth_callback(
             label = %label,
             "PROVISIONED BUT NOT RECORDED: the tenant is running in the cluster and has no control-plane row"
         );
-        log_orphaned_vk(&label, vk_id.as_deref());
+        log_orphaned_vks(&label, vk_id.as_deref(), assistant_vk_id.as_deref());
         let detail = match e {
             StoreError::LabelTaken | StoreError::AccountTaken => {
                 "That address or account was claimed while you were signing in. Get in touch and we will sort it out."
@@ -835,7 +865,7 @@ pub async fn oauth_callback(
         ));
     }
 
-    // The vk id joins the row it was minted for, now that the row exists.
+    // The vk ids join the row they were minted for, now that the row exists.
     // Fail-soft like the rest of the LLM block: a record that did not land
     // costs `llm revoke` its pointer, not the user their mailbox.
     if let Some(id) = &vk_id {
@@ -843,6 +873,13 @@ pub async fn oauth_callback(
             Ok(true) => {}
             Ok(false) => tracing::error!(label = %label, vk_id = %id, "VK NOT RECORDED: the tenant row vanished under it"),
             Err(e) => tracing::error!(error = %e, label = %label, vk_id = %id, "VK NOT RECORDED: revoke or re-mint by this id by hand"),
+        }
+    }
+    if let Some(id) = &assistant_vk_id {
+        match state.store().set_tenant_assistant_vk(&label, id) {
+            Ok(true) => {}
+            Ok(false) => tracing::error!(label = %label, assistant_vk_id = %id, "ASSISTANT VK NOT RECORDED: the tenant row vanished under it"),
+            Err(e) => tracing::error!(error = %e, label = %label, assistant_vk_id = %id, "ASSISTANT VK NOT RECORDED: revoke or re-mint by this id by hand"),
         }
     }
 
@@ -1026,16 +1063,24 @@ fn release_invite(state: &ControlState, invite_id: i64, holder: &str) {
     }
 }
 
-/// Shout about a virtual key minted for a signup that then failed before its
-/// tenant row existed: nothing in the store points at it, so nothing will ever
-/// revoke it unless a human sees this line. The id only — the value is either
-/// installed in the cluster or already dropped.
-fn log_orphaned_vk(label: &str, vk_id: Option<&str>) {
+/// Shout about virtual keys minted for a signup that then failed before its
+/// tenant row existed: nothing in the store points at them, so nothing will
+/// ever revoke them unless a human sees these lines. The ids only — the
+/// values are either installed in the cluster or already dropped. One line
+/// per key, so grepping for either id finds its own verdict.
+fn log_orphaned_vks(label: &str, vk_id: Option<&str>, assistant_vk_id: Option<&str>) {
     if let Some(id) = vk_id {
         tracing::error!(
             label = %label,
             vk_id = %id,
             "VK ORPHANED: minted for a signup that did not finish; revoke it in Bifrost, or a retry plus `llm mint` replaces it"
+        );
+    }
+    if let Some(id) = assistant_vk_id {
+        tracing::error!(
+            label = %label,
+            assistant_vk_id = %id,
+            "ASSISTANT VK ORPHANED: minted for a signup that did not finish; revoke it in Bifrost, or a retry plus `llm mint` replaces it"
         );
     }
 }

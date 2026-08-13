@@ -1,9 +1,18 @@
-// LOGIN CODES, ON THE DASHBOARD. The Mac puts auth mail behind a rail icon with
-// a countdown ring on it and a whole page (`g`) behind that; a phone has neither,
-// and a login code is the single most time-critical thing in an inbox — you are
-// standing at a login form holding the phone that has the code on it.
+// LOGIN CODES, BEHIND THE KEY IN THE SITREP'S BAR. The Mac puts auth mail behind
+// a rail icon with a countdown ring on it and a whole page (`g`) behind that; the
+// phone now has the same two halves, at phone scale: a key glyph on the dashboard
+// that wears a live dot when something just landed, and this page behind it. A
+// login code is the single most time-critical thing in an inbox — you are standing
+// at a login form holding the phone that has the code on it — so what it costs to
+// reach is one tap from the surface you open the app onto.
 //
-// PRESENT, DON'T READ, exactly as the Mac does it. This zone renders sealed
+// IT IS NOT A TAB, and that is the point of moving it here. Codes are not a place
+// you live; they are a thing you look up in the ten seconds a form is waiting on
+// you and then leave. A tab spends permanent bar width on a surface that is empty
+// most days, and Quick Look (where this zone used to head the column) is a scroll
+// you would be racing a code's expiry to reach.
+//
+// PRESENT, DON'T READ, exactly as the Mac does it. This page renders sealed
 // METADATA only — who it is from, what kind, how long ago. No body is fetched to
 // draw it. Revealing is always a deliberate human tap, and it goes through the
 // same audited `revealSealed` call and the same `store.pushAuthCode` queue the
@@ -18,59 +27,54 @@
 
 import SwiftUI
 
-struct MobileAuthZone: View {
+struct MobileAuthView: View {
     @Environment(AppStore.self) private var store
 
-    /// Newer than this heads the zone and keeps its live ring. Same window the
-    /// Mac's auth page calls "last hour".
-    private static let liveWindow: TimeInterval = 60 * 60
-    /// How many rows before the zone stops growing. A dashboard zone is a
-    /// glance; the backlog is the auth page's job, and the phone has no auth
-    /// page yet, so this is deliberately a little longer than the Mac's rail.
-    private static let maxRows = 5
+    /// Newer than this keeps its live ring and reads "live". Same window the
+    /// Mac's auth page calls "last hour" — and the same one the sitrep's key
+    /// badge asks about, which is why it and `isLive` are internal rather than
+    /// private: two surfaces disagreeing about what "live" means would make the
+    /// dot and the row contradict each other.
+    static let liveWindow: TimeInterval = 60 * 60
 
-    @State private var busy: Int?
-    @State private var revealing: SealedMeta?
-
-    /// Newest first — a code you are waiting for is always the newest thing here.
-    private var rows: [SealedMeta] {
-        store.sitrep.sealed
-            .sorted { age($0.received_at) < age($1.received_at) }
-            .prefix(Self.maxRows)
-            .map { $0 }
-    }
-
-    private func age(_ iso: String?) -> TimeInterval {
+    static func age(_ iso: String?) -> TimeInterval {
         guard let d = Fmt.date(iso) else { return .greatestFiniteMagnitude }
         return Date().timeIntervalSince(d)
     }
 
+    static func isLive(_ meta: SealedMeta) -> Bool {
+        age(meta.received_at) <= liveWindow
+    }
+
+    @State private var busy: Int?
+    @State private var revealing: SealedMeta?
+
+    /// EVERY sealed message, newest first. The zone this grew out of stopped at
+    /// five because a card on a shared column is a glance; a page is the whole
+    /// list by definition, and the row you came looking for after a day away is
+    /// exactly the one a cap would have cut. The sort still puts the newest on
+    /// top, because a code you are waiting for is always the newest thing here.
+    private var rows: [SealedMeta] {
+        store.sitrep.sealed.sorted { Self.age($0.received_at) < Self.age($1.received_at) }
+    }
+
     var body: some View {
-        ZoneCard(
-            symbol: "key.fill", title: "Login codes", count: store.sitrep.sealed.count,
-            subtitle: "sealed · revealing is audited", tint: Palette.lock
-        ) {
-            if rows.isEmpty {
-                // Always on the board, empty or not — the same reason the
-                // newsletters zone states: a card that vanishes reads as a
-                // missing feature rather than as "nothing right now".
-                Text("No codes or sign-in mail waiting.")
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.inkFaintest)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 4)
-            } else {
-                VStack(spacing: 2) {
-                    ForEach(rows) { meta in
-                        AuthRow(
-                            meta: meta,
-                            live: age(meta.received_at) <= Self.liveWindow,
-                            busy: busy == meta.id,
-                            onReveal: { Task { await reveal(meta) } })
-                    }
-                }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                masthead
+                codes
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 28)
         }
+        .background(Palette.canvas)
+        .navigationTitle("Login Codes")
+        .navigationBarTitleDisplayMode(.inline)
+        // The sealed list rides the sitrep pull, not the zones fetch, and this
+        // page's one promise is "the code you are waiting for, now". A
+        // pull-to-refresh that could not fetch a just-arrived code would betray
+        // the only reason anyone opens it.
+        .refreshable { _ = await SitrepPoller.shared.pull() }
         // The one-time panel for kinds with no digits to present. A full-screen
         // cover rather than a sheet: it renders a sandboxed web body, and a
         // half-height card is not a reading surface.
@@ -78,6 +82,60 @@ struct MobileAuthZone: View {
             RevealPanel(meta: meta) { revealing = nil }
                 .background(Palette.canvas.ignoresSafeArea())
         }
+    }
+
+    /// The one serif line on this screen, and under it the sentence the zone
+    /// carried as a card subtitle. Both halves of that line are load-bearing
+    /// promises rather than decoration, so they survive the move verbatim.
+    private var masthead: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("login codes")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.accent)
+                .textCase(.uppercase)
+                .tracking(0.6)
+            Text("Held sealed until you ask.")
+                .font(Typo.hero(26))
+                .foregroundStyle(Palette.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("sealed · revealing is audited")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 4)
+    }
+
+    /// One glass pane holding the rows, rather than the `ZoneCard` the zone
+    /// used: a card's header earns its space by naming its contents while three
+    /// other cards sit beside it, and this screen has no beside. The nav title
+    /// and the masthead say it once.
+    private var codes: some View {
+        VStack(spacing: 2) {
+            if rows.isEmpty {
+                // Stated, not omitted — the same reason the zone gave: a surface
+                // that renders nothing reads as broken rather than as "nothing
+                // right now", and this one is reached by a deliberate tap.
+                Text("No codes or sign-in mail waiting.")
+                    .font(Typo.rowSub)
+                    .foregroundStyle(Palette.inkFaintest)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(rows) { meta in
+                    AuthRow(
+                        meta: meta,
+                        live: Self.isLive(meta),
+                        busy: busy == meta.id,
+                        onReveal: { Task { await reveal(meta) } })
+                }
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .passbandGlass(.pane, cornerRadius: 18, tint: Palette.lock.opacity(0.12))
     }
 
     /// The desktop `reveal(_:)`, verbatim in shape: code kinds resolve to digits,

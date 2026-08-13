@@ -1604,6 +1604,15 @@ final class AppStore {
         inlineReply = nil
     }
 
+    // MARK: - assistant relay
+
+    /// Whether the ⌘K assistant can go through the daemon instead of a local
+    /// key. Read off the sitrep stats — /client/stats is already the connect
+    /// probe and SitrepPoller keeps it fresh, so no extra fetch exists for
+    /// this. A self-host daemon never says `assistant_relay`, and nil means
+    /// the switch is simply not offered (same posture as `trackingAvailable`).
+    var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
+
     // MARK: - read tracking
 
     /// Whether a composer may offer the pixel at all. A daemon with no tracking
