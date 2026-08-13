@@ -117,11 +117,17 @@ targets:
           # --- phase 4: the remaining destinations ------------------------
           # The rail is the Mac's navigation model; the phone's is the tab bar.
           - "Views/SidebarRail.swift"
-          # All three render inside RoutedHeader, which lives in the excluded
+          # Both render inside RoutedHeader, which lives in the excluded
           # App/RootView.swift. Nothing else about them is macOS-only.
+          #
+          # SettingsView is NOT on this list any more. Its desktop chrome — the
+          # routed header and the 158pt sub-nav column — is fenced behind
+          # #if os(macOS), and the fifteen section structs it declares are now
+          # internal, so Sources/PassbandiOS/Views/AccountPage.swift composes
+          # THE SAME sections behind a navigation list. Settings that forked
+          # into two implementations would drift within a week.
           - "Views/AuthView.swift"
           - "Views/UsageView.swift"
-          - "Views/SettingsView.swift"
       - path: Sources/PassbandiOS
       # The same fonts and chimes the Mac ships, but NOT as one `Resources`
       # folder reference the way the macOS target takes them. An iOS bundle is
