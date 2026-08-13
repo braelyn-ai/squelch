@@ -236,6 +236,34 @@ If Test fails, jump to troubleshooting below; the error text names the cause.
 
 ## 6. Optional extras
 
+**The console.** The daemon serves a small web console for itself at
+`http://<nas-ip>:8848/console` — the address the client uses, plus `/console`. It
+is where you see what this mailbox is doing and manage the devices allowed to
+reach it: mint a pairing code for a new one, revoke one you have lost.
+
+Signing in is the pairing code you already met in step 5. Run this on the NAS:
+
+```sh
+docker compose exec -u squelch squelchd squelchd pair
+```
+
+and type the `XXXX-XXXX` code into the page. The browser then IS a paired device:
+the session cookie is an ordinary device token, so it appears in
+`squelchd token list` under the name `console` and
+`squelchd token revoke <id>` ends that session for good. Signing out revokes it
+too. The same ten-minute, one-shot, burns-after-a-few-wrong-guesses rules apply
+to the code.
+
+Hosted Passband shows a "Continue with Google" button on this page as well. That
+is a hosted-only hop through the signup service, because Google will not accept a
+redirect URI per tenant subdomain, and it appears only when
+`SQUELCH_CONSOLE_SSO_URL` is set — which a self-host does not set. On your own
+daemon the console is the code form, and it is the same credential either way.
+
+One caveat: on plain HTTP over the LAN, that session cookie travels in the clear
+like the bearer token does. If that bothers you, the Tailscale route from step 2
+is what puts the console behind TLS.
+
 **Write actions.** Archive, label, and send need a second credential that only
 the human door's action handlers load. Sync and triage never touch it, and the
 agent door has no write tools at all. Mint it by exporting with `--write`, which

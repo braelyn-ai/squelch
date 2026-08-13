@@ -75,6 +75,7 @@ enum Analytics {
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
+        "tour_completed", "tour_skipped",
     ]
 
     /// The counter events that ride at `minimal`: anonymous counts and
@@ -90,6 +91,10 @@ enum Analytics {
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
+        // Onboarding carries one number, the step it ended on. Whether the
+        // first run explains itself is exactly the "does the product work"
+        // question this level exists for.
+        "tour_completed", "tour_skipped",
     ]
 
     /// The closed set of STRING property values allowed off the machine.

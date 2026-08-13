@@ -73,6 +73,23 @@ pub fn deep_link(tenant_url: &str, pair_code: &str) -> String {
     )
 }
 
+/// Where a finished console login sends the browser: the tenant's own console,
+/// carrying the pairing code it will claim.
+///
+/// BUILT HERE FROM TWO THINGS THIS DEPLOYMENT OWNS, and that is the whole reason
+/// the console-login route takes no return URL: `tenant_url` comes from this
+/// deployment's configured base domain and a label this crate validated, and the
+/// code is the warden's answer, shape-checked and then percent-encoded. There is
+/// no caller-supplied string anywhere in the result, so there is no open
+/// redirect to find. A `?next=` parameter would have been one line and a
+/// standing invitation.
+pub fn console_callback_url(tenant_url: &str, pair_code: &str) -> String {
+    format!(
+        "{tenant_url}/console/callback?code={}",
+        percent_encode(pair_code)
+    )
+}
+
 /// The shell every page shares.
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let title = escape_html(title);
@@ -234,6 +251,61 @@ device in.</p>"#,
     )
 }
 
+/// The console login's own problem page: the same shell as [`problem`] with NO
+/// link out.
+///
+/// Two reasons it is not [`problem`]. The link there goes to the signup form,
+/// which is the wrong place to send somebody who already has a mailbox and was
+/// trying to sign in to it. And the only honest link back would be built from
+/// the label this request named, which on a uniform refusal is a label that may
+/// not exist: rendering it would answer, in an `href`, the question the refusal
+/// exists to leave unanswered.
+pub fn console_problem(status: StatusCode, heading: &str, detail: &str) -> Response {
+    page(
+        status,
+        heading,
+        &format!(
+            r#"<h1>{heading}</h1>
+<p>{detail}</p>"#,
+            heading = escape_html(heading),
+            detail = escape_html(detail),
+        ),
+    )
+}
+
+/// The console's problem page WITH the one link that is always right on it:
+/// back to the console this sign in was for.
+///
+/// Used where the label is one this service MINTED into a session of its own
+/// (an expired console login, a replayed callback, a cookie that does not match
+/// its session), so the `href` echoes nothing a stranger chose and answers
+/// nothing about which addresses exist: it is the address the person already
+/// typed, handed back. [`console_problem`] stays link-free for the refusals that
+/// turn on identity, where the only link available would be built from a label
+/// the refusal exists to say nothing about.
+///
+/// NEVER the signup form. Somebody signing in to a mailbox they already own is
+/// not somebody to send off to make a second one.
+pub fn console_problem_with_link(
+    status: StatusCode,
+    heading: &str,
+    detail: &str,
+    console_url: &str,
+) -> Response {
+    page(
+        status,
+        heading,
+        &format!(
+            r#"<h1>{heading}</h1>
+<p>{detail}</p>
+<p><a class="button" href="{url}">Back to your console</a></p>"#,
+            heading = escape_html(heading),
+            detail = escape_html(detail),
+            url = escape_html(console_url),
+        ),
+    )
+}
+
 /// Something went wrong after the user left for Google. `status` is the HTTP
 /// status; `detail` is a sentence a person can act on and never a machine
 /// reason.
@@ -338,6 +410,35 @@ mod tests {
         assert!(!html.contains("<script"));
     }
 
+    /// The console redirect is assembled from a validated tenant URL and a
+    /// validated code, and the code is encoded on the way in: nothing in it can
+    /// end the parameter it sits in or start a second one.
+    #[test]
+    fn builds_the_console_callback_from_its_own_parts() {
+        assert_eq!(
+            console_callback_url("https://ada.passband.email", "ABCD-EFGH"),
+            "https://ada.passband.email/console/callback?code=ABCD-EFGH"
+        );
+        assert_eq!(
+            console_callback_url("https://ada.passband.email", "A&next=https://evil.test"),
+            "https://ada.passband.email/console/callback?code=A%26next%3Dhttps%3A%2F%2Fevil.test"
+        );
+    }
+
+    /// The console refusal links nowhere: the only link it could offer would be
+    /// built from a label the refusal is deliberately saying nothing about.
+    #[tokio::test]
+    async fn the_console_refusal_offers_no_way_onward() {
+        let html = body_of(console_problem(
+            StatusCode::BAD_REQUEST,
+            "Nope",
+            "Try again.",
+        ))
+        .await;
+        assert!(!html.contains("<a "), "{html}");
+        assert!(!html.contains("href"), "{html}");
+    }
+
     /// House rule: no em dashes in anything a person reads.
     #[tokio::test]
     async fn no_em_dashes_in_user_facing_copy() {
@@ -345,6 +446,7 @@ mod tests {
             body_of(signup_form("passband.email", "ada", "ABCD-EFGH", Some("no"))).await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
+            body_of(console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
         ] {
             assert!(!html.contains('\u{2014}'), "{html}");
         }
@@ -356,6 +458,7 @@ mod tests {
             signup_form("passband.email", "", "", None),
             success("https://ada.passband.email", "ABCD-EFGH", 10),
             problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
+            console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
         ] {
             let h = r.headers().clone();
             assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");

@@ -282,7 +282,17 @@ struct ModalCard<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) { content }
             .padding(18)
-            .frame(width: width)
+            // A MEASURE ON THE MAC, A CEILING ON THE PHONE. Every card in this app
+            // is sized to read well at a desk, and the narrowest of them is still
+            // wider than a phone — so on iOS the number becomes the most it may
+            // take rather than what it takes, and the screen decides the rest.
+            // Same treatment ConnectView's 440 got when the phone target landed.
+            #if os(macOS)
+                .frame(width: width)
+            #else
+                .frame(maxWidth: width)
+                .padding(.horizontal, 12)
+            #endif
             .passbandGlass(.pane, cornerRadius: 20, tint: tint)
             .shadow(color: .black.opacity(0.28), radius: 40, y: 18)
     }

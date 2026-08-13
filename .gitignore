@@ -13,3 +13,7 @@ cred.txt
 # Signing material must never land in git: Sparkle EdDSA key and Developer ID bundle.
 sparkle-key.txt
 passband/Certificates.p12
+
+# Session-local Claude state: permission settings, saved workflows, and (for
+# sessions that use them) entire git worktrees. Machine-local by nature.
+.claude/

@@ -62,26 +62,33 @@ let historyCap = 50
 /// Which page the emails tab shows. `inbox` is the flat all-tiers list; `noise`
 /// is the spam-folder equivalent — the same rows and the same verbs, narrowed to
 /// the noise tier BY THE DAEMON so nothing has to be discarded client-side.
+/// `sent` is the odd one out: outbound mail, off its own route, with none of the
+/// triage verbs (nothing triaged it, and nothing can resolve it).
 enum MailMode: String, Sendable, Hashable, CaseIterable {
-    case inbox, noise
+    case inbox, noise, sent
 
     /// The page's name — the header title and the segmented control both.
     var label: String {
         switch self {
         case .inbox: "all mail"
         case .noise: "noise"
+        case .sent: "sent"
         }
     }
 
-    /// Server-side tier filter for the page; nil = every tier.
+    /// Server-side tier filter for the page; nil = every tier. Nil for `sent`
+    /// too, but vacuously: that page never goes to /client/updates at all, so
+    /// there is no tier to narrow.
     var tier: Tier? {
         switch self {
-        case .inbox: nil
+        case .inbox, .sent: nil
         case .noise: .noise
         }
     }
 
-    /// What `n` flips to, so the key is one binding rather than two.
+    /// What `n` flips to, so the key is one binding rather than two. It stays
+    /// the inbox/noise flip from every page: from `sent`, `n` dips into noise
+    /// exactly as it would from the inbox.
     var flipped: MailMode { self == .noise ? .inbox : .noise }
 }
 
@@ -271,8 +278,28 @@ struct RuleEditorRequest: Identifiable, Sendable {
     var want: String?
     /// Explicit match_pattern override; wins over deriving from `sender`.
     var pattern: String?
+    /// TAKES THE SAVE OVER. Set, the editor hands it the body it built and
+    /// stops there: no POST, no analytics, no rule. The onboarding tour is the
+    /// only caller — its rule is a demonstration, and a real write would both
+    /// invent a rule nobody asked for and 403 on a read-only daemon.
+    var intercept: (@MainActor @Sendable (CreateRuleBody) -> Void)?
     /// Called after a successful save so the opener re-fetches its list.
     var onSaved: (@MainActor @Sendable () -> Void)?
+}
+
+/// The open thread, reduced to what the ⌘K agent needs to be told about it:
+/// which email the person is looking at, and the id every thread-level verb in
+/// the reader already targets. A named struct rather than a tuple because it is
+/// an `@Observable` property, and lifted out of the viewer because the ask bar
+/// is a modal ABOVE it with no other way to see what it holds.
+struct OpenThreadSummary: Sendable, Equatable {
+    /// WHICH THREAD THIS DESCRIBES. Carried so a reader can check the summary
+    /// against the thread actually open rather than trust that the last writer
+    /// won — a slow fetch lands whenever it lands. See `currentThreadSummary`.
+    var threadId: String
+    var subject: String
+    /// The NEWEST message in the thread — see ThreadViewer's `newest`.
+    var newestMessageId: Int
 }
 
 // MARK: - the store
@@ -342,6 +369,32 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
+    /// What that thread IS, once it has landed — written by the viewer. nil
+    /// while a thread is loading. READ IT THROUGH `currentThreadSummary`: this
+    /// is the raw last write, and the writer is a network callback.
+    var openThreadSummary: OpenThreadSummary?
+    /// The summary ONLY IF it describes the thread that is open. The viewer
+    /// writes it from a fetch callback, so a slow load can land after the user
+    /// has moved on; `openThread` clears the stale one on the way out, and this
+    /// is the second lock on the same door — the ask bar pins what it reads
+    /// here into a prompt, where a subject and a message id belonging to
+    /// another email would be a lie told confidently.
+    var currentThreadSummary: OpenThreadSummary? {
+        guard let threadId, let summary = openThreadSummary, summary.threadId == threadId
+        else { return nil }
+        return summary
+    }
+    /// Bumped when a sync brings a message NEWER than the one the reader holds
+    /// into the thread on screen — see SitrepPoller.performPull. The viewer
+    /// watches it and refetches without moving the reading position.
+    ///
+    /// A token rather than the mail itself: the poller reads the attention
+    /// bands, which say a thread moved but not what it now contains, and the
+    /// viewer is the one place that knows how to adopt a thread. It is also why
+    /// nothing resets it — a counter only has to CHANGE, so a thread switch
+    /// under a live token is a viewer that simply never hears about the bump it
+    /// no longer cares about.
+    var openThreadRefreshToken = 0
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
@@ -362,6 +415,10 @@ final class AppStore {
     /// transcript survives until the user asks for a new chat.
     let assistant = AssistantSession()
     var shortcutsOpen = false
+    /// The first-run tour. Held here for the same reason the assistant is: it
+    /// outlives every view it draws itself in, and the trigger that starts it
+    /// (the first sync of the session) fires from the shell, not from a step.
+    let tour = TourController()
 
     // MARK: undo / toasts
     var undos: [PendingUndo] = []
@@ -922,11 +979,9 @@ final class AppStore {
         HeroCache.shared.wipe()
         AttachmentThumbs.shared.wipe()
         FrameHeights.shared.wipeAll()
-        #if os(macOS)
-            // The reader's live-frame pool. `EmailFrames` is its one door from
-            // outside EmailWebView.swift.
-            EmailFrames.wipeAll()
-        #endif
+        // The reader's live-frame pool. In EmailWebCore, which both targets
+        // compile, so no platform fence.
+        WebFramePool.shared.wipeAll()
         ImageWarmer.shared.resetForSwitch()
         AuthArrival.shared.resetForSwitch()
         // AuthDecisions.reload() is NOT here — see switchAccount step (8).
@@ -1049,6 +1104,12 @@ final class AppStore {
                 "via_reply": replyTo != nil,
                 "from_noise": activeView == .emails && mailMode == .noise,
             ])
+        // A DIFFERENT thread drops the summary NOW rather than when the new one
+        // lands: in that gap the reader is showing thread B while this still
+        // described A, and the ask bar would pin B's id under A's subject and
+        // A's message id. Same-thread reopens keep it — the viewer is already
+        // mounted and may never re-adopt.
+        if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
         self.threadQueue = queue
         // HERE, not in the search panel's open path: the reader can be opened
@@ -1069,6 +1130,7 @@ final class AppStore {
     func closeThread() {
         threadId = nil
         threadQueue = []
+        openThreadSummary = nil
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
@@ -1081,9 +1143,13 @@ final class AppStore {
     /// overlays on one. The reader's `inlineReply` is absent for the same reason:
     /// it is part of the viewer, and blurring the email you are answering would
     /// be absurd.
+    /// The tour joins on `wantsBlur` alone: its three talking steps are modals
+    /// like any other, but its coach marks POINT AT the board, so blurring what
+    /// they are ringing would defeat them.
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
+            || tour.wantsBlur
     }
 
     // MARK: - sitrep zones
@@ -1205,6 +1271,9 @@ final class AppStore {
 
     /// One page's rows. Never fetched reads as LOADING, so the first paint of a
     /// page shows "loading" rather than claiming it is empty.
+    ///
+    /// INBOX AND NOISE ONLY — `.sent` holds a different wire type and lives in
+    /// `sentPage`; asking here for it answers a permanent "loading".
     func mailPage(_ mode: MailMode) -> Loadable<[AttentionUpdate]> {
         mailPages[mode] ?? .loading
     }
@@ -1292,6 +1361,63 @@ final class AppStore {
     private static func receivedTS(_ u: AttentionUpdate) -> Double {
         guard let s = u.surfaced_at else { return .greatestFiniteMagnitude }
         return Fmt.date(s)?.timeIntervalSince1970 ?? 0
+    }
+
+    // MARK: - the sent page
+
+    /// The sent page's rows, in their OWN cache rather than a third `mailPages`
+    /// entry. `SentItem` is a different fact: recipients instead of a sender,
+    /// opens instead of a tier, and no status at all — forcing it into
+    /// `AttentionUpdate` would mean inventing triage answers for mail nothing
+    /// triaged. It lives in the store for the same reason the other two pages
+    /// do: `@State` dies on navigate-away, and this list would refetch from
+    /// blank on every visit.
+    private var sentRows: Loadable<[SentItem]> = .loading
+    /// Freshness + in-flight fetch, the sent half of `mailLoadedAt`/`mailRefreshes`.
+    private var sentLoadedAt: Date?
+    private var sentRefresh: Task<Void, Never>?
+
+    var sentPage: Loadable<[SentItem]> { sentRows }
+
+    /// Same TTL-plus-join shape as `refreshMail`, for the same reasons: a
+    /// revisit inside the window is free, and a mount landing on the same tick
+    /// as the poll costs one fetch rather than two.
+    func refreshSent(force: Bool = false) async {
+        if !force, let loadedAt = sentLoadedAt,
+            Date().timeIntervalSince(loadedAt) < Self.mailTTL
+        {
+            return
+        }
+        if let running = sentRefresh {
+            await running.value
+            if !force { return }
+        }
+        let refresh = Task { await performSentRefresh() }
+        sentRefresh = refresh
+        await refresh.value
+        if sentRefresh == refresh { sentRefresh = nil }
+    }
+
+    private func performSentRefresh() async {
+        sentRows.isLoading = true
+        do {
+            let page = try await APIClient.shared.listSent(limit: Self.mailLimit)
+            // THE SERVER'S ORDER IS THE ORDER (received_at DESC, id DESC): no
+            // client-side sort, and no `resolvedIds` subtraction either — sent
+            // mail is a record of what went out, and none of the triage verbs
+            // can take a row off it.
+            //
+            // Assigned only on a real change, like the mail pages: the poll
+            // re-runs this, and an identical assignment re-renders every row.
+            if page.items != sentRows.value { sentRows.value = page.items }
+            sentRows.error = nil
+            sentLoadedAt = Date()
+            ThreadPrefetch.shared.warm(
+                page.items.prefix(Self.mailWarmRows).map(\.thread_id), immediate: 5)
+        } catch {
+            sentRows.error = errText(error, "load failed")
+        }
+        sentRows.isLoading = false
     }
 
     /// Preload the emails behind the records the columns show, so clicking one

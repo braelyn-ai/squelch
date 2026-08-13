@@ -20,28 +20,49 @@ struct TriageFixPalette: View {
     private var hits: [TriageTarget] { TriageTargets.match(query) }
 
     var body: some View {
-        OverlayScrim(alignment: .top, topInset: 110, onDismiss: onClose) {
-            GlassEffectContainer(spacing: 8) {
-                VStack(alignment: .leading, spacing: 0) {
-                    header
-                    wasRow
-                    input
-                    Divider().overlay(Palette.hairline)
-                    list
-                    footer
-                }
-                .frame(width: 560)
-                .passbandGlass(
-                    .pane, cornerRadius: 20, tint: Palette.glassTintStrong,
-                    id: "palette", in: paletteGlass)
-                .shadow(color: .black.opacity(0.32), radius: 46, y: 20)
+        surface
+            .keyContext(.modal)
+            .keyBindings(.modal, bindings)
+            .onAppear { focused = true }
+            .onChange(of: hits.count) { _, count in
+                selection = max(0, min(selection, max(0, count - 1)))
             }
-        }
-        .keyContext(.modal)
-        .keyBindings(.modal, bindings)
-        .onAppear { focused = true }
-        .onChange(of: hits.count) { _, count in
-            selection = max(0, min(selection, max(0, count - 1)))
+    }
+
+    /// The palette itself. Same rows, same input, same apply — only the thing it
+    /// is mounted IN differs: a command bar hanging under the Mac's chrome, or
+    /// the phone's sheet, which brings its own scrim and its own dismissal.
+    @ViewBuilder
+    private var surface: some View {
+        #if os(macOS)
+            OverlayScrim(alignment: .top, topInset: 110, onDismiss: onClose) {
+                GlassEffectContainer(spacing: 8) {
+                    palette
+                        .frame(width: 560)
+                        .passbandGlass(
+                            .pane, cornerRadius: 20, tint: Palette.glassTintStrong,
+                            id: "palette", in: paletteGlass)
+                        .shadow(color: .black.opacity(0.32), radius: 46, y: 20)
+                }
+            }
+        #else
+            palette
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .background(Palette.canvas.ignoresSafeArea())
+                // The keyboard is up the moment this opens — the field autofocuses
+                // — so the list has to be able to get out from under it.
+                .presentationDetents([.large])
+        #endif
+    }
+
+    private var palette: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            wasRow
+            input
+            Divider().overlay(Palette.hairline)
+            list
+            footer
         }
     }
 
@@ -145,14 +166,21 @@ struct TriageFixPalette: View {
 
     private var footer: some View {
         HStack(spacing: 4) {
-            Kbd("↑"); Kbd("↓")
-            Text("pick").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            Text("·").foregroundStyle(Palette.inkFaintest)
-            Kbd("↵")
-            Text("apply").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            Text("·").foregroundStyle(Palette.inkFaintest)
-            Kbd("esc")
-            Text("cancel").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            // Three keycaps for three keys the phone does not have. There, the
+            // rows are the pick, the tap is the apply, and pulling the sheet down
+            // is the cancel — all of it already visible.
+            #if os(macOS)
+                Kbd("↑"); Kbd("↓")
+                Text("pick").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                Text("·").foregroundStyle(Palette.inkFaintest)
+                Kbd("↵")
+                Text("apply").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                Text("·").foregroundStyle(Palette.inkFaintest)
+                Kbd("esc")
+                Text("cancel").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            #else
+                Text("tap to apply").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            #endif
             Spacer()
             Text("stored to refine triage")
                 .font(Typo.micro)

@@ -338,6 +338,10 @@ impl Harness {
             token_url: format!("{google}/token"),
             auth_url: format!("{google}/authorize"),
             profile_url: format!("{google}/profile"),
+            // Never reached on this flow: a signup's mailbox comes from Gmail's
+            // profile endpoint, which is what its own grant permits. The console
+            // login is the one that reads userinfo (`tests/console_auth.rs`).
+            userinfo_url: format!("{google}/userinfo"),
         };
 
         let store = ControlStore::open_in_memory().unwrap();
@@ -548,6 +552,12 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
         "{consent_url}"
     );
     assert!(consent_url.contains("code_challenge_method=S256"));
+    // ...and offline access, which is what makes Google return the refresh token
+    // this whole flow exists to seal. Asserted here because the scope set and
+    // these parameters are now chosen per flow, and the console login asks for
+    // neither.
+    assert_eq!(query_param(&consent_url, "access_type"), "offline");
+    assert_eq!(query_param(&consent_url, "prompt"), "consent");
 
     // Hold the exchange to the PKCE challenge that rode on THIS consent URL,
     // so the verifier is proven rather than merely present.

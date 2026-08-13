@@ -72,7 +72,14 @@ struct RevealPanel: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
             }
-            .frame(width: 720)
+            // A Mac sizes this against the window it floats in; a phone has one
+            // measure and the panel takes it.
+            #if os(macOS)
+                .frame(width: 720)
+            #else
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 12)
+            #endif
             .passbandGlass(.pane, cornerRadius: 20, tint: Palette.lockSoft.opacity(0.85))
             .shadow(color: .black.opacity(0.32), radius: 46, y: 20)
         }
@@ -92,10 +99,19 @@ struct RevealPanel: View {
             Text("sensitive · one-time reveal · not stored")
                 .font(Typo.micro)
             Spacer()
-            HStack(spacing: 4) {
-                Kbd("esc")
-                Text("close").font(Typo.micro)
-            }
+            // The keycap is the Mac's exit. A phone taps the scrim, and a hint
+            // naming a key it has no way to press is worse than no hint.
+            #if os(macOS)
+                HStack(spacing: 4) {
+                    Kbd("esc")
+                    Text("close").font(Typo.micro)
+                }
+            #else
+                Button("close", action: onClose)
+                    .font(Typo.micro)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Palette.lock)
+            #endif
         }
         .foregroundStyle(Palette.lock)
         .padding(.horizontal, 16)

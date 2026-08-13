@@ -176,6 +176,16 @@ pub trait Warden: Send + Sync {
     /// The tenant's state, or `None` when the warden has never heard of it.
     /// Used before consent to check that a label is free.
     async fn status(&self, label: &str) -> Result<Option<TenantStatus>, WardenError>;
+
+    /// Mint a FRESH pairing code for a tenant that already exists, by running
+    /// `squelchd pair` inside its pod.
+    ///
+    /// The console login's last step, and the reason that login needs no new
+    /// credential of its own: the ticket it hands the browser is an ordinary
+    /// pairing code, one-shot and short-lived, which the daemon claims into an
+    /// ordinary device token. A browser is just another paired device, so
+    /// revocation, audit, and expiry are the ones already shipped.
+    async fn pair(&self, label: &str) -> Result<Pairing, WardenError>;
 }
 
 /// The real client: one reqwest client, one bearer, one base URL.
@@ -297,6 +307,39 @@ impl Warden for HttpWarden {
             // with it. It collapses into the generic retriable failure so the
             // page says "not finished yet" instead of blaming their input.
             422 => Err(WardenError::Failed),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
+    async fn pair(&self, label: &str) -> Result<Pairing, WardenError> {
+        // Into a URL path again, so validated again, for the reason spelled out
+        // on call 2: "somebody upstream checked it" is how a `../` reaches a path.
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+
+        // NO BODY. The tenant is the whole request, and the answer is a live
+        // pairing code, so nothing about this call may be logged.
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/tenants/{label}/pair")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| WardenError::Unreachable)?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let body = read_capped(resp).await?;
+                let pairing: Pairing =
+                    serde_json::from_slice(&body).map_err(|_| WardenError::BadPairing)?;
+                validate_pairing(&pairing)?;
+                Ok(pairing)
+            }
+            401 | 403 => Err(WardenError::Unauthorized),
+            // The tenant is gone, or never existed. This crate's own record said
+            // otherwise, which is drift worth its own variant rather than a
+            // generic failure.
+            404 => Err(WardenError::UnknownTenant),
+            422 => Err(WardenError::LabelRefused),
             _ => Err(WardenError::Failed),
         }
     }
@@ -477,6 +520,65 @@ mod tests {
                 matches!(w.status(bad).await, Err(WardenError::LabelRefused)),
                 "{bad:?}"
             );
+            assert!(
+                matches!(w.pair(bad).await, Err(WardenError::LabelRefused)),
+                "{bad:?}"
+            );
         }
+    }
+
+    /// The pairing route answers with the same shape call 2 does, and it is held
+    /// to the same standard: a code this crate would not render is a refusal,
+    /// not something to put in a redirect.
+    #[tokio::test]
+    async fn a_pairing_answer_is_validated_like_every_other() {
+        use axum::{Router, routing::post};
+
+        let app = Router::new()
+            .route(
+                "/v1/tenants/good/pair",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "pair_code": "ABCD-EFGH",
+                        "pair_url": "https://good.passband.test",
+                        "deep_link": "passband://pair?url=x&code=ABCD-EFGH",
+                    }))
+                }),
+            )
+            .route(
+                "/v1/tenants/bad/pair",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "pair_code": "<script>alert(1)</script>",
+                        "pair_url": "https://bad.passband.test",
+                        "deep_link": "passband://pair",
+                    }))
+                }),
+            )
+            .route(
+                "/v1/tenants/gone/pair",
+                post(|| async { axum::http::StatusCode::NOT_FOUND }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let w = HttpWarden::new(
+            format!("http://{addr}"),
+            "token".into(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(w.pair("good").await.unwrap().pair_code, "ABCD-EFGH");
+        assert!(matches!(
+            w.pair("bad").await,
+            Err(WardenError::BadPairing)
+        ));
+        assert!(matches!(
+            w.pair("gone").await,
+            Err(WardenError::UnknownTenant)
+        ));
     }
 }

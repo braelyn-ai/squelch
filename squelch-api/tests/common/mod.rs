@@ -98,8 +98,21 @@ pub fn msg(account_id: i64, gmail: &str, thread: &str, subject: &str, body: &str
         body: body.to_string(),
         body_html: None,
         is_sent: false,
+        to_addrs: None,
         list_unsubscribe: None,
         list_unsub_one_click: false,
         auth_pass: None,
+    }
+}
+
+/// The outbound counterpart of [`msg`]: a message the account SENT, carrying the
+/// display recipients the sent listing reads.
+pub fn sent_msg(account_id: i64, gmail: &str, thread: &str, subject: &str, to: &str) -> NewMessage {
+    NewMessage {
+        from_addr: "me@example.com".to_string(),
+        from_name: Some("Me".to_string()),
+        is_sent: true,
+        to_addrs: Some(to.to_string()),
+        ..msg(account_id, gmail, thread, subject, "what I wrote")
     }
 }

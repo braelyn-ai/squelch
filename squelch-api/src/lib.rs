@@ -6,6 +6,7 @@
 //! docs/SECURITY.md §4.
 
 mod auth;
+mod console;
 mod devices;
 mod error;
 mod events;
@@ -41,10 +42,29 @@ use axum::{
 ///
 /// Nothing else is ever added to either. Everything in [`client_router`] is
 /// behind the bearer.
+///
+/// `/console` ([`console::console_router`]) is the third tree, and the only one
+/// authenticated by a COOKIE rather than a header. It sits outside the bearer
+/// layer (signing in has to be possible without a credential) and outside the
+/// `/client` CORS layer (a browser attaches a cookie by itself, so the
+/// permissive CORS the JSON tree can afford would be a gift to any page on the
+/// web). What it authenticates with is not a new credential: a console session
+/// IS a device token, verified by the same store call.
 pub fn router(state: ApiState) -> Router {
     client_router(state.clone())
         .merge(pair::pair_router(state.clone()))
+        .merge(console::console_router(state.clone()))
         .merge(tracking::pixel_router(state))
+        // The bare root: a browser typing the tenant hostname lands on the
+        // console's login page instead of a 404. A redirect carries nothing,
+        // so it needs no auth; on hosted the Ingress publishes "/" as an
+        // EXACT match so this stays the only extra path a vhost serves.
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::response::Redirect::temporary("/console")
+            }),
+        )
 }
 
 /// The `/client/*` router. Bearer auth is layered over every route in it: the
@@ -66,6 +86,10 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/banking", get(handlers::get_banking))
         .route("/client/calendar", get(handlers::get_calendar))
         .route("/client/search", get(handlers::search))
+        // The user's own sent mail. Human door only — this is the one listing
+        // that reads `is_sent = 1`, and the agent door gets no such route: what
+        // the user writes is not the agent's to page through.
+        .route("/client/sent", get(handlers::get_sent))
         .route("/client/rules", get(handlers::list_rules))
         .route("/client/rules", post(handlers::create_rule))
         .route("/client/rules/{id}", put(handlers::update_rule))

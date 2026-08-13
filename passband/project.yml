@@ -91,27 +91,28 @@ targets:
           - "App/**"
           # Sparkle. iOS has no sideloaded updater; the App Store is the updater.
           - "Model/Updater.swift"
-          # --- phase 2: the reader ---------------------------------------
-          # WKWebView hosted through an NSViewRepresentable, plus the whole
-          # body-preparation pipeline nested inside it (EmailWebView.Prepared).
+          # The AppKit HALF of the reader, and only that: an NSViewRepresentable
+          # plus the WKWebView subclass that hands the scroll wheel back to the
+          # column. Everything the reader is made of — the body-preparation
+          # pipeline, the sandbox configuration, the measuring bridge, the frame
+          # pool and the SwiftUI EmailWebView itself — lives in
+          # Views/EmailWebCore.swift and compiles here; the UIKit twin is
+          # Sources/PassbandiOS/Views/EmailWebViewiOS.swift.
           - "Views/EmailWebView.swift"
-          # Needs EmailWebView.
-          - "Views/ThreadViewer.swift"
-          - "Views/RevealPanel.swift"
-          # NSSavePanel (Downloads.saveBytes is macOS-fenced) + a PDFView
-          # NSViewRepresentable. iOS saves through a document picker instead.
-          - "Views/AttachmentStrip.swift"
-          # --- phase 3: composing + the assistant -------------------------
-          # NSTextView representable — the markdown editor the composers use.
+          # --- phase 4: composing + the assistant -------------------------
+          # The AppKit HALF of the markdown editor, and only that: the scanner
+          # (Lib/Markdown.swift) and the span → attributes pass
+          # (Views/MarkdownStyle.swift) compile here, and the UIKit twin is
+          # Sources/PassbandiOS/Views/MarkdownTextViewiOS.swift, which declares
+          # `MarkdownTextView` under the same name so no composer forks.
           - "Views/MarkdownTextView.swift"
-          # Needs MarkdownTextView.
-          - "Views/ComposePane.swift"
-          # Needs MarkdownTextView, ThreadViewer and ComposePane's summary rows.
-          - "Views/InlineReply.swift"
           # Needs ComposePane's ComposeSummaryRow.
           - "Views/AskBar.swift"
-          # Needs AskBar. Otherwise portable — the toasts, the palettes and the
-          # tour overlay it hosts all compile here already.
+          # Needs AskBar. Otherwise portable — the palettes and the tour overlay
+          # it hosts all compile here already, and its TOAST half is re-laid-out
+          # for a thumb (over the tab bar, undo as a button) in
+          # Sources/PassbandiOS/Views/MobileToastHost.swift, off the same
+          # store.toasts / store.undos state.
           - "Views/ActionLayer.swift"
           # --- phase 4: the remaining destinations ------------------------
           # The rail is the Mac's navigation model; the phone's is the tab bar.
@@ -139,6 +140,10 @@ targets:
         buildPhase: resources
       - path: Sources/Passband/Resources/newsreader-italic-var.ttf
         buildPhase: resources
+      # The same Icon Composer document the Mac ships. Its squares are
+      # "shared", so actool renders the one design for both platforms.
+      - path: Passband.icon
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.passband.client.ios
@@ -163,6 +168,14 @@ targets:
         CODE_SIGN_IDENTITY[config=Release]: "-"
         ENABLE_HARDENED_RUNTIME: NO
         ENABLE_HARDENED_RUNTIME[config=Release]: NO
+        # A physical iPhone refuses ad-hoc signatures, so device builds (and
+        # only device builds — the sdk pattern spares the simulator) sign as
+        # Apple Development under the team, and Xcode mints the certificate
+        # and profile on first run to a device.
+        DEVELOPMENT_TEAM: AAT39BQ9LV
+        CODE_SIGN_IDENTITY[sdk=iphoneos*]: "Apple Development"
+        CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]: "Apple Development"
+        ASSETCATALOG_COMPILER_APPICON_NAME: Passband
     dependencies:
       - sdk: WebKit.framework
       - sdk: Security.framework

@@ -239,6 +239,14 @@ actor APIClient {
         try await get("/client/contacts", query: ["q": q, "limit": String(limit)])
     }
 
+    /// The sent page: mail the user WROTE, newest first, already ordered by the
+    /// daemon. HUMAN DOOR ONLY, like everything else on this client — the agent
+    /// door has no route that enumerates what its principal has sent.
+    func listSent(limit: Int? = nil, cursor: String? = nil) async throws -> Page<SentItem> {
+        try await get(
+            "/client/sent", query: ["limit": limit.map(String.init), "cursor": cursor])
+    }
+
     func getStats() async throws -> StoreStats { try await get("/client/stats") }
 
     /// Prove a CANDIDATE credential pair against /client/stats without adopting

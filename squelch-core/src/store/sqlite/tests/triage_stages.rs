@@ -814,6 +814,7 @@ fn count_inbound_since_counts_only_received_in_window() {
             body: String::new(),
             body_html: None,
             is_sent: sent,
+            to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,
             auth_pass: None,

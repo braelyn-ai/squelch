@@ -8,16 +8,29 @@
 // one, so the rail's seven destinations collapse to four and the rest arrive as
 // the tabs that own them grow up.
 //
-// PROOF OF LIFE, not the product: the Sitrep and Mail tabs render real store
-// state (band counts, the day's updates, the inbox page) so a connected phone
-// visibly holds live data. The rows are not the Mac's UpdateRow and are not
-// pretending to be — the shared row chrome comes over with the reader.
+// AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
+// that covers the window; here it is a NavigationStack destination — but driven
+// by the SAME `store.threadId`, so every surface that opens mail (a list row, a
+// record zone, a newsletter card) opens it through the identical store call and
+// leaving nils the identical state.
+//
+// THE ACTION LAYER, MINUS THE PARTS THAT ARE FURNITURE. `Views/ActionLayer.swift`
+// is excluded from this target because it hosts the ⌘K ask bar, not because its
+// contents are desktop-shaped: the toasts, the rule editor, the deck, the 2FA
+// modal and the triage palette are all state on AppStore, and this shell mounts
+// the same views off the same flags. Nothing below owns a flag of its own —
+// every one of them is written by the verbs in Model/Actions.swift.
 
 import SwiftUI
 
-/// The four phone destinations. Sitrep is the landing surface, matching the Mac.
+/// The five phone destinations. Sitrep is the landing surface, matching the Mac.
+///
+/// RECORDS IS A TAB HERE AND A RAIL THERE. On the Mac the record zones are
+/// pinned beside the work surface, read WHILE working it; a phone has no room to
+/// pin anything, and stacking them under the obligations would put reference
+/// material behind a scroll past everything you owe. So they get a destination.
 private enum MobileTab: Hashable {
-    case sitrep, mail, search, settings
+    case sitrep, records, mail, search, settings
 }
 
 struct MobileRootView: View {
@@ -39,8 +52,10 @@ struct MobileRootView: View {
         // the palette paints it directly.
         .background(Palette.canvas.ignoresSafeArea())
         .task {
-            // No EmailWebView.warmProcess() twin: the reader is not on the phone
-            // yet, so there is no WebKit process worth paying for at boot.
+            // Pay WebKit's process-launch cost at boot rather than on the first
+            // email the reader opens — the reader is here now, so this is worth
+            // the same as it is on the Mac.
+            EmailWebView.warmProcess()
             await store.loadSettings()
         }
         .onChange(of: store.connStatus) { _, status in
@@ -78,201 +93,189 @@ private struct MobileLoadingGate: View {
 // MARK: - the tab shell
 
 private struct MobileShell: View {
+    @Environment(AppStore.self) private var store
     @State private var tab: MobileTab = .sitrep
 
     var body: some View {
-        TabView(selection: $tab) {
+        @Bindable var store = store
+
+        return TabView(selection: $tab) {
             Tab("Sitrep", systemImage: MainView.sitrep.symbol, value: MobileTab.sitrep) {
-                NavigationStack { SitrepTab() }
+                NavigationStack {
+                    MobileSitrepView()
+                        .threadDestination(active: tab == .sitrep)
+                }
+            }
+            // `archivebox` and not `tray.full`: a tray is an inbox, and the tab
+            // beside this one already IS the inbox. These are the things kept out
+            // of it.
+            Tab("Records", systemImage: "archivebox", value: MobileTab.records) {
+                NavigationStack {
+                    MobileRecordsView()
+                        .threadDestination(active: tab == .records)
+                }
             }
             Tab("Mail", systemImage: MainView.emails.symbol, value: MobileTab.mail) {
-                NavigationStack { MailTab() }
+                NavigationStack {
+                    EmailsView()
+                        .navigationTitle("Mail")
+                        .navigationBarTitleDisplayMode(.inline)
+                        // `c` ON THE MAC IS GLOBAL; here the new-message door is
+                        // ONE door, and it is on the mail. A phone's global verb
+                        // is a tab, and a compose button repeated across five of
+                        // them is five buttons for one composer. Replies do not
+                        // come through here at all — they open in the reader,
+                        // where the thread they answer is.
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button { store.openComposeNew() } label: {
+                                    Image(systemName: "square.and.pencil")
+                                }
+                                .accessibilityLabel("New message")
+                            }
+                        }
+                        .threadDestination(active: tab == .mail)
+                }
             }
             Tab("Settings", systemImage: MainView.settings.symbol, value: MobileTab.settings) {
-                NavigationStack { PlaceholderTab(
-                    title: "Settings",
-                    symbol: MainView.settings.symbol,
-                    line: "Connection, theme, signature and telemetry move over with the settings pane.")
+                NavigationStack {
+                    PlaceholderTab(
+                        title: "Settings",
+                        symbol: MainView.settings.symbol,
+                        line:
+                            "Connection, theme, signature and telemetry move over with the settings pane."
+                    )
                 }
             }
             // The search role parks this tab apart from the others in iOS 26's
             // tab bar, next to the minimize affordance, which is where a phone
             // user reaches for it.
             Tab(value: MobileTab.search, role: .search) {
-                NavigationStack { PlaceholderTab(
-                    title: "Search",
-                    symbol: "magnifyingglass",
-                    line: "Full-text search over the mail the daemon has ingested.")
+                NavigationStack {
+                    PlaceholderTab(
+                        title: "Search",
+                        symbol: "magnifyingglass",
+                        line: "Full-text search over the mail the daemon has ingested.")
                 }
             }
         }
         // Scrolling down surrenders the bar to the content and brings it back on
-        // the way up: a mail list is a reading surface first.
+        // the way up: a mail list is a reading surface first. All three tabs that own
+        // one are a real ScrollView/List, so both drive it.
         .tabBarMinimizeBehavior(.onScrollDown)
+        // Toasts ride ABOVE the tab bar, where the Mac's stack rides above the
+        // rail. The offset clears the bar at rest; when the bar minimizes on
+        // scroll the stack simply sits a little higher than it needs to, which is
+        // the harmless direction to be wrong in.
+        .overlay(alignment: .bottom) {
+            MobileToastHost()
+                .padding(.bottom, 68)
+        }
+        // The two modals the Mac stacks in its action layer, mounted here on the
+        // same store flags. Overlays rather than sheets: both are their own scrim
+        // already (OverlayScrim), both dismiss by tapping off, and a sheet would
+        // put a second card shape around a card.
+        .overlay {
+            if let request = store.ruleEditor {
+                RuleEditor(request: request) { store.closeRuleEditor() }
+            }
+        }
+        .overlay {
+            if !store.authQueue.isEmpty { AuthCodeModal() }
+        }
+        // `p` on the Mac. A deck is the whole screen on a phone — there is no
+        // board behind it worth dimming — so it covers rather than floats.
+        .fullScreenCover(isPresented: $store.processModeOpen) {
+            ProcessMode { store.processModeOpen = false }
+        }
+        // `v`. A SHEET here and a top-anchored command bar there, for one reason:
+        // the palette autofocuses a text field, and a phone answers that by
+        // raising the keyboard over the bottom half of the screen. A sheet is the
+        // only presentation that gets out of its way.
+        .sheet(isPresented: triageFixOpen) {
+            if let target = store.triageFix {
+                TriageFixPalette(target: target) { store.closeTriageFix() }
+            }
+        }
+        // `c` / ⌘N. THE SAME `ComposePane` the Mac opens as a half-window pane,
+        // off THE SAME `store.compose` — which is what makes the draft restore,
+        // the autosave and the send ceremony one code path rather than two. A
+        // pane needs the page beside it to stay live; a phone has no beside, so
+        // it is a full-height sheet.
+        .sheet(isPresented: composeOpen) {
+            ComposePane()
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Palette.canvas)
+                // A drag-down mid-send would leave the request in flight with
+                // nothing on screen to report the verdict to. Every other moment
+                // is dismissable: closing FLUSHES the draft, so nothing is lost.
+                .interactiveDismissDisabled(store.compose?.sending == true)
+                .scrollDismissesKeyboard(.interactively)
+        }
+    }
+
+    /// Presented-ness derived from the store's own `triageFix`, so dismissing the
+    /// sheet by dragging it down runs the same `closeTriageFix()` the palette's
+    /// cancel does and the state can never disagree with what is on screen.
+    private var triageFixOpen: Binding<Bool> {
+        Binding(
+            get: { store.triageFix != nil },
+            set: { if !$0 { store.closeTriageFix() } })
+    }
+
+    /// Same contract for the composer: the store owns whether it is open, and a
+    /// dragged-down sheet runs the identical `closeCompose()` the footer's cancel
+    /// does — so the draft is flushed exactly once either way.
+    private var composeOpen: Binding<Bool> {
+        Binding(
+            get: { store.compose != nil },
+            set: { if !$0 { store.closeCompose() } })
     }
 }
 
-// MARK: - sitrep
+// MARK: - the reader, as a push
 
-/// Band counts plus the updates behind them, straight off `store.sitrep`. This
-/// is the surface that proves the SSE feed and the poller are both alive: the
-/// numbers move without a gesture.
-private struct SitrepTab: View {
+/// The thread viewer as a NavigationStack destination, bound to `store.threadId`
+/// — the same state the Mac's overlay is gated on, so nothing about opening mail
+/// is per-platform. Popping (the back chevron, the edge swipe) writes nil, which
+/// runs `closeThread()`: the exact call the Mac's close button makes, so the
+/// queue and the pending reply are cleared the same way rather than left behind.
+///
+/// `active` IS LOAD-BEARING. A TabView keeps every visited tab's stack mounted,
+/// so both destinations see the same store field; without this, opening a thread
+/// from the sitrep would silently push the same reader onto the mail tab's stack
+/// too. Off-tab the binding reads nil (that stack pops) and refuses to write
+/// (the pop must not close a thread the visible tab is still showing).
+private struct ThreadDestination: ViewModifier {
     @Environment(AppStore.self) private var store
+    let active: Bool
 
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                bandRow
-                UpdateSection(title: "standing", updates: store.sitrep.standing)
-                UpdateSection(title: "new", updates: store.sitrep.new)
-                UpdateSection(title: "open", updates: store.sitrep.open)
-                if store.lastRefresh == nil && store.refreshError == nil {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("waiting for the first sync…")
-                            .font(Typo.rowSub)
-                            .foregroundStyle(Palette.inkFaint)
-                    }
-                    .padding(.vertical, 8)
-                }
-                if let refreshError = store.refreshError {
-                    Label(refreshError.message, systemImage: "exclamationmark.triangle.fill")
-                        .font(Typo.rowSub)
-                        .foregroundStyle(Palette.danger)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 24)
+    func body(content: Content) -> some View {
+        content.navigationDestination(item: openThread) { threadId in
+            ThreadViewer(threadId: threadId)
+                .id(threadId)
+                // The subject is the first thing under the bar already; a second
+                // copy of it up here, truncated to a phrase, is noise. The bar
+                // stays for its back chevron.
+                .navigationTitle("")
+                .navigationBarTitleDisplayMode(.inline)
         }
-        .background(Palette.canvas)
-        .navigationTitle("Sitrep")
-        .navigationBarTitleDisplayMode(.large)
-        .refreshable { await SitrepPoller.shared.pull() }
     }
 
-    /// The three bands as one row of counts. `nil` stats means the first stats
-    /// call has not landed — an em-dash, never a zero, because zero is a claim.
-    private var bandRow: some View {
-        HStack(spacing: 10) {
-            BandTile(label: "standing", count: store.sitrep.stats?.bands.standing)
-            BandTile(label: "new", count: store.sitrep.stats?.bands.new)
-            BandTile(label: "open", count: store.sitrep.stats?.bands.open)
-        }
+    private var openThread: Binding<String?> {
+        Binding(
+            get: { active ? store.threadId : nil },
+            set: { newValue in
+                guard active, newValue == nil else { return }
+                store.closeThread()
+            })
     }
 }
 
-private struct BandTile: View {
-    let label: String
-    let count: Int?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(count.map(String.init) ?? "—")
-                .font(Typo.num(26, weight: .medium))
-                .foregroundStyle(Palette.ink)
-            Text(label)
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaint)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .zonePadding()
-        .passbandGlass(.pane, cornerRadius: 16)
-    }
-}
-
-private struct UpdateSection: View {
-    let title: String
-    let updates: [AttentionUpdate]
-
-    var body: some View {
-        if !updates.isEmpty {
-            VStack(alignment: .leading, spacing: 0) {
-                Text(title)
-                    .font(Typo.sectionLabel)
-                    .foregroundStyle(Palette.inkFaint)
-                    .textCase(.uppercase)
-                    .padding(.bottom, 8)
-                VStack(spacing: 0) {
-                    ForEach(updates) { update in
-                        MobileUpdateRow(update: update)
-                        if update.id != updates.last?.id { Hairline() }
-                    }
-                }
-                .zonePadding()
-                .passbandGlass(.pane, cornerRadius: 18)
-            }
-        }
-    }
-}
-
-// MARK: - mail
-
-private struct MailTab: View {
-    @Environment(AppStore.self) private var store
-
-    private var page: Loadable<[AttentionUpdate]> { store.mailPage(.inbox) }
-
-    var body: some View {
-        List {
-            if let rows = page.value, !rows.isEmpty {
-                ForEach(rows) { update in
-                    MobileUpdateRow(update: update)
-                        .listRowBackground(Color.clear)
-                        .listRowSeparatorTint(Palette.hairline)
-                }
-            } else if page.isLoading {
-                Text("loading mail…")
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.inkFaint)
-                    .listRowBackground(Color.clear)
-            } else if let error = page.error {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.danger)
-                    .listRowBackground(Color.clear)
-            } else {
-                Text("nothing in the inbox.")
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.inkFaint)
-                    .listRowBackground(Color.clear)
-            }
-        }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .background(Palette.canvas)
-        .navigationTitle("Mail")
-        .navigationBarTitleDisplayMode(.large)
-        .refreshable { await store.refreshMail(.inbox, force: true) }
-    }
-}
-
-/// One update, phone-sized. Sender, subject line, tier dot — no verbs, because
-/// the phone has no undo surface yet and an action you cannot take back is not
-/// an action to ship on a walking skeleton.
-private struct MobileUpdateRow: View {
-    let update: AttentionUpdate
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(Palette.tierColor(update.tier))
-                .frame(width: 7, height: 7)
-                .padding(.top, 5)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(SenderCache.resolved(update.senderString).displayName)
-                    .font(Typo.row.weight(.medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(1)
-                Text(update.one_line)
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.inkDim)
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
+extension View {
+    fileprivate func threadDestination(active: Bool) -> some View {
+        modifier(ThreadDestination(active: active))
     }
 }
 

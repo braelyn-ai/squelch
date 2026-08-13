@@ -18,12 +18,18 @@ import SwiftUI
 
     typealias PlatformImage = NSImage
     typealias PlatformFont = NSFont
+    /// The concrete color class `NSAttributedString.Key.foregroundColor` wants.
+    /// SwiftUI's `Color` is not it on either platform, and both spell the
+    /// conversion `init(_: Color)` — so shared attribute code says
+    /// `PlatformColor(Palette.ink)` and stops caring which OS it is on.
+    typealias PlatformColor = NSColor
     typealias PlatformSound = NSSound
 #else
     import UIKit
 
     typealias PlatformImage = UIImage
     typealias PlatformFont = UIFont
+    typealias PlatformColor = UIColor
 
     /// The notification chime is the only sound this app plays, and it plays it
     /// by holding the object alive for the duration. UIKit has no equivalent

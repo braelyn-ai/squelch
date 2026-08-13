@@ -14,7 +14,7 @@ use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
 mod common;
-use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg};
+use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg, sent_msg};
 
 #[tokio::test]
 async fn missing_token_is_401() {
@@ -1042,6 +1042,94 @@ async fn sealed_list_has_no_bodies() {
         "no body field in sealed list"
     );
     assert_eq!(items[0]["kind"], "otp");
+}
+
+#[tokio::test]
+async fn sent_listing_pages_the_outbox_and_hides_sealed_and_received_mail() {
+    // The human door's only `is_sent = 1` listing: the user's own outbox, with
+    // recipients and read receipts, newest first.
+    let Harness { app, .. } = harness(|store, acct| {
+        let seed = |gmail: &str, thread: &str, subject: &str, to: &str, sensitivity| {
+            let id = store
+                .upsert_message(&sent_msg(acct, gmail, thread, subject, to))
+                .unwrap();
+            store
+                .set_triage(id, acct, 0, Tier::Noise, sensitivity, None, "", "", None)
+                .unwrap();
+            id
+        };
+        seed(
+            "s1",
+            "ts1",
+            "first",
+            "Alice <alice@friends.com>",
+            Sensitivity::Normal,
+        );
+        seed(
+            "s2",
+            "ts2",
+            "second",
+            "bob@friends.com",
+            Sensitivity::Normal,
+        );
+        // A sealed outbound copy and ordinary inbound mail: neither is listed.
+        seed(
+            "s3",
+            "ts3",
+            "sealed",
+            "support@bank.com",
+            Sensitivity::Sealed,
+        );
+        store
+            .upsert_message(&msg(acct, "g-in", "t-in", "inbound", "hi"))
+            .unwrap();
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/sent?limit=1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    // Newest first: each fixture stamps its own `now`, so "second" is later.
+    assert_eq!(items[0]["subject"], "second");
+    assert_eq!(items[0]["to"], "bob@friends.com");
+    assert_eq!(items[0]["opens"], 0);
+    assert!(items[0]["sent_at"].as_str().unwrap().contains('T'));
+    assert!(items[0]["thread_id"].as_str().is_some());
+
+    // The cursor pages to the older message, and no sealed or inbound row can
+    // appear on any page.
+    let cursor = json["next_cursor"]
+        .as_str()
+        .expect("next_cursor")
+        .to_string();
+    let resp2 = app
+        .oneshot(authed(
+            "GET",
+            &format!("/client/sent?limit=1&cursor={cursor}"),
+        ))
+        .await
+        .unwrap();
+    let json2 = body_json(resp2).await;
+    let items2 = json2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert_eq!(items2[0]["subject"], "first");
+    assert_eq!(items2[0]["to"], "Alice <alice@friends.com>");
+}
+
+#[tokio::test]
+async fn sent_listing_needs_the_bearer() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let req = Request::builder()
+        .uri("/client/sent")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -3628,6 +3716,49 @@ async fn stats_expose_stage2_usage_and_cost() {
     // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6) = 3.0 + 3.0 = 6.0
     let cost = s2["est_cost_usd_today"].as_f64().unwrap();
     assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
+}
+
+#[tokio::test]
+async fn stats_carry_gmail_inbox_unread_only_once_the_sync_loop_has_fetched_it() {
+    // Never fetched (old DB, or every fetch so far failed): the key is ABSENT.
+    // A zeroed object would read as "your inbox is clear", which is a claim this
+    // daemon cannot make without having asked Gmail.
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert!(
+        json.get("inbox_unread").is_none(),
+        "unfetched counts must be absent, not zero"
+    );
+
+    // Once the sync loop has stored a pair, it rides along with the stats.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        store.set_inbox_unread(acct, 214, 190).unwrap();
+    });
+    let stamped = store.inbox_unread(acct).unwrap().unwrap().fetched_at;
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["inbox_unread"]["messages"], 214);
+    assert_eq!(json["inbox_unread"]["threads"], 190);
+    // The counts keep being served while a fetch is failing, so the stamp is
+    // what separates a live pair from one frozen since the scope was revoked.
+    assert_eq!(
+        json["inbox_unread"]["fetched_at"],
+        Value::String(stamped.to_rfc3339()),
+        "the stored stamp, verbatim RFC3339"
+    );
+    // Still the same body it always was.
+    assert!(json["stage2"].is_object());
+
+    // A real zero IS reported: nothing unread is a different answer from not
+    // knowing, and the client renders them differently.
+    let Harness { app, .. } = harness(|store, acct| {
+        store.set_inbox_unread(acct, 0, 0).unwrap();
+    });
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["inbox_unread"]["messages"], 0);
+    assert_eq!(json["inbox_unread"]["threads"], 0);
 }
 
 #[tokio::test]
