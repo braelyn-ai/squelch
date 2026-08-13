@@ -1291,6 +1291,9 @@ mod tests {
         // With no gateway configured, the LLM block is entirely absent: not a
         // base URL, not a provider pin, not an optional key reference. This is
         // the byte-identical-when-unset half of the contract.
+        // ANTHROPIC_API_KEY is in the list as a tombstone: the shared-key
+        // bridge injected the real provider key under that name, and a revert
+        // that resurrects it must fail here, not in production.
         for llm_var in [
             "SQUELCH_ANTHROPIC_BASE_URL",
             "SQUELCH_STAGE2_PROVIDER",
@@ -1299,6 +1302,7 @@ mod tests {
             "SQUELCH_MODEL",
             "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
             "SQUELCH_STAGE2_GLOBAL_DAILY_CAP",
+            "ANTHROPIC_API_KEY",
         ] {
             assert!(
                 env.iter().all(|e| e.name != llm_var),
@@ -1348,6 +1352,14 @@ mod tests {
         ] {
             assert!(env.iter().all(|e| e.name != tuned), "{tuned} appeared unset");
         }
+
+        // "No tenant ever holds a real provider key" has to hold in BOTH
+        // modes: a configured gateway injects the virtual key only, never the
+        // shared-bridge ANTHROPIC_API_KEY this guarantee replaced.
+        assert!(
+            env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
+            "the raw provider key reappeared in a gateway-configured pod"
+        );
     }
 
     /// The tuning knobs, each landing under the daemon's real variable name.
