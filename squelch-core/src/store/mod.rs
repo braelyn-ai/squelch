@@ -11,6 +11,7 @@ pub use search_query::{SearchFilter, parse_search_query};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
+use crate::triage::extract::shipments::ShipmentsApplied;
 use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
@@ -891,6 +892,44 @@ pub trait Store: Send + Sync {
     /// `sensitivity='normal'`, exactly like [`Store::extract_mark_processed`].
     fn ship_extract_mark(&self, account_id: AccountId, message_id: i64, marker: &str)
     -> Result<()>;
+
+    /// Apply one SHIPMENTS-EXTRACTOR verdict IN ONE TRANSACTION: stamp
+    /// `triage.ship_extract_model` (leaving [`Store::ship_extract_queue`]), then
+    /// reconcile the package IDENTITY the model found against what the regex
+    /// detector already wrote. Returns whether a tracked record was written or
+    /// updated — a `shipments` row, or a staged `shipment_orders` row.
+    ///
+    /// The marker is stamped FIRST, guarded by `sensitivity='normal'`. If that
+    /// guard matches nothing the message was SEALED mid-pass, and the call writes
+    /// NOTHING derived from it and returns `Ok(false)` — the same TOCTOU rule as
+    /// [`Store::stage1_apply`].
+    ///
+    /// Every DELETE is bounded to rows THIS message currently feeds
+    /// (`shipments.last_message_id = message_id`) and to AMBIGUOUS tracking
+    /// SHAPES only (see
+    /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape)),
+    /// so a model false negative can never destroy a real `1Z…` / `TBA…` / IMpb
+    /// package, and one mail's verdict can never reach another mail's shipment.
+    /// Then, by which identity the model found:
+    ///
+    /// * TRACKING NUMBER — upsert the shipment (status still flows through
+    ///   [`ShipmentStatus::merge`](crate::triage::ShipmentStatus::merge), so a
+    ///   delivered package never walks back), overwrite `item_name` with the
+    ///   extractor's (it beats the upsert's longer-name-wins heuristic, which
+    ///   otherwise keeps regex junk), record `order_ref`, and PROMOTE any staged
+    ///   `shipment_orders` row under that reference — donating its item name if
+    ///   the shipment has none — then delete it.
+    /// * ORDER REFERENCE ONLY — adopt the item name onto the shipment already
+    ///   carrying that reference, or STAGE the purchase in `shipment_orders`
+    ///   until a ship notice arrives with a number.
+    /// * NEITHER — name adoption only, and only when the thread holds exactly one
+    ///   shipment and that row has no name. Status, `last_message_id` and
+    ///   `last_update` are never touched: a mail with no identity has no claim on
+    ///   a row's lifecycle.
+    ///
+    /// `last_message_id` is only ever set by the tracking-number upsert, always
+    /// to a real message id — the seal-time delete keys on it.
+    fn shipments_extract_apply(&self, applied: &ShipmentsApplied) -> Result<bool>;
 
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows
     /// so they re-enter the Stage-1 queue, deleting their stale `banking`,

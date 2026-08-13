@@ -269,7 +269,11 @@ fn detector() -> &'static Detector {
 
 /// The tracking URL template for a carrier, with `{n}` substituted by the number.
 /// Amazon and unknown carriers have no public URL -> `None`.
-fn tracking_url(carrier: &str, number: &str) -> Option<String> {
+///
+/// `pub` because the SHIPMENTS EXTRACTOR's store apply builds a [`ShipmentInfo`]
+/// from model output rather than from [`detect_shipment`], and both paths must
+/// mint the same URL from the same table — a second copy would drift.
+pub fn tracking_url(carrier: &str, number: &str) -> Option<String> {
     let enc = number.trim();
     match carrier {
         "usps" => Some(format!(

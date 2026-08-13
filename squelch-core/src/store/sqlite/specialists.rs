@@ -385,6 +385,70 @@ pub(super) fn auto_close_bill_for_receipt_conn(
     Ok(Some(bill_id))
 }
 
+/// The `(id, tracking_number)` of every shipment row THIS message currently
+/// feeds — the ONLY rows a shipments-extractor apply is allowed to delete. Read
+/// before any write, so the upsert below can never delete the row it just wrote.
+fn shipments_fed_by(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tracking_number FROM shipments
+         WHERE account_id = ?1 AND last_message_id = ?2",
+    )?;
+    let out = stmt
+        .query_map(params![account_id, message_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(out)
+}
+
+/// Delete the AMBIGUOUS-shaped rows in `fed`, sparing `keep` (the number the
+/// model just confirmed). Shape-gated on purpose: a model false negative must
+/// never destroy a real `1Z…` / `TBA…` / IMpb package, and only the bare
+/// digit-runs can be phantoms of a retailer's item or order id in the first
+/// place (see
+/// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape)).
+fn delete_fed_phantoms(
+    conn: &Connection,
+    account_id: AccountId,
+    fed: &[(i64, String)],
+    keep: Option<&str>,
+) -> Result<()> {
+    for (id, number) in fed {
+        if keep == Some(number.as_str()) {
+            continue;
+        }
+        if crate::triage::is_ambiguous_tracking_shape(number) {
+            conn.execute(
+                "DELETE FROM shipments WHERE account_id = ?1 AND id = ?2",
+                params![account_id, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A shipment row's current `item_name`.
+fn shipment_item_name(conn: &Connection, shipment_id: i64) -> Result<String> {
+    let name: String = conn.query_row(
+        "SELECT item_name FROM shipments WHERE id = ?1",
+        params![shipment_id],
+        |r| r.get(0),
+    )?;
+    Ok(name)
+}
+
+fn set_shipment_item_name(conn: &Connection, shipment_id: i64, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE shipments SET item_name = ?2 WHERE id = ?1",
+        params![shipment_id, name],
+    )?;
+    Ok(())
+}
+
 /// The projection every shipment read shares, in [`shipment_row`]'s order.
 /// LEFT JOIN: a NULL `last_message_id` (a row written by an older daemon, or one
 /// only a carrier poll has touched) leaves the shipment standing, just with
@@ -426,6 +490,181 @@ impl SqliteStore {
     ) -> Result<i64> {
         let conn = self.lock()?;
         upsert_shipment_conn(&conn, account_id, message_id, shipment, seen_at)
+    }
+
+    /// Apply one SHIPMENTS-EXTRACTOR verdict in ONE transaction — the identity
+    /// merge rules. See [`Store::shipments_extract_apply`](crate::store::Store::shipments_extract_apply)
+    /// for the contract; the reasoning for each branch is inline below.
+    pub(super) fn shipments_extract_apply(
+        &self,
+        a: &crate::triage::extract::shipments::ShipmentsApplied,
+    ) -> Result<bool> {
+        use crate::triage::{ShipmentInfo, ShipmentStatus, shipment::tracking_url};
+
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // MARKER FIRST, guarded on sensitivity='normal'. Matching zero rows means
+        // the message was SEALED between the queue read and here (or never
+        // existed): commit the nothing we have done and write no derived row —
+        // sealed mail must leave no trace in the shipments zone.
+        let n = tx.execute(
+            "UPDATE triage SET ship_extract_model = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![a.message_id, a.account_id, a.extractor_model_used],
+        )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        // The blast radius of this apply: rows THIS message currently feeds.
+        // Every delete below is bounded to it, so one mail's verdict can never
+        // reach a package another mail is tracking.
+        let fed = shipments_fed_by(&tx, a.account_id, a.message_id)?;
+
+        // NEGATIVE VERDICT: the model read the mail and says it is not an inbound
+        // package. Retire the phantoms this message minted; keep everything else.
+        if !a.is_shipment {
+            delete_fed_phantoms(&tx, a.account_id, &fed, None)?;
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let wrote = if let Some(tn) = a.tracking_number.as_deref() {
+            // IDENTITY: a carrier tracking number. Any OTHER ambiguous row this
+            // message fed was the regex detector reading an order id as a number.
+            delete_fed_phantoms(&tx, a.account_id, &fed, Some(tn))?;
+            let info = ShipmentInfo {
+                carrier: a.carrier.clone(),
+                tracking_number: tn.to_string(),
+                item_name: a.item_name.clone().unwrap_or_default(),
+                // A shipping mail that states no status is in transit, matching
+                // the regex detector's own default.
+                status: a.status.unwrap_or(ShipmentStatus::Shipped),
+                tracking_url: tracking_url(&a.carrier, tn),
+            };
+            let ship_id =
+                upsert_shipment_conn(&tx, a.account_id, a.message_id, &info, a.received_at)?;
+
+            // EXTRACTOR WINS over the upsert's longer-name-wins heuristic: that
+            // rule exists to pick between two REGEX guesses, and it otherwise
+            // keeps junk like "package now with its carrier!" over the model's
+            // "Anker USB-C charger" purely because it is longer.
+            if let Some(name) = a.item_name.as_deref() {
+                set_shipment_item_name(&tx, ship_id, name)?;
+            }
+
+            if let Some(oref) = a.order_ref.as_deref() {
+                tx.execute(
+                    "UPDATE shipments SET order_ref = ?2 WHERE id = ?1",
+                    params![ship_id, oref],
+                )?;
+                // PROMOTION: the order confirmation that arrived days earlier
+                // staged a row under this reference. Donate its name if we have
+                // none, then delete it — the purchase now has a real identity.
+                let staged: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT id, item_name FROM shipment_orders
+                         WHERE account_id = ?1 AND order_ref = ?2",
+                        params![a.account_id, oref],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((staged_id, staged_name)) = staged {
+                    if shipment_item_name(&tx, ship_id)?.trim().is_empty()
+                        && !staged_name.trim().is_empty()
+                    {
+                        set_shipment_item_name(&tx, ship_id, &staged_name)?;
+                    }
+                    tx.execute(
+                        "DELETE FROM shipment_orders WHERE id = ?1",
+                        params![staged_id],
+                    )?;
+                }
+            }
+            true
+        } else if let Some(oref) = a.order_ref.as_deref() {
+            // IDENTITY: an order reference and NO tracking number. The model read
+            // the whole mail and found no carrier number, so any ambiguous row
+            // this message fed is a regex phantom OF that order id.
+            delete_fed_phantoms(&tx, a.account_id, &fed, None)?;
+            let existing: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT id, item_name FROM shipments
+                     WHERE account_id = ?1 AND order_ref = ?2",
+                    params![a.account_id, oref],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                // The shipment already landed under this reference: the only
+                // thing an order mail can still add is the item's name.
+                Some((ship_id, cur_name)) => match a.item_name.as_deref() {
+                    Some(name) if cur_name.trim().is_empty() => {
+                        set_shipment_item_name(&tx, ship_id, name)?;
+                        true
+                    }
+                    _ => false,
+                },
+                // No tracking number anywhere yet: STAGE the purchase, keyed by
+                // the retailer's reference, until a ship notice promotes it.
+                None => {
+                    let ts = a.received_at.to_rfc3339();
+                    tx.execute(
+                        "INSERT INTO shipment_orders(account_id, order_ref, item_name, thread_id,
+                             last_message_id, first_seen, last_update)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                         ON CONFLICT(account_id, order_ref) DO UPDATE SET
+                             item_name = CASE WHEN excluded.item_name != ''
+                                              THEN excluded.item_name ELSE item_name END,
+                             thread_id = excluded.thread_id,
+                             last_message_id = excluded.last_message_id,
+                             last_update = excluded.last_update",
+                        params![
+                            a.account_id,
+                            oref,
+                            a.item_name.clone().unwrap_or_default(),
+                            a.thread_id,
+                            a.message_id,
+                            ts,
+                        ],
+                    )?;
+                    true
+                }
+            }
+        } else {
+            // NO IDENTITY AT ALL — a shipping mail naming neither a number nor an
+            // order. Conservative by construction: retire this message's phantoms,
+            // then adopt a name onto the thread's ONE shipment if it has none.
+            delete_fed_phantoms(&tx, a.account_id, &fed, None)?;
+            let survivors: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT s.id, s.item_name FROM shipments s
+                     JOIN messages m
+                       ON m.id = s.last_message_id AND m.account_id = s.account_id
+                     WHERE s.account_id = ?1 AND m.thread_id = ?2",
+                )?;
+                stmt.query_map(params![a.account_id, a.thread_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            // Two packages in one thread and no identity to tell them apart: the
+            // name would be a coin flip, so nothing is written. Status,
+            // `last_message_id` and `last_update` are never touched here either —
+            // a mail with no identity has no claim on a row's lifecycle.
+            match (survivors.as_slice(), a.item_name.as_deref()) {
+                ([(ship_id, cur_name)], Some(name)) if cur_name.trim().is_empty() => {
+                    set_shipment_item_name(&tx, *ship_id, name)?;
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        tx.commit()?;
+        Ok(wrote)
     }
 
     pub(super) fn list_shipments(

@@ -569,6 +569,13 @@ impl Store for SqliteStore {
         self.ship_extract_mark(account_id, message_id, marker)
     }
 
+    fn shipments_extract_apply(
+        &self,
+        applied: &crate::triage::extract::shipments::ShipmentsApplied,
+    ) -> Result<bool> {
+        self.shipments_extract_apply(applied)
+    }
+
     fn retriage_reset(
         &self,
         account_id: AccountId,

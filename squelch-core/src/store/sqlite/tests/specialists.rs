@@ -1487,3 +1487,458 @@ fn redetect_leaves_pointerless_rows_alone() {
         "no feeder message, no judgement"
     );
 }
+
+// ---- the shipments EXTRACTOR apply (identity merge rules) ---------------
+
+use crate::triage::extract::shipments::ShipmentsApplied;
+
+/// A message + triage row queued for the shipments extractor.
+fn ship_queued_msg(store: &SqliteStore, acct: AccountId, gmail: &str, thread: &str) -> i64 {
+    triaged_row(acct, gmail, thread, None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(store)
+}
+
+/// A NEGATIVE extractor verdict for `(mid, thread)`; the positive helpers below
+/// build on it, so every test starts from the same explicit baseline.
+fn ship_verdict(acct: AccountId, mid: i64, thread: &str) -> ShipmentsApplied {
+    ShipmentsApplied {
+        message_id: mid,
+        account_id: acct,
+        thread_id: thread.into(),
+        is_shipment: false,
+        tracking_number: None,
+        order_ref: None,
+        item_name: None,
+        carrier: "unknown".into(),
+        status: None,
+        received_at: Utc::now(),
+        extractor_model_used: "claude-haiku-4-5".into(),
+    }
+}
+
+/// A shipment row exactly as the REGEX detector would have written it.
+fn detected(carrier: &str, number: &str, item_name: &str) -> crate::triage::ShipmentInfo {
+    crate::triage::ShipmentInfo {
+        carrier: carrier.into(),
+        tracking_number: number.into(),
+        item_name: item_name.into(),
+        status: crate::triage::ShipmentStatus::Shipped,
+        tracking_url: None,
+    }
+}
+
+/// `(tracking_number, item_name, order_ref, status)` for every shipment row,
+/// ordered by id — `order_ref` is not on the wire type.
+fn shipment_rows(
+    store: &SqliteStore,
+    acct: AccountId,
+) -> Vec<(String, String, Option<String>, String)> {
+    let conn = store.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT tracking_number, item_name, order_ref, status FROM shipments
+             WHERE account_id=?1 ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map(params![acct], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
+    .unwrap()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+/// `(order_ref, item_name, last_message_id)` for every staged order.
+fn staged_orders(store: &SqliteStore, acct: AccountId) -> Vec<(String, String, Option<i64>)> {
+    let conn = store.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT order_ref, item_name, last_message_id FROM shipment_orders
+             WHERE account_id=?1 ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map(params![acct], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn ship_marker(store: &SqliteStore, mid: i64) -> Option<String> {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT ship_extract_model FROM triage WHERE message_id=?1",
+            params![mid],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn ship_extract_apply_replaces_the_ebay_phantom_with_the_real_impb() {
+    // THE live bug end-to-end: the regex detector minted a 12-digit eBay ITEM id
+    // as a shipment; the model reads the same mail, names the real IMpb number
+    // and the item, and the phantom goes.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-ebay", "t-ebay");
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("fedex", "123456789012", "package now with its carrier!"),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("9400111899223817428490".into()),
+            order_ref: Some("234567890123".into()),
+            item_name: Some("Double Take mirror".into()),
+            carrier: "usps".into(),
+            status: Some(crate::triage::ShipmentStatus::Shipped),
+            ..ship_verdict(acct, mid, "t-ebay")
+        })
+        .unwrap();
+    assert!(wrote);
+
+    let rows = shipment_rows(&store, acct);
+    assert_eq!(rows.len(), 1, "the phantom is gone: {rows:?}");
+    assert_eq!(rows[0].0, "9400111899223817428490");
+    assert_eq!(rows[0].1, "Double Take mirror");
+    assert_eq!(rows[0].2.as_deref(), Some("234567890123"));
+
+    // The real row carries the carrier's URL, and the row leaves the queue.
+    let listed = store
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+        .unwrap();
+    assert!(
+        listed[0]
+            .tracking_url
+            .as_deref()
+            .unwrap()
+            .contains("tools.usps.com")
+    );
+    assert_eq!(
+        ship_marker(&store, mid).as_deref(),
+        Some("claude-haiku-4-5")
+    );
+    assert!(store.ship_extract_queue(acct, 10).unwrap().is_empty());
+}
+
+#[test]
+fn ship_extract_apply_stages_an_order_then_promotes_it_with_its_name() {
+    // The order confirmation lands days before the ship notice, so the purchase
+    // is staged under the retailer's reference and promoted when a number shows.
+    let (store, acct) = store();
+    let order_msg = ship_queued_msg(&store, acct, "g-ord", "t-ord");
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            order_ref: Some("112-3456789-1234567".into()),
+            item_name: Some("Anker USB-C charger".into()),
+            ..ship_verdict(acct, order_msg, "t-ord")
+        })
+        .unwrap();
+    assert!(wrote, "staging a purchase is a write");
+    assert_eq!(
+        staged_orders(&store, acct),
+        vec![(
+            "112-3456789-1234567".to_string(),
+            "Anker USB-C charger".to_string(),
+            Some(order_msg)
+        )]
+    );
+    assert!(
+        shipment_rows(&store, acct).is_empty(),
+        "no tracking number, no shipments row"
+    );
+
+    // The ship notice: same order reference, a real number, and NO item name of
+    // its own — the staged name is the only one anyone has.
+    let ship_msg = ship_queued_msg(&store, acct, "g-shipnote", "t-ord");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            order_ref: Some("112-3456789-1234567".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, ship_msg, "t-ord")
+        })
+        .unwrap();
+
+    let rows = shipment_rows(&store, acct);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "1Z999AA10123456784");
+    assert_eq!(
+        rows[0].1, "Anker USB-C charger",
+        "the staged name is donated"
+    );
+    assert_eq!(rows[0].2.as_deref(), Some("112-3456789-1234567"));
+    assert!(
+        staged_orders(&store, acct).is_empty(),
+        "the promoted staging row is deleted"
+    );
+}
+
+#[test]
+fn ship_extract_apply_negative_verdict_retires_only_the_phantom_it_fed() {
+    // A false verdict retires the ambiguous row THIS message minted, and nothing
+    // else: another message's package is none of its business.
+    let (store, acct) = store();
+    let mine = ship_queued_msg(&store, acct, "g-mine", "t1");
+    let theirs = ship_queued_msg(&store, acct, "g-theirs", "t2");
+    store
+        .upsert_shipment(
+            acct,
+            mine,
+            &detected("fedex", "123456789012", ""),
+            Utc::now(),
+        )
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            theirs,
+            &detected("ups", "1Z999AA10123456784", "Headphones"),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let wrote = store
+        .shipments_extract_apply(&ship_verdict(acct, mine, "t1"))
+        .unwrap();
+    assert!(!wrote, "a negative verdict writes no shipment row");
+
+    let rows = shipment_rows(&store, acct);
+    assert_eq!(rows.len(), 1, "only my phantom goes: {rows:?}");
+    assert_eq!(rows[0].0, "1Z999AA10123456784");
+}
+
+#[test]
+fn ship_extract_apply_negative_verdict_spares_a_real_number_it_fed() {
+    // THE FALSE-NEGATIVE GUARD: the model can be wrong, and a `1Z…` number is
+    // self-identifying — no retailer id impersonates it — so the row stays even
+    // though this very message fed it.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-ups", "t1");
+    for number in [
+        "1Z999AA10123456784",
+        "TBA303392911000",
+        "9400111899223817428490",
+    ] {
+        store
+            .upsert_shipment(acct, mid, &detected("ups", number, ""), Utc::now())
+            .unwrap();
+    }
+
+    store
+        .shipments_extract_apply(&ship_verdict(acct, mid, "t1"))
+        .unwrap();
+    assert_eq!(
+        shipment_rows(&store, acct).len(),
+        3,
+        "self-identifying shapes survive a false verdict"
+    );
+}
+
+#[test]
+fn ship_extract_apply_names_a_lone_thread_shipment() {
+    // NO IDENTITY AT ALL: the only safe inference is "this thread's one package
+    // is the one being named".
+    let (store, acct) = store();
+    let feeder = ship_queued_msg(&store, acct, "g-feed", "t-solo");
+    store
+        .upsert_shipment(
+            acct,
+            feeder,
+            &detected("ups", "1Z999AA10123456784", ""),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let follow_up = ship_queued_msg(&store, acct, "g-follow", "t-solo");
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            item_name: Some("Double Take mirror".into()),
+            ..ship_verdict(acct, follow_up, "t-solo")
+        })
+        .unwrap();
+    assert!(wrote);
+    assert_eq!(shipment_rows(&store, acct)[0].1, "Double Take mirror");
+}
+
+#[test]
+fn ship_extract_apply_leaves_a_two_shipment_thread_unnamed() {
+    // Two packages in one thread and no identity to tell them apart: naming
+    // either would be a coin flip, so nothing is written.
+    let (store, acct) = store();
+    let a = ship_queued_msg(&store, acct, "g-a", "t-pair");
+    let b = ship_queued_msg(&store, acct, "g-b", "t-pair");
+    store
+        .upsert_shipment(
+            acct,
+            a,
+            &detected("ups", "1Z999AA10123456784", ""),
+            Utc::now(),
+        )
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            b,
+            &detected("ups", "1Z12345E0205271688", ""),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let third = ship_queued_msg(&store, acct, "g-c", "t-pair");
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            item_name: Some("Double Take mirror".into()),
+            ..ship_verdict(acct, third, "t-pair")
+        })
+        .unwrap();
+    assert!(!wrote, "an ambiguous thread is left alone");
+    assert!(
+        shipment_rows(&store, acct).iter().all(|r| r.1.is_empty()),
+        "neither row may be named"
+    );
+}
+
+#[test]
+fn ship_extract_apply_never_walks_a_delivered_row_back() {
+    // The extractor's status still flows through `ShipmentStatus::merge`, so a
+    // late "shipped" mail cannot un-deliver a package.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-del", "t1");
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &crate::triage::ShipmentInfo {
+                status: crate::triage::ShipmentStatus::Delivered,
+                ..detected("ups", "1Z999AA10123456784", "")
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            carrier: "ups".into(),
+            status: Some(crate::triage::ShipmentStatus::Shipped),
+            ..ship_verdict(acct, mid, "t1")
+        })
+        .unwrap();
+    assert_eq!(shipment_rows(&store, acct)[0].3, "delivered");
+}
+
+#[test]
+fn ship_extract_apply_writes_nothing_for_a_row_sealed_mid_pass() {
+    // TOCTOU: the queue handed out a normal row and the user sealed it while the
+    // model was thinking. The guarded marker matches nothing, so nothing derived
+    // from sealed mail may land.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-seal", "t1");
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET sensitivity='sealed' WHERE message_id=?1",
+            params![mid],
+        )
+        .unwrap();
+
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            order_ref: Some("112-3456789-1234567".into()),
+            item_name: Some("Anker USB-C charger".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, mid, "t1")
+        })
+        .unwrap();
+    assert!(!wrote);
+    assert!(shipment_rows(&store, acct).is_empty(), "no shipment row");
+    assert!(staged_orders(&store, acct).is_empty(), "no staged order");
+    assert_eq!(
+        ship_marker(&store, mid).as_deref(),
+        Some("pending"),
+        "the marker itself is guarded too"
+    );
+}
+
+#[test]
+fn ship_extract_apply_item_name_beats_a_longer_regex_name() {
+    // `upsert_shipment_conn`'s longer-name-wins heuristic picks between two REGEX
+    // guesses; against the extractor it would keep subject-line junk purely for
+    // being longer, so the extractor's name is written over the top.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-junk", "t1");
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected(
+                "ups",
+                "1Z999AA10123456784",
+                "package is now with its carrier and on its way to you",
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            item_name: Some("Anker USB-C charger".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, mid, "t1")
+        })
+        .unwrap();
+    assert_eq!(shipment_rows(&store, acct)[0].1, "Anker USB-C charger");
+}
+
+#[test]
+fn ship_extract_apply_order_only_names_the_shipment_that_already_landed() {
+    // The ship notice arrived FIRST and recorded the reference; a later order
+    // mail carrying the item name has nothing but that name to contribute — and
+    // must not re-stage a purchase that is already tracked.
+    let (store, acct) = store();
+    let ship_msg = ship_queued_msg(&store, acct, "g-ship", "t-a");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            order_ref: Some("ORD-1".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, ship_msg, "t-a")
+        })
+        .unwrap();
+
+    let order_msg = ship_queued_msg(&store, acct, "g-order", "t-b");
+    let wrote = store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            order_ref: Some("ORD-1".into()),
+            item_name: Some("Anker USB-C charger".into()),
+            ..ship_verdict(acct, order_msg, "t-b")
+        })
+        .unwrap();
+    assert!(wrote);
+    assert_eq!(shipment_rows(&store, acct)[0].1, "Anker USB-C charger");
+    assert!(
+        staged_orders(&store, acct).is_empty(),
+        "a tracked purchase is never re-staged"
+    );
+}
