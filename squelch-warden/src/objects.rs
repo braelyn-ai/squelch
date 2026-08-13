@@ -137,16 +137,6 @@ pub const OAUTH_CLIENT_ID_KEY: &str = "client_id";
 /// See [`OAUTH_CLIENT_ID_KEY`].
 pub const OAUTH_CLIENT_SECRET_KEY: &str = "client_secret";
 
-/// Data key in the shared Anthropic key Secret
-/// ([`crate::config::Config::anthropic_secret_name`]). Named for the variable it
-/// becomes, so `kubectl create secret generic anthropic-api-key
-/// --from-literal=ANTHROPIC_API_KEY=...` is the whole command.
-///
-/// The reference is OPTIONAL (see [`daemon_env`]): a cluster with no such Secret
-/// starts every tenant pod anyway, and those daemons run heuristic-only triage
-/// rather than failing to boot.
-pub const ANTHROPIC_API_KEY_KEY: &str = "ANTHROPIC_API_KEY";
-
 /// Annotation on the pod template carrying the SHA-256 of the credential
 /// ciphertext this pod was rolled for.
 ///
@@ -1054,23 +1044,6 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
             config.oauth_secret_name.clone(),
             OAUTH_CLIENT_SECRET_KEY,
         ),
-        // Stage-2 triage, from a Secret the cluster may simply not have. See
-        // [`ANTHROPIC_API_KEY_KEY`]: optional on purpose, because a tenant with
-        // no model triage is a working tenant and a tenant that will not start
-        // is not. The relay replaces this arrangement; until then it is the one
-        // production runs by hand. When both are present the daemon prefers
-        // SQUELCH_STAGE2_API_KEY (the relay's virtual key, below) over this
-        // var, so a minted tenant is already off the shared key. NOTE the two
-        // do not compose the other way: once the gateway base URL is set, an
-        // UNMINTED tenant presents this raw key to the gateway, which only
-        // accepts virtual keys — triage degrades to per-call 401s until the
-        // tenant is minted. Mint promptly; the stopgap Secret's deletion is
-        // part of the same rollout.
-        from_optional_secret(
-            "ANTHROPIC_API_KEY",
-            config.anthropic_secret_name.clone(),
-            ANTHROPIC_API_KEY_KEY,
-        ),
     ];
 
     // The control plane's origin, behind the console's "Continue with Google"
@@ -1092,9 +1065,9 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         // provider path the gateway does not speak.
         env.push(plain("SQUELCH_STAGE2_PROVIDER", "anthropic"));
         // The virtual key, from the Secret, never inline — and OPTIONAL: a
-        // tenant whose key was never minted must still boot. The daemon
-        // fail-softs triage when no key resolves at all; see the stopgap note
-        // above for what an unminted tenant does while that Secret lingers.
+        // tenant whose key was never minted must still boot. An unminted
+        // tenant resolves no key at all, and the daemon fail-softs to
+        // heuristic-only triage until `squelch-control llm mint` runs.
         env.push(from_optional_secret(
             "SQUELCH_STAGE2_API_KEY",
             name.llm_secret(),
@@ -1535,47 +1508,6 @@ mod tests {
                 .iter()
                 .any(|e| e.name == "SQUELCH_CONSOLE_SSO_URL")
         );
-    }
-
-    /// The Stage-2 key, from a Secret that may not exist. `optional: true` is the
-    /// whole point: without it, a cluster that has not created the Secret holds
-    /// every tenant pod in `CreateContainerConfigError`.
-    #[test]
-    fn the_anthropic_key_is_an_optional_secret_reference() {
-        let c = test_config();
-        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
-        let var = pod.containers[0]
-            .env
-            .clone()
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == "ANTHROPIC_API_KEY")
-            .expect("ANTHROPIC_API_KEY is missing from the tenant pod");
-        assert!(var.value.is_none(), "the API key is inline in the pod spec");
-        let from = var.value_from.unwrap().secret_key_ref.unwrap();
-        assert_eq!(from.name, "anthropic-api-key");
-        assert_eq!(from.key, "ANTHROPIC_API_KEY");
-        assert_eq!(from.optional, Some(true));
-    }
-
-    #[test]
-    fn the_anthropic_secret_can_be_renamed() {
-        let mut c = test_config();
-        c.anthropic_secret_name = "passband-llm".to_string();
-        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
-        let from = pod.containers[0]
-            .env
-            .clone()
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == "ANTHROPIC_API_KEY")
-            .unwrap()
-            .value_from
-            .unwrap()
-            .secret_key_ref
-            .unwrap();
-        assert_eq!(from.name, "passband-llm");
-        assert_eq!(from.optional, Some(true));
     }
 
     /// Every container bounded, and the one writable scratch volume bounded

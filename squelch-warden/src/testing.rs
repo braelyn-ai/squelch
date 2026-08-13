@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::Secret;
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object};
 use crate::config::{
-    Config, DEFAULT_ANTHROPIC_SECRET_NAME, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST,
+    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST,
     DEFAULT_EPHEMERAL_LIMIT, DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS,
     DEFAULT_INGRESS_NAMESPACE, DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST,
     DEFAULT_OAUTH_SECRET_NAME, DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS,
@@ -51,7 +51,6 @@ pub fn test_config() -> Config {
         ingress_class: DEFAULT_INGRESS_CLASS.to_string(),
         tls_secret: DEFAULT_TLS_SECRET.to_string(),
         oauth_secret_name: DEFAULT_OAUTH_SECRET_NAME.to_string(),
-        anthropic_secret_name: DEFAULT_ANTHROPIC_SECRET_NAME.to_string(),
         // Unset, like a self-host and like a hosted deploy whose operator has
         // not filled it in: the tests that care set it themselves.
         console_sso_url: None,
