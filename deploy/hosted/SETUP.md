@@ -360,14 +360,28 @@ The gateway, on Railway:
    the only place the real key lives, anywhere.
 4. Generate the service's public domain (port 8080). Tenant egress already
    allows any public 443 host, so the cluster needs nothing.
-5. First boot, in the web UI: create the admin user, then turn on
-   `enforce_auth_on_inference` (Settings → Client Settings) so a request
-   without a valid virtual key is refused rather than passed through, and
-   confirm the governance API refuses unauthenticated requests once auth is
-   on. Mint the admin API token the control plane will use. The exact
-   first-boot auth flow is Bifrost's, not ours, and drifts with their
-   releases; what must be true at the end is fixed: **the `/api/*` plane and
-   the UI demand credentials, and `/anthropic` demands a virtual key.**
+5. First boot: enable auth with an admin credential (`PUT /api/config` with
+   `auth_config` — or the web UI) and turn on `enforce_auth_on_inference`
+   (Settings → Client Settings, or `client_config` in the same call) so a
+   request without a valid virtual key is refused rather than passed through.
+   Then confirm the governance API refuses unauthenticated requests. The
+   control plane authenticates with HTTP Basic — the admin `username:password`
+   IS its `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` (session bearer tokens expire
+   monthly; do not paste one there). The exact first-boot flow is Bifrost's,
+   not ours, and drifts with their releases; what must be true at the end is
+   fixed: **the `/api/*` plane and the UI demand credentials, and
+   `/anthropic` demands a virtual key.**
+6. Bifrost auto-detects `ANTHROPIC_API_KEY` into a provider key on first
+   boot, but two of its defaults do not survive contact with our models
+   (v1.6.9): the key's `models: ["*"]` wildcard does not match models missing
+   from Bifrost's own catalog, and routing resolves keys only through a
+   virtual key's `provider_configs.key_ids`. The control plane handles the
+   latter when it mints (it discovers key ids from
+   `/api/providers/anthropic/keys`); the former is one `PUT` on the provider
+   key setting `models` to the explicit list (`claude-haiku-4-5`,
+   `claude-sonnet-5`). Verify with a curl through a test virtual key before
+   pointing any tenant at it — the failure mode is a 400 `no keys found for
+   provider`, not a misrouted call.
 
 Then point both planes at it:
 
