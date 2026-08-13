@@ -482,12 +482,18 @@ final class AppStore {
                 connError = nil
                 // A link that arrived during boot (the app was LAUNCHED by one)
                 // races the keychain read and finds no Connect gate to land on.
-                // It is no longer dropped for that: this install having an
+                // On the Mac it is not dropped for that: this install having an
                 // identity is precisely what makes the link an ADD rather than
                 // a re-pair, so it goes to the same sheet a link arriving a
-                // minute later would. The link itself stays parked for the
-                // sheet's ConnectView to read as it mounts.
-                if pairLink != nil { addAccountSheetOpen = true }
+                // minute later would, parked for the sheet's ConnectView to
+                // read as it mounts. On the phone nothing presents that sheet,
+                // and a link left parked only goes stale — same policy as
+                // `receivePairLink`, it is dropped instead.
+                #if os(iOS)
+                    pairLink = nil
+                #else
+                    if pairLink != nil { addAccountSheetOpen = true }
+                #endif
             } else {
                 connStatus = .disconnected
             }
@@ -537,21 +543,20 @@ final class AppStore {
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
             _ = try await APIClient.shared.getStats()  // 401 => bad token; network => bad url
-            // Re-connecting to the SAME daemon keeps the live account's id
-            // (and so its keychain slots and scoped cursors); anything else
-            // mints a fresh record. The gate can be reached with healthy
-            // accounts still in the index — a failed switch, a denied keychain
-            // read at boot — and reusing the active record there would
-            // overwrite a surviving account's credentials with a stranger
-            // daemon's. The index entry is written only after the credentials
-            // are in the keychain.
-            let activeRecord = AccountIndex.load().active
-            var account: AccountRecord
-            if let activeRecord, activeRecord.displayHost == AccountRecord.host(from: serverURL) {
-                account = activeRecord
-            } else {
-                account = AccountRecord()
-            }
+            // Re-connecting to a daemon the index ALREADY NAMES — active or
+            // not — keeps that record's id (and so its keychain slots and
+            // scoped cursors); a daemon no record names mints a fresh one. The
+            // gate can be reached with healthy accounts still in the index (a
+            // failed switch, a denied keychain read at boot), and the two
+            // wrong answers there are each other's mirror: reusing the active
+            // record for a DIFFERENT daemon overwrites a survivor's
+            // credentials, while minting a fresh record for a KNOWN daemon
+            // splits one mailbox across two accounts and doubles its streams
+            // and banners. The index entry is written only after the
+            // credentials are in the keychain.
+            let host = AccountRecord.host(from: serverURL)
+            var account =
+                AccountIndex.load().accounts.first { $0.displayHost == host } ?? AccountRecord()
             let named = label.trimmingCharacters(in: .whitespacesAndNewlines)
             if !named.isEmpty { account.label = named }
             // The name the switcher shows when there is no label, learned here
@@ -719,7 +724,13 @@ final class AppStore {
         while switching { try? await Task.sleep(for: .milliseconds(50)) }
         switching = true
         defer { switching = false }
-        await performSwitch(to: record)
+        // The switch can fail its credential read-back (a denied access panel
+        // on the slots just written). The account exists either way — saying
+        // `ok` while the old mailbox stays on screen would read as a failed
+        // add, and the retry it invites is refused as a duplicate daemon.
+        guard await performSwitch(to: record) else {
+            return (false, "account added, but the keychain refused its credentials; pick it from the account switcher to retry")
+        }
         return (true, nil)
     }
 
@@ -758,29 +769,13 @@ final class AppStore {
         guard wasActive else { return }
 
         guard let survivor = AccountManager.shared.active else {
-            // THE LAST ACCOUNT. Back to the Connect gate, torn down exactly as
-            // a switch tears it down: every id on screen addressed a daemon
-            // this install no longer holds credentials for. The drafts are
-            // deliberately NOT flushed on the way out (a switch flushes them) —
-            // there is nowhere to send them that we are still entitled to talk
-            // to, and the human asked for this account to be forgotten.
-            epoch &+= 1
-            SitrepPoller.shared.stop()
-            assistant.clear()
-            wipeAccountState()
-            wipeAccountCaches()
-            // No live account, no key — this empties the in-memory ledger, so
-            // a later `connect` cannot inherit (and then persist) the removed
-            // account's verdicts under a new daemon's colliding ids.
-            AuthDecisions.shared.reload()
-            // The client would otherwise keep the removed daemon's URL and a
-            // token whose slots were just deleted — and anything that survived
-            // the fence above would present it to the daemon the human just
-            // asked to forget.
-            await APIClient.shared.deconfigure()
-            settings = nil
-            connStatus = .disconnected
-            connError = nil
+            // THE LAST ACCOUNT. Back to the Connect gate: every id on screen
+            // addressed a daemon this install no longer holds credentials for.
+            // The drafts are deliberately NOT flushed on the way out (a switch
+            // flushes them) — there is nowhere to send them that we are still
+            // entitled to talk to, and the human asked for this account to be
+            // forgotten.
+            await tearDownToGate(error: nil)
             return
         }
         // Straight to `performSwitch` rather than `AccountManager.switchTo`:
@@ -829,9 +824,10 @@ final class AppStore {
     /// drafts would go to is the one being forgotten. The settle still runs —
     /// a debounced save already in flight must finish before the client is
     /// reconfigured, whoever it was addressed to.
+    @discardableResult
     private func performSwitch(
         to record: AccountRecord, flushDrafts: Bool = true, currentWorldGone: Bool = false
-    ) async {
+    ) async -> Bool {
         // (2) The target's credentials, BEFORE anything is torn down — the one
         //     step that can fail. Failing here, with the old world untouched,
         //     keeps the human on a working mailbox; checking after the wipe
@@ -850,27 +846,18 @@ final class AppStore {
             }
             guard currentWorldGone else {
                 // A plain switch: the world on screen is intact and the
-                // credentials backing it were never touched. Stay.
-                connError = why
-                return
+                // credentials backing it were never touched. Stay — and say
+                // so. A toast, not `connError`: that field renders only on
+                // ConnectView, so writing it here would show nothing now and
+                // then greet the next Add Account sheet with a stale failure.
+                pushToast(why, .error)
+                return false
             }
             // The removal path: the account on screen is already gone from the
             // index, so there is no working world to stay in — the Connect
-            // gate is the honest answer, torn down exactly as the last-account
-            // branch tears it down. The ledger goes with the world, and the
-            // client must not keep presenting a token for a daemon this
-            // install no longer holds.
-            epoch &+= 1
-            SitrepPoller.shared.stop()
-            assistant.clear()
-            wipeAccountState()
-            wipeAccountCaches()
-            AuthDecisions.shared.reload()
-            await APIClient.shared.deconfigure()
-            settings = nil
-            connStatus = .disconnected
-            connError = why
-            return
+            // gate is the honest answer.
+            await tearDownToGate(error: why)
+            return false
         }
 
         // (3) From here, every answer still in flight belongs to the old
@@ -919,6 +906,30 @@ final class AppStore {
         SitrepPoller.shared.start()
         Task { await refreshMail(.inbox) }
         Task { await refreshTrackingConfig() }
+        return true
+    }
+
+    /// Tear the world down to the Connect gate: the shared tail of "the
+    /// account on screen is gone" — the last account removed, or a removal's
+    /// survivor unreadable. ONE copy, because a teardown-ordering fix that
+    /// lands in one path and misses another leaves that path presenting a
+    /// forgotten daemon's token.
+    ///
+    /// The ledger reload empties the in-memory verdicts (no live account, no
+    /// key), so a later `connect` cannot inherit — and then persist — a gone
+    /// account's decisions under a new daemon's colliding message ids. The
+    /// deconfigure is the same principle for the client itself.
+    private func tearDownToGate(error: String?) async {
+        epoch &+= 1
+        SitrepPoller.shared.stop()
+        assistant.clear()
+        wipeAccountState()
+        wipeAccountCaches()
+        AuthDecisions.shared.reload()
+        await APIClient.shared.deconfigure()
+        settings = nil
+        connStatus = .disconnected
+        connError = error
     }
 
     /// Everything in this store that belongs to ONE account. Message ids are
@@ -1187,47 +1198,56 @@ final class AppStore {
     /// In-flight zone refresh, so concurrent callers share one pass.
     private var zoneRefresh: Task<Void, Never>?
 
+    /// One zone's answer, tagged so completion order can drive the writes.
+    /// nil rows = that endpoint failed and its zone keeps what it had.
+    private enum ZoneAnswer: Sendable {
+        case calendar([CalendarUpdate]?)
+        case shipments([Shipment]?)
+        case banking([BankingRecord]?)
+        case receipts([Receipt]?)
+        case rules(Int?)
+        case newsletters([Newsletter])
+    }
+
     private func performZoneRefresh() async {
         let e = epoch
-        // Six independent fetches, kicked off together so the first paint does
-        // not wait on the sum of them.
-        async let calendar = APIClient.shared.getCalendar()
-        async let shipments = APIClient.shared.getShipments(includeDelivered: true)
-        async let banking = APIClient.shared.getBanking()
-        async let receipts = APIClient.shared.getReceipts()
-        async let rules = APIClient.shared.listRules()
-        async let newsletterRows = NewsletterFeed.load()
-
-        // Each zone lands as its endpoint answers — one wedged endpoint riding
-        // out its timeout must not hold every other zone's paint hostage — and
-        // every write is individually fenced on the epoch, so a switch landing
-        // mid-pass cannot show half of each mailbox. A failing endpoint leaves
-        // its own zone's last good rows rather than blanking the column.
-        if let rows = try? await calendar {
-            guard e == epoch else { return }
-            zones.calendar = rows
+        // Six independent fetches racing in one group, each zone written the
+        // moment ITS fetch answers — completion order, not a fixed await
+        // order, which is what actually keeps one wedged endpoint riding out
+        // its timeout from holding every later zone's paint hostage. Every
+        // write is individually fenced on the epoch, so a switch landing
+        // mid-pass cannot show half of each mailbox; a failing endpoint (nil
+        // rows) leaves its own zone's last good rows rather than blanking the
+        // column.
+        await withTaskGroup(of: ZoneAnswer.self) { group in
+            group.addTask { .calendar(try? await APIClient.shared.getCalendar()) }
+            group.addTask {
+                .shipments(try? await APIClient.shared.getShipments(includeDelivered: true))
+            }
+            group.addTask { .banking(try? await APIClient.shared.getBanking()) }
+            group.addTask { .receipts(try? await APIClient.shared.getReceipts()) }
+            group.addTask { .rules((try? await APIClient.shared.listRules())?.count) }
+            group.addTask { .newsletters(await NewsletterFeed.load()) }
+            for await answer in group {
+                guard e == epoch else {
+                    group.cancelAll()
+                    return
+                }
+                switch answer {
+                case .calendar(let rows?): zones.calendar = rows
+                case .shipments(let rows?): zones.shipments = rows
+                case .banking(let rows?): zones.banking = rows
+                case .receipts(let rows?): zones.receipts = rows
+                case .rules(let count?): zones.rulesCount = count
+                case .newsletters(let rows):
+                    if !rows.isEmpty || zones.newsletters.isEmpty {
+                        zones.newsletters = rows
+                    }
+                case .calendar, .shipments, .banking, .receipts, .rules: break
+                }
+            }
         }
-        if let rows = try? await shipments {
-            guard e == epoch else { return }
-            zones.shipments = rows
-        }
-        if let rows = try? await banking {
-            guard e == epoch else { return }
-            zones.banking = rows
-        }
-        if let rows = try? await receipts {
-            guard e == epoch else { return }
-            zones.receipts = rows
-        }
-        if let rows = try? await rules {
-            guard e == epoch else { return }
-            zones.rulesCount = rows.count
-        }
-        let newsletters = await newsletterRows
         guard e == epoch else { return }
-        if !newsletters.isEmpty || zones.newsletters.isEmpty {
-            zones.newsletters = newsletters
-        }
         zones.loadedAt = Date()
 
         HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))

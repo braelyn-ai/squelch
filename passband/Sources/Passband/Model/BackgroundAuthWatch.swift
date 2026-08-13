@@ -154,8 +154,12 @@ final class BackgroundAuthWatch {
         // Re-checked AFTER the round trip, not just before it: a switch can
         // land inside the request, and the instant this account is the live one
         // its seen-set has another writer. Dropping the answer on the floor is
-        // safe — `AuthArrival` seeds that same set from disk on its first
-        // observation, so nothing here fires twice.
+        // safe because the set is PERSISTED: every id this watcher fired for
+        // was saved before the switch, so `AuthArrival` reads it from disk and
+        // stays quiet, and an id seen here but never saved is equally unseen
+        // there — the live side fires the one notification instead. Exactly
+        // once, either way; that argument leans on the save-on-fire rule in
+        // `AuthSeenSet.arrivals`, not on any first-observation seeding.
         guard AccountManager.shared.activeId != accountId else { return }
         let arrivals = seen.arrivals(in: sealed)
         guard !arrivals.isEmpty else { return }

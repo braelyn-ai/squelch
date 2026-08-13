@@ -319,19 +319,28 @@ final class Notifier {
             front()
             return
         }
-        // NOT FROM BEHIND THE CONNECT GATE. A switch assumes a live world to
-        // replace — it never touches `connStatus`, so from the gate it would
-        // point the client at a daemon while the screen is still asking the
-        // human to name one, and nothing would show for it. Fronting the app
-        // puts the banner's own tap where it can still be acted on.
-        guard AppStore.shared.connStatus == .connected else {
+        // The live account's own banner opens in place; no switch to run.
+        // Mid-boot counts: a tap that LAUNCHED the app arrives while status is
+        // still `.loading`, and `open` only parks view state the shell shows
+        // once the world is up. Only the gate states refuse — there is no
+        // world to park into, and the client's config (if any survives) is not
+        // this tap's to spend.
+        if resolved == AccountManager.shared.activeId {
             front()
+            switch AppStore.shared.connStatus {
+            case .disconnected, .error: break
+            case .loading, .connecting, .connected: open(target)
+            }
             return
         }
-        // The live account's own banner opens in place; no switch to run.
-        guard resolved != AccountManager.shared.activeId else {
+        // A DIFFERENT account's banner needs a switch, and a switch assumes a
+        // fully-live world to replace — it never touches `connStatus`, so from
+        // the gate (or mid-boot) it would point the client at a daemon while
+        // the screen is still sorting out which one is live, and nothing would
+        // show for it. Fronting the app puts the banner's own tap where it can
+        // still be acted on.
+        guard AppStore.shared.connStatus == .connected else {
             front()
-            open(target)
             return
         }
         Task {
