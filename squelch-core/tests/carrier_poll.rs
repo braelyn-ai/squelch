@@ -204,8 +204,10 @@ fn land(
 }
 
 fn row(store: &SqliteStore, acct: i64, number: &str) -> Shipment {
+    // u32::MAX = no ambiguous-row suppression: these tests are about polling,
+    // and several of them deliberately drive `poll_failures` up.
     store
-        .list_shipments(acct, true)
+        .list_shipments(acct, true, u32::MAX)
         .unwrap()
         .into_iter()
         .find(|s| s.tracking_number == number)

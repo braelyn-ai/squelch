@@ -583,7 +583,9 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
         .unwrap();
     assert_eq!(id1, id2, "same tracking number dedupes to one row");
 
-    let en_route = store.list_shipments(acct, false).unwrap();
+    let en_route = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(en_route.len(), 1);
     assert_eq!(en_route[0].status, "out_for_delivery");
     assert_eq!(en_route[0].item_name, "Wireless Headphones");
@@ -591,7 +593,12 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
     // Deliver it.
     let delivered_at = t0 + chrono::Duration::minutes(2);
     store
-        .upsert_shipment(acct, mid, &ship(ShipmentStatus::Delivered, ""), delivered_at)
+        .upsert_shipment(
+            acct,
+            mid,
+            &ship(ShipmentStatus::Delivered, ""),
+            delivered_at,
+        )
         .unwrap();
     // A LATE stale "shipped" email (from another thread) must NOT regress the
     // delivered shipment — and must not become the row's click target or bump
@@ -609,9 +616,16 @@ fn shipment_upsert_dedupes_and_state_machine_no_regress() {
         .unwrap();
 
     // En-route list now excludes it (delivered).
-    assert!(store.list_shipments(acct, false).unwrap().is_empty());
+    assert!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty()
+    );
     // include_delivered surfaces it, still delivered (no regress).
-    let all = store.list_shipments(acct, true).unwrap();
+    let all = store
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].status, "delivered", "delivered never regresses");
     // The rejected stale email moved neither the click target nor the clock.
@@ -649,7 +663,9 @@ fn list_shipments_serves_thread_and_left_join_keeps_pointerless_rows() {
         .unwrap();
 
     // The join serves the feeding message's thread so the card can open it.
-    let listed = store.list_shipments(acct, false).unwrap();
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].thread_id.as_deref(), Some("t1"));
 
@@ -661,7 +677,9 @@ fn list_shipments_serves_thread_and_left_join_keeps_pointerless_rows() {
         .unwrap()
         .execute("UPDATE shipments SET last_message_id = NULL", [])
         .unwrap();
-    let listed = store.list_shipments(acct, false).unwrap();
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(listed.len(), 1, "pointerless rows must still list");
     assert_eq!(listed[0].thread_id, None);
 }
@@ -731,7 +749,9 @@ fn carrier_track_advances_status_and_leaves_the_click_target_alone() {
         .unwrap();
     assert!(changed, "shipped -> out_for_delivery is a status change");
 
-    let listed = store.list_shipments(acct, false).unwrap();
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(listed[0].status, "out_for_delivery");
     assert_eq!(
         listed[0].carrier_status_raw.as_deref(),
@@ -801,7 +821,7 @@ fn carrier_replaces_the_email_inferred_status_in_both_directions() {
         .unwrap();
 
     let by_id: std::collections::HashMap<i64, String> = store
-        .list_shipments(acct, true)
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
         .unwrap()
         .into_iter()
         .map(|s| (s.id, s.status))
@@ -847,7 +867,10 @@ fn a_delivered_shipment_survives_any_carrier_status() {
         .unwrap();
     assert!(!changed, "delivered is terminal, so nothing changed");
     assert_eq!(
-        store.list_shipments(acct, true).unwrap()[0].status,
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()[0]
+            .status,
         "delivered"
     );
 }
@@ -883,7 +906,9 @@ fn an_unmappable_carrier_status_records_the_raw_string_only() {
         )
         .unwrap();
     assert!(!changed);
-    let listed = store.list_shipments(acct, false).unwrap();
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(
         listed[0].status, "shipped",
         "an unmapped status is not guessed at"
@@ -922,7 +947,10 @@ fn a_poll_with_nothing_new_advances_last_polled_at_but_not_last_update() {
     };
     let first = t0 + chrono::Duration::minutes(1);
     store.apply_carrier_track(acct, sid, &track, first).unwrap();
-    let after_first = store.list_shipments(acct, false).unwrap().remove(0);
+    let after_first = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap()
+        .remove(0);
     assert_eq!(after_first.last_update, first, "the raw string was new");
 
     // Same answer an hour later: nothing the user can see moved.
@@ -931,7 +959,10 @@ fn a_poll_with_nothing_new_advances_last_polled_at_but_not_last_update() {
         .apply_carrier_track(acct, sid, &track, second)
         .unwrap();
     assert!(!changed);
-    let after_second = store.list_shipments(acct, false).unwrap().remove(0);
+    let after_second = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap()
+        .remove(0);
     assert_eq!(
         after_second.last_update, first,
         "an unchanged poll must not churn the sort order"
@@ -1048,7 +1079,9 @@ fn record_poll_outcome_stamps_every_attempt_but_counts_only_permanent_failures()
         .record_poll_outcome(acct, sid, transient, false)
         .unwrap();
     assert_eq!(shipment_internals(&store, sid).1, 0);
-    let listed = store.list_shipments(acct, false).unwrap();
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert_eq!(listed[0].last_polled_at, Some(transient));
     assert_eq!(
         listed[0].last_update, t0,
@@ -1142,7 +1175,7 @@ fn delivered_at_is_stamped_by_either_path_and_never_overwritten() {
 
     let stamped = |id: i64| {
         store
-            .list_shipments(acct, true)
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
             .unwrap()
             .into_iter()
             .find(|s| s.id == id)
@@ -1189,9 +1222,268 @@ fn a_shipment_carries_no_poll_state_until_it_is_polled() {
             Utc::now(),
         )
         .unwrap();
-    let s = store.list_shipments(acct, false).unwrap().remove(0);
+    let s = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap()
+        .remove(0);
     assert_eq!(s.carrier_status_raw, None);
     assert_eq!(s.eta, None);
     assert_eq!(s.delivered_at, None);
     assert_eq!(s.last_polled_at, None, "NULL means never polled");
+}
+
+// ---- read-side suppression of capped ambiguous rows ---------------------
+
+/// Drive a shipment's `poll_failures` to `n` with permanent poll failures.
+fn fail_polls(store: &SqliteStore, acct: AccountId, shipment_id: i64, n: u32) {
+    for _ in 0..n {
+        store
+            .record_poll_outcome(acct, shipment_id, Utc::now(), true)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_capped_ambiguous_row_is_suppressed_but_a_prefixed_one_is_not() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    // Same failure history, different SHAPES: only the bare digit-run could be
+    // an eBay item id, so only it is hideable.
+    let phantom = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    let real = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    fail_polls(&store, acct, phantom, 5);
+    fail_polls(&store, acct, real, 5);
+
+    let listed = store.list_shipments(acct, false, 5).unwrap();
+    let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec![real], "only the ambiguous shape is suppressed");
+    assert_eq!(
+        listed[0].poll_failures, 5,
+        "the counter is on the wire type"
+    );
+
+    // SUPPRESSION IS A READ FILTER, not a delete: the row is still there for a
+    // repair pass to fix or remove.
+    assert_eq!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        2,
+        "the suppressed row is still stored"
+    );
+}
+
+#[test]
+fn an_ambiguous_row_below_the_cap_still_lists() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    fail_polls(&store, acct, sid, 4);
+
+    let listed = store.list_shipments(acct, false, 5).unwrap();
+    assert_eq!(listed.len(), 1, "cap-1 failures is not yet a phantom");
+    assert_eq!(listed[0].poll_failures, 4);
+}
+
+#[test]
+fn a_successful_poll_unsuppresses_an_ambiguous_row() {
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    fail_polls(&store, acct, sid, 5);
+    assert!(
+        store.list_shipments(acct, false, 5).unwrap().is_empty(),
+        "capped out"
+    );
+
+    // The carrier acknowledging the number is proof it was real all along, and
+    // the success zeroes `poll_failures` — so the row comes straight back.
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let listed = store.list_shipments(acct, false, 5).unwrap();
+    assert_eq!(listed.len(), 1, "a successful poll brings the row back");
+    assert_eq!(listed[0].poll_failures, 0);
+}
+
+// ---- one-shot re-detect cleanup ----------------------------------------
+
+/// A shipment row on `(carrier, number)` whose feeder is `msg` — the shape the
+/// re-detect pass re-judges.
+fn shipment_over_mail(
+    store: &SqliteStore,
+    acct: AccountId,
+    msg: &NewMessage,
+    carrier: &str,
+    number: &str,
+) -> i64 {
+    let mid = store.upsert_message(msg).unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped(carrier, number, crate::triage::ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn redetect_deletes_the_ebay_phantom_and_keeps_the_real_row() {
+    let (store, acct) = store();
+    // The live bug: an eBay item id minted as a "fedex" shipment.
+    let phantom = shipment_over_mail(
+        &store,
+        acct,
+        &triaged(acct, "g-ebay", "t-ebay")
+            .from("ebay@ebay.com")
+            .subject("Your package is now with its carrier!")
+            .body(
+                "Your package is now with its carrier! Shipping via USPS. \
+                 See https://www.ebay.com/itm/123456789012, item 234567890123.",
+            )
+            .msg(),
+        "fedex",
+        "123456789012",
+    );
+    // A real UPS notice, which the tightened detector still yields.
+    let real = shipment_over_mail(
+        &store,
+        acct,
+        &triaged(acct, "g-ups", "t-ups")
+            .from("mcinfo@ups.com")
+            .subject("Your UPS package has shipped")
+            .body("Tracking number: 1Z999AA10123456784. Track your package.")
+            .msg(),
+        "ups",
+        "1Z999AA10123456784",
+    );
+
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 1);
+    let ids: Vec<i64> = store
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![real], "only the phantom goes");
+    assert!(!ids.contains(&phantom));
+
+    // IDEMPOTENT: a second pass over the repaired store deletes nothing.
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn redetect_deletes_a_row_whose_feeder_now_yields_a_different_number() {
+    let (store, acct) = store();
+    // The mail yields the IMpb; the stored row is one of its item ids, which the
+    // old first-match-only scan had picked instead.
+    shipment_over_mail(
+        &store,
+        acct,
+        &triaged(acct, "g-ebay", "t-ebay")
+            .from("ebay@ebay.com")
+            .subject("Your package is now with its carrier!")
+            .body("Item 234567890123 shipped via USPS. Tracking number 9400111899223817428490.")
+            .msg(),
+        "fedex",
+        "234567890123",
+    );
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 1);
+    assert!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty(),
+        "a row the feeder no longer yields is deleted"
+    );
+}
+
+#[test]
+fn redetect_leaves_pointerless_rows_alone() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    // An ambiguous number that would NOT re-detect from any mail — but with no
+    // feeder message there is no evidence to judge it on, so it stays.
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
+            Utc::now(),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute("UPDATE shipments SET last_message_id = NULL", [])
+        .unwrap();
+
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1,
+        "no feeder message, no judgement"
+    );
 }

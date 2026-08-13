@@ -691,8 +691,14 @@ pub async fn get_shipments(
     // The shipments table holds no sealed rows: detection never runs on sealed
     // mail, and hand-sealing a message deletes the shipment row it fed
     // (correct_triage), so there is no sealed filtering to apply.
+    //
+    // Ambiguous digit-run rows the carrier has permanently rejected up to the
+    // poller's retirement cap ARE filtered — a number no carrier will
+    // acknowledge, in a shape a retailer item id shares, is a phantom. The rows
+    // stay in the store; only this read hides them.
+    let cap = state.shipment_suppress_failures;
     query(&state, move |store, account_id| {
-        store.list_shipments(account_id, q.include_delivered)
+        store.list_shipments(account_id, q.include_delivered, cap)
     })
     .await
 }

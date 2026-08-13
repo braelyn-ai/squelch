@@ -307,6 +307,130 @@ fn is_return_or_outbound(hay: &str) -> bool {
     detector().return_signal.iter().any(|re| re.is_match(hay))
 }
 
+// ---- ambiguous digit-run gating ------------------------------------------
+//
+// The `requires_signal` shapes are bare digit runs, and a retailer's ITEM or
+// ORDER id has exactly the same shape: one eBay order thread carries six
+// 12-digit item ids, and an Amazon marketing mail ("review your upcoming
+// delivery") carries a 10-digit run next to a DHL mention. A carrier signal
+// somewhere in the mail is not enough to tell those apart, so an ambiguous
+// candidate must ALSO sit in tracking-number CONTEXT and must not sit in
+// retailer item/order context. The unambiguous shapes (1Z…, TBA…, 9[234]…) are
+// exempt from both tests: their prefix already identifies them.
+
+/// The largest byte index `<= idx` that is a char boundary, `n` bytes back.
+fn window_start(hay: &str, idx: usize, n: usize) -> usize {
+    let mut lo = idx.saturating_sub(n);
+    while lo < idx && !hay.is_char_boundary(lo) {
+        lo += 1;
+    }
+    lo
+}
+
+/// The smallest byte index `>= idx` that is a char boundary, `n` bytes on.
+fn window_end(hay: &str, idx: usize, n: usize) -> usize {
+    let mut hi = idx.saturating_add(n).min(hay.len());
+    while hi > idx && !hay.is_char_boundary(hi) {
+        hi -= 1;
+    }
+    hi
+}
+
+/// The whitespace-delimited token containing `hay[start..end]` — the URL or word
+/// the number is embedded in.
+fn containing_token(hay: &str, start: usize, end: usize) -> &str {
+    let b = hay.as_bytes();
+    // Both scans stop just past an ASCII whitespace byte (or at an edge), which
+    // is always a char boundary: a UTF-8 continuation byte is never whitespace.
+    let mut lo = start;
+    while lo > 0 && !b[lo - 1].is_ascii_whitespace() {
+        lo -= 1;
+    }
+    let mut hi = end.min(b.len());
+    while hi < b.len() && !b[hi].is_ascii_whitespace() {
+        hi += 1;
+    }
+    &hay[lo..hi]
+}
+
+/// Is `from_addr` one of the carriers themselves? The carrier mailing you a
+/// number IS the context — their notices routinely print it with no label at all.
+/// Subdomains count (`ship-confirm@email.ups.com`); look-alikes do not
+/// (`ups.com.example.net` fails the suffix test).
+fn is_carrier_sender(from_addr: &str) -> bool {
+    let Some(domain) = from_addr.rsplit('@').next() else {
+        return false;
+    };
+    let domain = domain.trim().trim_end_matches('>').to_ascii_lowercase();
+    ["ups.com", "usps.com", "fedex.com", "dhl.com"]
+        .iter()
+        .any(|c| domain == *c || domain.ends_with(&format!(".{c}")))
+}
+
+/// Positive context for an ambiguous digit-run at `hay[start..end]`: any of
+///  (a) a tracking-ish label within ~80 chars before or ~40 after the match,
+///  (b) the match lies inside a known carrier tracking URL (the containing
+///      non-whitespace token carries one of the carriers' number parameters),
+///  (c) CARRIER-SENDER EXEMPTION: the mail came FROM a carrier's domain.
+fn ambiguous_number_in_context(from_addr: &str, hay: &str, start: usize, end: usize) -> bool {
+    // (c) first: it is the cheapest and needs no windowing.
+    if is_carrier_sender(from_addr) {
+        return true;
+    }
+    static LABEL: OnceLock<Regex> = OnceLock::new();
+    let label = LABEL.get_or_init(|| rx(r"tracking\s*(number|no\.?|#|:|id)?|\btrack\b"));
+    let before = &hay[window_start(hay, start, 80)..start];
+    let after = &hay[end..window_end(hay, end, 40)];
+    if label.is_match(before) || label.is_match(after) {
+        return true;
+    }
+    static URL_PARAM: OnceLock<Regex> = OnceLock::new();
+    URL_PARAM
+        .get_or_init(|| rx(r"tracknum=|trknbr=|tLabels=|tracking-id=|TrackConfirmAction"))
+        .is_match(containing_token(hay, start, end))
+}
+
+/// Hard negative for an ambiguous digit-run at `hay[start..end]`, with
+/// PRECEDENCE OVER the positive context — a labelled-looking item id is still an
+/// item id:
+///  (a) the match sits inside a retailer item/order URL, or
+///  (b) the match is immediately preceded by an item/order label.
+fn ambiguous_number_is_hard_negative(hay: &str, start: usize, end: usize) -> bool {
+    static ITEM_URL: OnceLock<Regex> = OnceLock::new();
+    let token = containing_token(hay, start, end);
+    if ITEM_URL
+        .get_or_init(|| rx(r"/itm/|/ord/|ebay\."))
+        .is_match(token)
+    {
+        return true;
+    }
+    static ITEM_LABEL: OnceLock<Regex> = OnceLock::new();
+    ITEM_LABEL
+        .get_or_init(|| rx(r"\b(item|order)\b\s*(#|no\.?|number|:)?\s*$"))
+        .is_match(&hay[window_start(hay, start, 20)..start])
+}
+
+/// Shape-only ambiguity test for an ALREADY-STORED tracking number, the read-side
+/// sibling of the gating above: `true` for the bare digit runs a retailer item or
+/// order id can impersonate (10-15 digits, or 20-22 digits without the IMpb
+/// `9[234]` prefix), `false` for the self-identifying shapes — UPS `1Z…`, Amazon
+/// `TBA…`, and `9[234]`-prefixed IMpb numbers.
+///
+/// ONE definition of "ambiguous", shared by the listing suppression and the
+/// repair passes, so a number can never be ambiguous to one and not the other.
+pub fn is_ambiguous_tracking_shape(number: &str) -> bool {
+    let n = number.trim();
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        // Anything carrying letters is a prefixed shape (1Z…, TBA…), not a run.
+        return false;
+    }
+    match n.len() {
+        10..=15 => true,
+        20..=22 => !matches!(&n[..2], "92" | "93" | "94"),
+        _ => false,
+    }
+}
+
 /// Does the text carry GENUINE INBOUND-DELIVERY phrasing? Advisory only, and it
 /// never overrides the return exclusion — see [`is_return_or_outbound`].
 #[cfg(test)]
@@ -464,14 +588,26 @@ pub fn detect_shipment(from_addr: &str, subject: &str, body: &str) -> Option<Shi
 
     let mentioned = mentioned_carriers(&hay);
 
-    // First match by most-specific-first shape wins its number; the carrier is
-    // then disambiguated.
+    // First ACCEPTED match by most-specific-first shape wins its number; the
+    // carrier is then disambiguated.
     for (shape_carrier, re, requires_signal) in &d.numbers {
-        if let Some(m) = re.find(&hay) {
-            // CARRIER SIGNAL GATE: the ambiguous bare-digit shapes need a real
-            // carrier signal, so skip to the next shape without one. There is no
-            // other shape for a plain 10-digit number, so that falls to `None`.
-            if *requires_signal && !has_carrier_signal(&mentioned, &hay) {
+        // CARRIER SIGNAL GATE: the ambiguous bare-digit shapes need a real
+        // carrier signal, so skip to the next shape without one. There is no
+        // other shape for a plain 10-digit number, so that falls to `None`.
+        if *requires_signal && !has_carrier_signal(&mentioned, &hay) {
+            continue;
+        }
+        // EVERY match of the shape, not just the first: an eBay order mail leads
+        // with six 12-digit ITEM ids and may carry the real number after them, so
+        // first-match-only would pin the row to an item id forever.
+        for m in re.find_iter(&hay) {
+            // CONTEXT GATE, ambiguous shapes only. The hard negative has
+            // precedence: an item id under a "tracking" heading is still an item
+            // id.
+            if *requires_signal
+                && (ambiguous_number_is_hard_negative(&hay, m.start(), m.end())
+                    || !ambiguous_number_in_context(from_addr, &hay, m.start(), m.end()))
+            {
                 continue;
             }
             let number = m.as_str().to_string();
@@ -943,6 +1079,152 @@ mod tests {
             s.item_name, "",
             "no real phrase => empty, desktop fills the fallback"
         );
+    }
+
+    // ---- ambiguous digit-run context gating -------------------------------
+
+    #[test]
+    fn ebay_item_id_with_usps_mention_is_not_a_shipment() {
+        // THE live bug: an eBay order mail carries 12-digit ITEM ids, shipping
+        // language and a USPS mention, which cleared the old carrier-signal gate
+        // and minted a phantom row per item id. Neither id sits in tracking
+        // context, and both sit in item context.
+        let s = detect_shipment(
+            "ebay@ebay.com",
+            "Your package is now with its carrier!",
+            "Your package is now with its carrier! It is shipping via USPS. \
+             See https://www.ebay.com/itm/123456789012 for the listing, item 234567890123.",
+        );
+        assert!(s.is_none(), "eBay item ids are not tracking numbers: {s:?}");
+    }
+
+    #[test]
+    fn ebay_thread_with_item_ids_and_real_impb_yields_only_the_impb() {
+        // The same mail once the carrier's REAL number lands in it: the IMpb is
+        // self-identifying, so it wins outright and the item ids stay phantoms.
+        let s = detect_shipment(
+            "ebay@ebay.com",
+            "Your package is now with its carrier!",
+            "Item 234567890123 (https://www.ebay.com/itm/123456789012) shipped via USPS. \
+             Tracking number 9400111899223817428490.",
+        )
+        .expect("the real IMpb is a shipment");
+        assert_eq!(s.tracking_number, "9400111899223817428490");
+        assert_eq!(s.carrier, "usps");
+    }
+
+    #[test]
+    fn amazon_marketing_ten_digit_run_with_dhl_mention_is_not_a_shipment() {
+        // "Price changes: review your upcoming delivery" — delivery language, a
+        // DHL mention and a bare 10-digit run, none of it a tracking number.
+        // Amazon is NOT a carrier-sender domain, so the exemption does not fire.
+        let s = detect_shipment(
+            "store-news@amazon.com",
+            "Price changes: review your upcoming delivery",
+            "We noticed a price change on an item in your upcoming delivery. \
+             Reference 3051234567. Fulfilled by DHL eCommerce.",
+        );
+        assert!(s.is_none(), "marketing digit-run is not a shipment: {s:?}");
+    }
+
+    #[test]
+    fn ambiguous_number_in_later_position_is_still_found() {
+        // First-match-only would pin this row to the item id; the scan has to
+        // walk past it to the labelled number behind it.
+        let s = detect_shipment(
+            "orders@shop.example",
+            "Your order has shipped",
+            "Item 234567890123 from the store. Tracking number 123456789012 via FedEx.",
+        )
+        .expect("the labelled number is a shipment");
+        assert_eq!(s.tracking_number, "123456789012");
+        assert_eq!(s.carrier, "fedex");
+    }
+
+    #[test]
+    fn carrier_sender_domain_is_sufficient_context() {
+        // A carrier's own notice often prints the number with no label at all —
+        // the sender IS the context. Subdomains count.
+        let s = detect_shipment(
+            "auto@ship.fedex.com",
+            "Your FedEx shipment",
+            "Shipment 123456789012 is on its way.",
+        )
+        .expect("carrier-sent shipment");
+        assert_eq!(s.tracking_number, "123456789012");
+        assert_eq!(s.carrier, "fedex");
+        // Same body from a retailer, with no label anywhere: not enough.
+        assert!(
+            detect_shipment(
+                "orders@shop.example",
+                "Your FedEx shipment",
+                "Shipment 123456789012 is on its way.",
+            )
+            .is_none(),
+            "no label, no carrier sender => no shipment"
+        );
+    }
+
+    #[test]
+    fn tracking_url_around_the_number_is_context() {
+        // The number inside a carrier tracking URL needs no prose label.
+        let s = detect_shipment(
+            "orders@shop.example",
+            "Your FedEx shipment is on its way",
+            "See https://www.fedex.com/fedextrack/?trknbr=123456789012 for details.",
+        )
+        .expect("url-embedded number is a shipment");
+        assert_eq!(s.tracking_number, "123456789012");
+    }
+
+    #[test]
+    fn item_label_beats_a_nearby_tracking_label() {
+        // Hard negative has PRECEDENCE: a "tracking" heading a few words away
+        // does not launder an id introduced as "item".
+        let s = detect_shipment(
+            "orders@shop.example",
+            "Tracking details for your USPS shipment",
+            "Tracking details below. Item 234567890123 was packed.",
+        );
+        assert!(s.is_none(), "item label wins over the heading: {s:?}");
+    }
+
+    #[test]
+    fn ambiguous_shape_test_covers_bare_runs_only() {
+        // Bare runs an item/order id can impersonate.
+        assert!(is_ambiguous_tracking_shape("1234567890"), "10 digits");
+        assert!(is_ambiguous_tracking_shape("123456789012"), "12 digits");
+        assert!(is_ambiguous_tracking_shape("123456789012345"), "15 digits");
+        assert!(
+            is_ambiguous_tracking_shape("12345678901234567890"),
+            "20 digits, no IMpb prefix"
+        );
+        assert!(is_ambiguous_tracking_shape(" 1234567890 "), "trimmed");
+
+        // Self-identifying shapes.
+        assert!(!is_ambiguous_tracking_shape("1Z999AA10123456784"), "UPS");
+        assert!(!is_ambiguous_tracking_shape("TBA303392911000"), "Amazon");
+        assert!(
+            !is_ambiguous_tracking_shape("9400111899223817428490"),
+            "IMpb 94"
+        );
+        assert!(
+            !is_ambiguous_tracking_shape("9205590164917312751089"),
+            "IMpb 92"
+        );
+        assert!(
+            !is_ambiguous_tracking_shape("9300120111410471677883"),
+            "IMpb 93"
+        );
+
+        // Out-of-range runs and junk.
+        assert!(!is_ambiguous_tracking_shape("123456789"), "9 digits");
+        assert!(
+            !is_ambiguous_tracking_shape("1234567890123456"),
+            "16 digits"
+        );
+        assert!(!is_ambiguous_tracking_shape(""), "empty");
+        assert!(!is_ambiguous_tracking_shape("abc"), "not digits");
     }
 
     #[test]

@@ -538,3 +538,9 @@ pub(super) fn vec_count_for(store: &SqliteStore, message_id: i64) -> i64 {
     )
     .unwrap()
 }
+
+/// The ambiguous-row suppression cap for listing tests that are NOT about
+/// suppression: `u32::MAX` keeps every row, so the read-side filter can never
+/// perturb a test asking about something else. The suppression tests pass their
+/// own cap.
+pub(super) const KEEP_ALL_SHIPMENTS: u32 = u32::MAX;

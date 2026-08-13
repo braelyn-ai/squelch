@@ -305,10 +305,16 @@ impl SquelchServer {
         Parameters(params): Parameters<GetShipmentsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let include_delivered = params.include_delivered.unwrap_or(false);
-        // No sealed row to filter: detection never runs on sealed mail.
+        // No sealed row to filter: detection never runs on sealed mail. Rows
+        // whose ambiguous bare digit-run the carrier has permanently rejected up
+        // to the retirement cap ARE filtered, so the agent door does not report
+        // phantom packages. The agent door carries no config, so the cap is the
+        // built-in default rather than the operator's `[carriers] max_failures`;
+        // it only decides how many failed polls precede the hiding.
+        let cap = squelch_core::config::CarriersConfig::default().max_failures;
         let shipments = self
             .store
-            .list_shipments(self.account_id, include_delivered)
+            .list_shipments(self.account_id, include_delivered, cap)
             .map_err(Self::map_err)?;
         let out: Vec<ShipmentHit> = shipments
             .into_iter()

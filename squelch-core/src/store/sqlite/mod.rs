@@ -482,8 +482,13 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
+        suppress_failed_ambiguous_at: u32,
     ) -> Result<Vec<crate::types::Shipment>> {
-        self.list_shipments(account_id, include_delivered)
+        self.list_shipments(account_id, include_delivered, suppress_failed_ambiguous_at)
+    }
+
+    fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {
+        self.shipments_redetect_cleanup(account_id)
     }
 
     fn list_pollable_shipments(

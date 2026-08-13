@@ -140,6 +140,12 @@ pub struct ApiState {
     /// is the resting state of every daemon with no carrier credentials — and
     /// the endpoint reports that as `kicked: false` rather than an error.
     pub(crate) shipment_poll: Option<ShipmentPoll>,
+    /// `[carriers] max_failures`, reused as the SUPPRESSION CAP for the shipments
+    /// listing: an ambiguous bare digit-run the carrier has permanently rejected
+    /// this many times has been retired by the poller and is almost certainly a
+    /// retailer item/order id, so the listing stops showing it. Defaults to the
+    /// config default so a hand-built state still filters sensibly.
+    pub(crate) shipment_suppress_failures: u32,
 }
 
 /// What the human door needs to force a carrier pass: the poller's
@@ -326,6 +332,8 @@ impl ApiState {
             ))),
             rule_infer: None,
             shipment_poll: None,
+            shipment_suppress_failures: squelch_core::config::CarriersConfig::default()
+                .max_failures,
         }
     }
 
@@ -373,6 +381,13 @@ impl ApiState {
             kick,
             carriers: carriers.into(),
         });
+        self
+    }
+
+    /// Set the ambiguous-shipment suppression cap from `[carriers] max_failures`.
+    /// See [`ApiState::shipment_suppress_failures`].
+    pub fn with_shipment_suppress_failures(mut self, max_failures: u32) -> Self {
+        self.shipment_suppress_failures = max_failures;
         self
     }
 
@@ -657,6 +672,10 @@ impl ApiState {
                 cfg.stage1.global_daily_cap,
             )
             .with_tracking_base_url(cfg.tracking.base_url.clone())
+            // The poller's retirement cap doubles as the listing's suppression
+            // cap, so a row the poller gave up on stops being shown at the same
+            // point it stops being polled.
+            .with_shipment_suppress_failures(cfg.carriers.max_failures)
             // Rule-disposition inference rides the SAME key/provider the triage
             // stages resolve and the Stage-1 model; no key => `None` => rules
             // that omit a disposition are stored filtered.

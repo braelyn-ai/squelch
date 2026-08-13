@@ -1782,6 +1782,42 @@ fn cmd_serve(
             });
         }
 
+        // One-shot shipment re-detect: the tracking-number detector was tightened
+        // (eBay item ids and marketing digit-runs used to mint phantom rows), so
+        // every existing row is re-judged against its own feeder message ONCE and
+        // the ones the detector no longer produces are deleted. Store-only and
+        // fast, so it runs inline on a blocking thread rather than on a delay —
+        // no network, no Gmail quota. The done flag is set only after a
+        // successful pass, so a failure simply retries on the next start.
+        {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                const FLAG: &str = "shipments_redetect_v1";
+                match store.get_app_setting(account_id, FLAG) {
+                    Ok(Some(v)) if v == "done" => return,
+                    Ok(_) => {}
+                    // Unreadable settings row: skip this start rather than risk
+                    // re-running a pass whose completion we cannot record.
+                    Err(_) => {
+                        eprintln!("squelchd: shipment re-detect skipped (settings unreadable)");
+                        return;
+                    }
+                }
+                match store.shipments_redetect_cleanup(account_id) {
+                    // Count only — a tracking number is never logged.
+                    Ok(n) => {
+                        eprintln!("squelchd: shipment re-detect removed {n} stale shipment row(s)");
+                        if store.set_app_setting(account_id, FLAG, "done").is_err() {
+                            eprintln!(
+                                "squelchd: shipment re-detect flag not stored (reruns next start)"
+                            );
+                        }
+                    }
+                    Err(_) => eprintln!("squelchd: shipment re-detect failed (retries next start)"),
+                }
+            });
+        }
+
         // Auth-mail retention runs here because this process owns the write
         // credential (sync is bound to gmail.readonly by hard invariant). No-op
         // unless the shredder is enabled AND a write credential exists.

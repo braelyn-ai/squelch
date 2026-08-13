@@ -114,7 +114,13 @@ fn sealing_by_hand_deletes_the_shipment_the_message_fed() {
             t0,
         )
         .unwrap();
-    assert_eq!(store.list_shipments(acct, true).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
 
     // The human says: actually this is auth.
     store
@@ -123,7 +129,12 @@ fn sealing_by_hand_deletes_the_shipment_the_message_fed() {
         .unwrap();
 
     // The shipment row is gone from every listing, delivered included.
-    assert!(store.list_shipments(acct, true).unwrap().is_empty());
+    assert!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -165,14 +176,25 @@ fn sealing_by_hand_deletes_a_poll_advanced_shipment_too() {
             t0 + chrono::Duration::minutes(5),
         )
         .unwrap();
-    assert_eq!(store.list_shipments(acct, true).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
 
     store
         .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
         .unwrap()
         .unwrap();
 
-    assert!(store.list_shipments(acct, true).unwrap().is_empty());
+    assert!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

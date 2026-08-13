@@ -740,11 +740,29 @@ pub trait Store: Send + Sync {
     /// List shipments for the account, most-recently-updated first;
     /// `include_delivered=false` restricts to en-route (status != 'delivered').
     /// Sealed rows are structurally absent, so no sealed filter is required.
+    ///
+    /// `suppress_failed_ambiguous_at` hides rows whose tracking number is an
+    /// AMBIGUOUS SHAPE (a bare digit-run — see
+    /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape))
+    /// AND which the carrier has permanently rejected that many times: a number
+    /// no carrier will acknowledge, in a shape a retailer item/order id shares,
+    /// is a phantom. Suppression is READ-SIDE ONLY — the row stays live for the
+    /// repair passes, and one successful poll (which zeroes the counter) brings
+    /// it straight back. Callers pass the carrier poller's retirement cap; 0
+    /// would hide every ambiguous row.
     fn list_shipments(
         &self,
         account_id: AccountId,
         include_delivered: bool,
+        suppress_failed_ambiguous_at: u32,
     ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// ONE-SHOT REPAIR: re-run shipment detection over every shipment row's
+    /// feeder message and delete the rows the current detector no longer yields
+    /// that number from, returning how many were deleted. Rows with no feeder
+    /// message are left alone. Idempotent — a second run over a repaired store
+    /// deletes nothing.
+    fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64>;
 
     /// Shipments worth a carrier-API poll: not yet delivered, on a carrier that
     /// HAS an API ("ups" | "usps" | "fedex" | "dhl" — Amazon and "unknown" have

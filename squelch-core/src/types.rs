@@ -340,6 +340,11 @@ pub struct Shipment {
     pub delivered_at: Option<DateTime<Utc>>,
     /// Last carrier-API poll ATTEMPT; `None` = never polled.
     pub last_polled_at: Option<DateTime<Utc>>,
+    /// Consecutive PERMANENT carrier-poll failures (0 until one happens, reset by
+    /// any successful poll). Surfaced because it is EVIDENCE ABOUT THE NUMBER: a
+    /// bare digit-run the carrier keeps rejecting is very likely a retailer item
+    /// or order id that was never a tracking number at all.
+    pub poll_failures: u32,
 }
 
 /// A record of money ALREADY PAID, extracted from NON-SEALED past-transaction

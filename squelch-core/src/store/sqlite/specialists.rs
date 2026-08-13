@@ -391,7 +391,8 @@ pub(super) fn auto_close_bill_for_receipt_conn(
 /// nowhere to jump to.
 const SHIPMENT_SELECT: &str = "SELECT s.id, s.account_id, s.tracking_number, s.carrier,
             s.item_name, s.status, s.tracking_url, s.first_seen, s.last_update,
-            m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at
+            m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at,
+            s.poll_failures
      FROM shipments s
      LEFT JOIN messages m ON m.id = s.last_message_id AND m.account_id = s.account_id";
 
@@ -411,6 +412,7 @@ fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipmen
         eta: dt_opt(r, 11)?,
         delivered_at: dt_opt(r, 12)?,
         last_polled_at: dt_opt(r, 13)?,
+        poll_failures: r.get(14)?,
     })
 }
 
@@ -430,6 +432,7 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
+        suppress_failed_ambiguous_at: u32,
     ) -> Result<Vec<crate::types::Shipment>> {
         let conn = self.lock()?;
         // No sealed rows: detection never runs on sealed mail, and sealing an
@@ -443,7 +446,70 @@ impl SqliteStore {
         let out = stmt
             .query_map(params![account_id], shipment_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(out)
+        // READ-SIDE suppression, deliberately not a stored column: the rows stay
+        // live so a later repair pass can still fix or delete them, and one
+        // successful poll (which zeroes `poll_failures`) brings a row straight
+        // back. A carrier that has rejected an ambiguous bare digit-run
+        // `suppress_failed_ambiguous_at` times running is telling us it was
+        // never a tracking number — but only the ambiguous SHAPES can be
+        // phantoms, so a 1Z…/TBA…/IMpb row is never hidden however badly it polls.
+        // NOTE: a cap of 0 hides every ambiguous row, since `poll_failures` is
+        // never negative; callers pass the carrier poller's retirement cap.
+        Ok(out
+            .into_iter()
+            .filter(|s| {
+                s.poll_failures < suppress_failed_ambiguous_at
+                    || !crate::triage::is_ambiguous_tracking_shape(&s.tracking_number)
+            })
+            .collect())
+    }
+
+    /// One-shot repair: re-run the (tightened) detector over each shipment row's
+    /// FEEDER MESSAGE and delete the row when that message no longer yields that
+    /// tracking number — the phantom rows a looser detector minted from eBay item
+    /// ids and marketing digit-runs. Returns the number of rows deleted.
+    ///
+    /// A row whose `last_message_id` is NULL is LEFT ALONE: there is no evidence
+    /// to re-judge it on (an older daemon wrote it, or only a carrier poll has
+    /// touched it), and deleting on absent evidence would drop live shipments.
+    ///
+    /// SECURITY: the detector never runs on sealed mail, so the join skips any
+    /// feeder whose triage row is not `sensitivity='normal'` — those rows keep
+    /// the structural guarantee they already have (sealing deletes the shipment).
+    pub(super) fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {
+        let conn = self.lock()?;
+        let rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.tracking_number, m.from_addr, m.subject, m.body
+                 FROM shipments s
+                 JOIN messages m
+                   ON m.id = s.last_message_id AND m.account_id = s.account_id
+                 LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
+                 WHERE s.account_id = ?1
+                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+            )?;
+            stmt.query_map(params![account_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut deleted = 0u64;
+        for (id, tracking_number, from_addr, subject, body) in rows {
+            // Keep ONLY when the same message still yields the SAME number: a
+            // different number means the row was minted from a candidate the
+            // tightened gates now reject, and the surviving number gets its own
+            // row from the next ingest of that mail.
+            let still_detected = crate::triage::detect_shipment(&from_addr, &subject, &body)
+                .is_some_and(|s| s.tracking_number == tracking_number);
+            if !still_detected {
+                deleted += conn.execute(
+                    "DELETE FROM shipments WHERE account_id=?1 AND id=?2",
+                    params![account_id, id],
+                )? as u64;
+            }
+        }
+        Ok(deleted)
     }
 
     pub(super) fn list_pollable_shipments(
