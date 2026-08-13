@@ -95,7 +95,17 @@ actor QueryClassifier {
         inFlight?.cancel()
         let task = Task { await Self.ask(text) }
         inFlight = task
-        let answer = await task.value
+        // The caller is a SwiftUI `.task(id:)`: when the keystroke that started
+        // this classification is superseded, THAT task is cancelled, not this
+        // unstructured one. Without the handler the model call would run to
+        // completion on the user's own key with nobody left to read the answer
+        // — cancellation has to be walked across the structured/unstructured
+        // boundary by hand.
+        let answer = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
         // nil is "no usable answer" — cancelled, no key, or the call failed.
         // NOT memoized: caching a cancellation as `.search` would make the
         // string permanently wrong for the rest of the session.

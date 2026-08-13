@@ -539,10 +539,19 @@ struct MobileAgentView: View {
     /// names what the NEXT question would carry. Same rule as the Mac's chip, and
     /// it matters MORE here: the reader is a push on another tab, so the pinned
     /// thread is usually somewhere you cannot see from this screen.
+    ///
+    /// NEVER NIL WHILE A THREAD WOULD RIDE ALONG. `openEmail` attaches off
+    /// `store.threadId`, but the subject arrives later, from the viewer's own
+    /// fetch — and the chip is the only disclosure this screen has. In that
+    /// window the chip says so generically rather than staying silent about an
+    /// attachment the model can read.
     private var pinnedSubject: String? {
-        session.running
-            ? session.activeAskEmail?.summary?.subject
-            : store.currentThreadSummary?.subject
+        if session.running {
+            guard let active = session.activeAskEmail else { return nil }
+            return active.summary?.subject ?? "the open email"
+        }
+        guard store.threadId != nil else { return nil }
+        return store.currentThreadSummary?.subject ?? "the open email"
     }
 
     private var composer: some View {

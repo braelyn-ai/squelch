@@ -221,8 +221,16 @@ struct AssistantKeyStatus: Sendable, Equatable {
 enum AssistantKeyStore {
     /// Provider inferred from the key prefix, matching the server-side Stage-2
     /// routing. Never exposes the key value.
-    fileprivate static func provider(forKey key: String) -> AssistantProvider {
-        key.hasPrefix("sk-ant-") ? .anthropic : .openai
+    ///
+    /// `nil` for anything that matches NEITHER prefix, and that is a safety
+    /// property, not pedantry: an iOS keyboard that auto-capitalized a
+    /// hand-typed key ("Sk-ant-…") used to fall through to the OpenAI arm and
+    /// POST an Anthropic key to api.openai.com. An unrecognized key now routes
+    /// nowhere.
+    fileprivate static func provider(forKey key: String) -> AssistantProvider? {
+        if key.hasPrefix("sk-ant-") { return .anthropic }
+        if key.hasPrefix("sk-") { return .openai }
+        return nil
     }
 
     /// No provider's key ever contains whitespace, but a pasted one can — a
@@ -338,11 +346,20 @@ enum LLMProxy {
 
     /// Make ONE completion call. `body` is a fully-formed provider request body
     /// MINUS auth (model, messages, tools, max_tokens, …).
-    static func complete(body: Data) async throws -> LLMResponse {
+    ///
+    /// `require` enforces a provider IN-BAND, at the same keychain read that
+    /// decides the routing: a caller whose body names a Claude model passes
+    /// `.anthropic` and can never race a key swap into posting that body to a
+    /// host that would not understand it. A status() precheck in the caller is
+    /// a courtesy that saves a round trip; this is the guarantee.
+    static func complete(body: Data, require: AssistantProvider? = nil) async throws -> LLMResponse
+    {
         guard let key = AssistantKeyStore.read() else { throw LLMError.noKey }
+        let provider = AssistantKeyStore.provider(forKey: key)
+        if let require, provider != require { throw LLMError.wrongProvider }
 
         var req: URLRequest
-        switch AssistantKeyStore.provider(forKey: key) {
+        switch provider {
         case .anthropic:
             req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
             req.setValue(key, forHTTPHeaderField: "x-api-key")
@@ -350,6 +367,10 @@ enum LLMProxy {
         case .openai:
             req = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
             req.setValue("Bearer \(key)", forHTTPHeaderField: "authorization")
+        case nil:
+            // A key that matches no known prefix routes NOWHERE. See
+            // provider(forKey:) for why this case exists.
+            throw LLMError.wrongProvider
         }
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -377,13 +398,15 @@ enum LLMProxy {
     ///
     /// Anthropic's response shape, deliberately: this exists for the small
     /// classifier calls the app makes on its own behalf, which name a Claude
-    /// model, and a caller pointing it at an OpenAI key would get "" back. Ask
-    /// `AssistantKeyStore.status()` for the provider before spending a call.
+    /// model — so the Anthropic provider is REQUIRED in-band, and a non-Claude
+    /// key throws `.wrongProvider` instead of spending a call a different
+    /// endpoint cannot read. Callers may still ask `AssistantKeyStore.status()`
+    /// first as the cheap don't-bother gate.
     static func complete(body: [String: Any]) async throws -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: body) else {
             throw LLMError.nonJSON
         }
-        let response = try await complete(body: data)
+        let response = try await complete(body: data, require: .anthropic)
         guard response.status == 200 else {
             throw LLMError.provider(
                 status: response.status, message: errorMessage(inJSON: response.json))

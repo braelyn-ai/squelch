@@ -166,8 +166,12 @@ struct MobileSearchView: View {
                     .font(Typo.serif(24, weight: .medium))
                     .foregroundStyle(Palette.ink)
                 // Says the second thing this field does, once, where a first
-                // visit will read it. Nobody discovers a handoff by accident.
-                Text("Type words to find a message, or ask a question and the agent takes it.")
+                // visit will read it. Nobody discovers a handoff by accident —
+                // and because telling the two apart can spend the user's own
+                // key, the sentence owns up to that here rather than nowhere.
+                Text(
+                    "Type words to find a message, or ask a question and the agent takes it. Telling the two apart can use your Anthropic key."
+                )
                     .font(Typo.rowSub)
                     .foregroundStyle(Palette.inkFaint)
                     .multilineTextAlignment(.center)
@@ -214,6 +218,14 @@ struct MobileSearchView: View {
             // client that pinned one would be choosing worse for half the
             // installs.
             let page = try await APIClient.shared.search(query, limit: 50)
+            // Re-check after the await, same as the catch does: a superseded
+            // task landing late must not stamp `fetchedQuery` with a term that
+            // is no longer in the field — the `query != fetchedQuery` guard
+            // above would then refuse to fetch the term that IS.
+            guard !Task.isCancelled, term == query else {
+                loading = false
+                return
+            }
             store.search.hits = page.items
             store.search.nextCursor = page.next_cursor
             store.search.error = nil

@@ -43,7 +43,14 @@ struct MobileRecordsView: View {
         .background(Palette.canvas)
         .navigationTitle("Quick Look")
         .navigationBarTitleDisplayMode(.inline)
-        .refreshable { await store.refreshZones(force: true) }
+        // The sealed list rides the sitrep pull, not the zones fetch — and this
+        // tab now hosts the login codes, whose whole point is "the code you are
+        // waiting for, now". A pull-to-refresh that could not fetch a
+        // just-arrived code would betray the surface's one promise.
+        .refreshable {
+            _ = await SitrepPoller.shared.pull()
+            await store.refreshZones(force: true)
+        }
         // Each zone asks for this too and the store joins the in-flight pass, so
         // asking here as well is what makes a cold open paint from one round of
         // requests rather than from whichever zone happened to mount first.

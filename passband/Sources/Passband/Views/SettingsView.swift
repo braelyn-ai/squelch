@@ -145,6 +145,12 @@ struct SecretField: View {
             input
                 .textFieldStyle(.plain)
                 .autocorrectionDisabled()
+                // The phone keyboard arms the shift key at the start of every
+                // empty field, and a capitalized "Sk-ant-…" is a key no
+                // provider check recognizes. Secrets are never sentences.
+                #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                #endif
                 .onSubmit { focused = false }
                 .onChange(of: focused) { _, nowFocused in
                     if !nowFocused { Task { await commit() } }
@@ -1027,11 +1033,14 @@ struct AssistantSection: View {
     }
 
     /// What the hint calls the thing this key pays for. The chord IS the Mac's
-    /// name for it; a phone has no chords, so it gets the plain noun.
+    /// name for it; a phone has no chords, so it gets the plain noun — plus the
+    /// one OTHER spender the phone has: the search field's question check names
+    /// itself here, because "used only for X" must be the whole truth of what
+    /// the key is spent on.
     #if os(macOS)
         private let assistantName = "the ⌘K assistant"
     #else
-        private let assistantName = "the assistant"
+        private let assistantName = "the assistant and the quick check that sorts Search typing into lookups or questions"
     #endif
 
     var body: some View {

@@ -107,7 +107,10 @@ struct MobileSettingsView: View {
                     ConnectionSection()
                     AppearanceSection()
                     NotificationsSection()
-                    TourSection()
+                    // NO TourSection: the tour renders in TourOverlay, which is
+                    // mounted by the desktop's ActionLayer and has no iOS host
+                    // yet. The button would set `tour.active` with no surface
+                    // able to show or dismiss it.
                     DeveloperSection()
                     YouSection()
                 case .mail:

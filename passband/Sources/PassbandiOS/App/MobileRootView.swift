@@ -314,7 +314,11 @@ private struct TabSlide: ViewModifier {
     @State private var parked: CGFloat = 0
 
     func body(content: Content) -> some View {
-        content
+        // Captured as a plain value: `visualEffect`'s closure is Sendable and
+        // runs off the main actor, so it may not touch main-actor state — it
+        // gets the number, not the property.
+        let travel = parked
+        return content
             // `visualEffect` and not `.offset(x:)` over a GeometryReader: it hands
             // over the proxy for the view's OWN size at draw time, so the shift
             // costs no layout pass and no extra wrapper around each tab's stack.
@@ -322,7 +326,7 @@ private struct TabSlide: ViewModifier {
             // content is screen-wide, and iOS 26 deprecated the main-screen
             // accessor for exactly that reason.
             .visualEffect { effect, proxy in
-                effect.offset(x: parked * proxy.size.width)
+                effect.offset(x: travel * proxy.size.width)
             }
             .onChange(of: selection) { old, new in
                 // Only the tab being switched TO moves, and only when it really
@@ -353,39 +357,65 @@ extension View {
 
 // MARK: - the reader, as a push
 
-/// The thread viewer as a NavigationStack destination, bound to `store.threadId`
+/// The thread viewer as a NavigationStack destination, driven by `store.threadId`
 /// — the same state the Mac's overlay is gated on, so nothing about opening mail
-/// is per-platform. Popping (the back chevron, the edge swipe) writes nil, which
-/// runs `closeThread()`: the exact call the Mac's close button makes, so the
+/// is per-platform. Popping (the back chevron, the edge swipe) runs
+/// `closeThread()`: the exact call the Mac's close button makes, so the
 /// queue and the pending reply are cleared the same way rather than left behind.
 ///
-/// `active` IS LOAD-BEARING. A TabView keeps every visited tab's stack mounted,
-/// so both destinations see the same store field; without this, opening a thread
-/// from the sitrep would silently push the same reader onto the mail tab's stack
-/// too. Off-tab the binding reads nil (that stack pops) and refuses to write
-/// (the pop must not close a thread the visible tab is still showing).
+/// THE READER BELONGS TO THE TAB THAT OPENED IT. A TabView keeps every visited
+/// tab's stack mounted, and all six destinations watch the same store field; if
+/// each simply presented `store.threadId` whenever it was frontmost, switching
+/// tabs mid-read would re-push the same reader onto the new tab's stack (the
+/// tab bar stays tappable under a pushed reader). So each destination keeps its
+/// own `mine` and captures the store's thread only while its tab is active:
+/// switch away and the reader stays parked on the tab you left it on; open a
+/// different thread elsewhere and the stale stack lets go silently, without
+/// closing the thread the visible tab is showing.
 private struct ThreadDestination: ViewModifier {
     @Environment(AppStore.self) private var store
     let active: Bool
 
+    /// The thread THIS tab's stack owns. Captured from `store.threadId` only
+    /// while the tab is frontmost, so a store-level thread never leaks onto a
+    /// stack that didn't open it.
+    @State private var mine: String?
+
     func body(content: Content) -> some View {
-        content.navigationDestination(item: openThread) { threadId in
-            ThreadViewer(threadId: threadId)
-                .id(threadId)
-                // The subject is the first thing under the bar already; a second
-                // copy of it up here, truncated to a phrase, is noise. The bar
-                // stays for its back chevron.
-                .navigationTitle("")
-                .navigationBarTitleDisplayMode(.inline)
-        }
+        content
+            .navigationDestination(item: openThread) { threadId in
+                ThreadViewer(threadId: threadId)
+                    .id(threadId)
+                    // The subject is the first thing under the bar already; a
+                    // second copy of it up here, truncated to a phrase, is
+                    // noise. The bar stays for its back chevron.
+                    .navigationTitle("")
+                    .navigationBarTitleDisplayMode(.inline)
+            }
+            .onChange(of: store.threadId) { _, newValue in
+                if active {
+                    // Frontmost: this tab drives. Opening claims the thread,
+                    // closing (from anywhere: pop, account teardown) releases it.
+                    mine = newValue
+                } else if newValue != mine {
+                    // Another tab opened a different thread, or the thread was
+                    // closed while this tab held it off-screen: this stack's
+                    // reader describes state that is gone, so it pops silently.
+                    mine = nil
+                }
+            }
     }
 
     private var openThread: Binding<String?> {
         Binding(
-            get: { active ? store.threadId : nil },
+            get: { mine },
             set: { newValue in
-                guard active, newValue == nil else { return }
-                store.closeThread()
+                guard newValue == nil, let owned = mine else { return }
+                mine = nil
+                // A user-driven pop closes the store's thread only when it is
+                // still the one this stack owned; a stack releasing a stale
+                // reader must not close what another tab is showing.
+                if active, store.threadId == owned { store.closeThread() }
             })
     }
 }
