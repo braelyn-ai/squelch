@@ -446,10 +446,20 @@ final class AssistantSession {
             }
         }
 
-        // The event and the model tier alone — the question text is the user's
-        // mail, not telemetry.
+        // The event, the model tier, and the transport — the question text is
+        // the user's mail, not telemetry.
         let model = Prefs.shared.assistantModel
-        Analytics.capture("assistant_asked", ["model": model.shortLabel.lowercased()])
+        // Resolved ONCE per ask: the pref says relay by default, but relay is
+        // only real where the daemon advertises it — a self-host daemon never
+        // does, so byok is the only honest answer there. The run then carries
+        // its choice; a Settings flip mid-stream must not reroute a question
+        // already in flight.
+        let transport: AssistantTransport =
+            Prefs.shared.assistantTransport == .relay && AppStore.shared.relayAvailable
+            ? .relay : .byok
+        Analytics.capture(
+            "assistant_asked",
+            ["model": model.shortLabel.lowercased(), "transport": transport.rawValue])
 
         rollbackMark = history.count
         append(.user, text: question)
@@ -466,21 +476,26 @@ final class AssistantSession {
         var outputTokens = 0
         func fail(_ message: String) {
             end(
-                gen, error: message, model: model, inputTokens: inputTokens,
-                outputTokens: outputTokens)
+                gen, error: message, model: model, transport: transport,
+                inputTokens: inputTokens, outputTokens: outputTokens)
         }
 
-        let status = await AssistantKeyStore.statusAsync()
-        guard alive(gen) else { return }
-        guard status.present else {
-            fail("No assistant key set — add one in Settings.")
-            return
-        }
-        guard status.provider == .anthropic else {
-            fail(
-                "The assistant currently supports Anthropic keys (sk-ant-…). "
-                    + "OpenAI support is coming; paste an Anthropic key in Settings for now.")
-            return
+        // The BYOK gates, byok only: a relayed ask needs no local key — the
+        // daemon holds the credential — so requiring one would turn the hosted
+        // product off for exactly the users it exists for.
+        if transport == .byok {
+            let status = await AssistantKeyStore.statusAsync()
+            guard alive(gen) else { return }
+            guard status.present else {
+                fail("No assistant key set — add one in Settings.")
+                return
+            }
+            guard status.provider == .anthropic else {
+                fail(
+                    "The assistant currently supports Anthropic keys (sk-ant-…). "
+                        + "OpenAI support is coming; paste an Anthropic key in Settings for now.")
+                return
+            }
         }
 
         let encoder = JSONEncoder()
@@ -502,7 +517,13 @@ final class AssistantSession {
             var turn = TurnState()
             do {
                 var accumulator = AnthropicStreamAccumulator()
-                for try await payload in LLMProxy.stream(body: body) {
+                // The ONE seam where the transports diverge: both yield the
+                // same Anthropic SSE `data:` payloads, so everything below is
+                // transport-blind.
+                let stream =
+                    transport == .relay
+                    ? RelayProxy.stream(body: body) : LLMProxy.stream(body: body)
+                for try await payload in stream {
                     guard alive(gen) else { return }
                     for event in accumulator.feed(payload) { absorb(event, into: &turn) }
                     // A fatal provider error ends the message; reading the rest
@@ -590,8 +611,8 @@ final class AssistantSession {
             }
 
             finish(
-                gen, model: model, inputTokens: inputTokens, outputTokens: outputTokens,
-                wroteText: turn.assistantItem != nil)
+                gen, model: model, transport: transport, inputTokens: inputTokens,
+                outputTokens: outputTokens, wroteText: turn.assistantItem != nil)
             return
         }
 
@@ -766,13 +787,15 @@ final class AssistantSession {
     /// A clean end: citations, then the ledger. One ask, tokens summed across
     /// its turns.
     private func finish(
-        _ gen: Int, model: AssistantModel, inputTokens: Int, outputTokens: Int, wroteText: Bool
+        _ gen: Int, model: AssistantModel, transport: AssistantTransport, inputTokens: Int,
+        outputTokens: Int, wroteText: Bool
     ) {
         guard alive(gen) else { return }
         if !wroteText { append(.assistant, text: "(the assistant returned no text)") }
         let picked = pickCitations()
         if !picked.isEmpty { append(.citations, citations: picked) }
-        recordUsage(model: model, inputTokens: inputTokens, outputTokens: outputTokens)
+        recordUsage(model: model, transport: transport, inputTokens: inputTokens,
+            outputTokens: outputTokens)
     }
 
     /// The ledger, from EVERY terminal path. A run that made API calls cost real
@@ -780,10 +803,13 @@ final class AssistantSession {
     /// most expensive ask the session can make — and the Usage page is the
     /// number the user decides on. Guarded on having spent something, so the
     /// paths that die before the first request don't inflate the ask count.
-    private func recordUsage(model: AssistantModel, inputTokens: Int, outputTokens: Int) {
+    private func recordUsage(
+        model: AssistantModel, transport: AssistantTransport, inputTokens: Int, outputTokens: Int
+    ) {
         guard inputTokens + outputTokens > 0 else { return }
         AssistantUsageLedger.record(
-            model: model, inputTokens: inputTokens, outputTokens: outputTokens)
+            model: model, transport: transport, inputTokens: inputTokens,
+            outputTokens: outputTokens)
     }
 
     /// A failed end. Errors never throw out of `send` — they land in the
@@ -795,7 +821,8 @@ final class AssistantSession {
     /// next question. The tray keeps the visible record; only the provider's
     /// copy forgets the broken exchange.
     private func end(
-        _ gen: Int, error: String, model: AssistantModel, inputTokens: Int, outputTokens: Int
+        _ gen: Int, error: String, model: AssistantModel, transport: AssistantTransport,
+        inputTokens: Int, outputTokens: Int
     ) {
         guard alive(gen) else { return }
         if history.count > rollbackMark { history.removeSubrange(rollbackMark...) }
@@ -803,7 +830,8 @@ final class AssistantSession {
         // be a turn the next one has to be told it switched away from.
         if !askedThreadIds.isEmpty { askedThreadIds.removeLast() }
         append(.error, text: error)
-        recordUsage(model: model, inputTokens: inputTokens, outputTokens: outputTokens)
+        recordUsage(model: model, transport: transport, inputTokens: inputTokens,
+            outputTokens: outputTokens)
     }
 
     /// Threads surfaced by search vs. actually opened: cite the opened ones
@@ -977,13 +1005,19 @@ final class AssistantSession {
 
 // MARK: - local usage ledger
 
-/// Client-side token tally for the BYOK assistant. Its calls go straight from
-/// this machine to the user's provider, so the squelch server never sees them
-/// and the tally is local only — entirely separate from server-side triage
+/// Client-side token tally for the ⌘K assistant, both transports. BYOK calls go
+/// straight from this machine to the user's provider, so this tally is the only
+/// record they leave anywhere; relayed calls are ALSO metered server-side by
+/// Passband, and the daemon's number is the billing truth for those — this one
+/// is just what this machine saw. Entirely separate from server-side triage
 /// usage.
 struct AssistantUsage: Sendable, Equatable {
     /// Completed asks (not per-turn API calls).
     var asks = 0
+    /// Of `asks`, how many went through the daemon relay. ABSENT in a tally
+    /// written before the relay existed, which reads as 0 — correct, because
+    /// every ask back then was BYOK.
+    var relayAsks = 0
     var inputTokens = 0
     var outputTokens = 0
     /// Dollars, summed ask by ask at THAT ask's model's rates. Stored rather
@@ -1007,6 +1041,7 @@ enum AssistantUsageLedger {
         let lastModel = dict["lastModel"] as? String
         return AssistantUsage(
             asks: dict["asks"] as? Int ?? 0,
+            relayAsks: dict["relayAsks"] as? Int ?? 0,
             inputTokens: inputTokens,
             outputTokens: outputTokens,
             // A tally written before cost was stored per-ask: price its totals
@@ -1020,14 +1055,22 @@ enum AssistantUsageLedger {
     }
 
     /// Fold one completed ask (summed across its tool-loop turns) into the tally.
-    static func record(model: AssistantModel, inputTokens: Int, outputTokens: Int) {
+    static func record(
+        model: AssistantModel, transport: AssistantTransport, inputTokens: Int, outputTokens: Int
+    ) {
         let current = read()
         let next: [String: Any] = [
             "asks": current.asks + 1,
+            "relayAsks": current.relayAsks + (transport == .relay ? 1 : 0),
             "inputTokens": current.inputTokens + inputTokens,
             "outputTokens": current.outputTokens + outputTokens,
+            // Dollars are BYOK-ONLY. A relayed ask spends the plan's monthly
+            // budget, which Passband meters server-side; pricing it here at
+            // provider rates would invent a number nobody is paying.
             "estimatedCost": current.estimatedCost
-                + price(model, inputTokens: inputTokens, outputTokens: outputTokens),
+                + (transport == .byok
+                    ? price(model, inputTokens: inputTokens, outputTokens: outputTokens)
+                    : 0),
             "lastModel": model.rawValue,
             "lastAt": ISO8601DateFormatter().string(from: Date()),
         ]

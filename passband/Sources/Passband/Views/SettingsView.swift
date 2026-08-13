@@ -961,12 +961,19 @@ private struct RankingSection: View {
 
 // MARK: - assistant
 
-/// BYOK settings for the ⌘K assistant: the user's own Anthropic key, kept in the
-/// OS keychain and never sent to the squelch server. It rests masked and is read
-/// back only through `AssistantKeyStore.revealAsync`, the one sanctioned way for
-/// a view to hold it; the request path never does — `LLMProxy` reads the keychain.
+/// Settings for the ⌘K assistant. On a daemon that advertises the hosted relay
+/// (`store.relayAvailable`) a transport switch appears: "Passband relay" sends
+/// chats through the daemon on the plan's budget, "My own key" is BYOK. A
+/// daemon that never advertises it renders exactly the BYOK card that always
+/// existed — no dead switch (the read-tracking section's posture).
+///
+/// The BYOK key is the user's own Anthropic key, kept in the OS keychain and
+/// never sent to the squelch server. It rests masked and is read back only
+/// through `AssistantKeyStore.revealAsync`, the one sanctioned way for a view
+/// to hold it; the request path never does — `LLMProxy` reads the keychain.
 private struct AssistantSection: View {
     @Environment(Prefs.self) private var prefs
+    @Environment(AppStore.self) private var store
 
     @State private var status = AssistantKeyStatus.absent
     @State private var keyInput = ""
@@ -979,42 +986,33 @@ private struct AssistantSection: View {
         case err(String)
     }
 
+    /// Whether the key affordances render. True the moment the daemon offers
+    /// no relay: there the pref (whatever it says) cannot mean relay, and the
+    /// section must look exactly like it always has.
+    private var byokMode: Bool {
+        !store.relayAvailable || prefs.assistantTransport == .byok
+    }
+
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Assistant") {
-            SecretField(
-                label: "api key (yours)", placeholder: "sk-ant-…",
-                hasStored: status.present,
-                load: { await AssistantKeyStore.revealAsync() },
-                onCommit: { await saveKey($0) },
-                text: $keyInput, editing: $editingKey
-            )
-            .onChange(of: keyInput) { _, _ in note = nil }
-            HStack(spacing: 10) {
-                if busy {
-                    Text("saving…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                }
-                if status.present {
-                    StatusDot(
-                        color: Palette.positive,
-                        label: "key set" + (status.provider.map { " · \($0.label)" } ?? ""))
-                    Button("forget") { Task { await forgetKey() } }
-                        .buttonStyle(.plain)
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.danger)
-                }
-                switch note {
-                case .ok(let text):
-                    Text(text).font(Typo.micro).foregroundStyle(Palette.positive)
-                case .err(let text):
-                    Text(text).font(Typo.micro).foregroundStyle(Palette.danger)
-                case nil:
-                    EmptyView()
+            if store.relayAvailable {
+                InlineRow(key: "chats via") {
+                    GlassSegmented(
+                        options: AssistantTransport.allCases.map { ($0, $0.label) },
+                        selection: $prefs.assistantTransport)
                 }
             }
-            SettingsHint(
-                "Saved when you click away. Your key stays on this machine (macOS keychain) and is used only for the ⌘K assistant — never sent to the squelch server."
-            )
+            if byokMode {
+                byokFields
+            } else {
+                // The BYOK hint's "never sent to the squelch server" is FALSE
+                // here — the daemon is exactly where a relayed chat goes — so
+                // relay mode says what actually happens instead.
+                SettingsHint(
+                    "Chats go through your Passband daemon and count against your plan's monthly assistant budget."
+                )
+            }
 
             InlineRow(key: "model") {
                 GlassSegmented(
@@ -1024,6 +1022,45 @@ private struct AssistantSection: View {
             SettingsHint(prefs.assistantModel.label)
         }
         .task { status = await AssistantKeyStore.statusAsync() }
+    }
+
+    /// The BYOK card as it has always been: the masked key field, its status
+    /// row, and the on-this-machine promise (true only of this mode).
+    @ViewBuilder
+    private var byokFields: some View {
+        SecretField(
+            label: "api key (yours)", placeholder: "sk-ant-…",
+            hasStored: status.present,
+            load: { await AssistantKeyStore.revealAsync() },
+            onCommit: { await saveKey($0) },
+            text: $keyInput, editing: $editingKey
+        )
+        .onChange(of: keyInput) { _, _ in note = nil }
+        HStack(spacing: 10) {
+            if busy {
+                Text("saving…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            }
+            if status.present {
+                StatusDot(
+                    color: Palette.positive,
+                    label: "key set" + (status.provider.map { " · \($0.label)" } ?? ""))
+                Button("forget") { Task { await forgetKey() } }
+                    .buttonStyle(.plain)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.danger)
+            }
+            switch note {
+            case .ok(let text):
+                Text(text).font(Typo.micro).foregroundStyle(Palette.positive)
+            case .err(let text):
+                Text(text).font(Typo.micro).foregroundStyle(Palette.danger)
+            case nil:
+                EmptyView()
+            }
+        }
+        SettingsHint(
+            "Saved when you click away. Your key stays on this machine (macOS keychain) and is used only for the ⌘K assistant — never sent to the squelch server."
+        )
     }
 
     /// Called by the field on blur. Clearing `keyInput` afterwards keeps the

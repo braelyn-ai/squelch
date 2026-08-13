@@ -52,15 +52,6 @@ pub const DEFAULT_TLS_SECRET: &str = "passband-wildcard-tls";
 /// boot. See `deploy/hosted/SETUP.md`, "The Google OAuth client".
 pub const DEFAULT_OAUTH_SECRET_NAME: &str = "google-oauth-client";
 
-/// Secret holding the Anthropic API key tenant daemons run Stage-2 triage with.
-///
-/// One Secret, shared by every tenant, in the tenant namespace, and the
-/// `secretKeyRef` that reads it is OPTIONAL: a cluster with no such Secret still
-/// starts every tenant pod, and those daemons run heuristic-only triage. This is
-/// the bridge arrangement production already runs by hand (issue #33); when the
-/// relay ships, the key stops living in the cluster at all.
-pub const DEFAULT_ANTHROPIC_SECRET_NAME: &str = "anthropic-api-key";
-
 /// k3s's built-in dynamic provisioner.
 pub const DEFAULT_STORAGE_CLASS: &str = "local-path";
 
@@ -185,11 +176,6 @@ pub struct Config {
     /// refreshes with, in [`Config::namespace`]. See
     /// [`DEFAULT_OAUTH_SECRET_NAME`].
     pub oauth_secret_name: String,
-    /// Secret holding the Anthropic API key tenant daemons read, in
-    /// [`Config::namespace`]. See [`DEFAULT_ANTHROPIC_SECRET_NAME`]: the
-    /// reference is optional, so a missing Secret is a tenant without model
-    /// triage rather than a tenant that will not start.
-    pub anthropic_secret_name: String,
     /// The control plane's origin, injected into every tenant daemon as
     /// `SQUELCH_CONSOLE_SSO_URL`. Optional, and the whole hosted/self-host split
     /// of the console login page: set it and each tenant's console renders a
@@ -270,7 +256,6 @@ impl std::fmt::Debug for Config {
             .field("ingress_class", &self.ingress_class)
             .field("tls_secret", &self.tls_secret)
             .field("oauth_secret_name", &self.oauth_secret_name)
-            .field("anthropic_secret_name", &self.anthropic_secret_name)
             .field("console_sso_url", &self.console_sso_url)
             .field("storage_class", &self.storage_class)
             .field("storage_size", &self.storage_size)
@@ -570,11 +555,6 @@ impl Config {
                 get,
                 "SQUELCH_WARDEN_OAUTH_SECRET_NAME",
                 DEFAULT_OAUTH_SECRET_NAME,
-            )?,
-            anthropic_secret_name: name_var(
-                get,
-                "SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME",
-                DEFAULT_ANTHROPIC_SECRET_NAME,
             )?,
             console_sso_url,
             storage_class: name_var(get, "SQUELCH_WARDEN_STORAGE_CLASS", DEFAULT_STORAGE_CLASS)?,
@@ -895,7 +875,6 @@ mod tests {
         assert_eq!(c.ingress_class, "traefik");
         assert_eq!(c.tls_secret, "passband-wildcard-tls");
         assert_eq!(c.oauth_secret_name, "google-oauth-client");
-        assert_eq!(c.anthropic_secret_name, "anthropic-api-key");
         assert_eq!(c.storage_class, "local-path");
         assert_eq!(c.storage_size, "10Gi");
         assert_eq!(c.daemon_resources.cpu_request, "100m");
@@ -949,7 +928,6 @@ mod tests {
             ("SQUELCH_WARDEN_INGRESS_NAMESPACE", "kube system"),
             ("SQUELCH_WARDEN_TLS_SECRET", "Wildcard"),
             ("SQUELCH_WARDEN_OAUTH_SECRET_NAME", "oauth_client"),
-            ("SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME", "Anthropic_Key"),
             ("SQUELCH_WARDEN_MODEL_PVC", "Models"),
             ("SQUELCH_WARDEN_IMAGE_PULL_SECRET", "GHCR"),
             // The ingress peer, which is a label rather than a name.
@@ -1056,12 +1034,6 @@ mod tests {
                 .unwrap()
                 .oauth_secret_name,
             "passband-oauth"
-        );
-        assert_eq!(
-            with("SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME", "passband-llm")
-                .unwrap()
-                .anthropic_secret_name,
-            "passband-llm"
         );
         // Trimmed, and the trailing slash removed: the daemon appends the route.
         assert_eq!(

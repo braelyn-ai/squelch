@@ -14,10 +14,7 @@ fn bump_usage_category(
     account_id: AccountId,
     day: &str,
     category: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_creation_tokens: u64,
-    cache_read_tokens: u64,
+    tokens: UsageTokens,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO stage2_usage(account_id, day, category, calls, input_tokens, output_tokens,
@@ -33,10 +30,10 @@ fn bump_usage_category(
             account_id,
             day,
             category,
-            input_tokens as i64,
-            output_tokens as i64,
-            cache_creation_tokens as i64,
-            cache_read_tokens as i64
+            tokens.input as i64,
+            tokens.output as i64,
+            tokens.cache_creation as i64,
+            tokens.cache_read as i64
         ],
     )?;
     Ok(())
@@ -354,22 +351,10 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
         let conn = self.lock()?;
-        bump_usage_category(
-            &conn,
-            account_id,
-            day,
-            "stage1",
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        bump_usage_category(&conn, account_id, day, "stage1", tokens)
     }
 
     pub(super) fn stage1_usage_since(
@@ -387,22 +372,10 @@ impl SqliteStore {
         account_id: AccountId,
         day: &str,
         category: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
         let conn = self.lock()?;
-        bump_usage_category(
-            &conn,
-            account_id,
-            day,
-            category,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        bump_usage_category(&conn, account_id, day, category, tokens)
     }
 
     pub(super) fn list_usage_stage1(
@@ -605,22 +578,10 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
         let conn = self.lock()?;
-        bump_usage_category(
-            &conn,
-            account_id,
-            day,
-            "stage2",
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        bump_usage_category(&conn, account_id, day, "stage2", tokens)
     }
 
     pub(super) fn stage2_usage_today(

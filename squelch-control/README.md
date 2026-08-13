@@ -94,8 +94,10 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | `SQUELCH_CONTROL_DB_PATH` | no | Control store. Default `/data/control.sqlite3`. |
 | `SQUELCH_CONTROL_BIFROST_URL` | pair | The Bifrost LLM gateway's governance origin, `https://` only. With the token below it is all-or-nothing: both set mints a per-tenant virtual key at signup, neither set provisions keyless tenants, anything partial (including a budget or model list on their own) refuses to boot. |
 | `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` | pair | The gateway admin's `username:password`, sent as HTTP Basic on every governance call (a session bearer expires after 30 days and does not belong here). Exactly one `:` between two nonempty halves, at least 32 characters total. It can mint unbounded LLM spend; treat it like the warden bearer. |
-| `SQUELCH_CONTROL_LLM_BUDGET_USD` | no | Monthly USD budget stamped on each minted key. Default `5.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
-| `SQUELCH_CONTROL_LLM_MODELS` | no | Comma-separated model allow-list stamped on each minted key. Default `claude-haiku-4-5,claude-sonnet-5`. Never empty (the gateway treats an empty list as deny-all). Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_LLM_BUDGET_USD` | no | Monthly USD budget stamped on each minted triage key. Default `5.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_LLM_MODELS` | no | Comma-separated model allow-list stamped on each minted triage key. Default `claude-haiku-4-5,claude-sonnet-5`. Never empty (the gateway treats an empty list as deny-all). Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_ASSISTANT_BUDGET_USD` | no | Monthly USD budget stamped on each minted assistant key (`tenant-<label>-assistant`, the tenant's second key). Default `10.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_ASSISTANT_MODELS` | no | Comma-separated model allow-list stamped on each minted assistant key. Default `claude-haiku-4-5,claude-opus-4-8`. Never empty. Only meaningful with the gateway pair set; set alone it refuses to boot. |
 | `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS` | no | How many proxies write `X-Forwarded-For` in front of this listener. `0` (default) meters the TCP peer, which behind a platform edge means one shared rate-limit bucket. Set `1` on Railway. |
 | `SQUELCH_CONTROL_LOG` | no | `tracing` filter. Default `info`. |
 
