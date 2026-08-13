@@ -58,6 +58,80 @@ impl GmailErrorKind {
     }
 }
 
+/// A carrier the shipment poller can call, as a metrics label. A CLOSED set of
+/// four, which is the whole cardinality bound on the carrier axis: the label is
+/// resolved from this enum, never from the `carrier` string on a shipment row,
+/// so nothing a mail body wrote can become a series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollCarrier {
+    Ups,
+    Fedex,
+    Usps,
+    Dhl,
+}
+
+impl PollCarrier {
+    /// Every carrier, in exposition order. This array's ORDER IS THE INDEX used
+    /// by [`SyncMetrics::record_carrier_poll`], so it must stay in step with the
+    /// variant declaration order.
+    const ALL: [Self; 4] = [Self::Ups, Self::Fedex, Self::Usps, Self::Dhl];
+
+    /// The registry slug onto the label, or `None` for anything else — a carrier
+    /// with no client is a carrier with no polls to count.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "ups" => Some(Self::Ups),
+            "fedex" => Some(Self::Fedex),
+            "usps" => Some(Self::Usps),
+            "dhl" => Some(Self::Dhl),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ups => "ups",
+            Self::Fedex => "fedex",
+            Self::Usps => "usps",
+            Self::Dhl => "dhl",
+        }
+    }
+}
+
+/// How one carrier-API poll ended. The five are exactly [`crate::carriers`]'s
+/// four error classes plus success, because those are the five the poller
+/// already treats differently — an operator reading `rate_limited` climbing
+/// knows to slow the cadence, and `auth` climbing knows to re-key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierPollOutcome {
+    Ok,
+    NotFound,
+    RateLimited,
+    Auth,
+    Transient,
+}
+
+impl CarrierPollOutcome {
+    /// Exposition order; the index into a carrier's outcome row.
+    const ALL: [Self; 5] = [
+        Self::Ok,
+        Self::NotFound,
+        Self::RateLimited,
+        Self::Auth,
+        Self::Transient,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotFound => "not_found",
+            Self::RateLimited => "rate_limited",
+            Self::Auth => "auth",
+            Self::Transient => "transient",
+        }
+    }
+}
+
 /// What one row's trip through the Stage-1 refine pass produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage1Verdict {
@@ -112,6 +186,19 @@ pub struct SyncMetrics {
     stage2_failed: AtomicU64,
     stage2_retryable: AtomicU64,
     stage2_stale_skipped: AtomicU64,
+
+    /// Carrier polls as `[carrier][outcome]`, both axes closed enums — 20
+    /// series, fixed forever, no matter how many shipments or tracking numbers
+    /// pass through. A TRACKING NUMBER IS NEVER A LABEL: it names a parcel and
+    /// its recipient to anyone who can reach the scrape.
+    carrier_poll: [[AtomicU64; CarrierPollOutcome::ALL.len()]; PollCarrier::ALL.len()],
+    /// Polls that moved a shipment's status, which is the only reason the
+    /// feature exists: a poller that answers 200 all day and advances nothing is
+    /// broken in a way the poll counter alone cannot show.
+    shipments_advanced_by_poll: AtomicU64,
+    /// Unix seconds of the last poll a carrier answered. 0 = never, for the same
+    /// reason as the sync stamp below.
+    carrier_poll_last_success_unix: AtomicI64,
 }
 
 impl SyncMetrics {
@@ -173,6 +260,25 @@ impl SyncMetrics {
             Stage2Verdict::StaleSkipped => &self.stage2_stale_skipped,
         };
         slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one carrier-API poll. A successful one ALSO moves the freshness
+    /// stamp, so the two can never disagree about whether a carrier has ever
+    /// answered.
+    pub fn record_carrier_poll(&self, carrier: PollCarrier, outcome: CarrierPollOutcome) {
+        // Both indices come from closed enums whose `ALL` arrays size the table,
+        // so this cannot be out of bounds.
+        self.carrier_poll[carrier as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
+        if outcome == CarrierPollOutcome::Ok {
+            self.carrier_poll_last_success_unix
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+        }
+    }
+
+    /// A poll advanced a shipment's status (`apply_carrier_track` said so).
+    pub fn record_shipment_advanced(&self) {
+        self.shipments_advanced_by_poll
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn get(&self, slot: &AtomicU64) -> f64 {
@@ -497,6 +603,44 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         );
     }
 
+    // ALL 20 series are emitted, including carriers this daemon has no
+    // credentials for: an absent series is indistinguishable from a scraper
+    // problem, and a flat 0 is what makes `rate(...)` on a carrier that just
+    // started failing read correctly from its first sample.
+    e.family(
+        "squelchd_carrier_poll_total",
+        MetricKind::Counter,
+        "Carrier tracking-API polls by carrier and outcome.",
+    );
+    for carrier in PollCarrier::ALL {
+        for outcome in CarrierPollOutcome::ALL {
+            e.sample(
+                "squelchd_carrier_poll_total",
+                &[("carrier", carrier.label()), ("outcome", outcome.label())],
+                metrics.get(&metrics.carrier_poll[carrier as usize][outcome as usize]),
+            );
+        }
+    }
+
+    e.scalar(
+        "squelchd_shipments_advanced_by_poll_total",
+        MetricKind::Counter,
+        "Shipments whose status a carrier poll moved (as opposed to confirmed).",
+        metrics.get(&metrics.shipments_advanced_by_poll),
+    );
+
+    // 0 until a carrier has ever answered, for the same reason the sync stamp
+    // is: `time() - metric` must fire on a poller that has never worked, not
+    // evaluate to nothing.
+    e.scalar(
+        "squelchd_shipment_poll_last_success_timestamp_seconds",
+        MetricKind::Gauge,
+        "Unix timestamp of the last carrier poll that returned a track; 0 if none ever has.",
+        metrics
+            .carrier_poll_last_success_unix
+            .load(Ordering::Relaxed) as f64,
+    );
+
     // The db-derived families are OPTIONAL on purpose: see the caller. A scrape
     // that carries the atomics and omits these is a degraded scrape; a 500 is
     // no scrape at all.
@@ -661,6 +805,51 @@ mod tests {
         assert!(text.contains(
             "squelchd_triage_verdicts_total{stage=\"stage2\",outcome=\"retryable\"} 1\n"
         ));
+    }
+
+    /// The carrier axis is closed: every carrier/outcome pair is exported, a
+    /// slug that is not a carrier maps to no label at all, and the freshness
+    /// stamp moves only for an answered poll.
+    #[test]
+    fn carrier_poll_counters_export_every_pair_and_stamp_only_on_success() {
+        let m = SyncMetrics::new();
+        assert_eq!(PollCarrier::from_slug("amazon"), None);
+        assert_eq!(PollCarrier::from_slug("UPS"), None);
+        assert_eq!(PollCarrier::from_slug("dhl"), Some(PollCarrier::Dhl));
+
+        m.record_carrier_poll(PollCarrier::Dhl, CarrierPollOutcome::RateLimited);
+        m.record_carrier_poll(PollCarrier::Dhl, CarrierPollOutcome::RateLimited);
+        m.record_carrier_poll(PollCarrier::Ups, CarrierPollOutcome::NotFound);
+        assert_eq!(
+            m.carrier_poll_last_success_unix.load(Ordering::Relaxed),
+            0,
+            "a failed poll is not a success"
+        );
+
+        m.record_carrier_poll(PollCarrier::Ups, CarrierPollOutcome::Ok);
+        m.record_shipment_advanced();
+
+        let text = render(&m, None);
+        assert!(
+            text.contains(
+                "squelchd_carrier_poll_total{carrier=\"dhl\",outcome=\"rate_limited\"} 2\n"
+            )
+        );
+        assert!(
+            text.contains("squelchd_carrier_poll_total{carrier=\"ups\",outcome=\"not_found\"} 1\n")
+        );
+        assert!(text.contains("squelchd_carrier_poll_total{carrier=\"ups\",outcome=\"ok\"} 1\n"));
+        // A carrier nobody configured still exports its whole outcome row.
+        assert!(
+            text.contains("squelchd_carrier_poll_total{carrier=\"fedex\",outcome=\"auth\"} 0\n")
+        );
+        assert!(
+            text.contains(
+                "squelchd_carrier_poll_total{carrier=\"usps\",outcome=\"transient\"} 0\n"
+            )
+        );
+        assert!(text.contains("squelchd_shipments_advanced_by_poll_total 1\n"));
+        assert!(m.carrier_poll_last_success_unix.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

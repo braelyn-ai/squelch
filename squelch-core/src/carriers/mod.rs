@@ -17,10 +17,15 @@
 //! ([`TrackError::Auth`]), or count a failure and try again
 //! ([`TrackError::Transient`]). Errors carry NO url, body, or credential: a
 //! carrier's 401 body routinely echoes the client id back.
+//!
+//! WHEN any of this happens is [`poller::ShipmentPoller`]'s business, not a
+//! client's: the clients here are stateless request/response, and every quota,
+//! cooldown and cadence decision lives in the one task that owns the registry.
 
 pub mod dhl;
 pub mod fedex;
 pub mod oauth;
+pub mod poller;
 pub mod ups;
 pub mod usps;
 

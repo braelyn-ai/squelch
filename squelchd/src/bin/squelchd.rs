@@ -1622,6 +1622,28 @@ fn cmd_serve(
     // reads it. Built here so both sides get the same Arc.
     let sync_metrics = squelch_core::metrics::SyncMetrics::new();
 
+    // The carrier poller keeps the shipments tracker moving between emails.
+    // CARRIER CREDENTIALS ARE ITS ONLY FEATURE FLAG: with none configured
+    // `from_config` returns None and no carrier API is ever contacted. Built
+    // after the metrics registry so its polls land in the same scrape as
+    // everything else.
+    let shipment_poller = match squelch_core::carriers::poller::ShipmentPoller::from_config(
+        store.clone() as Arc<dyn squelch_core::store::Store>,
+        account_id,
+        &config,
+    ) {
+        Ok(poller) => poller.map(|p| p.with_metrics(sync_metrics.clone())),
+        Err(e) => {
+            eprintln!(
+                "squelchd: shipment poller NOT started: carriers are configured but the poller could not be built: {e}"
+            );
+            None
+        }
+    };
+    // wave5: thread into ApiState so a human-door endpoint can force a pass.
+    // Taken here because `run` consumes the poller below.
+    let _shipment_kick = shipment_poller.as_ref().map(|p| p.kick_handle());
+
     // The human door SERVES WITH OR WITHOUT SQUELCH_API_TOKEN. Without it the
     // door accepts only the per-device tokens in the store, and a daemon with
     // neither still comes up 401ing everything: pairing is how the first
@@ -1674,6 +1696,27 @@ fn cmd_serve(
             None => {
                 eprintln!(
                     "squelchd: opens poller disabled (no SQUELCH_RELAY_URL / [pusher] relay_url)"
+                );
+                None
+            }
+        };
+
+        // Polls the carrier APIs for shipments detected in mail. Same shape as
+        // the two above: shares the shutdown watch, awaited on the way out.
+        let shipment_handle = match shipment_poller {
+            Some(poller) => {
+                eprintln!(
+                    "squelchd: shipment poller enabled (carriers: {})",
+                    poller.enabled_carriers().join(", ")
+                );
+                let shutdown_rx = shutdown_rx.clone();
+                Some(tokio::spawn(async move { poller.run(shutdown_rx).await }))
+            }
+            None => {
+                // The normal case — carrier polling is BYOK — so a detail, not a
+                // warning.
+                eprintln!(
+                    "squelchd: shipment poller disabled (no carrier credentials in [carriers])"
                 );
                 None
             }
@@ -1865,6 +1908,13 @@ fn cmd_serve(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("squelchd: opens poller ended with error: {e}"),
                 Err(e) => eprintln!("squelchd: opens poller task join error: {e}"),
+            }
+        }
+        if let Some(handle) = shipment_handle {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("squelchd: shipment poller ended with error: {e}"),
+                Err(e) => eprintln!("squelchd: shipment poller task join error: {e}"),
             }
         }
         if let Some(handle) = metrics_handle {
