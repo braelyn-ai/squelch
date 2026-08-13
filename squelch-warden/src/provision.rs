@@ -903,10 +903,23 @@ impl Warden {
         // Ingress first: no new requests get routed at a pod that is about to
         // go. NetworkPolicy last: the pod stays policed for the whole of its
         // termination.
+        //
+        // The Service goes BEFORE the Deployment, and that order is load
+        // bearing rather than cosmetic. This loop bails on its first error, so
+        // whichever object is deleted first may be the only one deleted at all,
+        // and [`Warden::interrupted`] reads a surviving Service as proof that a
+        // reconcile died mid-purge and should be resumed. Taking the Deployment
+        // first would let a half-finished cancellation - Deployment gone,
+        // Service left behind by a failed call - look exactly like that, and
+        // the next reconcile would put a cancelled mailbox back on the
+        // internet. With this order, no state that has lost its Deployment can
+        // still have its Service, so the signal cannot be forged by a failure
+        // here. It also drains the endpoint before the pod goes, which is the
+        // same direction the Ingress rule above is reasoning in.
         for (kind, reason) in [
             (Kind::Ingress, "ingress_delete_failed"),
-            (Kind::Deployment, "workload_delete_failed"),
             (Kind::Service, "service_delete_failed"),
+            (Kind::Deployment, "workload_delete_failed"),
             (Kind::NetworkPolicy, "network_policy_delete_failed"),
         ] {
             self.cluster
@@ -1831,8 +1844,12 @@ mod tests {
             h.cluster.deleted(),
             vec![
                 (Kind::Ingress, "alice".to_string()),
-                (Kind::Deployment, "alice".to_string()),
+                // Before the Deployment, and this test is where that is
+                // pinned: `interrupted` reads a Service that outlived its
+                // Deployment as a reconcile to resume, so a cancellation must
+                // never be able to produce one. See delete().
                 (Kind::Service, "alice".to_string()),
+                (Kind::Deployment, "alice".to_string()),
                 (Kind::NetworkPolicy, "alice".to_string()),
                 // The gateway credential goes with the workload; see delete().
                 (Kind::Secret, "alice-llm".to_string()),
@@ -2506,6 +2523,50 @@ mod tests {
             other => panic!("not a Deployment: {:?}", other.kind()),
         };
         assert!(drift::foreign_managers(&live).is_empty());
+    }
+
+    /// The invariant [`Warden::interrupted`] rests on, held against a teardown
+    /// that dies anywhere in the middle.
+    ///
+    /// `delete` stops at its first failure, so a cancellation can leave a
+    /// tenant in any prefix of its teardown. NONE of those prefixes may be a
+    /// Service that outlived its Deployment, because that is the exact shape
+    /// `interrupted` reads as "a reconcile died here, finish it" - and
+    /// finishing it would put a cancelled mailbox back on the internet.
+    #[tokio::test]
+    async fn no_half_finished_cancellation_looks_like_an_interrupted_reconcile() {
+        for failing in [
+            Kind::Ingress,
+            Kind::Service,
+            Kind::Deployment,
+            Kind::NetworkPolicy,
+        ] {
+            let h = Harness::new();
+            h.warden
+                .create_tenant("alice", "alice@example.com")
+                .await
+                .unwrap();
+            h.warden
+                .set_credentials("alice", &armored("alice"))
+                .await
+                .unwrap();
+
+            h.cluster.fail_delete_of(failing);
+            assert!(
+                h.warden.delete("alice").await.is_err(),
+                "{failing:?} was supposed to fail the teardown"
+            );
+
+            let service = h.cluster.exists(Kind::Service, "alice");
+            let deployment = h.cluster.exists(Kind::Deployment, "alice");
+            // "A Service implies its Deployment", which is the invariant
+            // `interrupted` reads backwards.
+            assert!(
+                !service || deployment,
+                "a teardown that died on {failing:?} left a Service with no Deployment, \
+                 which reconcile would read as a job to finish"
+            );
+        }
     }
 
     /// A CANCELLED tenant stays refused, which is the distinction

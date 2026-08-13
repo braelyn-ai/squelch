@@ -136,6 +136,8 @@ struct MockInner {
     reads_ok: bool,
     /// Whether the next `create` loses a race with a concurrent one.
     create_loses_race: bool,
+    /// A kind whose deletes all fail, for the partial-teardown paths.
+    fail_delete: Option<Kind>,
 }
 
 /// A cluster that records instead of connecting.
@@ -197,6 +199,14 @@ impl MockCluster {
     /// the reconcile again.
     pub fn pods_release(&self) {
         self.lock().pods_linger = false;
+    }
+
+    /// Every delete of `kind` fails, the way one call in a teardown does when
+    /// the API server is having a bad minute. What makes a PARTIAL teardown
+    /// reachable in a test: the loop in `delete` stops at the first error, so
+    /// this decides how far it got.
+    pub fn fail_delete_of(&self, kind: Kind) {
+        self.lock().fail_delete = Some(kind);
     }
 
     /// The next `create` loses a race, the way a second signup for one label
@@ -383,6 +393,9 @@ impl Cluster for MockCluster {
 
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
         let mut inner = self.lock();
+        if inner.fail_delete == Some(kind) {
+            return Err(ClusterError::NoPod);
+        }
         inner.deleted.push((kind, name.to_string()));
         inner.objects.remove(&(kind, name.to_string()));
         Ok(())
