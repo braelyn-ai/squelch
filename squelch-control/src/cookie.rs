@@ -18,6 +18,18 @@
 //! second name would mean a second value to clear on every terminal answer for
 //! no property gained: the server-side session is what decides which flow this
 //! is, and the claim is only ever held against it.
+//!
+//! THE ADMIN COOKIE IS THE EXCEPTION, and it is separated twice over. It is a
+//! long-lived credential rather than a hop marker: holding it means being the
+//! operator, and the operator can mint invites. So it gets its own name AND
+//! [`AdminClaim`] carries a required `aud` marker that [`SessionClaim`] does
+//! not have. Both halves are signed with the same key, so either alone would be
+//! thin: a signed session claim presented under the admin name has no `aud` and
+//! is refused, and an admin claim presented as a session has no `sid` and is
+//! refused the same way. `SameSite=Strict` (not `Lax`) keeps that cookie off
+//! requests another SITE's page causes, which is half the CSRF defense on the
+//! admin POSTs; the sibling subdomains it does not cover are handled by the
+//! origin check in [`crate::admin`].
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,6 +51,21 @@ pub const COOKIE_NAME: &str = "passband_signup";
 /// either one outliving the other is a session that cannot complete but can
 /// still be replayed at.
 pub const COOKIE_TTL_SECS: i64 = 10 * 60;
+
+/// The admin session cookie. Its own name, not a second value under the signup
+/// one: the two are different credentials with different lifetimes, and a
+/// browser that holds both must be able to lose one without losing the other.
+pub const ADMIN_COOKIE_NAME: &str = "passband_admin";
+
+/// How long one admin sign-in lasts. A working day: long enough that an
+/// operator working through a morning's waitlist signs in once, short enough
+/// that a laptop left open somewhere is not an admin session next week.
+pub const ADMIN_COOKIE_TTL_SECS: i64 = 12 * 60 * 60;
+
+/// The `aud` every admin claim carries and no other claim in this crate does.
+/// The marker is what makes the two claim types different DOCUMENTS under one
+/// key, rather than two shapes that happen to have different fields.
+pub const ADMIN_AUD: &str = "admin";
 
 /// Ceiling on a presented cookie. The real one is a couple of hundred bytes;
 /// this stops an attacker spending our CPU on base64 and HMAC over a megabyte
@@ -71,8 +98,73 @@ pub struct SessionClaim {
     pub iat: i64,
 }
 
+/// What the admin cookie asserts: that whoever holds it presented the admin
+/// token to this deployment, and when.
+///
+/// TWO FIELDS, one of which exists only to be checked. `aud` is the domain
+/// separator: a [`SessionClaim`] signed with the same key has no such field, so
+/// it cannot deserialize into this, and [`verify_admin`] holds the value
+/// against [`ADMIN_AUD`] as well.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminClaim {
+    /// Always [`ADMIN_AUD`]. No default and no `Option`: a payload without it
+    /// must fail to parse rather than fall back to something.
+    pub aud: String,
+    /// Which admin token opened this session, as [`token_fingerprint`]. It is
+    /// what makes rotating `SQUELCH_CONTROL_ADMIN_TOKEN` a kill switch: without
+    /// it, a cookie minted under a leaked token keeps working for its full
+    /// twelve hours and the only remedy is rotating the cookie key, which
+    /// signs out every signup in flight too.
+    pub tfp: String,
+    /// Issued-at, unix seconds. The TTL is enforced on the server, so this is
+    /// signed rather than trusted.
+    pub iat: i64,
+}
+
+impl AdminClaim {
+    /// The claim a successful login signs. The only constructor callers need,
+    /// so `aud` cannot be spelled wrong at a call site.
+    pub fn new(token: &str, now_unix: i64) -> Self {
+        Self {
+            aud: ADMIN_AUD.to_string(),
+            tfp: token_fingerprint(token),
+            iat: now_unix,
+        }
+    }
+}
+
+/// A short, one-way name for an admin token.
+///
+/// Truncated to 16 hex characters (64 bits) because this is an equality check
+/// against ONE configured token, not a lookup: it only has to change when the
+/// token does. The token itself never rides in the cookie, and this digest is
+/// not a secret, but it is still never logged, like everything else here.
+pub fn token_fingerprint(token: &str) -> String {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .take(8)
+        .fold(String::with_capacity(16), |mut out, b| {
+            // Writing to a String cannot fail.
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
 /// Sign a claim into a cookie value: `base64url(json).base64url(mac)`.
 pub fn sign(key: &[u8], claim: &SessionClaim) -> String {
+    sign_claim(key, claim)
+}
+
+/// The same, for an admin claim. A separate entry point rather than one generic
+/// public function, so a caller cannot sign the wrong claim type into the
+/// wrong cookie by inference.
+pub fn sign_admin(key: &[u8], claim: &AdminClaim) -> String {
+    sign_claim(key, claim)
+}
+
+fn sign_claim<T: Serialize>(key: &[u8], claim: &T) -> String {
     // The claim is our own struct of primitives; serialization cannot fail.
     let payload = serde_json::to_vec(claim).unwrap_or_default();
     let mac = mac(key, &payload);
@@ -89,6 +181,37 @@ pub fn sign(key: &[u8], claim: &SessionClaim) -> String {
 /// payload that is not our JSON are one answer, because the page above shows
 /// one message for all of them and an attacker learns nothing from which.
 pub fn verify(key: &[u8], value: &str, now_unix: i64) -> Option<SessionClaim> {
+    let payload = authentic_payload(key, value)?;
+    let claim: SessionClaim = serde_json::from_slice(&payload).ok()?;
+    fresh(claim.iat, now_unix, COOKIE_TTL_SECS).then_some(claim)
+}
+
+/// Verify and decode an ADMIN cookie value.
+///
+/// Four things must hold, and every failure is the same `None`: the MAC is
+/// ours, the payload is an admin claim (`aud` present and [`ADMIN_AUD`]), the
+/// session was opened with the token this deployment is configured with NOW,
+/// and it is inside [`ADMIN_COOKIE_TTL_SECS`]. The `aud` check is what makes a
+/// signup cookie's payload, signed with this very key, useless here; the
+/// fingerprint check is what makes rotating the token sign everybody out.
+pub fn verify_admin(
+    key: &[u8],
+    token: &str,
+    value: &str,
+    now_unix: i64,
+) -> Option<AdminClaim> {
+    let payload = authentic_payload(key, value)?;
+    let claim: AdminClaim = serde_json::from_slice(&payload).ok()?;
+    if claim.aud != ADMIN_AUD || claim.tfp != token_fingerprint(token) {
+        return None;
+    }
+    fresh(claim.iat, now_unix, ADMIN_COOKIE_TTL_SECS).then_some(claim)
+}
+
+/// The bytes of a cookie whose MAC is ours, or `None`. Everything before the
+/// claim type is the same work for both cookies, and doing it in one place is
+/// what keeps the constant-time compare from being reimplemented per claim.
+fn authentic_payload(key: &[u8], value: &str) -> Option<Vec<u8>> {
     if value.len() > MAX_COOKIE_LEN {
         return None;
     }
@@ -97,17 +220,15 @@ pub fn verify(key: &[u8], value: &str, now_unix: i64) -> Option<SessionClaim> {
     let presented = URL_SAFE_NO_PAD.decode(mac_b64).ok()?;
     // Constant-time, and over the DECODED bytes, so two spellings of the same
     // MAC cannot be told apart by timing or by encoding.
-    if !squelch_httpauth::ct_eq(&presented, &mac(key, &payload)) {
-        return None;
-    }
-    let claim: SessionClaim = serde_json::from_slice(&payload).ok()?;
-    // Both ends of the window: a future `iat` is a clock problem or a forgery
-    // attempt, and either way it is not a session this process opened.
-    let age = now_unix.checked_sub(claim.iat)?;
-    if !(0..=COOKIE_TTL_SECS).contains(&age) {
-        return None;
-    }
-    Some(claim)
+    squelch_httpauth::ct_eq(&presented, &mac(key, &payload)).then_some(payload)
+}
+
+/// Both ends of the window: a future `iat` is a clock problem or a forgery
+/// attempt, and either way it is not a claim this process issued.
+fn fresh(iat: i64, now_unix: i64, ttl: i64) -> bool {
+    now_unix
+        .checked_sub(iat)
+        .is_some_and(|age| (0..=ttl).contains(&age))
 }
 
 fn mac(key: &[u8], payload: &[u8]) -> Vec<u8> {
@@ -142,13 +263,48 @@ pub fn clear_cookie(secure: bool) -> String {
     format!("{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure}")
 }
 
+/// The `Set-Cookie` value that installs an admin session.
+///
+/// - `SameSite=Strict`, not `Lax`: this cookie authorizes minting invites and
+///   sending mail, and Strict keeps it off requests another SITE's page caused.
+///   It costs nothing here because nothing ever redirects INTO the admin page
+///   from somewhere else. It is not the whole CSRF story: "site" is the
+///   registrable domain, so a sibling `passband.app` name is inside it and
+///   [`crate::admin`] checks the origin as well.
+/// - `HttpOnly`, `Path=/`, no `Domain`, and `Secure` whenever the origin is
+///   https, for the same reasons the signup cookie has them.
+pub fn set_admin_cookie(value: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{ADMIN_COOKIE_NAME}={value}; Path=/; Max-Age={ADMIN_COOKIE_TTL_SECS}; HttpOnly; SameSite=Strict{secure}"
+    )
+}
+
+/// The `Set-Cookie` value that clears the admin session: the sign-out, and what
+/// a refused admin request sends so a stale cookie does not sit in the browser
+/// being presented forever.
+pub fn clear_admin_cookie(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{ADMIN_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}")
+}
+
 /// Pull our cookie out of a `Cookie` header. Hand-parsed rather than pulled in
 /// as a dependency: the header is a `;`-separated list of `name=value`, and the
 /// value we care about is base64url and a dot, so there is nothing to unquote.
 pub fn from_header(header: &str) -> Option<&str> {
+    named_cookie(header, COOKIE_NAME)
+}
+
+/// The same, for the admin cookie. Both cookies can be present at once (one
+/// browser, both errands), so each is looked up by its own name.
+pub fn admin_from_header(header: &str) -> Option<&str> {
+    named_cookie(header, ADMIN_COOKIE_NAME)
+}
+
+fn named_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     header.split(';').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name.trim() == COOKIE_NAME).then(|| value.trim())
+        let (n, value) = pair.split_once('=')?;
+        (n.trim() == name).then(|| value.trim())
     })
 }
 
@@ -157,6 +313,8 @@ mod tests {
     use super::*;
 
     const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+    /// The admin token these claims are opened under, long enough to be one.
+    const TOKEN: &str = "an admin token of entirely sufficient length";
 
     fn claim() -> SessionClaim {
         SessionClaim {
@@ -265,6 +423,133 @@ mod tests {
         assert_eq!(from_header(""), None);
         // A cookie whose NAME merely ends with ours must not match.
         assert_eq!(from_header(&format!("x{COOKIE_NAME}={v}")), None);
+    }
+
+    #[test]
+    fn round_trips_an_admin_claim() {
+        let c = AdminClaim::new(TOKEN, 1_000_000);
+        assert_eq!(c.aud, ADMIN_AUD);
+        let v = sign_admin(KEY, &c);
+        assert_eq!(verify_admin(KEY, TOKEN, &v, c.iat).unwrap(), c);
+        assert_eq!(
+            verify_admin(KEY, TOKEN, &v, c.iat + ADMIN_COOKIE_TTL_SECS).unwrap(),
+            c
+        );
+    }
+
+    /// ROTATING THE TOKEN IS THE KILL SWITCH. An operator who thinks the admin
+    /// token leaked changes it, and every cookie minted under the old one stops
+    /// working on the next request rather than lasting out its twelve hours.
+    /// The alternative kill switch, rotating the cookie key, would also sign out
+    /// every signup in flight.
+    #[test]
+    fn a_rotated_token_ends_every_admin_session() {
+        let v = sign_admin(KEY, &AdminClaim::new(TOKEN, 1_000_000));
+        assert!(verify_admin(KEY, TOKEN, &v, 1_000_000).is_some());
+        assert_eq!(
+            verify_admin(KEY, "a different token, just as long as the other", &v, 1_000_000),
+            None
+        );
+    }
+
+    /// THE DOMAIN SEPARATION, in both directions. Both claims are signed with
+    /// the same key, so nothing here fails on the MAC: a signup claim is
+    /// refused as admin because it carries no `aud`, and an admin claim is
+    /// refused as a signup session because it carries no `sid`. Whoever holds a
+    /// perfectly valid cookie for one errand holds nothing for the other.
+    #[test]
+    fn a_signup_claim_is_not_an_admin_claim() {
+        let signup = sign(KEY, &claim());
+        assert!(verify(KEY, &signup, 1_000_000).is_some(), "still a session");
+        assert_eq!(verify_admin(KEY, TOKEN, &signup, 1_000_000), None);
+
+        let admin = sign_admin(KEY, &AdminClaim::new(TOKEN, 1_000_000));
+        assert_eq!(verify(KEY, &admin, 1_000_000), None);
+
+        // Nor can a payload be talked into the right shape: an `aud` that is
+        // not ours is refused even though the MAC over it is.
+        let forged = sign_admin(
+            KEY,
+            &AdminClaim {
+                aud: "signup".into(),
+                tfp: token_fingerprint(TOKEN),
+                iat: 1_000_000,
+            },
+        );
+        assert_eq!(verify_admin(KEY, TOKEN, &forged, 1_000_000), None);
+    }
+
+    #[test]
+    fn refuses_a_tampered_or_expired_admin_claim() {
+        let c = AdminClaim::new(TOKEN, 1_000_000);
+        let v = sign_admin(KEY, &c);
+        let (payload_b64, mac_b64) = v.split_once('.').unwrap();
+
+        // A stretched `iat` under the original MAC buys nothing.
+        let forged = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&AdminClaim::new(TOKEN, c.iat + ADMIN_COOKIE_TTL_SECS)).unwrap()
+            ),
+            mac_b64
+        );
+        assert_eq!(verify_admin(KEY, TOKEN, &forged, c.iat + 1), None);
+        assert_eq!(
+            verify_admin(b"another key that is long enough", TOKEN, &v, c.iat),
+            None
+        );
+        assert_eq!(verify_admin(KEY, TOKEN, payload_b64, c.iat), None);
+        assert_eq!(
+            verify_admin(KEY, TOKEN, &format!("{payload_b64}.AAAA"), c.iat),
+            None
+        );
+
+        // Twelve hours and a second is a sign-in that has to happen again.
+        assert_eq!(
+            verify_admin(KEY, TOKEN, &v, c.iat + ADMIN_COOKIE_TTL_SECS + 1),
+            None
+        );
+        assert_eq!(verify_admin(KEY, TOKEN, &v, c.iat - 1), None);
+        assert_eq!(verify_admin(KEY, TOKEN, "", 0), None);
+        assert_eq!(
+            verify_admin(KEY, TOKEN, &"a".repeat(MAX_COOKIE_LEN + 1), 0),
+            None
+        );
+    }
+
+    /// One browser can hold both cookies, and each is found by its own name.
+    #[test]
+    fn finds_each_cookie_by_its_own_name() {
+        let signup = sign(KEY, &claim());
+        let admin = sign_admin(KEY, &AdminClaim::new(TOKEN, 1_000_000));
+        let header = format!("{COOKIE_NAME}={signup}; {ADMIN_COOKIE_NAME}={admin}");
+        assert_eq!(from_header(&header), Some(signup.as_str()));
+        assert_eq!(admin_from_header(&header), Some(admin.as_str()));
+        assert_eq!(admin_from_header(&format!("{COOKIE_NAME}={signup}")), None);
+        assert_eq!(
+            admin_from_header(&format!("x{ADMIN_COOKIE_NAME}={admin}")),
+            None
+        );
+    }
+
+    /// `SameSite=Strict` is the CSRF defense on every admin POST, so it is
+    /// asserted rather than trusted to survive an edit.
+    #[test]
+    fn the_admin_cookie_is_strict() {
+        let v = set_admin_cookie("abc", true);
+        assert!(v.contains("HttpOnly"), "{v}");
+        assert!(v.contains("SameSite=Strict"), "{v}");
+        assert!(v.contains("Secure"), "{v}");
+        assert!(v.contains("Path=/"), "{v}");
+        assert!(!v.contains("Domain"), "{v}");
+        assert!(
+            v.contains(&format!("Max-Age={ADMIN_COOKIE_TTL_SECS}")),
+            "{v}"
+        );
+        assert!(!set_admin_cookie("abc", false).contains("Secure"));
+        let cleared = clear_admin_cookie(true);
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("SameSite=Strict"), "{cleared}");
     }
 
     #[test]

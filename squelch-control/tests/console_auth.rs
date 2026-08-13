@@ -255,6 +255,8 @@ impl Harness {
             userinfo_url: format!("{google}/userinfo"),
             // Console auth never touches the LLM gateway; feature off.
             bifrost: None,
+            // Nor the waitlist: with it off, those routes are not mounted.
+            waitlist: None,
         };
 
         let store = ControlStore::open_in_memory().unwrap();

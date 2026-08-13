@@ -4,11 +4,12 @@
 //! will ever see, and one that guesses its base domain hands out tenant URLs
 //! that resolve to somebody else.
 //!
-//! FOUR FIELDS HERE ARE SECRETS — the OAuth client secret, the cookie key, the
-//! warden bearer, and the Bifrost admin token — so [`Config`] (and
-//! [`BifrostConfig`] inside it) has a HAND-WRITTEN `Debug` that redacts them. A
-//! derived one would put all four in any `tracing::debug!` that ever formats
-//! the config, and that is exactly the line nobody notices adding.
+//! SIX FIELDS HERE ARE SECRETS: the OAuth client secret, the cookie key, the
+//! warden bearer, the Bifrost admin token, the admin-page token, and the Resend
+//! API key. So [`Config`] (and [`BifrostConfig`] and [`WaitlistConfig`] inside
+//! it) has a HAND-WRITTEN `Debug` that redacts them. A derived one would put
+//! all six in any `tracing::debug!` that ever formats the config, and that is
+//! exactly the line nobody notices adding.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -88,6 +89,32 @@ pub const DEFAULT_LLM_MODELS: &str = "claude-haiku-4-5,claude-sonnet-5";
 /// larger one is a paste accident.
 pub const MAX_LLM_MODEL_LEN: usize = 128;
 
+/// Minimum admin-token length, the same bar the warden bearer and the Bifrost
+/// credential are held to. This one token is the entire authentication of the
+/// admin page on a PUBLIC service, and the page mints invites, so anything a
+/// human could think up is not it: `openssl rand -base64 32`.
+pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
+
+/// Resend's API origin. Pinned as a constant and deliberately NOT readable from
+/// the environment, for the same reason Google's token endpoint is: this
+/// request carries the sending API key, so "which host do we send the key to"
+/// must not be a deploy-time typo. Tests point [`WaitlistConfig::resend_url`]
+/// at a mock by constructing the struct directly.
+pub const RESEND_URL: &str = "https://api.resend.com";
+
+/// The origin the waitlist form is served from, and so the only one the CORS
+/// answer names. A default rather than a required variable because the product
+/// has exactly one marketing site; an operator running their own points this at
+/// it.
+pub const DEFAULT_WAITLIST_ORIGIN: &str = "https://passband.app";
+
+/// Ceiling on the Resend API key. Real ones are ~35 characters.
+const MAX_RESEND_API_KEY_LEN: usize = 256;
+
+/// Ceiling on the `From:` the invite is sent as. RFC 5321's address limit, with
+/// the display name riding in front of it.
+const MAX_INVITE_FROM_LEN: usize = 320;
+
 /// Why the control plane refused to start.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -143,6 +170,10 @@ pub struct Config {
     /// feature is OFF and signup provisions tenants with no LLM key at all;
     /// a partial configuration is a refusal to boot, never a silent off.
     pub bifrost: Option<BifrostConfig>,
+    /// The waitlist and its admin page, when this deployment has them. `None`
+    /// means those routes are NOT MOUNTED at all (a 404, not a 403), because a
+    /// deployment with no admin token must not answer at an admin URL.
+    pub waitlist: Option<WaitlistConfig>,
 }
 
 /// The Bifrost governance settings: where the gateway is, the admin
@@ -174,10 +205,47 @@ impl std::fmt::Debug for BifrostConfig {
     }
 }
 
+/// The waitlist settings: the token that opens the admin page, the credential
+/// and the sender the invite email goes out with, and the one browser origin
+/// the public form may be posted from. `admin_token` and `resend_api_key` are
+/// secrets; the hand-written `Debug` redacts both.
+#[derive(Clone)]
+pub struct WaitlistConfig {
+    /// The operator's password for the admin page, compared with
+    /// [`squelch_httpauth::ct_eq`]. Redacted from `Debug`.
+    pub admin_token: String,
+    /// Bearer presented to Resend on the one call this feature makes.
+    /// Redacted from `Debug`.
+    pub resend_api_key: String,
+    /// The `From:` every invite is sent as, e.g. `Passband
+    /// <invites@passband.app>`. Must be an address on a domain verified at
+    /// Resend, or every send is refused.
+    pub invite_from: String,
+    /// The origin the waitlist form is served from, echoed as
+    /// `Access-Control-Allow-Origin` on that route and nowhere else. A canonical
+    /// origin: no path, no trailing slash.
+    pub allowed_origin: String,
+    /// Resend's API origin. A field rather than a constant use-site so the send
+    /// can be tested against a mock; `from_env` always pins [`RESEND_URL`].
+    pub resend_url: String,
+}
+
+impl std::fmt::Debug for WaitlistConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitlistConfig")
+            .field("admin_token", &"<redacted>")
+            .field("resend_api_key", &"<redacted>")
+            .field("invite_from", &self.invite_from)
+            .field("allowed_origin", &self.allowed_origin)
+            .field("resend_url", &self.resend_url)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for Config {
-    /// Hand-written so the three secrets can never ride out in a formatted
-    /// config. The cookie key shows its LENGTH, which is the only property
-    /// anyone debugging it needs.
+    /// Hand-written so the secrets can never ride out in a formatted config.
+    /// The cookie key shows its LENGTH, which is the only property anyone
+    /// debugging it needs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("bind", &self.bind)
@@ -197,6 +265,9 @@ impl std::fmt::Debug for Config {
             .field("userinfo_url", &self.userinfo_url)
             // BifrostConfig's own Debug redacts the admin token.
             .field("bifrost", &self.bifrost)
+            // WaitlistConfig's own Debug redacts the admin token and the
+            // Resend key.
+            .field("waitlist", &self.waitlist)
             .finish()
     }
 }
@@ -272,6 +343,13 @@ impl Config {
             var("SQUELCH_CONTROL_LLM_MODELS"),
         )?;
 
+        let waitlist = waitlist_from(
+            var("SQUELCH_CONTROL_ADMIN_TOKEN"),
+            var("SQUELCH_CONTROL_RESEND_API_KEY"),
+            var("SQUELCH_CONTROL_INVITE_FROM"),
+            var("SQUELCH_CONTROL_WAITLIST_ORIGIN"),
+        )?;
+
         let trusted_proxy_hops = match var("SQUELCH_CONTROL_TRUSTED_PROXY_HOPS") {
             None => 0,
             Some(v) => {
@@ -306,6 +384,7 @@ impl Config {
             profile_url: GMAIL_PROFILE_URL.to_string(),
             userinfo_url: GOOGLE_USERINFO_URL.to_string(),
             bifrost,
+            waitlist,
         })
     }
 
@@ -429,6 +508,84 @@ fn bifrost_from(
         admin_token,
         budget_usd,
         models,
+    }))
+}
+
+/// Validate the waitlist settings, all-or-nothing.
+///
+/// None of the four set means the feature is OFF, which is a legal deployment
+/// (self-host, or hosted before there is a marketing site to collect from) and
+/// means the waitlist and admin routes are NOT MOUNTED. Some-but-not-all is a
+/// REFUSAL TO BOOT, and the stakes are higher here than for the gateway: a
+/// deployment that quietly came up with an admin token and no way to send would
+/// approve people into silence, and one that came up with a sender and no token
+/// would have no admin page to approve from. The origin is the one field with a
+/// default, because "the feature is on" is decided by the token, the key, and
+/// the sender, and an origin without those three is still half a feature.
+fn waitlist_from(
+    admin_token: Option<String>,
+    resend_api_key: Option<String>,
+    invite_from: Option<String>,
+    allowed_origin: Option<String>,
+) -> Result<Option<WaitlistConfig>, ConfigError> {
+    if admin_token.is_none()
+        && resend_api_key.is_none()
+        && invite_from.is_none()
+        && allowed_origin.is_none()
+    {
+        return Ok(None);
+    }
+    let (Some(admin_token), Some(resend_api_key), Some(invite_from)) =
+        (admin_token, resend_api_key, invite_from)
+    else {
+        return Err(ConfigError::invalid(
+            "SQUELCH_CONTROL_ADMIN_TOKEN, SQUELCH_CONTROL_RESEND_API_KEY and \
+             SQUELCH_CONTROL_INVITE_FROM must be set together \
+             (SQUELCH_CONTROL_WAITLIST_ORIGIN is optional); set all three or none",
+        ));
+    };
+    if admin_token.len() < MIN_ADMIN_TOKEN_LEN {
+        return Err(ConfigError::invalid(format!(
+            "SQUELCH_CONTROL_ADMIN_TOKEN is {} characters; at least {MIN_ADMIN_TOKEN_LEN} are required. Generate one with `openssl rand -base64 32`",
+            admin_token.len()
+        )));
+    }
+    // The key becomes an Authorization header. Held to printable ASCII here so
+    // a pasted key with a stray newline in it fails at boot rather than as an
+    // unsendable request on the first approval.
+    if !(1..=MAX_RESEND_API_KEY_LEN).contains(&resend_api_key.len())
+        || !resend_api_key.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(ConfigError::invalid(
+            "invalid SQUELCH_CONTROL_RESEND_API_KEY: expected a Resend API key (printable ASCII, \
+             no spaces), e.g. re_...",
+        ));
+    }
+    // The sender lands in a mail header at Resend, so a control character or a
+    // line break is refused rather than passed on, and it must at least be
+    // shaped like an address: `invites@passband.app` or
+    // `Passband <invites@passband.app>`.
+    let from_ok = (3..=MAX_INVITE_FROM_LEN).contains(&invite_from.len())
+        && invite_from.contains('@')
+        && invite_from
+            .bytes()
+            .all(|b| b == b' ' || b.is_ascii_graphic());
+    if !from_ok {
+        return Err(ConfigError::invalid(format!(
+            "invalid SQUELCH_CONTROL_INVITE_FROM `{invite_from}`: expected an address on a domain \
+             verified at Resend, e.g. `Passband <invites@passband.app>`"
+        )));
+    }
+    let allowed_origin = match allowed_origin {
+        None => DEFAULT_WAITLIST_ORIGIN.to_string(),
+        Some(raw) => canonical_origin("SQUELCH_CONTROL_WAITLIST_ORIGIN", &raw)?,
+    };
+    Ok(Some(WaitlistConfig {
+        admin_token,
+        resend_api_key,
+        invite_from,
+        allowed_origin,
+        resend_url: RESEND_URL.to_string(),
     }))
 }
 
@@ -601,6 +758,13 @@ mod tests {
                 budget_usd: DEFAULT_LLM_BUDGET_USD,
                 models: vec!["claude-haiku-4-5".into()],
             }),
+            waitlist: Some(WaitlistConfig {
+                admin_token: "ADMIN-PAGE-TOKEN-VALUE".into(),
+                resend_api_key: "RESEND-API-KEY-VALUE".into(),
+                invite_from: "Passband <invites@passband.app>".into(),
+                allowed_origin: DEFAULT_WAITLIST_ORIGIN.into(),
+                resend_url: RESEND_URL.into(),
+            }),
         }
     }
 
@@ -691,13 +855,15 @@ mod tests {
         assert!(decode_cookie_key(&short).is_err());
     }
 
-    /// The four secrets must not be formattable out of the struct.
+    /// Every secret must not be formattable out of the struct.
     #[test]
     fn debug_redacts_every_secret() {
         let rendered = format!("{:?}", sample());
         assert!(!rendered.contains("TOP-SECRET-VALUE"), "{rendered}");
         assert!(!rendered.contains("WARDEN-BEARER-VALUE"), "{rendered}");
         assert!(!rendered.contains("BIFROST-ADMIN-VALUE"), "{rendered}");
+        assert!(!rendered.contains("ADMIN-PAGE-TOKEN-VALUE"), "{rendered}");
+        assert!(!rendered.contains("RESEND-API-KEY-VALUE"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("<32 bytes>"));
     }
@@ -784,6 +950,104 @@ mod tests {
             assert!(
                 bifrost_from(some("https://bifrost.example"), some(&token), None, some(bad))
                     .is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The waitlist settings are a unit: token + key + sender is the feature
+    /// on, none set is off (the routes are not mounted at all), and anything in
+    /// between is a refusal to boot. The origin is the one field with a
+    /// default.
+    #[test]
+    fn the_waitlist_settings_are_all_or_nothing() {
+        let some = |s: &str| Some(s.to_string());
+        let token = "t".repeat(MIN_ADMIN_TOKEN_LEN);
+        let key = "re_the_sending_key";
+        let from = "Passband <invites@passband.app>";
+
+        assert!(
+            waitlist_from(None, None, None, None).unwrap().is_none(),
+            "off"
+        );
+
+        let on = waitlist_from(some(&token), some(key), some(from), None)
+            .unwrap()
+            .expect("token + key + sender switches the feature on");
+        assert_eq!(on.admin_token, token);
+        assert_eq!(on.invite_from, from);
+        assert_eq!(on.allowed_origin, DEFAULT_WAITLIST_ORIGIN);
+        // Pinned, never read from the environment.
+        assert_eq!(on.resend_url, RESEND_URL);
+
+        let on = waitlist_from(
+            some(&token),
+            some(key),
+            some(from),
+            some("https://Staging.Passband.App/"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(on.allowed_origin, "https://staging.passband.app");
+
+        // Every partial combination refuses.
+        assert!(waitlist_from(some(&token), None, None, None).is_err());
+        assert!(waitlist_from(None, some(key), None, None).is_err());
+        assert!(waitlist_from(None, None, some(from), None).is_err());
+        assert!(waitlist_from(None, None, None, some("https://passband.app")).is_err());
+        assert!(waitlist_from(some(&token), some(key), None, None).is_err());
+        assert!(waitlist_from(some(&token), None, some(from), None).is_err());
+        assert!(waitlist_from(None, some(key), some(from), None).is_err());
+        assert!(
+            waitlist_from(None, None, None, some("https://passband.app")).is_err(),
+            "an origin on its own is still a half-configured feature"
+        );
+    }
+
+    /// The values are held to the same bar as the rest of the config: a token
+    /// long enough to be the whole authentication of a public admin page, a key
+    /// that can be a header, a sender that can be a mail header, and an origin
+    /// that is an origin.
+    #[test]
+    fn the_waitlist_settings_are_validated() {
+        let some = |s: &str| Some(s.to_string());
+        let token = "t".repeat(MIN_ADMIN_TOKEN_LEN);
+        let key = "re_the_sending_key";
+        let from = "Passband <invites@passband.app>";
+
+        let short = "t".repeat(MIN_ADMIN_TOKEN_LEN - 1);
+        assert!(waitlist_from(some(&short), some(key), some(from), None).is_err());
+
+        // A key that could not be an Authorization header.
+        for bad in ["re_key with spaces", "re_key\nX-Evil: 1", &"k".repeat(300)] {
+            assert!(
+                waitlist_from(some(&token), some(bad), some(from), None).is_err(),
+                "{bad:?}"
+            );
+        }
+        // A sender that is not an address, or that carries a line break into a
+        // mail header.
+        for bad in [
+            "Passband",
+            "a@",
+            "Passband <invites@passband.app>\r\nBcc: someone@example.com",
+        ] {
+            assert!(
+                waitlist_from(some(&token), some(key), some(bad), None).is_err(),
+                "{bad:?}"
+            );
+        }
+        // A bare address with no display name is fine.
+        assert!(waitlist_from(some(&token), some(key), some("invites@passband.app"), None).is_ok());
+        // The origin goes through the same canonicalization as every other
+        // origin here: no path, no query, no userinfo.
+        for bad in [
+            "passband.app",
+            "https://passband.app/waitlist",
+            "https://passband.app/?x=1",
+        ] {
+            assert!(
+                waitlist_from(some(&token), some(key), some(from), some(bad)).is_err(),
                 "{bad:?}"
             );
         }

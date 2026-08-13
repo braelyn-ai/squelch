@@ -464,6 +464,9 @@ impl Harness {
                 budget_usd: DEFAULT_LLM_BUDGET_USD,
                 models: vec!["claude-haiku-4-5".into(), "claude-sonnet-5".into()],
             }),
+            // The signup flow does not touch the waitlist; feature off, so
+            // those routes are not mounted at all.
+            waitlist: None,
         };
 
         let store = ControlStore::open_in_memory().unwrap();

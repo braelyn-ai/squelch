@@ -14,14 +14,27 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::bifrost::{BifrostClient, BifrostError};
-use crate::config::{BifrostConfig, Config, OUTBOUND_TIMEOUT};
+use crate::config::{BifrostConfig, Config, OUTBOUND_TIMEOUT, WaitlistConfig};
 use crate::ratelimit::{
-    CALLBACK_REQUESTS_PER_MINUTE, CONSOLE_AUTH_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE,
-    RateLimiter, SIGNUP_REQUESTS_PER_MINUTE,
+    ADMIN_LOGIN_REQUESTS_PER_MINUTE, ADMIN_REQUESTS_PER_MINUTE, CALLBACK_REQUESTS_PER_MINUTE,
+    CONSOLE_AUTH_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE, RateLimiter,
+    SIGNUP_REQUESTS_PER_MINUTE, WAITLIST_REQUESTS_PER_MINUTE,
 };
+use crate::resend::{ResendClient, ResendError};
 use crate::sessions::SessionStore;
 use crate::store::ControlStore;
 use crate::warden::Warden;
+
+/// Why state could not be built. Both variants are a client that would not
+/// construct, which is the only failure derivation has: everything else that
+/// could be refused was refused when the config was validated.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    #[error(transparent)]
+    Bifrost(#[from] BifrostError),
+    #[error(transparent)]
+    Resend(#[from] ResendError),
+}
 
 #[derive(Clone)]
 pub struct ControlState {
@@ -38,6 +51,11 @@ struct Inner {
     /// provisions keyless tenants and the `llm mint` operator command
     /// backfills them later.
     bifrost: Option<Arc<BifrostClient>>,
+    /// The invite mailer, DERIVED in [`ControlState::new`] from
+    /// `config.waitlist` for the same reason the Bifrost client is: present
+    /// exactly when the config says the feature is, never in disagreement with
+    /// it. `None` means the waitlist and admin routes are not mounted at all.
+    resend: Option<Arc<ResendClient>>,
     sessions: Mutex<SessionStore>,
     page_limiter: Mutex<RateLimiter>,
     signup_limiter: Mutex<RateLimiter>,
@@ -46,15 +64,21 @@ struct Inner {
     /// opening a console session costs a stranger nothing to ask for.
     console_auth_limiter: Mutex<RateLimiter>,
     callback_limiter: Mutex<RateLimiter>,
+    waitlist_limiter: Mutex<RateLimiter>,
+    admin_limiter: Mutex<RateLimiter>,
+    /// `POST /admin/login`'s own bucket, for the reason `console_auth_limiter`
+    /// has one: it is the route where a stranger guesses at a secret, and it
+    /// must not be able to spend the budget the operator's own page needs.
+    admin_login_limiter: Mutex<RateLimiter>,
 }
 
 impl ControlState {
     /// Build state from validated config, an open store, and a warden client.
     ///
-    /// The Bifrost client is DERIVED here from `config.bifrost`, so the
-    /// feature has exactly one switch: the config. A caller cannot hand
-    /// in a client the config does not describe, or forget one it does.
-    /// Fallible only in the one way that derivation is (the HTTP client
+    /// The Bifrost client and the invite mailer are both DERIVED here from the
+    /// config, so each feature has exactly one switch: the config. A caller
+    /// cannot hand in a client the config does not describe, or forget one it
+    /// does. Fallible only in the one way that derivation is (an HTTP client
     /// failing to build); everything else that could be refused was refused
     /// when the config was validated, and the only key material in the flow
     /// arrives per signup from the warden.
@@ -62,7 +86,7 @@ impl ControlState {
         config: Config,
         store: ControlStore,
         warden: Arc<dyn Warden>,
-    ) -> Result<Self, BifrostError> {
+    ) -> Result<Self, StateError> {
         let bifrost = config
             .bifrost
             .as_ref()
@@ -76,12 +100,26 @@ impl ControlState {
                 .map(Arc::new)
             })
             .transpose()?;
+        let resend = config
+            .waitlist
+            .as_ref()
+            .map(|w| {
+                ResendClient::new(
+                    w.resend_url.clone(),
+                    w.resend_api_key.clone(),
+                    w.invite_from.clone(),
+                    OUTBOUND_TIMEOUT,
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 store,
                 warden,
                 bifrost,
+                resend,
                 sessions: Mutex::new(SessionStore::new()),
                 page_limiter: Mutex::new(RateLimiter::per_minute(PAGE_REQUESTS_PER_MINUTE)),
                 signup_limiter: Mutex::new(RateLimiter::per_minute(SIGNUP_REQUESTS_PER_MINUTE)),
@@ -89,6 +127,11 @@ impl ControlState {
                     CONSOLE_AUTH_REQUESTS_PER_MINUTE,
                 )),
                 callback_limiter: Mutex::new(RateLimiter::per_minute(CALLBACK_REQUESTS_PER_MINUTE)),
+                waitlist_limiter: Mutex::new(RateLimiter::per_minute(WAITLIST_REQUESTS_PER_MINUTE)),
+                admin_limiter: Mutex::new(RateLimiter::per_minute(ADMIN_REQUESTS_PER_MINUTE)),
+                admin_login_limiter: Mutex::new(RateLimiter::per_minute(
+                    ADMIN_LOGIN_REQUESTS_PER_MINUTE,
+                )),
             }),
         })
     }
@@ -114,6 +157,18 @@ impl ControlState {
             .bifrost
             .as_deref()
             .zip(self.inner.config.bifrost.as_ref())
+    }
+
+    /// The invite mailer and its settings, together, when this deployment has
+    /// the waitlist. One `Option` for the pair for the same reason
+    /// [`Self::bifrost`] is one: both derive from `config.waitlist` in
+    /// [`Self::new`], so no caller can see a mailer without the admin token
+    /// that gates it, or the token without a way to send.
+    pub fn waitlist(&self) -> Option<(&ResendClient, &WaitlistConfig)> {
+        self.inner
+            .resend
+            .as_deref()
+            .zip(self.inner.config.waitlist.as_ref())
     }
 
     /// The pending-signup table. Poisoning is RECOVERED rather than propagated:
@@ -149,6 +204,18 @@ impl ControlState {
 
     pub(crate) fn check_callback_rate(&self, ip: IpAddr) -> bool {
         self.charge(&self.inner.callback_limiter, ip)
+    }
+
+    pub(crate) fn check_waitlist_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.waitlist_limiter, ip)
+    }
+
+    pub(crate) fn check_admin_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.admin_limiter, ip)
+    }
+
+    pub(crate) fn check_admin_login_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.admin_login_limiter, ip)
     }
 
     fn charge(&self, limiter: &Mutex<RateLimiter>, ip: IpAddr) -> bool {
