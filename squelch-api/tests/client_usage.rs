@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use common::{Harness, authed, body_json, harness};
 use serde_json::Value;
 use squelch_api::{ApiState, router};
-use squelch_core::store::Store;
+use squelch_core::store::{Store, UsageTokens};
 use tower::ServiceExt;
 
 /// Stage-1 per-MTok prices used throughout, distinct from the Stage-2 pair so a
@@ -49,16 +49,26 @@ async fn get_usage(app: axum::Router) -> Value {
 async fn categories_include_ledger_writers_the_endpoint_never_heard_of() {
     let app = priced_harness(|store, acct| {
         store
-            .stage1_bump_usage(acct, "2026-07-09", 1_000, 100, 0, 0)
+            .stage1_bump_usage(acct, "2026-07-09", UsageTokens::new(1_000, 100, 0, 0))
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", 2_000, 200, 0, 0)
+            .stage2_bump_usage(acct, "2026-07-09", UsageTokens::new(2_000, 200, 0, 0))
             .unwrap();
         store
-            .extract_bump_usage(acct, "2026-07-09", "extract_banking", 4_000, 400, 0, 0)
+            .extract_bump_usage(
+                acct,
+                "2026-07-09",
+                "extract_banking",
+                UsageTokens::new(4_000, 400, 0, 0),
+            )
             .unwrap();
         store
-            .extract_bump_usage(acct, "2026-07-09", "extract_fictional", 8_000, 800, 0, 0)
+            .extract_bump_usage(
+                acct,
+                "2026-07-09",
+                "extract_fictional",
+                UsageTokens::new(8_000, 800, 0, 0),
+            )
             .unwrap();
     })
     .app;
@@ -88,13 +98,26 @@ async fn categories_include_ledger_writers_the_endpoint_never_heard_of() {
 async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
     let app = priced_harness(|store, acct| {
         store
-            .stage1_bump_usage(acct, "2026-07-09", 1_000_000, 1_000_000, 0, 0)
+            .stage1_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens::new(1_000_000, 1_000_000, 0, 0),
+            )
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", 1_000_000, 1_000_000, 0, 0)
+            .stage2_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens::new(1_000_000, 1_000_000, 0, 0),
+            )
             .unwrap();
         store
-            .extract_bump_usage(acct, "2026-07-09", "extract_banking", 1_000_000, 1_000_000, 0, 0)
+            .extract_bump_usage(
+                acct,
+                "2026-07-09",
+                "extract_banking",
+                UsageTokens::new(1_000_000, 1_000_000, 0, 0),
+            )
             .unwrap();
     })
     .app;
@@ -125,13 +148,22 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
 async fn top_level_fields_stay_stage2_for_older_clients() {
     let app = priced_harness(|store, acct| {
         store
-            .stage1_bump_usage(acct, "2026-07-09", 1_000, 100, 0, 0)
+            .stage1_bump_usage(acct, "2026-07-09", UsageTokens::new(1_000, 100, 0, 0))
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", 1_000_000, 1_000_000, 0, 0)
+            .stage2_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens::new(1_000_000, 1_000_000, 0, 0),
+            )
             .unwrap();
         store
-            .extract_bump_usage(acct, "2026-07-09", "extract_banking", 9_999, 9_999, 0, 0)
+            .extract_bump_usage(
+                acct,
+                "2026-07-09",
+                "extract_banking",
+                UsageTokens::new(9_999, 9_999, 0, 0),
+            )
             .unwrap();
     })
     .app;
