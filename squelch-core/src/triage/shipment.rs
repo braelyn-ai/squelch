@@ -307,6 +307,26 @@ fn is_return_or_outbound(hay: &str) -> bool {
     detector().return_signal.iter().any(|re| re.is_match(hay))
 }
 
+/// LOOSE shipping signal: the `shipping_signal` battery minus the
+/// tracking-number requirement, still excluding returns and outbound mail.
+/// Drives the shipments-extractor trigger (`triage.ship_extract_model`), which
+/// is why it is deliberately HIGH-RECALL — an order confirmation that names no
+/// carrier and carries no number must still reach the model, and the model
+/// makes the real call. Reuses [`detect_shipment`]'s own batteries, so the two
+/// can never drift.
+pub fn has_loose_shipping_signal(from_addr: &str, subject: &str, body: &str) -> bool {
+    let hay = format!("{from_addr}\n{subject}\n{body}");
+    // Same PRECEDENCE as `detect_shipment`: a return notice is excluded even
+    // when it also talks about the original inbound shipment.
+    if is_return_or_outbound(&hay) {
+        return false;
+    }
+    detector()
+        .shipping_signal
+        .iter()
+        .any(|re| re.is_match(&hay))
+}
+
 // ---- ambiguous digit-run gating ------------------------------------------
 //
 // The `requires_signal` shapes are bare digit runs, and a retailer's ITEM or
@@ -1015,6 +1035,60 @@ mod tests {
             detect_shipment("x@y.com", subject, body).is_none(),
             "return exclusion must win over the inbound-delivery language"
         );
+    }
+
+    // ---- the LOOSE trigger signal ----------------------------------------
+
+    #[test]
+    fn loose_signal_fires_on_an_order_confirmation_with_no_tracking_number() {
+        // THE CASE THE TRIGGER EXISTS FOR: a real purchase whose confirmation
+        // names no carrier and carries no number, so `detect_shipment` can do
+        // nothing with it — but the model can.
+        let from = "auto-confirm@shop.example";
+        let subject = "Order #A-1042 confirmed";
+        let body = "Thanks for your order! We'll email you when it ships. \
+                    Shipping to 100 Main St.";
+        assert!(
+            detect_shipment(from, subject, body).is_none(),
+            "no tracking number: the regex extractor has nothing to key on"
+        );
+        assert!(
+            has_loose_shipping_signal(from, subject, body),
+            "but the loose trigger must still queue it for the extractor"
+        );
+    }
+
+    #[test]
+    fn loose_signal_excludes_returns_and_rmas() {
+        // Same precedence as detection: goods flowing AWAY are never queued, so
+        // the extractor never spends a call arguing with a return label.
+        assert!(!has_loose_shipping_signal(
+            "support@shop.example",
+            "Your return label is ready",
+            "Print the label and drop off your package at any UPS location. \
+             Your refund posts once we receive it."
+        ));
+        assert!(!has_loose_shipping_signal(
+            "support@shop.example",
+            "RMA 4471 approved",
+            "Your RMA has been approved; ship the item back to us."
+        ));
+    }
+
+    #[test]
+    fn loose_signal_ignores_unrelated_mail() {
+        assert!(!has_loose_shipping_signal(
+            "alice@example.com",
+            "Lunch tomorrow?",
+            "Want to grab a sandwich around noon? My treat."
+        ));
+        // A bare invoice with an amount and a long digit-run, and no shipping
+        // vocabulary anywhere: no signal, so no model spend.
+        assert!(!has_loose_shipping_signal(
+            "billing@saas.example",
+            "Invoice 998877665544 is ready",
+            "Your monthly invoice for $42.00 is available in your dashboard."
+        ));
     }
 
     // ---- carrier signal required for bare digit-runs ---------------------

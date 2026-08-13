@@ -554,12 +554,23 @@ impl SqliteStore {
         const PROCESSED: &str = "(triage.model_used IS NOT NULL \
              OR (triage.stage1_model_used IS NOT NULL \
                  AND triage.stage1_model_used NOT IN ('rule', 'n/a')))";
+        // SHIPMENTS-EXTRACTOR TRIGGER. 'pending' queues the row for the shipments
+        // specialist; NULL means no shipping signal at ingest. Sealed and sent
+        // mail never queue — the detector does not even run for them.
+        let ship_extract_model: Option<&str> = if triaged.ship_extract
+            && triaged.sensitivity == Sensitivity::Normal
+            && !triaged.message.is_sent
+        {
+            Some("pending")
+        } else {
+            None
+        };
         let triage_upsert = format!(
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
                  sealed_kind, one_line, reason, deadline, matched_rule_id,
                  stage1_model_used, needs_stage2, model_used,
-                 status, resolved_at, created_at, field_reasons)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16)
+                 status, resolved_at, created_at, field_reasons, ship_extract_model)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17)
              ON CONFLICT(message_id) DO UPDATE SET
                  importance=CASE WHEN {PROCESSED} THEN triage.importance ELSE excluded.importance END,
                  tier=CASE WHEN {PROCESSED} THEN triage.tier ELSE excluded.tier END,
@@ -569,6 +580,14 @@ impl SqliteStore {
                  field_reasons=CASE WHEN {PROCESSED} THEN triage.field_reasons ELSE excluded.field_reasons END,
                  deadline=CASE WHEN {PROCESSED} THEN triage.deadline ELSE excluded.deadline END,
                  matched_rule_id=excluded.matched_rule_id,
+                 -- A PROCESSED shipments marker survives re-ingest (re-running a
+                 -- paid extractor on the same mail buys nothing); a NULL or a
+                 -- still-'pending' one refreshes from the fresh detection, so a
+                 -- detector fix can newly queue — or newly un-queue — a row.
+                 ship_extract_model = CASE
+                     WHEN triage.ship_extract_model IS NOT NULL
+                          AND triage.ship_extract_model != 'pending'
+                     THEN triage.ship_extract_model ELSE excluded.ship_extract_model END,
                  status=CASE WHEN excluded.status='done' THEN 'done' ELSE triage.status END,
                  resolved_at=CASE WHEN excluded.status='done'
                      THEN excluded.resolved_at ELSE triage.resolved_at END"
@@ -592,6 +611,7 @@ impl SqliteStore {
                 resolved_at,
                 now_s,
                 field_reasons_json,
+                ship_extract_model,
             ],
         )?;
 

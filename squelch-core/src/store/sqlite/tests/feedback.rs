@@ -138,6 +138,57 @@ fn sealing_by_hand_deletes_the_shipment_the_message_fed() {
 }
 
 #[test]
+fn sealing_by_hand_nulls_the_ship_trigger_and_deletes_the_staged_order() {
+    // A staged order is nothing but mail-derived content (order reference, item
+    // name, thread) and the trigger is a standing instruction to send this mail
+    // to a model. Sealing must clear both, or the row keeps queueing itself.
+    let (store, acct) = store();
+    let t0 = Utc::now();
+    let id = triaged(acct, "g1", "t1")
+        .from("orders@shop.com")
+        .ship_extract(true)
+        .ingest(&store);
+    assert_eq!(store.ship_extract_queue(acct, 10).unwrap().len(), 1);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO shipment_orders(account_id, order_ref, item_name, thread_id,
+                                         last_message_id, first_seen, last_update)
+             VALUES(?1, 'ORD-9', 'Prescription refill', 't1', ?2, ?3, ?3)",
+            params![acct, id, t0.to_rfc3339()],
+        )
+        .unwrap();
+    }
+
+    store
+        .correct_triage(acct, id, TriageAxis::Sensitivity, "sealed", None, t0)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        store.ship_extract_queue(acct, 10).unwrap().is_empty(),
+        "a sealed row must never re-enter the shipments queue"
+    );
+    let conn = store.lock().unwrap();
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT ship_extract_model FROM triage WHERE message_id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, None, "the trigger is nulled, not stamped");
+    let staged: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shipment_orders WHERE account_id=?1",
+            params![acct],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(staged, 0, "the staged order goes with the seal");
+}
+
+#[test]
 fn sealing_by_hand_deletes_a_poll_advanced_shipment_too() {
     // The delete is keyed on `last_message_id`, and carrier polls deliberately
     // never touch that pointer — so a row the carrier has since advanced still

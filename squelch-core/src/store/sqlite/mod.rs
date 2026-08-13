@@ -552,6 +552,23 @@ impl Store for SqliteStore {
         self.extract_queue(account_id, categories, limit)
     }
 
+    fn ship_extract_queue(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<ExtractQueued>> {
+        self.ship_extract_queue(account_id, limit)
+    }
+
+    fn ship_extract_mark(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        marker: &str,
+    ) -> Result<()> {
+        self.ship_extract_mark(account_id, message_id, marker)
+    }
+
     fn retriage_reset(
         &self,
         account_id: AccountId,

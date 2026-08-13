@@ -44,6 +44,10 @@ pub(super) struct TriagedBuilder {
     deadline: Option<DeadlineHit>,
     receipt: Option<ReceiptInfo>,
     calendar: Option<CalendarInfo>,
+    /// The loose shipping signal ingest computes — set directly here so the
+    /// trigger/queue tests do not have to write shipping prose that happens to
+    /// satisfy the detector.
+    ship_extract: bool,
     confident: bool,
     /// Applied through the Stage-1 categorizer by `ingest`, after the row lands.
     category: Option<String>,
@@ -81,6 +85,7 @@ pub(super) fn triaged(account_id: AccountId, gmail: &str, thread: &str) -> Triag
         deadline: None,
         receipt: None,
         calendar: None,
+        ship_extract: false,
         confident: true,
         category: None,
     }
@@ -187,6 +192,12 @@ impl TriagedBuilder {
         self.calendar = Some(calendar);
         self
     }
+    /// Carry the loose shipping signal, i.e. queue this row for the shipments
+    /// extractor (`ship_extract_model='pending'`).
+    pub(super) fn ship_extract(mut self, ship_extract: bool) -> Self {
+        self.ship_extract = ship_extract;
+        self
+    }
     pub(super) fn category(mut self, category: &str) -> Self {
         self.category = Some(category.to_string());
         self
@@ -211,6 +222,7 @@ impl TriagedBuilder {
             field_reasons: self.field_reasons.clone(),
             deadline: self.deadline.clone(),
             shipment: None,
+            ship_extract: self.ship_extract,
             receipt: self.receipt.clone(),
             calendar: self.calendar.clone(),
             attachments: vec![],

@@ -407,3 +407,228 @@ fn init_upgrades_old_db_with_banking_table_and_extract_flow() {
     store.banking_apply(&applied).unwrap();
     assert_eq!(store.list_banking(acct).unwrap().len(), 1);
 }
+
+// ---- the shipments trigger: column, backfill, and the stale-marker sweep ----
+
+/// A DB shaped like an install that predates `ship_extract_model`: the two
+/// tables the one-shots read, with no shipping columns on either.
+fn preship_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, from_addr TEXT NOT NULL DEFAULT '',
+             subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '',
+             received_at TEXT NOT NULL, is_sent INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE triage(
+             message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             sensitivity TEXT NOT NULL DEFAULT 'normal',
+             category TEXT, extractor_model_used TEXT,
+             model_used TEXT, status TEXT NOT NULL DEFAULT 'new');",
+    )
+    .unwrap();
+    conn
+}
+
+/// Insert a message + its triage row, `days_ago` old.
+fn preship_msg(conn: &Connection, id: i64, subject: &str, body: &str, days_ago: i64, sent: bool) {
+    let at = (Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339();
+    conn.execute(
+        "INSERT INTO messages(id, account_id, gmail_msg_id, from_addr, subject, body,
+                              received_at, is_sent)
+         VALUES(?1, 1, ?2, 'orders@shop.com', ?3, ?4, ?5, ?6)",
+        params![id, format!("g{id}"), subject, body, at, sent as i64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO triage(message_id, account_id) VALUES(?1, 1)",
+        params![id],
+    )
+    .unwrap();
+}
+
+fn ship_marker(conn: &Connection, id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT ship_extract_model FROM triage WHERE message_id=?1",
+        params![id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn migrate_backfills_ship_extract_only_for_recent_signal_bearing_mail() {
+    let conn = preship_db();
+    // Recent + shipping signal -> pending.
+    preship_msg(
+        &conn,
+        1,
+        "Your order has shipped",
+        "Tracking number 1Z999AA10123456784",
+        2,
+        false,
+    );
+    // Recent, no shipping signal at all -> untouched.
+    preship_msg(&conn, 2, "Lunch tomorrow?", "See you at noon", 2, false);
+    // Recent, but a RETURN -> excluded by the same precedence detection uses.
+    preship_msg(
+        &conn,
+        3,
+        "Your return label",
+        "Print the return label and drop off your package",
+        2,
+        false,
+    );
+    // Signal-bearing but OUTSIDE the 30-day window -> untouched.
+    preship_msg(
+        &conn,
+        4,
+        "Your package was delivered",
+        "Delivered to your porch",
+        90,
+        false,
+    );
+    // Signal-bearing SENT mail -> the user's own outbox is never tracked.
+    preship_msg(
+        &conn,
+        5,
+        "Re: your package shipped",
+        "thanks, tracking looks right",
+        2,
+        true,
+    );
+
+    migrate(&conn).unwrap();
+    assert_eq!(ship_marker(&conn, 1).as_deref(), Some("pending"));
+    assert_eq!(ship_marker(&conn, 2), None, "no shipping signal");
+    assert_eq!(ship_marker(&conn, 3), None, "a return is not a shipment");
+    assert_eq!(ship_marker(&conn, 4), None, "outside the 30-day window");
+    assert_eq!(ship_marker(&conn, 5), None, "sent mail is never queued");
+
+    // Idempotent: the one-shot fires only on the open that ADDS the column, so
+    // a second migrate must not re-pend a row an extractor has since ruled on.
+    conn.execute(
+        "UPDATE triage SET ship_extract_model='claude-x' WHERE message_id=1",
+        [],
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(
+        ship_marker(&conn, 1).as_deref(),
+        Some("claude-x"),
+        "the backfill must not fire twice"
+    );
+}
+
+#[test]
+fn migrate_ship_extract_backfill_honors_its_hard_row_cap() {
+    // 600 signal-bearing messages, newest first by id. The cap is on the
+    // CANDIDATE select, so exactly 500 rows can ever be pended, and they are the
+    // newest ones (the mail most likely to still be in flight).
+    let conn = preship_db();
+    for i in 1..=600i64 {
+        // id 600 is newest (0 days old), id 1 is oldest (~20 days old).
+        preship_msg(
+            &conn,
+            i,
+            "Your order has shipped",
+            "on its way",
+            (600 - i) / 30,
+            false,
+        );
+    }
+    migrate(&conn).unwrap();
+    let pended: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM triage WHERE ship_extract_model='pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pended, 500,
+        "the hard cap bounds what a migration can spend"
+    );
+    assert_eq!(
+        ship_marker(&conn, 600).as_deref(),
+        Some("pending"),
+        "newest mail is kept"
+    );
+    assert_eq!(ship_marker(&conn, 1), None, "oldest mail falls off the cap");
+}
+
+#[test]
+fn migrate_clears_stale_skip_no_extractor_only_where_an_extractor_exists() {
+    // Rows stamped 'skip-no-extractor' while the dispatch bug hid the marketing
+    // extractor are permanently processed and would never re-queue. The sweep
+    // frees exactly those; a category that genuinely has no extractor keeps its
+    // honest verdict, and a real model marker is never touched.
+    let conn = preship_db();
+    conn.execute_batch(
+        "INSERT INTO triage(message_id, account_id, category, extractor_model_used) VALUES
+             (1, 1, 'marketing', 'skip-no-extractor'),
+             (2, 1, 'invoice', 'skip-no-extractor'),
+             (3, 1, 'banking_statement', 'claude-haiku-4-5'),
+             (4, 1, NULL, 'skip-no-extractor');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+
+    let ext = |mid: i64| -> Option<String> {
+        conn.query_row(
+            "SELECT extractor_model_used FROM triage WHERE message_id=?1",
+            params![mid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(ext(1), None, "marketing has an extractor now: re-queue it");
+    assert_eq!(
+        ext(2).as_deref(),
+        Some("skip-no-extractor"),
+        "invoice really has no extractor"
+    );
+    assert_eq!(
+        ext(3).as_deref(),
+        Some("claude-haiku-4-5"),
+        "a real model marker is untouched"
+    );
+    assert_eq!(
+        ext(4).as_deref(),
+        Some("skip-no-extractor"),
+        "a NULL category has no extractor"
+    );
+}
+
+#[test]
+fn migrate_adds_order_ref_and_init_creates_the_orders_staging_table() {
+    // The column seam covers `shipments.order_ref`; `shipment_orders` and its
+    // indexes ride in on schema.sql, which `init` runs on EVERY open — the
+    // reason migrate needs no CREATE TABLE of its own.
+    register_vec_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             tracking_number TEXT NOT NULL, carrier TEXT NOT NULL,
+             item_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'shipped',
+             tracking_url TEXT, last_message_id INTEGER,
+             first_seen TEXT NOT NULL, last_update TEXT NOT NULL,
+             UNIQUE(account_id, tracking_number));",
+    )
+    .unwrap();
+    let store = SqliteStore::init(conn).unwrap();
+    let conn = store.lock().unwrap();
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(shipments)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "order_ref"), "order_ref added");
+    let staged: i64 = conn
+        .query_row("SELECT COUNT(*) FROM shipment_orders", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(staged, 0, "the staging table exists on an upgraded DB");
+}

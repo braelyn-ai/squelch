@@ -164,7 +164,8 @@ impl SqliteStore {
         // extracted rows.
         if matches!(axis, TriageAxis::Sensitivity) && to_value == "sealed" {
             tx.execute(
-                "UPDATE triage SET category = NULL, extractor_model_used = NULL
+                "UPDATE triage SET category = NULL, extractor_model_used = NULL,
+                        ship_extract_model = NULL
                  WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
@@ -185,6 +186,13 @@ impl SqliteStore {
             // seal, same as the draft below.
             tx.execute(
                 "DELETE FROM shipments WHERE account_id = ?1 AND last_message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            // Staged orders go with them, for the same reason and with less to
+            // weigh: a `shipment_orders` row is nothing BUT mail-derived content
+            // (order reference, item name, thread) and carries no poll state.
+            tx.execute(
+                "DELETE FROM shipment_orders WHERE account_id = ?1 AND last_message_id = ?2",
                 params![account_id, message_id],
             )?;
             // And the LOCAL DRAFT replying to it, for the same reason: `put_draft`

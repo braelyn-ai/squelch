@@ -114,6 +114,14 @@ pub struct TriagedMessage {
     /// A detected shipment/package. Runs independently of the triage tier, and
     /// only ever `Some` for non-sealed mail.
     pub shipment: Option<ShipmentInfo>,
+    /// The LOOSE shipping signal
+    /// ([`has_loose_shipping_signal`](crate::triage::shipment::has_loose_shipping_signal)):
+    /// `true` queues the row for the shipments EXTRACTOR by stamping
+    /// `triage.ship_extract_model='pending'`. Much wider than `shipment`, which
+    /// needs a tracking number the regex could attribute — an order confirmation
+    /// with neither sets this and leaves `shipment` `None`. Always `false` for
+    /// sealed and sent mail, exactly like `shipment`.
+    pub ship_extract: bool,
     /// A detected receipt (money already paid). Independent of the tier AND of
     /// shipment detection — one mail can be both. Only ever `Some` for non-sealed
     /// mail. Ingest AUTO-RESOLVES the triage row (`status='done'`) so a receipt
@@ -867,9 +875,30 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ExtractQueued>>;
 
+    /// Up to `limit` rows the SHIPMENTS extractor still owes a verdict:
+    /// NON-SEALED, non-sent rows with `ship_extract_model='pending'`, newest
+    /// first. Deliberately NOT [`Store::extract_queue`] — that one routes on
+    /// `triage.category` (no shipping category exists) and excludes
+    /// receipt-bearing messages, which most order confirmations are. The trigger
+    /// is stamped at INGEST from a loose shipping signal, so a queued row may
+    /// still carry a NULL category, surfaced here as `""`.
+    fn ship_extract_queue(&self, account_id: AccountId, limit: usize)
+    -> Result<Vec<ExtractQueued>>;
+
+    /// Stamp `triage.ship_extract_model` with a PROCESSED marker (the extractor
+    /// model id, or a `'stale-skip'` / `'apply-failed'` / `'extract-failed'`
+    /// sentinel), taking the row out of [`Store::ship_extract_queue`]. Guarded by
+    /// `sensitivity='normal'`, exactly like [`Store::extract_mark_processed`].
+    fn ship_extract_mark(&self, account_id: AccountId, message_id: i64, marker: &str)
+    -> Result<()>;
+
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows
-    /// so they re-enter the Stage-1 queue, deleting their stale `banking` rows
-    /// (extraction recreates them). Rule-decided rows (`stage1_model_used='rule'`)
+    /// so they re-enter the Stage-1 queue, deleting their stale `banking`,
+    /// `marketing` and `shipment_orders` rows (extraction recreates them) and
+    /// re-pending any row that ever carried a shipping signal. `shipments` rows
+    /// SURVIVE — they are identity-keyed by tracking number and carry
+    /// carrier-poll state no re-run can recover.
+    /// Rule-decided rows (`stage1_model_used='rule'`)
     /// and sealed/sent rows (`'n/a'`) are NEVER touched — rules are authoritative
     /// and sealed mail re-enters no queue. `message_id=None` scopes to the
     /// trailing `days` of inbound mail; `Some(id)` to that one message.

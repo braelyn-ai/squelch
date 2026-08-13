@@ -1032,6 +1032,7 @@ pub fn ingest(
             matched_rule: None,
             deadline: None,
             shipment: None,
+            ship_extract: false,
             receipt: None,
             calendar: None,
             attachments,
@@ -1059,6 +1060,7 @@ pub fn ingest(
             matched_rule: None,
             deadline: None,
             shipment: None,
+            ship_extract: false,
             receipt: None,
             calendar: None,
             attachments,
@@ -1077,6 +1079,14 @@ pub fn ingest(
     // package tracker. Only ever runs here, on the NON-SEALED path — a sealed OTP
     // short-circuited above and never reaches this line.
     let shipment = shipment::detect_shipment(&from_addr, &subject, &text);
+
+    // SHIPMENTS-EXTRACTOR TRIGGER, next to detection and on the SAME non-sealed,
+    // non-sent path: the LOOSE signal (no tracking number required) that stamps
+    // `triage.ship_extract_model='pending'` so the shipments specialist picks the
+    // row up. Wider than `detect_shipment` on purpose — an order confirmation
+    // with no number is exactly the mail the regex cannot handle and the model
+    // can. Sealed mail short-circuited above, so this never sees sealed content.
+    let ship_extract = shipment::has_loose_shipping_signal(&from_addr, &subject, &text);
 
     // RECEIPT DETECTION runs INDEPENDENTLY of the triage tier AND of shipment
     // detection: a receipt (record of money already paid) is noise-tier for the
@@ -1115,6 +1125,7 @@ pub fn ingest(
         matched_rule: result.matched_rule,
         deadline: result.deadline,
         shipment,
+        ship_extract,
         receipt,
         calendar,
         attachments,

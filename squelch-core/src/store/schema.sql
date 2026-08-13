@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS triage (
     -- a 'skip-*' sentinel. Queue predicate: `category IN (<extractable>) AND
     -- extractor_model_used IS NULL AND sensitivity='normal'`.
     extractor_model_used TEXT,
+    -- SHIPMENTS-EXTRACTOR trigger + marker, stamped at INGEST from a LOOSE
+    -- shipping signal (`triage::shipment::has_loose_shipping_signal`) rather than
+    -- from an LLM category:
+    --   NULL        no shipping signal at ingest — this row never queues.
+    --   'pending'   queued for the shipments extractor.
+    --   anything    a processed marker: the extractor model id, or one of the
+    --               'stale-skip' / 'apply-failed' / 'extract-failed' sentinels.
+    -- Its own column and its own queue BECAUSE the extract queue routes on
+    -- `triage.category` (there is no shipping category) and excludes
+    -- receipt-bearing rows, which most order confirmations are. Re-ingest
+    -- PRESERVES a processed marker and only refreshes 'pending'; sealing NULLs
+    -- it, and retriage re-pends it.
+    ship_extract_model TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,
@@ -188,10 +201,43 @@ CREATE TABLE IF NOT EXISTS shipments (
     -- retirement cap for the poll queue. Transient errors do not count, and a
     -- successful poll resets it to 0.
     poll_failures   INTEGER NOT NULL DEFAULT 0,
+    -- The RETAILER's identifier for the purchase ("112-3456789-1234567"), when
+    -- the mail carried one. NOT a dedupe key — `tracking_number` still is — but
+    -- the join back to `shipment_orders`, so a tracking-bearing email can absorb
+    -- the staged order it belongs to. NULL when no order reference was found.
+    order_ref       TEXT,
     UNIQUE(account_id, tracking_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status);
+-- `idx_shipments_order_ref ON shipments(account_id, order_ref)` is created in
+-- migrate.rs, NOT here. This file runs in full on every open, BEFORE the column
+-- migrations, so an index over a migrated column would fail ("no such column:
+-- order_ref") on every pre-existing DB and make the store unopenable.
+
+-- ORDERS STAGING. A purchase the shipments extractor recognized but that carries
+-- NO TRACKING NUMBER yet (the order confirmation arrives days before the ship
+-- notice). Keyed by (account, order_ref) instead of a tracking number, so it
+-- cannot live in `shipments` — that table's identity IS the tracking number.
+-- When the ship notice lands with both the order reference and a number, the
+-- staged row is promoted into `shipments` and deleted here.
+--
+-- SECURITY: written only from the shipments extractor, whose queue gates on
+-- sensitivity='normal', so this table has no sealed rows BY CONSTRUCTION.
+-- Sealing a message still deletes the rows it fed, and so does a re-triage.
+CREATE TABLE IF NOT EXISTS shipment_orders (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    order_ref TEXT NOT NULL,
+    item_name TEXT NOT NULL DEFAULT '',
+    thread_id TEXT NOT NULL DEFAULT '',
+    last_message_id INTEGER,
+    first_seen TEXT NOT NULL,
+    last_update TEXT NOT NULL,
+    UNIQUE(account_id, order_ref)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shipment_orders_msg ON shipment_orders(account_id, last_message_id);
 
 -- RECEIPTS. One row per (account, message): money ALREADY PAID, extracted from
 -- NON-SEALED past-transaction mail. Records, not obligations — auto-resolved
