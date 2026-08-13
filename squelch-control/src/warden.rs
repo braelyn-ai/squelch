@@ -55,6 +55,19 @@ use serde::{Deserialize, Serialize};
 /// hundred bytes; the credential ciphertext travels the other way.
 const MAX_RESPONSE_BODY: usize = 64 * 1024;
 
+/// Ceiling on a drift report, which is the one answer whose size is decided by
+/// the tenant's own object rather than by this contract.
+///
+/// It has to sit ABOVE what a Deployment can hold, and deliberately so. The
+/// report grows with the number of foreign-owned fields, and the principal who
+/// can add those is the principal this whole feature exists to catch: a cap
+/// that a padded object could cross would let them push their own tenant's
+/// report over it and have the answer come back as "the warden is
+/// unreachable", which reads as a network problem and not as a finding. A
+/// Kubernetes object cannot exceed roughly 1.5 MB, so nothing that fits in the
+/// cluster can fail to fit here.
+const MAX_DRIFT_BODY: usize = 8 * 1024 * 1024;
+
 /// Bounds on the pairing code the warden reports. Crockford `XXXX-XXXX`, which
 /// is what `squelchd pair` prints.
 const PAIR_CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -637,7 +650,10 @@ impl HttpWarden {
 
         match resp.status().as_u16() {
             200 => {
-                let body = read_capped(resp).await?;
+                // The drift cap, not the contract's: a report is as big as the
+                // drift it found, and the tenant that drifted most must not be
+                // the one that comes back unreadable. See [`MAX_DRIFT_BODY`].
+                let body = read_capped_to(resp, MAX_DRIFT_BODY).await?;
                 let mut report: DriftReport =
                     serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
                 report.declaw();
@@ -705,10 +721,17 @@ fn validate_pairing(p: &Pairing) -> Result<(), WardenError> {
     Ok(())
 }
 
-async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, WardenError> {
+async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, WardenError> {
+    read_capped_to(resp, MAX_RESPONSE_BODY).await
+}
+
+async fn read_capped_to(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, WardenError> {
     let mut out = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|_| WardenError::Unreachable)? {
-        if out.len() + chunk.len() > MAX_RESPONSE_BODY {
+        if out.len() + chunk.len() > cap {
             return Err(WardenError::Unreachable);
         }
         out.extend_from_slice(&chunk);

@@ -65,7 +65,7 @@ enum Command {
         command: LlmCommand,
     },
     /// Report what is on tenants' workloads that the warden did not put there.
-    /// Exits 1 when anything has drifted.
+    /// Exits 1 when anything has drifted, 2 when a tenant could not be checked.
     Drift {
         /// One tenant. Omit it to walk every tenant in the store.
         label: Option<String>,
@@ -493,23 +493,35 @@ fn drift(label: Option<String>) -> anyhow::Result<()> {
 
     let total = labels.len();
     let word = tenant_word(total);
-    if failed > 0 {
-        anyhow::bail!("{failed} of {total} {word} could not be checked");
-    }
-    if drifted == 0 {
+    if drifted > 0 {
+        eprintln!(
+            "squelch-control: drift found on {drifted} of {total} {word}. Reconcile one tenant at \
+             a time, verifying each before the next."
+        );
+    } else if failed == 0 {
         eprintln!("squelch-control: {total} {word} checked, nothing has drifted.");
-        return Ok(());
     }
-    eprintln!(
-        "squelch-control: drift found on {drifted} of {total} {word}. Reconcile one tenant at a \
-         time, verifying each before the next."
-    );
-    // The report is the output, so the drift itself leaves by the exit code
-    // rather than as an error: nothing failed here, and a caller that only wants
-    // the answer should not have to parse a message for it. Stdout is flushed by
-    // hand because `exit` runs no destructors.
+    if failed > 0 {
+        eprintln!("squelch-control: {failed} of {total} {word} could not be checked.");
+    }
+    // Three outcomes, three codes, because the caller for this command is a
+    // timer and not a person: a timer that cannot tell "the fleet has drifted"
+    // from "the warden did not answer" either pages for the wrong thing or
+    // stops paging. Drift wins the tie - it is the finding, and an unreachable
+    // tenant is still worth a look afterwards. The summary above prints in
+    // every case, including the mixed one.
+    //
+    // 0 = everything checked and clean; 1 = drift found; 2 = at least one
+    // tenant could not be checked and none of the rest had drifted.
+    //
+    // Stdout is flushed by hand because `exit` runs no destructors.
+    let code = match (drifted, failed) {
+        (0, 0) => return Ok(()),
+        (0, _) => 2,
+        _ => 1,
+    };
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    std::process::exit(1);
+    std::process::exit(code);
 }
 
 /// `1 tenant`, `3 tenants`. A summary that says "1 tenants" reads as a bug in
