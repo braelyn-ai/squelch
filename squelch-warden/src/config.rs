@@ -239,6 +239,21 @@ pub struct Config {
     /// caller-supplied and would otherwise mint unlimited rate-limit
     /// identities.
     pub trusted_proxy_hops: usize,
+    /// The LLM gateway URL handed to every tenant daemon as
+    /// `SQUELCH_ANTHROPIC_BASE_URL`. Absent, the whole LLM env feature is off:
+    /// no gateway vars, no key reference, byte-identical pods to a warden that
+    /// never heard of it. Always https, because the hosted gateway is not on
+    /// this box and a virtual key crossing the wire in the clear would be a
+    /// credential leak by configuration.
+    pub llm_base_url: Option<String>,
+    /// Stage-1 (triage) model override, when the operator pins one.
+    pub llm_stage1_model: Option<String>,
+    /// Stage-2 (drafting) model override.
+    pub llm_stage2_model: Option<String>,
+    /// Per-tenant daily ceiling on stage-1 calls.
+    pub llm_stage1_daily_cap: Option<u32>,
+    /// Per-tenant daily ceiling on stage-2 calls.
+    pub llm_stage2_daily_cap: Option<u32>,
 }
 
 impl std::fmt::Debug for Config {
@@ -269,6 +284,11 @@ impl std::fmt::Debug for Config {
             .field("ready_timeout", &self.ready_timeout)
             .field("pending_ttl", &self.pending_ttl)
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
+            .field("llm_base_url", &self.llm_base_url)
+            .field("llm_stage1_model", &self.llm_stage1_model)
+            .field("llm_stage2_model", &self.llm_stage2_model)
+            .field("llm_stage1_daily_cap", &self.llm_stage1_daily_cap)
+            .field("llm_stage2_daily_cap", &self.llm_stage2_daily_cap)
             .finish()
     }
 }
@@ -496,6 +516,38 @@ impl Config {
             Some(raw) => Some(canonical_origin(&raw)?),
         };
 
+        let llm_base_url = match var(get, "SQUELCH_WARDEN_LLM_BASE_URL") {
+            None => None,
+            Some(raw) => Some(canonical_llm_base_url(&raw)?),
+        };
+        let llm_stage1_model = llm_value_var(get, "SQUELCH_WARDEN_LLM_STAGE1_MODEL")?;
+        let llm_stage2_model = llm_value_var(get, "SQUELCH_WARDEN_LLM_STAGE2_MODEL")?;
+        let llm_stage1_daily_cap = llm_cap_var(get, "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP")?;
+        let llm_stage2_daily_cap = llm_cap_var(get, "SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP")?;
+        // The four tuning vars mean nothing without a gateway: a model pin the
+        // pods never receive is an operator believing something false about
+        // what their tenants run, so it is a refusal to boot instead.
+        if llm_base_url.is_none() {
+            for (name, set) in [
+                ("SQUELCH_WARDEN_LLM_STAGE1_MODEL", llm_stage1_model.is_some()),
+                ("SQUELCH_WARDEN_LLM_STAGE2_MODEL", llm_stage2_model.is_some()),
+                (
+                    "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP",
+                    llm_stage1_daily_cap.is_some(),
+                ),
+                (
+                    "SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP",
+                    llm_stage2_daily_cap.is_some(),
+                ),
+            ] {
+                if set {
+                    return Err(ConfigError::invalid(format!(
+                        "{name} is set but SQUELCH_WARDEN_LLM_BASE_URL is not; without a gateway URL the value would never reach a tenant"
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             bind,
             token,
@@ -560,6 +612,11 @@ impl Config {
             ready_timeout: Duration::from_secs(ready_timeout),
             pending_ttl: Duration::from_secs(pending_ttl),
             trusted_proxy_hops,
+            llm_base_url,
+            llm_stage1_model,
+            llm_stage2_model,
+            llm_stage1_daily_cap,
+            llm_stage2_daily_cap,
         })
     }
 
@@ -720,6 +777,71 @@ fn canonical_cidr(raw: &str) -> Result<String, ConfigError> {
     Ok(format!("{addr}/{bits}"))
 }
 
+/// Validate the LLM gateway URL: https, a host, and nothing that would break
+/// an environment value.
+///
+/// It lands verbatim in every tenant pod as `SQUELCH_ANTHROPIC_BASE_URL`, so
+/// the checks are the boot-time versions of the two ways it fails silently
+/// later: a non-https scheme sends every tenant's virtual key over the wire in
+/// the clear, and a space or control byte becomes an env value every daemon
+/// rejects on its first triage call, hours after boot. The trailing slash is
+/// trimmed so two operator spellings of one gateway are one string.
+fn canonical_llm_base_url(raw: &str) -> Result<String, ConfigError> {
+    let url = raw.trim().trim_end_matches('/');
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_LLM_BASE_URL must be an https:// URL; the gateway is remote and a virtual key must never cross the wire in the clear",
+        ));
+    };
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_LLM_BASE_URL has no host",
+        ));
+    }
+    if !url
+        .bytes()
+        .all(|b| (b'!'..=b'~').contains(&b) && !matches!(b, b'"' | b'\'' | b'\\' | b'$' | b'`'))
+    {
+        return Err(ConfigError::invalid(
+            "SQUELCH_WARDEN_LLM_BASE_URL contains a character that is not allowed in a URL",
+        ));
+    }
+    Ok(url.to_string())
+}
+
+/// An optional LLM tuning value (a model id): printable, no whitespace, no
+/// shell metacharacters, because it becomes an environment value in every
+/// tenant pod.
+fn llm_value_var(get: Lookup, name: &str) -> Result<Option<String>, ConfigError> {
+    match var(get, name) {
+        None => Ok(None),
+        Some(value) => {
+            if !value.bytes().all(|b| {
+                (b'!'..=b'~').contains(&b) && !matches!(b, b'"' | b'\'' | b'\\' | b'$' | b'`')
+            }) {
+                return Err(ConfigError::invalid(format!(
+                    "{name} contains a character that is not allowed in an environment value"
+                )));
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+/// An optional per-day call ceiling. A number, refused here rather than parsed
+/// leniently by every daemon it reaches.
+fn llm_cap_var(get: Lookup, name: &str) -> Result<Option<u32>, ConfigError> {
+    match var(get, name) {
+        None => Ok(None),
+        Some(value) => {
+            let cap: u32 = value
+                .parse()
+                .map_err(|e| ConfigError::invalid(format!("invalid {name} `{value}`: {e}")))?;
+            Ok(Some(cap))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -792,6 +914,12 @@ mod tests {
         assert!(c.model_pvc.is_none());
         assert!(c.pull_secret.is_none());
         assert!(c.console_sso_url.is_none());
+        // The LLM env feature is off unless the operator turns it on.
+        assert!(c.llm_base_url.is_none());
+        assert!(c.llm_stage1_model.is_none());
+        assert!(c.llm_stage2_model.is_none());
+        assert!(c.llm_stage1_daily_cap.is_none());
+        assert!(c.llm_stage2_daily_cap.is_none());
     }
 
     /// The boot-refusal table. Every one of these is a value that would
@@ -875,6 +1003,17 @@ mod tests {
                 "https://signup passband.app",
             ),
             ("SQUELCH_WARDEN_CONSOLE_SSO_URL", "javascript:alert(1)"),
+            // The gateway URL: https or nothing, and always with a host.
+            ("SQUELCH_WARDEN_LLM_BASE_URL", "http://llm.internal"),
+            ("SQUELCH_WARDEN_LLM_BASE_URL", "llm.internal"),
+            ("SQUELCH_WARDEN_LLM_BASE_URL", "https://"),
+            ("SQUELCH_WARDEN_LLM_BASE_URL", "https:///v1"),
+            // Each of the four tuning vars, orphaned: without a gateway URL
+            // they would never reach a pod, so the operator hears it at boot.
+            ("SQUELCH_WARDEN_LLM_STAGE1_MODEL", "claude-haiku-4-5"),
+            ("SQUELCH_WARDEN_LLM_STAGE2_MODEL", "claude-sonnet-4-5"),
+            ("SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP", "200"),
+            ("SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP", "40"),
         ];
         for (key, value) in table {
             assert!(with(key, value).is_err(), "{key}=`{value}` was accepted");
@@ -943,6 +1082,70 @@ mod tests {
                 .as_deref(),
             Some("http://localhost:8853")
         );
+    }
+
+    /// The whole LLM knob set, accepted together and validated together. The
+    /// URL is normalized so two spellings of one gateway are one string.
+    #[test]
+    fn accepts_a_full_llm_configuration() {
+        let mut vars = required();
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_BASE_URL".to_string(),
+            " https://llm.passband.internal/ ".to_string(),
+        );
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE1_MODEL".to_string(),
+            "claude-haiku-4-5".to_string(),
+        );
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE2_MODEL".to_string(),
+            "claude-sonnet-4-5".to_string(),
+        );
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP".to_string(),
+            "200".to_string(),
+        );
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP".to_string(),
+            "40".to_string(),
+        );
+        let c = load(&vars).unwrap();
+        assert_eq!(
+            c.llm_base_url.as_deref(),
+            Some("https://llm.passband.internal")
+        );
+        assert_eq!(c.llm_stage1_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(c.llm_stage2_model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(c.llm_stage1_daily_cap, Some(200));
+        assert_eq!(c.llm_stage2_daily_cap, Some(40));
+
+        // The URL alone is a complete configuration: the tuning vars are
+        // overrides, not requirements.
+        let mut vars = required();
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_BASE_URL".to_string(),
+            "https://llm.passband.internal".to_string(),
+        );
+        assert!(load(&vars).is_ok());
+
+        // A cap that is not a number is refused even with the URL present.
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP".to_string(),
+            "many".to_string(),
+        );
+        assert!(load(&vars).is_err());
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP".to_string(),
+            "-1".to_string(),
+        );
+        assert!(load(&vars).is_err());
+        // And a model with a space would break the env value it becomes.
+        vars.remove("SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP");
+        vars.insert(
+            "SQUELCH_WARDEN_LLM_STAGE1_MODEL".to_string(),
+            "claude haiku".to_string(),
+        );
+        assert!(load(&vars).is_err());
     }
 
     /// The token is the one value that must never appear in a diagnostic, and

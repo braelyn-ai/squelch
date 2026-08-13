@@ -156,6 +156,7 @@ pub fn router(state: WardenState) -> Router {
             "/v1/tenants/{label}/credentials",
             put(handlers::set_credentials),
         )
+        .route("/v1/tenants/{label}/llm-key", put(handlers::set_llm_key))
         .route("/v1/tenants/{label}/pair", post(handlers::repair_tenant))
         .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
         .layer(middleware::from_fn_with_state(

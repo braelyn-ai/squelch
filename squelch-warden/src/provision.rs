@@ -72,7 +72,7 @@ use crate::config::Config;
 use crate::identity::TenantIdentity;
 use crate::objects;
 use crate::pair::{self, Pairing};
-use crate::validate::{self, CiphertextError, EmailError, LabelError, TenantName};
+use crate::validate::{self, ApiKeyError, CiphertextError, EmailError, LabelError, TenantName};
 
 /// What a tenant looks like from outside. The four words the wire has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,10 +124,18 @@ pub enum WardenError {
     InvalidEmail(#[from] EmailError),
     #[error("invalid cred_read_ciphertext: {0}")]
     InvalidCiphertext(#[from] CiphertextError),
+    #[error("invalid api_key: {0}")]
+    InvalidApiKey(#[from] ApiKeyError),
     #[error("label already exists")]
     Conflict,
     #[error("no such tenant")]
     NotFound,
+    /// The LLM gateway feature is off on this warden
+    /// ([`crate::config::Config::llm_base_url`] is absent), so a stored key
+    /// would never reach any pod. Refusing beats storing it and rolling the
+    /// fleet for nothing.
+    #[error("llm gateway not configured")]
+    LlmNotConfigured,
     #[error("{reason}")]
     Cluster { reason: &'static str },
 }
@@ -323,6 +331,19 @@ impl Warden {
             "service_failed",
         )
         .await?;
+        // A virtual key stored before provisioning must reach the pod being
+        // born: "PUT llm-key then PUT credentials" is a legal order, and the
+        // pod that comes up here has to carry the key's hash or the first
+        // rotation would find nothing to differ from. The Secret can only
+        // exist if `llm_base_url` was configured when `set_llm_key` accepted
+        // it, so this pickup cannot stamp the annotation with the feature off.
+        let llm_key = self
+            .cluster
+            .get_secret(&name.llm_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| secret_value(secret, objects::LLM_API_KEY_KEY));
         // The hash of what was just stored, not of what is running: this is the
         // whole mechanism by which a re-consent reaches the daemon.
         self.apply(
@@ -331,6 +352,7 @@ impl Warden {
                 &self.config,
                 &name,
                 &objects::credential_hash(&ciphertext),
+                llm_key.as_deref().map(objects::credential_hash).as_deref(),
             ))),
             "workload_failed",
         )
@@ -351,6 +373,85 @@ impl Warden {
         let pairing = self.mint_pairing(&name, &pod).await?;
         tracing::info!(tenant = %name, "tenant provisioned");
         Ok(pairing)
+    }
+
+    /// Store or rotate the tenant's LLM gateway virtual key.
+    ///
+    /// Legal at any point after phase one, deliberately: the control plane
+    /// mints the key alongside the signup, so "PUT llm-key then PUT
+    /// credentials" must birth a keyed pod, and a rotation against a running
+    /// tenant must reach the daemon. The second half works exactly like a
+    /// re-consent does — the key's hash rides on the pod template
+    /// ([`objects::LLM_KEY_HASH_ANNOTATION`]), so when a Deployment exists it
+    /// is rebuilt and re-applied here and the changed annotation rolls the
+    /// pod. With no Deployment yet, storing the Secret is the whole job;
+    /// [`Warden::set_credentials`] picks the key up when the workload is
+    /// applied.
+    ///
+    /// The key is a live credential: never logged, never returned, stored
+    /// verbatim in the tenant's Secret and read back only as a hash.
+    pub async fn set_llm_key(&self, raw_label: &str, raw_api_key: &str) -> Result<(), WardenError> {
+        // Feature gate first: with no gateway URL configured, the env this key
+        // would feed is never rendered ([`objects::daemon_env`]), so storing it
+        // would only roll pods onto a value they cannot use.
+        if self.config.llm_base_url.is_none() {
+            return Err(WardenError::LlmNotConfigured);
+        }
+        let name = TenantName::parse(raw_label)?;
+        let api_key = validate::validate_llm_api_key(raw_api_key)?;
+        if self.identity(&name).await?.is_none() {
+            return Err(WardenError::NotFound);
+        }
+
+        self.apply(
+            &name,
+            Object::Secret(Box::new(objects::llm_secret(&self.config, &name, &api_key))),
+            "llm_key_write_failed",
+        )
+        .await?;
+
+        let deployment = self
+            .cluster
+            .get_deployment(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        if deployment.is_some() {
+            // The rebuild needs the credential-ciphertext hash the running pod
+            // was rolled for, and the stored Secret is the byte-exact source
+            // of it: set_credentials wrote the validated ciphertext verbatim.
+            let ciphertext = self
+                .cluster
+                .get_secret(&name.credential_secret())
+                .await
+                .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+                .as_ref()
+                .and_then(|secret| secret_value(secret, objects::CREDENTIAL_KEY));
+            let Some(ciphertext) = ciphertext else {
+                // A Deployment with no sealed credential behind it is a state
+                // this warden never writes; refusing beats rolling a pod onto
+                // a hash of nothing.
+                tracing::error!(
+                    tenant = %name,
+                    reason = "credential_missing",
+                    "a workload exists but its credential Secret does not"
+                );
+                return Err(WardenError::cluster("credential_missing"));
+            };
+            self.apply(
+                &name,
+                Object::Deployment(Box::new(objects::deployment(
+                    &self.config,
+                    &name,
+                    &objects::credential_hash(&ciphertext),
+                    Some(&objects::credential_hash(&api_key)),
+                ))),
+                "workload_failed",
+            )
+            .await?;
+        }
+
+        tracing::info!(tenant = %name, "llm key stored");
+        Ok(())
     }
 
     /// Re-mint a pairing code for a later device. Nothing else about the tenant
@@ -387,7 +488,8 @@ impl Warden {
     /// The PersistentVolumeClaim, the identity Secret and the credential Secret
     /// are all left in place. This is the "cancel my account" path, not the
     /// "destroy my mail" path, and the second one is a later flag with a lot
-    /// more ceremony behind it.
+    /// more ceremony behind it. The LLM Secret is the exception — it holds a
+    /// gateway credential, not data, and goes with the workload; see below.
     ///
     /// Idempotent: an unknown label is success. The control plane calls this on
     /// its own unwind paths, where a retry after a partial failure must not
@@ -408,6 +510,15 @@ impl Warden {
                 .await
                 .map_err(|e| fail(name.as_str(), reason, &e))?;
         }
+        // The LLM key goes too, and it is the one Secret this path deletes: it
+        // is a live credential to a shared gateway, not tenant data. The
+        // control plane revokes the key when it cancels the account, so a kept
+        // Secret would hold a dead token at best; a re-opened account gets a
+        // freshly minted one through `set_llm_key`.
+        self.cluster
+            .delete(Kind::Secret, &name.llm_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "llm_key_delete_failed", &e))?;
         tracing::info!(tenant = %name, "tenant stopped; volume, identity and credential kept");
         Ok(())
     }
@@ -607,7 +718,7 @@ impl Warden {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Harness, armored};
+    use crate::testing::{Harness, armored, llm_test_config};
 
     /// The whole two-phase happy path, asserted as an exact ordered list of
     /// applies. If provisioning grows a step, or reorders one, this test is the
@@ -891,6 +1002,17 @@ mod tests {
 
     /// The annotation the running pod carries, as the mock stored it.
     fn pod_annotation(h: &Harness) -> String {
+        pod_annotations(h)[objects::CREDENTIAL_HASH_ANNOTATION].clone()
+    }
+
+    /// The LLM key hash on the running pod's template, when one is stamped.
+    fn llm_annotation(h: &Harness) -> Option<String> {
+        pod_annotations(h)
+            .get(objects::LLM_KEY_HASH_ANNOTATION)
+            .cloned()
+    }
+
+    fn pod_annotations(h: &Harness) -> std::collections::BTreeMap<String, String> {
         let Some(crate::cluster::Object::Deployment(deployment)) =
             h.cluster.object(Kind::Deployment, "alice")
         else {
@@ -903,8 +1025,102 @@ mod tests {
             .metadata
             .unwrap()
             .annotations
-            .unwrap()[objects::CREDENTIAL_HASH_ANNOTATION]
-            .clone()
+            .unwrap()
+    }
+
+    /// The provisioning order the control plane actually uses: the key is
+    /// minted alongside the signup, so it lands before the workload does, and
+    /// the pod that comes up must be born keyed.
+    #[tokio::test]
+    async fn a_key_stored_before_provisioning_births_a_keyed_pod() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+        // Stored, and nothing rolled: there is no workload yet to roll.
+        assert!(h.cluster.secret("alice-llm").is_some());
+        assert!(!h.cluster.exists(Kind::Deployment, "alice"));
+
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        let hash = llm_annotation(&h).expect("the pod was born without the key hash");
+        assert_eq!(hash, objects::credential_hash("sk-vk-first"));
+    }
+
+    /// Rotation against a running tenant: the new key's hash is a new pod
+    /// spec, and the credential hash beside it does not move.
+    #[tokio::test]
+    async fn rotating_the_llm_key_rolls_a_running_tenant() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        // Provisioned unkeyed: no hash on the template, nothing to roll for.
+        assert!(llm_annotation(&h).is_none());
+        let credential = pod_annotation(&h);
+
+        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+        let first = llm_annotation(&h).expect("the rotation did not reach the pod");
+        assert_eq!(pod_annotation(&h), credential, "the seed hash must not move");
+
+        h.warden.set_llm_key("alice", "sk-vk-second").await.unwrap();
+        assert_ne!(
+            first,
+            llm_annotation(&h).unwrap(),
+            "a new key must be a new pod spec"
+        );
+        // The stored Secret is the new key, verbatim.
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
+            "sk-vk-second"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_llm_key_refuses_an_unknown_label_and_a_broken_key() {
+        let h = Harness::with_config(llm_test_config());
+        assert_eq!(
+            h.warden.set_llm_key("nobody", "sk-vk").await.unwrap_err(),
+            WardenError::NotFound
+        );
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.warden.set_llm_key("alice", "sk\nvk").await.unwrap_err(),
+            WardenError::InvalidApiKey(_)
+        ));
+        // Neither call put anything past the identity.
+        assert_eq!(h.cluster.applied_names(), vec!["alice-identity"]);
+    }
+
+    /// With no gateway URL configured, the key has nowhere to go: the write is
+    /// refused before anything touches the cluster, rather than storing a
+    /// Secret no pod would ever read and rolling the fleet for nothing.
+    #[tokio::test]
+    async fn an_llm_key_is_refused_when_the_gateway_is_not_configured() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            h.warden.set_llm_key("alice", "sk-vk").await.unwrap_err(),
+            WardenError::LlmNotConfigured
+        );
+        assert!(h.cluster.secret("alice-llm").is_none());
+        assert_eq!(h.cluster.applied_names(), vec!["alice-identity"]);
     }
 
     #[tokio::test]
@@ -964,9 +1180,12 @@ mod tests {
                 (Kind::Deployment, "alice".to_string()),
                 (Kind::Service, "alice".to_string()),
                 (Kind::NetworkPolicy, "alice".to_string()),
+                // The gateway credential goes with the workload; see delete().
+                (Kind::Secret, "alice-llm".to_string()),
             ]
         );
-        // The three that hold data or keys are untouched, by name.
+        // The three that hold data or keys are untouched, by name: the only
+        // Secret this path may delete is the LLM key.
         assert!(h.cluster.secret("alice-identity").is_some());
         assert!(h.cluster.secret("alice-credential").is_some());
         assert!(h.cluster.exists(Kind::Pvc, "alice-data"));
@@ -974,7 +1193,11 @@ mod tests {
             h.cluster
                 .deleted()
                 .iter()
-                .all(|(kind, _)| !matches!(kind, Kind::Secret | Kind::Pvc))
+                .all(|(kind, name)| match kind {
+                    Kind::Pvc => false,
+                    Kind::Secret => name == "alice-llm",
+                    _ => true,
+                })
         );
 
         assert_eq!(
@@ -1111,15 +1334,24 @@ mod tests {
 
         assert_eq!(h.warden.sweep_pending().await.unwrap(), 1);
 
-        // The pending one is gone, and it is the only Secret ever deleted.
+        // The pending one is gone, and it is the only IDENTITY Secret ever
+        // deleted. (Carol's delete also took her `-llm` Secret, which is the
+        // workload's credential, not a tenant record; see `delete`.)
         assert!(h.cluster.secret("alice-identity").is_none());
         assert_eq!(
             h.cluster
                 .deleted()
                 .iter()
-                .filter(|(kind, _)| *kind == Kind::Secret)
+                .filter(|(kind, name)| *kind == Kind::Secret && name.ends_with("-identity"))
                 .count(),
             1
+        );
+        assert!(
+            h.cluster
+                .deleted()
+                .iter()
+                .filter(|(kind, _)| *kind == Kind::Secret)
+                .all(|(_, name)| name.ends_with("-identity") || name.ends_with("-llm"))
         );
         assert_eq!(
             h.warden.status("alice").await.unwrap_err(),

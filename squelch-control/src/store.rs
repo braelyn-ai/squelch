@@ -40,7 +40,12 @@ CREATE TABLE IF NOT EXISTS tenants (
     label         TEXT NOT NULL UNIQUE,
     account_email TEXT NOT NULL,
     status        TEXT NOT NULL,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    -- The Bifrost virtual-key ID installed for this tenant, and when it was
+    -- minted. THE ID ONLY: the key's value is the tenant's LLM bearer, and it
+    -- passes through this process without ever reaching this file.
+    bifrost_vk_id TEXT,
+    vk_minted_at  TEXT
 );
 -- One mailbox, one daemon. A PARTIAL unique index rather than a plain one, so a
 -- tenant that has been torn down frees its address for a later signup while an
@@ -73,6 +78,11 @@ const ADDED_COLUMNS: [(&str, &str); 3] = [
     ("reserved_by", "TEXT"),
     ("reserved_until", "TEXT"),
 ];
+
+/// The same, for `tenants`: the virtual-key columns arrived after the first
+/// hosted deployment.
+const TENANT_ADDED_COLUMNS: [(&str, &str); 2] =
+    [("bifrost_vk_id", "TEXT"), ("vk_minted_at", "TEXT")];
 
 /// Store errors. `Sqlite` carries rusqlite's message, which never contains a
 /// code or a token: the only values bound into these statements are hashes,
@@ -410,6 +420,44 @@ impl ControlStore {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Record the Bifrost virtual-key id installed for this tenant, stamping
+    /// when it was minted in the same RFC3339 shape as every other timestamp
+    /// in this file. THE ID ONLY: the key's value never comes here.
+    /// Returns whether a tenant row with `label` existed to take it.
+    pub fn set_tenant_vk(&self, label: &str, vk_id: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tenants SET bifrost_vk_id = ?2, vk_minted_at = ?3 WHERE label = ?1",
+            params![label, vk_id, stamp(Utc::now())],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The virtual-key id recorded for `label`. `None` covers both "no such
+    /// tenant" and "tenant with no key"; the callers that care ask
+    /// [`Self::label_exists`] first.
+    pub fn tenant_vk(&self, label: &str) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT bifrost_vk_id FROM tenants WHERE label = ?1",
+                params![label],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Forget the recorded virtual key, after `llm revoke` has revoked it in
+    /// Bifrost. Returns whether there was a recorded key to forget.
+    pub fn clear_tenant_vk(&self, label: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tenants SET bifrost_vk_id = NULL, vk_minted_at = NULL
+              WHERE label = ?1 AND bifrost_vk_id IS NOT NULL",
+            params![label],
+        )?;
+        Ok(changed == 1)
+    }
 }
 
 /// Bring an older store's `invite_codes` up to the schema above.
@@ -419,21 +467,25 @@ impl ControlStore {
 /// columns added by hand. Adding a column is the only migration shape this
 /// schema has ever needed; anything bigger would want a real tool.
 fn migrate(conn: &Connection) -> Result<()> {
+    add_missing_columns(conn, "invite_codes", &ADDED_COLUMNS)?;
+    add_missing_columns(conn, "tenants", &TENANT_ADDED_COLUMNS)?;
+    backfill_expiry(conn)
+}
+
+fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
     let existing: std::collections::HashSet<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(invite_codes)")?;
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
         names.collect::<rusqlite::Result<_>>()?
     };
-    for (name, ty) in ADDED_COLUMNS {
-        if !existing.contains(name) {
-            // The name and type are this file's own constants, never input.
-            conn.execute(
-                &format!("ALTER TABLE invite_codes ADD COLUMN {name} {ty}"),
-                [],
-            )?;
+    for (name, ty) in columns {
+        if !existing.contains(*name) {
+            // The table, name, and type are this file's own constants, never
+            // input.
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {ty}"), [])?;
         }
     }
-    backfill_expiry(conn)
+    Ok(())
 }
 
 /// Give every outstanding code minted before expiry existed one, counted from
@@ -763,6 +815,76 @@ mod tests {
             s.insert_tenant("ada", "someone@example.com"),
             Err(StoreError::LabelTaken)
         ));
+    }
+
+    /// The raw `vk_minted_at` cell for `label`, for asserting the shape it is
+    /// written in.
+    fn vk_minted_at(s: &ControlStore, label: &str) -> Option<String> {
+        s.lock()
+            .query_row(
+                "SELECT vk_minted_at FROM tenants WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The vk id rides on the tenant row: set, rotate, clear, and the two
+    /// nothing-there cases. Only ever the ID; the value has no path here.
+    #[test]
+    fn the_vk_id_rides_on_the_tenant_row() {
+        let s = store();
+        s.insert_tenant("ada", "ada@example.com").unwrap();
+
+        assert_eq!(s.tenant_vk("ada").unwrap(), None);
+        assert_eq!(vk_minted_at(&s, "ada"), None);
+        assert!(s.set_tenant_vk("ada", "vk-1").unwrap());
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-1".to_string()));
+        // The mint stamp is TEXT RFC3339 in the ONE shape every timestamp
+        // column in this file uses, not unix seconds: it round-trips through
+        // `parse_ts`/`stamp` unchanged.
+        let minted = vk_minted_at(&s, "ada").expect("stamped alongside the id");
+        assert_eq!(stamp(parse_ts(minted.clone())), minted, "{minted}");
+        // A rotation overwrites; the store tracks only the installed key.
+        assert!(s.set_tenant_vk("ada", "vk-2").unwrap());
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-2".to_string()));
+
+        assert!(s.clear_tenant_vk("ada").unwrap());
+        assert_eq!(s.tenant_vk("ada").unwrap(), None);
+        assert_eq!(vk_minted_at(&s, "ada"), None, "cleared with the id");
+        assert!(!s.clear_tenant_vk("ada").unwrap(), "nothing left to forget");
+
+        // A label with no row takes nothing and answers nothing.
+        assert!(!s.set_tenant_vk("ghost", "vk-9").unwrap());
+        assert_eq!(s.tenant_vk("ghost").unwrap(), None);
+    }
+
+    /// A tenants table written before the vk columns existed opens, gains
+    /// them, and takes a key id like any other row.
+    #[test]
+    fn an_older_tenants_table_gains_the_vk_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tenants (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 label         TEXT NOT NULL UNIQUE,
+                 account_email TEXT NOT NULL,
+                 status        TEXT NOT NULL,
+                 created_at    TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tenants(label, account_email, status, created_at)
+             VALUES('ada', 'ada@example.com', 'active', ?1)",
+            params![stamp(Utc::now())],
+        )
+        .unwrap();
+
+        let s = ControlStore::init(conn).unwrap();
+        assert_eq!(s.tenant_vk("ada").unwrap(), None, "migrated, keyless");
+        assert!(s.set_tenant_vk("ada", "vk-1").unwrap());
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-1".to_string()));
     }
 
     /// What a console login asks the store, both times it asks: the label's

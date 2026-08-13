@@ -88,6 +88,16 @@ pub enum WardenError {
     /// written a plaintext token into a Secret.
     #[error("refusing to send a credential that is not age ciphertext")]
     NotCiphertext,
+    /// 503 on the llm-key route: the warden has no LLM gateway configured, so
+    /// no key can be installed for anyone. Distinct from `Failed` because the
+    /// remedy is deployment configuration, not a retry — with the trio set
+    /// here and the gateway absent there, the two deployments disagree.
+    #[error("the provisioning service has no LLM gateway configured")]
+    LlmNotConfigured,
+    /// The caller handed this client something it will not present as an API
+    /// key. A bug on our side, caught before the socket is opened.
+    #[error("refusing to send an unusable API key")]
+    BadApiKey,
 }
 
 /// `POST /v1/tenants` request body. NO CREDENTIAL: at this point in the flow the
@@ -119,6 +129,13 @@ struct CredentialsRequest<'a> {
     /// `email#write`). The warden writes the blob into the tenant's Secret
     /// verbatim and never looks inside, so the name is stale, not wrong.
     cred_read_ciphertext: &'a str,
+}
+
+/// `PUT /v1/tenants/{label}/llm-key` request body. NO Debug derive, unlike its
+/// siblings: the field is the tenant's live LLM bearer.
+#[derive(Serialize)]
+struct LlmKeyRequest<'a> {
+    api_key: &'a str,
 }
 
 /// `PUT /v1/tenants/{label}/credentials` 200 body, and the same shape
@@ -172,6 +189,11 @@ pub trait Warden: Send + Sync {
         label: &str,
         cred_read_ciphertext: &str,
     ) -> Result<Pairing, WardenError>;
+
+    /// Install or rotate the tenant's LLM-gateway virtual key. The value is
+    /// SECRET: held for the length of this call, never logged, and nothing of
+    /// it comes back.
+    async fn put_llm_key(&self, label: &str, api_key: &str) -> Result<(), WardenError>;
 
     /// The tenant's state, or `None` when the warden has never heard of it.
     /// Used before consent to check that a label is free.
@@ -307,6 +329,38 @@ impl Warden for HttpWarden {
             // with it. It collapses into the generic retriable failure so the
             // page says "not finished yet" instead of blaming their input.
             422 => Err(WardenError::Failed),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
+    async fn put_llm_key(&self, label: &str, api_key: &str) -> Result<(), WardenError> {
+        // The label goes into a URL path, same as the other routes.
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+        // The Bifrost client shape-checks what it mints; this holds every
+        // OTHER caller to the same bar, before the socket is opened.
+        if api_key.is_empty() || !api_key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(WardenError::BadApiKey);
+        }
+
+        let resp = self
+            .http
+            .put(self.url(&format!("/v1/tenants/{label}/llm-key")))
+            .bearer_auth(&self.token)
+            .json(&LlmKeyRequest { api_key })
+            .send()
+            .await
+            .map_err(|_| WardenError::Unreachable)?;
+
+        match resp.status().as_u16() {
+            // The 200 body is `{}` by contract: the key came in, nothing goes
+            // out. Nothing to read.
+            200 => Ok(()),
+            401 | 403 => Err(WardenError::Unauthorized),
+            404 => Err(WardenError::UnknownTenant),
+            503 => Err(WardenError::LlmNotConfigured),
+            // 422 (`invalid_api_key`) collapses here: it is the two sides
+            // disagreeing about what Bifrost mints, and the guard above should
+            // make it unreachable.
             _ => Err(WardenError::Failed),
         }
     }
@@ -517,6 +571,13 @@ mod tests {
                 "{bad:?}"
             );
             assert!(
+                matches!(
+                    w.put_llm_key(bad, "sk-bf-key").await,
+                    Err(WardenError::LabelRefused)
+                ),
+                "{bad:?}"
+            );
+            assert!(
                 matches!(w.status(bad).await, Err(WardenError::LabelRefused)),
                 "{bad:?}"
             );
@@ -524,6 +585,114 @@ mod tests {
                 matches!(w.pair(bad).await, Err(WardenError::LabelRefused)),
                 "{bad:?}"
             );
+        }
+    }
+
+    /// An empty key, or one carrying whitespace or control bytes, is refused
+    /// before any socket is opened: it is a bug here, not a 422 there.
+    #[tokio::test]
+    async fn refuses_an_api_key_it_would_not_present() {
+        let w = offline_client();
+        for bad in ["", "with space", "with\nnewline", "with\ttab"] {
+            assert!(
+                matches!(
+                    w.put_llm_key("ada", bad).await,
+                    Err(WardenError::BadApiKey)
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The llm-key route on the wire: the key rides as `{"api_key": ...}` with
+    /// the bearer, a 200 is silence, and each refusal maps to its own error —
+    /// 503 distinctly, because "this deployment has no gateway" needs a log
+    /// line that says so rather than a generic failure.
+    #[tokio::test]
+    async fn put_llm_key_speaks_the_wire_and_maps_its_refusals() {
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode, header},
+            response::IntoResponse,
+            routing::put,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        // `(bearer, body)` per request, so the wire itself is asserted on.
+        type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+
+        // The mock picks its answer by label, so one server covers the map.
+        let app = Router::new()
+            .route(
+                "/v1/tenants/{label}/llm-key",
+                put(
+                    |State(seen): State<Seen>,
+                     Path(label): Path<String>,
+                     headers: HeaderMap,
+                     body: String| async move {
+                        let bearer = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                        seen.lock().unwrap().push((bearer, parsed));
+                        match label.as_str() {
+                            "okay" => (StatusCode::OK, Json(json!({}))).into_response(),
+                            "ghost" => {
+                                (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"})))
+                                    .into_response()
+                            }
+                            "nollm" => (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error":"llm_not_configured"})),
+                            )
+                                .into_response(),
+                            _ => (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                Json(json!({"error":"invalid_api_key"})),
+                            )
+                                .into_response(),
+                        }
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let w = HttpWarden::new(
+            format!("http://{addr}"),
+            "token".into(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        w.put_llm_key("okay", "sk-bf-THE-KEY").await.unwrap();
+        assert!(matches!(
+            w.put_llm_key("ghost", "sk-bf-THE-KEY").await,
+            Err(WardenError::UnknownTenant)
+        ));
+        assert!(matches!(
+            w.put_llm_key("nollm", "sk-bf-THE-KEY").await,
+            Err(WardenError::LlmNotConfigured)
+        ));
+        assert!(matches!(
+            w.put_llm_key("other", "sk-bf-THE-KEY").await,
+            Err(WardenError::Failed)
+        ));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        for (bearer, body) in seen.iter() {
+            assert_eq!(bearer, "Bearer token");
+            assert_eq!(body["api_key"], "sk-bf-THE-KEY");
         }
     }
 

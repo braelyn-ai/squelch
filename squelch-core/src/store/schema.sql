@@ -423,6 +423,9 @@ CREATE TABLE IF NOT EXISTS wake_budget (
 -- own line so per-specialist cost stays visible. `calls` counts SUCCESSFUL
 -- classify responses that carried a usage block. Cost is NOT stored: the human
 -- door computes it at read time from config-driven per-MTok prices.
+-- `input_tokens` is the UNCACHED prompt remainder; prompt-cache writes and
+-- reads sit in their own columns because they price differently (kept in sync
+-- with the additive migration in migrate.rs for pre-existing DBs).
 CREATE TABLE IF NOT EXISTS stage2_usage (
     account_id    INTEGER NOT NULL,
     day           TEXT NOT NULL,
@@ -430,6 +433,8 @@ CREATE TABLE IF NOT EXISTS stage2_usage (
     calls         INTEGER NOT NULL DEFAULT 0,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(account_id, day, category)
 );
 

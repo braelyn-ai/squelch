@@ -142,7 +142,7 @@ impl CredentialBackend {
 }
 
 /// Which LLM provider Stage-2 talks to. Selected by KEY PREFIX at resolution
-/// time (see [`Stage2Config::resolve_key_and_provider`]) unless forced via the
+/// time (see [`Stage2Config::resolve_llm`]) unless forced via the
 /// `stage2_provider` config field / `SQUELCH_STAGE2_PROVIDER` env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -402,9 +402,9 @@ pub struct Stage1Config {
     pub bill_absurd_amount_threshold: f64,
 
     // ---- Stage-1 LLM pass (the small model run on every non-rule email) ----
-    // The heuristic fields above are its seed/fallback. Key and provider come
-    // from [`Stage2Config::resolve_key_and_provider`]; only the fields below are
-    // Stage-1's own.
+    // The heuristic fields above are its seed/fallback. Key, provider, and
+    // endpoint come from [`Stage2Config::resolve_llm`]; only the fields below
+    // are Stage-1's own.
     /// The Stage-1 model id string. Default `claude-haiku-4-5` (a small, cheap
     /// model — it sees nearly every email). Env: `SQUELCH_STAGE1_MODEL`.
     pub model: String,
@@ -449,6 +449,13 @@ impl Default for Stage1Config {
     }
 }
 
+/// Prompt-cache multipliers on the per-MTok INPUT price, for costing the
+/// ledger's cache-token columns at read time. These are Anthropic's standard
+/// 5-minute-ephemeral-cache rates (the TTL our `cache_control` blocks use):
+/// cache writes bill at 1.25x the input price, cache reads at 0.1x.
+pub const CACHE_WRITE_INPUT_MULT: f64 = 1.25;
+pub const CACHE_READ_INPUT_MULT: f64 = 0.1;
+
 /// Stage-2 LLM triage tunables. The pass runs only over rows Stage-1 refined but
 /// left non-confident: `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
 /// model_used IS NULL AND sensitivity='normal'` — that last clause is what keeps
@@ -463,6 +470,18 @@ pub struct Stage2Config {
     /// Force the provider (`anthropic` / `openai`), overriding key-prefix
     /// sniffing. Env: `SQUELCH_STAGE2_PROVIDER`.
     pub stage2_provider: Option<Stage2Provider>,
+    /// Anthropic-wire base URL override: when set (and the resolved provider is
+    /// Anthropic), every LLM call posts to `<base>/v1/messages` instead of
+    /// api.anthropic.com. This is the hosted fleet's knob for routing tenant
+    /// daemons through our Bifrost gateway. It exists in production while
+    /// `SyncEngine::with_api_base` stays `#[cfg(test)]`-only because the threat
+    /// model differs: that hook would re-aim the tenant's GOOGLE BEARER (an
+    /// exfiltration primitive), whereas this one redirects a scoped, revocable,
+    /// budget-capped virtual key WE issue. It is operator-set, https-enforced
+    /// (plain http only for loopback, so tests/dev mocks work), and never
+    /// logged; a non-conforming value is announced once on stderr and treated
+    /// as absent. Env: `SQUELCH_ANTHROPIC_BASE_URL`.
+    pub anthropic_base_url: Option<String>,
     /// Model id, written verbatim into the request's `model` field and stored as
     /// `model_used` on applied rows.
     pub model: String,
@@ -501,6 +520,7 @@ impl Default for Stage2Config {
         Self {
             anthropic_api_key: None,
             stage2_provider: None,
+            anthropic_base_url: None,
             // Stage-2 is the ESCALATION pass on a MORE CAPABLE model.
             model: "claude-sonnet-5".to_string(),
             max_body_chars: 1500,
@@ -516,16 +536,40 @@ impl Default for Stage2Config {
     }
 }
 
+/// A fully resolved LLM destination: the key, the wire it speaks, and the exact
+/// endpoint URL every call posts to. Produced once at startup by
+/// [`Stage2Config::resolve_llm`] so no call site re-derives (and none can
+/// disagree on) where the key is sent. No `Debug` on purpose: `api_key` is key
+/// material and must never reach a log line.
+pub struct ResolvedLlm {
+    pub api_key: String,
+    pub provider: Stage2Provider,
+    pub url: String,
+}
+
 impl Stage2Config {
-    /// Resolve the Stage-2 API key and its provider, first match wins:
-    /// `SQUELCH_STAGE2_API_KEY` (provider sniffed from an `sk-ant-` prefix) >
-    /// `ANTHROPIC_API_KEY` > `OPENAI_API_KEY` > config `anthropic_api_key`.
-    /// `stage2_provider` force-overrides the inferred provider; empty strings
-    /// count as absent, and key material is never logged.
-    pub fn resolve_key_and_provider(&self) -> Option<(String, Stage2Provider)> {
+    /// Resolve the LLM key, provider, and endpoint in one shot. Key source,
+    /// first match wins: `SQUELCH_STAGE2_API_KEY` > `ANTHROPIC_API_KEY` >
+    /// `OPENAI_API_KEY` > config `anthropic_api_key`. Provider precedence:
+    /// explicit `stage2_provider` override > `sk-ant-` prefix sniff > (a valid
+    /// `anthropic_base_url` is set => Anthropic) > OpenAI — the base-URL arm
+    /// exists because a gateway virtual key (`sk-bf-...`) is not `sk-ant-`
+    /// shaped, yet an operator who pointed the daemon at an Anthropic-compatible
+    /// gateway has already declared the wire. The URL is the provider's
+    /// production endpoint unless the Anthropic wire carries a valid
+    /// `anthropic_base_url`, in which case it is `<base>/v1/messages`; the
+    /// override never applies to OpenAI. Empty strings count as absent, and key
+    /// material is never logged.
+    pub fn resolve_llm(&self) -> Option<ResolvedLlm> {
+        // Validate the override BEFORE provider inference: a rejected URL is
+        // absent everywhere, so it cannot flip a key onto the Anthropic wire
+        // and then fall back to posting it at api.anthropic.com.
+        let base_url = self.validated_base_url();
+
         let (key, inferred) = if let Some(key) = env_nonempty("SQUELCH_STAGE2_API_KEY") {
-            // Explicit var: sniff the provider from the prefix.
-            let provider = if key.starts_with("sk-ant-") {
+            // Explicit var: sniff the provider from the prefix; a set base URL
+            // breaks the tie for non-Anthropic-shaped keys (see above).
+            let provider = if key.starts_with("sk-ant-") || base_url.is_some() {
                 Stage2Provider::Anthropic
             } else {
                 Stage2Provider::OpenAI
@@ -543,17 +587,78 @@ impl Stage2Config {
 
         // Config force-override wins over the inferred provider.
         let provider = self.stage2_provider.unwrap_or(inferred);
-        Some((key, provider))
+        let url = match (provider, base_url) {
+            (Stage2Provider::Anthropic, Some(base)) => {
+                format!("{}/v1/messages", base.trim_end_matches('/'))
+            }
+            _ => crate::triage::llm::provider_url(provider).to_string(),
+        };
+        Some(ResolvedLlm {
+            api_key: key,
+            provider,
+            url,
+        })
+    }
+
+    /// The `anthropic_base_url` override, or `None` when it is unset, blank, or
+    /// fails the transport check: https anywhere, plain http only for loopback
+    /// (dev/test mocks). A rejected value is announced on stderr and then
+    /// treated as absent, so a typo'd override disables the gateway loudly
+    /// instead of sending our key in cleartext.
+    fn validated_base_url(&self) -> Option<&str> {
+        let base = self
+            .anthropic_base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())?;
+        if base_url_transport_ok(base) {
+            Some(base)
+        } else {
+            eprintln!(
+                "squelch: stage2.anthropic_base_url / SQUELCH_ANTHROPIC_BASE_URL must be https \
+                 (plain http is loopback-only) with no query or fragment — override ignored, \
+                 using the provider's production endpoint"
+            );
+            None
+        }
+    }
+
+    /// Key + provider only; compat shim over [`Stage2Config::resolve_llm`].
+    pub fn resolve_key_and_provider(&self) -> Option<(String, Stage2Provider)> {
+        self.resolve_llm().map(|r| (r.api_key, r.provider))
     }
 
     /// Just the API key, for callers that only need presence.
     pub fn resolve_api_key(&self) -> Option<String> {
-        self.resolve_key_and_provider().map(|(k, _)| k)
+        self.resolve_llm().map(|r| r.api_key)
     }
 
     /// Stage-2 is enabled iff an API key is resolvable.
     pub fn enabled(&self) -> bool {
-        self.resolve_key_and_provider().is_some()
+        self.resolve_llm().is_some()
+    }
+}
+
+/// `true` when `base` is safe to send an API key to: https anywhere, or http
+/// terminating on this machine (127.0.0.0/8, `::1`, `localhost`). Anything that
+/// does not parse as a URL fails too, as does a base carrying a query or
+/// fragment — `/v1/messages` is appended to this string, so a `?` or `#` in it
+/// would produce a mangled join; better to fail loudly than post at a typo.
+fn base_url_transport_ok(base: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base) else {
+        return false;
+    };
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return false;
+    }
+    match parsed.scheme() {
+        "https" => true,
+        "http" => match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -878,12 +983,16 @@ impl Config {
 
         // ---- Stage-2 overrides ---------------------------------------------
         // The API key itself is resolved lazily via env in
-        // `Stage2Config::resolve_key_and_provider`; no need to copy it here.
+        // `Stage2Config::resolve_llm`; no need to copy it here.
         if let Ok(v) = std::env::var("SQUELCH_STAGE2_PROVIDER")
             && let Some(p) = Stage2Provider::from_str_lenient(&v)
         {
             self.stage2.stage2_provider = Some(p);
         }
+        env_override_opt(
+            "SQUELCH_ANTHROPIC_BASE_URL",
+            &mut self.stage2.anthropic_base_url,
+        );
         env_override("SQUELCH_MODEL", &mut self.stage2.model);
         env_override(
             "SQUELCH_STAGE2_MAX_BODY_CHARS",
@@ -1587,7 +1696,8 @@ backfill_days = 90
         }
     }
 
-    /// Clear every Stage-2 key/provider env var. Caller must hold `ENV_LOCK`.
+    /// Clear every Stage-2 key/provider/endpoint env var. Caller must hold
+    /// `ENV_LOCK`.
     fn clear_stage2_env() {
         // SAFETY: caller holds ENV_LOCK.
         unsafe {
@@ -1595,6 +1705,7 @@ backfill_days = 90
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("SQUELCH_STAGE2_PROVIDER");
+            std::env::remove_var("SQUELCH_ANTHROPIC_BASE_URL");
         }
     }
 
@@ -1737,6 +1848,148 @@ backfill_days = 90
         let mut cfg = Config::default();
         cfg.apply_env_overrides();
         assert_eq!(cfg.stage2.stage2_provider, Some(Stage2Provider::OpenAI));
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn anthropic_base_url_env_override_folds_into_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_ANTHROPIC_BASE_URL", "https://gw.example.com");
+        }
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+        assert_eq!(
+            cfg.stage2.anthropic_base_url.as_deref(),
+            Some("https://gw.example.com")
+        );
+
+        // Blank is "unset", never "set to empty": the config-file layer stays.
+        unsafe {
+            std::env::set_var("SQUELCH_ANTHROPIC_BASE_URL", "");
+        }
+        let mut cfg = Config {
+            stage2: Stage2Config {
+                anthropic_base_url: Some("https://file.example.com".to_string()),
+                ..Stage2Config::default()
+            },
+            ..Config::default()
+        };
+        cfg.apply_env_overrides();
+        assert_eq!(
+            cfg.stage2.anthropic_base_url.as_deref(),
+            Some("https://file.example.com")
+        );
+        unsafe {
+            std::env::remove_var("SQUELCH_ANTHROPIC_BASE_URL");
+        }
+    }
+
+    #[test]
+    fn anthropic_base_url_rewrites_the_anthropic_endpoint() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        let with_base = |base: &str| Stage2Config {
+            anthropic_api_key: Some("sk-config".into()),
+            anthropic_base_url: Some(base.to_string()),
+            ..Stage2Config::default()
+        };
+
+        let r = with_base("https://gw.example.com").resolve_llm().unwrap();
+        assert_eq!(r.provider, Stage2Provider::Anthropic);
+        assert_eq!(r.url, "https://gw.example.com/v1/messages");
+
+        // A trailing slash never doubles.
+        assert_eq!(
+            with_base("https://gw.example.com/").resolve_llm().unwrap().url,
+            "https://gw.example.com/v1/messages"
+        );
+
+        // Absent (and blank, the house convention) => production endpoint.
+        let c = Stage2Config {
+            anthropic_api_key: Some("sk-config".into()),
+            ..Stage2Config::default()
+        };
+        assert_eq!(c.resolve_llm().unwrap().url, crate::triage::llm::API_URL);
+        assert_eq!(
+            with_base("").resolve_llm().unwrap().url,
+            crate::triage::llm::API_URL
+        );
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn anthropic_base_url_requires_https_off_loopback() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        let with_base = |base: &str| Stage2Config {
+            anthropic_api_key: Some("sk-config".into()),
+            anthropic_base_url: Some(base.to_string()),
+            ..Stage2Config::default()
+        };
+
+        // Cleartext off-box (or garbage): the override is treated as absent —
+        // triage stays on the production endpoint rather than sending the key
+        // over http. A query or fragment is rejected too: `/v1/messages` is
+        // appended to the base, so a typo'd `?` or `#` would mangle the join.
+        for bad in [
+            "http://gw.example.com",
+            "http://10.0.0.7:8080",
+            "not a url",
+            "https://gw.example.com?token=x",
+            "https://gw.example.com/#anchor",
+        ] {
+            let r = with_base(bad).resolve_llm().unwrap();
+            assert_eq!(r.url, crate::triage::llm::API_URL, "{bad} must be ignored");
+        }
+
+        // Loopback http is the dev/test carve-out.
+        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080"] {
+            let base = format!("http://{host}");
+            assert_eq!(
+                with_base(&base).resolve_llm().unwrap().url,
+                format!("{base}/v1/messages")
+            );
+        }
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn base_url_pins_a_gateway_shaped_key_to_the_anthropic_wire() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        // A Bifrost virtual key is sk-bf- shaped, so the prefix sniff alone
+        // would put it on the OpenAI wire — but an operator who set the base
+        // URL has already declared the wire is Anthropic.
+        unsafe {
+            std::env::set_var("SQUELCH_STAGE2_API_KEY", "sk-bf-virtual");
+        }
+        let c = Stage2Config {
+            anthropic_base_url: Some("https://gw.example.com".to_string()),
+            ..Stage2Config::default()
+        };
+        let r = c.resolve_llm().unwrap();
+        assert_eq!(r.provider, Stage2Provider::Anthropic);
+        assert_eq!(r.url, "https://gw.example.com/v1/messages");
+
+        // A REJECTED override must not flip the wire either: still OpenAI.
+        let c = Stage2Config {
+            anthropic_base_url: Some("http://gw.example.com".to_string()),
+            ..Stage2Config::default()
+        };
+        assert_eq!(c.resolve_llm().unwrap().provider, Stage2Provider::OpenAI);
+
+        // The explicit provider override outranks everything, and the OpenAI
+        // wire ignores the base URL entirely.
+        let c = Stage2Config {
+            stage2_provider: Some(Stage2Provider::OpenAI),
+            anthropic_base_url: Some("https://gw.example.com".to_string()),
+            ..Stage2Config::default()
+        };
+        let r = c.resolve_llm().unwrap();
+        assert_eq!(r.provider, Stage2Provider::OpenAI);
+        assert_eq!(r.url, crate::triage::llm::OPENAI_API_URL);
         clear_stage2_env();
     }
 

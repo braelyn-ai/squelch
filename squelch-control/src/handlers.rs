@@ -615,6 +615,42 @@ pub async fn oauth_callback(
     };
     drop(grant.token);
 
+    // THE LLM KEY, when this deployment fronts a Bifrost gateway: minted here,
+    // between call 1 and call 2, so the key is installed before the workload
+    // is applied and the pod is born with it instead of being rolled onto it.
+    //
+    // FAIL-SOFT, deliberately, and unlike everything around it: triage is not
+    // mail custody. A Bifrost outage must cost a tenant its LLM key — which
+    // `squelch-control llm mint` backfills — and never the signup itself, so
+    // every failure in this block is one loud line and a shrug. The key VALUE
+    // exists only inside this block; the id is recorded once the tenant row
+    // exists below, and until then it rides in `vk_id`.
+    let mut vk_id: Option<String> = None;
+    if let Some((bifrost, llm)) = state.bifrost() {
+        match bifrost.mint_virtual_key(&label, llm.budget_usd).await {
+            Ok(vk) => {
+                // The id is kept EVEN IF the install below fails, so the
+                // record can name the key a revoke or a re-mint must find.
+                vk_id = Some(vk.id);
+                if let Err(e) = state.warden().put_llm_key(&label, &vk.value).await {
+                    tracing::error!(
+                        error = %e,
+                        label = %label,
+                        vk_id = vk_id.as_deref().unwrap_or_default(),
+                        "LLM KEY NOT INSTALLED: minted but the warden did not take it; run `squelch-control llm mint` to replace it (which prints the old id to revoke)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    label = %label,
+                    "LLM KEY NOT MINTED: this tenant will run keyless until `squelch-control llm mint` backfills it"
+                );
+            }
+        }
+    }
+
     // CALL 2. The credential is installed and the workload applied. A failure
     // here leaves the pending tenant standing, which is the retriable state the
     // page below describes: no credential was written, no invite was spent, and
@@ -623,6 +659,7 @@ pub async fn oauth_callback(
         Ok(p) => p,
         Err(WardenError::AlreadyProvisioned) => {
             release();
+            log_orphaned_vk(&label, vk_id.as_deref());
             return done(pages::problem(
                 StatusCode::CONFLICT,
                 "That mailbox is already set up",
@@ -634,6 +671,7 @@ pub async fn oauth_callback(
             // The page tells this user to start again with the SAME code, so the
             // hold has to go back now rather than in ten minutes.
             release();
+            log_orphaned_vk(&label, vk_id.as_deref());
             return done(incomplete_problem());
         }
     };
@@ -652,6 +690,7 @@ pub async fn oauth_callback(
             label = %label,
             "PROVISIONED BUT NOT RECORDED: the tenant is running in the cluster and has no control-plane row"
         );
+        log_orphaned_vk(&label, vk_id.as_deref());
         let detail = match e {
             StoreError::LabelTaken | StoreError::AccountTaken => {
                 "That address or account was claimed while you were signing in. Get in touch and we will sort it out."
@@ -663,6 +702,17 @@ pub async fn oauth_callback(
             "Something went wrong at the last step",
             detail,
         ));
+    }
+
+    // The vk id joins the row it was minted for, now that the row exists.
+    // Fail-soft like the rest of the LLM block: a record that did not land
+    // costs `llm revoke` its pointer, not the user their mailbox.
+    if let Some(id) = &vk_id {
+        match state.store().set_tenant_vk(&label, id) {
+            Ok(true) => {}
+            Ok(false) => tracing::error!(label = %label, vk_id = %id, "VK NOT RECORDED: the tenant row vanished under it"),
+            Err(e) => tracing::error!(error = %e, label = %label, vk_id = %id, "VK NOT RECORDED: revoke or re-mint by this id by hand"),
+        }
     }
 
     // LAST: spend the invite, which this session has held since the form was
@@ -842,6 +892,20 @@ fn release_invite(state: &ControlState, invite_id: i64, holder: &str) {
         // revoked it mid-signup. Nothing to undo, but worth a line.
         Ok(false) => tracing::warn!("the invite hold was already gone"),
         Err(e) => tracing::error!(error = %e, "releasing the invite hold failed"),
+    }
+}
+
+/// Shout about a virtual key minted for a signup that then failed before its
+/// tenant row existed: nothing in the store points at it, so nothing will ever
+/// revoke it unless a human sees this line. The id only — the value is either
+/// installed in the cluster or already dropped.
+fn log_orphaned_vk(label: &str, vk_id: Option<&str>) {
+    if let Some(id) = vk_id {
+        tracing::error!(
+            label = %label,
+            vk_id = %id,
+            "VK ORPHANED: minted for a signup that did not finish; revoke it in Bifrost, or a retry plus `llm mint` replaces it"
+        );
     }
 }
 

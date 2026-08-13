@@ -253,6 +253,8 @@ impl Harness {
             auth_url: format!("{google}/authorize"),
             profile_url: format!("{google}/profile"),
             userinfo_url: format!("{google}/userinfo"),
+            // Console auth never touches the LLM gateway; feature off.
+            bifrost: None,
         };
 
         let store = ControlStore::open_in_memory().unwrap();
@@ -271,7 +273,7 @@ impl Harness {
             HttpWarden::new(warden_url, "warden-bearer".into(), Duration::from_secs(5)).unwrap(),
         );
         Self {
-            app: router(ControlState::new(config, store, warden)),
+            app: router(ControlState::new(config, store, warden).unwrap()),
             rec,
             invite_code: minted.code,
         }

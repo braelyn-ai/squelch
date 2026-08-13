@@ -572,11 +572,15 @@ pub struct BankingApplied {
 
 /// A day's Stage-2 API usage for one account. Cost is NOT stored — the human
 /// door computes it from config-driven per-MTok prices at read time.
+/// `input_tokens` is the UNCACHED prompt remainder; prompt-cache writes and
+/// reads are separate columns because they price differently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stage2Usage {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 /// One day's Stage-2 usage row carrying its `day` key, for the human-door usage
@@ -588,6 +592,8 @@ pub struct Stage2UsageDay {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 /// Runtime daily-cap overrides from `app_settings`. `None` means no override
@@ -1266,6 +1272,8 @@ pub trait Store: Send + Sync {
         day: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()>;
 
     /// Sum the Stage-1 usage ledger over every day `>= since_day`. Drives the
@@ -1282,6 +1290,8 @@ pub trait Store: Send + Sync {
         category: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()>;
 
     /// Stage-1 usage history: the most recent `days` rows, newest-first (sparse).
@@ -1347,6 +1357,8 @@ pub trait Store: Send + Sync {
         day: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()>;
 
     /// Read the Stage-2 usage totals for `(account_id, day)`. Returns a zeroed

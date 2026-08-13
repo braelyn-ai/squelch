@@ -898,8 +898,17 @@ impl Store for SqliteStore {
         day: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()> {
-        self.stage1_bump_usage(account_id, day, input_tokens, output_tokens)
+        self.stage1_bump_usage(
+            account_id,
+            day,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        )
     }
 
     fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
@@ -913,8 +922,18 @@ impl Store for SqliteStore {
         category: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()> {
-        self.extract_bump_usage(account_id, day, category, input_tokens, output_tokens)
+        self.extract_bump_usage(
+            account_id,
+            day,
+            category,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        )
     }
 
     fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
@@ -965,8 +984,17 @@ impl Store for SqliteStore {
         day: &str,
         input_tokens: u64,
         output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) -> Result<()> {
-        self.stage2_bump_usage(account_id, day, input_tokens, output_tokens)
+        self.stage2_bump_usage(
+            account_id,
+            day,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        )
     }
 
     fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage> {

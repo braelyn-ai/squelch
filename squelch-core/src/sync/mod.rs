@@ -18,7 +18,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use crate::config::{Config, Stage2Provider};
+use crate::config::{Config, ResolvedLlm, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::metrics::{GmailErrorKind, Stage1Verdict, Stage2Verdict, SyncMetrics};
@@ -316,6 +316,9 @@ enum CapKind {
 struct PassSetup<'a> {
     api_key: &'a str,
     provider: Stage2Provider,
+    /// The endpoint every classify call this pass makes posts to — resolved
+    /// once at startup, gateway override already folded in.
+    url: &'a str,
     caps: Stage2CapOverrides,
     /// UTC date key (`YYYY-MM-DD`) for the budget rows; one value per pass.
     day: String,
@@ -351,10 +354,10 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     account_email: String,
     config: Config,
     http: reqwest::Client,
-    /// Stage-2 API key + provider, resolved once at startup. `None` disables
-    /// Stage-2 gracefully: rows stay queued, one stderr notice, sync continues.
-    /// The key is never logged.
-    stage2_key: Option<(String, Stage2Provider)>,
+    /// LLM key + provider + endpoint URL, resolved once at startup. `None`
+    /// disables LLM triage gracefully: rows stay queued, one stderr notice,
+    /// sync continues. The key is never logged.
+    stage2_llm: Option<ResolvedLlm>,
     /// Embedder OVERRIDE; usually `None`, with [`SyncEngine::embedder`] falling
     /// back to the store's. Resolving per tick is what lets a LATE-attached
     /// embedder be picked up without a restart.
@@ -389,14 +392,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         config: Config,
     ) -> Self {
         // Timeouts keep a hung connection from wedging the poll loop.
+        // Redirects are REFUSED deliberately: this client carries credentials
+        // (Gmail bearer token, LLM x-api-key) and reqwest re-sends custom
+        // headers cross-host on a redirect. Gmail's API does not redirect, so
+        // this matches the repo's other Google-facing clients.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client build");
         // Absence => graceful disable, one notice, no key material logged.
-        let stage2_key = config.stage2.resolve_key_and_provider();
-        if stage2_key.is_none() {
+        let stage2_llm = config.stage2.resolve_llm();
+        if stage2_llm.is_none() {
             eprintln!(
                 "squelch: no Stage-2 API key set (SQUELCH_STAGE2_API_KEY / ANTHROPIC_API_KEY / \
                  OPENAI_API_KEY) — Stage-2 LLM triage disabled (ambiguous rows stay queued; \
@@ -410,7 +418,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             account_email,
             config,
             http,
-            stage2_key,
+            stage2_llm,
             embedder: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
@@ -1302,15 +1310,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// applies within a cycle, no restart. Precedence: override > config/env
     /// > default.
     fn pass_setup(&self) -> Option<PassSetup<'_>> {
-        let (api_key, provider) = self.stage2_key.as_ref()?;
+        let llm = self.stage2_llm.as_ref()?;
         let caps = self
             .store
             .stage2_cap_overrides(self.account_id)
             .unwrap_or_default();
         let now = Utc::now();
         Some(PassSetup {
-            api_key,
-            provider: *provider,
+            api_key: &llm.api_key,
+            provider: llm.provider,
+            url: &llm.url,
             caps,
             day: now.format("%Y-%m-%d").to_string(),
             stale_cutoff: now - ChronoDuration::days(self.config.stage2.max_age_days as i64),
@@ -1383,6 +1392,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let Some(PassSetup {
             api_key,
             provider,
+            url,
             caps,
             day,
             stale_cutoff,
@@ -1441,7 +1451,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 BudgetGate::Proceed => {}
             }
 
-            let outcome = stage1_llm::classify(&self.http, api_key, cfg, provider, row).await;
+            let outcome = stage1_llm::classify(&self.http, url, api_key, cfg, provider, row).await;
             match outcome {
                 Ok(stage1_llm::ClassifyOutcome::Ok(out, usage)) => {
                     if let Some(u) = usage {
@@ -1452,6 +1462,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             &day,
                             u.input_tokens,
                             u.output_tokens,
+                            u.cache_creation_input_tokens,
+                            u.cache_read_input_tokens,
                         ) {
                             eprintln!("squelch: stage-1 usage ledger bump failed ({e})");
                         }
@@ -1547,6 +1559,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let Some(PassSetup {
             api_key,
             provider,
+            url,
             caps,
             day,
             stale_cutoff,
@@ -1618,7 +1631,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // ROUTE BY CATEGORY: each specialist owns its own prompt, schema and
             // ledger line, so the row's category decides which one runs.
             if marketing::CATEGORIES.contains(&row.category.as_str()) {
-                match marketing::classify(&self.http, api_key, cfg, provider, row).await {
+                match marketing::classify(&self.http, url, api_key, cfg, provider, row).await {
                     Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
                         if let Some(u) = usage {
                             in_tok += u.input_tokens;
@@ -1629,6 +1642,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 marketing::LEDGER_CATEGORY,
                                 u.input_tokens,
                                 u.output_tokens,
+                                u.cache_creation_input_tokens,
+                                u.cache_read_input_tokens,
                             ) {
                                 eprintln!("squelch: extract usage ledger bump failed ({e})");
                             }
@@ -1665,7 +1680,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 continue;
             }
 
-            let outcome = banking::classify(&self.http, api_key, cfg, provider, row).await;
+            let outcome = banking::classify(&self.http, url, api_key, cfg, provider, row).await;
             match outcome {
                 Ok(banking::ExtractOutcome::Ok(out, usage)) => {
                     if let Some(u) = usage {
@@ -1677,6 +1692,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             banking::LEDGER_CATEGORY,
                             u.input_tokens,
                             u.output_tokens,
+                            u.cache_creation_input_tokens,
+                            u.cache_read_input_tokens,
                         ) {
                             eprintln!("squelch: extract usage ledger bump failed ({e})");
                         }
@@ -1736,6 +1753,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let Some(PassSetup {
             api_key,
             provider,
+            url,
             caps,
             day,
             stale_cutoff,
@@ -1880,7 +1898,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
 
             let ctx = RowContext::from_queued(row, cfg.max_body_chars);
-            let outcome = stage2::classify(&self.http, api_key, cfg, provider, &ctx).await;
+            let outcome = stage2::classify(&self.http, url, api_key, cfg, provider, &ctx).await;
 
             match outcome {
                 Ok(ClassifyOutcome::Ok(out, usage)) => {
@@ -1894,6 +1912,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             &day,
                             u.input_tokens,
                             u.output_tokens,
+                            u.cache_creation_input_tokens,
+                            u.cache_read_input_tokens,
                         ) {
                             eprintln!("squelch: stage-2 usage ledger bump failed ({e})");
                         }

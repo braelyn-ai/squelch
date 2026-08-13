@@ -1,8 +1,9 @@
-//! The control-plane wire: five routes and a health check.
+//! The control-plane wire: six routes and a health check.
 //!
 //! ```text
 //! POST   /v1/tenants                     -> 201 { recipient }
 //! PUT    /v1/tenants/{label}/credentials -> 200 { pair_code, pair_url, deep_link }
+//! PUT    /v1/tenants/{label}/llm-key     -> 200 {}
 //! GET    /v1/tenants/{label}             -> 200 { status } | 404
 //! POST   /v1/tenants/{label}/pair        -> 200 { pair_code, pair_url, deep_link }
 //! DELETE /v1/tenants/{label}             -> 204
@@ -63,8 +64,18 @@ fn error_response(e: &WardenError) -> Response {
             "invalid_cred_read_ciphertext",
             Some(inner.to_string()),
         ),
+        WardenError::InvalidApiKey(inner) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_api_key",
+            Some(inner.to_string()),
+        ),
         WardenError::Conflict => (StatusCode::CONFLICT, "label_exists", None),
         WardenError::NotFound => (StatusCode::NOT_FOUND, "not_found", None),
+        // 503, not 422: the request was fine, this deployment is what lacks
+        // the LLM gateway. The control plane should not be calling here at all.
+        WardenError::LlmNotConfigured => {
+            (StatusCode::SERVICE_UNAVAILABLE, "llm_not_configured", None)
+        }
         WardenError::Cluster { reason } => (StatusCode::INTERNAL_SERVER_ERROR, *reason, None),
     };
     match detail {
@@ -116,6 +127,13 @@ struct SetCredentials {
     /// control plane to the recipient this warden minted. Stored verbatim and
     /// never read here.
     cred_read_ciphertext: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetLlmKey {
+    /// The tenant's LLM gateway virtual key, minted by the control plane.
+    /// Stored verbatim in the tenant's Secret and never read back here.
+    api_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +202,25 @@ pub async fn set_credentials(
     }
 }
 
+/// `PUT /v1/tenants/{label}/llm-key` - store or rotate the tenant's LLM
+/// gateway virtual key. A running tenant is rolled onto it; a pending one
+/// picks it up when the workload is applied.
+pub async fn set_llm_key(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+    body: Bytes,
+) -> Response {
+    let req: SetLlmKey = match parse_json(&body) {
+        Ok(req) => req,
+        Err(detail) => return malformed(detail),
+    };
+    match state.warden().set_llm_key(&label, &req.api_key).await {
+        // Nothing to hand back: the key came in, and it never goes out.
+        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// `GET /v1/tenants/{label}` - what the cluster says about this tenant.
 pub async fn get_tenant(State(state): State<WardenState>, Path(label): Path<String>) -> Response {
     match state.warden().status(&label).await {
@@ -229,7 +266,7 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use crate::testing::{Harness, TEST_TOKEN, armored};
+    use crate::testing::{Harness, TEST_TOKEN, armored, llm_test_config};
 
     /// Send a request through the real router, with the real bearer.
     async fn call(h: &Harness, req: Request<Body>) -> (StatusCode, Value) {
@@ -386,6 +423,57 @@ mod tests {
         assert_eq!(h.cluster.applied_names(), vec!["carol-identity"]);
     }
 
+    /// The llm-key route, end to end on the wire: a 200 with an empty object,
+    /// and never the key back out.
+    #[tokio::test]
+    async fn the_llm_key_route_stores_and_says_nothing() {
+        let h = Harness::with_config(llm_test_config());
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+
+        let body = serde_json::json!({ "api_key": "sk-vk-abc123" }).to_string();
+        let (status, body) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({}));
+        assert!(!body.to_string().contains("sk-vk"));
+
+        // A key that would break the env value it becomes is a 422 that names
+        // the constraint and never echoes the key.
+        let bad = serde_json::json!({ "api_key": "sk\nvk" }).to_string();
+        let (status, body) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &bad)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "invalid_api_key");
+        assert!(!body.to_string().contains("sk\nvk"));
+
+        // An empty one is the same class of refusal.
+        let empty = serde_json::json!({ "api_key": "" }).to_string();
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &empty)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // A missing field is a caller bug, not a validation refusal.
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", "{}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // And a label nobody minted has nothing to key.
+        let body = serde_json::json!({ "api_key": "sk-vk-abc123" }).to_string();
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/nobody/llm-key", &body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A warden with no LLM gateway configured refuses the llm-key route: a
+    /// 503 naming the reason, no key stored, and never the key echoed back.
+    #[tokio::test]
+    async fn the_llm_key_route_refuses_when_the_gateway_is_not_configured() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+
+        let body = serde_json::json!({ "api_key": "sk-vk-abc123" }).to_string();
+        let (status, body) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &body)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "llm_not_configured");
+        assert!(!body.to_string().contains("sk-vk"));
+        assert!(h.cluster.secret("alice-llm").is_none());
+    }
+
     #[tokio::test]
     async fn unknown_tenants_404_except_on_delete() {
         let h = Harness::new();
@@ -461,6 +549,7 @@ mod tests {
         let routes = [
             ("POST", "/v1/tenants"),
             ("PUT", "/v1/tenants/alice/credentials"),
+            ("PUT", "/v1/tenants/alice/llm-key"),
             ("GET", "/v1/tenants/alice"),
             ("DELETE", "/v1/tenants/alice"),
             ("POST", "/v1/tenants/alice/pair"),

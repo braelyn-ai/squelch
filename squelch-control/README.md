@@ -92,6 +92,10 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | `SQUELCH_CONTROL_WARDEN_URL` | **yes** | The warden's base URL, e.g. `https://warden.passband.app` (product domain, same reasoning as the public URL). |
 | `SQUELCH_CONTROL_WARDEN_TOKEN` | **yes** | Bearer presented to the warden. Must match `SQUELCH_WARDEN_TOKEN` in the cluster. |
 | `SQUELCH_CONTROL_DB_PATH` | no | Control store. Default `/data/control.sqlite3`. |
+| `SQUELCH_CONTROL_BIFROST_URL` | pair | The Bifrost LLM gateway's governance origin, `https://` only. With the token below it is all-or-nothing: both set mints a per-tenant virtual key at signup, neither set provisions keyless tenants, anything partial (including a budget or model list on their own) refuses to boot. |
+| `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` | pair | The gateway admin's `username:password`, sent as HTTP Basic on every governance call (a session bearer expires after 30 days and does not belong here). Exactly one `:` between two nonempty halves, at least 32 characters total. It can mint unbounded LLM spend; treat it like the warden bearer. |
+| `SQUELCH_CONTROL_LLM_BUDGET_USD` | no | Monthly USD budget stamped on each minted key. Default `5.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_LLM_MODELS` | no | Comma-separated model allow-list stamped on each minted key. Default `claude-haiku-4-5,claude-sonnet-5`. Never empty (the gateway treats an empty list as deny-all). Only meaningful with the gateway pair set; set alone it refuses to boot. |
 | `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS` | no | How many proxies write `X-Forwarded-For` in front of this listener. `0` (default) meters the TCP peer, which behind a platform edge means one shared rate-limit bucket. Set `1` on Railway. |
 | `SQUELCH_CONTROL_LOG` | no | `tracing` filter. Default `info`. |
 
@@ -115,6 +119,8 @@ squelch-control invite issue --ttl 7      # ...good for a week instead of 30 day
 squelch-control invite list               # ids and status. Never codes or hashes
 squelch-control invite revoke <id>        # revoke an unused code
 squelch-control tenants                   # what has been provisioned
+squelch-control llm mint <label>          # mint + install a Bifrost virtual key (also rotates)
+squelch-control llm revoke <label>        # revoke the recorded key and forget it
 ```
 
 Invite codes are Crockford `XXXX-XXXX-XXXX-XXXX` (80 bits), stored only as a
@@ -135,6 +141,13 @@ a retry does not have to wait it out.
 The invite commands talk to the store directly and need none of the serving
 configuration, so codes can be minted on a box with no OAuth client in its
 environment.
+
+The `llm` commands need the Bifrost trio, the warden pair, and the store — but
+still no OAuth client or cookie key. `llm mint` backfills a tenant that signed
+up while Bifrost was down (signup is fail-soft about the key: an outage costs
+the tenant its key, never the signup), and rotates one that has a key already;
+rotation prints the old key's id, which stays live in Bifrost until revoked
+there. Key **values** are never printed, stored, or logged — only ids are.
 
 ## Deploying to Railway
 

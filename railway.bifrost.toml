@@ -1,0 +1,25 @@
+# Railway deployment config for the Bifrost LLM gateway (Dockerfile.bifrost).
+#
+# Same landmine as railway.control.toml: the root railway.toml pins
+# dockerfilePath to the relay's Dockerfile, and config-as-code OUTRANKS the
+# RAILWAY_DOCKERFILE_PATH service variable. This file must be selected in the
+# bifrost service's settings under "Config-as-code file path" or the service
+# ships the relay image.
+#
+# No healthcheckPath: Bifrost's GET /health sits behind its session auth once
+# auth is enabled, and Railway's probe cannot send credentials — a probe that
+# breaks the moment the admin plane is locked down is worse than none.
+#
+# Deploy quirk: `railway up` from the repo root fails with "service config at
+# 'railway.bifrost.toml' not found" even though the file is in the upload
+# (observed 2026-08-13, CLI 4.x). Deploy from a two-file staging dir instead:
+#   mkdir /tmp/bifrost-ctx && cp Dockerfile.bifrost railway.bifrost.toml /tmp/bifrost-ctx
+#   (cd /tmp/bifrost-ctx && railway up -s bifrost --detach)
+# The Dockerfile is FROM-only, so the tiny context is the whole build input.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.bifrost"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5

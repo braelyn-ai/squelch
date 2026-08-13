@@ -42,7 +42,7 @@ use axum::{
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
-use squelch_control::config::Config;
+use squelch_control::config::{BifrostConfig, Config, DEFAULT_LLM_BUDGET_USD};
 use squelch_control::warden::HttpWarden;
 use squelch_control::{ControlState, ControlStore, invites, router, seal};
 use tower::ServiceExt as _;
@@ -84,6 +84,13 @@ struct Recorder {
     /// Recorded BEFORE the mock decides whether to fail, so a failed install is
     /// still visible to the assertions.
     credential_puts: Vec<(String, Value)>,
+    /// `(label, api_key)` seen on `PUT /v1/tenants/{label}/llm-key`.
+    llm_key_puts: Vec<(String, String)>,
+    /// Bodies posted to the mock Bifrost's mint route.
+    bifrost_mint_bodies: Vec<Value>,
+    /// Authorization headers the mock Bifrost saw, on every route. The live
+    /// gateway takes HTTP Basic with the admin `username:password`.
+    bifrost_auths: Vec<String>,
     /// Bearer values the warden saw, on every route.
     warden_bearers: Vec<String>,
     /// Labels asked about via `GET /v1/tenants/{label}`.
@@ -94,6 +101,9 @@ struct Recorder {
     tenants: BTreeMap<String, MockTenant>,
     /// When true, call 2 fails the way an apply that never went Ready does.
     fail_credentials: bool,
+    /// When true, the llm-key install answers 503 `llm_not_configured`, the
+    /// way a warden whose LLM wiring is absent refuses a key it cannot place.
+    fail_llm_key: bool,
     /// When set, call 2 answers with this status instead of doing anything. For
     /// the statuses that are a WIRE disagreement rather than an outcome.
     credentials_status: Option<u16>,
@@ -272,6 +282,26 @@ async fn spawn_warden(rec: Shared) -> String {
             ),
         )
         .route(
+            "/v1/tenants/{label}/llm-key",
+            put(
+                |AxumState(rec): AxumState<Shared>,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    // Recorded BEFORE the mock decides whether to fail, so a
+                    // refused install is still visible to the assertions.
+                    r.llm_key_puts.push((label, str_field(&parsed, "api_key")));
+                    r.warden_bearers.push(bearer_of(&headers));
+                    if r.fail_llm_key {
+                        return json_status(StatusCode::SERVICE_UNAVAILABLE, "llm_not_configured");
+                    }
+                    Json(json!({})).into_response()
+                },
+            ),
+        )
+        .route(
             "/v1/tenants/{label}",
             get(
                 |AxumState(rec): AxumState<Shared>,
@@ -288,6 +318,71 @@ async fn spawn_warden(rec: Shared) -> String {
                         Some(_) => Json(json!({"status":"pending"})).into_response(),
                         None => json_status(StatusCode::NOT_FOUND, "unknown"),
                     }
+                },
+            ),
+        )
+        .with_state(rec);
+    spawn(app).await
+}
+
+/// The value the mock Bifrost mints. The control plane must forward it to the
+/// warden and keep no other copy.
+const VK_VALUE: &str = "sk-bf-THE-VIRTUAL-KEY-VALUE";
+const VK_ID: &str = "vk-mock-1";
+
+/// The Bifrost admin credential the harness configures: `username:password`,
+/// sent by the client as HTTP Basic on every governance call.
+const BIFROST_ADMIN: &str = "bifrost-admin:the-basic-password";
+
+/// The provider key id the mock gateway lists, mirroring the one the live
+/// gateway auto-detects.
+const PROVIDER_KEY_ID: &str = "ANTHROPIC_API_KEY_auto_detected";
+
+fn bifrost_basic_auth() -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(BIFROST_ADMIN)
+    )
+}
+
+/// A mock Bifrost: the two routes a mint speaks (the provider-key listing and
+/// the governance create), answering the LIVE gateway's shapes — the mint echo
+/// carries the attached `budgets` and `provider_configs`, which the client
+/// refuses to trust a key without.
+async fn spawn_bifrost(rec: Shared) -> String {
+    let app = Router::new()
+        .route(
+            "/api/providers/anthropic/keys",
+            get(
+                |AxumState(rec): AxumState<Shared>, headers: HeaderMap| async move {
+                    let mut r = rec.lock().unwrap();
+                    r.bifrost_auths.push(bearer_of(&headers));
+                    Json(json!({ "keys": [{ "id": PROVIDER_KEY_ID, "models": [] }] }))
+                        .into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/governance/virtual-keys",
+            post(
+                |AxumState(rec): AxumState<Shared>, headers: HeaderMap, body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    r.bifrost_mint_bodies.push(parsed);
+                    r.bifrost_auths.push(bearer_of(&headers));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "message": "Virtual key created successfully",
+                            "virtual_key": {
+                                "id": VK_ID,
+                                "value": VK_VALUE,
+                                "budgets": [{ "max_limit": DEFAULT_LLM_BUDGET_USD, "reset_duration": "1M" }],
+                                "provider_configs": [{ "provider": "anthropic", "weight": 1 }],
+                            },
+                        })),
+                    )
+                        .into_response()
                 },
             ),
         )
@@ -317,11 +412,30 @@ struct Harness {
     invite_code: String,
 }
 
+/// How a harness is wired to Bifrost: not at all (the trio unset), a live
+/// mock, or a configured gateway that is DOWN (the fail-soft case).
+enum Bifrost {
+    Off,
+    Mock,
+    Down,
+}
+
 impl Harness {
     async fn new() -> Self {
+        Self::with_bifrost(Bifrost::Off).await
+    }
+
+    async fn with_bifrost(bifrost: Bifrost) -> Self {
         let rec: Shared = Arc::new(Mutex::new(Recorder::default()));
         let google = spawn_google(rec.clone()).await;
         let warden_url = spawn_warden(rec.clone()).await;
+        let bifrost_url = match bifrost {
+            Bifrost::Off => None,
+            Bifrost::Mock => Some(spawn_bifrost(rec.clone()).await),
+            // Port 1: nothing listens, so every mint fails the way an outage
+            // fails.
+            Bifrost::Down => Some("http://127.0.0.1:1".to_string()),
+        };
 
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -342,6 +456,14 @@ impl Harness {
             // profile endpoint, which is what its own grant permits. The console
             // login is the one that reads userinfo (`tests/console_auth.rs`).
             userinfo_url: format!("{google}/userinfo"),
+            // The struct is constructed directly, so an http mock URL is fine
+            // here; `from_env` is where https is enforced.
+            bifrost: bifrost_url.map(|url| BifrostConfig {
+                url,
+                admin_token: BIFROST_ADMIN.into(),
+                budget_usd: DEFAULT_LLM_BUDGET_USD,
+                models: vec!["claude-haiku-4-5".into(), "claude-sonnet-5".into()],
+            }),
         };
 
         let store = ControlStore::open_in_memory().unwrap();
@@ -353,7 +475,9 @@ impl Harness {
         let warden = Arc::new(
             HttpWarden::new(warden_url, "warden-bearer".into(), Duration::from_secs(5)).unwrap(),
         );
-        let state = ControlState::new(config, store, warden);
+        // The Bifrost client is DERIVED inside `ControlState::new` from
+        // `config.bifrost`; there is no second wiring point to disagree with.
+        let state = ControlState::new(config, store, warden).unwrap();
         Self {
             app: router(state.clone()),
             state,
@@ -1138,6 +1262,106 @@ async fn a_wider_grant_than_we_asked_for_is_accepted() {
     let (status, body) = h.run_signup("ada", &invite).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("ABCD-EFGH"), "{body}");
+}
+
+/// With the Bifrost trio configured, signup mints one virtual key per tenant,
+/// hands the VALUE to the warden, and keeps only the ID. The value never
+/// reaches the page or the store.
+#[tokio::test]
+async fn signup_mints_and_installs_a_tenant_llm_key() {
+    let h = Harness::with_bifrost(Bifrost::Mock).await;
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains(VK_VALUE), "the key value must never reach a page");
+
+    let rec = h.rec.lock().unwrap();
+    // TWO governance requests — the provider-key listing, then the one mint —
+    // both carrying HTTP Basic with the admin `username:password`.
+    assert_eq!(
+        rec.bifrost_auths,
+        vec![bifrost_basic_auth(), bifrost_basic_auth()]
+    );
+    let mint = &rec.bifrost_mint_bodies[0];
+    assert_eq!(mint["name"], "tenant-ada");
+    // `budgets` is an ARRAY on the live gateway; a singular `budget` object
+    // is silently ignored and mints an unbudgeted key.
+    assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
+    assert_eq!(mint["budgets"][0]["max_limit"], DEFAULT_LLM_BUDGET_USD);
+    assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
+    assert_eq!(mint["is_active"], true);
+    // The provider config pins the listed key ids and a non-empty model
+    // allow-list; without both the key cannot serve inference.
+    let pc = &mint["provider_configs"][0];
+    assert_eq!(pc["provider"], "anthropic");
+    assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
+    assert_eq!(
+        pc["allowed_models"],
+        json!(["claude-haiku-4-5", "claude-sonnet-5"])
+    );
+    // The VALUE went to the warden, once, for this tenant.
+    assert_eq!(
+        rec.llm_key_puts,
+        vec![("ada".to_string(), VK_VALUE.to_string())]
+    );
+    drop(rec);
+    // The store kept the ID, and only the ID.
+    assert_eq!(
+        h.state.store().tenant_vk("ada").unwrap(),
+        Some(VK_ID.to_string())
+    );
+}
+
+/// THE ORPHAN PROMISE: Bifrost minted the key but the warden would not take
+/// it. The signup still completes — fail-soft, exactly like an outage — AND
+/// the vk id is still recorded on the tenant row, because a key that is live
+/// in Bifrost with no record is one no operator can ever find to revoke.
+#[tokio::test]
+async fn a_failed_key_install_still_records_the_vk_id() {
+    let h = Harness::with_bifrost(Bifrost::Mock).await;
+    h.rec.lock().unwrap().fail_llm_key = true;
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("ABCD-EFGH"), "{body}");
+    assert!(!body.contains(VK_VALUE), "the key value must never reach a page");
+
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.bifrost_mint_bodies.len(), 1, "the mint happened");
+        assert_eq!(rec.llm_key_puts.len(), 1, "the install was attempted");
+        assert_eq!(rec.credential_puts.len(), 1, "the mailbox still provisioned");
+    }
+    // The id is on the row for the manual `llm revoke` or `llm mint` the log
+    // line points the operator at.
+    assert_eq!(
+        h.state.store().tenant_vk("ada").unwrap(),
+        Some(VK_ID.to_string())
+    );
+    // ...and the signup was a real one: the invite is spent.
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+}
+
+/// THE FAIL-SOFT PROMISE: a Bifrost outage costs the tenant its LLM key, never
+/// the signup. Triage is not mail custody, and `llm mint` backfills.
+#[tokio::test]
+async fn a_bifrost_outage_does_not_refuse_a_signup() {
+    let h = Harness::with_bifrost(Bifrost::Down).await;
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("ABCD-EFGH"), "{body}");
+
+    let rec = h.rec.lock().unwrap();
+    assert!(rec.llm_key_puts.is_empty(), "no key existed to install");
+    assert_eq!(rec.credential_puts.len(), 1, "the mailbox still provisioned");
+    drop(rec);
+    // Nothing was minted, so nothing is recorded: `tenant_vk` stays empty
+    // rather than naming a key that does not exist.
+    assert_eq!(h.state.store().tenant_vk("ada").unwrap(), None);
+    // ...and the signup was a real one: the invite is spent.
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
 }
 
 /// The form and the health check are the only things reachable without a

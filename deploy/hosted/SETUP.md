@@ -335,6 +335,80 @@ The Secret's name is `SQUELCH_WARDEN_OAUTH_SECRET_NAME` on the warden (default
 `google-oauth-client`); its two keys are fixed at `client_id` and
 `client_secret`. Details and rotation: `google-oauth-client.example.yaml`.
 
+## 6b. LLM triage through the gateway
+
+Tenant daemons never hold our Anthropic key. Each pod gets a **Bifrost virtual
+key** with a monthly dollar budget, and sends its unchanged Anthropic-wire
+traffic to a Bifrost gateway we run on Railway; Bifrost holds the real key,
+swaps it in, meters spend per tenant, and refuses a tenant that has blown its
+budget. The daemon's own daily call caps are the second, inner layer. Notably
+there is **no cluster-side operator secret for any of this**: the per-tenant
+`<label>-llm` Secrets are written by the warden when the control plane mints
+keys, and the real key lives only in the Railway service's environment.
+
+The gateway, on Railway:
+
+1. New service `bifrost` from this repo, built by `Dockerfile.bifrost`. Set
+   `railway.bifrost.toml` as the service's **Config-as-code file path** before
+   the first deploy — the root `railway.toml` pins the relay's Dockerfile and
+   config-as-code outranks the `RAILWAY_DOCKERFILE_PATH` variable, so skipping
+   this ships the relay image (again).
+2. Volume mounted at `/app/data`. This is the governance state — every virtual
+   key, budget, and recorded cent of spend. Losing it revokes the whole fleet's
+   keys at once, so treat it like a database, not a cache.
+3. Environment: `APP_HOST=0.0.0.0`, `APP_PORT=8080`, and `ANTHROPIC_API_KEY` —
+   the only place the real key lives, anywhere.
+4. Generate the service's public domain (port 8080). Tenant egress already
+   allows any public 443 host, so the cluster needs nothing.
+5. First boot: enable auth with an admin credential (`PUT /api/config` with
+   `auth_config` — or the web UI) and turn on `enforce_auth_on_inference`
+   (Settings → Client Settings, or `client_config` in the same call) so a
+   request without a valid virtual key is refused rather than passed through.
+   Then confirm the governance API refuses unauthenticated requests. The
+   control plane authenticates with HTTP Basic — the admin `username:password`
+   IS its `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` (session bearer tokens expire
+   monthly; do not paste one there). The exact first-boot flow is Bifrost's,
+   not ours, and drifts with their releases; what must be true at the end is
+   fixed: **the `/api/*` plane and the UI demand credentials, and
+   `/anthropic` demands a virtual key.**
+6. Bifrost auto-detects `ANTHROPIC_API_KEY` into a provider key on first
+   boot, but two of its defaults do not survive contact with our models
+   (v1.6.9): the key's `models: ["*"]` wildcard does not match models missing
+   from Bifrost's own catalog, and routing resolves keys only through a
+   virtual key's `provider_configs.key_ids`. The control plane handles the
+   latter when it mints (it discovers key ids from
+   `/api/providers/anthropic/keys`); the former is one `PUT` on the provider
+   key setting `models` to the explicit list (`claude-haiku-4-5`,
+   `claude-sonnet-5`). Verify with a curl through a test virtual key before
+   pointing any tenant at it — the failure mode is a 400 `no keys found for
+   provider`, not a misrouted call.
+
+Then point both planes at it:
+
+- Warden (`20-warden.yaml`): `SQUELCH_WARDEN_LLM_BASE_URL` =
+  `https://<the-bifrost-domain>/anthropic`. This is the feature gate — with it
+  unset the warden injects no LLM env at all and refuses llm-key installs, and
+  it refuses to boot if any of the tuning knobs
+  (`SQUELCH_WARDEN_LLM_STAGE1_MODEL`, `SQUELCH_WARDEN_LLM_STAGE2_MODEL`,
+  `SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP`, `SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP`)
+  are set without it.
+- Control plane (Railway `control` service): the all-or-nothing trio
+  `SQUELCH_CONTROL_BIFROST_URL` (the bare gateway origin, no `/anthropic`),
+  `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN`, and `SQUELCH_CONTROL_LLM_BUDGET_USD`
+  (monthly, per tenant). A partial trio refuses to boot: a control plane that
+  silently stopped minting keys is an operator believing something false.
+
+From then on every signup mints and installs its own key. The failure mode is
+deliberately soft: if Bifrost is down mid-signup, the tenant still provisions
+and triages on rules alone, the control plane logs the miss loudly, and
+
+```sh
+squelch-control llm mint <label>
+```
+
+backfills the key later — the same command rotates a key (it prints the old
+Bifrost key id; revoke it there) and keys tenants that predate the gateway.
+
 ## 7. Tenant limits
 
 ```sh

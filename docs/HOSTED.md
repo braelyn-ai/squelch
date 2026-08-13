@@ -275,6 +275,16 @@ the per-daemon thing this design imagined — `deploy/hosted/SETUP.md` §11.)
   true on purpose.
 - LLM triage in hosted runs on our key; the existing per-user budget caps and cost
   ledger become the pricing mechanism. BYOK stays as an option.
+  SHIPPED, as a gateway rather than a mounted key: tenant pods send their
+  unchanged Anthropic-wire traffic to a Bifrost instance we run
+  (`SQUELCH_ANTHROPIC_BASE_URL`), presenting a per-tenant **virtual key** the
+  control plane mints at signup with a monthly dollar budget. The real key
+  lives only in the gateway's environment; pods never see it, and revoking one
+  tenant costs nothing. Pricing is two layers that must agree: Bifrost's meter
+  (authoritative, dollar-denominated, budget-enforcing) and the daemon's own
+  `stage2_usage` ledger (now cache-token-aware) — a persistent gap between them
+  is the fraud signal. The gateway also owns model choice, so a fleet-wide model
+  swap is a gateway config change, not a rollout. BYOK remains future work.
 
 ## Scaling path ("properly")
 

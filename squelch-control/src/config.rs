@@ -4,10 +4,11 @@
 //! will ever see, and one that guesses its base domain hands out tenant URLs
 //! that resolve to somebody else.
 //!
-//! THREE FIELDS HERE ARE SECRETS — the OAuth client secret, the cookie key, and
-//! the warden bearer — so [`Config`] has a HAND-WRITTEN `Debug` that redacts
-//! them. A derived one would put all three in any `tracing::debug!` that ever
-//! formats the config, and that is exactly the line nobody notices adding.
+//! FOUR FIELDS HERE ARE SECRETS — the OAuth client secret, the cookie key, the
+//! warden bearer, and the Bifrost admin token — so [`Config`] (and
+//! [`BifrostConfig`] inside it) has a HAND-WRITTEN `Debug` that redacts them. A
+//! derived one would put all four in any `tracing::debug!` that ever formats
+//! the config, and that is exactly the line nobody notices adding.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -63,6 +64,30 @@ pub const MIN_COOKIE_KEY_BYTES: usize = 32;
 /// to hold it.
 pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum Bifrost admin-credential length (the whole `username:password`),
+/// the same bar the warden holds its own bearer to: below this the credential
+/// stops being the thing that decides who can mint unbounded LLM spend.
+pub const MIN_BIFROST_TOKEN_LEN: usize = 32;
+
+/// The monthly spend a tenant's virtual key is minted with when
+/// `SQUELCH_CONTROL_LLM_BUDGET_USD` says nothing.
+pub const DEFAULT_LLM_BUDGET_USD: f64 = 5.00;
+
+/// Ceiling on the configured budget. Same reasoning as the proxy-hop cap: no
+/// tenant's triage costs four figures a month, a larger number is a typo, and
+/// this typo degrades into real money.
+pub const MAX_LLM_BUDGET_USD: f64 = 1_000.0;
+
+/// The models allowed on every minted virtual key when
+/// `SQUELCH_CONTROL_LLM_MODELS` says nothing. NEVER empty: on the live
+/// gateway an empty `allowed_models` is deny-all, and wildcards are
+/// unreliable, so "no list" must mean "the product's list", not "nothing".
+pub const DEFAULT_LLM_MODELS: &str = "claude-haiku-4-5,claude-sonnet-5";
+
+/// Ceiling on one configured model name. Real ids are ~30 characters; a
+/// larger one is a paste accident.
+pub const MAX_LLM_MODEL_LEN: usize = 128;
+
 /// Why the control plane refused to start.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -114,6 +139,39 @@ pub struct Config {
     /// OIDC's userinfo endpoint, pinned by `from_env` the same way. The console
     /// login reads it; the signup flow never touches it.
     pub userinfo_url: String,
+    /// The Bifrost LLM gateway, when this deployment has one. `None` means the
+    /// feature is OFF and signup provisions tenants with no LLM key at all;
+    /// a partial configuration is a refusal to boot, never a silent off.
+    pub bifrost: Option<BifrostConfig>,
+}
+
+/// The Bifrost governance settings: where the gateway is, the admin
+/// credential that mints virtual keys, the monthly budget each tenant's key
+/// is minted with, and the models it is allowed to call. `admin_token` is a
+/// secret; the hand-written `Debug` redacts it.
+#[derive(Clone)]
+pub struct BifrostConfig {
+    /// Base URL of the gateway's governance API, canonical https origin.
+    pub url: String,
+    /// The gateway admin's `username:password`, presented as HTTP Basic on
+    /// every governance call (session bearers expire after 30 days; Basic
+    /// works statically on `/api/*`). Redacted from `Debug`.
+    pub admin_token: String,
+    /// Monthly budget, USD, stamped on every minted virtual key.
+    pub budget_usd: f64,
+    /// `allowed_models` for every minted virtual key. Never empty.
+    pub models: Vec<String>,
+}
+
+impl std::fmt::Debug for BifrostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BifrostConfig")
+            .field("url", &self.url)
+            .field("admin_token", &"<redacted>")
+            .field("budget_usd", &self.budget_usd)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -137,6 +195,8 @@ impl std::fmt::Debug for Config {
             .field("auth_url", &self.auth_url)
             .field("profile_url", &self.profile_url)
             .field("userinfo_url", &self.userinfo_url)
+            // BifrostConfig's own Debug redacts the admin token.
+            .field("bifrost", &self.bifrost)
             .finish()
     }
 }
@@ -203,16 +263,13 @@ impl Config {
         // provisioning call instead of sitting in this deployment's environment.
         // One static recipient would have meant one key opening every mailbox.
 
-        let warden_url = canonical_origin(
-            "SQUELCH_CONTROL_WARDEN_URL",
-            &require(
-                "SQUELCH_CONTROL_WARDEN_URL",
-                "the warden's base URL, e.g. https://warden.passband.email",
-            )?,
-        )?;
-        let warden_token = require(
-            "SQUELCH_CONTROL_WARDEN_TOKEN",
-            "the bearer the warden expects; must match SQUELCH_WARDEN_TOKEN in the cluster",
+        let (warden_url, warden_token) = warden_from_env()?;
+
+        let bifrost = bifrost_from(
+            var("SQUELCH_CONTROL_BIFROST_URL"),
+            var("SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN"),
+            var("SQUELCH_CONTROL_LLM_BUDGET_USD"),
+            var("SQUELCH_CONTROL_LLM_MODELS"),
         )?;
 
         let trusted_proxy_hops = match var("SQUELCH_CONTROL_TRUSTED_PROXY_HOPS") {
@@ -248,6 +305,7 @@ impl Config {
             auth_url: GOOGLE_AUTH_URL.to_string(),
             profile_url: GMAIL_PROFILE_URL.to_string(),
             userinfo_url: GOOGLE_USERINFO_URL.to_string(),
+            bifrost,
         })
     }
 
@@ -263,6 +321,149 @@ impl Config {
     pub fn is_insecure(&self) -> bool {
         self.public_url.starts_with("http://")
     }
+}
+
+/// The warden pair from the environment, validated. Shared by `serve` (via
+/// [`Config::from_env`]) and the `llm` operator commands, which need a warden
+/// client but must not need an OAuth client or a cookie key to rotate a key.
+pub fn warden_from_env() -> Result<(String, String), ConfigError> {
+    let url = canonical_origin(
+        "SQUELCH_CONTROL_WARDEN_URL",
+        &require(
+            "SQUELCH_CONTROL_WARDEN_URL",
+            "the warden's base URL, e.g. https://warden.passband.email",
+        )?,
+    )?;
+    let token = require(
+        "SQUELCH_CONTROL_WARDEN_TOKEN",
+        "the bearer the warden expects; must match SQUELCH_WARDEN_TOKEN in the cluster",
+    )?;
+    Ok((url, token))
+}
+
+impl BifrostConfig {
+    /// The Bifrost settings from the environment: `Ok(None)` when the feature
+    /// is off, an error when it is half-configured. For the `llm` operator
+    /// commands, which need this and the warden pair and nothing else.
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        bifrost_from(
+            var("SQUELCH_CONTROL_BIFROST_URL"),
+            var("SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN"),
+            var("SQUELCH_CONTROL_LLM_BUDGET_USD"),
+            var("SQUELCH_CONTROL_LLM_MODELS"),
+        )
+    }
+}
+
+/// Validate the Bifrost settings, all-or-nothing.
+///
+/// None of the four set means the feature is OFF, which is a legal deployment
+/// (self-host, or hosted before the gateway exists). Some-but-not-all is a
+/// REFUSAL TO BOOT: a control plane that quietly ran without the gateway would
+/// provision every tenant keyless and nobody would notice until the first
+/// triage call failed, weeks of signups later. The budget and the model list
+/// are the two fields with defaults, because "the feature is on" is decided
+/// by the url and the credential, and either of the others without both of
+/// those is still a half-configured feature.
+fn bifrost_from(
+    url: Option<String>,
+    admin_token: Option<String>,
+    budget: Option<String>,
+    models: Option<String>,
+) -> Result<Option<BifrostConfig>, ConfigError> {
+    if url.is_none() && admin_token.is_none() && budget.is_none() && models.is_none() {
+        return Ok(None);
+    }
+    let (Some(url), Some(admin_token)) = (url, admin_token) else {
+        return Err(ConfigError::invalid(
+            "SQUELCH_CONTROL_BIFROST_URL and SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN must be set \
+             together (SQUELCH_CONTROL_LLM_BUDGET_USD and SQUELCH_CONTROL_LLM_MODELS are \
+             optional); set both or neither",
+        ));
+    };
+    let url = canonical_origin("SQUELCH_CONTROL_BIFROST_URL", &url)?;
+    // https only, no local-dev exception: what rides this connection is an
+    // admin credential that mints spend and, coming back, a live per-tenant
+    // key.
+    if !url.starts_with("https://") {
+        return Err(ConfigError::invalid(format!(
+            "invalid SQUELCH_CONTROL_BIFROST_URL `{url}`: the governance API must be https"
+        )));
+    }
+    if admin_token.len() < MIN_BIFROST_TOKEN_LEN {
+        return Err(ConfigError::invalid(format!(
+            "SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN is {} characters; at least {MIN_BIFROST_TOKEN_LEN} are required",
+            admin_token.len()
+        )));
+    }
+    // The credential is the gateway admin's `username:password`, sent as HTTP
+    // Basic (session bearers expire after 30 days; Basic works statically on
+    // `/api/*`). Exactly one `:` splitting two nonempty halves, checked here
+    // so a pasted session bearer fails at boot instead of as a 401 on the
+    // first signup weeks later.
+    let colons = admin_token.matches(':').count();
+    if colons != 1 || admin_token.starts_with(':') || admin_token.ends_with(':') {
+        return Err(ConfigError::invalid(
+            "SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN must be the gateway admin's `username:password` \
+             (exactly one `:` between two nonempty halves), sent as HTTP Basic; a session bearer \
+             expires and does not belong here",
+        ));
+    }
+    let budget_usd = match budget {
+        None => DEFAULT_LLM_BUDGET_USD,
+        Some(v) => {
+            let usd: f64 = v.parse().map_err(|e| {
+                ConfigError::invalid(format!("invalid SQUELCH_CONTROL_LLM_BUDGET_USD `{v}`: {e}"))
+            })?;
+            if !usd.is_finite() || usd <= 0.0 || usd > MAX_LLM_BUDGET_USD {
+                return Err(ConfigError::invalid(format!(
+                    "SQUELCH_CONTROL_LLM_BUDGET_USD `{v}` must be a positive amount no larger than {MAX_LLM_BUDGET_USD}"
+                )));
+            }
+            usd
+        }
+    };
+    let models = parse_models(&models.unwrap_or_else(|| DEFAULT_LLM_MODELS.to_string()))?;
+    Ok(Some(BifrostConfig {
+        url,
+        admin_token,
+        budget_usd,
+        models,
+    }))
+}
+
+/// Parse the comma-separated model allow-list. Empty segments (a trailing
+/// comma) are tolerated; what remains must be at least one name, each held to
+/// the same allowlist bar as every other value that lands in an outbound
+/// request: model ids are made of letters, digits, `-`, `_`, `.` and nothing
+/// that could restructure JSON or a log line. An EMPTY list is refused rather
+/// than passed through, because on the live gateway empty `allowed_models` is
+/// deny-all.
+fn parse_models(raw: &str) -> Result<Vec<String>, ConfigError> {
+    let ok = |m: &str| {
+        m.len() <= MAX_LLM_MODEL_LEN
+            && m.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    let models: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .collect();
+    if models.is_empty() {
+        return Err(ConfigError::invalid(format!(
+            "invalid SQUELCH_CONTROL_LLM_MODELS `{raw}`: at least one model is required (an empty \
+             allow-list would deny every call)"
+        )));
+    }
+    if let Some(bad) = models.iter().find(|m| !ok(m)) {
+        return Err(ConfigError::invalid(format!(
+            "invalid SQUELCH_CONTROL_LLM_MODELS entry `{bad}`: expected a model id made of \
+             letters, digits, `-`, `_`, `.`"
+        )));
+    }
+    Ok(models)
 }
 
 /// Parse, validate, and canonicalize an origin (`https://host[:port]`).
@@ -394,6 +595,12 @@ mod tests {
             auth_url: GOOGLE_AUTH_URL.into(),
             profile_url: GMAIL_PROFILE_URL.into(),
             userinfo_url: GOOGLE_USERINFO_URL.into(),
+            bifrost: Some(BifrostConfig {
+                url: "https://bifrost.passband.email".into(),
+                admin_token: "admin:BIFROST-ADMIN-VALUE".into(),
+                budget_usd: DEFAULT_LLM_BUDGET_USD,
+                models: vec!["claude-haiku-4-5".into()],
+            }),
         }
     }
 
@@ -484,14 +691,102 @@ mod tests {
         assert!(decode_cookie_key(&short).is_err());
     }
 
-    /// The three secrets must not be formattable out of the struct.
+    /// The four secrets must not be formattable out of the struct.
     #[test]
     fn debug_redacts_every_secret() {
         let rendered = format!("{:?}", sample());
         assert!(!rendered.contains("TOP-SECRET-VALUE"), "{rendered}");
         assert!(!rendered.contains("WARDEN-BEARER-VALUE"), "{rendered}");
+        assert!(!rendered.contains("BIFROST-ADMIN-VALUE"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("<32 bytes>"));
+    }
+
+    /// The Bifrost settings are a unit: url + credential is the feature on,
+    /// none set is off, and anything in between is a refusal to boot rather
+    /// than a silent off. The budget and the model list are the two fields
+    /// with defaults.
+    #[test]
+    fn the_bifrost_settings_are_all_or_nothing() {
+        let some = |s: &str| Some(s.to_string());
+        let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
+
+        assert!(bifrost_from(None, None, None, None).unwrap().is_none(), "off");
+
+        let on = bifrost_from(some("https://bifrost.example"), some(&token), None, None)
+            .unwrap()
+            .expect("url + credential switches the feature on");
+        assert_eq!(on.url, "https://bifrost.example");
+        assert_eq!(on.budget_usd, DEFAULT_LLM_BUDGET_USD);
+        // The default model list is the product's, and never empty.
+        assert_eq!(on.models, vec!["claude-haiku-4-5", "claude-sonnet-5"]);
+
+        let on = bifrost_from(
+            some("https://bifrost.example"),
+            some(&token),
+            some("12.5"),
+            some("claude-opus-4-1, claude-haiku-4-5,"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(on.budget_usd, 12.5);
+        assert_eq!(on.models, vec!["claude-opus-4-1", "claude-haiku-4-5"]);
+
+        // Every partial combination refuses.
+        assert!(bifrost_from(some("https://bifrost.example"), None, None, None).is_err());
+        assert!(bifrost_from(None, some(&token), None, None).is_err());
+        assert!(bifrost_from(None, None, some("5"), None).is_err());
+        assert!(bifrost_from(None, None, None, some("claude-haiku-4-5")).is_err());
+        assert!(bifrost_from(some("https://bifrost.example"), None, some("5"), None).is_err());
+        assert!(bifrost_from(None, some(&token), some("5"), None).is_err());
+        assert!(
+            bifrost_from(None, some(&token), None, some("claude-haiku-4-5")).is_err(),
+            "models without the url is still a half-configured feature"
+        );
+    }
+
+    /// The values themselves are held to the same bar the rest of the config
+    /// is: https only, a real `username:password`, a budget that is money and
+    /// not a typo, a model list that could not restructure a request.
+    #[test]
+    fn the_bifrost_settings_are_validated() {
+        let some = |s: &str| Some(s.to_string());
+        let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
+
+        assert!(bifrost_from(some("http://bifrost.example"), some(&token), None, None).is_err());
+        assert!(bifrost_from(some("not a url"), some(&token), None, None).is_err());
+        let short = format!("a:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN - 3));
+        assert!(bifrost_from(some("https://bifrost.example"), some(&short), None, None).is_err());
+        // The credential is Basic material: `username:password`, exactly one
+        // colon, both halves nonempty. A pasted session bearer (no colon)
+        // must fail at boot, not as a 401 weeks later.
+        for bad in [
+            "b".repeat(MIN_BIFROST_TOKEN_LEN),                    // no colon: a bearer
+            format!(":{}", "b".repeat(MIN_BIFROST_TOKEN_LEN)),    // empty username
+            format!("{}:", "b".repeat(MIN_BIFROST_TOKEN_LEN)),    // empty password
+            format!("a:b:{}", "c".repeat(MIN_BIFROST_TOKEN_LEN)), // two colons
+        ] {
+            assert!(
+                bifrost_from(some("https://bifrost.example"), some(&bad), None, None).is_err(),
+                "{bad:?}"
+            );
+        }
+        for bad in ["nonsense", "0", "-5", "NaN", "inf", "1000000"] {
+            assert!(
+                bifrost_from(some("https://bifrost.example"), some(&token), some(bad), None)
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        // A model list that is empty once parsed, or carries a name that
+        // could restructure a request, refuses to boot.
+        for bad in ["", " , ,", "claude haiku", "claude/../x", "mod\"el"] {
+            assert!(
+                bifrost_from(some("https://bifrost.example"), some(&token), None, some(bad))
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

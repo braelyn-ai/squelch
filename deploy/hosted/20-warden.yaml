@@ -46,7 +46,7 @@ spec:
       containers:
         - name: warden
           # 1. EDIT ME
-          image: ghcr.io/braelyn-ai/squelch-warden:v0.2.4
+          image: ghcr.io/braelyn-ai/squelch-warden:v0.2.5
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -59,7 +59,7 @@ spec:
             # image would silently upgrade every tenant's daemon on any pod
             # restart. The warden refuses to start without one.
             - name: SQUELCH_WARDEN_IMAGE
-              value: ghcr.io/braelyn-ai/squelchd:v0.2.4
+              value: ghcr.io/braelyn-ai/squelchd:v0.2.5
             - name: SQUELCH_WARDEN_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -95,6 +95,17 @@ spec:
             # This is the shared-key bridge (issue #33); the relay replaces it.
             - name: SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME
               value: anthropic-api-key
+            # The LLM gateway (the relay that replaces the bridge above). With
+            # this set, every tenant pod sends its Anthropic-wire traffic to
+            # Bifrost's /anthropic route with a per-tenant virtual key the
+            # control plane mints at signup (Secret <label>-llm, installed via
+            # PUT /v1/tenants/{label}/llm-key). Unset = no LLM env injected and
+            # llm-key installs refused. Once every tenant is minted, delete the
+            # shared anthropic-api-key Secret: an UNMINTED tenant under the
+            # gateway presents the raw key to a gateway that only takes virtual
+            # keys, and its triage degrades until `squelch-control llm mint`.
+            - name: SQUELCH_WARDEN_LLM_BASE_URL
+              value: https://bifrost.passband.app/anthropic
             # 5. EDIT ME. The control plane's origin, handed to every tenant
             # daemon as SQUELCH_CONSOLE_SSO_URL. It is what puts "Continue with
             # Google" on a tenant's own /console login page: Google forbids

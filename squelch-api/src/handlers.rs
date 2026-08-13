@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squelch_core::CoreError;
+use squelch_core::config::{CACHE_READ_INPUT_MULT, CACHE_WRITE_INPUT_MULT};
 use squelch_core::store::{
     ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SitrepBand, SqliteStore, Store,
 };
@@ -865,6 +866,8 @@ fn bill_rule_inference(store: &SqliteStore, account_id: AccountId, usage: Option
         RULE_INFER_LEDGER_CATEGORY,
         u.input_tokens,
         u.output_tokens,
+        u.cache_creation_input_tokens,
+        u.cache_read_input_tokens,
     ) {
         eprintln!("squelch: rule inference usage ledger bump failed ({e})");
     }
@@ -1426,11 +1429,18 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     })
     .await?;
 
-    // tokens/1e6 * per-MTok price, over input+output. Switching the model means
-    // updating stage2_price_*_per_mtok or this drifts.
+    // tokens/1e6 * per-MTok price, over input+output plus the prompt-cache
+    // split (write 1.25x / read 0.1x of the input price). Switching the model
+    // means updating stage2_price_*_per_mtok or this drifts.
     let est_cost_usd_today = (usage.input_tokens as f64 / 1_000_000.0)
         * state.stage2_price_in_per_mtok
-        + (usage.output_tokens as f64 / 1_000_000.0) * state.stage2_price_out_per_mtok;
+        + (usage.output_tokens as f64 / 1_000_000.0) * state.stage2_price_out_per_mtok
+        + (usage.cache_creation_tokens as f64 / 1_000_000.0)
+            * state.stage2_price_in_per_mtok
+            * CACHE_WRITE_INPUT_MULT
+        + (usage.cache_read_tokens as f64 / 1_000_000.0)
+            * state.stage2_price_in_per_mtok
+            * CACHE_READ_INPUT_MULT;
 
     let mut body = serde_json::to_value(&stats)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
@@ -1438,6 +1448,8 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
         "calls_today": usage.calls,
         "input_tokens_today": usage.input_tokens,
         "output_tokens_today": usage.output_tokens,
+        "cache_creation_tokens_today": usage.cache_creation_tokens,
+        "cache_read_tokens_today": usage.cache_read_tokens,
         "est_cost_usd_today": est_cost_usd_today,
     });
     // Gmail's own unread counts, as of the sync loop's last successful fetch.
@@ -1470,22 +1482,27 @@ pub struct UsageQuery {
     days: Option<u32>,
 }
 
-/// One day's row in the usage history response.
+/// One day's row in the usage history response. `input_tokens` is the uncached
+/// prompt remainder; the cache columns ride along so clients can show the split.
 #[derive(Debug, Serialize)]
 struct UsageRow {
     day: String,
     calls: u64,
     input_tokens: u64,
     output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
 }
 
 /// Totals across the returned window, costed from the same per-MTok prices
-/// `get_stats` uses.
+/// `get_stats` uses (cache writes at 1.25x / reads at 0.1x of the input price).
 #[derive(Debug, Serialize)]
 struct UsageTotals {
     calls: u64,
     input_tokens: u64,
     output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
     est_cost_usd: f64,
 }
 
@@ -1520,28 +1537,37 @@ pub async fn get_usage(
                   price_out: f64|
      -> (Vec<UsageRow>, UsageTotals) {
         let (mut in_tok, mut out_tok, mut calls) = (0u64, 0u64, 0u64);
+        let (mut cache_w, mut cache_r) = (0u64, 0u64);
         let out_rows: Vec<UsageRow> = rows
             .into_iter()
             .map(|r| {
                 calls += r.calls;
                 in_tok += r.input_tokens;
                 out_tok += r.output_tokens;
+                cache_w += r.cache_creation_tokens;
+                cache_r += r.cache_read_tokens;
                 UsageRow {
                     day: r.day,
                     calls: r.calls,
                     input_tokens: r.input_tokens,
                     output_tokens: r.output_tokens,
+                    cache_creation_tokens: r.cache_creation_tokens,
+                    cache_read_tokens: r.cache_read_tokens,
                 }
             })
             .collect();
-        let est_cost_usd =
-            (in_tok as f64 / 1_000_000.0) * price_in + (out_tok as f64 / 1_000_000.0) * price_out;
+        let est_cost_usd = (in_tok as f64 / 1_000_000.0) * price_in
+            + (out_tok as f64 / 1_000_000.0) * price_out
+            + (cache_w as f64 / 1_000_000.0) * price_in * CACHE_WRITE_INPUT_MULT
+            + (cache_r as f64 / 1_000_000.0) * price_in * CACHE_READ_INPUT_MULT;
         (
             out_rows,
             UsageTotals {
                 calls,
                 input_tokens: in_tok,
                 output_tokens: out_tok,
+                cache_creation_tokens: cache_w,
+                cache_read_tokens: cache_r,
                 est_cost_usd,
             },
         )
