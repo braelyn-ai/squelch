@@ -697,6 +697,31 @@ pub async fn get_shipments(
     .await
 }
 
+// --- POST /client/shipments/poll --------------------------------------------
+
+/// Poke the carrier poller to run a pass NOW, the shipments-tracker sibling of
+/// [`refresh_now`]. Fire-and-forget: it does not wait for the carrier round
+/// trips, and the kick does NOT bypass per-carrier cooldowns, budgets or
+/// `min_interval` — a user mashing refresh cannot spend a daily cap or earn a
+/// 429.
+///
+/// `kicked: false` with an empty `carriers` is a 200 and a NORMAL answer, not an
+/// error: carrier polling is BYOK, so a daemon with no carrier credentials runs
+/// no poller at all. The client reads the same two fields either way and can
+/// hide the button when the list is empty.
+///
+/// A READ-path trigger, like `refresh` — no write scope, no mutation, nothing to
+/// audit.
+pub async fn poll_shipments_now(State(state): State<ApiState>) -> impl IntoResponse {
+    match &state.shipment_poll {
+        Some(poll) => {
+            poll.kick.notify_one();
+            Json(json!({ "kicked": true, "carriers": &poll.carriers[..] }))
+        }
+        None => Json(json!({ "kicked": false, "carriers": [] })),
+    }
+}
+
 // --- GET /client/receipts ---------------------------------------------------
 
 /// Default look-back window for the receipts list.

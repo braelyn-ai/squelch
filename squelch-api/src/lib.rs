@@ -82,6 +82,9 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         .route("/client/attachments/{id}", get(handlers::get_attachment))
         .route("/client/shipments", get(handlers::get_shipments))
+        // Force a carrier pass. HUMAN DOOR ONLY: the agent door reads the
+        // shipments table and never gets to spend the operator's carrier quota.
+        .route("/client/shipments/poll", post(handlers::poll_shipments_now))
         .route("/client/receipts", get(handlers::get_receipts))
         .route("/client/banking", get(handlers::get_banking))
         .route("/client/calendar", get(handlers::get_calendar))

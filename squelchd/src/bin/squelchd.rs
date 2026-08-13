@@ -1640,9 +1640,12 @@ fn cmd_serve(
             None
         }
     };
-    // wave5: thread into ApiState so a human-door endpoint can force a pass.
-    // Taken here because `run` consumes the poller below.
-    let _shipment_kick = shipment_poller.as_ref().map(|p| p.kick_handle());
+    // The kick handle + the carriers behind it, for `POST /client/shipments/poll`.
+    // Taken here because `run` consumes the poller below; `None` when no poller
+    // was built, which the endpoint reports as `kicked: false`.
+    let shipment_kick = shipment_poller
+        .as_ref()
+        .map(|p| (p.kick_handle(), p.enabled_carriers()));
 
     // The human door SERVES WITH OR WITHOUT SQUELCH_API_TOKEN. Without it the
     // door accepts only the per-device tokens in the store, and a daemon with
@@ -1655,6 +1658,13 @@ fn cmd_serve(
         .map_err(|e| other_err(format!("{e}")))?
         .with_refresh(refresh.clone())
         .with_event_notifier(event_tx);
+    // Carrier polling is BYOK, so the no-poller path is the common one and is
+    // spelled out rather than left implicit: the door still serves
+    // `/client/shipments/poll`, it just answers `kicked: false`.
+    let api_state = match shipment_kick {
+        Some((kick, carriers)) => api_state.with_shipment_poll_kick(kick, carriers),
+        None => api_state,
+    };
 
     let runtime = build_runtime()?;
     runtime.block_on(async move {

@@ -98,6 +98,13 @@ pub struct ShipmentHit {
     pub tracking_number: String,
     pub tracking_url: Option<String>,
     pub last_update: DateTime<Utc>,
+    /// Carrier-estimated delivery; `None` when the carrier gives none (and
+    /// always `None` on a daemon that polls no carrier).
+    pub eta: Option<DateTime<Utc>>,
+    /// The carrier's own latest status string, verbatim; `None` until the first
+    /// poll. Carried because our five-rung ladder loses detail the agent can
+    /// usefully relay ("Delivered to neighbor", "Held at customs").
+    pub carrier_status_raw: Option<String>,
 }
 
 /// Parameters for `set_sender_rule`.
@@ -286,9 +293,12 @@ impl SquelchServer {
         name = "get_shipments",
         description = "Tracked packages/shipments. Returns en-route packages by \
                        default (item_name, carrier, status, tracking_number, \
-                       tracking_url, last_update); pass include_delivered=true to \
-                       also include delivered ones. Extracted from shipping mail; \
-                       auth/verification emails are never represented."
+                       tracking_url, last_update, eta, carrier_status_raw); pass \
+                       include_delivered=true to also include delivered ones. \
+                       eta and carrier_status_raw come from the carrier's own API \
+                       and are null until the package has been polled. Extracted \
+                       from shipping mail; auth/verification emails are never \
+                       represented."
     )]
     async fn get_shipments(
         &self,
@@ -309,6 +319,8 @@ impl SquelchServer {
                 tracking_number: s.tracking_number,
                 tracking_url: s.tracking_url,
                 last_update: s.last_update,
+                eta: s.eta,
+                carrier_status_raw: s.carrier_status_raw,
             })
             .collect();
         Self::ok_json(out)
@@ -748,11 +760,12 @@ mod tests {
     }
 
     /// get_shipments returns en-route packages by default and includes delivered
-    /// ones only when asked. Shipments are structurally sealed-free (never built
-    /// from sealed mail), so there is no sealed row to exclude here.
+    /// ones only when asked, and carries the carrier's ETA + verbatim status for
+    /// a polled row. Shipments are structurally sealed-free (never built from
+    /// sealed mail), so there is no sealed row to exclude here.
     #[tokio::test]
     async fn get_shipments_en_route_by_default_and_delivered_with_flag() {
-        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
+        use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@localhost").unwrap();
         let mid = seed_msg(
@@ -764,7 +777,8 @@ mod tests {
             Sensitivity::Normal,
             None,
         );
-        store
+        let eta = Utc::now() + chrono::Duration::hours(6);
+        let ups = store
             .upsert_shipment(
                 acct,
                 mid,
@@ -774,6 +788,19 @@ mod tests {
                     item_name: "Headphones".into(),
                     status: ShipmentStatus::Shipped,
                     tracking_url: Some("https://www.ups.com/track?tracknum=1Z".into()),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .apply_carrier_track(
+                acct,
+                ups,
+                &CarrierTrack {
+                    status: None,
+                    carrier_status_raw: "Held at customs".into(),
+                    eta: Some(eta),
+                    delivered_at: None,
                 },
                 Utc::now(),
             )
@@ -808,8 +835,22 @@ mod tests {
         assert_eq!(hits.len(), 1, "delivered excluded by default");
         assert_eq!(hits[0]["status"], "shipped");
         assert_eq!(hits[0]["tracking_number"], "1Z999AA10123456784");
-        // SUMMARY-ONLY shape: no body key.
+        // The carrier's own words survive a status it does not map onto our
+        // ladder ("Held at customs" left the row `shipped`), and the ETA rides
+        // out as a timestamp the agent can parse back.
+        assert_eq!(hits[0]["carrier_status_raw"], "Held at customs");
+        assert_eq!(
+            hits[0]["eta"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .unwrap(),
+            eta
+        );
+        // SUMMARY-ONLY shape: no body key. The agent door stays minimal — no
+        // thread_id, no ids, nothing to pivot into a message with.
         assert!(hits[0].get("body").is_none());
+        assert!(hits[0].get("thread_id").is_none());
 
         // With the flag: both.
         let res = server

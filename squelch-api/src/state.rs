@@ -135,6 +135,22 @@ pub struct ApiState {
     /// inference resolves to `filtered`, which is the safe default. HUMAN DOOR
     /// ONLY, like every other rule write.
     pub(crate) rule_infer: Option<Arc<RuleInferClient>>,
+    /// The carrier poller's kick handle plus the carriers it was built over,
+    /// behind `POST /client/shipments/poll`. `None` when no poller runs — which
+    /// is the resting state of every daemon with no carrier credentials — and
+    /// the endpoint reports that as `kicked: false` rather than an error.
+    pub(crate) shipment_poll: Option<ShipmentPoll>,
+}
+
+/// What the human door needs to force a carrier pass: the poller's
+/// [`Notify`](tokio::sync::Notify) and the carrier slugs it was built over, so
+/// the response can say WHICH carriers a kick will reach. Cheap to clone, like
+/// every other field on [`ApiState`].
+#[derive(Clone)]
+pub(crate) struct ShipmentPoll {
+    pub(crate) kick: Arc<tokio::sync::Notify>,
+    /// Enabled carrier slugs, sorted and deduplicated at build time.
+    pub(crate) carriers: Arc<[String]>,
 }
 
 /// A fixed-rate token bucket per client address, for the console's
@@ -309,6 +325,7 @@ impl ApiState {
                 crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE,
             ))),
             rule_infer: None,
+            shipment_poll: None,
         }
     }
 
@@ -326,6 +343,36 @@ impl ApiState {
     /// [`SyncEngine::with_refresh`]: squelch_core::sync::SyncEngine::with_refresh
     pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
         self.refresh = Some(refresh);
+        self
+    }
+
+    /// Share the carrier poller's kick [`Notify`](tokio::sync::Notify) and the
+    /// carriers it was built over, enabling `POST /client/shipments/poll`. Wire
+    /// the SAME handle the poller handed out
+    /// ([`ShipmentPoller::kick_handle`]), with
+    /// [`ShipmentPoller::enabled_carriers`] as `carriers`.
+    ///
+    /// NOT CALLING THIS IS A SUPPORTED STATE, not a misconfiguration: carrier
+    /// polling is BYOK, so a daemon with no carrier credentials runs no poller
+    /// and the endpoint answers `kicked: false` with an empty carrier list.
+    ///
+    /// The list is sorted and deduplicated here rather than trusted, so the
+    /// response shape does not depend on how the caller assembled it.
+    ///
+    /// [`ShipmentPoller::kick_handle`]: squelch_core::carriers::poller::ShipmentPoller::kick_handle
+    /// [`ShipmentPoller::enabled_carriers`]: squelch_core::carriers::poller::ShipmentPoller::enabled_carriers
+    pub fn with_shipment_poll_kick(
+        mut self,
+        kick: Arc<tokio::sync::Notify>,
+        carriers: Vec<String>,
+    ) -> Self {
+        let mut carriers = carriers;
+        carriers.sort();
+        carriers.dedup();
+        self.shipment_poll = Some(ShipmentPoll {
+            kick,
+            carriers: carriers.into(),
+        });
         self
     }
 

@@ -196,6 +196,165 @@ async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
     );
 }
 
+/// WIRE CONTRACT: the four carrier-poll fields ride out on `/client/shipments`
+/// verbatim, so the client can show an ETA and the carrier's own words. A row
+/// that has never been polled still carries all four KEYS, as nulls — a client
+/// decoding them must never have to distinguish "absent" from "not yet polled".
+#[tokio::test]
+async fn shipments_carry_the_carrier_poll_fields() {
+    use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
+    let t0 = chrono::Utc::now();
+    let eta = t0 + chrono::Duration::hours(6);
+    let polled = t0 + chrono::Duration::minutes(3);
+
+    let Harness { app, .. } = harness(|store, acct| {
+        let mid = store
+            .upsert_message(&msg(acct, "g1", "t1", "shipped", "b"))
+            .unwrap();
+        let polled_id = store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "ups".into(),
+                    tracking_number: "1Z999AA10123456784".into(),
+                    item_name: "Headphones".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                t0,
+            )
+            .unwrap();
+        // A second row that no poll has ever touched, for the null case.
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "usps".into(),
+                    tracking_number: "9400111899223817428490".into(),
+                    item_name: "Book".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                t0,
+            )
+            .unwrap();
+        store
+            .apply_carrier_track(
+                acct,
+                polled_id,
+                &CarrierTrack {
+                    status: Some(ShipmentStatus::OutForDelivery),
+                    carrier_status_raw: "Out For Delivery".into(),
+                    eta: Some(eta),
+                    delivered_at: None,
+                },
+                polled,
+            )
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+
+    let polled_row = items
+        .iter()
+        .find(|i| i["tracking_number"] == "1Z999AA10123456784")
+        .expect("the polled shipment");
+    assert_eq!(polled_row["status"], "out_for_delivery");
+    assert_eq!(polled_row["carrier_status_raw"], "Out For Delivery");
+    // Timestamps go out as strings the client parses back to the same instant.
+    let parse = |v: &Value| {
+        v.as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    };
+    assert_eq!(parse(&polled_row["eta"]), eta);
+    assert_eq!(parse(&polled_row["last_polled_at"]), polled);
+    assert!(
+        polled_row["delivered_at"].is_null(),
+        "out for delivery is not delivered"
+    );
+
+    let unpolled = items
+        .iter()
+        .find(|i| i["tracking_number"] == "9400111899223817428490")
+        .expect("the never-polled shipment");
+    for field in [
+        "carrier_status_raw",
+        "eta",
+        "delivered_at",
+        "last_polled_at",
+    ] {
+        assert!(
+            unpolled.get(field).is_some_and(Value::is_null),
+            "{field} must be present and null before the first poll"
+        );
+    }
+}
+
+/// A configured kick reaches the poller's `Notify` and reports the carriers it
+/// will hit. `notify_one` parks a permit when nobody is waiting yet, so awaiting
+/// AFTER the request still completes — the timeout is what makes a missed poke
+/// a failure rather than a hang.
+#[tokio::test]
+async fn shipment_poll_kicks_the_poller_and_lists_its_carriers() {
+    let kick = Arc::new(tokio::sync::Notify::new());
+    let (state, _store, _acct) = common::state_with(|_, _| {});
+    // Deliberately unsorted + duplicated: the response must not depend on how
+    // the caller assembled the list.
+    let app = router(
+        state.with_shipment_poll_kick(kick.clone(), vec!["ups".into(), "dhl".into(), "ups".into()]),
+    );
+
+    let resp = app
+        .oneshot(authed("POST", "/client/shipments/poll"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["kicked"], true);
+    assert_eq!(json["carriers"], serde_json::json!(["dhl", "ups"]));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), kick.notified())
+        .await
+        .expect("the poller's kick must have been notified");
+}
+
+/// Carrier polling is BYOK, so no poller is the RESTING STATE, not an error: the
+/// route serves 200 with `kicked: false` and an empty list, which is how the
+/// client knows to hide the button. Still behind the bearer, like everything in
+/// the `/client` tree.
+#[tokio::test]
+async fn shipment_poll_without_a_poller_is_a_200_that_kicked_nothing() {
+    let Harness { app, .. } = harness(|_, _| {});
+
+    let unauthed = Request::builder()
+        .method("POST")
+        .uri("/client/shipments/poll")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauthed).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .oneshot(authed("POST", "/client/shipments/poll"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["kicked"], false);
+    assert_eq!(json["carriers"], serde_json::json!([]));
+}
+
 #[tokio::test]
 async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::ReceiptInfo;
