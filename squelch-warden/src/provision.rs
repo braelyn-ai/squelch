@@ -720,14 +720,11 @@ impl Warden {
     /// here. Nothing is applied until the old pod is off the volume, and a
     /// timeout there is a refusal rather than a second writer.
     ///
-    /// That refusal has a cost worth knowing about: between the delete and the
-    /// apply there is no Deployment, so a reconcile that dies in the window
-    /// leaves a tenant that reads [`TenantStatus::Stopped`] and that this
-    /// route will then refuse. Recovery is the path a stopped tenant already
-    /// has - the control plane re-PUTs the sealed credential it holds, which
-    /// converges the workload back - and the data, the identity and the
-    /// credential are all still where they were. Losing the pod for a minute
-    /// is the price of a purge; corrupting the store is not a price.
+    /// That refusal has a cost, and [`Warden::interrupted`] is what keeps it
+    /// from becoming a trap: between the delete and the apply there is no
+    /// Deployment, so a reconcile that dies in the window leaves a tenant
+    /// reading [`TenantStatus::Stopped`], and a route that refused every
+    /// stopped tenant would refuse to finish the job its own failure started.
     ///
     /// ## What it will and will not act on
     ///
@@ -736,12 +733,15 @@ impl Warden {
     /// reference has no ready replica - and refusing it would make this route
     /// useless in the one case it was built for.
     ///
-    /// [`TenantStatus::Pending`] and [`TenantStatus::Stopped`] are
-    /// [`WardenError::NotReconcilable`]. Neither has a workload, and bringing
-    /// one up is somebody else's transition: a pending tenant is a signup to
-    /// finish with [`Warden::set_credentials`], and a stopped one is an account
-    /// to reopen, which is re-consent. A reconcile that quietly started a
-    /// deleted tenant back up would be a resurrection nobody asked for.
+    /// [`TenantStatus::Pending`] is [`WardenError::NotReconcilable`]: it has
+    /// never had a workload, and bringing one up is a signup to finish with
+    /// [`Warden::set_credentials`], not a shape to converge.
+    ///
+    /// [`TenantStatus::Stopped`] depends on WHY it stopped, which the status
+    /// word cannot say and [`Warden::interrupted`] can. A cancelled account and
+    /// an interrupted reconcile look identical from the Deployment alone; the
+    /// Service tells them apart, and starting a cancelled tenant back up would
+    /// be a resurrection nobody asked for.
     ///
     /// Secrets are never rewritten. This converges SHAPE; identities,
     /// credentials and keys are what they were when it started, and the two
@@ -754,6 +754,15 @@ impl Warden {
         }
         match self.status_of(&name).await? {
             TenantStatus::Active | TenantStatus::Failed => {}
+            // Stopped by an interrupted reconcile, not by a cancellation: the
+            // objects around the missing Deployment are still standing, and
+            // finishing is the whole point of the route.
+            TenantStatus::Stopped if self.interrupted(&name).await? => {
+                tracing::info!(
+                    tenant = %name,
+                    "resuming a reconcile that did not finish; the workload is still routed"
+                );
+            }
             TenantStatus::Pending | TenantStatus::Stopped => {
                 return Err(WardenError::NotReconcilable);
             }
@@ -1023,6 +1032,34 @@ impl Warden {
             // whatever the first one sealed.
             _ => Err(WardenError::Conflict),
         }
+    }
+
+    /// Whether a [`TenantStatus::Stopped`] tenant was stopped by an
+    /// INTERRUPTED RECONCILE rather than by a cancellation.
+    ///
+    /// Both states are "no Deployment, credential still sealed", so the status
+    /// word cannot tell them apart and the surviving objects have to. The two
+    /// paths that reach here leave different wreckage:
+    ///
+    /// - [`Warden::delete`] takes the Ingress, the Deployment, the Service and
+    ///   the NetworkPolicy down together. A cancelled tenant has no Service.
+    /// - [`Warden::reconcile`] applies the Service BEFORE it touches the
+    ///   Deployment, so a reconcile that died in the delete-recreate window
+    ///   left the Service exactly where it was.
+    ///
+    /// So a surviving Service means the workload is still routed and only the
+    /// Deployment is missing, which is a job to finish rather than an account
+    /// to reopen. The check is deliberately the Service and not the Ingress:
+    /// the Ingress is the object an operator is most likely to have applied by
+    /// hand during the era this route replaces, and a hand-applied Ingress must
+    /// not read as consent to restart a cancelled mailbox.
+    async fn interrupted(&self, name: &TenantName) -> Result<bool, WardenError> {
+        Ok(self
+            .cluster
+            .get_service(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .is_some())
     }
 
     /// Derive the status from what exists. See [`TenantStatus`].
@@ -2419,6 +2456,81 @@ mod tests {
                 (Kind::Service, "alice".to_string()),
             ]
         );
+    }
+
+    /// The other half of the rule above: a reconcile that died in the
+    /// delete-recreate window must be finishable by running it again.
+    ///
+    /// The tenant reads `stopped` at that point, exactly as a cancelled account
+    /// does, and a route that refused on the status word alone would refuse to
+    /// clean up after its own failure - leaving the long way round (re-consent)
+    /// as the only exit from a state this route created. The surviving Service
+    /// is what tells the two aparts.
+    #[tokio::test]
+    async fn reconcile_finishes_what_an_interrupted_reconcile_started() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        hand_edit_the_deployment(&h).await;
+        h.cluster.pods_linger();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::cluster("pods_not_gone")
+        );
+
+        // The wreckage: no Deployment, so the status word says `stopped`, but
+        // the Service the reconcile applied on its way in is still standing.
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Stopped
+        );
+        assert!(!h.cluster.exists(Kind::Deployment, "alice"));
+        assert!(h.cluster.exists(Kind::Service, "alice"));
+
+        // The pod lets go and the operator runs it again. Nothing foreign
+        // survived the delete, so this is a plain apply rather than a purge.
+        h.cluster.pods_release();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap().deployment,
+            "created"
+        );
+        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        let live = match h.cluster.object(Kind::Deployment, "alice").unwrap() {
+            Object::Deployment(d) => *d,
+            other => panic!("not a Deployment: {:?}", other.kind()),
+        };
+        assert!(drift::foreign_managers(&live).is_empty());
+    }
+
+    /// A CANCELLED tenant stays refused, which is the distinction
+    /// [`Warden::interrupted`] exists to draw: `delete` took the Service down
+    /// with the Deployment, so nothing here reads as a job to finish.
+    #[tokio::test]
+    async fn reconcile_will_not_resurrect_a_cancelled_tenant() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        assert!(!h.cluster.exists(Kind::Service, "alice"));
+
+        let stopped = h.cluster.applied().len();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::NotReconcilable
+        );
+        assert_eq!(h.cluster.applied().len(), stopped);
     }
 
     /// Neither tenant without a workload is reconcilable, and the refusal

@@ -360,19 +360,27 @@ inside one Deployment the `Recreate` strategy guarantees no overlap, but across 
 delete and a re-create nothing holds that promise, so `Cluster::pods_gone` holds
 it here. A timeout is a refusal (`pods_not_gone`), never a second writer.
 
-That window costs something worth knowing about: while it is open the tenant has
-no Deployment, so a reconcile that dies inside it leaves a `stopped` tenant,
-which this route then refuses. Recovery is the path a stopped tenant already
-has — the control plane re-`PUT`s the sealed credential it holds, and every
-object comes back from today's code — with the volume, the identity and the
-credential exactly where they were.
+While that window is open the tenant has no Deployment, so a reconcile that dies
+inside it leaves a tenant reading `stopped` — the same word a cancelled account
+reads. Run the reconcile again once the pod lets go and it finishes the job; the
+volume, the identity and the credential never moved.
 
 `active` and `failed` both proceed. Failed is precisely the incident state, a
 pod wedged on a foreign secret reference with no ready replica, and refusing it
-would make the route useless in the case it exists for. `pending` and `stopped`
-are `409 not_reconcilable`: neither has a workload, and bringing one up is
-somebody else's transition (a signup to finish, an account to reopen), not a
-shape repair.
+would make the route useless in the case it exists for. `pending` is
+`409 not_reconcilable`: it has never had a workload, and bringing one up is a
+signup to finish, not a shape to converge.
+
+`stopped` depends on why it stopped, and the status word cannot say. `DELETE`
+takes the Ingress, the Deployment, the Service and the NetworkPolicy down
+together, while a reconcile applies the Service before it touches the
+Deployment — so a surviving Service means the workload is still routed and only
+the Deployment is missing. That is a job to finish, and it proceeds. No Service
+means somebody cancelled this account, and it stays `409`: starting a cancelled
+mailbox back up would be a resurrection nobody asked for. The check is the
+Service and not the Ingress deliberately, because the Ingress is the object an
+operator was most likely to have applied by hand during the era this route
+replaces, and a hand-applied Ingress must not read as consent to restart.
 
 Secrets are never rewritten. A reconcile converges SHAPE; the sealed credential
 and the LLM key are read back only to re-derive the two SHA-256 annotations on

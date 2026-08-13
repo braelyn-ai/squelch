@@ -253,15 +253,21 @@ deliberately no fleet reconcile: a loop that re-applies to every tenant is a loo
 that can take every mailbox down on one bad render, and fleet `drift` already
 tells you how long the list is without touching anything.
 
-**The fallback, for what reconcile refuses.** `pending` and `stopped` tenants
-have no workload and come back as `409 not_reconcilable`; starting one back up is
-a different transition, not a shape repair. There, and after a reconcile that
-died in its own delete/apply window (which leaves the tenant `stopped`), the
-answer is `DELETE /v1/tenants/{label}` — which keeps both Secrets and the
-volume — then `PUT /v1/tenants/{label}/credentials` with the tenant's current
-sealed blob, which rebuilds every object from today's code. The control plane
-must still hold the ciphertext to re-send, and the mailbox is down for the length
-of a provision.
+**A reconcile that died in its own delete/apply window** leaves the tenant
+reading `stopped`, because for that moment it has no Deployment. Wait for the
+old pod to finish terminating and run the same `reconcile` again: a surviving
+Service is how the warden tells an interrupted reconcile from a cancelled
+account, so it resumes rather than refusing. Nothing was lost — the volume, the
+identity and the sealed credential never moved.
+
+**The fallback, for what reconcile refuses.** A `pending` tenant, and a
+`stopped` one that was genuinely cancelled (its Service is gone too), come back
+as `409 not_reconcilable`; starting either back up is a different transition,
+not a shape repair. There the answer is `DELETE /v1/tenants/{label}` — which
+keeps both Secrets and the volume — then `PUT /v1/tenants/{label}/credentials`
+with the tenant's current sealed blob, which rebuilds every object from today's
+code. The control plane must still hold the ciphertext to re-send, and the
+mailbox is down for the length of a provision.
 
 > **Standing rule: no hand edits on a tenant Deployment. Ever.** Not
 > `kubectl set env`, not `kubectl edit`, not a client-side `kubectl apply`. An

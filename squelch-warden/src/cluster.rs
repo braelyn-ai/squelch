@@ -215,6 +215,16 @@ pub trait Cluster: Send + Sync {
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError>;
 
+    /// The tenant's Service, if one exists.
+    ///
+    /// One caller, and it is asking a question the status word cannot answer.
+    /// A tenant with no Deployment reads [`crate::TenantStatus::Stopped`]
+    /// whether its workload was cancelled or merely interrupted, and those two
+    /// want opposite treatment. [`crate::Warden::delete`] takes the Service down
+    /// with the Deployment, so a surviving Service means nobody cancelled this
+    /// tenant and the missing Deployment is a job somebody did not finish.
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError>;
+
     /// Delete by name. A missing object is success: every caller is either
     /// tearing down or retrying a teardown.
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError>;
@@ -448,6 +458,10 @@ impl Cluster for KubeCluster {
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError> {
         optional(self.api::<Deployment>().get(name).await, "get deployment")
+    }
+
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
+        optional(self.api::<Service>().get(name).await, "get service")
     }
 
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
