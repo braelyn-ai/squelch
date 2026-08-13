@@ -179,6 +179,29 @@ pub trait Cluster: Send + Sync {
     /// Server-side apply: create or update, idempotently.
     async fn apply(&self, object: Object) -> Result<(), ClusterError>;
 
+    /// The same apply as [`Cluster::apply`], with `dryRun=All`: the API server
+    /// merges and defaults the object and answers with what it WOULD have
+    /// stored, having stored nothing.
+    ///
+    /// This exists so a drift report can be honest. Diffing a render against a
+    /// live object directly compares a hand-written spec with a defaulted one,
+    /// and the answer is dozens of fields nobody set: `terminationMessagePath`,
+    /// `dnsPolicy`, a `protocol` on every port, a `creationTimestamp` on the
+    /// pod template. Diffing the API server's own answer against the live
+    /// object removes every one of them, because both sides went through the
+    /// same defaulting, and what is left is exactly what a real apply would
+    /// move.
+    ///
+    /// It says nothing about fields the warden does not declare. Server-side
+    /// apply never removes those - they belong to whichever manager wrote them
+    /// and they survive on both sides of this diff - so finding them is
+    /// [`crate::drift::foreign_managers`]' job, reading the API server's
+    /// ownership ledger, and not this one's.
+    async fn apply_deployment_dry_run(
+        &self,
+        deployment: Deployment,
+    ) -> Result<Deployment, ClusterError>;
+
     /// Create, failing with [`ClusterError::AlreadyExists`] if the name is
     /// taken. Used for the identity Secret, where "already there" is a decision
     /// point rather than something to overwrite.
@@ -276,8 +299,15 @@ impl KubeCluster {
 /// A free function rather than a method so it can be tested without a client:
 /// what it checks is the object, and the client has nothing to do with it.
 fn guard(namespace: &str, object: &Object) -> Result<(), ClusterError> {
-    let name = object.name();
-    let target = object.metadata().namespace.clone().unwrap_or_default();
+    guard_meta(namespace, object.metadata())
+}
+
+/// [`guard`] for a caller that holds a typed object rather than an [`Object`].
+/// The check is the metadata's, and wrapping a value in an enum only to unwrap
+/// it again would say otherwise.
+fn guard_meta(namespace: &str, metadata: &ObjectMeta) -> Result<(), ClusterError> {
+    let name = metadata.name.as_deref().unwrap_or_default();
+    let target = metadata.namespace.clone().unwrap_or_default();
     let name_ok = !name.is_empty() && name.len() <= 63 && crate::config::is_dns_label(name);
     if name_ok && target == namespace {
         return Ok(());
@@ -332,6 +362,25 @@ impl Cluster for KubeCluster {
             Object::Deployment(o) => apply!(self.api::<Deployment>(), o),
             Object::Ingress(o) => apply!(self.api::<Ingress>(), o),
         }
+    }
+
+    async fn apply_deployment_dry_run(
+        &self,
+        deployment: Deployment,
+    ) -> Result<Deployment, ClusterError> {
+        guard_meta(&self.namespace, &deployment.metadata)?;
+        let name = deployment.metadata.name.clone().unwrap_or_default();
+        // The same manager and the same force as the real apply, so the answer
+        // is the answer to "what would `apply` do", and `dryRun=All`, so it
+        // does none of it.
+        let params = PatchParams::apply(FIELD_MANAGER).force().dry_run();
+        self.api::<Deployment>()
+            .patch(&name, &params, &Patch::Apply(&deployment))
+            .await
+            .map_err(|source| ClusterError::Api {
+                op: "dry run apply",
+                source: Box::new(source),
+            })
     }
 
     async fn create(&self, object: Object) -> Result<(), ClusterError> {

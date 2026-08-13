@@ -57,6 +57,10 @@
 //!   armor check in [`crate::validate::validate_ciphertext`].
 //! - `squelchd pair` prints a LIVE pairing code. No exec output is logged at
 //!   any level, which is the only rule that keeps that true.
+//! - [`Warden::drift`] recovers the stored ciphertext and the stored LLM key to
+//!   re-render a Deployment, and both leave that function only as a SHA-256 in
+//!   a pod-template annotation. What its report quotes is a Deployment spec:
+//!   field names, images, mount points, and Secret references by name.
 //! - The tenant's mailbox address never reaches a log line or a response body.
 //!   The label does: it is a public subdomain and it is in the ingress
 //!   controller's access log already, and an operator with no identifier cannot
@@ -69,6 +73,7 @@ use k8s_openapi::api::core::v1::Secret;
 
 use crate::cluster::{Cluster, ClusterError, Kind, Object};
 use crate::config::Config;
+use crate::drift::{self, DriftReport};
 use crate::identity::TenantIdentity;
 use crate::objects;
 use crate::pair::{self, Pairing};
@@ -552,6 +557,101 @@ impl Warden {
             return Err(WardenError::NotFound);
         }
         self.status_of(&name).await
+    }
+
+    /// What is on this tenant's Deployment that the warden did not put there,
+    /// and what an apply of today's render would change.
+    ///
+    /// Read-only. The one write it makes is a `dryRun=All` apply, which the API
+    /// server merges, defaults and then discards; nothing is stored, nothing is
+    /// rolled, and a tenant is exactly as it was when this returns. See
+    /// [`crate::drift`] for why the two halves of the answer are two separate
+    /// questions.
+    ///
+    /// A tenant with no Deployment - pending, or stopped - reports its status
+    /// with both arrays empty. There is no object to have drifted, and
+    /// rendering one to diff against would be inventing a finding.
+    ///
+    /// The render has to be the render this tenant would GET, which means the
+    /// same two hashes phase two stamped on it: the credential ciphertext's,
+    /// recovered byte-exact from the stored Secret, and the LLM key's when one
+    /// exists. A render with either one wrong would report a pod-template
+    /// annotation as drift on every single tenant.
+    pub async fn drift(&self, raw_label: &str) -> Result<DriftReport, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        if self.identity(&name).await?.is_none() {
+            return Err(WardenError::NotFound);
+        }
+        // Two reads of the same object rather than one shared one:
+        // `status_of` is the single definition of what the four words mean,
+        // and a diagnostic route can afford the second GET.
+        let status = self.status_of(&name).await?;
+        let live = self
+            .cluster
+            .get_deployment(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        let Some(live) = live else {
+            return Ok(DriftReport {
+                status: status.as_str(),
+                deployment_present: false,
+                foreign: Vec::new(),
+                changes: Vec::new(),
+            });
+        };
+
+        let ciphertext = self
+            .cluster
+            .get_secret(&name.credential_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| secret_value(secret, objects::CREDENTIAL_KEY));
+        let Some(ciphertext) = ciphertext else {
+            // The same state `set_llm_key` refuses to render against: a
+            // workload whose sealed credential is gone. There is no honest
+            // render to compare the live object with.
+            tracing::error!(
+                tenant = %name,
+                reason = "credential_missing",
+                "a workload exists but its credential Secret does not"
+            );
+            return Err(WardenError::cluster("credential_missing"));
+        };
+        let llm_key = self
+            .cluster
+            .get_secret(&name.llm_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| secret_value(secret, objects::LLM_API_KEY_KEY));
+
+        let rendered = objects::deployment(
+            &self.config,
+            &name,
+            &objects::credential_hash(&ciphertext),
+            llm_key.as_deref().map(objects::credential_hash).as_deref(),
+        );
+        let merged = self
+            .cluster
+            .apply_deployment_dry_run(rendered)
+            .await
+            // A dry run the API server will not answer is this cluster failing
+            // to answer a question, not this tenant being broken. The shape of
+            // the refusal is in this pod's log.
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+
+        let foreign = drift::foreign_managers(&live);
+        let changes = drift::diff_spec(
+            &serde_json::to_value(&live.spec).unwrap_or(serde_json::Value::Null),
+            &serde_json::to_value(&merged.spec).unwrap_or(serde_json::Value::Null),
+        );
+        Ok(DriftReport {
+            status: status.as_str(),
+            deployment_present: true,
+            foreign,
+            changes,
+        })
     }
 
     /// Stop a tenant: the workload, the route and the policy go; the DATA
@@ -1710,6 +1810,232 @@ mod tests {
 
         assert_eq!(h.warden.sweep_pending().await.unwrap(), 0);
         assert!(h.cluster.secret("alice-identity").is_some());
+    }
+
+    /// The stored Deployment, edited the way `kubectl set env` edits one: a
+    /// variable with a secret reference on the seed container, and a
+    /// managedFields entry saying somebody else owns it now.
+    ///
+    /// Both halves matter and neither implies the other. Without the ledger
+    /// entry this is a field the warden would take back on the next apply;
+    /// with it, the warden's applies converge around the field forever.
+    async fn hand_edit_the_deployment(h: &Harness) {
+        use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
+
+        let Some(Object::Deployment(mut deployment)) = h.cluster.object(Kind::Deployment, "alice")
+        else {
+            panic!("no deployment");
+        };
+        let seed = &mut deployment
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .init_containers
+            .as_mut()
+            .unwrap()[0];
+        seed.env = Some(vec![EnvVar {
+            name: "SQUELCH_ANTHROPIC_API_KEY".to_string(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: "squelch-anthropic".to_string(),
+                    key: "ANTHROPIC_API_KEY".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        deployment.metadata.managed_fields = Some(vec![
+            ManagedFieldsEntry {
+                manager: Some(crate::cluster::FIELD_MANAGER.to_string()),
+                operation: Some("Apply".to_string()),
+                fields_v1: Some(FieldsV1(serde_json::json!({
+                    "f:spec": { "f:template": { "f:spec": {
+                        "f:initContainers": {
+                            "k:{\"name\":\"seed\"}": { ".": {}, "f:image": {} }
+                        }
+                    }}}
+                }))),
+                ..Default::default()
+            },
+            ManagedFieldsEntry {
+                manager: Some("kubectl-set".to_string()),
+                operation: Some("Update".to_string()),
+                fields_v1: Some(FieldsV1(serde_json::json!({
+                    "f:spec": { "f:template": { "f:spec": {
+                        "f:initContainers": {
+                            "k:{\"name\":\"seed\"}": {
+                                "f:env": {
+                                    "k:{\"name\":\"SQUELCH_ANTHROPIC_API_KEY\"}": {
+                                        ".": {},
+                                        "f:name": {},
+                                        "f:valueFrom": {
+                                            "f:secretKeyRef": { ".": {}, "f:key": {}, "f:name": {} }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }}}
+                }))),
+                ..Default::default()
+            },
+        ]);
+        h.cluster
+            .apply(Object::Deployment(deployment))
+            .await
+            .unwrap();
+    }
+
+    /// The incident, end to end. A tenant the warden has never stopped
+    /// converging carries a field the warden does not declare, and the only
+    /// thing that can see it is this report.
+    #[tokio::test]
+    async fn drift_finds_a_hand_edit_the_warden_would_never_see() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        // Freshly provisioned: nobody else owns anything, and an apply would
+        // move nothing.
+        let clean = h.warden.drift("alice").await.unwrap();
+        assert_eq!(clean.status, "active");
+        assert!(clean.deployment_present);
+        assert_eq!(clean.foreign, Vec::new());
+        assert_eq!(clean.changes, Vec::new());
+
+        hand_edit_the_deployment(&h).await;
+        let applied = h.cluster.applied().len();
+        let report = h.warden.drift("alice").await.unwrap();
+
+        // The ledger names the editor and everything it took.
+        assert_eq!(report.foreign.len(), 1);
+        assert_eq!(report.foreign[0].manager, "kubectl-set");
+        assert_eq!(report.foreign[0].operation, "Update");
+        assert_eq!(
+            report.foreign[0].paths,
+            vec![
+                "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].name",
+                "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].valueFrom.secretKeyRef.key",
+                "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].valueFrom.secretKeyRef.name",
+            ]
+        );
+        // And the diff names the field, with the reference that goes fatal the
+        // day the Secret behind it is deleted.
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(
+            report.changes[0].path,
+            "spec.template.spec.initContainers[seed].env"
+        );
+        assert_eq!(report.changes[0].rendered, serde_json::Value::Null);
+        assert!(
+            report.changes[0]
+                .live
+                .to_string()
+                .contains("squelch-anthropic")
+        );
+
+        // Read-only: the dry run is not an apply and not a store.
+        assert_eq!(h.cluster.applied().len(), applied);
+        assert!(h.cluster.deleted().is_empty());
+    }
+
+    /// A tenant with no workload has nothing to have drifted, in both of the
+    /// ways that happens.
+    #[tokio::test]
+    async fn drift_on_a_tenant_with_no_workload_is_an_empty_report() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        let pending = h.warden.drift("alice").await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert!(!pending.deployment_present);
+        assert_eq!(pending.foreign, Vec::new());
+        assert_eq!(pending.changes, Vec::new());
+
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        let stopped = h.warden.drift("alice").await.unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert!(!stopped.deployment_present);
+        assert_eq!(stopped.changes, Vec::new());
+    }
+
+    /// The render has to carry the hashes the running pod was rolled for, and
+    /// the credential Secret is the only source of the first one. Without it
+    /// there is no honest render, and reporting one anyway would call every
+    /// pod-template annotation drift.
+    #[tokio::test]
+    async fn drift_refuses_a_workload_whose_credential_is_gone() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.cluster
+            .delete(Kind::Secret, "alice-credential")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            h.warden.drift("alice").await.unwrap_err(),
+            WardenError::cluster("credential_missing")
+        );
+    }
+
+    /// A keyed tenant's render must pick the key's hash back up, or the
+    /// annotation that rolls a rotation would look like drift on every keyed
+    /// tenant in the fleet.
+    #[tokio::test]
+    async fn drift_is_clean_for_a_tenant_that_carries_an_llm_key() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+
+        let report = h.warden.drift("alice").await.unwrap();
+        assert_eq!(report.changes, Vec::new());
+        assert_eq!(report.foreign, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn drift_refuses_a_label_nobody_minted() {
+        let h = Harness::new();
+        assert_eq!(
+            h.warden.drift("nobody").await.unwrap_err(),
+            WardenError::NotFound
+        );
+        assert!(matches!(
+            h.warden.drift("-nope-").await.unwrap_err(),
+            WardenError::InvalidLabel(_)
+        ));
     }
 
     #[test]

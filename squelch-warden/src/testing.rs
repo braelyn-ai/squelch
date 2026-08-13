@@ -283,6 +283,27 @@ impl Cluster for MockCluster {
         Ok(())
     }
 
+    /// A dry run stores nothing and records nothing: the tests that assert an
+    /// exact list of applies must not see a drift report in it.
+    ///
+    /// The answer is the render itself, put through [`persist`] so it comes
+    /// back shaped the way a stored one would be. A real API server would also
+    /// default and merge it, which is the whole reason the drift path asks the
+    /// server rather than diffing the render directly - so a clean tenant's
+    /// diff here is a diff of two renders, and the merge semantics are held to
+    /// [`crate::drift::diff_spec`]'s own tests instead.
+    async fn apply_deployment_dry_run(
+        &self,
+        deployment: Deployment,
+    ) -> Result<Deployment, ClusterError> {
+        let ready = self.lock().ready;
+        let Object::Deployment(deployment) = persist(Object::Deployment(Box::new(deployment)), ready)
+        else {
+            unreachable!("persist does not change an object's kind")
+        };
+        Ok(*deployment)
+    }
+
     async fn create(&self, object: Object) -> Result<(), ClusterError> {
         if self.lock().create_loses_race || self.exists(object.kind(), object.name()) {
             return Err(ClusterError::AlreadyExists);

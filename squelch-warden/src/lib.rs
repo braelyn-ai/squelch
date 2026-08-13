@@ -39,6 +39,8 @@
 //! - [`cluster`] - the one trait every Kubernetes call goes through, and the
 //!   kube-rs implementation of it.
 //! - [`provision`] - the two-phase sequence, and the pending sweep.
+//! - [`drift`] - reading a live tenant back: who else owns part of it, and what
+//!   an apply of today's render would change.
 //! - [`pair`] - reading `squelchd pair`'s output back.
 //! - [`auth`] / [`ratelimit`] / [`handlers`] - the wire.
 //!
@@ -60,6 +62,7 @@ use axum::{
 pub mod auth;
 pub mod cluster;
 pub mod config;
+pub mod drift;
 pub mod handlers;
 pub mod identity;
 pub mod objects;
@@ -72,6 +75,7 @@ pub mod validate;
 
 pub use cluster::{Cluster, KubeCluster};
 pub use config::{Config, ConfigError};
+pub use drift::{DriftReport, FieldChange, ForeignManager};
 pub use pair::Pairing;
 pub use provision::{Created, TenantStatus, Warden, WardenError};
 
@@ -157,6 +161,7 @@ pub fn router(state: WardenState) -> Router {
             put(handlers::set_credentials),
         )
         .route("/v1/tenants/{label}/llm-key", put(handlers::set_llm_key))
+        .route("/v1/tenants/{label}/drift", get(handlers::get_drift))
         .route("/v1/tenants/{label}/pair", post(handlers::repair_tenant))
         .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
         .layer(middleware::from_fn_with_state(
