@@ -311,6 +311,234 @@ pub struct ConsoleConfig {
     pub allow_insecure_cookie: bool,
 }
 
+/// BYOK carrier-API credentials, plus the cadence the poller keeps.
+///
+/// CREDENTIALS ARE THE FEATURE FLAG, one carrier at a time: a carrier whose
+/// creds are absent — or only half there — is never polled, and when
+/// [`CarriersConfig::any_enabled`] is false no carrier API is contacted at all.
+/// Nothing in this table turns polling on by itself; the four knobs only pace a
+/// poller that credentials have already enabled.
+///
+/// Every secret can come from the environment instead of the file
+/// (`SQUELCH_UPS_CLIENT_ID`, …), and an env PAIR materializes a carrier the TOML
+/// never mentions — that is how a container is configured. Secrets are never
+/// logged: each cred struct hand-writes a `Debug` that redacts them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CarriersConfig {
+    /// Baseline poll cadence (hours) for an in-flight shipment.
+    /// Env: `SQUELCH_CARRIERS_POLL_INTERVAL_HOURS`.
+    pub poll_interval_hours: u64,
+    /// The tighter cadence (minutes) for a shipment that is OUT FOR DELIVERY,
+    /// where the next interesting state change is an hour away, not a day.
+    /// Env: `SQUELCH_CARRIERS_OFD_POLL_INTERVAL_MINS`.
+    pub ofd_poll_interval_mins: u64,
+    /// Give up on a shipment this many days after it was first seen: a tracking
+    /// number nobody ever delivers must not be polled forever.
+    /// Env: `SQUELCH_CARRIERS_MAX_AGE_DAYS`.
+    pub max_age_days: u32,
+    /// Consecutive per-shipment API failures tolerated before it is dropped.
+    /// Env: `SQUELCH_CARRIERS_MAX_FAILURES`.
+    pub max_failures: u32,
+    /// `[carriers.ups]`. `None` (or half a pair) => UPS is never polled.
+    pub ups: Option<UpsCarrierConfig>,
+    /// `[carriers.fedex]`. `None` (or half a pair) => FedEx is never polled.
+    pub fedex: Option<FedexCarrierConfig>,
+    /// `[carriers.usps]`. `None` (or half a pair) => USPS is never polled.
+    pub usps: Option<UspsCarrierConfig>,
+    /// `[carriers.dhl]`. `None` (or a blank key) => DHL is never polled.
+    pub dhl: Option<DhlCarrierConfig>,
+}
+
+impl Default for CarriersConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_hours: 6,
+            ofd_poll_interval_mins: 60,
+            max_age_days: 45,
+            max_failures: 5,
+            ups: None,
+            fedex: None,
+            usps: None,
+            dhl: None,
+        }
+    }
+}
+
+impl CarriersConfig {
+    /// `true` when at least one carrier is FULLY configured. This is the feature
+    /// flag for the whole poller: false means no carrier API is ever contacted,
+    /// so an operator who configured nothing gets no outbound traffic and no
+    /// background task.
+    pub fn any_enabled(&self) -> bool {
+        self.ups.as_ref().is_some_and(UpsCarrierConfig::enabled)
+            || self.fedex.as_ref().is_some_and(FedexCarrierConfig::enabled)
+            || self.usps.as_ref().is_some_and(UspsCarrierConfig::enabled)
+            || self.dhl.as_ref().is_some_and(DhlCarrierConfig::enabled)
+    }
+}
+
+/// One half of a credential, trimmed, or `None` when absent or blank. BLANK IS
+/// ABSENT everywhere here, so a `client_id = ""` left behind in a config cannot
+/// half-enable a carrier and send an empty string at someone's auth endpoint.
+fn cred_half(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// UPS OAuth client credentials (the client-credentials grant). BOTH halves are
+/// required; either one alone leaves UPS off.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UpsCarrierConfig {
+    /// Env: `SQUELCH_UPS_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// Env: `SQUELCH_UPS_CLIENT_SECRET`. Secret material, NEVER logged.
+    pub client_secret: Option<String>,
+}
+
+impl UpsCarrierConfig {
+    /// The complete pair, or `None` when either half is missing or blank.
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        Some((cred_half(&self.client_id)?, cred_half(&self.client_secret)?))
+    }
+
+    /// UPS is enabled iff a complete pair resolves.
+    pub fn enabled(&self) -> bool {
+        self.credentials().is_some()
+    }
+}
+
+/// Hand-written so the secret half can never ride out through a stray `{:?}`.
+impl std::fmt::Debug for UpsCarrierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpsCarrierConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// FedEx OAuth client credentials. Both halves required.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FedexCarrierConfig {
+    /// Env: `SQUELCH_FEDEX_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// Env: `SQUELCH_FEDEX_CLIENT_SECRET`. Secret material, NEVER logged.
+    pub client_secret: Option<String>,
+}
+
+impl FedexCarrierConfig {
+    /// The complete pair, or `None` when either half is missing or blank.
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        Some((cred_half(&self.client_id)?, cred_half(&self.client_secret)?))
+    }
+
+    /// FedEx is enabled iff a complete pair resolves.
+    pub fn enabled(&self) -> bool {
+        self.credentials().is_some()
+    }
+}
+
+/// Hand-written so the secret half can never ride out through a stray `{:?}`.
+impl std::fmt::Debug for FedexCarrierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FedexCarrierConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// USPS OAuth consumer credentials. Both halves required.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UspsCarrierConfig {
+    /// Env: `SQUELCH_USPS_CONSUMER_KEY`.
+    pub consumer_key: Option<String>,
+    /// Env: `SQUELCH_USPS_CONSUMER_SECRET`. Secret material, NEVER logged.
+    pub consumer_secret: Option<String>,
+}
+
+impl UspsCarrierConfig {
+    /// The complete pair, or `None` when either half is missing or blank.
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        Some((
+            cred_half(&self.consumer_key)?,
+            cred_half(&self.consumer_secret)?,
+        ))
+    }
+
+    /// USPS is enabled iff a complete pair resolves.
+    pub fn enabled(&self) -> bool {
+        self.credentials().is_some()
+    }
+}
+
+/// Hand-written so the secret half can never ride out through a stray `{:?}`.
+impl std::fmt::Debug for UspsCarrierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UspsCarrierConfig")
+            .field("consumer_key", &self.consumer_key)
+            .field(
+                "consumer_secret",
+                &self.consumer_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// DHL API key, plus the one carrier-specific budget we keep. DHL's free tier is
+/// 250 calls/day and the key is the WHOLE credential, so there is no pair here.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DhlCarrierConfig {
+    /// Env: `SQUELCH_DHL_API_KEY`. Secret material, NEVER logged.
+    pub api_key: Option<String>,
+    /// Calls/day ceiling for DHL. Default 200, deliberately UNDER the 250/day
+    /// free tier so a busy day cannot spend an operator into a bill.
+    /// Env: `SQUELCH_DHL_DAILY_CAP` (honored only when DHL is already
+    /// configured — a cap alone must never conjure a carrier).
+    pub daily_cap: u32,
+}
+
+impl Default for DhlCarrierConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            daily_cap: 200,
+        }
+    }
+}
+
+impl DhlCarrierConfig {
+    /// The key, or `None` when it is missing or blank.
+    pub fn api_key(&self) -> Option<&str> {
+        cred_half(&self.api_key)
+    }
+
+    /// DHL is enabled iff a key resolves.
+    pub fn enabled(&self) -> bool {
+        self.api_key().is_some()
+    }
+}
+
+/// Hand-written so the key can never ride out through a stray `{:?}`.
+impl std::fmt::Debug for DhlCarrierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhlCarrierConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("daily_cap", &self.daily_cap)
+            .finish()
+    }
+}
+
 /// Default embedding-weights cache dir, a sibling of the sqlite db under the
 /// XDG data dir; CWD-relative only when `HOME` is unset.
 pub fn default_embed_cache_dir() -> PathBuf {
@@ -691,6 +919,28 @@ fn env_override_opt<T: std::str::FromStr>(name: &str, slot: &mut Option<T>) {
     }
 }
 
+/// [`env_override_opt`] for a secret that lives INSIDE an optional credential
+/// struct: a usable value materializes that struct — a container gets its
+/// carriers entirely from the environment, with no `[carriers.ups]` table on
+/// disk to attach to — and then writes the named half.
+///
+/// Trimmed, and blank is "unset", which is the relay block's rule: an
+/// exported-but-empty var neither clobbers a configured secret nor conjures a
+/// carrier out of nothing. Because a carrier needs BOTH halves to count, a lone
+/// id still leaves it disabled.
+fn env_override_cred<T: Default>(
+    name: &str,
+    holder: &mut Option<T>,
+    half: impl FnOnce(&mut T) -> &mut Option<String>,
+) {
+    if let Ok(v) = std::env::var(name) {
+        let v = v.trim();
+        if !v.is_empty() {
+            *half(holder.get_or_insert_default()) = Some(v.to_string());
+        }
+    }
+}
+
 // ---- Stage-2 daily-cap runtime-override plumbing ---------------------------
 // Three layers, highest wins: an `app_settings` runtime override (applied
 // without a restart) > config/env > [`Stage2Config::default`]. These constants
@@ -835,6 +1085,9 @@ pub struct Config {
     /// The tenant console. Absent `sso_url` means no Google sign-in button,
     /// which is the self-host posture.
     pub console: ConsoleConfig,
+    /// BYOK carrier APIs. No credentials anywhere means no carrier is ever
+    /// polled, which is the default.
+    pub carriers: CarriersConfig,
 }
 
 impl Default for Config {
@@ -857,6 +1110,7 @@ impl Default for Config {
             tracking: TrackingConfig::default(),
             metrics: MetricsConfig::default(),
             console: ConsoleConfig::default(),
+            carriers: CarriersConfig::default(),
         }
     }
 }
@@ -1047,6 +1301,59 @@ impl Config {
             &mut self.stage1.price_out_per_mtok,
         );
 
+        // ---- BYOK carrier APIs ---------------------------------------------
+        // Secrets, handled the relay block's way: trimmed, blank is "unset",
+        // never echoed anywhere (each cred struct's `Debug` redacts them). The
+        // one difference is that a value MATERIALIZES its carrier when the TOML
+        // never mentioned one, because that is how a container is configured —
+        // and since a carrier needs both halves, a lone id leaves it off.
+        env_override_cred("SQUELCH_UPS_CLIENT_ID", &mut self.carriers.ups, |c| {
+            &mut c.client_id
+        });
+        env_override_cred("SQUELCH_UPS_CLIENT_SECRET", &mut self.carriers.ups, |c| {
+            &mut c.client_secret
+        });
+        env_override_cred("SQUELCH_FEDEX_CLIENT_ID", &mut self.carriers.fedex, |c| {
+            &mut c.client_id
+        });
+        env_override_cred(
+            "SQUELCH_FEDEX_CLIENT_SECRET",
+            &mut self.carriers.fedex,
+            |c| &mut c.client_secret,
+        );
+        env_override_cred("SQUELCH_USPS_CONSUMER_KEY", &mut self.carriers.usps, |c| {
+            &mut c.consumer_key
+        });
+        env_override_cred(
+            "SQUELCH_USPS_CONSUMER_SECRET",
+            &mut self.carriers.usps,
+            |c| &mut c.consumer_secret,
+        );
+        env_override_cred("SQUELCH_DHL_API_KEY", &mut self.carriers.dhl, |c| {
+            &mut c.api_key
+        });
+        env_override(
+            "SQUELCH_CARRIERS_POLL_INTERVAL_HOURS",
+            &mut self.carriers.poll_interval_hours,
+        );
+        env_override(
+            "SQUELCH_CARRIERS_OFD_POLL_INTERVAL_MINS",
+            &mut self.carriers.ofd_poll_interval_mins,
+        );
+        env_override(
+            "SQUELCH_CARRIERS_MAX_AGE_DAYS",
+            &mut self.carriers.max_age_days,
+        );
+        env_override(
+            "SQUELCH_CARRIERS_MAX_FAILURES",
+            &mut self.carriers.max_failures,
+        );
+        // Only when DHL already exists: a budget must never conjure a carrier
+        // (the api_key override above is the only thing that can).
+        if let Some(dhl) = self.carriers.dhl.as_mut() {
+            env_override("SQUELCH_DHL_DAILY_CAP", &mut dhl.daily_cap);
+        }
+
         // Range-guard the caps, matching POST /client/triage-config's
         // validation: a cap of 0 would silently block EVERY row each cycle
         // (`used >= cap` holds at 0). Clamps with a warning rather than
@@ -1064,6 +1371,25 @@ impl Config {
                      ({STAGE2_CAP_MIN}..={STAGE2_CAP_MAX}); clamping to {clamped}"
                 );
                 *cap = clamped;
+            }
+        }
+
+        // Same idea for the carrier cadences: a ZERO interval is a spin loop
+        // against somebody else's rate-limited API, so it gets a floor of 1
+        // rather than a config that quietly hammers UPS.
+        for (name, interval) in [
+            (
+                "carriers.poll_interval_hours",
+                &mut self.carriers.poll_interval_hours,
+            ),
+            (
+                "carriers.ofd_poll_interval_mins",
+                &mut self.carriers.ofd_poll_interval_mins,
+            ),
+        ] {
+            if *interval == 0 {
+                eprintln!("squelch: config {name}=0 would poll without pause; clamping to 1");
+                *interval = 1;
             }
         }
     }
@@ -2239,6 +2565,271 @@ backfill_days = 90
             std::env::remove_var("SQUELCH_CRED_BACKEND");
             std::env::remove_var("SQUELCH_CREDENTIALS_PATH");
         }
+    }
+
+    /// Clear every carrier credential/knob var. Caller must hold `ENV_LOCK`.
+    fn clear_carrier_env() {
+        // SAFETY: caller holds ENV_LOCK.
+        unsafe {
+            for name in [
+                "SQUELCH_UPS_CLIENT_ID",
+                "SQUELCH_UPS_CLIENT_SECRET",
+                "SQUELCH_FEDEX_CLIENT_ID",
+                "SQUELCH_FEDEX_CLIENT_SECRET",
+                "SQUELCH_USPS_CONSUMER_KEY",
+                "SQUELCH_USPS_CONSUMER_SECRET",
+                "SQUELCH_DHL_API_KEY",
+                "SQUELCH_DHL_DAILY_CAP",
+                "SQUELCH_CARRIERS_POLL_INTERVAL_HOURS",
+                "SQUELCH_CARRIERS_OFD_POLL_INTERVAL_MINS",
+                "SQUELCH_CARRIERS_MAX_AGE_DAYS",
+                "SQUELCH_CARRIERS_MAX_FAILURES",
+            ] {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    /// The feature is OFF out of the box, and a config written before it existed
+    /// (no `[carriers]` table at all) still parses.
+    #[test]
+    fn carriers_default_is_off_and_legacy_configs_still_parse() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_carrier_env();
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert!(!c.carriers.any_enabled(), "no creds => no carrier polling");
+        assert!(c.carriers.ups.is_none());
+        assert!(c.carriers.fedex.is_none());
+        assert!(c.carriers.usps.is_none());
+        assert!(c.carriers.dhl.is_none());
+        assert_eq!(c.carriers.poll_interval_hours, 6);
+        assert_eq!(c.carriers.ofd_poll_interval_mins, 60);
+        assert_eq!(c.carriers.max_age_days, 45);
+        assert_eq!(c.carriers.max_failures, 5);
+
+        // A config predating the feature has no [carriers] table whatsoever.
+        let cfg: Config = toml::from_str("squelch_level = 1\n").unwrap();
+        assert_eq!(cfg.carriers, CarriersConfig::default());
+        assert!(!cfg.carriers.any_enabled());
+    }
+
+    #[test]
+    fn carriers_section_round_trips_through_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+[carriers]
+poll_interval_hours = 3
+max_failures = 9
+
+[carriers.ups]
+client_id = "ups-id"
+client_secret = "ups-sekret"
+
+[carriers.dhl]
+api_key = "dhl-key"
+daily_cap = 240
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.carriers.poll_interval_hours, 3);
+        assert_eq!(cfg.carriers.max_failures, 9);
+        // Unspecified knobs keep their defaults (#[serde(default)]).
+        assert_eq!(cfg.carriers.ofd_poll_interval_mins, 60);
+        assert_eq!(cfg.carriers.max_age_days, 45);
+        assert_eq!(
+            cfg.carriers.ups.as_ref().unwrap().credentials(),
+            Some(("ups-id", "ups-sekret"))
+        );
+        assert_eq!(
+            cfg.carriers.dhl.as_ref().unwrap().api_key(),
+            Some("dhl-key")
+        );
+        assert_eq!(cfg.carriers.dhl.as_ref().unwrap().daily_cap, 240);
+        // The carriers nobody configured stay absent.
+        assert!(cfg.carriers.fedex.is_none());
+        assert!(cfg.carriers.usps.is_none());
+        assert!(cfg.carriers.any_enabled());
+
+        // And it survives a serialize/parse lap unchanged.
+        let rendered = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.carriers, cfg.carriers);
+
+        // An omitted daily_cap lands under DHL's 250/day free tier.
+        let cfg: Config = toml::from_str("[carriers.dhl]\napi_key = \"k\"\n").unwrap();
+        assert_eq!(cfg.carriers.dhl.unwrap().daily_cap, 200);
+    }
+
+    /// The container case: nothing on disk, everything in the environment. A
+    /// full env PAIR has to materialize a carrier the TOML never mentioned.
+    #[test]
+    fn carrier_env_materializes_a_carrier_absent_from_the_toml() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_carrier_env();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_FEDEX_CLIENT_ID", "  fedex-id  ");
+            std::env::set_var("SQUELCH_FEDEX_CLIENT_SECRET", "fedex-sekret");
+            std::env::set_var("SQUELCH_USPS_CONSUMER_KEY", "usps-key");
+            std::env::set_var("SQUELCH_USPS_CONSUMER_SECRET", "usps-sekret");
+            std::env::set_var("SQUELCH_DHL_API_KEY", "dhl-key");
+            std::env::set_var("SQUELCH_DHL_DAILY_CAP", "150");
+            std::env::set_var("SQUELCH_CARRIERS_POLL_INTERVAL_HOURS", "2");
+            std::env::set_var("SQUELCH_CARRIERS_MAX_AGE_DAYS", "10");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(
+            c.carriers.fedex.as_ref().unwrap().credentials(),
+            // Trimmed, exactly like the relay block.
+            Some(("fedex-id", "fedex-sekret"))
+        );
+        assert_eq!(
+            c.carriers.usps.as_ref().unwrap().credentials(),
+            Some(("usps-key", "usps-sekret"))
+        );
+        assert_eq!(c.carriers.dhl.as_ref().unwrap().api_key(), Some("dhl-key"));
+        assert_eq!(c.carriers.dhl.as_ref().unwrap().daily_cap, 150);
+        assert_eq!(c.carriers.poll_interval_hours, 2);
+        assert_eq!(c.carriers.max_age_days, 10);
+        assert!(c.carriers.any_enabled());
+        // Untouched carriers are still absent, not empty-but-present.
+        assert!(c.carriers.ups.is_none());
+
+        // Env beats the file, same as everywhere else.
+        unsafe {
+            std::env::set_var("SQUELCH_UPS_CLIENT_ID", "env-id");
+        }
+        let mut c: Config = toml::from_str(
+            "[carriers.ups]\nclient_id = \"file-id\"\nclient_secret = \"file-sekret\"\n",
+        )
+        .unwrap();
+        c.apply_env_overrides();
+        assert_eq!(
+            c.carriers.ups.as_ref().unwrap().credentials(),
+            Some(("env-id", "file-sekret"))
+        );
+        clear_carrier_env();
+    }
+
+    /// A blank carrier var is "unset", never "set to empty": it must not clobber
+    /// a configured secret, and it must not conjure a credential-shaped table
+    /// that would make the poller think a carrier is available.
+    #[test]
+    fn blank_carrier_env_is_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_carrier_env();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_UPS_CLIENT_ID", "   ");
+            std::env::set_var("SQUELCH_UPS_CLIENT_SECRET", "");
+            std::env::set_var("SQUELCH_DHL_API_KEY", "  ");
+            std::env::set_var("SQUELCH_CARRIERS_POLL_INTERVAL_HOURS", "");
+        }
+        let mut c: Config = toml::from_str(
+            "[carriers]\npoll_interval_hours = 4\n\n\
+             [carriers.ups]\nclient_id = \"file-id\"\nclient_secret = \"file-sekret\"\n",
+        )
+        .unwrap();
+        c.apply_env_overrides();
+        assert_eq!(
+            c.carriers.ups.as_ref().unwrap().credentials(),
+            Some(("file-id", "file-sekret")),
+            "a blank env value does not clobber the file"
+        );
+        assert_eq!(c.carriers.poll_interval_hours, 4);
+        assert!(
+            c.carriers.dhl.is_none(),
+            "a blank secret never materializes a carrier"
+        );
+        clear_carrier_env();
+    }
+
+    /// Half a pair is not a credential. A `client_id` with no secret leaves that
+    /// carrier disabled, whether it came from the file or from one lone env var
+    /// — and a blank half in the file counts as absent too.
+    #[test]
+    fn half_a_credential_pair_is_not_enabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_carrier_env();
+
+        let cfg: Config = toml::from_str("[carriers.ups]\nclient_id = \"only-the-id\"\n").unwrap();
+        let ups = cfg.carriers.ups.as_ref().unwrap();
+        assert!(!ups.enabled(), "an id with no secret is not a credential");
+        assert_eq!(ups.credentials(), None);
+        assert!(!cfg.carriers.any_enabled());
+
+        // A blank half in the file is absent, not "configured with nothing".
+        let cfg: Config =
+            toml::from_str("[carriers.usps]\nconsumer_key = \"k\"\nconsumer_secret = \"   \"\n")
+                .unwrap();
+        assert!(!cfg.carriers.usps.as_ref().unwrap().enabled());
+        assert!(!cfg.carriers.any_enabled());
+
+        // One lone env var materializes the struct but not the feature.
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_FEDEX_CLIENT_ID", "lonely-id");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert!(c.carriers.fedex.is_some());
+        assert!(!c.carriers.fedex.as_ref().unwrap().enabled());
+        assert!(
+            !c.carriers.any_enabled(),
+            "half a pair leaves the feature off"
+        );
+        clear_carrier_env();
+    }
+
+    /// Carrier secrets are redacted from `Debug`, the way every other
+    /// secret-bearing config struct in the workspace does it — a `{:?}` of the
+    /// whole `Config` must not put an API key in a log.
+    #[test]
+    fn carrier_debug_redacts_the_secrets() {
+        let cfg: Config = toml::from_str(
+            r#"
+[carriers.ups]
+client_id = "ups-id"
+client_secret = "ups-sekret"
+
+[carriers.fedex]
+client_id = "fedex-id"
+client_secret = "fedex-sekret"
+
+[carriers.usps]
+consumer_key = "usps-key"
+consumer_secret = "usps-sekret"
+
+[carriers.dhl]
+api_key = "dhl-key"
+"#,
+        )
+        .unwrap();
+        let rendered = format!("{:?}", cfg.carriers);
+        for secret in ["ups-sekret", "fedex-sekret", "usps-sekret", "dhl-key"] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+        assert_eq!(rendered.matches("<redacted>").count(), 4);
+        // The public halves stay visible — they are what makes a Debug useful.
+        assert!(rendered.contains("ups-id"));
+        assert!(rendered.contains("usps-key"));
+        // And the same holds through the whole Config's derived Debug.
+        assert!(!format!("{cfg:?}").contains("ups-sekret"));
+    }
+
+    /// A zero cadence would spin against a carrier's API; it floors at 1.
+    #[test]
+    fn zero_carrier_interval_is_floored() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_carrier_env();
+        let mut c: Config =
+            toml::from_str("[carriers]\npoll_interval_hours = 0\nofd_poll_interval_mins = 0\n")
+                .unwrap();
+        c.apply_env_overrides();
+        assert_eq!(c.carriers.poll_interval_hours, 1);
+        assert_eq!(c.carriers.ofd_poll_interval_mins, 1);
     }
 
     #[test]
