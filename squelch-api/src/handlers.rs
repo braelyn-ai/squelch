@@ -1460,6 +1460,10 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
             "fetched_at": unread.fetched_at.to_rfc3339(),
         });
     }
+    // Capability flag for the app: whether /client/assistant/messages will
+    // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
+    // Always present so a client reads an answer, not absence.
+    body["assistant_relay"] = json!(state.assistant().is_some());
     Ok(Json(body))
 }
 
