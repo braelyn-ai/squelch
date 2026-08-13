@@ -65,7 +65,9 @@ pub fn mint() -> Result<MintedInvite, std::io::Error> {
     // holds whole, so no symbol is correlated with another.
     let mut bytes = [0u8; CODE_LEN * 5 / 8];
     getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
-    let bits = bytes.iter().fold(0u128, |acc, b| (acc << 8) | u128::from(*b));
+    let bits = bytes
+        .iter()
+        .fold(0u128, |acc, b| (acc << 8) | u128::from(*b));
     let raw: String = (0..CODE_LEN)
         .map(|i| {
             let shift = 5 * (CODE_LEN - 1 - i);
@@ -116,13 +118,14 @@ pub fn normalize(input: &str) -> String {
 /// touches disk.
 pub fn hash(code: &str) -> String {
     use std::fmt::Write as _;
-    Sha256::digest(normalize(code).as_bytes())
-        .iter()
-        .fold(String::with_capacity(64), |mut out, b| {
+    Sha256::digest(normalize(code).as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut out, b| {
             // Writing to a String cannot fail.
             let _ = write!(out, "{b:02x}");
             out
-        })
+        },
+    )
 }
 
 /// Whether a submitted string is even shaped like a code. Cheap enough to run
@@ -135,8 +138,7 @@ pub fn hash(code: &str) -> String {
 /// eventually fail (expiry), which is the same oracle in a smaller window.
 pub fn is_plausible(input: &str) -> bool {
     let n = normalize(input);
-    (n.len() == CODE_LEN || n.len() == LEGACY_CODE_LEN)
-        && n.bytes().all(|b| ALPHABET.contains(&b))
+    (n.len() == CODE_LEN || n.len() == LEGACY_CODE_LEN) && n.bytes().all(|b| ALPHABET.contains(&b))
 }
 
 #[cfg(test)]

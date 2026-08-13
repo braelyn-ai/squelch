@@ -617,11 +617,17 @@ mod tests {
         // What a Role without `pods/exec` produces, and what an h2 connection
         // or a stray reverse proxy would produce: an answer that was not 101.
         assert_eq!(
-            upgrade(UpgradeConnectionError::ProtocolSwitch(StatusCode::FORBIDDEN)).summary(),
+            upgrade(UpgradeConnectionError::ProtocolSwitch(
+                StatusCode::FORBIDDEN
+            ))
+            .summary(),
             "api(exec): transport(upgrade) http 403"
         );
         assert_eq!(
-            upgrade(UpgradeConnectionError::ProtocolSwitch(StatusCode::NOT_FOUND)).summary(),
+            upgrade(UpgradeConnectionError::ProtocolSwitch(
+                StatusCode::NOT_FOUND
+            ))
+            .summary(),
             "api(exec): transport(upgrade) http 404"
         );
 

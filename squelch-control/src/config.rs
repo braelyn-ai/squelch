@@ -436,7 +436,10 @@ mod tests {
 
     #[test]
     fn validates_the_base_domain() {
-        assert_eq!(canonical_domain("Passband.Email").unwrap(), "passband.email");
+        assert_eq!(
+            canonical_domain("Passband.Email").unwrap(),
+            "passband.email"
+        );
         assert_eq!(
             canonical_domain("passband.email.").unwrap(),
             "passband.email"

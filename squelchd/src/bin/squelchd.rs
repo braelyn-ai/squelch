@@ -34,7 +34,10 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8848";
 
 #[derive(Parser)]
-#[command(name = "squelchd", about = "squelch local-first email intelligence daemon")]
+#[command(
+    name = "squelchd",
+    about = "squelch local-first email intelligence daemon"
+)]
 struct Cli {
     /// Path to config.toml (defaults to ~/.config/squelch/config.toml).
     #[arg(long, global = true)]
@@ -408,9 +411,9 @@ fn make_credential_store(
         CredentialBackend::Keyring => {
             Arc::new(KeyringCredentialStore::new(account_id, email, client))
         }
-        CredentialBackend::File => {
-            Arc::new(FileCredentialStore::new(account_id, email, creds_path, client))
-        }
+        CredentialBackend::File => Arc::new(FileCredentialStore::new(
+            account_id, email, creds_path, client,
+        )),
     }
 }
 
@@ -444,7 +447,10 @@ fn mirror_env_to_config(env_path: &std::path::Path) {
         }
     };
     match squelch_core::config::mirror_env_pairs_to_config(&pairs, &config_path) {
-        Ok(true) => eprintln!("squelchd: mirrored .env settings into {}", config_path.display()),
+        Ok(true) => eprintln!(
+            "squelchd: mirrored .env settings into {}",
+            config_path.display()
+        ),
         Ok(false) => {}
         Err(e) => eprintln!(
             "squelchd: could not mirror .env into {}: {e}",
@@ -1342,7 +1348,11 @@ fn resolve_bind(args: &ServeArgs) -> Result<SocketAddr, squelch_core::CoreError>
     let raw = args
         .bind
         .clone()
-        .or_else(|| std::env::var("SQUELCH_BIND").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("SQUELCH_BIND")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
     raw.parse()
         .map_err(|e| other_err(format!("invalid bind address `{raw}`: {e}")))
@@ -1650,9 +1660,9 @@ fn cmd_serve(
             Some(pusher) => {
                 eprintln!("squelchd: APNs pusher enabled (relay configured)");
                 let shutdown_rx = shutdown_rx.clone();
-                Some(tokio::spawn(
-                    async move { pusher.run(pusher_wake, shutdown_rx).await },
-                ))
+                Some(tokio::spawn(async move {
+                    pusher.run(pusher_wake, shutdown_rx).await
+                }))
             }
             None => {
                 // The normal case — iOS push is opt-in — so a detail, not a warning.
@@ -1680,7 +1690,8 @@ fn cmd_serve(
         };
 
         // READ-bound store, shared by the sync loop and the contacts harvest.
-        let sync_creds = make_credential_store(backend, account_id, email.clone(), creds_path, client);
+        let sync_creds =
+            make_credential_store(backend, account_id, email.clone(), creds_path, client);
 
         // No embedder override: the loop resolves it from the shared store each
         // tick, so it picks up the background-attached one.
@@ -1941,7 +1952,14 @@ mod tests {
             _ => panic!("expected auth subcommand"),
         }
 
-        let cli = Cli::parse_from(["squelchd", "auth", "--write", "--headless", "--port", "9100"]);
+        let cli = Cli::parse_from([
+            "squelchd",
+            "auth",
+            "--write",
+            "--headless",
+            "--port",
+            "9100",
+        ]);
         match cli.command {
             Command::Auth(args) => {
                 assert!(args.write);
@@ -2552,9 +2570,8 @@ mod tests {
     /// link to a port nothing is listening on.
     #[test]
     fn the_default_pair_url_follows_the_resolved_bind() {
-        let default_for = |bind: &str| {
-            pair_base_url(&PairArgs { url: None }, bind.parse().unwrap()).unwrap()
-        };
+        let default_for =
+            |bind: &str| pair_base_url(&PairArgs { url: None }, bind.parse().unwrap()).unwrap();
 
         assert_eq!(default_for("127.0.0.1:9000"), "http://127.0.0.1:9000");
         // A wildcard bind keeps the PORT and prints as loopback: `0.0.0.0` is
@@ -2729,19 +2746,10 @@ mod tests {
         );
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mcp")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_ne!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "/mcp must be mounted"
-        );
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "/mcp must be mounted");
     }
 
     /// The metrics bind IS the feature flag: absent or blank means no listener,

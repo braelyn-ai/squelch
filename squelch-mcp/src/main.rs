@@ -61,9 +61,7 @@ fn select_transport() -> anyhow::Result<Transport> {
                 // Optional inline address: `--http 127.0.0.1:9000`.
                 if let Some(next) = args.next() {
                     if next.starts_with('-') {
-                        return Err(anyhow::anyhow!(
-                            "unexpected argument `{next}` after --http"
-                        ));
+                        return Err(anyhow::anyhow!("unexpected argument `{next}` after --http"));
                     }
                     flag_addr = Some(next);
                 }

@@ -81,7 +81,8 @@ const MAX_TTL_DAYS: i64 = 365;
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_env("SQUELCH_CONTROL_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_env("SQUELCH_CONTROL_LOG")
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 

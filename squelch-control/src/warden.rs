@@ -159,11 +159,8 @@ impl TenantStatus {
 pub trait Warden: Send + Sync {
     /// Call 1: record the tenant and learn the recipient to seal to. Idempotent
     /// for a pending label with the same `account_email`.
-    async fn create_tenant(
-        &self,
-        label: &str,
-        account_email: &str,
-    ) -> Result<Created, WardenError>;
+    async fn create_tenant(&self, label: &str, account_email: &str)
+    -> Result<Created, WardenError>;
 
     /// Call 2: install the sealed credential and provision. `cred_read_ciphertext`
     /// MUST be age armor.
@@ -572,10 +569,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(w.pair("good").await.unwrap().pair_code, "ABCD-EFGH");
-        assert!(matches!(
-            w.pair("bad").await,
-            Err(WardenError::BadPairing)
-        ));
+        assert!(matches!(w.pair("bad").await, Err(WardenError::BadPairing)));
         assert!(matches!(
             w.pair("gone").await,
             Err(WardenError::UnknownTenant)

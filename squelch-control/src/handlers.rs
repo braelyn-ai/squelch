@@ -199,7 +199,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         Ok(None) => return reject(INVITE_REFUSED, &label),
         Err(e) => {
             tracing::error!(error = %e, "invite lookup failed");
-            return reject("Something went wrong on our side. Please try again.", &label);
+            return reject(
+                "Something went wrong on our side. Please try again.",
+                &label,
+            );
         }
     }
 
@@ -211,7 +214,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         Ok(false) => {}
         Err(e) => {
             tracing::error!(error = %e, "label lookup failed");
-            return reject("Something went wrong on our side. Please try again.", &label);
+            return reject(
+                "Something went wrong on our side. Please try again.",
+                &label,
+            );
         }
     }
     match state.warden().status(&label).await {
@@ -238,7 +244,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         (Ok(a), Ok(b)) => (a, b),
         _ => {
             tracing::error!("the system random source failed");
-            return reject("Something went wrong on our side. Please try again.", &label);
+            return reject(
+                "Something went wrong on our side. Please try again.",
+                &label,
+            );
         }
     };
 
@@ -246,7 +255,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "building the consent url failed");
-            return reject("Something went wrong on our side. Please try again.", &label);
+            return reject(
+                "Something went wrong on our side. Please try again.",
+                &label,
+            );
         }
     };
 
@@ -266,7 +278,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         Ok(None) => return reject(INVITE_REFUSED, &label),
         Err(e) => {
             tracing::error!(error = %e, "reserving the invite failed");
-            return reject("Something went wrong on our side. Please try again.", &label);
+            return reject(
+                "Something went wrong on our side. Please try again.",
+                &label,
+            );
         }
     };
 
@@ -282,7 +297,10 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         Instant::now(),
     );
     if let Err(InsertError::Full) = inserted {
-        tracing::warn!(sessions = state.live_sessions(), "signup session table full");
+        tracing::warn!(
+            sessions = state.live_sessions(),
+            "signup session table full"
+        );
         // The session that would have held this code does not exist, so the
         // hold is handed back rather than left to lapse on its own.
         release_invite(&state, invite_id, &holder);
@@ -464,8 +482,7 @@ pub async fn oauth_callback(
         let console_label = claimed_console.then(|| claim.label.clone());
         return done(refused_session_for(&state, console_label.as_deref()));
     };
-    let console_label =
-        matches!(session.kind, SessionKind::Console).then(|| session.label.clone());
+    let console_label = matches!(session.kind, SessionKind::Console).then(|| session.label.clone());
     let console_label = console_label.as_deref();
 
     // From here the session is gone but a signup's invite is still held, so
@@ -565,7 +582,11 @@ pub async fn oauth_callback(
     // back only the public half. Nothing is encrypted yet and no credential
     // exists on the far side: what this creates is a reservation, tied to this
     // mailbox, that only this mailbox can complete.
-    let created = match state.warden().create_tenant(&label, &grant.account_email).await {
+    let created = match state
+        .warden()
+        .create_tenant(&label, &grant.account_email)
+        .await
+    {
         Ok(c) => c,
         Err(WardenError::LabelTaken) => {
             release();
@@ -656,7 +677,9 @@ pub async fn oauth_callback(
             StoreError::LabelTaken | StoreError::AccountTaken => {
                 "That address or account was claimed while you were signing in. Get in touch and we will sort it out."
             }
-            _ => "Your mailbox was set up but we could not finish recording it. Get in touch and we will sort it out.",
+            _ => {
+                "Your mailbox was set up but we could not finish recording it. Get in touch and we will sort it out."
+            }
         };
         return done(pages::problem(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -759,10 +782,8 @@ async fn console_login(
 
     // CONSTRUCTED, not echoed: this deployment's base domain, the validated
     // label, and the validated code, percent-encoded.
-    let destination = pages::console_callback_url(
-        &state.config().tenant_url(label),
-        &pairing.pair_code,
-    );
+    let destination =
+        pages::console_callback_url(&state.config().tenant_url(label), &pairing.pair_code);
     let Ok(location) = header::HeaderValue::from_str(&destination) else {
         // Unreachable with a validated label and an encoded code; a refusal
         // rather than a panic, because the alternative is a 500 on the one route
@@ -817,8 +838,7 @@ fn console_unavailable() -> Response {
 /// the DAEMON's constant rather than typed here, because the warden mints that
 /// code by running `squelchd pair` on the box: if the daemon's TTL ever moves,
 /// this sentence moves with it instead of quietly lying to the user.
-const PAIRING_MINUTES: i64 =
-    squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS / 60;
+const PAIRING_MINUTES: i64 = squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS / 60;
 
 /// How long a signup holds its invite code: the session's own lifetime.
 ///
@@ -1007,7 +1027,10 @@ mod tests {
 
     #[test]
     fn reads_query_parameters() {
-        assert_eq!(param(Some("code=abc&state=xyz"), "code").as_deref(), Some("abc"));
+        assert_eq!(
+            param(Some("code=abc&state=xyz"), "code").as_deref(),
+            Some("abc")
+        );
         assert_eq!(param(Some("a=1"), "code"), None);
         assert_eq!(param(None, "code"), None);
     }
