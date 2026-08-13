@@ -168,7 +168,7 @@ pub struct Config {
     /// in this crate ever hardcodes the domain.
     pub base_domain: String,
     /// The squelchd image every tenant Deployment runs, e.g.
-    /// `ghcr.io/braelyn-ai/squelchd:v0.4.0`. Pinned by the operator: a tenant
+    /// `ghcr.io/braelyn-ai/squelchd:daemon-0.4.0`. Pinned by the operator: a tenant
     /// that silently moved to a new daemon on a restart would be an upgrade
     /// nobody scheduled.
     pub image: String,
@@ -401,7 +401,7 @@ impl Config {
 
         let image = var(get, "SQUELCH_WARDEN_IMAGE").ok_or_else(|| {
             ConfigError::invalid(
-                "SQUELCH_WARDEN_IMAGE is required (the squelchd image tenants run, e.g. ghcr.io/braelyn-ai/squelchd:v0.4.0)",
+                "SQUELCH_WARDEN_IMAGE is required (the squelchd image tenants run, e.g. ghcr.io/braelyn-ai/squelchd:daemon-0.4.0)",
             )
         })?;
         let image = canonical_image(&image)?;
@@ -863,7 +863,7 @@ mod tests {
             ),
             (
                 "SQUELCH_WARDEN_IMAGE".to_string(),
-                "ghcr.io/braelyn-ai/squelchd:v0.4.0".to_string(),
+                "ghcr.io/braelyn-ai/squelchd:daemon-0.4.0".to_string(),
             ),
         ])
     }
