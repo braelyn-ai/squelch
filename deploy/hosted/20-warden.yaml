@@ -93,7 +93,11 @@ spec:
             # installed via PUT /v1/tenants/{label}/llm-key). Unset = no LLM
             # env injected and llm-key installs refused. An UNMINTED tenant
             # resolves no key at all and runs heuristic-only triage until
-            # `squelch-control llm mint`.
+            # `squelch-control llm mint`. True only of tenants THIS warden
+            # rendered: one provisioned before the shared-key bridge was
+            # removed still carries the legacy ANTHROPIC_API_KEY env, and is
+            # 401ing on every Stage-2 call rather than idling, until llm mint
+            # re-applies its Deployment. See PRODUCTION.md, "History".
             - name: SQUELCH_WARDEN_LLM_BASE_URL
               value: https://bifrost.passband.app/anthropic
             # 5. EDIT ME. The control plane's origin, handed to every tenant
