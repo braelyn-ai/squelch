@@ -248,19 +248,25 @@ you put the daemon in a crash loop.
 
 ### Retirement and suppression
 
-Only a carrier's "I have never heard of this number" counts against a package.
-Rate limits, auth failures and transport errors are the carrier's problem, not
-the number's: they leave `poll_failures` alone and leave `last_polled_at`
-unstamped, so a skipped row stays first in line. A successful poll resets the
-counter to zero.
+Only a carrier's "I have never heard of this number" counts against a package,
+and only once the package is old enough to have been handed over: a rejection
+inside the first 72 hours is recorded but not counted. Retailers routinely mail a
+waybill before the parcel reaches the carrier, so a fresh 404 means "not yet",
+not "never". Rate limits and auth failures are the carrier's problem rather than
+the number's and never count. Transport errors do not count either, but they do
+stamp the attempt, so one unanswerable number cannot hold the front of the queue
+and starve every other package behind it.
 
-At `max_failures` consecutive rejections the row leaves the pollable set for
-good. It also disappears from `GET /client/shipments` and from the agent door's
-`get_shipments`, but only if its tracking number is one of the *ambiguous* bare
-digit shapes: a number in a shape a retailer item id shares, that no carrier will
-acknowledge, was probably never a tracking number. A `1Z…`, `TBA…` or IMpb row is
-never hidden however badly it polls. The rows stay in the database either way;
-this is a read-side filter, and one successful poll brings a row straight back.
+At `max_failures` counted rejections the row leaves the pollable set. It also
+disappears from `GET /client/shipments` and from the agent door's
+`get_shipments`, but only if its tracking number is *ambiguous*, meaning it does
+not identify its own carrier: a number in a shape a retailer item id shares, that
+no carrier will acknowledge, was probably never a tracking number. A `1Z…`,
+`TBA…` or IMpb row is never hidden however badly it polls.
+
+Retirement is not permanent. The rows stay in the database, the listing filter is
+read-side only, and either a successful poll or a new email that the state
+machine accepts clears the counter and brings the package back.
 
 ### Forcing a pass
 
