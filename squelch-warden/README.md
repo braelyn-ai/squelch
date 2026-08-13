@@ -61,6 +61,8 @@ it costs a compare.
 | `POST /v1/tenants` | `201 { recipient }` | `409` label taken, `422` invalid label / address, `400` malformed JSON |
 | `PUT /v1/tenants/{label}/credentials` | `200 { pair_code, pair_url, deep_link }` | `404` unknown label, `409` already serving, `422` unarmored ciphertext, `500` machine reason |
 | `GET /v1/tenants/{label}` | `200 { status }`: `pending` / `active` / `failed` / `stopped` | `404` |
+| `GET /v1/tenants/{label}/drift` | `200 { status, deployment_present, foreign, changes }` | `404`, `422` invalid label, `500` machine reason |
+| `POST /v1/tenants/{label}/reconcile` | `200 { deployment, status }`: `converged` / `recreated` / `created` | `404`, `409 not_reconcilable`, `500` machine reason |
 | `POST /v1/tenants/{label}/pair` | `200 { pair_code, pair_url, deep_link }` | `404`, `500 no_ready_pod` |
 | `DELETE /v1/tenants/{label}` | `204` (workload gone, **data kept**) | - |
 | `GET /healthz` | `200 ok` (no token: it is a probe and says nothing) | - |
@@ -291,80 +293,91 @@ duplicating. That is why there is no unwind code: a best-effort teardown running
 on a cluster that is already misbehaving is worse than leaving objects the next
 attempt overwrites.
 
-### What does not reconcile
+### What reconciles, and only when asked
 
 Kube's control loop keeps each tenant's pod matching the objects the warden
-wrote. **Nothing keeps those objects matching the warden's current code.** A
-tenant's Ingress, NetworkPolicy, Service and Deployment are written once, during
-phase two, and are never revisited unless that tenant is provisioned again.
+wrote. **Nothing keeps those objects matching the warden's current code on its
+own.** A tenant's Ingress, NetworkPolicy, Service and Deployment are written
+during phase two and are not revisited until somebody asks.
 
-So a change to the SHAPE of a tenant reaches new tenants only: a path added to
-`HUMAN_DOOR_PREFIXES`, a new environment variable in the pod, a changed
-NetworkPolicy peer. Tenants that already exist keep whatever shape they were
-provisioned with, on an image that may itself be newer, and nothing anywhere
-reports the drift. Deploying a new warden is not a migration.
+So a change to the SHAPE of a tenant reaches new tenants by itself and existing
+ones never: a path added to `HUMAN_DOOR_PREFIXES`, a new environment variable in
+the pod, a changed NetworkPolicy peer. Deploying a new warden is not a migration.
+What it is instead is two routes an operator drives:
 
-Two ways to land a shape change on existing tenants today, both by hand:
+- **`GET /v1/tenants/{label}/drift`** — what is wrong with this tenant.
+  Read-only; the only write it makes is a dry run.
+- **`POST /v1/tenants/{label}/reconcile`** — put it back on today's render.
 
-**1. Apply the object yourself.** Fine for an Ingress or a NetworkPolicy, which
-nothing has to restart to pick up. The Ingress, per tenant, matching what
-`objects.rs::ingress` builds (substitute the label, the base domain, the ingress
-class and the wildcard Secret if yours differ). Server-side, under the warden's
-OWN field manager, because that is how the warden wrote it: a client-side
-`kubectl apply` would leave a second manager owning half the fields and the next
-provision would fight it.
+On demand and per label, not a controller, deliberately: a loop that re-applies
+to every tenant is a loop that can take every mailbox down on one bad render,
+whereas a route an operator drives is run against one tenant, verified, and then
+walked across the list. `squelch-control drift` (fleet-wide, exits 1 on drift)
+and `squelch-control reconcile <label>` are the other end of both.
 
-```sh
-kubectl apply --server-side --field-manager=squelch-warden --force-conflicts -f - <<'EOF'
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: alice
-  namespace: tenants
-  labels:
-    app.kubernetes.io/name: squelchd
-    app.kubernetes.io/instance: alice
-    app.kubernetes.io/managed-by: squelch-warden
-spec:
-  ingressClassName: traefik
-  tls:
-    - hosts: ["alice.passband.email"]
-      secretName: passband-wildcard-tls
-  rules:
-    - host: alice.passband.email
-      http:
-        paths:
-          - path: /client
-            pathType: Prefix
-            backend: { service: { name: alice, port: { name: http } } }
-          - path: /console
-            pathType: Prefix
-            backend: { service: { name: alice, port: { name: http } } }
-          - path: /t
-            pathType: Prefix
-            backend: { service: { name: alice, port: { name: http } } }
-EOF
-```
+#### Two detectors, because each kind of drift is invisible to the other
 
-That is hand-written YAML carrying a tenant label, which is exactly what the
-crate's hard rule forbids INSIDE the warden. Outside it, on an operator's
-terminal, with the label already provisioned and in front of a human, it is the
-honest workaround rather than a bug — and it is the strongest argument for the
-reconcile route below.
+A drift report answers two independent questions:
 
-**2. `DELETE` then `PUT` the credential again.** The general answer, and the only
-one for a change to the pod (a new environment variable, new resources, a new
-image). `DELETE /v1/tenants/{label}` removes the workload and **keeps the data**
-— both Secrets and the volume survive — and a `PUT
-/v1/tenants/{label}/credentials` with the tenant's current sealed blob rebuilds
-every object from today's code. The cost is a recycled pod: that mailbox is down
-for the length of a provision, in-flight requests fail, and the control plane
-must still hold the ciphertext to re-send.
+1. **Who else owns something here?** `metadata.managedFields` is the API
+   server's ownership ledger. `drift::foreign_managers` walks every entry that
+   is not the warden's (and not the controller's `status` bookkeeping) into
+   dotted paths, and any surviving path is the finding.
+2. **What would an apply change?** The warden renders this tenant's Deployment
+   from today's code, sends it as a `dryRun=All` server-side apply, and diffs
+   the merged object the API server hands back against the live spec.
 
-The real fix is a reconcile route on the warden, filed as a design note in
-`deploy/hosted/PRODUCTION.md`'s open items. It is deliberately not in this slice:
-a controller that re-applies to live tenants is a thing that can take every
-tenant down at once, and it wants its own change with its own tests.
+Detector 1 is needed because SSA owns FIELDS, not objects: a field the warden
+does not declare belongs to whoever wrote it, so the warden's applies converge
+around it forever and detector 2 never mentions it — it is identical on both
+sides of that diff. One `kubectl set env` is otherwise invisible to this service
+for the rest of the tenant's life.
+
+Detector 2 is needed because ownership says nothing about VALUES. A tenant
+provisioned two releases ago is entirely warden-owned, with a spotless ledger,
+running an old image, an old env block and old resource bounds.
+
+Exactly one path is dropped from a report,
+`metadata.annotations.deployment.kubernetes.io/revision`: the deployment
+controller writes it on every rollout, so reporting it would mark every tenant
+permanently drifted and make the report worth nothing.
+
+#### Delete-and-recreate, and the wait in the middle
+
+A reconcile re-applies the PVC, NetworkPolicy, Service, Deployment and Ingress
+in provision order and does not answer until a pod is Ready. When foreign
+managers own part of the Deployment it deletes the Deployment first and applies
+a fresh one, whose ownership ledger starts empty and carries exactly what the
+warden declares. There is no forced apply that takes a foreign field back:
+`--force-conflicts` settles a conflict over a field the applier declares and
+never removes one it does not. So the answer says which happened — `converged`
+(applied in place), `recreated` (a purge, and a rolled pod), `created` (a
+`DELETE` landed while it was working).
+
+Between the delete and the apply it waits for the old pod to be GONE, not merely
+not-Ready. The data volume is `ReadWriteOnce` and the daemon is one SQLite file;
+inside one Deployment the `Recreate` strategy guarantees no overlap, but across a
+delete and a re-create nothing holds that promise, so `Cluster::pods_gone` holds
+it here. A timeout is a refusal (`pods_not_gone`), never a second writer.
+
+That window costs something worth knowing about: while it is open the tenant has
+no Deployment, so a reconcile that dies inside it leaves a `stopped` tenant,
+which this route then refuses. Recovery is the path a stopped tenant already
+has — the control plane re-`PUT`s the sealed credential it holds, and every
+object comes back from today's code — with the volume, the identity and the
+credential exactly where they were.
+
+`active` and `failed` both proceed. Failed is precisely the incident state, a
+pod wedged on a foreign secret reference with no ready replica, and refusing it
+would make the route useless in the case it exists for. `pending` and `stopped`
+are `409 not_reconcilable`: neither has a workload, and bringing one up is
+somebody else's transition (a signup to finish, an account to reopen), not a
+shape repair.
+
+Secrets are never rewritten. A reconcile converges SHAPE; the sealed credential
+and the LLM key are read back only to re-derive the two SHA-256 annotations on
+the pod template, so the render is the one that tenant is entitled to rather
+than a new one, and a re-render on its own does not roll the pod.
 
 ## Logging
 
@@ -394,8 +407,12 @@ node CIDR), that the metrics port is admitted to one pod and published by
 neither the Service nor the Ingress, the `/mcp` arrangement on the Ingress, the
 pending-label idempotency, the 409 both ways round including a lost create race,
 that a new ciphertext rolls the pod and a stopped tenant can be
-re-credentialed, that the sweep collects abandoned pending tenants and nothing
-else, every 4xx path, that DELETE keeps the volume and both Secrets, a 401 for
+re-credentialed, that a drift report names the manager behind a hand edit and
+says nothing about the three owners every healthy Deployment has, that a
+reconcile converges a clean tenant, delete-recreates one another manager owns,
+refuses to apply while the old pod still holds the volume, and refuses a tenant
+with no workload at all, that the sweep collects abandoned pending tenants and
+nothing else, every 4xx path, that DELETE keeps the volume and both Secrets, a 401 for
 every way of getting the bearer wrong, that a cluster error never reaches a log
 line verbatim, the boot-refusal table for every environment variable, and the
 pairing parser against a captured copy of the daemon's real output.
