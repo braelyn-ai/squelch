@@ -12,6 +12,8 @@ struct RootView: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
+        @Bindable var store = store
+
         Group {
             switch store.connStatus {
             case .loading:
@@ -22,6 +24,14 @@ struct RootView: View {
                 ConnectView()
             }
         }
+        // ADD ACCOUNT — the same form as the gate, over a working app. Hung on
+        // the whole shell rather than on any one surface: it is raised from
+        // Settings, from the rail's account menu, from the Accounts menu, and
+        // by a pair link from a second daemon, and none of those can be sure
+        // which page is on screen.
+        .sheet(isPresented: $store.addAccountSheetOpen) {
+            ConnectView(purpose: .addAccount)
+        }
         .task {
             // Pay WebKit's process-launch cost at boot rather than on the first
             // email the reader opens.
@@ -31,7 +41,11 @@ struct RootView: View {
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
                 SitrepPoller.shared.start()
-                EventStream.shared.start()
+                // EVERY account's ears, not just the live one's: the poller
+                // above follows whichever mailbox is on screen, while the event
+                // feeds (and, for the inactive accounts, the auth watches) are
+                // how the human hears about mail in the ones that are not.
+                AccountManager.shared.startAllFeeds()
                 // Warm the emails page at CONNECT, not on its first visit: the
                 // list lives in the store, so fetching it now means opening the
                 // page lands on rows instead of on "loading mail…". This also
@@ -44,7 +58,12 @@ struct RootView: View {
                 Task { await store.refreshTrackingConfig() }
             } else {
                 SitrepPoller.shared.stop()
-                EventStream.shared.stop()
+                AccountManager.shared.stopAllFeeds()
+                // The Connect gate is now the whole window, and it is the same
+                // form the sheet holds. Leaving one stacked on the other would
+                // offer two ways to connect at once, the front one adding an
+                // account to an install that no longer has any.
+                store.addAccountSheetOpen = false
             }
         }
     }

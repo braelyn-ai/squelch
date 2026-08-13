@@ -67,7 +67,9 @@
 		4DF190F34838471A99C7213B /* Chrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0E547B2A7CA1DA951D255C /* Chrome.swift */; };
 		4E260638B2736F4A91E83841 /* EmailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D358053F47CDAD2D0B7EAB5 /* EmailsView.swift */; };
 		513F475DB3A83BED4F68A57D /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
+		51B35B5F4D9B0D7D61BC44B9 /* BackgroundAuthWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */; };
 		553D7088D2A4B65FCAA59E61 /* ImageWarmer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 582A0094F147273BA003C4B6 /* ImageWarmer.swift */; };
+		57D260FC9FFF00F0F3DB336E /* Accounts.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4806E9349EDC2C9EF8520C5 /* Accounts.swift */; };
 		5A8A0E6E45A1AF07A426F4A1 /* AttachmentPreviewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A1CE9442DCA54FF7863D7C5 /* AttachmentPreviewiOS.swift */; };
 		5AB209F662F02A1426CD72C0 /* ProcessMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3484EC544E0909F3D7A88E26 /* ProcessMode.swift */; };
 		5CE1E70309CEFF44F81AD969 /* Notifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = B13A2C48EBA35F12689998E3 /* Notifier.swift */; };
@@ -139,6 +141,7 @@
 		B36D0542B36A1421D26CA968 /* Platform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37AEAA24984488DA00EBD6C4 /* Platform.swift */; };
 		B3BD3AFC1DED8C5544D23602 /* PassbandiOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F714235A8E6F4742ABF772B3 /* PassbandiOSApp.swift */; };
 		B5D62B99FA378656F0BCF7DD /* AttachmentThumbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE85FBF58B14F2DC27FC16FB /* AttachmentThumbs.swift */; };
+		B630FFBD5E9BB701A32D3D7D /* BackgroundAuthWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */; };
 		B65E72D6B22EB9694BFEB245 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89A44DCD12D99794B8DF43B0 /* AuthView.swift */; };
 		B6F86A1B7C9CECBF25C347FA /* SitrepZones.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B6CF4EF83BEF15EB372184 /* SitrepZones.swift */; };
 		B91230E83D52E90A46495F77 /* WireTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C9F46E8DA615783DD2BEAF6 /* WireTypes.swift */; };
@@ -185,6 +188,7 @@
 		E4B1EE75A584D999AA58B0E2 /* MarkdownTextViewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9FAE568A595DDCE359FFA33 /* MarkdownTextViewiOS.swift */; };
 		E5DC83A762609363C2ED15CB /* Actions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10544C7DF8CDBA851AF0D9D8 /* Actions.swift */; };
 		E796A08FD35B6AFC987CF6A6 /* HTMLImg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 579ABC2B7707848B4AED6F18 /* HTMLImg.swift */; };
+		E96078DC56E87F722CEBEDE8 /* Accounts.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4806E9349EDC2C9EF8520C5 /* Accounts.swift */; };
 		EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */ = {isa = PBXBuildFile; fileRef = E645BA6EC9A8686D95460095 /* SubjectText.swift */; };
 		EA82308C99D5B6C590E73289 /* AgentTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E7DFB379AF677D44E393FF /* AgentTools.swift */; };
 		EB3A6A193AE3E0C7EDD7E459 /* MobileRecordsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 356A38CCAAFCC056126A2978 /* MobileRecordsView.swift */; };
@@ -267,6 +271,7 @@
 		5283FAB3FFAED5F77BF41F71 /* TourController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TourController.swift; sourceTree = "<group>"; };
 		54C5FAF93A0E521B9AA4DB60 /* PassbandiOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = PassbandiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5512C13F456F49B6DF7B182B /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
+		568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundAuthWatch.swift; sourceTree = "<group>"; };
 		579ABC2B7707848B4AED6F18 /* HTMLImg.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLImg.swift; sourceTree = "<group>"; };
 		582A0094F147273BA003C4B6 /* ImageWarmer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageWarmer.swift; sourceTree = "<group>"; };
 		5883BA424612265657845246 /* Format.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Format.swift; sourceTree = "<group>"; };
@@ -317,6 +322,7 @@
 		D0318A22219D3A1E36429C76 /* MobileToastHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileToastHost.swift; sourceTree = "<group>"; };
 		D179CAC9853B13A5FBFD968E /* Updater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Updater.swift; sourceTree = "<group>"; };
 		D4382469FC056D0CD54B22F3 /* Raster.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Raster.swift; sourceTree = "<group>"; };
+		D4806E9349EDC2C9EF8520C5 /* Accounts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Accounts.swift; sourceTree = "<group>"; };
 		DA80DD18A355200FB6274585 /* Sessions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sessions.swift; sourceTree = "<group>"; };
 		E1C033DDA02DD344F437F943 /* Concurrency.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Concurrency.swift; sourceTree = "<group>"; };
 		E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SenderIdentity.swift; sourceTree = "<group>"; };
@@ -460,12 +466,14 @@
 		4800BF974871EC3DC431AF40 /* Model */ = {
 			isa = PBXGroup;
 			children = (
+				D4806E9349EDC2C9EF8520C5 /* Accounts.swift */,
 				10544C7DF8CDBA851AF0D9D8 /* Actions.swift */,
 				613B9741AD84024778FA8204 /* APIClient.swift */,
 				37716282CFABFF5910677BBC /* APIError.swift */,
 				6D18C66DBE79E1F7D55CD6DD /* AppStore.swift */,
 				BE85FBF58B14F2DC27FC16FB /* AttachmentThumbs.swift */,
 				FE241E317BA5B3B4D25B892E /* AuthArrival.swift */,
+				568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */,
 				35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */,
 				06A50E65F84872DFA0504B96 /* DraftSaver.swift */,
 				CE462B9CE6C195F53B48B801 /* EventStream.swift */,
@@ -727,6 +735,7 @@
 			files = (
 				37BD268312E51B58C631C8AC /* APIClient.swift in Sources */,
 				16B0C0F30C085FB37AB94D2A /* APIError.swift in Sources */,
+				E96078DC56E87F722CEBEDE8 /* Accounts.swift in Sources */,
 				022DB1DE5C307F7EFF36AFE5 /* ActionLayer.swift in Sources */,
 				E5DC83A762609363C2ED15CB /* Actions.swift in Sources */,
 				8584D208439539843BAE4481 /* AgentTools.swift in Sources */,
@@ -744,6 +753,7 @@
 				D1722EF952905C3BCED61CD5 /* AuthCodeModal.swift in Sources */,
 				B65E72D6B22EB9694BFEB245 /* AuthView.swift in Sources */,
 				26C5B834CA3DF63D12F9AAC4 /* Avatar.swift in Sources */,
+				51B35B5F4D9B0D7D61BC44B9 /* BackgroundAuthWatch.swift in Sources */,
 				4DF190F34838471A99C7213B /* Chrome.swift in Sources */,
 				D5661B76861FC80076B129EC /* ComposePane.swift in Sources */,
 				618C4DEC49021D6608427CB1 /* ComposeSubmit.swift in Sources */,
@@ -825,6 +835,7 @@
 			files = (
 				BFBC16B9E116B690313D1B5C /* APIClient.swift in Sources */,
 				93FFF0E02F7D65ADCF4824D9 /* APIError.swift in Sources */,
+				57D260FC9FFF00F0F3DB336E /* Accounts.swift in Sources */,
 				778A9FBEDBA350092B770844 /* Actions.swift in Sources */,
 				EA82308C99D5B6C590E73289 /* AgentTools.swift in Sources */,
 				C3DD204EC3377648F4153546 /* Analytics.swift in Sources */,
@@ -840,6 +851,7 @@
 				7D858C1B0E9A02383E35EB56 /* AuthCode.swift in Sources */,
 				9EA7C093CFE335E233A6411C /* AuthCodeModal.swift in Sources */,
 				4D1913697E7DE1A0B25EFDC4 /* Avatar.swift in Sources */,
+				B630FFBD5E9BB701A32D3D7D /* BackgroundAuthWatch.swift in Sources */,
 				BDE91DE1BD59B4CD5D50F21D /* Chrome.swift in Sources */,
 				99CFBE791F3799FBEFB5D213 /* ComposePane.swift in Sources */,
 				FE1D72F2A5B29E3F9DB0B1BC /* ComposeSubmit.swift in Sources */,

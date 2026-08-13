@@ -117,10 +117,59 @@ struct SidebarRail: View {
                         view: view, keyNumber: nil, active: store.activeView == view,
                         showRings: false, onSlot: { slots[view] = $0 })
                 }
+
+                accountBadge
             }
             .padding(.vertical, 10)
             .frame(width: Self.railWidth)
             .frame(maxHeight: .infinity)
+    }
+
+    /// WHICH MAILBOX YOU ARE IN, at the foot of the rail — and the fastest way
+    /// to another one. Absent with a single account: a switcher between one
+    /// thing is chrome, and the rail's whole argument is that it holds only
+    /// what earns its 60 points.
+    ///
+    /// Deliberately NOT a `RailButton`: it routes nowhere, so it takes no
+    /// selector pane and reports no slot.
+    @ViewBuilder
+    private var accountBadge: some View {
+        let manager = AccountManager.shared
+        if manager.accounts.count > 1 {
+            Menu {
+                // No `.keyboardShortcut` on these, deliberately: the Accounts
+                // menu in the menu bar owns the ⌘numbers, and a second
+                // registration of the same chord is a conflict, not a shortcut.
+                ForEach(manager.accounts) { account in
+                    Button {
+                        Task { await manager.switchTo(account.id) }
+                    } label: {
+                        if account.id == manager.activeId {
+                            Label(account.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(account.displayName)
+                        }
+                    }
+                }
+                Divider()
+                Button("Add Account…") { store.addAccountSheetOpen = true }
+            } label: {
+                Text(manager.active?.initial ?? "?")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Palette.accent)
+                    .frame(width: 26, height: 26)
+                    .background(Circle().fill(Palette.accentSoft))
+                    .overlay(Circle().strokeBorder(Palette.accent.opacity(0.35), lineWidth: 0.75))
+            }
+            // The default menu chrome is a bordered well with a chevron, which
+            // in a 60pt icon rail reads as a broken button. The badge IS the
+            // affordance.
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: Self.iconWidth, height: Self.iconHeight)
+            .help(manager.active.map { "account: \($0.displayName)" } ?? "accounts")
+            .accessibilityLabel("switch account")
+        }
     }
 
     private var railMaterial: some View {

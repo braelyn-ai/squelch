@@ -891,6 +891,16 @@ final class WebFramePool {
         }
     }
 
+    /// Drop every parked frame. An account switch: the key's `message` is a
+    /// message id, which is one daemon's — and a live WebKit attachment still
+    /// holding the old account's document is not something to hand the new one
+    /// on a key collision.
+    func wipeAll() {
+        for (_, entry) in frames { Self.discard(entry) }
+        frames.removeAll()
+        order.removeAll()
+    }
+
     /// A dropped frame has to be UNWIRED, not just released: the content controller
     /// retains the relay and the relay is the frame's delegate, so letting go
     /// leaves a live target for a late navigation or script callback.

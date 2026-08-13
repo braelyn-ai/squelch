@@ -32,16 +32,34 @@ final class ThreadPrefetch {
     /// threadId -> the warmer's repeated-image map. Rides the same LRU as the
     /// view it was derived from, being meaningful only beside one.
     private var repeated: [String: [Int: Set<String>]] = [:]
+    /// Bumped by `wipe()`. Every fetch this class starts captures it and files
+    /// nothing once it no longer matches: a thread fetched for the old account
+    /// must not land in the new account's cache, and the trickle of a batch
+    /// warm must not keep asking the NEW daemon for the OLD one's thread ids.
+    private var generation = 0
 
     private init() {}
 
-    private func put(_ threadId: String, _ view: ClientThreadView, fresh: TimeInterval) {
+    private func put(
+        _ threadId: String, _ view: ClientThreadView, fresh: TimeInterval, gen: Int
+    ) {
+        guard gen == generation else { return }
         // A view leaving the cache takes its repeated-image map with it — the
         // map is meaningful only beside the view it was derived from.
         if let evicted = cache.set(threadId, Entry(view: view, ts: Date(), fresh: fresh)) {
             repeated.removeValue(forKey: evicted)
         }
         warmBodies(threadId, view)
+    }
+
+    /// Drop everything, cache and in-flight bookkeeping alike. An account
+    /// switch: thread ids, the message ids inside the views, and the
+    /// repeated-image maps keyed off both all belong to one daemon.
+    func wipe() {
+        generation &+= 1
+        cache.removeAll()
+        repeated.removeAll()
+        inflight.removeAll()
     }
 
     /// Fire-and-forget fetch + cache. Deduped while in flight; a fresh hit is a
@@ -59,12 +77,21 @@ final class ThreadPrefetch {
         }
         guard !inflight.contains(threadId) else { return }
         inflight.insert(threadId)
+        let gen = generation
         Task { [weak self] in
-            defer { self?.inflight.remove(threadId) }
+            defer { self?.settled(threadId, gen: gen) }
             // Prefetch is best-effort; the real open surfaces any error.
             guard let view = try? await APIClient.shared.getThread(threadId) else { return }
-            self?.put(threadId, view, fresh: ttl)
+            self?.put(threadId, view, fresh: ttl, gen: gen)
         }
+    }
+
+    /// Retire an in-flight marker — unless a `wipe()` has emptied the table
+    /// since, in which case the marker under this id is a NEWER fetch's and
+    /// clearing it would let a third copy start.
+    private func settled(_ threadId: String, gen: Int) {
+        guard gen == generation else { return }
+        inflight.remove(threadId)
     }
 
     /// A fresh cached view for instant render, or nil.
@@ -81,15 +108,17 @@ final class ThreadPrefetch {
         if let hit = cache.get(threadId), Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
             return hit.view
         }
+        let gen = generation
         let view = try await APIClient.shared.getThread(threadId)
-        put(threadId, view, fresh: ttl)
+        put(threadId, view, fresh: ttl, gen: gen)
         return view
     }
 
     /// Let the viewer's own (authoritative) fetch feed the cache, so the next
-    /// reopen is instant too.
+    /// reopen is instant too. Synchronous, so the live generation is by
+    /// definition the one this view was fetched under.
     func note(_ threadId: String, _ view: ClientThreadView) {
-        put(threadId, view, fresh: Self.freshDefault)
+        put(threadId, view, fresh: Self.freshDefault, gen: generation)
     }
 
     // MARK: - prepared bodies
@@ -163,11 +192,16 @@ final class ThreadPrefetch {
         for id in threadIds.prefix(immediate) { prefetch(id) }
         let rest = Array(threadIds.dropFirst(immediate))
         guard !rest.isEmpty else { return }
+        let gen = generation
         Task { [weak self] in
             for id in rest {
                 try? await Task.sleep(for: spacing)
                 if Task.isCancelled { return }
-                self?.prefetch(id)
+                // The list belongs to ONE account. A switch mid-trickle must
+                // abandon the rest of it rather than ask the new daemon for
+                // thread ids it has never heard of.
+                guard let self, gen == self.generation else { return }
+                self.prefetch(id)
             }
         }
     }
@@ -220,4 +254,9 @@ final class FrameHeights {
     func get(_ key: String) -> CGFloat? { heights[key] }
     func set(_ key: String, _ height: CGFloat) { heights[key] = height }
     func clear(_ key: String) { heights.removeValue(forKey: key) }
+
+    /// Forget every height. An account switch: the keys are message ids, one
+    /// daemon's, so a surviving entry paints the new account's mail at the old
+    /// account's size and then snaps — which reads as a rendering glitch.
+    func wipeAll() { heights.removeAll() }
 }

@@ -104,6 +104,13 @@ final class SitrepPoller {
 
     /// Returns whether the daemon answered; the caller decides what a failure costs.
     private func performPull() async -> Bool {
+        // The account this pull is ABOUT. A switch bumps the store's epoch, and
+        // everything below writes the read model the whole app renders — bands
+        // keyed by per-daemon message ids most of all. A stale answer reports
+        // `true`: nothing was asked of the NEW daemon, so there is nothing for
+        // the backoff loop to back off from (and that loop is stopped by the
+        // switch anyway).
+        let e = store.epoch
         do {
             async let standing = APIClient.shared.getUpdates(
                 UpdatesParams(band: .standing, limit: Self.pageLimit))
@@ -115,6 +122,7 @@ final class SitrepPoller {
             async let sealed = APIClient.shared.listSealed()
 
             let (s, f, o, st, sl) = try await (standing, fresh, open, stats, sealed)
+            guard store.isCurrent(e) else { return true }
             let next = SitrepData(
                 standing: s.items, new: f.items, open: o.items, stats: st, sealed: sl)
             // ASSIGN ONLY ON CHANGE: @Observable notifies on assignment, not on
@@ -166,6 +174,7 @@ final class SitrepPoller {
             await store.refreshZones()
             return true
         } catch {
+            guard store.isCurrent(e) else { return true }
             // Transition only, before the error lands — count outages, not
             // every failing poll of one.
             if store.refreshError == nil { Analytics.capture("connection_lost") }

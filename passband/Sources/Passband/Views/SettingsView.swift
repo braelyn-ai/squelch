@@ -1081,26 +1081,47 @@ private struct PrivacySection: View {
 
 // MARK: - account
 
+/// THE ACCOUNT LIST: every mailbox this install knows about, in the order the
+/// ⌘number chords address them, plus the two verbs that change the list (add,
+/// remove) and the one that changes which is live.
+///
+/// The rows read `AccountManager` rather than the keychain: a settings pane
+/// re-renders constantly and a keychain read can raise the system's access
+/// panel, so the host each row shows is the non-secret one the index carries
+/// (see `AccountRecord.displayHost`).
 private struct AccountSection: View {
     @Environment(AppStore.self) private var store
     @State private var usage: UsageResponse?
 
+    private var accounts: [AccountRecord] { AccountManager.shared.accounts }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SectionCard(label: "Account") {
-                meta("server", store.settings?.serverURL ?? "—")
-                meta("triage model", usage?.model ?? "—")
-                meta("provider", usage?.provider ?? "—")
-            }
-            SectionCard(label: "Danger") {
+            SectionCard(label: "Accounts") {
+                ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                    AccountRow(
+                        account: account, number: index + 1,
+                        isActive: account.id == AccountManager.shared.activeId,
+                        isOnly: accounts.count == 1)
+                    if account.id != accounts.last?.id { Hairline() }
+                }
                 HStack(spacing: 12) {
-                    Button("Disconnect") { store.disconnect() }
+                    Button("Add Account…") { store.addAccountSheetOpen = true }
                         .buttonStyle(.glassProminent)
-                        .tint(Palette.danger)
-                    Text("clears saved settings and returns to the connect screen")
+                        .tint(Palette.accent)
+                    Text("one daemon per mailbox, each with its own rules and triage")
                         .font(Typo.micro)
                         .foregroundStyle(Palette.inkFaintest)
                 }
+                .padding(.top, 4)
+                SettingsHint(
+                    "⌘1 through ⌘9 switch accounts in the order listed here. Tokens live in your macOS keychain, one pair of slots per account."
+                )
+            }
+            SectionCard(label: "Live account") {
+                meta("server", store.settings?.serverURL ?? "—")
+                meta("triage model", usage?.model ?? "—")
+                meta("provider", usage?.provider ?? "—")
             }
         }
         // Usage is decorative here; errors are ignored.
@@ -1117,5 +1138,100 @@ private struct AccountSection: View {
                 .textSelection(.enabled)
             Spacer()
         }
+    }
+}
+
+/// One account: its dot, its editable name, the daemon behind it, and the two
+/// things you can do to it.
+private struct AccountRow: View {
+    @Environment(AppStore.self) private var store
+    let account: AccountRecord
+    /// Position in the list, which IS the ⌘number.
+    let number: Int
+    let isActive: Bool
+    /// The last account standing. Removing it is a Disconnect: there is no
+    /// survivor to switch to, so the app lands back on the Connect gate.
+    let isOnly: Bool
+
+    /// The edit buffer. Committed on blur and on Enter — the same "clicking
+    /// away saves" rule the connection fields above follow.
+    @State private var label = ""
+    /// Remove is two presses. A mis-click here deletes a token that only the
+    /// daemon can reissue, so the first press asks and the second does it.
+    @State private var confirming = false
+    @FocusState private var labelFocused: Bool
+
+    private var removeLabel: String {
+        if confirming { return isOnly ? "confirm disconnect" : "confirm remove" }
+        return isOnly ? "disconnect" : "remove"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Live or not. A dot rather than a word: the row is already dense,
+            // and the Make Active button says the rest.
+            Circle()
+                .fill(isActive ? Palette.positive : Palette.hairline)
+                .frame(width: 7, height: 7)
+            TextField(account.displayHost.isEmpty ? "account \(number)" : account.displayHost,
+                text: $label)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .focused($labelFocused)
+                .onSubmit { labelFocused = false }
+                .frame(width: 150)
+                .fieldWell()
+            Text(account.displayHost.isEmpty ? "—" : account.displayHost)
+                .font(Typo.mono(11))
+                .foregroundStyle(Palette.inkDim)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            if number <= 9 {
+                Text("⌘\(number)")
+                    .font(Typo.mono(10))
+                    .foregroundStyle(Palette.inkFaintest)
+            }
+            if !isActive {
+                Button("make active") {
+                    Task { await AccountManager.shared.switchTo(account.id) }
+                }
+                .buttonStyle(.textAction)
+            }
+            Button(removeLabel) { remove() }
+                .buttonStyle(.textAction)
+                .foregroundStyle(Palette.danger)
+        }
+        .padding(.vertical, 4)
+        // Seeded per account id, so a removal that re-uses this row's slot in
+        // the list cannot leave the previous account's name in the field.
+        .task(id: account.id) { label = account.label }
+        .onChange(of: labelFocused) { _, nowFocused in
+            guard !nowFocused else { return }
+            AccountManager.shared.rename(account.id, to: label.trimmed)
+        }
+        // Past the ninth there is no chord to name, so the tooltip does not
+        // promise one.
+        .help(
+            isActive
+                ? "the account on screen"
+                : (number <= 9 ? "switch to this account, or ⌘\(number)" : "switch to this account")
+        )
+    }
+
+    private func remove() {
+        guard confirming else {
+            confirming = true
+            // The question expires: a row left sitting in "confirm remove" is
+            // one stray click from deleting an account nobody is thinking about
+            // any more.
+            Task {
+                try? await Task.sleep(for: .seconds(5))
+                confirming = false
+            }
+            return
+        }
+        confirming = false
+        Task { await store.removeAccount(account.id) }
     }
 }

@@ -1,8 +1,17 @@
 // THE RESIDENT NOTIFICATION FEED: one long-lived SSE connection to
 // `GET /client/events`, every frame handed to the notifier.
 //
+// ONE INSTANCE PER ACCOUNT, owned by `AccountManager` — and that includes the
+// accounts that are NOT live, because being told about mail in a mailbox
+// nobody is looking at is the entire reason to hold a connection to it.
+// Everything an instance needs is fixed at construction: the account it posts
+// under and the credentials it connects with. Nothing in here reads
+// `AppStore.shared`, which is only ever the ACTIVE account's world and would
+// have every stream in the process dialling the same daemon.
+//
 // The daemon's events table is the truth; this client carries its OWN cursor
-// (`?after=<id>`, persisted in UserDefaults) and no connection state is
+// (`?after=<id>`, persisted in UserDefaults, per account — the ids are one
+// daemon's SQLite ints and mean nothing in another) and no connection state is
 // server-side. FIRST RUN CONNECTS CURSORLESS on purpose — with no `after` the
 // server sends live events only, so a fresh install is not handed a week of
 // backlog as a notification storm. The bearer token goes in the Authorization
@@ -96,13 +105,31 @@ struct SSEParser {
 
 @MainActor
 final class EventStream {
-    static let shared = EventStream()
+    /// Whose feed this is. Rides along to every notification posted from it:
+    /// a tap on the banner has to be able to take the human to the mailbox the
+    /// mail actually arrived in.
+    let accountId: UUID
 
-    /// The client's cursor. Read with `object(forKey:)` and NOT
-    /// `integer(forKey:)`: the absent case must stay nil, because `after=0` is
-    /// the legitimate "replay the entire log" cursor on the server. Reading a
-    /// missing key as 0 would turn every fresh install into a backlog storm.
-    private static let cursorKey = "passband.events.lastSeen"
+    /// The daemon this stream talks to, FIXED FOR THE LIFE OF THE OBJECT.
+    /// Injected rather than read from the live store for the reason in the
+    /// file header — and credentials that change (a re-validated token) reach
+    /// the feed by REPLACING the stream, never by mutating one, so that a
+    /// connection can never be holding one account's URL and another's token.
+    private let settings: ConnectionSettings
+
+    /// Base name of the client's cursor; the live key is this scoped to the
+    /// account (see `cursorKey`).
+    ///
+    /// Read with `object(forKey:)` and NOT `integer(forKey:)`: the absent case
+    /// must stay nil, because `after=0` is the legitimate "replay the entire
+    /// log" cursor on the server. Reading a missing key as 0 would turn every
+    /// fresh install into a backlog storm.
+    private static let cursorKeyBase = "passband.events.lastSeen"
+
+    /// This account's cursor key, derived once. Per account because event ids
+    /// are per-daemon: one shared cursor would let the account with the busier
+    /// log suppress every notification the quieter one has to offer.
+    private let cursorKey: String
 
     private static let backoffBase: TimeInterval = 1
     private static let backoffCap: TimeInterval = 60
@@ -137,7 +164,11 @@ final class EventStream {
     /// fails the 200 check and backs off.
     private static let pinned = SchemePinned(allow: [])
 
-    private init() {}
+    init(accountId: UUID, settings: ConnectionSettings) {
+        self.accountId = accountId
+        self.settings = settings
+        self.cursorKey = AccountIndex.scopedKey(Self.cursorKeyBase, accountId)
+    }
 
     /// Start following the feed. Idempotent.
     func start() {
@@ -216,7 +247,7 @@ final class EventStream {
             let event = try? Self.decoder.decode(Event.self, from: data)
         {
             note(seen: event.id)
-            Notifier.shared.post(event)
+            Notifier.shared.post(event, accountId: accountId)
         } else if let id = frame.id.flatMap({ Int($0) }) {
             // An undecodable frame still ADVANCES the cursor, mirroring the
             // server's pump: otherwise one malformed row replays on every
@@ -228,7 +259,6 @@ final class EventStream {
     // MARK: - request
 
     private func buildRequest() -> URLRequest? {
-        guard let settings = AppStore.shared.settings else { return nil }
         var base = settings.serverURL
         while base.hasSuffix("/") { base.removeLast() }
         guard var comps = URLComponents(string: base + "/client/events") else { return nil }
@@ -252,7 +282,7 @@ final class EventStream {
     private func loadCursor() -> Int? {
         if !cursorLoaded {
             cursorLoaded = true
-            cursor = UserDefaults.standard.object(forKey: Self.cursorKey) as? Int
+            cursor = UserDefaults.standard.object(forKey: cursorKey) as? Int
         }
         return cursor
     }
@@ -264,6 +294,6 @@ final class EventStream {
         let current = loadCursor()
         guard id > (current ?? Int.min) else { return }
         cursor = id
-        UserDefaults.standard.set(id, forKey: Self.cursorKey)
+        UserDefaults.standard.set(id, forKey: cursorKey)
     }
 }

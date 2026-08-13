@@ -41,6 +41,17 @@ final class ImageWarmer {
         Task { await warmSitrepOnce(store: AppStore.shared) }
     }
 
+    /// An account switch. The warm is once per WORLD, not once per process:
+    /// the new account's bands and zones land next and have their own images
+    /// to pull down — and their own pins, which is the half that matters, since
+    /// reconciling against the OLD sitrep would unpin every image the new
+    /// account's mail still needs.
+    func resetForSwitch() {
+        sitrepLanded = false
+        zonesLanded = false
+        started = false
+    }
+
     func warmSitrepOnce(store: AppStore) async {
         // Pins first: ids the read model no longer carries were resolved while the
         // app was closed, so their images fall back into the LRU rather than

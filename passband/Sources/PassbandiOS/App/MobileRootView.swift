@@ -1,7 +1,7 @@
 // The phone shell. Same three-state gate as the Mac's RootView — loading until
 // the keychain answers, the Connect gate until there is an identity, the shell
-// after — and the same connect-time lifecycle: poller up, event stream up, the
-// inbox and the tracking config warmed.
+// after — and the same connect-time lifecycle: poller up, every account's event
+// feed up, the inbox and the tracking config warmed.
 //
 // What differs is only the shape. A Mac gets a rail and a routed page; a phone
 // gets a tab bar, which is a different navigation model rather than a smaller
@@ -61,12 +61,17 @@ struct MobileRootView: View {
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
                 SitrepPoller.shared.start()
-                EventStream.shared.start()
+                // One feed per account, live or not, plus an auth watch on each
+                // account that is not live — same as the Mac. The phone has no
+                // account switcher yet, so today that is a list of one and no
+                // watches at all; it is the same call because the lifecycle is
+                // the shell's job and the shell is the only part that differs.
+                AccountManager.shared.startAllFeeds()
                 Task { await store.refreshMail(.inbox) }
                 Task { await store.refreshTrackingConfig() }
             } else {
                 SitrepPoller.shared.stop()
-                EventStream.shared.stop()
+                AccountManager.shared.stopAllFeeds()
             }
         }
     }

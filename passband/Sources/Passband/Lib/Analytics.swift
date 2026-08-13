@@ -74,6 +74,7 @@ enum Analytics {
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
+        "account_added",
         "tour_completed", "tour_skipped",
     ]
 
@@ -89,6 +90,7 @@ enum Analytics {
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
+        "account_added",
         // Onboarding carries one number, the step it ended on. Whether the
         // first run explains itself is exactly the "does the product work"
         // question this level exists for.

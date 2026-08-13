@@ -1,10 +1,14 @@
 // OS keychain storage for the human-door connection settings and the BYOK
-// assistant key. The service name and account slots are fixed — changing one
-// orphans an existing install's credentials. The API token is written only to
-// the keychain: never to disk, a log line, or an error message. The assistant
-// key is stricter — `read()` is fileprivate so `LLMProxy` (which lives in this
-// file for that reason) is its only consumer, and `revealAsync()` is the one
-// deliberate hole, for Settings' human-initiated Show / Edit.
+// assistant key. The service name and the slot names are fixed — changing one
+// orphans an existing install's credentials. Connection settings are stored
+// PER ACCOUNT, one `server_url.<uuid>` / `api_token.<uuid>` pair per
+// AccountRecord id (see Accounts.swift); the unsuffixed slots are the
+// pre-multi-account layout and survive only as that migration's source. The
+// API token is written only to the keychain: never to disk, a log line, or an
+// error message. The assistant key is stricter — `read()` is fileprivate so
+// `LLMProxy` (which lives in this file for that reason) is its only consumer,
+// and `revealAsync()` is the one deliberate hole, for Settings'
+// human-initiated Show / Edit.
 //
 // Both LLMProxy entry points hold that line: `complete()` and `stream()` each
 // read the key inside themselves and hand back only provider output — the key
@@ -15,10 +19,14 @@ import Security
 
 /// Keyring service name shared by every stored field.
 private let keychainService = "passband"
-/// Keyring "account" (username) slots within the service.
+/// Keyring "account" (username) slot PREFIXES within the service. A live slot
+/// is `<prefix>.<account uuid>`; bare, these two are the legacy single-account
+/// slots — read once by the migration in Accounts.swift, then deleted.
 private let accountURL = "server_url"
 private let accountToken = "api_token"
-/// BYOK assistant key slot — entirely separate from the human-door token above.
+/// BYOK assistant key slot — entirely separate from the human-door tokens
+/// above, and GLOBAL rather than per-account: the key is the human's, not the
+/// mailbox's, and one assistant serves every account.
 private let accountAssistantKey = "assistant_api_key"
 
 enum KeychainError: Error, LocalizedError {
@@ -94,8 +102,10 @@ enum Keychain {
 /// Run one keychain call OFF the main actor. Every read here can raise the
 /// system's "allow access?" panel and block until the human answers — on the
 /// main actor that is a frozen UI, so the `…Async` wrappers below are the only
-/// entry points the app is allowed to use.
-private func offMain<T>(_ work: @escaping @Sendable () -> T) async -> T {
+/// entry points the app is allowed to use. Module-visible for the one caller
+/// outside this file that also touches the keychain:
+/// `AccountIndex.loadOrMigrate`.
+func offMain<T>(_ work: @escaping @Sendable () -> T) async -> T {
     await withCheckedContinuation { continuation in
         DispatchQueue.global(qos: .userInitiated).async {
             continuation.resume(returning: work())
@@ -113,37 +123,71 @@ struct ConnectionSettings: Sendable, Equatable {
 }
 
 enum SettingsStore {
-    /// Load stored settings; nil until BOTH fields are saved (the first-run
-    /// Connect gate relies on that). ALWAYS call off the main actor (see
-    /// `loadAsync`): a keychain read can raise the system's "allow access?"
-    /// panel and block until the human answers, freezing the UI.
-    static func load() throws -> ConnectionSettings? {
-        let url = try Keychain.read(account: accountURL)
-        let token = try Keychain.read(account: accountToken)
+    /// The two slots one account's credentials occupy. Derived in ONE place
+    /// for the same reason `Keychain.baseQuery` is: a reader and a writer that
+    /// spelled the suffix differently would address different items and
+    /// quietly stop being each other's inverse.
+    private static func urlSlot(_ accountId: UUID) -> String {
+        "\(accountURL).\(accountId.uuidString)"
+    }
+    private static func tokenSlot(_ accountId: UUID) -> String {
+        "\(accountToken).\(accountId.uuidString)"
+    }
+
+    /// Load one account's stored settings; nil until BOTH fields are saved
+    /// (the first-run Connect gate relies on that). ALWAYS call off the main
+    /// actor (see `loadAsync`): a keychain read can raise the system's "allow
+    /// access?" panel and block until the human answers, freezing the UI.
+    static func load(accountId: UUID) throws -> ConnectionSettings? {
+        let url = try Keychain.read(account: urlSlot(accountId))
+        let token = try Keychain.read(account: tokenSlot(accountId))
         guard let url, let token, !url.isEmpty, !token.isEmpty else { return nil }
         return ConnectionSettings(serverURL: url, apiToken: token)
     }
 
     /// The safe entry point: runs the (possibly prompting) read on a background
     /// executor so the UI keeps painting.
-    static func loadAsync() async -> Result<ConnectionSettings?, Error> {
-        await offMain { Result { try load() } }
+    static func loadAsync(accountId: UUID) async -> Result<ConnectionSettings?, Error> {
+        await offMain { Result { try load(accountId: accountId) } }
     }
 
-    /// Persist settings into the OS keychain. The token never touches disk or logs.
-    static func save(_ settings: ConnectionSettings) throws {
-        try Keychain.write(account: accountURL, value: settings.serverURL)
-        try Keychain.write(account: accountToken, value: settings.apiToken)
+    /// Persist one account's settings into the OS keychain. The token never
+    /// touches disk or logs.
+    static func save(_ settings: ConnectionSettings, accountId: UUID) throws {
+        try Keychain.write(account: urlSlot(accountId), value: settings.serverURL)
+        try Keychain.write(account: tokenSlot(accountId), value: settings.apiToken)
     }
 
     /// Off-main-actor write, for the same reason as `loadAsync`.
-    static func saveAsync(_ settings: ConnectionSettings) async -> Result<Void, Error> {
-        await offMain { Result { try save(settings) } }
+    static func saveAsync(_ settings: ConnectionSettings, accountId: UUID) async -> Result<
+        Void, Error
+    > {
+        await offMain { Result { try save(settings, accountId: accountId) } }
     }
 
-    /// Clear stored settings (Disconnect) so the next boot lands on the
-    /// Connect gate. Best-effort: failures are swallowed by the caller.
-    static func clear() throws {
+    /// Clear one account's stored settings (Disconnect, or removing an
+    /// account) so nothing is left to reconnect with. Best-effort: failures
+    /// are swallowed by the caller.
+    static func clear(accountId: UUID) throws {
+        try Keychain.delete(account: urlSlot(accountId))
+        try Keychain.delete(account: tokenSlot(accountId))
+    }
+
+    // MARK: legacy single-account slots
+
+    /// The unsuffixed slots a pre-multi-account install wrote. ONLY
+    /// `AccountIndex`'s one-time migration may call these two — everything
+    /// else addresses an account by id.
+    static func loadLegacy() throws -> ConnectionSettings? {
+        let url = try Keychain.read(account: accountURL)
+        let token = try Keychain.read(account: accountToken)
+        guard let url, let token, !url.isEmpty, !token.isEmpty else { return nil }
+        return ConnectionSettings(serverURL: url, apiToken: token)
+    }
+
+    /// Delete the legacy slots. Called only once the migration has the same
+    /// credentials safely under an account id.
+    static func clearLegacy() throws {
         try Keychain.delete(account: accountURL)
         try Keychain.delete(account: accountToken)
     }

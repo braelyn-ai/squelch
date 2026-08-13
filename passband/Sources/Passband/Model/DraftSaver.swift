@@ -45,6 +45,12 @@ final class DraftSaver {
     /// still in flight when the composer closes and flushes — rather than being a
     /// general queue.
     private var inflight: [Slot: Task<Void, Never>] = [:]
+    /// Flushes that have been STARTED but have not reached `write` yet. A
+    /// flush hands its save to a fresh Task, and that task does not enter
+    /// `inflight` until it runs — so `inflight` alone cannot answer "is
+    /// anything still going out?", which is the only question `settle` asks.
+    private var flushes: [Int: Task<Void, Never>] = [:]
+    private var nextFlush = 0
 
     private init() {}
 
@@ -91,7 +97,30 @@ final class DraftSaver {
         // Nothing typed => nothing to write. `remove` both tests and clears, so a
         // second exit path firing on the same close cannot double-save.
         guard touched.remove(slot) != nil, let state else { return }
-        Task { await write(slot, state) }
+        let ticket = nextFlush
+        nextFlush &+= 1
+        flushes[ticket] = Task { [weak self] in
+            await self?.write(slot, state)
+            self?.flushes[ticket] = nil
+        }
+    }
+
+    /// Wait until nothing this saver started is still on the wire.
+    ///
+    /// The account switch's one hard ordering rule: the draft PUTs go to the
+    /// daemon that is configured when they are BUILT, so reconfiguring
+    /// APIClient while one is parked would post what the human wrote in
+    /// account A into account B's drafts, keyed to a `reply_to_message_id`
+    /// that means something else there.
+    ///
+    /// Call it after flushing every slot: `flush` cancels that slot's debounce
+    /// timer, and this drains the two tables the timers feed rather than
+    /// racing them.
+    func settle() async {
+        // Flushes first: each one ends inside `write`, which enters (and
+        // clears) `inflight` on its way through.
+        for (_, task) in flushes { await task.value }
+        for (_, task) in inflight { await task.value }
     }
 
     /// The send SUCCEEDED, which already deleted this draft server-side. Drop the

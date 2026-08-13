@@ -129,6 +129,10 @@ final class AsyncMemo<Key: Hashable, Value> {
     /// re-fetch on every render. Sites whose failures must stay retryable (a
     /// favicon that was merely offline) pass a predicate that rejects them.
     private let keep: (Value) -> Bool
+    /// Bumped by `clear()`. A resolve started before the wipe must not file its
+    /// answer afterwards — without this, emptying the table would be undone by
+    /// whatever was in flight across it.
+    private var generation = 0
 
     init(limit: Int, keep: @escaping (Value) -> Bool = { _ in true }) {
         self.entries = LRUMap(limit: limit)
@@ -155,18 +159,34 @@ final class AsyncMemo<Key: Hashable, Value> {
         if let hit = entries.get(key) { return hit }
         if let running = inFlight[key] { return await running.value.value }
 
+        let gen = generation
         let task = Task<Boxed<Value>, Never> { [weak self] in
             let value = await make()
-            self?.store(key, value)
+            self?.store(key, value, gen: gen)
             return Boxed(value)
         }
         inFlight[key] = task
         return await task.value.value
     }
 
+    /// Drop everything: the keys describe a world that no longer exists (an
+    /// account switch — ids minted by one daemon mean something else in the
+    /// next). Joiners already parked on an in-flight resolve still get its
+    /// value; that is a bounded staleness, and nothing rendering the old
+    /// account's cards is still mounted by the time this is called.
+    func clear() {
+        generation &+= 1
+        entries.removeAll()
+        inFlight.removeAll()
+    }
+
     /// Record the verdict and retire the parked task, in that order: both run
     /// before any joiner resumes, so nobody sees a settled key still in flight.
-    private func store(_ key: Key, _ value: Value) {
+    /// A resolve from before a `clear()` does NEITHER — the entry would
+    /// resurrect wiped state, and the in-flight slot may already belong to a
+    /// fresh resolve of the same key.
+    private func store(_ key: Key, _ value: Value, gen: Int) {
+        guard gen == generation else { return }
         if keep(value) { entries.set(key, value) }
         inFlight[key] = nil
     }

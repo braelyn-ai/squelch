@@ -122,6 +122,8 @@ enum AuthCopy {
 /// The human's verdict on a sign-in alert or password reset. Device-local by
 /// design: there is no server field (/client/sealed is read-only metadata), so
 /// decisions live in UserDefaults and do not follow the user to another machine.
+/// They are also per ACCOUNT — the map is keyed by message id, which is one
+/// daemon's SQLite int.
 enum AuthVerdict: String, Sendable {
     case mine
     case notMine = "not-mine"
@@ -140,14 +142,28 @@ final class AuthDecisions {
         return decisionKinds.contains(kind)
     }
 
-    private static let key = "passband.auth-decisions"
+    /// Base name of the stored map; the live key is this scoped to the account.
+    /// nil when there is no live account — nothing to read, nowhere to write.
+    private static let keyBase = "passband.auth-decisions"
+    private static var key: String? {
+        guard let id = AccountManager.shared.activeId else { return nil }
+        return AccountIndex.scopedKey(keyBase, id)
+    }
     /// Cap the stored map so it cannot grow without bound.
     private static let cap = 300
 
     private var store: [String: String] = [:]
 
-    private init() {
-        store = (UserDefaults.standard.dictionary(forKey: Self.key) as? [String: String]) ?? [:]
+    private init() { reload() }
+
+    /// Re-read the ledger for whatever account is live NOW. Called by the
+    /// account switch, AFTER the new id is committed — this key is derived
+    /// from it, so reloading any earlier would re-read the account that just
+    /// went away.
+    func reload() {
+        store =
+            Self.key.flatMap { UserDefaults.standard.dictionary(forKey: $0) as? [String: String] }
+            ?? [:]
     }
 
     /// The recorded verdict for a message, or nil while it is still open.
@@ -159,6 +175,9 @@ final class AuthDecisions {
     /// Record a verdict. Asymmetric by design: `mine` just resolves the card,
     /// while `notMine` starts an investigation — the caller opens the message.
     func set(_ id: Int, _ verdict: AuthVerdict) {
+        // No live account = no key to write under. Nothing can be showing a
+        // decision card in that state either.
+        guard let key = Self.key else { return }
         var next = store
         next[String(id)] = verdict.rawValue
         // Keys are message ids, so numeric order is arrival order: dropping the
@@ -168,6 +187,6 @@ final class AuthDecisions {
             for k in keys.prefix(next.count - Self.cap) { next.removeValue(forKey: k) }
         }
         store = next
-        UserDefaults.standard.set(next, forKey: Self.key)
+        UserDefaults.standard.set(next, forKey: key)
     }
 }

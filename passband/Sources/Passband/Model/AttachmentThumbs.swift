@@ -40,6 +40,11 @@ final class AttachmentThumbs {
     /// re-confirms what we hold. nil means "not resolved yet", NOT "no art".
     func cached(_ id: Int) -> Tile? { memo.cached(id) }
 
+    /// Forget every resolved tile. An account switch: attachment ids are one
+    /// daemon's SQLite ints, so a surviving entry would not merely be stale —
+    /// id 91 in the new account would render the old account's attachment.
+    func wipe() { memo.clear() }
+
     /// Resolve one tile, deduped and memoized.
     @discardableResult
     func resolve(_ attachment: Attachment, as source: Source) async -> Tile {
