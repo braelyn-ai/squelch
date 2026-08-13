@@ -31,6 +31,9 @@ import SwiftUI
 
 struct MobileAgentView: View {
     @Environment(AppStore.self) private var store
+    /// Read for the transport pref alone: whether an ask rides the daemon's
+    /// relay or this phone's own key decides whether there is a key to miss.
+    @Environment(Prefs.self) private var prefs
 
     /// The words that opened this screen, sent the moment it appears. nil when
     /// the chat was walked into rather than asked into.
@@ -641,10 +644,22 @@ struct MobileAgentView: View {
 
     // MARK: - the key gate
 
+    /// Whether this ask would ride the daemon rather than a local key. The SAME
+    /// resolution `AssistantSession.run` makes (pref AND capability), because a
+    /// gate that disagreed with the loop would either refuse a question the
+    /// daemon would have answered or wave through one nothing can.
+    private var relaying: Bool {
+        prefs.assistantTransport == .relay && store.relayAvailable
+    }
+
     /// True once the keychain has answered and the answer cannot drive a run:
     /// no key at all, or a key for a provider this loop does not speak yet.
+    ///
+    /// RELAY HAS NO KEY TO MISS. On hosted, the credential lives on the daemon
+    /// and this phone is never meant to hold one, so asking for a key there
+    /// would turn the agent off for exactly the users it ships for.
     private var keyMissing: Bool {
-        guard let keyStatus else { return false }
+        guard !relaying, let keyStatus else { return false }
         return !keyStatus.present || keyStatus.provider != .anthropic
     }
 
@@ -662,7 +677,7 @@ struct MobileAgentView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Palette.ink)
             }
-            Text(Self.gateLine(keyStatus))
+            Text(gateLine)
                 .font(Typo.rowSub)
                 .foregroundStyle(Palette.inkFaint)
                 .fixedSize(horizontal: false, vertical: true)
@@ -675,11 +690,26 @@ struct MobileAgentView: View {
         .background(.bar)
     }
 
-    private static func gateLine(_ status: AssistantKeyStatus?) -> String {
-        status?.present == true
-            ? "The agent speaks Anthropic for now. Swap in a key that starts with sk-ant- under Settings > Assistant."
-            : "Paste your Anthropic API key under Settings > Assistant to turn the agent on. It runs on your own key, from this phone."
+    /// Names the door that fixes it, and the door is not the same on every
+    /// install: where the daemon offers a relay, the cheapest fix is one tap on
+    /// a switch rather than finding an API key, so the sentence says so. The
+    /// path is Account and not Settings because that is where the panes live on
+    /// the phone.
+    private var gateLine: String {
+        if relayAvailableForCopy {
+            return keyStatus?.present == true
+                ? "The agent speaks Anthropic for now. Under Account > Assistant, swap in a key that starts with sk-ant-, or switch chats to the Passband relay."
+                : "Under Account > Assistant, switch chats to the Passband relay, or paste your own Anthropic API key."
+        }
+        return keyStatus?.present == true
+            ? "The agent speaks Anthropic for now. Swap in a key that starts with sk-ant- under Account > Assistant."
+            : "Paste your Anthropic API key under Account > Assistant to turn the agent on. It runs on your own key, from this phone."
     }
+
+    /// The relay exists on this daemon but the user is on their own key. Not
+    /// `relaying`: this gate only ever renders when relay is NOT carrying the
+    /// ask, and the question here is whether the relay is available to offer.
+    private var relayAvailableForCopy: Bool { store.relayAvailable }
 
     private func refreshKeyStatus() async {
         keyStatus = await AssistantKeyStore.statusAsync()

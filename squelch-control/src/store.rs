@@ -41,11 +41,14 @@ CREATE TABLE IF NOT EXISTS tenants (
     account_email TEXT NOT NULL,
     status        TEXT NOT NULL,
     created_at    TEXT NOT NULL,
-    -- The Bifrost virtual-key ID installed for this tenant, and when it was
-    -- minted. THE ID ONLY: the key's value is the tenant's LLM bearer, and it
-    -- passes through this process without ever reaching this file.
-    bifrost_vk_id TEXT,
-    vk_minted_at  TEXT
+    -- The Bifrost virtual-key IDs installed for this tenant — triage and
+    -- assistant — and when each was minted. THE IDS ONLY: the keys' values
+    -- are the tenant's LLM bearers, and they pass through this process
+    -- without ever reaching this file.
+    bifrost_vk_id           TEXT,
+    vk_minted_at            TEXT,
+    bifrost_assistant_vk_id TEXT,
+    assistant_vk_minted_at  TEXT
 );
 -- One mailbox, one daemon. A PARTIAL unique index rather than a plain one, so a
 -- tenant that has been torn down frees its address for a later signup while an
@@ -79,10 +82,14 @@ const ADDED_COLUMNS: [(&str, &str); 3] = [
     ("reserved_until", "TEXT"),
 ];
 
-/// The same, for `tenants`: the virtual-key columns arrived after the first
-/// hosted deployment.
-const TENANT_ADDED_COLUMNS: [(&str, &str); 2] =
-    [("bifrost_vk_id", "TEXT"), ("vk_minted_at", "TEXT")];
+/// The same, for `tenants`: the triage virtual-key columns arrived after the
+/// first hosted deployment, and the assistant pair after them.
+const TENANT_ADDED_COLUMNS: [(&str, &str); 4] = [
+    ("bifrost_vk_id", "TEXT"),
+    ("vk_minted_at", "TEXT"),
+    ("bifrost_assistant_vk_id", "TEXT"),
+    ("assistant_vk_minted_at", "TEXT"),
+];
 
 /// Store errors. `Sqlite` carries rusqlite's message, which never contains a
 /// code or a token: the only values bound into these statements are hashes,
@@ -454,6 +461,43 @@ impl ControlStore {
         let changed = self.lock().execute(
             "UPDATE tenants SET bifrost_vk_id = NULL, vk_minted_at = NULL
               WHERE label = ?1 AND bifrost_vk_id IS NOT NULL",
+            params![label],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Record the ASSISTANT virtual-key id, the same way and under the same
+    /// rule as [`Self::set_tenant_vk`]: the id only, stamped RFC3339.
+    /// Returns whether a tenant row with `label` existed to take it.
+    pub fn set_tenant_assistant_vk(&self, label: &str, vk_id: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tenants SET bifrost_assistant_vk_id = ?2, assistant_vk_minted_at = ?3
+              WHERE label = ?1",
+            params![label, vk_id, stamp(Utc::now())],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The assistant virtual-key id recorded for `label`. `None` covers both
+    /// "no such tenant" and "tenant with no key", like [`Self::tenant_vk`].
+    pub fn tenant_assistant_vk(&self, label: &str) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT bifrost_assistant_vk_id FROM tenants WHERE label = ?1",
+                params![label],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Forget the recorded assistant key, after a revoke has landed in
+    /// Bifrost. Returns whether there was a recorded key to forget.
+    pub fn clear_tenant_assistant_vk(&self, label: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tenants SET bifrost_assistant_vk_id = NULL, assistant_vk_minted_at = NULL
+              WHERE label = ?1 AND bifrost_assistant_vk_id IS NOT NULL",
             params![label],
         )?;
         Ok(changed == 1)
@@ -859,6 +903,54 @@ mod tests {
         assert_eq!(s.tenant_vk("ghost").unwrap(), None);
     }
 
+    /// The raw `assistant_vk_minted_at` cell for `label`.
+    fn assistant_vk_minted_at(s: &ControlStore, label: &str) -> Option<String> {
+        s.lock()
+            .query_row(
+                "SELECT assistant_vk_minted_at FROM tenants WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The assistant vk id rides its own columns, independently of the triage
+    /// one: setting, rotating, and clearing either leaves the other alone.
+    #[test]
+    fn the_assistant_vk_id_rides_its_own_columns() {
+        let s = store();
+        s.insert_tenant("ada", "ada@example.com").unwrap();
+
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert_eq!(assistant_vk_minted_at(&s, "ada"), None);
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a1".to_string())
+        );
+        // Same stamp convention as every other timestamp in this file.
+        let minted = assistant_vk_minted_at(&s, "ada").expect("stamped alongside the id");
+        assert_eq!(stamp(parse_ts(minted.clone())), minted, "{minted}");
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a2").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a2".to_string())
+        );
+
+        // The two pointers are independent: the triage key is untouched by
+        // anything the assistant one does, and vice versa.
+        assert!(s.set_tenant_vk("ada", "vk-t1").unwrap());
+        assert!(s.clear_tenant_assistant_vk("ada").unwrap());
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert_eq!(assistant_vk_minted_at(&s, "ada"), None, "cleared with the id");
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-t1".to_string()));
+        assert!(!s.clear_tenant_assistant_vk("ada").unwrap());
+        assert!(s.clear_tenant_vk("ada").unwrap());
+
+        assert!(!s.set_tenant_assistant_vk("ghost", "vk-9").unwrap());
+        assert_eq!(s.tenant_assistant_vk("ghost").unwrap(), None);
+    }
+
     /// A tenants table written before the vk columns existed opens, gains
     /// them, and takes a key id like any other row.
     #[test]
@@ -885,6 +977,47 @@ mod tests {
         assert_eq!(s.tenant_vk("ada").unwrap(), None, "migrated, keyless");
         assert!(s.set_tenant_vk("ada", "vk-1").unwrap());
         assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-1".to_string()));
+        // ...including the assistant pair, which arrived after the triage one.
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a1".to_string())
+        );
+    }
+
+    /// A table from the triage-only era — vk columns present, assistant
+    /// columns not — gains exactly the missing pair and keeps its data.
+    #[test]
+    fn a_triage_era_tenants_table_gains_the_assistant_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tenants (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 label         TEXT NOT NULL UNIQUE,
+                 account_email TEXT NOT NULL,
+                 status        TEXT NOT NULL,
+                 created_at    TEXT NOT NULL,
+                 bifrost_vk_id TEXT,
+                 vk_minted_at  TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tenants(label, account_email, status, created_at, bifrost_vk_id, vk_minted_at)
+             VALUES('ada', 'ada@example.com', 'active', ?1, 'vk-old', ?1)",
+            params![stamp(Utc::now())],
+        )
+        .unwrap();
+
+        let s = ControlStore::init(conn).unwrap();
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-old".to_string()), "kept");
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a1".to_string())
+        );
     }
 
     /// What a console login asks the store, both times it asks: the label's

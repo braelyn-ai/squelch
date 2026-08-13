@@ -79,9 +79,14 @@ Environment (names only — values are in Railway):
 `SQUELCH_CONTROL_CLIENT_ID`, `SQUELCH_CONTROL_CLIENT_SECRET`,
 `SQUELCH_CONTROL_COOKIE_KEY`, `SQUELCH_CONTROL_WARDEN_URL`,
 `SQUELCH_CONTROL_WARDEN_TOKEN`, `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS=1`,
-plus the Bifrost trio — `SQUELCH_CONTROL_BIFROST_URL`,
-`SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN`, `SQUELCH_CONTROL_LLM_BUDGET_USD` —
-which is all-or-nothing: a partial trio is a refusal to boot.
+plus the Bifrost pair — `SQUELCH_CONTROL_BIFROST_URL`,
+`SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` — which is all-or-nothing: one
+without the other is a refusal to boot. Four budget/model knobs ride on
+top, all defaulted: `SQUELCH_CONTROL_LLM_BUDGET_USD` ($5) and
+`SQUELCH_CONTROL_LLM_MODELS` for the triage key,
+`SQUELCH_CONTROL_ASSISTANT_BUDGET_USD` ($10) and
+`SQUELCH_CONTROL_ASSISTANT_MODELS` (haiku + opus) for the assistant key
+the Passband app's relay chats spend against.
 Full table: `squelch-control/README.md`.
 
 ### The LLM gateway
@@ -110,16 +115,9 @@ refuses to boot if any of the rest are set without it),
 `SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP`, `SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP`.
 Install procedure: `SETUP.md` → "LLM triage through the gateway".
 
-> **The stopgap this supersedes.** Before the gateway, keyed tenants ran on a
-> shared `anthropic-api-key` Secret in ns `tenants` with the env hand-patched
-> onto their Deployments — the real key, inside tenant pods, exactly what this
-> design exists to avoid. Both halves get removed during the gateway rollout:
-> delete the Secret, then push each tenant's virtual key through the warden
-> (`squelch-control llm mint <label>`). The llm-key install re-applies the
-> whole Deployment from the warden's rendered spec (server-side apply), so any
-> hand-patched Deployment converges back to spec in the same stroke — no
-> manual un-patching, and a hand-patch that lingers is a rollout that skipped
-> that tenant.
+> **History.** Before the gateway, keyed tenants ran on a shared
+> `anthropic-api-key` Secret in ns `tenants` — the pre-gateway bridge, removed
+> 2026-08-13.
 
 ## DNS
 
@@ -150,8 +148,14 @@ ClusterIssuer in `40-wildcard-certificate.yaml`.
 
 ## Images
 
-Every `v*` tag builds all three from `.github/workflows/release.yml` and pushes
-them to GHCR:
+Every `daemon-X.Y.Z` tag builds all three from
+`.github/workflows/release-daemon.yml` and pushes them to GHCR. The image tag is
+the git tag verbatim — `ghcr.io/braelyn-ai/squelchd:daemon-0.0.1`, plus a moving
+`latest`. There are no bare numeric tags any more, deliberately: GHCR tags are
+mutable and this node pulls `IfNotPresent`, so a recycled number would pin a
+stale image with nothing to show for it. The old numeric tags (`0.2.x`,
+`v0.2.6`) are frozen history; anything still pinned to one keeps working until
+it is repointed.
 
 | Image | Arch | Built by |
 |---|---|---|
@@ -174,13 +178,14 @@ turning binfmt back on.
 > ```
 >
 > That tag carries a GHCR name nothing has ever pushed, and adding the CI job
-> does not retroactively publish it. So: do not delete this image from
-> containerd, and do not assume `imagePullPolicy` will save you, until the next
-> `v*` tag is cut and `20-warden.yaml` is repointed at a tag the registry
+> does not retroactively publish it — `v0.2.0` is also from the retired
+> numbering, so nothing ever will. So: do not delete this image from
+> containerd, and do not assume `imagePullPolicy` will save you, until a
+> `daemon-*` tag is cut and `20-warden.yaml` is repointed at a tag the registry
 > actually has. From that point on, replacing this node is a pull.
 
-The squelchd and warden tags are both pinned in `20-warden.yaml`. The warden
-refuses to start with an untagged tenant image.
+The squelchd and warden tags are both pinned in `20-warden.yaml`, at
+`daemon-*` tags. The warden refuses to start with an untagged tenant image.
 
 ## Shipping a tenant-shape change (there is no reconcile)
 
@@ -191,8 +196,9 @@ tenant's pod against those objects; nothing reconciles those objects against the
 warden's current code.
 
 So anything that changes the SHAPE of a tenant — a new Ingress path prefix, a new
-environment variable in the pod (`SQUELCH_CONSOLE_SSO_URL` and `ANTHROPIC_API_KEY`
-are both this), a changed NetworkPolicy peer, new resource bounds — lands on new
+environment variable in the pod (`SQUELCH_CONSOLE_SSO_URL` and the
+`SQUELCH_WARDEN_LLM_*` block are both this), a changed NetworkPolicy peer, new
+resource bounds — lands on new
 signups and on nobody else, silently. Check what a live tenant actually has
 before assuming a deploy reached it:
 
@@ -227,7 +233,6 @@ a chat window.
 |---|---|---|---|
 | `warden` | `squelch-warden` | `token` | operator (`openssl rand -base64 32`); the same value is `SQUELCH_CONTROL_WARDEN_TOKEN` on Railway |
 | `tenants` | `google-oauth-client` | `client_id`, `client_secret` | operator; the confidential **web** client, the same one the control plane consents with |
-| `tenants` | `anthropic-api-key` | `ANTHROPIC_API_KEY` | operator; one shared key every tenant daemon runs Stage-2 triage with. Referenced `optional: true`, so its absence is heuristic-only triage rather than a fleet that will not start. The bridge until the relay ships (issue #33) |
 | `cert-manager` | `acme-dns-token` | `api-token` | operator; Cloudflare token scoped to the `passband.email` zone, DNS:Edit |
 
 Managed by the cluster, listed so an inventory sweep does not mistake them for
@@ -370,9 +375,9 @@ would happily stream over the real history.
   `kubectl -n tenants get secret -o yaml` and copy the key file. Litestream does
   not touch Secrets and never will, and it certainly does not back up its own
   key into the bucket that key opens.
-- **Cut a tag that publishes the warden** — the release workflow now has the
-  job (see "Images"), but this node still runs the hand-built image. The item
-  closes when `20-warden.yaml` points at a tag GHCR actually holds.
+- **Cut a `daemon-*` tag that publishes the warden** — the release workflow now
+  has the job (see "Images"), but this node still runs the hand-built image. The
+  item closes when `20-warden.yaml` points at a tag GHCR actually holds.
 - **Tenant reconcile: `POST /v1/tenants/{label}/reconcile`.** The warden
   re-applies the typed objects for one already-provisioned tenant, on demand,
   from its current code — the same server-side applies phase two runs, minus the
@@ -385,9 +390,9 @@ would happily stream over the real history.
   case where the change rolls the pod (an env or image change does, an Ingress or
   NetworkPolicy change does not), and it should refuse a tenant that is not
   `active`. **Needed the first time any tenant-shape change ships after tenants
-  exist** — which is now: `SQUELCH_CONSOLE_SSO_URL` and the optional
-  `ANTHROPIC_API_KEY` reference both reach new tenants only, and "Shipping a
-  tenant-shape change" above is the manual stand-in.
+  exist** — which is now: `SQUELCH_CONSOLE_SSO_URL` and the LLM gateway env
+  block both reach new tenants only, and "Shipping a tenant-shape change"
+  above is the manual stand-in.
 - **`/mcp` bearer auth** — the hosted MVP routes around it (tenant Ingresses
   publish `/client`, `/console` and `/t` only). Real auth is required before the
   agent door is ever served from the internet, and until then the console's MCP

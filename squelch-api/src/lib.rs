@@ -5,6 +5,7 @@
 //! capability. No token, secret, or message body is ever logged. See
 //! docs/SECURITY.md §4.
 
+mod assistant;
 mod auth;
 mod console;
 mod devices;
@@ -19,6 +20,7 @@ mod state;
 pub mod tracking;
 pub mod unsubscribe;
 
+pub use assistant::AssistantRelay;
 pub use auth::require_bearer;
 pub use error::ApiError;
 /// The auth-mail retention pass. Exported for the daemon's timer: it uses the
@@ -181,6 +183,15 @@ fn client_router(state: ApiState) -> Router {
         .route(
             "/client/devices/unregister",
             post(devices::unregister_device),
+        )
+        // Assistant relay: human door ONLY. The body is the user's own
+        // conversation, sent by their paired client, and it is spent against
+        // the tenant's assistant budget at the gateway — the agent door never
+        // gains a route that burns tenant money or fronts a daemon-held
+        // credential.
+        .route(
+            "/client/assistant/messages",
+            post(assistant::assistant_messages),
         )
         // Actions: the only write capability. Require the opt-in write
         // credential; 403 without one.

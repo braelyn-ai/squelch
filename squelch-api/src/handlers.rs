@@ -860,15 +860,8 @@ const RULE_INFER_LEDGER_CATEGORY: &str = "rule_infer";
 fn bill_rule_inference(store: &SqliteStore, account_id: AccountId, usage: Option<Usage>) {
     let Some(u) = usage else { return };
     let day = Utc::now().format("%Y-%m-%d").to_string();
-    if let Err(e) = store.extract_bump_usage(
-        account_id,
-        &day,
-        RULE_INFER_LEDGER_CATEGORY,
-        u.input_tokens,
-        u.output_tokens,
-        u.cache_creation_input_tokens,
-        u.cache_read_input_tokens,
-    ) {
+    if let Err(e) = store.extract_bump_usage(account_id, &day, RULE_INFER_LEDGER_CATEGORY, u.into())
+    {
         eprintln!("squelch: rule inference usage ledger bump failed ({e})");
     }
 }
@@ -1467,6 +1460,10 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
             "fetched_at": unread.fetched_at.to_rfc3339(),
         });
     }
+    // Capability flag for the app: whether /client/assistant/messages will
+    // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
+    // Always present so a client reads an answer, not absence.
+    body["assistant_relay"] = json!(state.assistant().is_some());
     Ok(Json(body))
 }
 

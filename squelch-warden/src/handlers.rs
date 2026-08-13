@@ -69,6 +69,10 @@ fn error_response(e: &WardenError) -> Response {
             "invalid_api_key",
             Some(inner.to_string()),
         ),
+        // The llm-key body parsed but named neither slot; a well-formed
+        // request that violates the "at least one key" constraint, so a 422
+        // that names it, not a 400.
+        WardenError::NoKeys => (StatusCode::UNPROCESSABLE_ENTITY, "no_keys", None),
         WardenError::Conflict => (StatusCode::CONFLICT, "label_exists", None),
         WardenError::NotFound => (StatusCode::NOT_FOUND, "not_found", None),
         // 503, not 422: the request was fine, this deployment is what lacks
@@ -129,11 +133,23 @@ struct SetCredentials {
     cred_read_ciphertext: String,
 }
 
-#[derive(Debug, Deserialize)]
+/// No `Debug`: both fields are live virtual keys, and a derived formatter is
+/// how one ends up in a log line by accident.
+#[derive(Deserialize)]
 struct SetLlmKey {
     /// The tenant's LLM gateway virtual key, minted by the control plane.
     /// Stored verbatim in the tenant's Secret and never read back here.
-    api_key: String,
+    /// Defaulted, matching the control plane's wire (it skips absent fields):
+    /// a half-failed mint installs the half that exists, and an absent slot
+    /// means "leave the installed key as it is", never "clear it".
+    #[serde(default)]
+    api_key: Option<String>,
+    /// The assistant relay virtual key the daemon proxies the Passband
+    /// assistant through, when the control plane has minted one. Defaulted so
+    /// a control plane from before the assistant era still parses: absent
+    /// means the triage slot only, with the same leave-it-alone semantics.
+    #[serde(default)]
+    assistant_api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,8 +219,9 @@ pub async fn set_credentials(
 }
 
 /// `PUT /v1/tenants/{label}/llm-key` - store or rotate the tenant's LLM
-/// gateway virtual key. A running tenant is rolled onto it; a pending one
-/// picks it up when the workload is applied.
+/// gateway virtual keys (triage and/or the assistant relay; at least one). An
+/// absent slot is left exactly as it is. A running tenant is rolled onto the
+/// result; a pending one picks it up when the workload is applied.
 pub async fn set_llm_key(
     State(state): State<WardenState>,
     Path(label): Path<String>,
@@ -214,8 +231,12 @@ pub async fn set_llm_key(
         Ok(req) => req,
         Err(detail) => return malformed(detail),
     };
-    match state.warden().set_llm_key(&label, &req.api_key).await {
-        // Nothing to hand back: the key came in, and it never goes out.
+    match state
+        .warden()
+        .set_llm_key(&label, req.api_key.as_deref(), req.assistant_api_key.as_deref())
+        .await
+    {
+        // Nothing to hand back: the keys came in, and they never go out.
         Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -449,14 +470,69 @@ mod tests {
         let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &empty)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
-        // A missing field is a caller bug, not a validation refusal.
-        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", "{}")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Both fields are optional on the wire — absent means "leave that
+        // slot alone" — so an empty object parses, and the refusal is the
+        // named constraint: a PUT that names neither slot installs nothing.
+        let (status, body) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", "{}")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "no_keys");
 
         // And a label nobody minted has nothing to key.
         let body = serde_json::json!({ "api_key": "sk-vk-abc123" }).to_string();
         let (status, _) = call(&h, authed("PUT", "/v1/tenants/nobody/llm-key", &body)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The extended llm-key body: an assistant key rides beside the triage
+    /// key, a body without the field — an old control plane — still lands,
+    /// and a broken assistant key is the same 422 as a broken triage key.
+    #[tokio::test]
+    async fn the_llm_key_route_takes_an_optional_assistant_key() {
+        let h = Harness::with_config(llm_test_config());
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+
+        // Backward compat: no assistant_api_key field at all is a 200, and
+        // the stored Secret has no assistant entry.
+        let body = serde_json::json!({ "api_key": "sk-vk-triage" }).to_string();
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert!(!stored.data.unwrap().contains_key("assistant-api-key"));
+
+        // Both keys: still a 200 with an empty object, never a key back out.
+        let body = serde_json::json!({
+            "api_key": "sk-vk-triage",
+            "assistant_api_key": "sk-vk-assistant",
+        })
+        .to_string();
+        let (status, body) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({}));
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert!(stored.data.unwrap().contains_key("assistant-api-key"));
+
+        // An assistant-only body — the shape a re-run after a half-failed
+        // mint sends — is a 200, and the triage slot it did not name is left
+        // exactly as it was.
+        let body = serde_json::json!({ "assistant_api_key": "sk-vk-assistant-2" }).to_string();
+        let (status, _) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let stored = h.cluster.secret("alice-llm").unwrap().data.unwrap();
+        assert!(stored.contains_key("api-key"));
+        assert!(stored.contains_key("assistant-api-key"));
+
+        // A broken assistant key is refused with the constraint named and
+        // neither key echoed.
+        let bad = serde_json::json!({
+            "api_key": "sk-vk-triage",
+            "assistant_api_key": "sk\nassistant",
+        })
+        .to_string();
+        let (status, body) = call(&h, authed("PUT", "/v1/tenants/alice/llm-key", &bad)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "invalid_api_key");
+        assert!(!body.to_string().contains("sk-vk"));
+        assert!(!body.to_string().contains("assistant"));
     }
 
     /// A warden with no LLM gateway configured refuses the llm-key route: a

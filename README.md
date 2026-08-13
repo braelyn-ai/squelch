@@ -6,7 +6,7 @@
 
 squelch reads your Gmail (read-only), decides what actually deserves attention, catches bills and deadlines, and serves that intelligence over MCP to an agent you already run. Your agent never holds your Gmail credential and never gets raw access to your mailbox.
 
-[![release](https://github.com/braelyn-ai/squelch/actions/workflows/release.yml/badge.svg)](https://github.com/braelyn-ai/squelch/actions/workflows/release.yml)
+[![release](https://github.com/braelyn-ai/squelch/actions/workflows/release-daemon.yml/badge.svg)](https://github.com/braelyn-ai/squelch/actions/workflows/release-daemon.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](Cargo.toml)
 [![container](https://img.shields.io/badge/ghcr.io-braelyn--ai%2Fsquelchd-2496ED.svg)](deploy/DOCKER.md)
