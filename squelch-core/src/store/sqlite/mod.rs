@@ -915,6 +915,7 @@ impl Store for SqliteStore {
         self.stage1_usage_since(account_id, since_day)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extract_bump_usage(
         &self,
         account_id: AccountId,

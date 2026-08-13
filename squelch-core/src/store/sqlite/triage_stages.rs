@@ -8,6 +8,7 @@ use super::*;
 
 /// Bump the `stage2_usage` ledger for `(account, day, category)`: +1 call and add
 /// the token counts. Both triage stages share this table keyed by `category`.
+#[allow(clippy::too_many_arguments)] // the parts of one usage ledger line
 fn bump_usage_category(
     conn: &Connection,
     account_id: AccountId,
@@ -380,6 +381,7 @@ impl SqliteStore {
         usage_since_category(&conn, account_id, since_day, "stage1")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn extract_bump_usage(
         &self,
         account_id: AccountId,
