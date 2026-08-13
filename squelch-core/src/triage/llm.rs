@@ -550,6 +550,16 @@ where
     }
 }
 
+/// True when a permanent-failure kind is an AUTH failure (`http_401` /
+/// `http_403`): the credential is wrong for the endpoint, which is a CONFIG
+/// problem shared by every queued row, not a fact about the message being
+/// classified. Callers should leave the row queued and stop the pass — the
+/// remaining rows would fail identically, and a row marked processed on an
+/// auth failure is foreclosed from triage even after the credential is fixed.
+pub fn is_auth_failure(kind: &str) -> bool {
+    kind.starts_with("http_401") || kind.starts_with("http_403")
+}
+
 /// Parse a `retry-after` header (seconds) if present.
 fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
     resp.headers()
@@ -571,6 +581,20 @@ async fn sleep_backoff(attempt: u32, retry_after: Option<Duration>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The auth split is what keeps a bad credential from eating the queue:
+    /// 401/403 leave rows queued for after the fix, everything else in the
+    /// permanent class marks the row processed so it cannot loop.
+    #[test]
+    fn auth_failures_split_from_the_permanent_class_by_kind() {
+        assert!(is_auth_failure("http_401:authentication_error"));
+        assert!(is_auth_failure("http_403:permission_error"));
+        assert!(!is_auth_failure("http_400:invalid_request_error"));
+        assert!(!is_auth_failure("http_404:not_found_error"));
+        assert!(!is_auth_failure("max_tokens_truncation"));
+        assert!(!is_auth_failure("json_parse"));
+        assert!(!is_auth_failure("response_decode"));
+    }
 
     #[test]
     fn usage_deserializes_cache_token_fields() {
