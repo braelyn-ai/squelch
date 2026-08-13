@@ -596,6 +596,31 @@ pub struct Stage2UsageDay {
     pub cache_read_tokens: u64,
 }
 
+/// One call's token counts, as the ledger records them: `input` is the UNCACHED
+/// prompt remainder, with prompt-cache writes and reads in their own fields
+/// because they price differently. A struct rather than four positional u64s so
+/// a transposed input/output can't compile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+}
+
+impl UsageTokens {
+    /// Counts in ledger-column order: uncached input, output, cache write,
+    /// cache read.
+    pub fn new(input: u64, output: u64, cache_creation: u64, cache_read: u64) -> Self {
+        Self {
+            input,
+            output,
+            cache_creation,
+            cache_read,
+        }
+    }
+}
+
 /// Runtime daily-cap overrides from `app_settings`. `None` means no override
 /// row, so the caller falls back to config/env then the built-in default; only
 /// values parsing as an integer in `1..=100000` are surfaced, a malformed or
@@ -1270,10 +1295,7 @@ pub trait Store: Send + Sync {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()>;
 
     /// Sum the Stage-1 usage ledger over every day `>= since_day`. Drives the
@@ -1288,10 +1310,7 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         day: &str,
         category: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()>;
 
     /// Stage-1 usage history: the most recent `days` rows, newest-first (sparse).
@@ -1355,10 +1374,7 @@ pub trait Store: Send + Sync {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()>;
 
     /// Read the Stage-2 usage totals for `(account_id, day)`. Returns a zeroed

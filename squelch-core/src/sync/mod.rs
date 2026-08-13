@@ -1457,14 +1457,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     if let Some(u) = usage {
                         in_tok += u.input_tokens;
                         out_tok += u.output_tokens;
-                        if let Err(e) = self.store.stage1_bump_usage(
-                            self.account_id,
-                            &day,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
-                        ) {
+                        if let Err(e) =
+                            self.store
+                                .stage1_bump_usage(self.account_id, &day, u.into())
+                        {
                             eprintln!("squelch: stage-1 usage ledger bump failed ({e})");
                         }
                     }
@@ -1640,10 +1636,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 self.account_id,
                                 &day,
                                 marketing::LEDGER_CATEGORY,
-                                u.input_tokens,
-                                u.output_tokens,
-                                u.cache_creation_input_tokens,
-                                u.cache_read_input_tokens,
+                                u.into(),
                             ) {
                                 eprintln!("squelch: extract usage ledger bump failed ({e})");
                             }
@@ -1690,10 +1683,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             self.account_id,
                             &day,
                             banking::LEDGER_CATEGORY,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
+                            u.into(),
                         ) {
                             eprintln!("squelch: extract usage ledger bump failed ({e})");
                         }
@@ -1907,14 +1897,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         out_tok += u.output_tokens;
                         // USAGE LEDGER, best-effort: a ledger write failure must
                         // not affect triage.
-                        if let Err(e) = self.store.stage2_bump_usage(
-                            self.account_id,
-                            &day,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
-                        ) {
+                        if let Err(e) =
+                            self.store
+                                .stage2_bump_usage(self.account_id, &day, u.into())
+                        {
                             eprintln!("squelch: stage-2 usage ledger bump failed ({e})");
                         }
                     }
