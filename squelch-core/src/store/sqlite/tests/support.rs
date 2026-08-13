@@ -86,6 +86,9 @@ pub(super) fn triaged(account_id: AccountId, gmail: &str, thread: &str) -> Triag
     }
 }
 
+// Setters are named for the columns they set (`from`, `is_sent`, `to_addrs`),
+// which collides with the from_*/is_*/to_* self conventions.
+#[allow(clippy::wrong_self_convention)]
 impl TriagedBuilder {
     // -- message fields --
     pub(super) fn from(mut self, addr: &str) -> Self {

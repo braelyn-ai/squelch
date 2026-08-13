@@ -1172,6 +1172,7 @@ pub fn ingest_with_rules(
 /// holding one, so echoing the reply would HIDE the counterparty's mail the user
 /// was reading a second ago. Skipping degrades to "your reply appears on the next
 /// backfill", which is exactly the pre-echo status quo.
+#[allow(clippy::too_many_arguments)] // the parts of one Gmail fetch, nothing more
 pub fn ingest_sent(
     store: &SqliteStore,
     account_id: AccountId,

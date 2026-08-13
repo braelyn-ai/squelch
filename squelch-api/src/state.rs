@@ -118,6 +118,12 @@ pub struct ApiState {
     /// simply does not work (a browser will not store a `Secure` cookie from
     /// `http://`). When it is on, the login page says so where the user can see
     /// it. See [`crate::console`].
+    ///
+    /// NOT YET CONSULTED (issue #46): squelchd never plumbs the config knob in,
+    /// and [`crate::console`]'s `Site::secure()` decides from the request
+    /// authority alone — so today the hatch parses but does nothing. Drop the
+    /// `dead_code` allow when wiring it.
+    #[allow(dead_code)]
     pub(crate) console_allow_insecure_cookie: bool,
     /// Per-client buckets over the two console routes that reach the store with
     /// no credential in front of them. See
