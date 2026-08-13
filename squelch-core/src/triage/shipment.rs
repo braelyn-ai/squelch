@@ -513,11 +513,30 @@ fn clean_item_phrase(s: &str) -> String {
 
 /// Is `s` a generic placeholder ("Package", "Your order", …) rather than a real
 /// item? Such a leftover is no better than the client's own fallback label.
-fn is_generic_item(s: &str) -> bool {
+///
+/// Shared with the LLM extractor, whose model volunteers a wider set of
+/// placeholders than the subject-lifting detector ever produces; one list keeps
+/// the two paths from disagreeing about what counts as a name.
+pub(crate) fn is_generic_item(s: &str) -> bool {
     let l = s.trim().to_lowercase();
     matches!(
         l.as_str(),
-        "" | "package" | "your order" | "order" | "shipment" | "parcel" | "item" | "your package"
+        "" | "package"
+            | "your package"
+            | "the package"
+            | "order"
+            | "your order"
+            | "order update"
+            | "shipping update"
+            | "delivery update"
+            | "shipment"
+            | "your shipment"
+            | "parcel"
+            | "item"
+            | "your item"
+            | "unknown"
+            | "n/a"
+            | "none"
     )
 }
 

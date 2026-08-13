@@ -2228,7 +2228,10 @@ backfill_days = 90
 
         // A trailing slash never doubles.
         assert_eq!(
-            with_base("https://gw.example.com/").resolve_llm().unwrap().url,
+            with_base("https://gw.example.com/")
+                .resolve_llm()
+                .unwrap()
+                .url,
             "https://gw.example.com/v1/messages"
         );
 

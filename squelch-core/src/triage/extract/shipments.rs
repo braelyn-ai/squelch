@@ -249,36 +249,6 @@ pub fn sanitize_order_ref(raw: Option<&str>) -> Option<String> {
     }
 }
 
-/// Is `s` a generic placeholder ("Package", "Your order", "Order update", …)
-/// rather than a real item name? Such a value is no better than the client's own
-/// fallback label, and storing it makes every shipment card read the same.
-///
-/// NOTE: `shipment::is_generic_item` is the regex detector's sibling of this
-/// test but is private to that module; the list here is a superset covering the
-/// phrases a model volunteers.
-fn is_generic_item_name(s: &str) -> bool {
-    let l = s.trim().to_lowercase();
-    matches!(
-        l.as_str(),
-        "" | "package"
-            | "your package"
-            | "the package"
-            | "order"
-            | "your order"
-            | "order update"
-            | "shipping update"
-            | "delivery update"
-            | "shipment"
-            | "your shipment"
-            | "parcel"
-            | "item"
-            | "your item"
-            | "unknown"
-            | "n/a"
-            | "none"
-    )
-}
-
 /// Is the candidate item name just the SUBJECT LINE handed back? A real item
 /// name is a fragment of the subject at most; a near-copy (>=90% of it) is the
 /// model echoing the header instead of naming the goods.
@@ -296,7 +266,10 @@ fn echoes_subject(item: &str, subject: &str) -> bool {
 /// capped at 120 chars, boilerplate and subject echoes refused.
 pub fn sanitize_item_name(raw: Option<&str>, subject: &str) -> Option<String> {
     let name = raw?.trim();
-    if name.is_empty() || is_generic_item_name(name) || echoes_subject(name, subject) {
+    if name.is_empty()
+        || crate::triage::shipment::is_generic_item(name)
+        || echoes_subject(name, subject)
+    {
         return None;
     }
     let capped = truncate_trimmed(name, 120);

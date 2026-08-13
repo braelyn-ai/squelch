@@ -1675,9 +1675,16 @@ mod tests {
         let q = queued(false, None);
         let ctx = RowContext::from_queued(&q, 4000);
 
-        let outcome = classify(&http, &url, "sk-test", &cfg, Stage2Provider::Anthropic, &ctx)
-            .await
-            .unwrap();
+        let outcome = classify(
+            &http,
+            &url,
+            "sk-test",
+            &cfg,
+            Stage2Provider::Anthropic,
+            &ctx,
+        )
+        .await
+        .unwrap();
         // The mock answered exactly one request — the classify above — so the
         // URL parameter is the one that was hit.
         let req = handle.await.unwrap();
