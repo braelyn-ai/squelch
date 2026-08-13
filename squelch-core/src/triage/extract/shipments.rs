@@ -202,9 +202,10 @@ fn normalize_tracking(raw: &str) -> Option<String> {
 ///    actually belongs in.
 pub fn sanitize_tracking_number(raw: Option<&str>, order_ref: Option<&str>) -> Option<String> {
     let candidate = normalize_tracking(raw?)?;
-    // Ambiguous shapes are bare digit runs, so this floor is unreachable today;
-    // it is kept so a loosening of the shape rule cannot silently admit a
-    // too-short run.
+    // "Ambiguous" is now anything that is not a self-identifying carrier shape
+    // (1Z…, TBA…, 9[234] IMpb), so this floor is live: an alphanumeric candidate
+    // carrying fewer than ten digits is too short to be any carrier's number, and
+    // a model that volunteers one is quoting a reference, not a tracking number.
     let digits = candidate.chars().filter(|c| c.is_ascii_digit()).count();
     if is_ambiguous_tracking_shape(&candidate) && digits < 10 {
         return None;

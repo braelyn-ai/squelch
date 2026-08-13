@@ -163,22 +163,31 @@ struct Detector {
 fn detector() -> &'static Detector {
     static D: OnceLock<Detector> = OnceLock::new();
     D.get_or_init(|| Detector {
+        // ASCII-ONLY, EVERY SHAPE. `rx` compiles these Unicode-aware, where
+        // `\d` is `\p{Nd}` and `(?i)[A-Z]` case-folds in Unicode — so a run of
+        // Arabic-Indic digits (`٠١٢…`) or a KELVIN SIGN inside a `1Z…` body used
+        // to be CAPTURED as a tracking number. No carrier issues a non-ASCII
+        // number, and such a capture is unpollable: a phantom the carrier can
+        // never resolve. `[0-9]` and `(?-u:…)` keep the classes ASCII (the
+        // `\b`s stay Unicode-aware on purpose: a non-ASCII digit is still a word
+        // character, so an ASCII run glued to one has no boundary and is
+        // correctly refused).
         numbers: vec![
             // UPS: 1Z + 16 alnum. Unambiguous prefix — trusted without a signal.
-            ("ups", rx(r"\b1Z[0-9A-Z]{16}\b"), false),
+            ("ups", rx(r"\b(?-u:1Z[0-9A-Z]{16})\b"), false),
             // Amazon logistics: TBA + >=9 digits. Unambiguous prefix.
-            ("amazon", rx(r"\bTBA\d{9,}\b"), false),
+            ("amazon", rx(r"\b(?-u:TBA[0-9]{9,})\b"), false),
             // USPS: the distinctive 9[234]-prefixed impb form is trusted; a bare
             // 20-22 digit run is ambiguous and needs a carrier signal.
-            ("usps", rx(r"\b9[234]\d{18,24}\b"), false),
-            ("usps", rx(r"\b\d{20,22}\b"), true),
+            ("usps", rx(r"\b9[234][0-9]{18,24}\b"), false),
+            ("usps", rx(r"\b[0-9]{20,22}\b"), true),
             // FedEx: 12, 15, or 20 digits — all bare runs, all need a signal.
-            ("fedex", rx(r"\b\d{20}\b"), true),
-            ("fedex", rx(r"\b\d{15}\b"), true),
-            ("fedex", rx(r"\b\d{12}\b"), true),
+            ("fedex", rx(r"\b[0-9]{20}\b"), true),
+            ("fedex", rx(r"\b[0-9]{15}\b"), true),
+            ("fedex", rx(r"\b[0-9]{12}\b"), true),
             // DHL: 10-11 digits, the loosest shape — a bare 10-digit order
             // number with no DHL signal must not read as a DHL shipment.
-            ("dhl", rx(r"\b\d{10,11}\b"), true),
+            ("dhl", rx(r"\b[0-9]{10,11}\b"), true),
         ],
         carrier_names: vec![
             ("ups", rx(r"\bUPS\b|\bups\.com\b")),
@@ -434,25 +443,58 @@ fn ambiguous_number_is_hard_negative(hay: &str, start: usize, end: usize) -> boo
         .is_match(&hay[window_start(hay, start, 20)..start])
 }
 
+/// Is `number` one of the SELF-IDENTIFYING carrier shapes — a shape whose own
+/// prefix says which carrier issued it? The whitelist behind
+/// [`is_ambiguous_tracking_shape`], and deliberately ASCII-only: no carrier
+/// issues a non-ASCII number, so a run of Arabic-Indic digits identifies nothing.
+///
+/// Each arm mirrors the matching `Detector::numbers` entry with
+/// `requires_signal = false`, since those are exactly the numbers whose prefix
+/// buys them entry with no carrier signal at all.
+fn is_self_identifying_shape(n: &str) -> bool {
+    if !n.is_ascii() {
+        return false;
+    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    // UPS: 1Z + 16 alnum.
+    if n.len() == 18
+        && n[..2].eq_ignore_ascii_case("1Z")
+        && n[2..].bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return true;
+    }
+    // Amazon logistics: TBA + >=9 digits.
+    if n.len() >= 12 && n[..3].eq_ignore_ascii_case("TBA") && digits(&n[3..]) {
+        return true;
+    }
+    // USPS IMpb: 9[234] + 18-24 more digits, the detector's trusted USPS shape.
+    if (20..=26).contains(&n.len()) && digits(n) && matches!(&n[..2], "92" | "93" | "94") {
+        return true;
+    }
+    false
+}
+
 /// Shape-only ambiguity test for an ALREADY-STORED tracking number, the read-side
-/// sibling of the gating above: `true` for the bare digit runs a retailer item or
-/// order id can impersonate (10-15 digits, or 20-22 digits without the IMpb
-/// `9[234]` prefix), `false` for the self-identifying shapes — UPS `1Z…`, Amazon
-/// `TBA…`, and `9[234]`-prefixed IMpb numbers.
+/// sibling of the gating above: `false` ONLY for the self-identifying shapes —
+/// UPS `1Z…`, Amazon `TBA…`, `9[234]`-prefixed IMpb — and `true` for everything
+/// else, the bare digit runs a retailer item or order id can impersonate
+/// included.
+///
+/// FAIL-SAFE BY CONSTRUCTION: the answer is `!self_identifying`, not a list of
+/// ambiguous shapes, because being wrong in the two directions costs very
+/// differently. Calling an ambiguous number self-identifying makes it
+/// unsuppressible and unreapable — an attacker-minted phantom the poller can
+/// never resolve and the repair passes refuse to delete (the live bug: a run of
+/// Arabic-Indic digits was captured as USPS and then classified NON-ambiguous,
+/// where the byte-identical ASCII run was ambiguous). Calling a self-identifying
+/// number ambiguous only exposes it to the same suppression the digit runs
+/// already get, behind repeated poll failures. So anything we cannot positively
+/// recognize is ambiguous.
 ///
 /// ONE definition of "ambiguous", shared by the listing suppression and the
 /// repair passes, so a number can never be ambiguous to one and not the other.
 pub fn is_ambiguous_tracking_shape(number: &str) -> bool {
-    let n = number.trim();
-    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
-        // Anything carrying letters is a prefixed shape (1Z…, TBA…), not a run.
-        return false;
-    }
-    match n.len() {
-        10..=15 => true,
-        20..=22 => !matches!(&n[..2], "92" | "93" | "94"),
-        _ => false,
-    }
+    !is_self_identifying_shape(number.trim())
 }
 
 /// Does the text carry GENUINE INBOUND-DELIVERY phrasing? Advisory only, and it
@@ -1298,8 +1340,12 @@ mod tests {
         );
         assert!(is_ambiguous_tracking_shape(" 1234567890 "), "trimmed");
 
-        // Self-identifying shapes.
+        // Self-identifying shapes: the ONLY non-ambiguous answers.
         assert!(!is_ambiguous_tracking_shape("1Z999AA10123456784"), "UPS");
+        assert!(
+            !is_ambiguous_tracking_shape("1z999aa10123456784"),
+            "UPS, as the case-insensitive detector would have captured it"
+        );
         assert!(!is_ambiguous_tracking_shape("TBA303392911000"), "Amazon");
         assert!(
             !is_ambiguous_tracking_shape("9400111899223817428490"),
@@ -1313,15 +1359,102 @@ mod tests {
             !is_ambiguous_tracking_shape("9300120111410471677883"),
             "IMpb 93"
         );
+    }
 
-        // Out-of-range runs and junk.
-        assert!(!is_ambiguous_tracking_shape("123456789"), "9 digits");
-        assert!(
-            !is_ambiguous_tracking_shape("1234567890123456"),
-            "16 digits"
+    /// FAIL-SAFE: anything that is not a recognized self-identifying ASCII shape
+    /// is ambiguous — including junk and the near-misses. The old list-the-
+    /// ambiguous-shapes form answered "not ambiguous" for everything it did not
+    /// recognize, which made such a row unsuppressible AND unreapable.
+    #[test]
+    fn an_unrecognizable_shape_is_ambiguous_not_self_identifying() {
+        for junk in [
+            "",
+            "   ",
+            "abc",
+            "123456789",              // 9 digits, under every shape
+            "1234567890123456",       // 16 digits, between the shapes
+            "1Z999AA1012345678",      // UPS one char short
+            "1Z999AA10123456784X",    // UPS one char long
+            "1Z999AA1012345678!",     // UPS length, non-alnum tail
+            "TBA12345678",            // TBA + only 8 digits
+            "TBA30339291100A",        // TBA + non-digits
+            "9400111899223817428",    // IMpb 19 digits, one short
+            "9100111899223817428490", // 91 is not an IMpb service prefix
+        ] {
+            assert!(
+                is_ambiguous_tracking_shape(junk),
+                "{junk:?} is not a recognizable carrier shape, so it must be reapable"
+            );
+        }
+    }
+
+    /// THE UNICODE DEFEAT, both halves. The regexes used the Unicode-aware `\d`,
+    /// so a run of Arabic-Indic digits was CAPTURED as a USPS tracking number,
+    /// while the byte test in `is_ambiguous_tracking_shape` called it
+    /// self-identifying — a phantom the poller can never resolve and the repair
+    /// passes refused to delete.
+    #[test]
+    fn unicode_digit_runs_are_neither_captured_nor_called_self_identifying() {
+        // The exact payload from the report: 21 Arabic-Indic digits.
+        let arabic: String = "٠١٢٣٤٥٦٧٨٩".chars().cycle().take(21).collect();
+        assert_eq!(arabic.chars().count(), 21);
+        let s = detect_shipment(
+            "auto-reply@usps.com",
+            "USPS Tracking update",
+            &format!("Tracking number {arabic} is in transit."),
         );
-        assert!(!is_ambiguous_tracking_shape(""), "empty");
-        assert!(!is_ambiguous_tracking_shape("abc"), "not digits");
+        assert!(
+            s.is_none(),
+            "carriers do not issue non-ASCII numbers: {s:?}"
+        );
+        assert!(
+            is_ambiguous_tracking_shape(&arabic),
+            "and if one were ever stored, it must stay reapable"
+        );
+
+        // Fullwidth digits, the same trick in another script.
+        let fullwidth: String = "１２３４５６７８９０".chars().cycle().take(10).collect();
+        assert!(
+            detect_shipment(
+                "noreply@dhl.com",
+                "Your DHL package is out for delivery",
+                &format!("Track your DHL shipment {fullwidth} at dhl.com."),
+            )
+            .is_none(),
+            "fullwidth digits are not a DHL number"
+        );
+        assert!(is_ambiguous_tracking_shape(&fullwidth));
+
+        // NOT VACUOUS: the byte-identical ASCII shape is still detected, and is
+        // still ambiguous. Only the script changed.
+        let ascii: String = "0123456789".chars().cycle().take(21).collect();
+        let s = detect_shipment(
+            "auto-reply@usps.com",
+            "USPS Tracking update",
+            &format!("Tracking number {ascii} is in transit."),
+        )
+        .expect("the ASCII run is a shipment");
+        assert_eq!(s.tracking_number, ascii);
+        assert_eq!(s.carrier, "usps");
+        assert!(is_ambiguous_tracking_shape(&ascii));
+    }
+
+    /// The same Unicode hole in the UNAMBIGUOUS shapes: `(?i)` case-folds
+    /// `[0-9A-Z]` in Unicode, so a KELVIN SIGN (U+212A, which folds to `k`) or a
+    /// LATIN SMALL LETTER LONG S (U+017F -> `s`) inside a `1Z…` body was
+    /// captured as a UPS number, no carrier signal required.
+    #[test]
+    fn unicode_case_folding_cannot_smuggle_a_ups_number() {
+        for smuggled in ["1Z999AA1012345678\u{212A}", "1Z999AA1012345678\u{017F}"] {
+            assert_eq!(smuggled.chars().count(), 18, "UPS shape length");
+            let s = detect_shipment(
+                "ship-confirm@ups.com",
+                "Your UPS package has shipped",
+                &format!("Tracking number: {smuggled}. Track your package."),
+            );
+            assert!(s.is_none(), "non-ASCII UPS number captured: {s:?}");
+            assert!(is_ambiguous_tracking_shape(smuggled));
+        }
     }
 
     #[test]
