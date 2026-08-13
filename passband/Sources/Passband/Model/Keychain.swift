@@ -10,12 +10,12 @@
 // and `revealAsync()` is the one deliberate hole, for Settings'
 // human-initiated Show / Edit.
 //
-// Every LLMProxy entry point holds that line: `complete()` (both shapes) and
-// `stream()` each read the key inside themselves and hand back only provider
-// output — the key is never a parameter, a returned/yielded value, or anything
-// an error carries. That is also why a caller wanting a one-shot answer gets an
-// overload HERE rather than building its own request somewhere else: the moment
-// a second file constructs the header, the key has to leave this one.
+// Every LLMProxy entry point holds that line: `complete()` and `stream()` each
+// read the key inside themselves and hand back only provider output — the key
+// is never a parameter, a returned/yielded value, or anything an error carries.
+// That is also why a caller wanting a one-shot answer gets its entry point HERE
+// rather than building its own request somewhere else: the moment a second file
+// constructs the header, the key has to leave this one.
 
 import Foundation
 import Security
@@ -387,41 +387,6 @@ enum LLMProxy {
         // Validate it parses as JSON so callers can assume a decodable body.
         guard (try? JSONSerialization.jsonObject(with: data)) != nil else { throw LLMError.nonJSON }
         return LLMResponse(status: http.statusCode, json: data)
-    }
-
-    /// The SAME one-shot call, for a caller that holds its request as a
-    /// dictionary and wants only the model's words back. Same key access and
-    /// same headers as `stream()` — it goes through `complete(body:)` above, so
-    /// there is exactly one place that builds the request — minus the two
-    /// things that make a call a stream: no `Accept: text/event-stream`, and
-    /// the caller must NOT set `"stream": true` in `body`.
-    ///
-    /// Anthropic's response shape, deliberately: this exists for the small
-    /// classifier calls the app makes on its own behalf, which name a Claude
-    /// model — so the Anthropic provider is REQUIRED in-band, and a non-Claude
-    /// key throws `.wrongProvider` instead of spending a call a different
-    /// endpoint cannot read. Callers may still ask `AssistantKeyStore.status()`
-    /// first as the cheap don't-bother gate.
-    static func complete(body: [String: Any]) async throws -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else {
-            throw LLMError.nonJSON
-        }
-        let response = try await complete(body: data, require: .anthropic)
-        guard response.status == 200 else {
-            throw LLMError.provider(
-                status: response.status, message: errorMessage(inJSON: response.json))
-        }
-        guard let object = try? JSONSerialization.jsonObject(with: response.json) as? [String: Any],
-            let content = object["content"] as? [[String: Any]]
-        else { return "" }
-        // The first block that CARRIES text, not literally block zero: a
-        // response that opens with a thinking or tool_use block would otherwise
-        // read as an empty answer, which is a silent wrong result rather than a
-        // visible failure.
-        for block in content {
-            if let text = block["text"] as? String { return text }
-        }
-        return ""
     }
 
     /// Make ONE streaming call and yield each SSE frame's `data:` payload as it

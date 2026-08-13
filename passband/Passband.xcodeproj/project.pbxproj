@@ -55,7 +55,6 @@
 		42B14F1B7A46FE2A0B7E9772 /* PassbandApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389673F8FDDB51FC4830D9D2 /* PassbandApp.swift */; };
 		42D3E80C99FEE7FA7C6D3CF0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
 		4836A3C84F0310D8E5E60FCB /* UpdateVerbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6895E072B54D7FEA646D6903 /* UpdateVerbs.swift */; };
-		48E6A19646CCEF224A50080E /* QueryClassifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BABEEDE28D809C2F736A636 /* QueryClassifier.swift */; };
 		4A484A26530C0131828B0A16 /* Loadable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A74374DEAEE21CDF9A5067D /* Loadable.swift */; };
 		4A6FA53C127DAD99FB5AF300 /* SenderIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */; };
 		4AC6AF18555B3DB2FE69CC91 /* ConnectionHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FCD987D800267801D7B4DFE /* ConnectionHealth.swift */; };
@@ -240,7 +239,6 @@
 		168312D5219614E1F658480C /* Resources */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Resources; path = Sources/Passband/Resources; sourceTree = SOURCE_ROOT; };
 		1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthCodeModal.swift; sourceTree = "<group>"; };
 		1A74374DEAEE21CDF9A5067D /* Loadable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Loadable.swift; sourceTree = "<group>"; };
-		1BABEEDE28D809C2F736A636 /* QueryClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueryClassifier.swift; sourceTree = "<group>"; };
 		1D19065EB7E9BFE9E846675B /* Keychain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Keychain.swift; sourceTree = "<group>"; };
 		1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Haptics.swift; sourceTree = "<group>"; };
 		1DD489E941E602E585098D3F /* EmailWebViewiOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmailWebViewiOS.swift; sourceTree = "<group>"; };
@@ -517,7 +515,6 @@
 			isa = PBXGroup;
 			children = (
 				1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */,
-				1BABEEDE28D809C2F736A636 /* QueryClassifier.swift */,
 			);
 			path = Lib;
 			sourceTree = "<group>";
@@ -914,7 +911,6 @@
 				B36D0542B36A1421D26CA968 /* Platform.swift in Sources */,
 				7379C8366D649A8F25C27826 /* Prefs.swift in Sources */,
 				334CF29FAF59FE56B41E581B /* ProcessMode.swift in Sources */,
-				48E6A19646CCEF224A50080E /* QueryClassifier.swift in Sources */,
 				79BB8595545903AE279A319C /* Quotes.swift in Sources */,
 				A252756AF0D9655F2C1477B7 /* Ranking.swift in Sources */,
 				F19396496FB9FFA6061B7E1A /* Raster.swift in Sources */,

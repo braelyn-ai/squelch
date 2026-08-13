@@ -1034,14 +1034,14 @@ struct AssistantSection: View {
     }
 
     /// What the hint calls the thing this key pays for. The chord IS the Mac's
-    /// name for it; a phone has no chords, so it gets the plain noun — plus the
-    /// one OTHER spender the phone has: the search field's question check names
-    /// itself here, because "used only for X" must be the whole truth of what
-    /// the key is spent on.
+    /// name for it; a phone has no chords, so it gets the plain noun. Both
+    /// platforms have exactly one spender: nothing else in the app makes a model
+    /// call on the user's behalf, which is what lets "used only for X" be the
+    /// whole truth of what the key is spent on.
     #if os(macOS)
         private let assistantName = "the ⌘K assistant"
     #else
-        private let assistantName = "the assistant and the quick check that sorts Search typing into lookups or questions"
+        private let assistantName = "the assistant"
     #endif
 
     var body: some View {

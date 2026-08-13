@@ -13,9 +13,9 @@
 // places anyone lives; they are reference surfaces you visit off the dashboard
 // and leave, so they hang from the sitrep's navigation bar (a person glyph
 // leading, a key trailing) instead of each spending permanent bar width. The
-// agent's own tab is gone too, and the next pass folds the assistant into the
-// search surface — one text field per screen is what a phone actually has, and
-// two doors for "ask me something" was one too many.
+// agent's own tab is gone too: one text field per screen is what a phone
+// actually has, so the assistant lives behind the search field and the chat is
+// a push off that stack. Two doors for "ask me something" was one too many.
 //
 // AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
 // that covers the window; here it is a NavigationStack destination — but driven
@@ -186,17 +186,17 @@ private struct MobileShell: View {
             // tab bar, next to the minimize affordance, which is where a phone
             // user reaches for it.
             //
+            // AND IT IS THE AGENT'S TAB TOO. The field asks or searches by how
+            // many words are in it, and the chat is a push on this same stack —
+            // so the only thing this shell has to know about the agent is that
+            // there is nothing here to know.
+            //
             // IT KEEPS A THREAD DESTINATION because a hit is mail and a hit you
-            // cannot open is a citation.
+            // cannot open is a citation — and because the agent's citations and
+            // email cards open onto this stack as well.
             Tab(value: MobileTab.search, role: .search) {
                 NavigationStack {
-                    // WAVE-2: the handoff has nowhere to land. The agent's tab
-                    // is gone, so a question QueryClassifier spots falls through
-                    // to plain search for now; the next pass folds the assistant
-                    // into this surface and gives the closure a real answer to
-                    // carry the words to. Left wired rather than removed so that
-                    // change is a body, not a signature.
-                    MobileSearchView(switchToAgent: { _ in })
+                    MobileSearchView()
                         .threadDestination(active: tab == .search)
                 }
                 .tabSlide(.search, selection: tab)

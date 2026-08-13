@@ -6,12 +6,19 @@
 // tray out of its own bottom edge becomes a whole screen, because a phone has
 // no window to float over and nothing to float above.
 //
+// IT IS PUSHED FROM THE SEARCH FIELD, and it has no tab of its own. The phone
+// has one text field per screen, so the field that asks the agent is the field
+// that searches; this screen is where those words land. Arriving with an
+// `initialQuestion` means the push itself WAS the send — the ask row was
+// tapped, or return was pressed on a five-word question — so the run starts on
+// appear rather than sitting in the composer waiting to be confirmed twice.
+//
 // WHAT THAT COSTS AND WHAT IT BUYS. The bar's glass container, its ⌘K/esc
-// chords and its "the conversation is behind a modal" framing are gone; a tab
-// is always there, so the conversation is a place you walk back into. In
-// exchange every row is re-laid out for a fingertip: bigger type, real tap
-// targets on the cards, and confirm buttons that span the card instead of
-// sitting in a 11pt row.
+// chords and its "the conversation is behind a modal" framing are gone; back
+// lands on the results the question came from, and the transcript survives the
+// pop because the session lives on the store. In exchange every row is re-laid
+// out for a fingertip: bigger type, real tap targets on the cards, and confirm
+// buttons that span the card instead of sitting in a 11pt row.
 //
 // THE ROW RENDERING IS PORTED, NOT SHARED, and deliberately: Views/AskBar.swift
 // is excluded from this target and stays that way. Its rows encode desktop
@@ -25,6 +32,10 @@ import SwiftUI
 struct MobileAgentView: View {
     @Environment(AppStore.self) private var store
 
+    /// The words that opened this screen, sent the moment it appears. nil when
+    /// the chat was walked into rather than asked into.
+    var initialQuestion: String?
+
     @State private var question = ""
     @FocusState private var focused: Bool
     /// Rendered markdown, kept across body evaluations — see MobileMarkdownCache.
@@ -33,6 +44,8 @@ struct MobileAgentView: View {
     /// swaps in for the composer, and flashing an explainer at a user who has a
     /// key set is the worse of the two wrong frames.
     @State private var keyStatus: AssistantKeyStatus?
+    /// The opening question has been sent. See `sendInitialQuestion`.
+    @State private var asked = false
 
     /// The conversation outlives this view — see AppStore.assistant.
     private var session: AssistantSession { store.assistant }
@@ -63,19 +76,13 @@ struct MobileAgentView: View {
             // STRUCTURE ONLY. Animating anything that changes per token would
             // smear the streaming text; the count changes once per row.
             .animation(.smooth(duration: 0.25), value: session.transcript.count)
-            .task { await refreshKeyStatus() }
-            // A TabView keeps a visited tab mounted, so `.task` fires once for
-            // the life of the shell — and the key gets pasted in the SETTINGS
-            // tab, after this one has already been looked at. Re-reading on
-            // every appearance is what lets walking back here turn the agent on.
+            // The key gets pasted in SETTINGS, on another tab, after this screen
+            // has already been looked at once. Re-reading on every appearance is
+            // what lets walking back in turn the agent on.
             .onAppear {
-                consumeSeed()
                 Task { await refreshKeyStatus() }
+                sendInitialQuestion()
             }
-            // The seed can also land while this tab is already mounted (the
-            // search tab hands its typed question over without a fresh mount),
-            // which `onAppear` alone would never see.
-            .onChange(of: store.agentSeed) { _, _ in consumeSeed() }
     }
 
     // MARK: - the log
@@ -672,17 +679,29 @@ struct MobileAgentView: View {
         keyStatus = await AssistantKeyStore.statusAsync()
     }
 
-    // MARK: - the handoff
+    // MARK: - the question that opened this
 
-    /// A question typed somewhere else, arriving here as a draft. It is PUT IN
-    /// THE FIELD, not sent: the other surface knows the words, not whether the
-    /// user meant them for the agent, and a tab switch that fired an API call on
-    /// its own would be the app spending the user's key without being asked.
-    private func consumeSeed() {
-        guard let seed = store.agentSeed else { return }
-        store.agentSeed = nil
-        question = seed
-        focused = true
+    /// Send the words this screen was pushed with, ONCE. Sent rather than
+    /// drafted because the push is the deliberate act: the ask row was tapped,
+    /// or return was pressed on a question, and offering the same sentence back
+    /// with a second Send to press is the app pretending it did not hear.
+    ///
+    /// The `asked` latch is not decoration. `onAppear` fires again every time
+    /// the reader pops back off this stack (a citation, a shown email), and
+    /// re-asking the opening question because somebody read one of its answers
+    /// would spend the user's key on their back button.
+    private func sendInitialQuestion() {
+        guard !asked, let text = initialQuestion?.trimmed, !text.isEmpty else { return }
+        asked = true
+        // A run is still open from the last visit: `send` would drop this on the
+        // floor, so it lands in the composer instead and the Send button lights
+        // up the moment the answer finishes. Losing a typed question silently is
+        // the one outcome worth writing four lines to avoid.
+        guard !session.running else {
+            question = text
+            return
+        }
+        session.send(text, openEmail: openEmail)
     }
 
     // MARK: - copy
