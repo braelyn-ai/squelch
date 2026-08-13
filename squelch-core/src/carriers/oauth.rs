@@ -1,10 +1,11 @@
 //! The client-credentials grant, shared by every carrier that speaks OAuth
 //! (UPS, FedEx, USPS — DHL is a bare API key and needs none of this).
 //!
-//! The three differ only in WHERE the client id and secret ride: UPS and USPS
-//! put them in an `Authorization: Basic` header, FedEx puts them in the form
-//! body. [`ClientAuth`] is that whole difference, so one [`TokenCache`] serves
-//! all three.
+//! The three differ in WHERE the client id and secret ride: UPS puts them in an
+//! `Authorization: Basic` header, FedEx in the form body — [`ClientAuth`] is
+//! that difference. USPS wants a JSON body neither arm encodes, so its client
+//! builds the request itself and shares only [`TokenCache`] and
+//! [`TokenResponse`].
 //!
 //! Tokens are cached in memory only, never persisted: a carrier access token is
 //! minutes-to-an-hour lived and re-mintable from creds we already hold, so
@@ -32,8 +33,28 @@ const DEFAULT_TTL: Duration = Duration::from_secs(300);
 pub struct TokenResponse {
     pub access_token: String,
     /// Seconds of validity, as the carrier reports it. Trusted as given.
-    #[serde(default)]
+    /// UPS types this as a JSON STRING (`"14399"`), so both spellings parse;
+    /// an unparseable value means "no stated expiry", answered by
+    /// [`DEFAULT_TTL`] rather than a failed mint.
+    #[serde(default, deserialize_with = "seconds")]
     pub expires_in: Option<u64>,
+}
+
+/// Accept `14399`, `"14399"`, or absence. Anything else is `None`, never an
+/// error: a token that arrived is worth using for [`DEFAULT_TTL`] even when its
+/// stated lifetime does not parse.
+fn seconds<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(u64),
+        Text(String),
+    }
+    Ok(match Option::<Raw>::deserialize(de).unwrap_or(None) {
+        Some(Raw::Number(n)) => Some(n),
+        Some(Raw::Text(s)) => s.trim().parse().ok(),
+        None => None,
+    })
 }
 
 /// Where a carrier wants the client id and secret on the token request.
