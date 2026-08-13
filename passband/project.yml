@@ -157,7 +157,9 @@ targets:
         # target above. CFBundleURLTypes (passband://) lives there, not here.
         INFOPLIST_FILE: Sources/PassbandiOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOS/PassbandiOS.entitlements
-        MARKETING_VERSION: "1.0.0"
+        # The ios-v* tag overrides this in CI; it exists so an untagged local
+        # build never claims a version ahead of what TestFlight actually has.
+        MARKETING_VERSION: "0.0.1"
         CURRENT_PROJECT_VERSION: "1"
         # iPhone only. The iPad layout is a different design, not a stretch.
         TARGETED_DEVICE_FAMILY: "1"
