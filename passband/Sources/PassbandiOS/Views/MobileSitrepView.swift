@@ -101,15 +101,23 @@ struct MobileSitrepView: View {
         // leading is where every phone keeps "you", and the trailing corner is
         // the thumb's corner, which is the right one for the thing you reach for
         // while a login form is waiting on you.
+        //
+        // BARE GLYPHS, NOT BUTTONS. iOS 26 gives a toolbar item its own glass
+        // capsule by default, and two of them over a dashboard that is already
+        // a column of glass cards reads as chrome competing with content. The
+        // background goes; the accent stays, which is the platform's own signal
+        // that a glyph is a door and the reason a bare icon still looks tappable.
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 NavigationLink {
                     AccountPage()
                 } label: {
                     Image(systemName: "person.crop.circle")
+                        .foregroundStyle(Palette.accent)
                 }
                 .accessibilityLabel("Account")
             }
+            .sharedBackgroundVisibility(.hidden)
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink {
                     MobileAuthView()
@@ -121,11 +129,12 @@ struct MobileSitrepView: View {
                     // window the page itself uses, so the dot and the row's
                     // "live" tag can never disagree.
                     //
-                    // The padding RESERVES the dot's corner rather than offsetting
-                    // it outside the glyph: a toolbar item is laid out inside its
-                    // own glass capsule, and anything hung past the label's bounds
-                    // is at the mercy of that capsule's clip.
+                    // The padding RESERVES the dot's corner rather than hanging
+                    // it outside the glyph: the item's own bounds are still what
+                    // the toolbar lays out and clips against, capsule or no
+                    // capsule, and a dot pushed past them is at that clip's mercy.
                     Image(systemName: "key.fill")
+                        .foregroundStyle(Palette.accent)
                         .padding(.top, 3)
                         .padding(.trailing, 3)
                         .overlay(alignment: .topTrailing) {
@@ -139,6 +148,7 @@ struct MobileSitrepView: View {
                 .accessibilityLabel("Login codes")
                 .accessibilityValue(liveCodeValue)
             }
+            .sharedBackgroundVisibility(.hidden)
         }
         .refreshable {
             _ = await SitrepPoller.shared.pull()

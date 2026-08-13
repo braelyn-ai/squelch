@@ -484,8 +484,16 @@ private struct NewsletterHero: View {
     let threadId: String
     @State private var resolved: HeroCache.Hero?
 
-    /// Side of the square thumb.
-    private static let side: CGFloat = 54
+    /// Side of the square thumb. SMALLER ON THE PHONE, because the card is: a
+    /// two-up phone card is roughly 160pt wide, and a 54pt square plus its
+    /// gutter takes a third of that away from the sender's name, which is the
+    /// one thing on the card you actually pick a newsletter by. The art is a
+    /// recognition cue, and it still works at 40.
+    #if os(iOS)
+        private static let side: CGFloat = 40
+    #else
+        private static let side: CGFloat = 54
+    #endif
 
     /// TUNABLE width:height cap on how wide a hero may be DRAWN. Wider art is
     /// cropped to exactly this ratio rather than letterboxed whole: a 728x90
