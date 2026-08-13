@@ -10,8 +10,9 @@
 #   ASC_KEY_ISSUER_ID  issuer id (App Store Connect > Users and Access > Keys)
 #   ASC_KEY_P8         the AuthKey_<id>.p8 file's contents, verbatim
 #
-# The key needs the App Manager role — cloud signing refuses to mint
-# certificates for anything weaker.
+# The key needs the ADMIN role. Apple's docs say App Manager suffices for
+# cloud signing; xcodebuild disagrees and fails with "Cloud signing permission
+# error" on anything below Admin (developer.apple.com/forums/thread/698117).
 name: release-ios
 
 on:
