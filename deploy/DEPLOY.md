@@ -140,6 +140,15 @@ never sees mail content — only an event id and a collapse id — and with
 `SQUELCH_RELAY_URL` unset, `squelchd serve` logs one line saying the pusher is
 disabled and spawns nothing.
 
+Carrier polling for package tracking is optional in the same way and configured
+the same way: `SQUELCH_UPS_CLIENT_ID` / `SQUELCH_UPS_CLIENT_SECRET`,
+`SQUELCH_FEDEX_CLIENT_ID` / `SQUELCH_FEDEX_CLIENT_SECRET`,
+`SQUELCH_USPS_CONSUMER_KEY` / `SQUELCH_USPS_CONSUMER_SECRET`,
+`SQUELCH_DHL_API_KEY` (plus `SQUELCH_DHL_DAILY_CAP` and the `SQUELCH_CARRIERS_*`
+cadence knobs). Credentials are the feature flag: with none set, no poller task
+runs and no carrier API is contacted. See
+[../docs/SHIPMENTS.md](../docs/SHIPMENTS.md).
+
 ---
 
 ## 4. Headless OAuth (read AND write credentials)

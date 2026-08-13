@@ -37,6 +37,36 @@ Config comes from `~/.config/squelch/config.toml` (override with `--config`) plu
 
 The listener defaults to loopback and never silently widens. To expose it beyond the machine, front it with a reverse proxy (e.g. `tailscale serve --bg 8848`) and set `SQUELCH_MCP_ALLOWED_HOSTS`.
 
+### Carrier polling
+
+Package tracking keeps working from mail alone, but the daemon can also ask the carriers directly. That is bring-your-own-credentials and off until you provide some: no credentials means no poller task and no carrier API is ever contacted.
+
+```toml
+[carriers]
+poll_interval_hours = 6        # baseline cadence for an in-flight package
+ofd_poll_interval_mins = 60    # tighter cadence once it is out for delivery
+max_age_days = 45              # stop chasing a package this old
+max_failures = 5               # consecutive permanent failures before retiring it
+
+[carriers.ups]                 # SQUELCH_UPS_CLIENT_ID / _CLIENT_SECRET
+client_id = "..."
+client_secret = "..."
+
+[carriers.fedex]               # SQUELCH_FEDEX_CLIENT_ID / _CLIENT_SECRET
+client_id = "..."
+client_secret = "..."
+
+[carriers.usps]                # SQUELCH_USPS_CONSUMER_KEY / _CONSUMER_SECRET
+consumer_key = "..."
+consumer_secret = "..."
+
+[carriers.dhl]                 # SQUELCH_DHL_API_KEY / SQUELCH_DHL_DAILY_CAP
+api_key = "..."
+daily_cap = 200
+```
+
+Each carrier is independent, and a credential pair set in the environment materializes a carrier the file never mentions, so a container needs no `config.toml`. The cadence knobs have `SQUELCH_CARRIERS_*` equivalents. Where to get each carrier's credentials, what the cadence actually does, and the metrics to alert on: [docs/SHIPMENTS.md](../docs/SHIPMENTS.md).
+
 ## Human-door credentials
 
 `SQUELCH_API_TOKEN` is the master key and is never going away: it works with an empty token table, so it is the way back in after revoking every device. It is now optional, though. `serve` comes up without it and accepts **per-device tokens** instead:
