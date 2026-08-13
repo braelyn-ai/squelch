@@ -1599,7 +1599,11 @@ mod tests {
             // "/" is Exact and everything else is Prefix: an Exact root
             // matches one path in the universe, a Prefix root would match all
             // of them.
-            let expected = if path.path.as_deref() == Some("/") { "Exact" } else { "Prefix" };
+            let expected = if path.path.as_deref() == Some("/") {
+                "Exact"
+            } else {
+                "Prefix"
+            };
             assert_eq!(path.path_type, expected, "{:?}", path.path);
             assert_eq!(
                 path.backend.service.as_ref().unwrap().name,

@@ -650,7 +650,10 @@ mod tests {
         let now = now();
         let id = s.insert_invite(&m.code_hash, now + days(30)).unwrap();
 
-        assert_eq!(s.find_available_invite(&m.code_hash, now).unwrap(), Some(id));
+        assert_eq!(
+            s.find_available_invite(&m.code_hash, now).unwrap(),
+            Some(id)
+        );
         let after = now + days(31);
         assert_eq!(s.find_available_invite(&m.code_hash, after).unwrap(), None);
         assert_eq!(
@@ -804,6 +807,9 @@ mod tests {
             s.insert_tenant("grace", "ADA@example.com"),
             Err(StoreError::AccountTaken)
         ));
-        assert_eq!(s.active_tenant_for_email("other@example.com").unwrap(), None);
+        assert_eq!(
+            s.active_tenant_for_email("other@example.com").unwrap(),
+            None
+        );
     }
 }

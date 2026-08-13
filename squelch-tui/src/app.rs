@@ -18,7 +18,10 @@ pub enum Mode {
     /// The plain ranked list.
     List,
     /// Thread detail drill-in; `None` view when the fetch was unavailable.
-    Detail { view: Option<ThreadView>, scroll: u16 },
+    Detail {
+        view: Option<ThreadView>,
+        scroll: u16,
+    },
     /// Sender rule editor for a selected message.
     RuleEdit(RuleEditor),
     /// Read-only audit list of all existing sender rules.
@@ -193,9 +196,11 @@ impl App {
         if let Some(prev) = prev {
             let rows = self.rows();
             let sel = Self::selectable_indices(&rows);
-            if let Some(new_pos) = sel.iter().enumerate().find_map(|(pos, &ri)| {
-                (row_id(&rows[ri]) == Some(prev.clone())).then_some(pos)
-            }) {
+            if let Some(new_pos) = sel
+                .iter()
+                .enumerate()
+                .find_map(|(pos, &ri)| (row_id(&rows[ri]) == Some(prev.clone())).then_some(pos))
+            {
                 self.selected = new_pos;
             } else {
                 self.clamp_selection();
@@ -207,17 +212,11 @@ impl App {
     }
 
     pub fn signal_count(&self) -> usize {
-        self.updates
-            .iter()
-            .filter(|u| self.above_line(u))
-            .count()
+        self.updates.iter().filter(|u| self.above_line(u)).count()
     }
 
     pub fn noise_count(&self) -> usize {
-        self.updates
-            .iter()
-            .filter(|u| !self.above_line(u))
-            .count()
+        self.updates.iter().filter(|u| !self.above_line(u)).count()
     }
 
     /// Whether an update sits above the squelch line, at the in-session threshold.
@@ -330,7 +329,10 @@ impl App {
     pub fn selected_is_sealed(&self) -> bool {
         let rows = self.rows();
         let sel = Self::selectable_indices(&rows);
-        matches!(sel.get(self.selected).map(|&i| &rows[i]), Some(Row::Sealed(_)))
+        matches!(
+            sel.get(self.selected).map(|&i| &rows[i]),
+            Some(Row::Sealed(_))
+        )
     }
 
     pub fn adjust_threshold(&mut self, delta: i16) {
@@ -358,7 +360,10 @@ impl App {
 
     /// Open the read-only rules audit list.
     pub fn open_rule_list(&mut self) {
-        let rules = self.store.list_sender_rules(self.account).unwrap_or_default();
+        let rules = self
+            .store
+            .list_sender_rules(self.account)
+            .unwrap_or_default();
         self.mode = Mode::RuleList { rules, scroll: 0 };
     }
 

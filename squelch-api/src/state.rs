@@ -298,16 +298,18 @@ impl ApiState {
             event_notifier: None,
             shutdown: None,
             tracking_base_url: None,
-            pixel_slots: Arc::new(tokio::sync::Semaphore::new(crate::tracking::PIXEL_CONCURRENCY)),
+            pixel_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::tracking::PIXEL_CONCURRENCY,
+            )),
             pair_slots: Arc::new(tokio::sync::Semaphore::new(crate::pair::PAIR_CONCURRENCY)),
             device_auth_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::auth::DEVICE_AUTH_CONCURRENCY,
             )),
             console_sso_url: None,
             console_allow_insecure_cookie: false,
-            console_signin_limiter: Arc::new(std::sync::Mutex::new(ConsoleRateLimiter::per_minute(
-                crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE,
-            ))),
+            console_signin_limiter: Arc::new(std::sync::Mutex::new(
+                ConsoleRateLimiter::per_minute(crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE),
+            )),
             rule_infer: None,
         }
     }
@@ -439,11 +441,7 @@ impl ApiState {
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
     /// the usage page shows what model produced the spend.
-    pub fn with_stage2_model(
-        mut self,
-        model: impl Into<String>,
-        provider: Option<String>,
-    ) -> Self {
+    pub fn with_stage2_model(mut self, model: impl Into<String>, provider: Option<String>) -> Self {
         self.stage2_model = Arc::from(model.into().as_str());
         self.stage2_provider = provider.map(|p| Arc::from(p.as_str()));
         self

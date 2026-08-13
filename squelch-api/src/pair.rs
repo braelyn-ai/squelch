@@ -368,7 +368,11 @@ mod tests {
             header::HeaderValue::from_static("https://evil.example"),
         );
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "the claim itself still works");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the claim itself still works"
+        );
         assert!(
             resp.headers()
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
