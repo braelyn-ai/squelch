@@ -412,8 +412,16 @@ and triages on rules alone, the control plane logs the miss loudly, and
 squelch-control llm mint <label>
 ```
 
-backfills the key later — the same command rotates a key (it prints the old
-Bifrost key id; revoke it there) and keys tenants that predate the gateway.
+backfills the keys later — the same command rotates them (it prints the old
+Bifrost key ids; revoke them there) and keys tenants that predate the gateway.
+
+Every mint is TWO virtual keys: the triage key and the assistant key
+(`tenant-<label>-assistant`, its own budget and model list). The assistant key
+never leaves the pod: the daemon holds it and proxies the Passband app's
+assistant chats through `/client/assistant/messages`, so the app spends
+against the tenant's assistant budget without ever seeing a credential. A
+tenant minted before the assistant era keeps working; the app's relay option
+simply does not appear until the tenant is re-minted.
 
 ## 7. Tenant limits
 

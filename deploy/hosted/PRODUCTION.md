@@ -79,9 +79,14 @@ Environment (names only — values are in Railway):
 `SQUELCH_CONTROL_CLIENT_ID`, `SQUELCH_CONTROL_CLIENT_SECRET`,
 `SQUELCH_CONTROL_COOKIE_KEY`, `SQUELCH_CONTROL_WARDEN_URL`,
 `SQUELCH_CONTROL_WARDEN_TOKEN`, `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS=1`,
-plus the Bifrost trio — `SQUELCH_CONTROL_BIFROST_URL`,
-`SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN`, `SQUELCH_CONTROL_LLM_BUDGET_USD` —
-which is all-or-nothing: a partial trio is a refusal to boot.
+plus the Bifrost pair — `SQUELCH_CONTROL_BIFROST_URL`,
+`SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` — which is all-or-nothing: one
+without the other is a refusal to boot. Four budget/model knobs ride on
+top, all defaulted: `SQUELCH_CONTROL_LLM_BUDGET_USD` ($5) and
+`SQUELCH_CONTROL_LLM_MODELS` for the triage key,
+`SQUELCH_CONTROL_ASSISTANT_BUDGET_USD` ($10) and
+`SQUELCH_CONTROL_ASSISTANT_MODELS` (haiku + opus) for the assistant key
+the Passband app's relay chats spend against.
 Full table: `squelch-control/README.md`.
 
 ### The LLM gateway
