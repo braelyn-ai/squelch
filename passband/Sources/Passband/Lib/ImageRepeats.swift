@@ -1,5 +1,5 @@
-// Repeated-image suppression, scoped to ONE thread: a signature logo repeated
-// by every message (and by each reply's quoted history) shows once.
+// Repeated-image suppression inside ONE message: quoted history can repeat the
+// same signature art several times, and only its first occurrence is useful.
 //
 // De-duplication only — it runs after Trackers.strip and changes no security
 // posture, since dropping a tag can only remove a request, never add one. The
@@ -22,24 +22,9 @@ enum ImageRepeats {
         ImageProxy.unescapeEntities(src.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Every dedupable `<img src>` in document order.
-    static func sources(_ html: String) -> [String] {
-        var found: [String] = []
-        // Read-only pass: every tag is kept and the spliced html is discarded.
-        _ = HTMLImg.walk(html) { tag in
-            if let src = Trackers.attrValue(tag, "src") {
-                let k = key(src)
-                if isDedupable(k) { found.append(k) }
-            }
-            return .keep
-        }
-        return found
-    }
-
-    /// Drop every `<img>` whose src already appeared, in an earlier message
-    /// (`alreadySeen`) or earlier in this same html.
-    static func dropRepeats(_ html: String, alreadySeen: Set<String>) -> String {
-        var seen = alreadySeen
+    /// Drop every `<img>` whose src appeared earlier in this same html.
+    static func dropRepeats(_ html: String) -> String {
+        var seen = Set<String>()
         return HTMLImg.walk(html) { tag in
             guard let src = Trackers.attrValue(tag, "src") else { return .keep }
             let k = key(src)

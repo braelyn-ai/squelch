@@ -3,7 +3,10 @@
 // — so `img-src` is `passband-img: data:` alone and a reference this pass misses
 // FAILS CLOSED (a broken-image glyph, never an un-proxied request). The
 // per-launch HMAC makes "minted by this rewrite" a checkable claim. cid:, data:
-// and protocol-relative are left alone. See docs/SECURITY.md §3.
+// and protocol-relative are left alone. Plain-http references are upgraded to
+// https when they use the default port: App Transport Security refuses the
+// original request, while newsletter CDNs routinely publish the same object on
+// both schemes. See docs/SECURITY.md §3.
 
 import CryptoKit
 import Foundation
@@ -36,6 +39,7 @@ enum ImageProxy {
             if decodeEntities { candidate = unescapeEntities(candidate) }
             let lower = candidate.lowercased()
             guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return nil }
+            candidate = upgradedToHTTPS(candidate)
             guard
                 let encoded = candidate.addingPercentEncoding(
                     withAllowedCharacters: Self.unreserved)
@@ -235,6 +239,19 @@ enum ImageProxy {
     private static let unreserved = CharacterSet(
         charactersIn:
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+    /// ATS blocks ordinary HTTP image loads. Upgrade only when no port is
+    /// explicit: changing the scheme while preserving `:80` would usually fail,
+    /// while removing a written port would no longer be a scheme-only splice.
+    private static func upgradedToHTTPS(_ raw: String) -> String {
+        guard let parts = URLComponents(string: raw), parts.scheme?.lowercased() == "http",
+            parts.port == nil
+        else { return raw }
+        // URLComponents is inspection-only. Serializing it would normalize the
+        // path (`%` -> `%25`, Unicode -> escapes, and so on), potentially naming
+        // a different object. Preserve every byte after the known prefix.
+        return "https://" + raw.dropFirst("http://".count)
+    }
 
     /// The entities an HTML serializer can put in an attribute value, decoded in
     /// ONE pass so `&amp;lt;` yields `&lt;` and not `<`. Internal because this

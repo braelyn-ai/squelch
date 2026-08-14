@@ -31,9 +31,6 @@ struct ThreadViewer: View {
     @State private var debugInfo: TriageDebug?
     /// True for `Clip.flashWindow` after the subject is clicked-to-copy.
     @State private var subjectCopied = false
-    /// messageId -> image srcs an earlier message in this thread already showed.
-    /// Rebuilt with the thread and thrown away with it; nothing crosses threads.
-    @State private var repeatedImages: [Int: Set<String>] = [:]
     /// messageId -> recorded opens of the user's own tracked sends. Only sent,
     /// tracked messages ever have an entry; see `refreshOpens`.
     @State private var opens: [Int: [MessageOpen]] = [:]
@@ -374,7 +371,6 @@ struct ThreadViewer: View {
                         ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                             MessageCard(
                                 message: m, selected: i == index, ruled: i > 0,
-                                seenEarlier: repeatedImages[m.id] ?? [],
                                 opens: opens[m.id] ?? []
                             ) {
                                 index = i
@@ -703,11 +699,6 @@ struct ThreadViewer: View {
         // arrival, and reopening this thread must not serve it back.
         ThreadPrefetch.shared.note(threadId, view)
         adopt(view)
-        // `adopt` read the prefetch's repeated-image map, but the warmer that
-        // recomputes it is detached and has not landed — the arrivals have no
-        // entry, and their repeated logos would all render again. Derive it
-        // from the view in hand instead.
-        repeatedImages = ThreadPrefetch.repeatedImages(in: view)
         if let anchor, let found = messages.firstIndex(where: { $0.id == anchor }) {
             index = found
         }
@@ -800,19 +791,9 @@ struct ThreadViewer: View {
         loading = false
     }
 
-    /// Take a loaded thread and derive everything per-thread from it ONCE.
-    ///
-    /// The repeated-image pass in particular must not be a computed property:
-    /// it strips and scans every message body, and the surrounding view
-    /// re-evaluates on every scroll frame — the same trap EmailWebView's
-    /// `Prepared` cache exists to close. The prefetch warmer normally has it
-    /// computed already (off the main actor, alongside the prepared bodies);
-    /// only a thread that opened ahead of its warmer pays for it here.
+    /// Take a loaded thread and derive its reader state.
     private func adopt(_ view: ClientThreadView) {
         thread = view
-        repeatedImages =
-            ThreadPrefetch.shared.cachedRepeatedImages(threadId)
-            ?? ThreadPrefetch.repeatedImages(in: view)
         index = 0  // newest renders first — land on it
         // What the ⌘K agent is told it is looking at. Lifted into the store
         // because the ask bar is a modal above this view and cannot see its
@@ -937,8 +918,6 @@ private struct MessageCard: View {
     /// The first message needs no divider above it: that is the top of the
     /// document, not a seam between two messages.
     let ruled: Bool
-    /// Image srcs an earlier message already showed; dropped from this body.
-    let seenEarlier: Set<String>
     /// Recorded opens of this message, when it is one of the user's own tracked
     /// sends. Empty for everything else, which renders no mark.
     let opens: [MessageOpen]
@@ -972,8 +951,7 @@ private struct MessageCard: View {
 
             if let html = message.html, !html.isEmpty {
                 EmailWebView(
-                    html: html, cacheKey: String(message.id), seenEarlier: seenEarlier,
-                    allowTrackers: message.allowsTrackers)
+                    html: html, cacheKey: String(message.id), allowTrackers: message.allowsTrackers)
             } else {
                 PlainBody(content: message.content)
             }

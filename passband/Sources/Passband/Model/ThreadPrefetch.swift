@@ -29,9 +29,6 @@ final class ThreadPrefetch {
     /// it leaves behind (which is why this is not an `AsyncMemo` — a hit here
     /// is a hit only while it is FRESH, and freshness is not memoizable).
     private var inflight: Set<String> = []
-    /// threadId -> the warmer's repeated-image map. Rides the same LRU as the
-    /// view it was derived from, being meaningful only beside one.
-    private var repeated: [String: [Int: Set<String>]] = [:]
     /// Bumped by `wipe()`. Every fetch this class starts captures it and files
     /// nothing once it no longer matches: a thread fetched for the old account
     /// must not land in the new account's cache, and the trickle of a batch
@@ -44,12 +41,8 @@ final class ThreadPrefetch {
         _ threadId: String, _ view: ClientThreadView, fresh: TimeInterval, gen: Int
     ) {
         guard gen == generation else { return }
-        // A view leaving the cache takes its repeated-image map with it — the
-        // map is meaningful only beside the view it was derived from.
-        if let evicted = cache.set(threadId, Entry(view: view, ts: Date(), fresh: fresh)) {
-            repeated.removeValue(forKey: evicted)
-        }
-        warmBodies(threadId, view)
+        _ = cache.set(threadId, Entry(view: view, ts: Date(), fresh: fresh))
+        warmBodies(view)
     }
 
     /// Drop everything, cache and in-flight bookkeeping alike. An account
@@ -58,7 +51,6 @@ final class ThreadPrefetch {
     func wipe() {
         generation &+= 1
         cache.removeAll()
-        repeated.removeAll()
         inflight.removeAll()
     }
 
@@ -123,10 +115,6 @@ final class ThreadPrefetch {
 
     // MARK: - prepared bodies
 
-    /// The warmer's repeated-image map for a thread. nil is a normal answer
-    /// (unfinished or evicted) — the viewer computes its own rather than wait.
-    func cachedRepeatedImages(_ threadId: String) -> [Int: Set<String>]? { repeated[threadId] }
-
     /// Preprocess every body in a freshly cached thread OFF the main actor —
     /// otherwise opening a thread pays for a regex walk of every body plus a
     /// runloop beat before the first frame has html to load.
@@ -134,54 +122,21 @@ final class ThreadPrefetch {
     /// Fire-and-forget and idempotent: a key already in PreparedBodies is
     /// skipped. Everything crossing out is a value type and Trackers /
     /// ImageRepeats are pure, so only the hand-back needs the main actor.
-    private func warmBodies(_ threadId: String, _ view: ClientThreadView) {
+    private func warmBodies(_ view: ClientThreadView) {
         Task.detached(priority: .utility) {
-            let map = Self.repeatedImages(in: view)
             for message in view.messages {
                 guard let html = message.html, !html.isEmpty else { continue }
-                let seenEarlier = map[message.id] ?? []
                 // The tracker policy is part of the prepared identity, so the
                 // warmer must key on the SAME one the card will render under or
                 // every known-sender body misses and re-scans on the main path.
                 let allow = message.allowsTrackers
-                let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, allow)
+                let key = EmailWebView.Prepared.cacheKey(html, allow)
                 guard PreparedBodies.shared.get(key) == nil else { continue }
                 PreparedBodies.shared.set(
                     key,
-                    EmailWebView.Prepared.make(
-                        from: html, seenEarlier: seenEarlier, allowTrackers: allow))
+                    EmailWebView.Prepared.make(from: html, allowTrackers: allow))
             }
-            await MainActor.run { ThreadPrefetch.shared.noteRepeated(threadId, map) }
         }
-    }
-
-    /// Only remember the map while the view it describes is still cached — a
-    /// thread evicted mid-scan must not leave its map behind.
-    private func noteRepeated(_ threadId: String, _ map: [Int: Set<String>]) {
-        // `peek`: a bookkeeping check must not keep a cold entry alive by asking.
-        guard cache.peek(threadId) != nil else { return }
-        repeated[threadId] = map
-    }
-
-    /// messageId -> image srcs already shown by a CHRONOLOGICALLY earlier
-    /// message, so this walks `view.messages` (server order, oldest first) and
-    /// not the newest-first order the reader sees — display order would suppress
-    /// the copy in the message that introduced the image.
-    ///
-    /// Scans TRACKER-STRIPPED html UNCONDITIONALLY, known sender or not: letting
-    /// a pixel register as a "first occurrence" could suppress a real image
-    /// sharing its src, and a per-message open is exactly what an allowed
-    /// tracker is for — deduping one away would under-report it. `nonisolated`
-    /// because the warmer runs it off the main actor and the cold path on it.
-    nonisolated static func repeatedImages(in view: ClientThreadView) -> [Int: Set<String>] {
-        var seen = Set<String>()
-        var out: [Int: Set<String>] = [:]
-        for message in view.messages {
-            out[message.id] = seen
-            guard let html = message.html, !html.isEmpty else { continue }
-            seen.formUnion(ImageRepeats.sources(Trackers.strip(html).html))
-        }
-        return out
     }
 
     // MARK: - batch warming
@@ -208,8 +163,7 @@ final class ThreadPrefetch {
 }
 
 /// Preprocessed email bodies, keyed by `EmailWebView.Prepared.cacheKey` — the
-/// html AND the suppression set, since the same body prepared against a
-/// different thread is a different document.
+/// html and tracker policy.
 ///
 /// LOCK-BASED RATHER THAN @MainActor, deliberately: the warmer fills it from a
 /// detached task while `EmailWebView.init` — which SwiftUI runs nonisolated,
