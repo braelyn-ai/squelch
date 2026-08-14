@@ -297,6 +297,29 @@ squelch-control tenants
 Codes are `XXXX-XXXX-XXXX-XXXX`, single use, 30 days. Stored as SHA-256 only, so
 a lost code is re-issued, never recovered.
 
+**Or approve from `/admin`.** With the waitlist trio set on the control service
+(`SQUELCH_CONTROL_ADMIN_TOKEN`, `SQUELCH_CONTROL_RESEND_API_KEY`,
+`SQUELCH_CONTROL_INVITE_FROM`, and the sending domain **verified at Resend**),
+`https://signup.passband.app/admin` lists everybody still waiting, oldest first,
+with the most recent approvals under them as history, and one button mints a code
+and emails it. That is the everyday path. The CLI
+above stays the break-glass one: it needs no browser, no Resend, and no
+`SQUELCH_CONTROL_ADMIN_TOKEN`, so it still issues codes when the mailer is down.
+
+A send the provider refused leaves the row approved and badged "email not sent"
+with a button beside it. Pressing it **revokes the code nobody received and
+mints a new one**, because only the hash was kept and nothing can read a code
+back out. Same button, quieter, on a row whose invite was delivered and lost.
+One thing the button will not do is take a code out from under somebody: a row
+whose invite is being redeemed right now says so and changes nothing, because
+that person has already granted Google consent they cannot grant twice.
+
+Rotating `SQUELCH_CONTROL_ADMIN_TOKEN` signs every admin session out on its next
+request, so a token you think leaked is a token you can simply change.
+
+With the trio unset the waitlist and `/admin` are not mounted at all: an
+unconfigured deployment answers 404 there, not 403.
+
 ## Backups
 
 Two mechanisms, split by which disk they cover:

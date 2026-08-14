@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
 // The background is a procedurally repeated fake inbox: the drudgery Passband
 // exists to kill, blurred into wallpaper so the pitch sits on top of it.
@@ -109,6 +109,63 @@ const styles = {
     textAlign: "center",
     padding: "0 1.5rem",
   },
+  card: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: "1rem",
+    padding: "1.25rem 1.5rem 1.5rem",
+    borderRadius: "1rem",
+    background: "rgba(255, 255, 255, 0.055)",
+    border: "1px solid rgba(255, 255, 255, 0.11)",
+  },
+  cardLabel: {
+    fontSize: "0.72rem",
+    fontWeight: 600,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "#8a8a90",
+  },
+  cardCopy: {
+    margin: 0,
+    maxWidth: "22rem",
+    color: "#b8b8bd",
+    fontSize: "0.95rem",
+    lineHeight: 1.5,
+    textAlign: "center",
+  },
+  pill: {
+    padding: "0.28rem 0.8rem",
+    borderRadius: "999px",
+    border: "1px solid #3a3a3f",
+    color: "#b8b8bd",
+    fontSize: "0.75rem",
+    background: "transparent",
+    fontFamily: "inherit",
+  },
+  waitlistForm: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "0.5rem",
+  },
+  waitlistInput: {
+    padding: "0.4rem 0.75rem",
+    borderRadius: "0.6rem",
+    border: "1px solid rgba(255, 255, 255, 0.14)",
+    background: "rgba(255, 255, 255, 0.04)",
+    color: "#f5f5f7",
+    fontSize: "0.9rem",
+    fontFamily: "inherit",
+    minWidth: "15rem",
+  },
+  status: {
+    margin: 0,
+    color: "#b8b8bd",
+    fontSize: "0.9rem",
+    textAlign: "center",
+  },
   button: {
     padding: "0.55rem 1.4rem",
     borderRadius: "0.6rem",
@@ -205,6 +262,28 @@ function FakeInbox() {
   );
 }
 
+// Same corner links on every React page, so /waitlist reads as a sibling of
+// the homepage rather than a detour off the site.
+function CornerLinks() {
+  return (
+    <>
+      <footer style={{ ...styles.corner, left: "1.5rem" }}>
+        <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
+          GitHub
+        </a>
+      </footer>
+      <footer style={{ ...styles.corner, right: "1.5rem" }}>
+        <a style={styles.link} href="/privacy">
+          Privacy
+        </a>
+        <a style={styles.link} href="/terms">
+          Terms
+        </a>
+      </footer>
+    </>
+  );
+}
+
 export function App() {
   return (
     <main style={styles.page}>
@@ -223,20 +302,104 @@ export function App() {
         <a style={{ ...styles.button, marginTop: "0.5rem" }} href="/download/latest">
           download the client
         </a>
+        <a style={styles.link} href="/waitlist">
+          want it hosted? join the waitlist
+        </a>
       </div>
-      <footer style={{ ...styles.corner, left: "1.5rem" }}>
-        <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
-          GitHub
+      <CornerLinks />
+    </main>
+  );
+}
+
+// The control plane answers 200 for a fresh address and for one already on the
+// list, so this page can never become a membership oracle.
+const WAITLIST_URL = "https://signup.passband.app/waitlist";
+
+export function WaitlistPage() {
+  const [email, setEmail] = useState("");
+  const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (state === "busy") return;
+    setState("busy");
+    try {
+      const res = await fetch(WAITLIST_URL, {
+        method: "POST",
+        // urlencoded keeps this a CORS simple request: no preflight round trip.
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ email }),
+        credentials: "omit",
+      });
+      setState(res.ok ? "done" : "error");
+    } catch {
+      setState("error");
+    }
+  };
+
+  return (
+    <main style={styles.page}>
+      <FakeInbox />
+      <div style={styles.frost} />
+      <div style={styles.content}>
+        <a
+          href="/"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: "1rem",
+            textDecoration: "none",
+          }}
+        >
+          <img
+            src="/knob.png"
+            alt="Passband"
+            width={112}
+            height={112}
+            style={{ borderRadius: "1.5rem" }}
+          />
+          <h1 style={styles.title}>Passband</h1>
         </a>
-      </footer>
-      <footer style={{ ...styles.corner, right: "1.5rem" }}>
-        <a style={styles.link} href="/privacy">
-          Privacy
-        </a>
-        <a style={styles.link} href="/terms">
-          Terms
-        </a>
-      </footer>
+        <section style={{ ...styles.card, marginTop: "0.5rem" }}>
+          <span style={styles.cardLabel}>hosted beta</span>
+          <p style={styles.cardCopy}>
+            we run the daemon for you. join the list and your invite lands by
+            email.
+          </p>
+          {state === "done" ? (
+            <p style={styles.status}>you're on the list. watch your inbox.</p>
+          ) : (
+            <form style={styles.waitlistForm} onSubmit={submit}>
+              <input
+                style={styles.waitlistInput}
+                type="email"
+                name="email"
+                required
+                autoComplete="email"
+                placeholder="you@example.com"
+                aria-label="email address"
+                value={email}
+                disabled={state === "busy"}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+              <button
+                style={styles.pill}
+                type="submit"
+                disabled={state === "busy"}
+              >
+                {state === "busy" ? "sending" : "join"}
+              </button>
+            </form>
+          )}
+          {state === "error" && (
+            <p style={{ ...styles.status, color: "#d8a39a" }}>
+              that didn't go through. give it a second and try again.
+            </p>
+          )}
+        </section>
+      </div>
+      <CornerLinks />
     </main>
   );
 }

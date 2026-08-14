@@ -485,6 +485,9 @@ impl Harness {
                 assistant_budget_usd: DEFAULT_ASSISTANT_BUDGET_USD,
                 assistant_models: vec!["claude-haiku-4-5".into(), "claude-opus-4-8".into()],
             }),
+            // The signup flow does not touch the waitlist; feature off, so
+            // those routes are not mounted at all.
+            waitlist: None,
         };
 
         let store = ControlStore::open_in_memory().unwrap();
