@@ -2284,6 +2284,273 @@ fn ship_extract_apply_item_name_beats_a_longer_regex_name() {
         })
         .unwrap();
     assert_eq!(shipment_rows(&store, acct)[0].1, "Anker USB-C charger");
+    assert_eq!(
+        name_and_source(&store, acct).1,
+        "llm",
+        "and the row now remembers WHICH MECHANISM named it"
+    );
+}
+
+// ---- item-name provenance: which MECHANISM named the package ------------
+
+/// The one shipment row's `(item_name, item_name_source)`.
+fn name_and_source(store: &SqliteStore, acct: AccountId) -> (String, String) {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT item_name, item_name_source FROM shipments WHERE account_id=?1",
+            params![acct],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_regex_name_never_overwrites_an_extractor_name() {
+    // The mirror of `ship_extract_apply_item_name_beats_a_longer_regex_name`:
+    // once the model has named the goods, a LATER email's subject-lifted phrase
+    // cannot take the card back, however much longer it is.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-1", "t1");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            item_name: Some("Anker USB-C charger".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, mid, "t1")
+        })
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        ("Anker USB-C charger".into(), "llm".into())
+    );
+
+    let later = store
+        .upsert_message(&triaged(acct, "g-2", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            later,
+            &detected(
+                "ups",
+                "1Z999AA10123456784",
+                "Wireless Noise Cancelling Headphones Over Ear",
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        ("Anker USB-C charger".into(), "llm".into()),
+        "a longer REGEX name does not outrank the extractor"
+    );
+}
+
+#[test]
+fn a_longer_extractor_name_wins_within_the_llm_source_and_a_shorter_one_loses() {
+    // Longer-wins still applies BETWEEN two model answers — it is only the
+    // cross-source comparison the provenance column exists to stop.
+    let (store, acct) = store();
+    let first = ship_queued_msg(&store, acct, "g-1", "t1");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            item_name: Some("USB-C charger".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, first, "t1")
+        })
+        .unwrap();
+
+    let second = ship_queued_msg(&store, acct, "g-2", "t1");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            item_name: Some("Anker 735 USB-C charger".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, second, "t1")
+        })
+        .unwrap();
+    assert_eq!(name_and_source(&store, acct).0, "Anker 735 USB-C charger");
+
+    let third = ship_queued_msg(&store, acct, "g-3", "t1");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            item_name: Some("charger".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, third, "t1")
+        })
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        ("Anker 735 USB-C charger".into(), "llm".into()),
+        "a vaguer model answer does not walk the name back"
+    );
+}
+
+#[test]
+fn a_longer_regex_name_still_beats_a_shorter_regex_name() {
+    // PINNED: within the regex source the original longer-wins heuristic is
+    // untouched — the provenance column only gates the cross-source case.
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g-1", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("ups", "1Z999AA10123456784", "Headphones"),
+            Utc::now(),
+        )
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("ups", "1Z999AA10123456784", "Wireless Headphones"),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        ("Wireless Headphones".into(), "regex".into())
+    );
+    // ... and a shorter one does not walk it back.
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("ups", "1Z999AA10123456784", "Cans"),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(name_and_source(&store, acct).0, "Wireless Headphones");
+}
+
+#[test]
+fn a_stored_filler_name_heals_to_empty_on_the_next_email() {
+    // THE LIVE ROWS: four packages read "package now with its carrier!", written
+    // by a strip that did not yet know that phrase was filler. An empty
+    // extraction normally cannot overwrite a non-empty name — which would leave
+    // them junk forever — so a stored name TODAY's strip refuses is treated as
+    // no name at all, and the next email clears it. The client then shows its
+    // own "Package via <carrier>" label.
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g-1", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("ups", "1Z999AA10123456784", "package now with its carrier!"),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct).0,
+        "package now with its carrier!"
+    );
+
+    // A later delivery notice whose subject yields nothing: the junk goes, and
+    // its provenance pointer goes with it — nobody donated an absence.
+    let later = store
+        .upsert_message(&triaged(acct, "g-2", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            later,
+            &detected("ups", "1Z999AA10123456784", ""),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        (String::new(), "regex".into()),
+        "the junk name is cleared, not preserved for being longer"
+    );
+    let name_msg: Option<i64> = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT item_name_msg FROM shipments WHERE account_id=?1",
+            params![acct],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(name_msg, None, "no message donated the empty name");
+}
+
+#[test]
+fn a_stored_filler_name_yields_to_a_shorter_real_one() {
+    // Healing is not only about clearing: junk loses to a real name even when
+    // longer-wins would have kept it.
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g-1", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("ups", "1Z999AA10123456784", "package now with its carrier!"),
+            Utc::now(),
+        )
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("ups", "1Z999AA10123456784", "Cat bed"),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        ("Cat bed".into(), "regex".into())
+    );
+}
+
+#[test]
+fn an_extractor_name_is_never_healed_away_by_a_later_email() {
+    // Healing is scoped to REGEX names. A name stamped 'llm' is the model's
+    // considered answer about the goods, so even one the subject strip would
+    // refuse survives an empty regex extraction — the healing rule is about
+    // undoing the DETECTOR's old mistakes, not overruling the extractor.
+    let (store, acct) = store();
+    let mid = ship_queued_msg(&store, acct, "g-1", "t1");
+    store
+        .shipments_extract_apply(&ShipmentsApplied {
+            is_shipment: true,
+            tracking_number: Some("1Z999AA10123456784".into()),
+            item_name: Some("package now with its carrier!".into()),
+            carrier: "ups".into(),
+            ..ship_verdict(acct, mid, "t1")
+        })
+        .unwrap();
+    let later = store
+        .upsert_message(&triaged(acct, "g-2", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            later,
+            &detected("ups", "1Z999AA10123456784", ""),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        name_and_source(&store, acct),
+        ("package now with its carrier!".into(), "llm".into())
+    );
 }
 
 #[test]

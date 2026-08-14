@@ -999,9 +999,11 @@ pub trait Store: Send + Sync {
     ///
     /// * TRACKING NUMBER — upsert the shipment (status still flows through
     ///   [`ShipmentStatus::merge`](crate::triage::ShipmentStatus::merge), so a
-    ///   delivered package never walks back), overwrite `item_name` with the
-    ///   extractor's (it beats the upsert's longer-name-wins heuristic, which
-    ///   otherwise keeps regex junk), record `order_ref` with its merchant, and
+    ///   delivered package never walks back), write `item_name` with
+    ///   `item_name_source='llm'` (which beats any 'regex' name outright, since
+    ///   the upsert's longer-name-wins heuristic otherwise keeps regex junk, and
+    ///   yields to another 'llm' name only when that one is longer), record
+    ///   `order_ref` with its merchant, and
     ///   PROMOTE any staged `shipment_orders` row under that reference — donating
     ///   its item name, and that name's PROVENANCE, if the shipment has none —
     ///   then delete it.
@@ -1022,8 +1024,9 @@ pub trait Store: Send + Sync {
     ///
     /// `last_message_id` is only ever set by the tracking-number upsert, always to
     /// a real message id — the seal-time delete keys on it — and every item-name
-    /// write stamps `item_name_msg`, so sealing scrubs a donated name even from a
-    /// row another message feeds.
+    /// write stamps `item_name_msg` (which MESSAGE) and `item_name_source` (which
+    /// MECHANISM), so sealing scrubs a donated name even from a row another
+    /// message feeds, and resets the source with it.
     fn shipments_extract_apply(&self, applied: &ShipmentsApplied) -> Result<bool>;
 
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows

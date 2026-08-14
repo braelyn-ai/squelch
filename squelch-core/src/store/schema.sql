@@ -224,6 +224,17 @@ CREATE TABLE IF NOT EXISTS shipments (
     -- adoption), and sealing a message must scrub the text it contributed
     -- wherever it landed. NULL when no name, or on pre-column rows.
     item_name_msg   INTEGER,
+    -- WHICH MECHANISM supplied the current `item_name`: 'regex' (the ingest
+    -- detector lifting it out of a subject or body) or 'llm' (the shipments
+    -- extractor). The sibling of `item_name_msg`, which answers WHICH MESSAGE.
+    -- An llm name replaces a regex one outright; a regex name never replaces an
+    -- llm one; within a source, longer-wins. Reset to 'regex' whenever the name
+    -- is scrubbed (sealing, re-triage), so a source marker whose name is gone
+    -- cannot lock a later regex name out.
+    --
+    -- `shipment_orders` deliberately has NO such column: only the extractor ever
+    -- writes that table, so every name in it is 'llm' by construction.
+    item_name_source TEXT NOT NULL DEFAULT 'regex',
     -- USER CLEAR (RFC3339, NULL = not cleared): the user said "stop showing me
     -- this". READ-SIDE ONLY, and it is never un-set: a listing hides the row
     -- only while `last_update <= cleared_at`, so the moment anything advances

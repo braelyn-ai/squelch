@@ -203,10 +203,19 @@ fn detector() -> &'static Detector {
             rx(r"\bhas shipped\b"),
             rx(r"\bhave shipped\b"),
             rx(r"\bhas been shipped\b"),
+            // Bare "shipped" LAST of the shipped-family, so the fuller phrases
+            // above document the intent; it also catches the "Shipped <X>!"
+            // subject style the phrases above miss.
+            rx(r"\bshipped\b"),
             rx(r"\bis on its way\b"),
-            rx(r"\bon the way\b"),
+            rx(r"\bon (its|the) way( to you)?\b"),
+            // The carrier-handoff filler, with the adverbs a real subject glues
+            // into it: "Your package is now with its carrier!" strips to
+            // "package" (generic) rather than to "package now".
+            rx(r"\b(is\s+)?(now\s+)?with its carrier\b"),
             rx(r"\bout for delivery\b"),
             rx(r"\barriving today\b"),
+            rx(r"\barriving soon\b"),
             rx(r"\bhas been delivered\b"),
             rx(r"\bwas delivered\b"),
             rx(r"\bhas been delivered\b"),
@@ -532,8 +541,11 @@ fn extract_item_name_from_body(body: &str) -> String {
 }
 
 /// Strip tracking-number/url noise and carrier names from a candidate item
-/// phrase, collapse whitespace, and cap length.
-fn clean_item_phrase(s: &str) -> String {
+/// phrase, collapse whitespace, and cap length. `pub(crate)` so the LLM
+/// shipments specialist runs MODEL OUTPUT through the SAME laundering — one
+/// function, so a name the model volunteers can never be dirtier than the same
+/// phrase lifted out of a subject.
+pub(crate) fn clean_item_phrase(s: &str) -> String {
     static TRACK: OnceLock<Regex> = OnceLock::new();
     let track =
         TRACK.get_or_init(|| rx(r"\b1Z[0-9A-Z]{16}\b|\bTBA\d{9,}\b|\b\d{10,}\b|https?://\S+"));
@@ -553,12 +565,16 @@ fn clean_item_phrase(s: &str) -> String {
         .to_string()
 }
 
-/// Is `s` a generic placeholder ("Package", "Your order", …) rather than a real
-/// item? Such a leftover is no better than the client's own fallback label.
+/// Is `s` a generic placeholder ("Package", "Your order", …) or carrier-filler
+/// status prose ("package is with its carrier") rather than a real item? Such a
+/// leftover is no better than the client's own fallback label. Guards the
+/// subject strip, the body extraction and the LLM extractor alike, so a filler
+/// phrase a body regex captured whole — or a model handed back — is refused too.
 ///
-/// Shared with the LLM extractor, whose model volunteers a wider set of
-/// placeholders than the subject-lifting detector ever produces; one list keeps
-/// the two paths from disagreeing about what counts as a name.
+/// ONE list for all three paths: the model volunteers a wider set of
+/// placeholders than the subject-lifting detector ever produces, and the
+/// detector produces status prose the model never would, so splitting it lets
+/// the two disagree about what counts as a name.
 pub(crate) fn is_generic_item(s: &str) -> bool {
     let l = s.trim().to_lowercase();
     matches!(
@@ -579,7 +595,30 @@ pub(crate) fn is_generic_item(s: &str) -> bool {
             | "unknown"
             | "n/a"
             | "none"
+            // Carrier filler: status prose that survived a partial strip and
+            // then beat the empty name on longer-wins.
+            | "with its carrier"
+            | "package with its carrier"
+            | "package is with its carrier"
+            | "your package is with its carrier"
+            | "on the way"
+            | "on the way to you"
+            | "out for delivery"
+            | "arriving soon"
     )
+}
+
+/// Is an ALREADY-STORED item name junk by TODAY's rules? The healing test: a
+/// name written by an older, laxer strip ("package now with its carrier!") comes
+/// back empty from [`extract_item_name`], and a row carrying one is no better off
+/// than a row with no name at all — the client's "Package via <carrier>" fallback
+/// is strictly nicer.
+///
+/// Defined as "the current strip reduces it to nothing" rather than as its own
+/// list, so it can never fall behind the strip: whatever we would refuse to
+/// STORE today is exactly what we will now agree to CLEAR.
+pub(crate) fn is_junk_item_name(stored: &str) -> bool {
+    !stored.trim().is_empty() && extract_item_name(stored).is_empty()
 }
 
 /// Which explicit carrier names are mentioned across the surfaces, in the fixed
@@ -615,15 +654,47 @@ pub fn extract_item_name(subject: &str) -> String {
     for (_, re) in &detector().carrier_names {
         s = re.replace_all(&s, " ").to_string();
     }
-    // Strip stray separators left behind by the removals.
-    let cleaned: String = s
-        .chars()
-        .map(|c| if "|:–—-•·".contains(c) { ' ' } else { c })
+    // Strip stray separators left behind by the removals. A HYPHEN is only a
+    // separator when it stands alone or dangles: between two alphanumerics it is
+    // part of the word, and blanking it there mangles half the product names in
+    // the world ("USB-C" -> "USB C", "T-Shirt" -> "T Shirt").
+    let chars: Vec<char> = s.chars().collect();
+    let cleaned: String = chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if "|:–—•·".contains(c) {
+                return ' ';
+            }
+            let glued = i > 0
+                && chars[i - 1].is_alphanumeric()
+                && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric());
+            if c == '-' && !glued { ' ' } else { c }
+        })
         .collect();
     let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = joined.trim_matches(|c: char| c == ',' || c == '.' || c.is_whitespace());
-    // A one-or-two-char residue ("s", "of") is noise, not an item.
-    if trimmed.chars().count() < 3 {
+    let punct = |c: char| matches!(c, ',' | '.' | '!' | '?') || c.is_whitespace();
+    let mut trimmed = joined.trim_matches(punct);
+    // A DANGLING conjunction is what a removed clause leaves behind ("package is
+    // with its carrier and on its way" -> "package and"). Only at the EDGES: an
+    // interior "and" is part of the name ("Salt and Pepper Grinder").
+    loop {
+        let shorter = trimmed
+            .strip_prefix("and ")
+            .or_else(|| trimmed.strip_prefix("or "))
+            .or_else(|| trimmed.strip_suffix(" and"))
+            .or_else(|| trimmed.strip_suffix(" or"))
+            .map(|t| t.trim_matches(punct));
+        match shorter {
+            Some(t) => trimmed = t,
+            None => break,
+        }
+    }
+    // A one-or-two-char residue ("s", "of") is noise, not an item; so is a
+    // generic/carrier-filler leftover ("package with its carrier") — EMPTY lets
+    // the client show its own "Package via <carrier>" fallback instead, which
+    // beats status prose masquerading as a product.
+    if trimmed.chars().count() < 3 || is_generic_item(trimmed) {
         String::new()
     } else {
         trimmed.to_string()
@@ -1015,6 +1086,81 @@ mod tests {
         assert_eq!(extract_item_name("Your order has shipped"), "");
         assert_eq!(extract_item_name("Shipping confirmation"), "");
         assert_eq!(extract_item_name("Tracking number update"), "");
+    }
+
+    #[test]
+    fn bare_shipped_is_stripped_not_stored() {
+        // Real-world junk header: "Shipped Allbirds!" was stored verbatim
+        // because only the "has/have shipped" phrases were stripped. The bare
+        // strip leaves the brand, which is a real item name.
+        assert_eq!(extract_item_name("Shipped Allbirds!"), "Allbirds");
+        // And a subject that is ONLY status residue strips to empty.
+        assert_eq!(extract_item_name("Shipped!"), "");
+    }
+
+    #[test]
+    fn carrier_filler_phrases_never_become_the_item_name() {
+        // Real-world junk header: "package with its carrier" survived the strip
+        // and beat the empty name via longer-wins. Filler prose must yield an
+        // EMPTY name so the client's "Package via <carrier>" fallback shows.
+        assert_eq!(extract_item_name("Your package is with its carrier"), "");
+        assert_eq!(
+            extract_item_name("Your package is now with its carrier!"),
+            "",
+            "the LIVE subject, adverb and all"
+        );
+        assert_eq!(extract_item_name("Your package is on the way to you"), "");
+        assert_eq!(extract_item_name("Arriving soon"), "");
+        for phrase in [
+            "with its carrier",
+            "package is with its carrier",
+            "on the way",
+            "on the way to you",
+            "out for delivery",
+            "arriving soon",
+        ] {
+            assert!(is_generic_item(phrase), "{phrase:?} must read as generic");
+        }
+    }
+
+    #[test]
+    fn carrier_filler_email_yields_empty_item_end_to_end() {
+        // The full detect path: subject and body are all status filler, so the
+        // shipment lands with an EMPTY item name, never the filler prose.
+        let s = detect_shipment(
+            "mcinfo@ups.com",
+            "Your package is with its carrier",
+            "Your package is with its carrier and on the way to you. \
+             Tracking 1Z999AA10123456784.",
+        )
+        .expect("ups shipment");
+        assert_eq!(s.item_name, "", "filler prose must not be stored");
+    }
+
+    #[test]
+    fn stored_filler_names_read_as_junk_and_real_ones_do_not() {
+        // The healing test the store uses to decide whether an EMPTY extraction
+        // may clear a name a laxer strip once wrote.
+        for junk in [
+            "package now with its carrier!",
+            "package is now with its carrier and on its way to you",
+            "Your order has shipped",
+            "package",
+            "Shipped!",
+        ] {
+            assert!(is_junk_item_name(junk), "{junk:?} must read as junk");
+        }
+        for real in [
+            "Anker USB-C charger",
+            "DOUBLE TAKE MIRROR",
+            "Mechanical Keyboard",
+            "Allbirds",
+        ] {
+            assert!(!is_junk_item_name(real), "{real:?} must survive");
+        }
+        // An absent name is not junk — there is nothing to heal.
+        assert!(!is_junk_item_name(""));
+        assert!(!is_junk_item_name("   "));
     }
 
     // ---- sealed-shaped mail never produces a shipment --------------------

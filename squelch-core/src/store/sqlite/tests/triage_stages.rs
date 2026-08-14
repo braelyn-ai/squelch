@@ -351,7 +351,9 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
         let conn = store.lock().unwrap();
         // The donation: the donor's extraction named a package another mail feeds.
         conn.execute(
-            "UPDATE shipments SET item_name='Anker charger', item_name_msg=?2 WHERE id=?1",
+            "UPDATE shipments SET item_name='Anker charger', item_name_msg=?2,
+                 item_name_source='llm'
+             WHERE id=?1",
             params![sid, donor],
         )
         .unwrap();
@@ -375,14 +377,19 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
     assert_eq!(listed[0].item_name, "", "the donated name is gone");
 
     let conn = store.lock().unwrap();
-    let ship_prov: Option<i64> = conn
+    let (ship_prov, ship_source): (Option<i64>, String) = conn
         .query_row(
-            "SELECT item_name_msg FROM shipments WHERE id=?1",
+            "SELECT item_name_msg, item_name_source FROM shipments WHERE id=?1",
             params![sid],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(ship_prov, None, "and so is its provenance");
+    assert_eq!(
+        ship_source, "regex",
+        "BOTH halves of the provenance reset: an 'llm' marker with no name left \
+         would lock the row out of taking a regex name on re-extraction"
+    );
     let (order_name, order_prov): (String, Option<i64>) = conn
         .query_row(
             "SELECT item_name, item_name_msg FROM shipment_orders WHERE account_id=?1",

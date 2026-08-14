@@ -191,6 +191,17 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // `item_name_source` — which MECHANISM supplied the name, the sibling of
+    // `item_name_msg`'s which MESSAGE. 'regex' is correct history and needs no
+    // backfill: every pre-existing name came from the ingest detector, so the
+    // shipments extractor may replace any of them, and the detector's own
+    // longer-wins heuristic still applies among them.
+    add_column_if_missing(
+        conn,
+        "shipments",
+        "item_name_source",
+        "TEXT NOT NULL DEFAULT 'regex'",
+    )?;
     // `order_merchant` — the namespace `order_ref` was always missing. Backfilled
     // in Rust below (it needs the registrable-domain rule, not a SQL expression);
     // a row left NULL simply matches no future order mail, which is the safe
