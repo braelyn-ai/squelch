@@ -289,20 +289,28 @@ fn problem(status: StatusCode, heading: &str, detail: &str) -> Response {
 /// `Host` header being caller-controlled costs nothing: the worst a forged one
 /// buys is a link that points somewhere the forger already controls, in a page
 /// only they can see.
+///
+/// All three hang off one answer, [`Site::origin_is_https`], so the escape hatch
+/// moves all three together. That is the point of it: see that method.
 #[derive(Clone, Debug, Default)]
 struct Site {
     /// Lowercased `host[:port]`, or empty when the request carried no usable
     /// authority at all.
     host: String,
+    /// The operator's declaration that this console is served over plain http.
+    /// From `[console] allow_insecure_cookie`; see [`Site::origin_is_https`].
+    allow_insecure_cookie: bool,
 }
 
-/// Whether an authority is loopback, and therefore the ONE case where a cookie
-/// may be set without `Secure`.
+/// Whether an authority is loopback, and therefore the one origin treated as
+/// plain http on its own, without the operator saying so.
 ///
-/// Nothing else gets the exception, including a plain-http LAN address: a
+/// Nothing else gets it automatically, including a plain-http LAN address: a
 /// session token crossing a network in the clear is exactly the thing `Secure`
 /// exists to prevent, and silently obliging would be worse than the console not
-/// working there. Front it with TLS, or reach it on loopback.
+/// working there. Front it with TLS, reach it on loopback, or say out loud that
+/// you accept the trade with `[console] allow_insecure_cookie` (see
+/// [`Site::origin_is_https`]) and get a banner on the login page for it.
 fn is_loopback(authority: &str) -> bool {
     let host = strip_port(authority);
     host == "localhost"
@@ -331,7 +339,7 @@ impl Site {
     /// Filtered to the characters an authority may contain. Everything below
     /// escapes what it interpolates anyway, but a value that reaches a
     /// `Set-Cookie` or an `href` is worth narrowing at the source.
-    fn from_parts(headers: &HeaderMap, uri: &Uri) -> Self {
+    fn from_parts(headers: &HeaderMap, uri: &Uri, allow_insecure_cookie: bool) -> Self {
         let raw = uri
             .authority()
             .map(|a| a.as_str().to_string())
@@ -350,12 +358,31 @@ impl Site {
             });
         Self {
             host: if usable { raw } else { String::new() },
+            allow_insecure_cookie,
         }
     }
 
-    /// Whether the session cookie may carry `Secure`. See [`is_loopback`].
-    fn secure(&self) -> bool {
-        !self.host.is_empty() && !is_loopback(&self.host)
+    /// Whether this console is reached over https, which is ONE answer with
+    /// three consumers: the cookie's `Secure` attribute, the scheme
+    /// [`Site::url`] builds (the pairing deep link, and the origin
+    /// [`same_origin_request`] compares against), and whether
+    /// [`Site::tenant_label`] will name a tenant for the SSO link.
+    ///
+    /// Normally it is derived from the authority alone: loopback is http,
+    /// everything else is https (see [`is_loopback`]).
+    ///
+    /// `allow_insecure_cookie` overrides that to http, and it is NOT only about
+    /// the cookie despite the name it is configured under. The operator is
+    /// telling us the whole console is served over plain http, so all three
+    /// consumers have to agree: a deep link and a CSRF origin comparison that
+    /// still said `https://` would leave the console signed in but unable to
+    /// POST anything, which is how it behaves on a plain-http LAN today with the
+    /// hatch shut. Enabling it on an origin that really is https therefore costs
+    /// more than the `Secure` attribute: the SSO button disappears and the
+    /// `Origin` fallback in [`same_origin_request`] starts refusing. That is the
+    /// documented deal, and the login page says so where the user can see it.
+    fn origin_is_https(&self) -> bool {
+        !self.allow_insecure_cookie && !self.host.is_empty() && !is_loopback(&self.host)
     }
 
     /// This daemon's own base URL, for the pairing deep link and for the
@@ -370,7 +397,7 @@ impl Site {
         if self.host.is_empty() {
             return None;
         }
-        let secure = self.secure();
+        let secure = self.origin_is_https();
         let scheme = if secure { "https" } else { "http" };
         let default_port = if secure { ":443" } else { ":80" };
         let host = self.host.strip_suffix(default_port).unwrap_or(&self.host);
@@ -384,7 +411,7 @@ impl Site {
     /// control plane's label rule. The only consumer is the SSO link, and a link
     /// control would refuse is worse than no link.
     fn tenant_label(&self) -> Option<&str> {
-        if !self.secure() {
+        if !self.origin_is_https() {
             return None;
         }
         let host = strip_port(&self.host);
@@ -403,13 +430,20 @@ impl Site {
     }
 }
 
-impl<S: Send + Sync> FromRequestParts<S> for Site {
+impl FromRequestParts<ApiState> for Site {
     /// Infallible: a request with no usable authority still renders a page, it
     /// just cannot offer a deep link or an SSO hop.
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Site::from_parts(&parts.headers, &parts.uri))
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Site::from_parts(
+            &parts.headers,
+            &parts.uri,
+            state.console_allow_insecure_cookie,
+        ))
     }
 }
 
@@ -451,7 +485,9 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
 ///   navigations (fixing the landing) while still withholding it from cross-site
 ///   POSTs; the mutating routes are guarded by [`csrf_guard`]'s Origin checks
 ///   regardless, so CSRF has two answers and neither is this attribute alone;
-/// - `Secure` unless this is loopback ([`is_loopback`]);
+/// - `Secure` unless this origin is plain http: loopback ([`is_loopback`]), or an
+///   operator who declared it with `[console] allow_insecure_cookie`
+///   ([`Site::origin_is_https`]);
 /// - `Path=/` and NO `Domain`, so the cookie is bound to this exact host and
 ///   never offered to a sibling tenant on the same base domain.
 fn set_cookie(token: &str, secure: bool) -> String {
@@ -570,11 +606,15 @@ fn same_origin_request(headers: &HeaderMap, site: &Site) -> bool {
 /// credential.
 ///
 /// GET and HEAD are untouched: nothing behind them mutates.
-async fn csrf_guard(req: Request<Body>, next: Next) -> Response {
+async fn csrf_guard(State(state): State<ApiState>, req: Request<Body>, next: Next) -> Response {
     if req.method().is_safe() {
         return next.run(req).await;
     }
-    let site = Site::from_parts(req.headers(), req.uri());
+    let site = Site::from_parts(
+        req.headers(),
+        req.uri(),
+        state.console_allow_insecure_cookie,
+    );
     if !same_origin_request(req.headers(), &site) {
         return problem(
             StatusCode::FORBIDDEN,
@@ -596,7 +636,11 @@ async fn require_console_session(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    let site = Site::from_parts(req.headers(), req.uri());
+    let site = Site::from_parts(
+        req.headers(),
+        req.uri(),
+        state.console_allow_insecure_cookie,
+    );
     let Some(session) = console_session(&state, req.headers()).await else {
         return with_cookie(
             login_page(
@@ -604,7 +648,7 @@ async fn require_console_session(
                 &site,
                 Some("That session has ended. Sign in again to continue."),
             ),
-            &clear_cookie(site.secure()),
+            &clear_cookie(site.origin_is_https()),
         );
     };
     req.extensions_mut().insert(session);
@@ -638,7 +682,7 @@ pub fn console_router(state: ApiState) -> Router {
         // CSRF wraps EVERYTHING, including the unauthenticated login POST: a
         // cross-site page must not be able to sign a browser into an account of
         // the attacker's choosing either.
-        .layer(middleware::from_fn(csrf_guard))
+        .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -742,7 +786,7 @@ async fn claim_and_land(
     match issued {
         Ok(Ok(issued)) => with_cookie(
             see_other("/console"),
-            &set_cookie(&issued.token, site.secure()),
+            &set_cookie(&issued.token, site.origin_is_https()),
         ),
         // Wrong, expired, already claimed, burned, and a store that could not
         // answer are one page with one status and one sentence.
@@ -813,7 +857,7 @@ async fn revoke(
 
     match revoked {
         Ok(_) if id == session.token_id => {
-            with_cookie(see_other("/console"), &clear_cookie(site.secure()))
+            with_cookie(see_other("/console"), &clear_cookie(site.origin_is_https()))
         }
         // A revoke that matched nothing (unknown id, already revoked) is not an
         // error worth a page: the table it came from is about to be re-rendered
@@ -844,7 +888,7 @@ async fn logout(
         store.revoke_device_token(account_id, token_id)
     })
     .await;
-    with_cookie(see_other("/console"), &clear_cookie(site.secure()))
+    with_cookie(see_other("/console"), &clear_cookie(site.origin_is_https()))
 }
 
 // --- pages ------------------------------------------------------------------
@@ -874,6 +918,13 @@ checks the address against this mailbox and sends you straight back here.</p>
         _ => String::new(),
     };
 
+    let insecure_html = if state.console_allow_insecure_cookie {
+        r#"<p class="stop"><strong>Insecure cookie mode is enabled.</strong> Your console session
+can travel over the network without encryption. Use this only on a trusted LAN.</p>"#
+    } else {
+        ""
+    };
+
     page(
         StatusCode::OK,
         "Passband console",
@@ -882,6 +933,7 @@ checks the address against this mailbox and sends you straight back here.</p>
 <p>This is the console for one Passband mailbox. Sign in to see what the daemon is doing, pair a
 device, or revoke one.</p>
 {error_html}
+{insecure_html}
 {sso_html}
 <form method="post" action="/console/login-code">
 <label for="code">Pairing code</label>
@@ -1804,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_is_the_only_insecure_origin() {
+    fn loopback_is_the_only_automatically_insecure_origin() {
         for host in [
             "localhost",
             "localhost:8849",
@@ -1812,12 +1864,138 @@ mod tests {
             "[::1]:8849",
         ] {
             assert!(is_loopback(host), "{host}");
-            assert!(!(Site { host: host.into() }).secure(), "{host}");
+            assert!(
+                !(Site {
+                    host: host.into(),
+                    ..Site::default()
+                })
+                .origin_is_https(),
+                "{host}"
+            );
         }
         for host in ["ada.passband.email", "192.168.1.9", "127notlocal.example"] {
             assert!(!is_loopback(host), "{host}");
-            assert!((Site { host: host.into() }).secure(), "{host}");
+            assert!(
+                (Site {
+                    host: host.into(),
+                    ..Site::default()
+                })
+                .origin_is_https(),
+                "{host}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn configured_insecure_mode_supports_plain_http_lan_and_warns() {
+        let (store, acct, app) =
+            fixture_with(|state| state.with_console_allow_insecure_cookie(true));
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console")
+                    .header(header::HOST, "192.168.1.9:8849")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        assert!(
+            body_of(login)
+                .await
+                .contains("Insecure cookie mode is enabled")
+        );
+
+        let minted = store.mint_pairing_code(acct, ttl()).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/console/login-code")
+                    .header(header::HOST, "192.168.1.9:8849")
+                    .header(header::ORIGIN, "http://192.168.1.9:8849")
+                    .header(SEC_FETCH_SITE, "same-origin")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("code={}", minted.code)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let set = resp.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(!set.contains("Secure"), "{set}");
+        assert!(
+            set.contains("HttpOnly") && set.contains("SameSite=Lax"),
+            "{set}"
+        );
+    }
+
+    /// The `Secure` attribute is the visible half of the hatch. This is the
+    /// other half, and the half a browser without `Sec-Fetch-Site` actually
+    /// depends on: [`same_origin_request`] falls back to comparing `Origin`
+    /// whole, scheme included, against [`Site::url`]. On a plain-http LAN with
+    /// the hatch shut that comparison expects `https://` and refuses every POST
+    /// the console can make, so the login it just rendered cannot be completed.
+    #[tokio::test]
+    async fn the_hatch_is_what_lets_a_plain_http_lan_post_at_all() {
+        let lan_post = |code: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/console/login-code")
+                .header(header::HOST, "192.168.1.9:8849")
+                .header(header::ORIGIN, "http://192.168.1.9:8849")
+                // NO `Sec-Fetch-Site`: it is believed absolutely where it is
+                // present, so sending it would return before `Origin` is ever
+                // consulted and this test would pass exercising nothing.
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("code={code}")))
+                .unwrap()
+        };
+
+        let (store, acct, app) =
+            fixture_with(|state| state.with_console_allow_insecure_cookie(true));
+        let minted = store.mint_pairing_code(acct, ttl()).unwrap();
+        let resp = app.oneshot(lan_post(&minted.code)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let (store, acct, app) = fixture();
+        let minted = store.mint_pairing_code(acct, ttl()).unwrap();
+        let resp = app.oneshot(lan_post(&minted.code)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The other side of that coin, and the reason the hatch is documented as a
+    /// declaration about the whole origin rather than as a cookie flag: turning
+    /// it on where the console really is https costs the SSO button and the
+    /// `Origin` fallback too, because all three follow the one answer.
+    #[tokio::test]
+    async fn the_hatch_on_an_https_origin_costs_the_sso_link_and_the_origin_check() {
+        let (store, acct, app) = fixture_with(|s| {
+            s.with_console_sso_url(Some(SSO.to_string()))
+                .with_console_allow_insecure_cookie(true)
+        });
+
+        let html = body_of(app.clone().oneshot(get("/console", None)).await.unwrap()).await;
+        assert!(!html.contains("Continue with Google"), "{html}");
+
+        let minted = store.mint_pairing_code(acct, ttl()).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/console/login-code")
+                    .header(header::HOST, "ada.passband.email")
+                    .header(header::ORIGIN, "https://ada.passband.email")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("code={}", minted.code)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     /// The label only ever feeds the SSO link, so anything that is not plainly a
@@ -1825,9 +2003,12 @@ mod tests {
     #[test]
     fn the_tenant_label_is_the_leftmost_hosted_label_or_nothing() {
         let label = |host: &str| {
-            (Site { host: host.into() })
-                .tenant_label()
-                .map(str::to_string)
+            (Site {
+                host: host.into(),
+                ..Site::default()
+            })
+            .tenant_label()
+            .map(str::to_string)
         };
         assert_eq!(label("ada.passband.email").as_deref(), Some("ada"));
         assert_eq!(label("ada-2.passband.email").as_deref(), Some("ada-2"));

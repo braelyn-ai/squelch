@@ -296,7 +296,16 @@ pub struct MetricsConfig {
 /// on a non-loopback origin, which means the cookie (a live device token) can
 /// cross a network in the clear. It exists for the self-host who serves the
 /// console over plain http on a LAN and cannot front it with TLS. Default off,
-/// and the login page says so out loud when it is on.
+/// the login page says so out loud when it is on, and the daemon warns at
+/// startup.
+///
+/// It is READ AS A STATEMENT ABOUT THE WHOLE ORIGIN, not as a cookie flag: the
+/// console also builds its pairing deep link with `http://`, compares `Origin`
+/// against that same `http://` origin for CSRF, and stops offering the SSO link.
+/// The first two are the point (with the hatch shut, a plain-http LAN console
+/// renders a login form and then refuses the POST from it), and the third is the
+/// cost of turning it on somewhere that really is https. `Site::origin_is_https`
+/// in `squelch-api`'s console is the one place all four are decided.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ConsoleConfig {
@@ -304,7 +313,8 @@ pub struct ConsoleConfig {
     /// link (e.g. `https://signup.passband.email`).
     /// Env: `SQUELCH_CONSOLE_SSO_URL`. `None` => no button.
     pub sso_url: Option<String>,
-    /// Allow the console session cookie WITHOUT `Secure` off loopback.
+    /// Declare this console plain-http off loopback: session cookie WITHOUT
+    /// `Secure`, `http://` deep link, `http://` CSRF origin, no SSO link.
     /// Env: `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`, spelled exactly `true`.
     /// Anything else (including `1` and `yes`) leaves it off: an operator who
     /// mistypes this one gets the safe answer.
