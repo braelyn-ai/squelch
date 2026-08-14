@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -232,8 +232,51 @@ pub trait Cluster: Send + Sync {
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError>;
 
     /// Block until a pod matching `selector` reports Ready, and return its
-    /// name. [`ClusterError::Timeout`] after `within`.
+    /// NAME. [`ClusterError::Timeout`] after `within`.
+    ///
+    /// For the one question that needs a pod name rather than a healthy
+    /// tenant: [`Cluster::exec`] runs `squelchd pair` inside a specific pod.
+    /// "Is this tenant serving the spec we just applied" is a different
+    /// question and a stricter one; it is [`Cluster::rollout_complete`]'s.
     async fn ready_pod(&self, selector: &str, within: Duration) -> Result<String, ClusterError>;
+
+    /// Block until the Deployment `name` has finished rolling onto the spec it
+    /// currently carries. [`ClusterError::Timeout`] after `within`;
+    /// [`ClusterError::NoPod`] if the Deployment is not there at all, which
+    /// mid-wait means something deleted the workload while it rolled.
+    ///
+    /// This is what [`Cluster::ready_pod`] cannot answer. The tenant strategy
+    /// is `Recreate`, so an apply that moves the pod template leaves the OLD
+    /// pod Ready for as long as it takes to terminate — and it still matches
+    /// the tenant's selector while it does. A caller that took the first Ready
+    /// pod as proof would be looking at the pod it just replaced and calling a
+    /// tenant that is about to be down `active`. For a single signup that is a
+    /// cosmetic lie the next status read corrects; for a sweep that walks the
+    /// whole fleet on the strength of each answer it is the difference between
+    /// one broken tenant and all of them.
+    ///
+    /// The conditions are exactly `kubectl rollout status`', and each of the
+    /// four rules out a different way of being wrong:
+    ///
+    /// - `status.observedGeneration >= metadata.generation` — the controller
+    ///   has SEEN this spec. Until it has, every field below describes the
+    ///   PREVIOUS template, and a rollout that has not begun reads as one that
+    ///   finished.
+    /// - `status.updatedReplicas == spec.replicas` — every replica that exists
+    ///   is on the new template. This is the one that is false while the new
+    ///   pod is still being created.
+    /// - `status.replicas == spec.replicas` — no old replica is left. Under
+    ///   `Recreate` that leftover is the terminating pod, and it still holds
+    ///   the tenant's `ReadWriteOnce` volume.
+    /// - `status.readyReplicas == spec.replicas` — the new replicas are
+    ///   serving. Created is not ready: the daemon opens 8848 only after it has
+    ///   installed its credential and opened its store, which is precisely the
+    ///   step a bad render breaks.
+    ///
+    /// `spec.replicas` absent is 1, Kubernetes' own default, and any missing
+    /// status field is 0: a Deployment the controller has not reported on has
+    /// not finished anything.
+    async fn rollout_complete(&self, name: &str, within: Duration) -> Result<(), ClusterError>;
 
     /// Block until NO pod matches `selector`. [`ClusterError::Timeout`] after
     /// `within`.
@@ -531,6 +574,28 @@ impl Cluster for KubeCluster {
         }
     }
 
+    async fn rollout_complete(&self, name: &str, within: Duration) -> Result<(), ClusterError> {
+        // Polled on the same 2s cadence as `ready_pod`, and for the same
+        // reasons: this runs once per tenant, it is bounded by the deadline the
+        // caller chose, and the question is four integers on one object.
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let Some(deployment) = self.get_deployment(name).await? else {
+                // Waiting out the deadline for an object that no longer exists
+                // would only spend the whole timeout to say what this read
+                // already said.
+                return Err(ClusterError::NoPod);
+            };
+            if rolled_out(&deployment) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClusterError::Timeout(within));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     async fn pods_gone(&self, selector: &str, within: Duration) -> Result<(), ClusterError> {
         let pods: Api<Pod> = self.api();
         let params = ListParams::default().labels(selector);
@@ -595,6 +660,29 @@ async fn drain(stream: Option<impl AsyncReadExt + Unpin>) -> String {
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Whether a Deployment has finished rolling onto the spec it carries.
+///
+/// The four conditions, and why each one is load bearing, are documented on
+/// [`Cluster::rollout_complete`]. Pure, so both the real poll loop and the test
+/// double answer from the same rule rather than from two readings of it.
+pub(crate) fn rolled_out(deployment: &Deployment) -> bool {
+    let desired = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
+    let generation = deployment.metadata.generation.unwrap_or(0);
+    let status = deployment.status.as_ref();
+    // A field the controller has not written is 0, never "assume it is fine":
+    // the absent case is a Deployment nothing has acted on yet.
+    let count = |pick: fn(&DeploymentStatus) -> Option<i32>| status.and_then(pick).unwrap_or(0);
+
+    status.and_then(|s| s.observed_generation).unwrap_or(0) >= generation
+        && count(|s| s.updated_replicas) == desired
+        && count(|s| s.replicas) == desired
+        && count(|s| s.ready_replicas) == desired
 }
 
 /// Whether a pod reports `Ready=True`. Kubernetes says a pod is ready when
@@ -686,6 +774,90 @@ mod tests {
         assert!(!is_ready(&with(vec![condition("Initialized", "True")])));
         assert!(!is_ready(&with(vec![])));
         assert!(!is_ready(&Pod::default()));
+    }
+
+    /// The four numbers `kubectl rollout status` waits on, one broken at a
+    /// time. Each of these is a real moment in a `Recreate` roll, and calling
+    /// any of them "done" is what would let a fleet sweep march past a tenant
+    /// it had just taken down.
+    #[test]
+    fn a_rollout_is_complete_only_when_all_four_numbers_agree() {
+        use k8s_openapi::api::apps::v1::DeploymentSpec;
+
+        let deployment = |generation: i64, status: DeploymentStatus| Deployment {
+            metadata: ObjectMeta {
+                generation: Some(generation),
+                ..Default::default()
+            },
+            spec: Some(DeploymentSpec {
+                replicas: Some(1),
+                ..Default::default()
+            }),
+            status: Some(status),
+        };
+        let settled = DeploymentStatus {
+            observed_generation: Some(3),
+            replicas: Some(1),
+            updated_replicas: Some(1),
+            ready_replicas: Some(1),
+            ..Default::default()
+        };
+        assert!(rolled_out(&deployment(3, settled.clone())));
+
+        // The apply landed and the controller has not looked yet: every number
+        // below is about the template this roll replaced.
+        assert!(!rolled_out(&deployment(
+            4,
+            DeploymentStatus {
+                observed_generation: Some(3),
+                ..settled.clone()
+            }
+        )));
+        // The new pod is not created yet.
+        assert!(!rolled_out(&deployment(
+            3,
+            DeploymentStatus {
+                updated_replicas: Some(0),
+                ready_replicas: Some(0),
+                ..settled.clone()
+            }
+        )));
+        // The old pod is still terminating, and still on the volume.
+        assert!(!rolled_out(&deployment(
+            3,
+            DeploymentStatus {
+                replicas: Some(2),
+                ..settled.clone()
+            }
+        )));
+        // Running is not serving: the daemon opens 8848 last.
+        assert!(!rolled_out(&deployment(
+            3,
+            DeploymentStatus {
+                ready_replicas: Some(0),
+                ..settled.clone()
+            }
+        )));
+
+        // A Deployment nothing has reported on. `spec.replicas` absent is 1,
+        // so an empty status is one replica short of everything.
+        assert!(!rolled_out(&Deployment::default()));
+        assert!(!rolled_out(&Deployment {
+            status: Some(DeploymentStatus::default()),
+            ..Default::default()
+        }));
+        // And the same object once the controller has caught up with it, with
+        // the replica count left to the default on both sides.
+        assert!(rolled_out(&Deployment {
+            status: Some(DeploymentStatus {
+                observed_generation: Some(0),
+                replicas: Some(1),
+                updated_replicas: Some(1),
+                ready_replicas: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
     }
 
     /// What reaches a log line. The API server's message never does: it can

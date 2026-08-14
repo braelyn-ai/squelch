@@ -40,7 +40,8 @@
 //! - [`cluster`] - the one trait every Kubernetes call goes through, and the
 //!   kube-rs implementation of it.
 //! - [`provision`] - the two-phase sequence, the reconcile that repairs a
-//!   tenant somebody edited, and the pending sweep.
+//!   tenant somebody edited, the pending sweep, and the fleet roll that walks
+//!   every tenant onto today's render one at a time.
 //! - [`drift`] - reading a live tenant back: who else owns part of it, and what
 //!   an apply of today's render would change.
 //! - [`pair`] - reading `squelchd pair`'s output back.
@@ -79,7 +80,7 @@ pub use cluster::{Cluster, KubeCluster};
 pub use config::{Config, ConfigError};
 pub use drift::{DriftReport, FieldChange, ForeignManager};
 pub use pair::Pairing;
-pub use provision::{Created, Reconciled, TenantStatus, Warden, WardenError};
+pub use provision::{Created, Reconciled, Rolled, TenantStatus, Warden, WardenError};
 
 /// State threaded through the router. Cheap to clone (one `Arc`).
 #[derive(Clone)]

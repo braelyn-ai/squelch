@@ -127,8 +127,11 @@ pub struct Reconciled {
     /// was deleted and applied fresh because another field manager owned part
     /// of it; see [`Warden::reconcile`] for why nothing gentler works.
     pub deployment: &'static str,
-    /// Always `active`. A reconcile that returns at all has waited for a ready
-    /// pod, which is the same thing the status route reads to say the word.
+    /// Always `active`, and it is the stronger sense of the word: a reconcile
+    /// that returns at all has waited for the Deployment's ROLLOUT to finish,
+    /// so every replica is on the render this call applied and serving. The
+    /// status route says `active` for one ready replica of any generation,
+    /// which is the right answer to a different question.
     pub status: &'static str,
 }
 
@@ -139,6 +142,49 @@ impl Reconciled {
             status: TenantStatus::Active.as_str(),
         }
     }
+}
+
+/// What a fleet roll looked at, and what it did about it.
+///
+/// Counts and LABELS, which are public subdomains and are in the ingress
+/// controller's access log already. An operator reading this has to be able to
+/// say which tenants moved, which ones need a person, and where a halted run
+/// stopped; nothing else about a tenant belongs in it. See [`Warden::roll`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Rolled {
+    /// How many tenants this run examined. On a halt that is the fleet up to
+    /// and INCLUDING the one it stopped at, so the four buckets below always
+    /// add up to this - and the gap between it and the fleet's size is how many
+    /// tenants the run never reached.
+    pub checked: usize,
+    /// Converged onto today's render, in the order it happened, each with a
+    /// finished rollout before the next was touched. In a dry run, the tenants
+    /// that WOULD have been.
+    pub rolled: Vec<String>,
+    /// Already matched the render. A re-run of a finished roll is all of these
+    /// and no writes at all.
+    pub current: usize,
+    /// Skipped because another field manager owns part of the Deployment.
+    /// Repairing one costs it its pod, so a person decides; see
+    /// [`Warden::roll`].
+    pub skipped_foreign: Vec<String>,
+    /// Skipped because there is no workload to converge: pending is a signup to
+    /// finish, stopped is an account to reopen.
+    pub skipped_inactive: Vec<String>,
+    /// The label the run stopped at, if it stopped. Everything after it in
+    /// [`Warden::fleet`] order was left exactly as it was.
+    pub halted_on: Option<String>,
+}
+
+/// What one tenant's turn in a [`Warden::roll`] came to. Internal: what leaves
+/// the roll is [`Rolled`], which is the same four outcomes counted up.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// Converged, or in a dry run, would have been.
+    Rolled,
+    Current,
+    Foreign,
+    Inactive,
 }
 
 /// Why an operation failed.
@@ -895,8 +941,18 @@ impl Warden {
         // the pod did not come back rather than that the reconcile did not
         // happen - the same thing a failed phase two says, and the operator
         // reads it the same way.
+        //
+        // The ROLLOUT rather than a ready pod, and the difference is the whole
+        // value of the answer. Under `Recreate` the pod the render replaced is
+        // Ready and matching this tenant's selector for as long as it takes to
+        // terminate, so "some pod is ready" can be true of a tenant that is
+        // about to be down. [`Cluster::rollout_complete`] is true only once the
+        // controller has observed this spec and every replica on it is
+        // serving, which is what a caller acting on the answer - the fleet
+        // roll in [`Warden::roll`], stepping to the next tenant - is entitled
+        // to assume it means.
         self.cluster
-            .ready_pod(&objects::pod_selector(&name), self.config.ready_timeout)
+            .rollout_complete(name.as_str(), self.config.ready_timeout)
             .await
             .map_err(|e| fail(name.as_str(), "not_ready", &e))?;
 
@@ -1031,6 +1087,214 @@ impl Warden {
             }
         }
         Ok(collected)
+    }
+
+    /// Every tenant this warden has provisioned, sorted.
+    ///
+    /// Read from the CLUSTER, by the same enumeration [`Warden::sweep_pending`]
+    /// walks: the identity Secrets carrying [`objects::MANAGED_SELECTOR`], with
+    /// any name that does not parse back into a label skipped rather than
+    /// guessed at. The cluster is the record; there is no list of tenants
+    /// anywhere in this service to fall out of date with it.
+    ///
+    /// Deliberately not the control plane's tenant table, and the difference is
+    /// the whole point of doing it here. A tenant can exist in this cluster
+    /// with no row over there - `squelch-control` logs that as PROVISIONED BUT
+    /// NOT RECORDED, and it is what a signup that died between the warden's
+    /// answer and the control plane's write leaves behind - and a tenant in
+    /// that state is the one most likely to have been finished by hand, which
+    /// is to say the one most likely to be shaped like nothing else in the
+    /// fleet. A sweep that cannot see it is a sweep with a blind spot exactly
+    /// where the drift is.
+    ///
+    /// Sorted so a run is deterministic and two runs are comparable: the same
+    /// fleet is walked in the same order every time, and two summaries read
+    /// side by side are two readings of one list.
+    pub async fn fleet(&self) -> Result<Vec<TenantName>, WardenError> {
+        let secrets = self
+            .cluster
+            .list_secrets(objects::MANAGED_SELECTOR)
+            .await
+            // No tenant to name: this failure is the enumeration's, not
+            // anyone's.
+            .map_err(|e| fail("-", "fleet_list_failed", &e))?;
+        let mut fleet: Vec<TenantName> = secrets
+            .iter()
+            .filter_map(|secret| {
+                secret
+                    .metadata
+                    .name
+                    .as_deref()
+                    .and_then(TenantName::from_identity_secret)
+            })
+            .collect();
+        fleet.sort();
+        Ok(fleet)
+    }
+
+    /// Walk the whole fleet and put every tenant that has fallen behind today's
+    /// render back onto it, one at a time, stopping at the first failure.
+    ///
+    /// The warden writes a tenant's objects once, at provision time, and never
+    /// revisits them. So changing [`crate::config::Config::image`] - or
+    /// anything else [`objects::deployment`] renders - changes what the NEXT
+    /// signup gets and nothing at all about the tenants already running. This
+    /// is the pass that closes that gap, and it is the only thing in the
+    /// service that touches more than one tenant's workload.
+    ///
+    /// ## Sequential, and verified between steps
+    ///
+    /// Zero downtime for a single tenant is not on offer: the strategy is
+    /// `Recreate`, the volume is `ReadWriteOnce`, and the store is one SQLite
+    /// file, so a tenant's daemon goes away for as long as its replacement
+    /// takes to come up. What IS on offer is that the FLEET is never down, and
+    /// that is bought by doing one tenant at a time and waiting for the roll to
+    /// finish before starting the next. [`Warden::reconcile`] does that waiting
+    /// through [`Cluster::rollout_complete`], which is why it and not a bare
+    /// ready-pod check is what this loop stands on.
+    ///
+    /// ## Halting is the safety property, not a limitation
+    ///
+    /// A render that cannot come up is the failure this design fears, because
+    /// a warden that kept going would apply it to every tenant it has. So the
+    /// first tenant that does not converge ends the run: [`Rolled::halted_on`]
+    /// names it, the tenants after it are not touched, and the answer is the
+    /// summary of what happened rather than an error. A bad render costs
+    /// exactly one tenant, which is the price that makes running this
+    /// unattended defensible at all.
+    ///
+    /// That covers a read that fails as well as a reconcile that fails. A
+    /// tenant this warden could not even inspect is not a tenant it may skip
+    /// past - the next one would be rolled on the strength of a cluster that
+    /// has just stopped answering - and throwing the summary away with an `Err`
+    /// would discard the record of the tenants it already changed.
+    ///
+    /// ## What it refuses to touch
+    ///
+    /// **A Deployment another field manager owns fields on is SKIPPED**, and
+    /// this is the single most important rule in here. `reconcile` purges a
+    /// foreign-owned field the only way server-side apply allows: by DELETING
+    /// the Deployment and applying a fresh one. That is a defensible decision
+    /// for an operator looking at one drift report and a completely
+    /// indefensible one for a timer walking a fleet, because it takes somebody's
+    /// live mailbox down to remove a field that a human put there on purpose.
+    /// Skipping also keeps this loop to plain server-side applies, so it can
+    /// never race a concurrent signup into a workload it had deleted out from
+    /// under it. Foreign drift is a page for a human, not a job for a timer.
+    ///
+    /// A tenant that is [`TenantStatus::Pending`] or [`TenantStatus::Stopped`]
+    /// is skipped too, for the reason `reconcile` refuses them: pending is a
+    /// signup to finish and stopped is an account to reopen, and neither is a
+    /// shape to converge. A tenant an interrupted reconcile left mid-repair
+    /// reads `stopped` as well, and this loop does not finish it either - it
+    /// lands in [`Rolled::skipped_inactive`], where a person can see it and
+    /// call [`Warden::reconcile`] on that one label.
+    ///
+    /// Which leaves [`TenantStatus::Active`] and [`TenantStatus::Failed`], the
+    /// two that have a workload for today's render to apply to. Failed is
+    /// deliberately in that list: a tenant a previous render broke is exactly
+    /// the one a new render is likely to fix.
+    ///
+    /// `dry_run` does every read and no write: it reports what it WOULD have
+    /// rolled, which is what an operator runs before the bump rather than
+    /// after.
+    ///
+    /// PRIVACY: this walks every tenant in the fleet and logs as it goes. What
+    /// goes in a line is a count, a status word or a LABEL, never a mailbox
+    /// address and never an API error string; the per-tenant failure detail
+    /// goes through [`fail`] like every other cluster error in this file.
+    pub async fn roll(&self, dry_run: bool) -> Result<Rolled, WardenError> {
+        let fleet = self.fleet().await?;
+        tracing::info!(
+            fleet = fleet.len(),
+            dry_run,
+            "fleet roll starting; one tenant at a time, stopping at the first failure"
+        );
+
+        let mut summary = Rolled::default();
+        for name in &fleet {
+            summary.checked += 1;
+            let label = name.as_str().to_string();
+            match self.roll_one(name, dry_run).await {
+                Ok(Step::Rolled) => summary.rolled.push(label),
+                Ok(Step::Current) => summary.current += 1,
+                Ok(Step::Foreign) => summary.skipped_foreign.push(label),
+                Ok(Step::Inactive) => summary.skipped_inactive.push(label),
+                // The step already logged what failed and why, through `fail`.
+                // What this adds is that the rest of the fleet is not going to
+                // happen, which is the part an operator has to see.
+                Err(_) => {
+                    tracing::error!(
+                        tenant = %name,
+                        remaining = fleet.len() - summary.checked,
+                        "fleet roll halted; the tenants after this one were not touched"
+                    );
+                    summary.halted_on = Some(label);
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            checked = summary.checked,
+            rolled = summary.rolled.len(),
+            current = summary.current,
+            skipped_foreign = summary.skipped_foreign.len(),
+            skipped_inactive = summary.skipped_inactive.len(),
+            halted = summary.halted_on.is_some(),
+            dry_run,
+            "fleet roll finished"
+        );
+        Ok(summary)
+    }
+
+    /// One tenant's turn in a [`Warden::roll`]. The decisions and their reasons
+    /// are documented there; this is the order they are asked in, which is
+    /// cheapest-and-safest first: the status word, then the drift report, then
+    /// the only call that writes anything.
+    async fn roll_one(&self, name: &TenantName, dry_run: bool) -> Result<Step, WardenError> {
+        match self.status_of(name).await? {
+            TenantStatus::Active | TenantStatus::Failed => {}
+            TenantStatus::Pending | TenantStatus::Stopped => return Ok(Step::Inactive),
+        }
+
+        let report = self.drift(name.as_str()).await?;
+        if !report.foreign.is_empty() {
+            // COUNT, not names, for the reason `reconcile` gives: a
+            // `fieldManager` is chosen by whoever wrote the field and this
+            // formatter writes one line per event. The names are in the drift
+            // report, which is structured and escaped.
+            tracing::warn!(
+                tenant = %name,
+                managers = report.foreign.len(),
+                "skipping a tenant another field manager owns fields on; repairing it \
+                 means deleting its workload, which is a decision for a person"
+            );
+            return Ok(Step::Foreign);
+        }
+        if report.changes.is_empty() {
+            return Ok(Step::Current);
+        }
+
+        if dry_run {
+            tracing::info!(
+                tenant = %name,
+                changes = report.changes.len(),
+                "would roll this tenant onto today's render"
+            );
+            return Ok(Step::Rolled);
+        }
+        // No foreign owner, so this takes `reconcile`'s converged path: plain
+        // applies, no delete, and a wait for the rollout to actually finish
+        // before the next tenant is touched.
+        let reconciled = self.reconcile(name.as_str()).await?;
+        tracing::info!(
+            tenant = %name,
+            deployment = reconciled.deployment,
+            changes = report.changes.len(),
+            "rolled a tenant onto today's render"
+        );
+        Ok(Step::Rolled)
     }
 
     /// The tenant's identity Secret, if phase one ever ran.
@@ -2366,12 +2630,19 @@ mod tests {
     /// Secret among them: a reconcile converges shape and never touches an
     /// identity, a credential or a key.
     fn workload_applies() -> Vec<(Kind, String)> {
+        workload_applies_for("alice")
+    }
+
+    /// [`workload_applies`] for a named tenant, which is what a fleet roll's
+    /// applies have to be read against: one tenant's five objects, then the
+    /// next tenant's, never interleaved.
+    fn workload_applies_for(label: &str) -> Vec<(Kind, String)> {
         vec![
-            (Kind::Pvc, "alice-data".to_string()),
-            (Kind::NetworkPolicy, "alice".to_string()),
-            (Kind::Service, "alice".to_string()),
-            (Kind::Deployment, "alice".to_string()),
-            (Kind::Ingress, "alice".to_string()),
+            (Kind::Pvc, format!("{label}-data")),
+            (Kind::NetworkPolicy, label.to_string()),
+            (Kind::Service, label.to_string()),
+            (Kind::Deployment, label.to_string()),
+            (Kind::Ingress, label.to_string()),
         ]
     }
 
@@ -2778,6 +3049,381 @@ mod tests {
             WardenError::InvalidLabel(_)
         ));
         assert!(h.cluster.applied().is_empty());
+    }
+
+    /// A tenant through both phases and serving, for the tests that need a
+    /// fleet rather than a tenant.
+    async fn serving_tenant(h: &Harness, label: &str) {
+        h.warden
+            .create_tenant(label, &format!("{label}@example.com"))
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials(label, &armored(label))
+            .await
+            .unwrap();
+    }
+
+    /// The image a tenant was provisioned on before somebody bumped
+    /// `SQUELCH_WARDEN_IMAGE`. Any value the test config does not name.
+    const PREVIOUS_IMAGE: &str = "ghcr.io/braelyn-ai/squelchd:daemon-0.3.0";
+
+    /// Put a tenant's live Deployment a render behind: the daemon image the
+    /// warden's config no longer names, with the warden still the only owner of
+    /// every field.
+    ///
+    /// This is the drift a fleet roll exists for, and it is the ORDINARY one.
+    /// Nobody edited anything; the warden wrote these objects once at provision
+    /// time and never came back, so a tenant provisioned before an image bump
+    /// carries the old render until something walks it forward. The hand-edit
+    /// fixture next to it is the other kind, and the roll treats them as
+    /// opposites.
+    async fn age_the_render(h: &Harness, label: &str) {
+        let Some(Object::Deployment(mut deployment)) = h.cluster.object(Kind::Deployment, label)
+        else {
+            panic!("no deployment for {label}");
+        };
+        let pod = deployment
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .spec
+            .as_mut()
+            .unwrap();
+        for container in pod
+            .containers
+            .iter_mut()
+            .chain(pod.init_containers.iter_mut().flatten())
+        {
+            container.image = Some(PREVIOUS_IMAGE.to_string());
+        }
+        h.cluster
+            .apply(Object::Deployment(deployment))
+            .await
+            .unwrap();
+    }
+
+    /// The image the tenant's daemon container currently carries.
+    fn daemon_image(h: &Harness, label: &str) -> String {
+        let Some(Object::Deployment(deployment)) = h.cluster.object(Kind::Deployment, label) else {
+            panic!("no deployment for {label}");
+        };
+        deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers
+            .iter()
+            .find(|container| container.name == "squelchd")
+            .and_then(|container| container.image.clone())
+            .expect("no daemon container")
+    }
+
+    fn labels_of(fleet: &[TenantName]) -> Vec<&str> {
+        fleet.iter().map(TenantName::as_str).collect()
+    }
+
+    /// What a roll walks: every tenant in the cluster, sorted, whatever order
+    /// they were minted in and whether or not anything else knows about them.
+    #[tokio::test]
+    async fn the_fleet_is_every_tenant_in_the_cluster_sorted() {
+        let h = Harness::new();
+        assert_eq!(h.warden.fleet().await.unwrap(), Vec::new());
+
+        serving_tenant(&h, "carol").await;
+        serving_tenant(&h, "alice").await;
+        // Pending: phase one and nothing since. Still in the fleet - a tenant
+        // half a signup away from being recorded anywhere else is exactly the
+        // one a sweep must not be blind to - and it is the status check inside
+        // the roll, not the enumeration, that decides to leave it alone.
+        h.warden
+            .create_tenant("bob", "bob@example.com")
+            .await
+            .unwrap();
+
+        // Carol's and Alice's credential Secrets carry the same managed
+        // selector and are not identities, which is the "skip a name that does
+        // not parse back to a label" path.
+        let fleet = h.warden.fleet().await.unwrap();
+        assert_eq!(labels_of(&fleet), vec!["alice", "bob", "carol"]);
+    }
+
+    /// The pass that closes the gap write-once provisioning leaves. Two tenants
+    /// are a render behind and one is not; the two are converged, in fleet
+    /// order rather than in the order they fell behind, and the third is not
+    /// written at all.
+    #[tokio::test]
+    async fn a_roll_converges_only_the_drifted_tenants_in_fleet_order() {
+        let h = Harness::new();
+        for label in ["alice", "bob", "carol"] {
+            serving_tenant(&h, label).await;
+        }
+        age_the_render(&h, "carol").await;
+        age_the_render(&h, "alice").await;
+        let before = h.cluster.applied().len();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.checked, 3);
+        assert_eq!(rolled.rolled, vec!["alice", "carol"]);
+        assert_eq!(rolled.current, 1);
+        assert_eq!(rolled.skipped_foreign, Vec::<String>::new());
+        assert_eq!(rolled.skipped_inactive, Vec::<String>::new());
+        assert_eq!(rolled.halted_on, None);
+
+        // One tenant's five objects, then the next tenant's. Nothing for Bob,
+        // who was already on today's render, and no delete anywhere: with no
+        // foreign owner this is the converged path.
+        assert_eq!(
+            h.cluster.applied()[before..].to_vec(),
+            [workload_applies_for("alice"), workload_applies_for("carol")].concat()
+        );
+        assert!(h.cluster.deleted().is_empty());
+        for label in ["alice", "bob", "carol"] {
+            assert_eq!(daemon_image(&h, label), h.config.image);
+            assert_eq!(h.warden.status(label).await.unwrap(), TenantStatus::Active);
+        }
+
+        // And the fleet is converged, so a second pass is all reads.
+        let applied = h.cluster.applied().len();
+        let second = h.warden.roll(false).await.unwrap();
+        assert_eq!(second.current, 3);
+        assert_eq!(second.rolled, Vec::<String>::new());
+        assert_eq!(h.cluster.applied().len(), applied);
+    }
+
+    /// The rule that makes an unattended roll defensible: a Deployment somebody
+    /// else owns fields on is left EXACTLY as it is. Repairing one means
+    /// deleting it, which is a live mailbox going down to remove a field a
+    /// person put there deliberately, and no timer gets to make that call.
+    #[tokio::test]
+    async fn a_roll_never_touches_a_tenant_another_manager_owns() {
+        let h = Harness::new();
+        for label in ["alice", "bob"] {
+            serving_tenant(&h, label).await;
+        }
+        age_the_render(&h, "bob").await;
+        // Alice is drifted AND hand-edited; the hand edit is what decides.
+        age_the_render(&h, "alice").await;
+        hand_edit_the_deployment(&h).await;
+        let before = h.cluster.applied().len();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.skipped_foreign, vec!["alice"]);
+        assert_eq!(rolled.rolled, vec!["bob"]);
+        assert_eq!(rolled.halted_on, None);
+
+        // Not one write against Alice: not an apply, not a delete. A skip that
+        // re-applied "just the safe fields" would still be this loop deciding
+        // something about somebody else's field.
+        assert_eq!(
+            h.cluster.applied()[before..].to_vec(),
+            workload_applies_for("bob")
+        );
+        assert!(h.cluster.deleted().is_empty());
+        assert_eq!(daemon_image(&h, "alice"), PREVIOUS_IMAGE);
+
+        // The foreign owner and its field are both still there, which is the
+        // state the operator has to be shown rather than have cleaned up
+        // behind them.
+        let Some(Object::Deployment(alice)) = h.cluster.object(Kind::Deployment, "alice") else {
+            panic!("no deployment");
+        };
+        assert_eq!(drift::foreign_managers(&alice).len(), 1);
+        let seed = &alice
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .init_containers
+            .unwrap()[0];
+        assert!(seed.env.is_some(), "the roll removed a foreign field");
+    }
+
+    /// Neither tenant without a workload is a shape to converge: pending is a
+    /// signup to finish and stopped is an account to reopen, and a roll that
+    /// "fixed" either would be starting something nobody asked it to start.
+    #[tokio::test]
+    async fn a_roll_skips_the_tenants_with_no_workload() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        serving_tenant(&h, "bob").await;
+        age_the_render(&h, "bob").await;
+        serving_tenant(&h, "carol").await;
+        h.warden.delete("carol").await.unwrap();
+        let applied = h.cluster.applied().len();
+        let deleted = h.cluster.deleted().len();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.checked, 3);
+        assert_eq!(rolled.skipped_inactive, vec!["alice", "carol"]);
+        assert_eq!(rolled.rolled, vec!["bob"]);
+        assert_eq!(rolled.current, 0);
+
+        assert_eq!(
+            h.cluster.applied()[applied..].to_vec(),
+            workload_applies_for("bob")
+        );
+        assert_eq!(h.cluster.deleted().len(), deleted);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Pending
+        );
+        assert_eq!(
+            h.warden.status("carol").await.unwrap(),
+            TenantStatus::Stopped
+        );
+    }
+
+    /// The whole reason this is a sweep and not a controller: a render that
+    /// will not come up costs ONE tenant. The run stops where it broke, says
+    /// so, and every tenant after it is untouched.
+    #[tokio::test]
+    async fn a_tenant_that_will_not_come_back_halts_the_run() {
+        let h = Harness::new();
+        for label in ["alice", "bob", "carol"] {
+            serving_tenant(&h, label).await;
+            age_the_render(&h, label).await;
+        }
+        let before = h.cluster.applied().len();
+        // Today's render is a render that does not serve.
+        h.cluster.never_ready();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.halted_on, Some("alice".to_string()));
+        assert_eq!(rolled.rolled, Vec::<String>::new());
+        // Examined exactly one tenant, out of a fleet of three.
+        assert_eq!(rolled.checked, 1);
+
+        // Alice was applied and did not come back; nobody else was written at
+        // all, and both of them are still serving the render they were on.
+        assert_eq!(
+            h.cluster.applied()[before..].to_vec(),
+            workload_applies_for("alice")
+        );
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Failed
+        );
+        for label in ["bob", "carol"] {
+            assert_eq!(daemon_image(&h, label), PREVIOUS_IMAGE);
+            assert_eq!(h.warden.status(label).await.unwrap(), TenantStatus::Active);
+        }
+    }
+
+    /// What an operator runs BEFORE the bump: every read, no write, and a list
+    /// of exactly which tenants the real run would touch.
+    #[tokio::test]
+    async fn a_dry_run_reports_the_work_and_does_none_of_it() {
+        let h = Harness::new();
+        for label in ["alice", "bob"] {
+            serving_tenant(&h, label).await;
+        }
+        age_the_render(&h, "alice").await;
+        let applied = h.cluster.applied();
+
+        let rolled = h.warden.roll(true).await.unwrap();
+        assert_eq!(rolled.checked, 2);
+        assert_eq!(rolled.rolled, vec!["alice"]);
+        assert_eq!(rolled.current, 1);
+
+        // Nothing was written, including by the drift report's dry-run apply,
+        // and Alice is still a render behind.
+        assert_eq!(h.cluster.applied(), applied);
+        assert!(h.cluster.deleted().is_empty());
+        assert_eq!(daemon_image(&h, "alice"), PREVIOUS_IMAGE);
+    }
+
+    /// A fleet that is already converged is a no-op, which is what makes this
+    /// safe to run on a timer: the steady state costs reads and changes
+    /// nothing.
+    #[tokio::test]
+    async fn a_fleet_already_on_todays_render_is_all_reads() {
+        let h = Harness::new();
+        for label in ["alice", "bob"] {
+            serving_tenant(&h, label).await;
+        }
+        let applied = h.cluster.applied();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.checked, 2);
+        assert_eq!(rolled.current, 2);
+        assert_eq!(rolled.rolled, Vec::<String>::new());
+        assert_eq!(rolled.halted_on, None);
+        assert_eq!(h.cluster.applied(), applied);
+        assert!(h.cluster.deleted().is_empty());
+    }
+
+    /// The check the whole roll stands on. A reconcile answers only once the
+    /// Deployment's rollout has FINISHED - the controller has observed the
+    /// spec and every replica on it is serving - and a rollout that never
+    /// completes is the same terse `not_ready` a pod that never came up gives.
+    ///
+    /// The last assertion is the false green this exists to refuse: a pod
+    /// matching the tenant's selector is Ready throughout, because under
+    /// `Recreate` the pod being replaced stays Ready while it terminates. A
+    /// roller that trusted that would step to the next tenant on the strength
+    /// of the pod it had just taken away.
+    #[tokio::test]
+    async fn a_reconcile_answers_only_once_the_rollout_is_complete() {
+        let h = Harness::new();
+        serving_tenant(&h, "alice").await;
+        assert_eq!(h.warden.reconcile("alice").await.unwrap().status, "active");
+
+        h.cluster.rollout_hangs();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::cluster("not_ready")
+        );
+        // Applied anyway: the objects landed, the roll did not finish.
+        assert!(h.cluster.exists(Kind::Deployment, "alice"));
+
+        let name = TenantName::parse("alice").unwrap();
+        assert!(
+            h.cluster
+                .ready_pod(&objects::pod_selector(&name), h.config.ready_timeout)
+                .await
+                .is_ok(),
+            "the weaker check has to pass here, or this test proves nothing"
+        );
+    }
+
+    /// A roll that cannot even enumerate the fleet is an ERROR, not an empty
+    /// summary. "Nothing to do" and "I could not look" are the same three
+    /// zeroes on the way out, and an operator must never be handed the second
+    /// one wearing the first one's face.
+    #[tokio::test]
+    async fn a_roll_that_cannot_read_the_fleet_is_not_an_empty_success() {
+        let h = Harness::new();
+        serving_tenant(&h, "alice").await;
+        h.cluster.break_reads();
+        assert_eq!(
+            h.warden.roll(false).await.unwrap_err(),
+            WardenError::cluster("fleet_list_failed")
+        );
+    }
+
+    /// And the same failure inside a roll: the tenant it halted on is the
+    /// tenant whose rollout hung.
+    #[tokio::test]
+    async fn a_rollout_that_never_completes_halts_the_run() {
+        let h = Harness::new();
+        for label in ["alice", "bob"] {
+            serving_tenant(&h, label).await;
+            age_the_render(&h, label).await;
+        }
+        h.cluster.rollout_hangs();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.halted_on, Some("alice".to_string()));
+        assert_eq!(rolled.rolled, Vec::<String>::new());
+        assert_eq!(daemon_image(&h, "bob"), PREVIOUS_IMAGE);
     }
 
     #[test]

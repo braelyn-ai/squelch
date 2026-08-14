@@ -12,9 +12,11 @@
 //! - `stringData` on a Secret is stored as `data`. A mock that echoed
 //!   `stringData` back would let a reader that looks at the wrong field pass
 //!   here and find nothing on a real cluster.
-//! - a Deployment that has been applied reports a ready replica, unless the
-//!   test says otherwise. That is what makes `pending` / `active` / `failed`
-//!   testable without a scheduler.
+//! - a Deployment that has been applied reports the status a running one would
+//!   have: a generation the controller has observed, and every replica updated,
+//!   present and ready, unless a knob says otherwise. That is what makes
+//!   `pending` / `active` / `failed` and a finished rollout testable without a
+//!   scheduler.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -25,7 +27,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
 use k8s_openapi::api::core::v1::{Secret, Service};
 
-use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object};
+use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
 use crate::config::{
     Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST, DEFAULT_EPHEMERAL_LIMIT,
     DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS, DEFAULT_INGRESS_NAMESPACE,
@@ -130,6 +132,8 @@ struct MockInner {
     exec_ok: bool,
     /// Whether an applied Deployment comes up.
     ready: bool,
+    /// Whether the controller ever notices an applied Deployment.
+    rollout_hangs: bool,
     /// Whether a deleted Deployment's pods hang around holding the volume.
     pods_linger: bool,
     /// Whether reads answer at all.
@@ -185,6 +189,18 @@ impl MockCluster {
     /// Every read fails, as a partitioned API server would.
     pub fn break_reads(&self) {
         self.lock().reads_ok = false;
+    }
+
+    /// An applied Deployment's rollout never completes: the controller has not
+    /// observed the new spec, so `status.observedGeneration` stays behind
+    /// `metadata.generation` forever and `rollout_complete` times out.
+    ///
+    /// The state a bad render produces on a real cluster is the neighbouring
+    /// one — the controller sees the spec and the pod never becomes ready,
+    /// which is [`MockCluster::never_ready`] — and both have to be failures a
+    /// caller can be held to, because the fleet roll stops on either.
+    pub fn rollout_hangs(&self) {
+        self.lock().rollout_hangs = true;
     }
 
     /// A deleted Deployment's pod never goes: `pods_gone` times out, the way a
@@ -272,15 +288,17 @@ impl MockCluster {
     fn store(&self, object: Object) {
         let mut inner = self.lock();
         let key = (object.kind(), object.name().to_string());
-        let ready = inner.ready;
+        let (ready, rollout_hangs) = (inner.ready, inner.rollout_hangs);
         inner.applied.push(key.clone());
-        inner.objects.insert(key, persist(object, ready));
+        inner
+            .objects
+            .insert(key, persist(object, ready, rollout_hangs));
     }
 }
 
 /// Imitate the API server: `stringData` is folded into `data`, and an applied
 /// Deployment gets the status a running one would have.
-fn persist(object: Object, ready: bool) -> Object {
+fn persist(object: Object, ready: bool, rollout_hangs: bool) -> Object {
     match object {
         Object::Secret(mut secret) => {
             if let Some(string_data) = secret.string_data.take() {
@@ -292,8 +310,28 @@ fn persist(object: Object, ready: bool) -> Object {
             Object::Secret(secret)
         }
         Object::Deployment(mut deployment) => {
+            let desired = deployment
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(1);
+            // The whole status, not just the ready count, because
+            // `rollout_complete` reads all four numbers and a mock that left
+            // three of them absent would report every roll as unfinished.
+            //
+            // The API server bumps `metadata.generation` on every spec write
+            // and the deployment controller copies it into
+            // `status.observedGeneration` once it has acted on that spec;
+            // `rollout_hangs` is a controller stuck in the gap between the two.
+            deployment.metadata.generation = Some(1);
             deployment.status = Some(DeploymentStatus {
-                ready_replicas: Some(i32::from(ready)),
+                observed_generation: Some(if rollout_hangs { 0 } else { 1 }),
+                // The replicas exist and are on the applied template either
+                // way: a pod that will not come up is a pod that is there and
+                // is not Ready, which is what `ready` decides.
+                replicas: Some(desired),
+                updated_replicas: Some(desired),
+                ready_replicas: Some(if ready { desired } else { 0 }),
                 ..Default::default()
             });
             Object::Deployment(deployment)
@@ -322,9 +360,15 @@ impl Cluster for MockCluster {
         &self,
         deployment: Deployment,
     ) -> Result<Deployment, ClusterError> {
-        let ready = self.lock().ready;
-        let Object::Deployment(deployment) = persist(Object::Deployment(Box::new(deployment)), ready)
-        else {
+        let (ready, rollout_hangs) = {
+            let inner = self.lock();
+            (inner.ready, inner.rollout_hangs)
+        };
+        let Object::Deployment(deployment) = persist(
+            Object::Deployment(Box::new(deployment)),
+            ready,
+            rollout_hangs,
+        ) else {
             unreachable!("persist does not change an object's kind")
         };
         Ok(*deployment)
@@ -412,6 +456,21 @@ impl Cluster for MockCluster {
             .find_map(|part| part.strip_prefix("app.kubernetes.io/instance="))
             .ok_or(ClusterError::NoPod)?;
         Ok(format!("{instance}-abc123"))
+    }
+
+    /// The stored Deployment's own status, put through the same
+    /// [`rolled_out`] the real poll loop uses, so a test cannot pass on a rule
+    /// the cluster does not apply. A roll that is not complete is not going to
+    /// become complete while nobody applies anything, so this answers at once
+    /// rather than spending the deadline.
+    async fn rollout_complete(&self, name: &str, within: Duration) -> Result<(), ClusterError> {
+        let Some(deployment) = self.get_deployment(name).await? else {
+            return Err(ClusterError::NoPod);
+        };
+        if rolled_out(&deployment) {
+            return Ok(());
+        }
+        Err(ClusterError::Timeout(within))
     }
 
     /// The mock keeps no pods, so a deleted Deployment has taken its pod with
