@@ -42,3 +42,7 @@ run_suite pairing \
 run_suite subject-text \
   Sources/Passband/Model/SubjectText.swift \
   Tests/SubjectTextTests.swift
+
+run_suite email-images \
+  Sources/Passband/Lib/ImageProxy.swift \
+  Tests/EmailImagesTests.swift

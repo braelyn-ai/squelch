@@ -97,14 +97,9 @@ final class ImageWarmer {
             let view = try? await ThreadPrefetch.shared.fetch(threadId)
         else { return }
 
-        let repeats =
-            ThreadPrefetch.shared.cachedRepeatedImages(threadId)
-            ?? ThreadPrefetch.repeatedImages(in: view)
-
         for message in view.messages {
             guard let html = message.html, !html.isEmpty else { continue }
-            let seenEarlier = repeats[message.id] ?? []
-            let prepared = await Self.prepared(html, seenEarlier)
+            let prepared = await Self.prepared(html)
             guard !prepared.imageURLs.isEmpty else { continue }
             await ImageStore.shared.warm(urls: prepared.imageURLs, pin: message.id)
         }
@@ -118,13 +113,11 @@ final class ImageWarmer {
     /// reader will keep: this runs before the mail is opened, and pre-fetching a
     /// tracking pixel would report an open that never happened. The known-sender
     /// body is prepared for real when the card renders it.
-    private static func prepared(_ html: String, _ seenEarlier: Set<String>)
-        async -> EmailWebView.Prepared
-    {
-        let key = EmailWebView.Prepared.cacheKey(html, seenEarlier, false)
+    private static func prepared(_ html: String) async -> EmailWebView.Prepared {
+        let key = EmailWebView.Prepared.cacheKey(html, false)
         if let warm = PreparedBodies.shared.get(key) { return warm }
         let made = await Task.detached(priority: .utility) {
-            EmailWebView.Prepared.make(from: html, seenEarlier: seenEarlier, allowTrackers: false)
+            EmailWebView.Prepared.make(from: html, allowTrackers: false)
         }.value
         PreparedBodies.shared.set(key, made)
         return made

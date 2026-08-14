@@ -19,11 +19,6 @@ struct EmailWebView: View {
     let html: String
     /// Stable id (message id) for the height memory.
     let cacheKey: String?
-    /// Image srcs an earlier message in this thread already showed; each is
-    /// dropped from this one. Empty is not "off" — a lone message still
-    /// de-duplicates against itself, collapsing the signature copies a quoted
-    /// history drags along behind it.
-    let seenEarlier: Set<String>
     /// The sender is somebody the user has written to (`sender_known` on the
     /// wire), so this body's tracking pixels are left in the document: a trusted
     /// correspondent is allowed to learn the mail was opened. Everyone else is
@@ -48,16 +43,14 @@ struct EmailWebView: View {
     /// `prepared` is seeded from the warm cache HERE: `@State` cannot be assigned
     /// from `body`, and every later hook is a frame too late.
     init(
-        html: String, cacheKey: String? = nil, seenEarlier: Set<String> = [],
-        allowTrackers: Bool = false
+        html: String, cacheKey: String? = nil, allowTrackers: Bool = false
     ) {
         self.html = html
         self.cacheKey = cacheKey
-        self.seenEarlier = seenEarlier
         self.allowTrackers = allowTrackers
         _prepared = State(
             initialValue: PreparedBodies.shared.get(
-                Prepared.cacheKey(html, seenEarlier, allowTrackers)) ?? .empty)
+                Prepared.cacheKey(html, allowTrackers)) ?? .empty)
     }
 
     struct Prepared: Equatable, Sendable {
@@ -79,8 +72,7 @@ struct EmailWebView: View {
             sourceHash: 0, html: "", trackers: 0, trackersAllowed: false,
             hasRemoteCandidates: false, links: [], imageURLs: [])
 
-        static func make(from html: String, seenEarlier: Set<String>, allowTrackers: Bool = false)
-            -> Prepared
+        static func make(from html: String, allowTrackers: Bool = false) -> Prepared
         {
             // The pass runs either way — one regex sweep, and its COUNT is what
             // the badge reports — but a known sender's body keeps its pixels.
@@ -90,7 +82,12 @@ struct EmailWebView: View {
             // in place of it.
             let stripped = Trackers.strip(html)
             let body = allowTrackers ? html : stripped.html
-            let deduped = ImageRepeats.dropRepeats(body, alreadySeen: seenEarlier)
+            // A repeated sender logo is still part of THIS message. Suppressing
+            // it because an older message used the same URL made current mail
+            // look broken (and could erase every image in a short reply). Keep
+            // the within-body pass for quoted-history duplicates, but do not let
+            // an earlier message remove content from this one.
+            let deduped = ImageRepeats.dropRepeats(body)
             // Read off the DEDUPED html: a message whose only images were
             // repeats has nothing left to fetch, so it must not offer the
             // "load remote images" bar.
@@ -101,7 +98,7 @@ struct EmailWebView: View {
             // no longer recognise as remote.
             let proxied = ImageProxy.rewrite(deduped)
             return Prepared(
-                sourceHash: cacheKey(html, seenEarlier, allowTrackers),
+                sourceHash: cacheKey(html, allowTrackers),
                 html: proxied.html,
                 trackers: stripped.blocked,
                 trackersAllowed: allowTrackers,
@@ -110,17 +107,11 @@ struct EmailWebView: View {
                 imageURLs: proxied.urls)
         }
 
-        /// The suppression set is an input, so it is part of the identity of what
-        /// was prepared — keying on the html alone would hand a message the
-        /// previous thread's dedupe result. So is the tracker policy: the two
-        /// policies produce DIFFERENT documents from the same body, and a shared
-        /// key would serve one message's pixels inside another's frame.
-        static func cacheKey(_ html: String, _ seenEarlier: Set<String>, _ allowTrackers: Bool)
-            -> Int
-        {
+        /// Tracker policy is part of the identity: the two policies produce
+        /// different documents from the same body.
+        static func cacheKey(_ html: String, _ allowTrackers: Bool) -> Int {
             var hasher = Hasher()
             hasher.combine(html)
-            hasher.combine(seenEarlier)
             hasher.combine(allowTrackers)
             return hasher.finalize()
         }
@@ -216,10 +207,9 @@ struct EmailWebView: View {
                 return
             }
             let source = html
-            let seen = seenEarlier
             let allow = allowTrackers
             let made = await Task.detached(priority: .userInitiated) {
-                Prepared.make(from: source, seenEarlier: seen, allowTrackers: allow)
+                Prepared.make(from: source, allowTrackers: allow)
             }.value
             PreparedBodies.shared.set(key, made)
             guard !Task.isCancelled else { return }
@@ -239,7 +229,7 @@ struct EmailWebView: View {
         }
     }
 
-    private var preparedKey: Int { Prepared.cacheKey(html, seenEarlier, allowTrackers) }
+    private var preparedKey: Int { Prepared.cacheKey(html, allowTrackers) }
     private var rememberedHeight: CGFloat? { cacheKey.flatMap { FrameHeights.shared.get($0) } }
     private var displayHeight: CGFloat {
         height > 0 ? height : (rememberedHeight ?? Self.placeholderHeight)
