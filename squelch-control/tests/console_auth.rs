@@ -1,6 +1,14 @@
-//! The console login hop end to end, against a MOCK Google and a MOCK warden.
+//! BOTH LOGIN HOPS end to end, against a MOCK Google and a MOCK warden.
 //!
-//! What this flow promises, and therefore what is asserted here:
+//! One file for the two because they are one flow with one input's worth of
+//! difference: the same identity-only consent, the same session table, the same
+//! callback, and the same warden-minted pairing code as the ticket. What differs
+//! is that `/console/auth` is TOLD a label and checks it against the mailbox,
+//! while `/app/auth` is told nothing and LOOKS THE LABEL UP from the mailbox;
+//! and that one ends at a tenant console while the other ends at a
+//! `passband://pair` deep link. The mocks below serve both unchanged.
+//!
+//! What the CONSOLE flow promises, and therefore what is asserted here:
 //!
 //! - it asks Google for IDENTITY ONLY (`openid email`), never a Gmail scope and
 //!   never offline access, because signing in to a console is not a reason to
@@ -17,6 +25,20 @@
 //!   tenant that is not active, and the wrong Google account are
 //!   indistinguishable from outside, and none of them offers the signup form,
 //! - nothing reaches the warden until the mailbox has been proved.
+//!
+//! What the APP flow promises on top of that:
+//!
+//! - it takes NO input, so there is nothing for a stranger to guess and no
+//!   parameter that could become a redirect,
+//! - the tenant is found by REVERSE LOOKUP on the address Google verified, so
+//!   the only mailbox anybody can ask about is the one they just proved they
+//!   hold, and only an ACTIVE tenant answers,
+//! - what comes back is a page carrying a `passband://pair` deep link built from
+//!   this deployment's own tenant URL and the warden's code, with no token on it,
+//! - a Google account with no mailbox here is told so plainly and costs the
+//!   warden nothing,
+//! - it shares the console hop's rate-limit bucket and the session table's login
+//!   carve-out, so alternating the two cannot buy a flooder a second budget.
 //!
 //! Nothing here touches a real Google endpoint, a real cluster, a real port
 //! 8848, or any store outside an in-memory SQLite.
@@ -335,14 +357,35 @@ impl Harness {
     /// Walk one whole console login and return the callback's answer.
     async fn run_login(&self, tenant: &str) -> (StatusCode, HeaderMap, String) {
         let (consent, cookie) = self.start_login(tenant).await;
+        self.finish_login(&consent, &cookie).await
+    }
+
+    /// Start an APP login and return `(consent url, cookie pair)`. No tenant
+    /// argument, because the route takes none.
+    async fn start_app_login(&self) -> (String, String) {
+        let (status, headers, body) = self.get("/app/auth", None).await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        let location = headers[header::LOCATION].to_str().unwrap().to_string();
+        let cookie = headers[header::SET_COOKIE].to_str().unwrap().to_string();
+        (location, cookie.split(';').next().unwrap().to_string())
+    }
+
+    /// Come back from Google with the `state` this consent carried.
+    async fn finish_login(&self, consent: &str, cookie: &str) -> (StatusCode, HeaderMap, String) {
         self.get(
             &format!(
                 "/oauth/callback?code=the-auth-code&state={}",
-                query_param(&consent, "state")
+                query_param(consent, "state")
             ),
-            Some(&cookie),
+            Some(cookie),
         )
         .await
+    }
+
+    /// Walk one whole app login and return the callback's answer.
+    async fn run_app_login(&self) -> (StatusCode, HeaderMap, String) {
+        let (consent, cookie) = self.start_app_login().await;
+        self.finish_login(&consent, &cookie).await
     }
 }
 
@@ -745,6 +788,7 @@ async fn a_cookie_that_claims_an_invite_cannot_drive_a_console_session() {
             sid: real["sid"].as_str().unwrap().to_string(),
             label: LABEL.to_string(),
             invite: Some(1),
+            app: false,
             iat: chrono::Utc::now().timestamp(),
         },
     );
@@ -948,4 +992,210 @@ async fn the_console_hop_has_its_own_budget() {
         .await;
     assert_eq!(status, StatusCode::OK, "signup paid for the console flood");
     assert!(body.contains("invite code"), "{body}");
+}
+
+// ---- the app hop ----------------------------------------------------------
+
+/// The happy path, asserted at every point the design makes a promise.
+///
+/// The DEEP LINK is the assertion that matters. It is compared whole rather than
+/// with a `contains`, because the property under test is that nothing except
+/// this deployment's own tenant URL and the warden's own code can get into it.
+#[tokio::test]
+async fn an_app_login_ends_at_a_deep_link_for_the_mailboxs_own_tenant() {
+    let h = Harness::new().await;
+
+    // NO INPUT. The route was reached with no query string at all, which is why
+    // there is nothing here for a stranger to guess at or to smuggle a redirect
+    // through.
+    let (consent, cookie) = h.start_app_login().await;
+    assert!(consent.contains("/authorize"), "{consent}");
+
+    // IDENTITY ONLY, the same ask a console login makes: no Gmail scope, no
+    // offline access. Connecting an app is not a reason to hold a second key to
+    // somebody's mail, and the daemon already holds the first.
+    let scope = query_param(&consent, "scope");
+    assert_eq!(scope.split(' ').collect::<Vec<_>>(), vec!["openid", "email"]);
+    assert!(!scope.contains("gmail"), "{scope}");
+    assert!(!consent.contains("access_type"), "{consent}");
+    assert_eq!(query_param(&consent, "code_challenge_method"), "S256");
+
+    // Hold the exchange to the challenge that rode on THIS consent URL.
+    h.rec.lock().unwrap().expected_challenge = Some(query_param(&consent, "code_challenge"));
+
+    let (status, headers, body) = h.finish_login(&consent, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // THE CENTRAL ASSERTION.
+    let link = format!(
+        "passband://pair?url=https%3A%2F%2F{LABEL}.passband.test&amp;code={PAIR_CODE}"
+    );
+    assert!(body.contains(&link), "{body}");
+    // The mailbox is named, because this is the one screen that can confirm
+    // Google picked the account the person meant.
+    assert!(body.contains(MAILBOX), "{body}");
+    // ...and no token is on it, in either spelling.
+    assert!(!body.contains(ACCESS_TOKEN));
+    assert!(!body.contains(REFRESH_TOKEN));
+
+    // A live pairing code is in that body, so nothing may cache it and it must
+    // not ride out as a referer when the link is pressed.
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store, no-cache");
+    assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+
+    // The session cookie is cleared on the way out, like every other terminal
+    // answer from the callback.
+    let set_cookie = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(set_cookie.contains("Max-Age=0"), "{set_cookie}");
+
+    // The warden minted for the label the LOOKUP found, which nobody sent.
+    let rec = h.rec.lock().unwrap();
+    assert_eq!(rec.pair_calls, vec![LABEL.to_string()]);
+    assert_eq!(rec.warden_bearers, vec!["Bearer warden-bearer".to_string()]);
+}
+
+/// The reverse lookup normalizes the way the store does, so the capitalized
+/// answer Google actually gives finds the row rather than missing it. The tenant
+/// in the harness is stored as `Ada@Example.com`; Google says `ada@example.com`.
+#[tokio::test]
+async fn an_app_login_finds_its_tenant_whatever_case_google_answers_in() {
+    let h = Harness::new().await;
+    h.rec.lock().unwrap().signed_in_as = Some("ADA@EXAMPLE.COM".into());
+
+    let (status, _, body) = h.run_app_login().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(PAIR_CODE), "{body}");
+    assert_eq!(h.rec.lock().unwrap().pair_calls, vec![LABEL.to_string()]);
+}
+
+/// A real Google account with no mailbox here is told so PLAINLY, unlike every
+/// refusal on the console hop.
+///
+/// That is safe precisely because the flow has no input: the only address this
+/// answer can be asked about is one the asker just proved they hold at Google,
+/// so there is no directory to walk and nobody else's mailbox to test. And
+/// nothing reaches the warden, so a stranger cannot make a pairing code exist.
+#[tokio::test]
+async fn an_app_login_with_no_mailbox_here_says_so_and_mints_nothing() {
+    let h = Harness::new().await;
+    h.rec.lock().unwrap().signed_in_as = Some("grace@example.com".into());
+
+    let (status, _, body) = h.run_app_login().await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("No Passband mailbox"), "{body}");
+    // No code, no link, nothing minted.
+    assert!(!body.contains(PAIR_CODE), "{body}");
+    assert!(!body.contains("passband://"), "{body}");
+    assert!(h.rec.lock().unwrap().pair_calls.is_empty(), "warden touched");
+}
+
+/// An address Google will not VOUCH for is not an identity, so it is not an app
+/// login either. Absent is not verified, which is the case a provider (or
+/// anything answering as one) produces by leaving the claim out.
+#[tokio::test]
+async fn an_unvouched_google_answer_is_not_an_app_login() {
+    for verified in [None, Some(Value::Bool(false))] {
+        let h = Harness::new().await;
+        h.rec.lock().unwrap().email_verified = verified.clone();
+
+        let (status, _, body) = h.run_app_login().await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{verified:?}: {body}");
+        assert!(h.rec.lock().unwrap().pair_calls.is_empty(), "{verified:?}");
+    }
+}
+
+/// A warden that will not mint says TRY AGAIN, not "check who you are": the
+/// person signed in correctly and this service is the thing that failed.
+#[tokio::test]
+async fn a_warden_that_will_not_mint_is_not_the_users_fault() {
+    let h = Harness::new().await;
+    h.rec.lock().unwrap().pair_status = Some(500);
+
+    let (status, _, body) = h.run_app_login().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("try again"), "{body}");
+    assert!(!body.contains("passband://"), "{body}");
+}
+
+/// THE CROSS-FLOW FORGERY: a cookie with a VALID MAC, naming a live session, but
+/// claiming to be the other kind of login.
+///
+/// The MAC cannot rule this out on its own, so the callback compares the flow
+/// the cookie claims against the flow the session records and refuses on a
+/// mismatch. Without that check, an app session's callback would be steered by
+/// the cookie into rendering a console refusal that links to a label the cookie
+/// chose.
+#[tokio::test]
+async fn a_cookie_cannot_change_which_login_a_session_is() {
+    let h = Harness::new().await;
+    let (consent, cookie) = h.start_app_login().await;
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            cookie
+                .split_once('=')
+                .unwrap()
+                .1
+                .split_once('.')
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+    let real: Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(real["app"], Value::Bool(true), "{real}");
+    assert_eq!(real["label"], "", "an app login names no tenant: {real}");
+
+    // Same session id, same empty label, but claiming to be a console login.
+    let forged = cookie::sign(
+        &COOKIE_KEY,
+        &SessionClaim {
+            sid: real["sid"].as_str().unwrap().to_string(),
+            label: String::new(),
+            invite: None,
+            app: false,
+            iat: chrono::Utc::now().timestamp(),
+        },
+    );
+
+    let (status, _, body) = h
+        .get(
+            &format!(
+                "/oauth/callback?code=c1&state={}",
+                query_param(&consent, "state")
+            ),
+            Some(&format!("passband_signup={forged}")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(!body.contains("passband://"), "{body}");
+    assert!(h.rec.lock().unwrap().pair_calls.is_empty(), "warden touched");
+}
+
+/// ONE BUDGET FOR BOTH HOPS. They are the same errand through the same consent,
+/// and a bucket each would let one client spend twice by alternating them.
+#[tokio::test]
+async fn the_two_login_hops_share_one_budget() {
+    let h = Harness::new().await;
+
+    let capacity = CONSOLE_AUTH_REQUESTS_PER_MINUTE as usize;
+    let mut refused = 0;
+    for i in 0..(capacity + 5) {
+        // Alternating on purpose: what is under test is that the second route
+        // does not come with a second allowance.
+        let uri = if i % 2 == 0 {
+            format!("/console/auth?tenant={LABEL}")
+        } else {
+            "/app/auth".to_string()
+        };
+        let (status, _, _) = h.get(&uri, None).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 5, "the shared bucket holds one stated capacity");
 }

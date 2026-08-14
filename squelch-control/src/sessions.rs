@@ -8,14 +8,16 @@
 //!   verifier, and the verifier lives here, in this process's memory, for ten
 //!   minutes.
 //!
-//! TWO KINDS OF SESSION share this table, because they are the same ten-minute
-//! hop through Google and differ only in what they ask for and what they do on
-//! the way back. A SIGNUP holds an invite reservation and provisions a tenant. A
-//! CONSOLE login holds nothing, spends nothing, and asks Google for identity
-//! alone; it ends in a pairing code for a tenant that already exists. The
-//! [`SessionKind`] is what the callback branches on, and it is the AUTHORITY:
-//! the cookie's copy of the same fact is checked against it, never trusted in
-//! its place.
+//! THREE KINDS OF SESSION share this table, because they are the same
+//! ten-minute hop through Google and differ only in what they ask for and what
+//! they do on the way back. A SIGNUP holds an invite reservation and provisions
+//! a tenant. A CONSOLE login holds nothing, spends nothing, and asks Google for
+//! identity alone; it ends in a pairing code for a tenant that already exists.
+//! An APP login is the console login with its one input removed: it does not
+//! know which tenant it is for, because it finds that out from the mailbox
+//! Google names. The [`SessionKind`] is what the callback branches on, and it is
+//! the AUTHORITY: the cookie's copy of the same fact is checked against it,
+//! never trusted in its place.
 //!
 //! In memory rather than in the store, deliberately. A restart drops pending
 //! consents, and that is the correct behaviour: the recovery is to start the
@@ -57,21 +59,26 @@ pub fn fingerprint(sid: &str) -> String {
 /// again shortly" rather than the process growing without limit.
 pub const MAX_SESSIONS: usize = 4_096;
 
-/// Hard ceiling on live CONSOLE sessions, CARVED OUT OF [`MAX_SESSIONS`] rather
-/// than added to it.
+/// Hard ceiling on live IDENTITY sessions, CARVED OUT OF [`MAX_SESSIONS`]
+/// rather than added to it. Both login flows spend it: `GET /console/auth` and
+/// `GET /app/auth`.
 ///
-/// THE ASYMMETRY IS THE POINT. `GET /console/auth` opens a session with no
-/// credential and no invite behind it, so it is the cheap half of this table to
-/// flood; a signup has to present a plausible invite code first. Without a
-/// per-kind ceiling, a stranger looping the console hop fills all
-/// [`MAX_SESSIONS`] slots and every real signup is refused. With it, console
-/// flooding can consume at most this many entries and a signup always has
-/// `MAX_SESSIONS - MAX_CONSOLE_SESSIONS` slots it cannot be crowded out of.
+/// THE ASYMMETRY IS THE POINT. Either login opens a session with no credential
+/// and no invite behind it, so they are the cheap half of this table to flood; a
+/// signup has to present a plausible invite code first. Without a per-kind
+/// ceiling, a stranger looping a login hop fills all [`MAX_SESSIONS`] slots and
+/// every real signup is refused. With it, login flooding can consume at most
+/// this many entries and a signup always has
+/// `MAX_SESSIONS - MAX_IDENTITY_SESSIONS` slots it cannot be crowded out of.
+///
+/// ONE CEILING FOR BOTH, not one each. They are the same errand through the same
+/// consent, and two budgets would only mean a flooder gets to spend twice for
+/// asking the same question two ways.
 ///
 /// The reverse is deliberately NOT true: a table filled with real signups will
-/// refuse a console login too. Provisioning a mailbox is the flow that cannot be
-/// retried cheaply, so it is the one that gets the whole table when it needs it.
-pub const MAX_CONSOLE_SESSIONS: usize = 512;
+/// refuse a login too. Provisioning a mailbox is the flow that cannot be retried
+/// cheaply, so it is the one that gets the whole table when it needs it.
+pub const MAX_IDENTITY_SESSIONS: usize = 512;
 
 /// Which flow a pending session belongs to, and therefore what the callback
 /// does with it.
@@ -87,17 +94,30 @@ pub enum SessionKind {
     /// A console login for a tenant that already exists. Spends nothing, holds
     /// nothing, and asks Google only who is signed in.
     Console,
+    /// An app login: the same identity hop with no tenant named going in. The
+    /// label on a session of this kind is EMPTY and stays empty, because the
+    /// mailbox Google names on the way back is what decides which tenant this
+    /// was for.
+    App,
 }
 
 impl SessionKind {
-    /// The invite row this session holds, if it holds one. `None` for a console
+    /// The invite row this session holds, if it holds one. `None` for either
     /// login, which is exactly what the release path wants: nothing to hand
     /// back.
     pub fn invite_id(self) -> Option<i64> {
         match self {
             SessionKind::Signup { invite_id } => Some(invite_id),
-            SessionKind::Console => None,
+            SessionKind::Console | SessionKind::App => None,
         }
+    }
+
+    /// Whether this session is one of the two LOGINS, which share
+    /// [`MAX_IDENTITY_SESSIONS`]. Asked as a question about the kind rather than
+    /// spelled as a match at each call site, so a fourth kind cannot be added
+    /// without deciding which budget it spends.
+    pub fn is_identity(self) -> bool {
+        matches!(self, SessionKind::Console | SessionKind::App)
     }
 }
 
@@ -141,8 +161,8 @@ impl SessionStore {
     /// Expired entries are purged first, so a deployment that has been running
     /// for a week is bounded by concurrent sessions rather than by total ones.
     ///
-    /// TWO CEILINGS, and a console login meets both: the whole-table
-    /// [`MAX_SESSIONS`], and its own [`MAX_CONSOLE_SESSIONS`] share of it.
+    /// TWO CEILINGS, and either login meets both: the whole-table
+    /// [`MAX_SESSIONS`], and the [`MAX_IDENTITY_SESSIONS`] share of it.
     pub fn insert(
         &mut self,
         sid: String,
@@ -160,7 +180,7 @@ impl SessionStore {
         // above is already a walk of the same map, so this costs the insert
         // nothing it was not paying, and a count that cannot drift out of step
         // with the table is worth more here than a field.
-        if matches!(kind, SessionKind::Console) && self.console_len() >= MAX_CONSOLE_SESSIONS {
+        if kind.is_identity() && self.identity_len() >= MAX_IDENTITY_SESSIONS {
             return Err(InsertError::Full);
         }
         self.sessions.insert(
@@ -202,12 +222,10 @@ impl SessionStore {
         self.sessions.len()
     }
 
-    /// Live CONSOLE sessions, which is what [`MAX_CONSOLE_SESSIONS`] bounds.
-    pub fn console_len(&self) -> usize {
-        self.sessions
-            .values()
-            .filter(|s| matches!(s.kind, SessionKind::Console))
-            .count()
+    /// Live LOGIN sessions of either kind, which is what
+    /// [`MAX_IDENTITY_SESSIONS`] bounds.
+    pub fn identity_len(&self) -> usize {
+        self.sessions.values().filter(|s| s.kind.is_identity()).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -244,12 +262,11 @@ mod tests {
         assert!(s.is_empty());
     }
 
-    /// The two kinds live in one table and come back as what they went in as.
-    /// A console login carries no invite, which is what makes the release path
-    /// on the callback a no-op rather than a lookup for a row that never
-    /// existed.
+    /// The three kinds live in one table and come back as what they went in as.
+    /// Neither login carries an invite, which is what makes the release path on
+    /// the callback a no-op rather than a lookup for a row that never existed.
     #[test]
-    fn a_console_session_holds_no_invite() {
+    fn a_login_session_holds_no_invite() {
         let mut s = SessionStore::new();
         let now = Instant::now();
         s.insert(
@@ -261,12 +278,28 @@ mod tests {
             now,
         )
         .unwrap();
+        // An app login names no tenant going in: the label is empty until
+        // Google says which mailbox this is.
+        s.insert(
+            "app".into(),
+            SessionKind::App,
+            "state".into(),
+            "verifier".into(),
+            String::new(),
+            now,
+        )
+        .unwrap();
         insert(&mut s, "signup", now).unwrap();
 
         let console = s.take("console", now).expect("live");
         assert_eq!(console.kind, SessionKind::Console);
         assert_eq!(console.kind.invite_id(), None);
         assert_eq!(console.label, "ada");
+
+        let app = s.take("app", now).expect("live");
+        assert_eq!(app.kind, SessionKind::App);
+        assert_eq!(app.kind.invite_id(), None);
+        assert_eq!(app.label, "");
 
         let signup = s.take("signup", now).expect("live");
         assert_eq!(signup.kind, SessionKind::Signup { invite_id: 1 });
@@ -306,14 +339,15 @@ mod tests {
         assert!(!a.contains("a-session-id"));
     }
 
-    fn insert_console(
+    fn insert_login(
         store: &mut SessionStore,
+        kind: SessionKind,
         sid: &str,
         now: Instant,
     ) -> Result<(), InsertError> {
         store.insert(
             sid.to_string(),
-            SessionKind::Console,
+            kind,
             "state".into(),
             "verifier".into(),
             "ada".into(),
@@ -321,25 +355,34 @@ mod tests {
         )
     }
 
-    /// The console's share of the table is CARVED OUT of it: a stranger looping
-    /// `GET /console/auth` fills its own ceiling and stops, and a signup posted
-    /// at that moment still opens.
+    /// The logins' share of the table is CARVED OUT of it: a stranger looping
+    /// `GET /console/auth` fills the ceiling and stops, and a signup posted at
+    /// that moment still opens.
+    ///
+    /// ONE BUDGET FOR BOTH LOGINS, which is the half worth asserting: with a
+    /// ceiling each, the same flooder gets to spend twice by alternating
+    /// `/console/auth` and `/app/auth`.
     #[test]
-    fn console_flooding_cannot_spend_signup_capacity() {
+    fn login_flooding_cannot_spend_signup_capacity() {
         let mut s = SessionStore::new();
         let now = Instant::now();
-        for i in 0..MAX_CONSOLE_SESSIONS {
-            insert_console(&mut s, &format!("console{i}"), now).unwrap();
+        for i in 0..MAX_IDENTITY_SESSIONS {
+            // Alternating, so the shared ceiling is what stops this and not one
+            // kind's own.
+            let kind = if i % 2 == 0 { SessionKind::Console } else { SessionKind::App };
+            insert_login(&mut s, kind, &format!("login{i}"), now).unwrap();
         }
-        assert_eq!(s.console_len(), MAX_CONSOLE_SESSIONS);
-        assert_eq!(
-            insert_console(&mut s, "one-console-too-many", now),
-            Err(InsertError::Full),
-            "the console ceiling holds"
-        );
+        assert_eq!(s.identity_len(), MAX_IDENTITY_SESSIONS);
+        for kind in [SessionKind::Console, SessionKind::App] {
+            assert_eq!(
+                insert_login(&mut s, kind, "one-login-too-many", now),
+                Err(InsertError::Full),
+                "the shared login ceiling holds for {kind:?}"
+            );
+        }
         // ...and the flow that cannot be retried cheaply is untouched: every
         // remaining slot in the table is still a signup's to take.
-        for i in 0..(MAX_SESSIONS - MAX_CONSOLE_SESSIONS) {
+        for i in 0..(MAX_SESSIONS - MAX_IDENTITY_SESSIONS) {
             insert(&mut s, &format!("signup{i}"), now).expect("signup capacity survives the flood");
         }
         assert_eq!(s.len(), MAX_SESSIONS);

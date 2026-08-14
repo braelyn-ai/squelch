@@ -19,8 +19,39 @@
 
 import SwiftUI
 
+/// The hosted control plane, and the two doors it opens.
+///
+/// SIGN IN is for somebody whose mailbox already exists: Google names them, the
+/// control plane finds the daemon that mailbox owns, and the browser comes back
+/// with a `passband://pair` link. No invite code anywhere in it, because an
+/// invite provisions a tenant and this person's tenant is already running.
+///
+/// SIGN UP is the invite-code form, and it is the only place a code is asked
+/// for. The two are one screen apart here for the same reason they are two
+/// routes over there: they answer different questions about the same person.
+private enum Hosted {
+    static let signIn = "https://signup.passband.app/app/auth"
+    static let signUp = "https://signup.passband.app"
+}
+
 /// Which way in the screen is showing.
 private enum ConnectMode: Hashable { case pair, token }
+
+/// The first decision a fresh install makes. It changes the explanation and
+/// defaults around the credential form, never the credential protocol itself:
+/// hosted and self-hosted daemons expose the same human door.
+private enum HostingChoice: Hashable { case hosted, selfHosted }
+
+/// Progressive disclosure for the first account. Add Account deliberately
+/// skips this — someone adding a second daemon already knows what Passband is.
+private enum ConnectGateStep: Hashable {
+    case welcome
+    case route(HostingChoice)
+    case selfHostGuide
+    /// nil means a complete pair link brought us here. Its URL is authoritative,
+    /// but it does not reliably reveal whether the daemon is hosted.
+    case credentials(HostingChoice?)
+}
 
 /// Why this screen is up. See the file header — it decides what a success
 /// MEANS, and nothing else about the form.
@@ -45,6 +76,7 @@ struct ConnectView: View {
     var purpose: ConnectPurpose = .gate
 
     @State private var mode: ConnectMode = .pair
+    @State private var gateStep: ConnectGateStep = .welcome
     @State private var url = "http://127.0.0.1:8848"
     @State private var code = ""
     @State private var deviceName = Pairing.defaultDeviceName()
@@ -80,6 +112,7 @@ struct ConnectView: View {
     /// A deep link filled the form and stopped. Rings the button that is
     /// waiting for the press the link will never make for the user.
     @State private var linkArmed = false
+    @State private var pairingHelp = false
     @FocusState private var focus: ConnectField?
 
     private var busy: Bool { claiming || adding || store.connStatus == .connecting }
@@ -120,14 +153,29 @@ struct ConnectView: View {
 
     private var gateBody: some View {
         ZStack {
-            // A fresh download lands here with no daemon and no idea what one
-            // is, so the gate teaches: getting-started beside the form when the
-            // window is wide enough, the form alone when it is not.
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 20) {
-                    GettingStartedPane()
-                    connectCard
+            switch gateStep {
+            case .welcome:
+                WelcomeGate { choice in
+                    url = choice == .selfHosted ? "http://127.0.0.1:8848" : ""
+                    gateStep = .route(choice)
                 }
+            case .route(let choice):
+                RouteGate(
+                    choice: choice,
+                    back: { gateStep = .welcome },
+                    continueToForm: {
+                        mode = .pair
+                        gateStep = .credentials(choice)
+                    },
+                    showSelfHostGuide: { gateStep = .selfHostGuide })
+            case .selfHostGuide:
+                SelfHostGuide(
+                    back: { gateStep = .route(.selfHosted) },
+                    continueToForm: {
+                        mode = .pair
+                        gateStep = .credentials(.selfHosted)
+                    })
+            case .credentials:
                 connectCard
             }
         }
@@ -137,25 +185,17 @@ struct ConnectView: View {
             .padding(.horizontal, 16)
         #endif
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .bottomTrailing) {
+            SetupThemeToggle()
+                .padding(20)
+        }
     }
 
     private var connectCard: some View {
             VStack(spacing: 0) {
                 header
                 linkNotice
-                GlassSegmented(
-                    options: [(ConnectMode.pair, "pair with code"), (.token, "api token")],
-                    selection: modeBinding)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.bottom, 16)
-
-                switch mode {
-                case .pair: pairForm
-                case .token: tokenForm
-                }
-
-                nameField
-                    .padding(.top, 14)
+                credentialContent
 
                 if let errorText {
                     Label(errorText, systemImage: "exclamationmark.triangle.fill")
@@ -165,44 +205,7 @@ struct ConnectView: View {
                         .padding(.top, 12)
                 }
 
-                HStack(spacing: 12) {
-                    // Only the sheet can be walked away from. The gate has no
-                    // "cancel": there is nothing behind it.
-                    if purpose == .addAccount {
-                        Button("cancel") { dismiss() }
-                            .buttonStyle(.textAction)
-                            .disabled(busy)
-                    }
-                    Button {
-                        submit()
-                    } label: {
-                        Text(buttonLabel)
-                            .font(.system(size: 13, weight: .semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 5)
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(Palette.accent)
-                    .disabled(!canSubmit)
-                    .focused($focus, equals: .submit)
-                    // A link fills the form and stops. The ring is where the one
-                    // deliberate press has to land for anything to be claimed.
-                    .overlay {
-                        if linkArmed {
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(Palette.accent, lineWidth: 2)
-                                .padding(-4)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                }
-                .padding(.top, 18)
-
-                Text(footnote)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.inkFaintest)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 14)
+                bottomActions.padding(.top, 20)
             }
             .padding(30)
             // A window can always be 440pt wide; a phone cannot. Same intended
@@ -213,18 +216,21 @@ struct ConnectView: View {
             #else
                 .frame(maxWidth: 440)
             #endif
-            .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTintStrong)
+            .passbandGlass(
+                purpose == .gate ? .chrome : .pane,
+                cornerRadius: 24,
+                tint: purpose == .gate ? Palette.glassTint.opacity(0.35) : Palette.glassTintStrong)
             .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(purpose == .gate ? "passband" : "add account")
-                .font(Typo.serif(purpose == .gate ? 40 : 30, weight: .medium))
+            Text(headerTitle)
+                .font(Typo.serif(purpose == .gate ? 34 : 30, weight: .medium))
                 .foregroundStyle(Palette.ink)
             Text(
                 purpose == .gate
-                    ? "connect to your human door"
+                    ? headerSubtitle
                     : "one daemon per mailbox. this one joins the accounts you already have."
             )
             .font(.system(size: 13))
@@ -233,6 +239,111 @@ struct ConnectView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 22)
+    }
+
+    private var hostingChoice: HostingChoice? {
+        guard purpose == .gate, case .credentials(let choice) = gateStep else { return nil }
+        return choice
+    }
+
+    private var headerTitle: String {
+        guard purpose == .gate else { return "add account" }
+        switch hostingChoice {
+        case .hosted: return "connect hosted"
+        case .selfHosted: return "connect self-hosted"
+        case nil: return "pair this device"
+        }
+    }
+
+    private var headerSubtitle: String {
+        switch hostingChoice {
+        case .hosted:
+            return "Sign in with the Google account your mailbox belongs to, and we will connect this device."
+        case .selfHosted:
+            return "Run squelchd pair on your server, then enter what it prints."
+        case nil:
+            return "Check the server below, then confirm the pairing link."
+        }
+    }
+
+    @ViewBuilder private var credentialContent: some View {
+        if hostingChoice == .hosted {
+            // THE WHOLE HOSTED SIGN IN. It leaves the app because Google's
+            // consent has to run in a real browser the user can inspect, and it
+            // comes back on its own: the page at the end of it carries a
+            // `passband://pair` link, which lands in `applyPairLink` below and
+            // fills the form under this button. Nothing is asked for here in the
+            // meantime, which is the point — an existing account has no invite
+            // code to find and no pairing code to go and mint.
+            Button("sign in with google") {
+                Opener.open(Hosted.signIn)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Palette.accent)
+            .controlSize(.large)
+            .frame(maxWidth: .infinity)
+
+            Text("Your browser opens, you pick your Google account, and the page it lands on brings you back here.")
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.inkFaintest)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 9)
+
+            HStack(spacing: 10) {
+                Rectangle().fill(Palette.hairline).frame(height: 0.75)
+                Text("or")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.inkFaintest)
+                Rectangle().fill(Palette.hairline).frame(height: 0.75)
+            }
+            .padding(.vertical, 15)
+
+            hostedManualForm
+        } else {
+            if purpose == .addAccount || hostingChoice == .selfHosted {
+                GlassSegmented(
+                    options: [(ConnectMode.pair, "pair with code"), (.token, "api token")],
+                    selection: modeBinding)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.bottom, 16)
+            }
+            switch mode {
+            case .pair: pairForm
+            case .token: tokenForm
+            }
+            nameField.padding(.top, 14)
+        }
+    }
+
+    private var bottomActions: some View {
+        HStack(spacing: 12) {
+            Button(purpose == .addAccount ? "cancel" : "back") { goBack() }
+                .disabled(busy)
+            Spacer()
+            Button(buttonLabel) { submit() }
+                .buttonStyle(.borderedProminent)
+                .tint(Palette.accent)
+                .disabled(!canSubmit)
+                .focused($focus, equals: .submit)
+                .overlay {
+                    if linkArmed {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(Palette.accent, lineWidth: 2)
+                            .padding(-4)
+                            .allowsHitTesting(false)
+                    }
+                }
+        }
+    }
+
+    private func goBack() {
+        guard purpose == .gate else { dismiss(); return }
+        pairError = nil
+        addError = nil
+        store.connError = nil
+        if let choice = hostingChoice { gateStep = .route(choice) }
+        else { gateStep = .welcome }
     }
 
     /// The account's name, optional in both purposes. It matters most in the
@@ -283,14 +394,37 @@ struct ConnectView: View {
     private var pairForm: some View {
         VStack(alignment: .leading, spacing: 14) {
             Field(label: "server url") {
-                TextField("http://127.0.0.1:8848", text: urlBinding)
+                TextField(serverPlaceholder, text: urlBinding)
                     .textFieldStyle(.plain)
                     .textContentType(.URL)
                     .autocorrectionDisabled()
                     .focused($focus, equals: .url)
                     .onSubmit { focus = .code }
             }
-            Field(label: "pairing code") {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                    FieldLabel("pairing code")
+                    if hostingChoice == .selfHosted {
+                        Button { pairingHelp = true } label: {
+                            Image(systemName: "questionmark.circle")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Palette.inkFaint)
+                        .popover(isPresented: $pairingHelp) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Run this on the machine hosting squelchd:")
+                                    .font(.system(size: 12))
+                                Text("squelchd pair")
+                                    .font(Typo.mono(13))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(Palette.canvas))
+                            }
+                            .padding(16)
+                        }
+                    }
+                }
                 TextField("XXXX-XXXX", text: codeBinding)
                     .textFieldStyle(.plain)
                     // Monospaced so a code read off a terminal lines up with
@@ -299,6 +433,7 @@ struct ConnectView: View {
                     .autocorrectionDisabled()
                     .focused($focus, equals: .code)
                     .onSubmit { submit() }
+                    .fieldWell()
             }
             Field(label: "device name") {
                 TextField("this Mac", text: $deviceName)
@@ -308,6 +443,39 @@ struct ConnectView: View {
                     .onSubmit { submit() }
             }
         }
+    }
+
+    /// Hosted's manual escape hatch, for the cases the sign in above cannot
+    /// cover: a browser that will not open app links, a sign in finished on a
+    /// phone for a Mac, or a code from the console's own Add Device button.
+    /// Device and account names keep their safe defaults; hiding those optional
+    /// fields makes this visibly secondary to the browser handoff instead of
+    /// presenting another full setup ceremony.
+    private var hostedManualForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Field(label: "server url") {
+                TextField("https://username.passband.email", text: urlBinding)
+                    .textFieldStyle(.plain)
+                    .textContentType(.URL)
+                    .autocorrectionDisabled()
+                    .focused($focus, equals: .url)
+                    .onSubmit { focus = .code }
+            }
+            Field(label: "pairing code") {
+                TextField("XXXX-XXXX", text: codeBinding)
+                    .textFieldStyle(.plain)
+                    .font(Typo.mono(13))
+                    .autocorrectionDisabled()
+                    .focused($focus, equals: .code)
+                    .onSubmit { submit() }
+            }
+        }
+    }
+
+    private var serverPlaceholder: String {
+        hostingChoice == .hosted
+            ? "https://username.passband.email"
+            : "http://127.0.0.1:8848"
     }
 
     private var tokenForm: some View {
@@ -337,20 +505,6 @@ struct ConnectView: View {
         let done = purpose == .gate ? "connect" : "add account"
         if mode == .pair && heldToken != nil { return done }
         return mode == .pair ? "pair" : done
-    }
-
-    private var footnote: String {
-        switch mode {
-        case .pair:
-            if heldToken != nil {
-                return
-                    "This Mac is paired already. The code is spent, so this retries the connection with the token it issued. No second code needed."
-            }
-            return
-                "Run squelchd pair on the machine running your daemon for a code. It issues a token for this Mac only, revocable with squelchd token revoke."
-        case .token:
-            return "The token is stored in your macOS keychain and sent only as a bearer header."
-        }
     }
 
     /// The mode switch, written by hand so flipping it also clears the stale
@@ -493,6 +647,7 @@ struct ConnectView: View {
     private func applyPairLink(_ link: PairLink?) {
         guard let link else { return }
         store.pairLink = nil
+        if purpose == .gate { gateStep = .credentials(nil) }
         guard !busy else { return }
         mode = .pair
         url = link.serverURL
@@ -515,129 +670,207 @@ struct ConnectView: View {
     }
 }
 
-/// Which way of getting a daemon the guide is describing.
-private enum GuideTab: Hashable { case hosted, selfHost }
-
-/// What a fresh install needs to hear before the connect form makes any sense:
-/// the app is a window onto a daemon, and here are the two ways to have one.
-/// Instructions only — the one credential-shaped act (typing the code) still
-/// happens in the form, which is where its guarantees live.
-///
-/// Hosted leads because it is the path that needs no terminal; the tab order is
-/// the pitch. Self-host keeps the full three commands.
-private struct GettingStartedPane: View {
-    @State private var tab: GuideTab = .hosted
+/// The calm first screen: one product sentence and the only decision needed to
+/// tailor what follows. Credentials stay off-screen until a route is chosen.
+private struct WelcomeGate: View {
+    let choose: (HostingChoice) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("new here?")
-                .font(Typo.serif(28, weight: .medium))
+            Text("welcome to passband")
+                .font(Typo.serif(40, weight: .medium))
                 .foregroundStyle(Palette.ink)
+            Text("A private, focused way to read and act on your inbox.")
+                .font(.system(size: 14))
+                .foregroundStyle(Palette.inkFaint)
+                .padding(.top, 6)
 
-            GlassSegmented(
-                options: [(GuideTab.hosted, "hosted"), (.selfHost, "self-host")],
-                selection: $tab)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 14)
+            Text("Where should your mail service run?")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.inkDim)
+                .padding(.top, 30)
 
-            switch tab {
-            case .hosted: hosted
-            case .selfHost: selfHost
+            VStack(spacing: 12) {
+                ChoiceCard(
+                    symbol: "cloud",
+                    title: "use hosted passband",
+                    detail: "We run it for you. No server or terminal required.",
+                    action: { choose(.hosted) })
+                ChoiceCard(
+                    symbol: "server.rack",
+                    title: "self-host",
+                    detail: "Run squelchd on this Mac, a NAS, or your own server.",
+                    action: { choose(.selfHosted) })
             }
+            .padding(.top, 12)
+
+            Text("Both paths use the same Passband app and support per-device pairing.")
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.inkFaintest)
+                .padding(.top, 18)
         }
-        .padding(30)
-        .frame(width: 380)
-        .passbandGlass(.pane, cornerRadius: 24, tint: Palette.glassTint)
+        .padding(34)
+        #if os(macOS)
+            .frame(width: 600)
+        #else
+            .frame(maxWidth: 600)
+        #endif
+        .passbandGlass(.chrome, cornerRadius: 24, tint: Palette.glassTint.opacity(0.35))
         .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
     }
-
-    private var hosted: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text(
-                "We run the daemon for you, on your own sealed account. No server, no terminal."
-            )
-            .font(.system(size: 12))
-            .foregroundStyle(Palette.inkFaint)
-            .fixedSize(horizontal: false, vertical: true)
-
-            GuideOption(
-                title: "have a pairing code?",
-                detail: "Type it into the form here and you are in.")
-            GuideOption(
-                title: "have an invite code?",
-                detail: "Account setup takes a minute and ends with a pairing code.",
-                linkLabel: "set up your account",
-                linkURL: "https://signup.passband.app")
-            GuideOption(
-                title: "neither yet?",
-                detail: "Hosted is invite-only while we grow.",
-                linkLabel: "join the waitlist",
-                linkURL: "https://passband.app")
-        }
-        .padding(.top, 16)
-    }
-
-    private var selfHost: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(
-                "The engine is squelchd, a small daemon that reads your Gmail read-only and runs on any box you own: this Mac, a NAS, a server."
-            )
-            .font(.system(size: 12))
-            .foregroundStyle(Palette.inkFaint)
-            .fixedSize(horizontal: false, vertical: true)
-
-            GuideStep(
-                number: 1, title: "run the daemon",
-                detail: "One public Docker image, amd64 and arm64.",
-                command: "docker pull ghcr.io/braelyn-ai/squelchd")
-            GuideStep(
-                number: 2, title: "authorize gmail",
-                detail: "A one-time Google consent, run where the daemon lives.",
-                command: "squelchd auth")
-            GuideStep(
-                number: 3, title: "pair this mac",
-                detail: "Prints a code. Type it into the form here.",
-                command: "squelchd pair")
-
-            HStack(spacing: 14) {
-                Button("full setup guide") { Opener.open("https://passband.app/self-host") }
-                Button("github") { Opener.open("https://github.com/braelyn-ai/squelch") }
-            }
-            .buttonStyle(.textAction)
-            .padding(.top, 4)
-        }
-        .padding(.top, 16)
-    }
 }
 
-/// One either/or row on the hosted tab: a question, the one-line answer, and
-/// where to go if the answer is elsewhere.
-private struct GuideOption: View {
-    let title: String
-    let detail: String
-    var linkLabel: String?
-    var linkURL: String?
+/// The route-specific fork before credentials. These are decisions, not tabs:
+/// one continues in-app and the other opens the setup surface that must finish
+/// before a credential can exist.
+private struct RouteGate: View {
+    let choice: HostingChoice
+    let back: () -> Void
+    let continueToForm: () -> Void
+    let showSelfHostGuide: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
+        VStack(alignment: .leading, spacing: 0) {
+            Text(choice == .hosted ? "hosted passband" : "self-hosted")
+                .font(Typo.serif(34, weight: .medium))
                 .foregroundStyle(Palette.ink)
-            Text(detail)
-                .font(.system(size: 11))
+            Text(choice == .hosted
+                ? "Connect an existing account or create a new one."
+                : "Connect a running squelch server or set one up first.")
+                .font(.system(size: 13))
                 .foregroundStyle(Palette.inkFaint)
-                .fixedSize(horizontal: false, vertical: true)
-            if let linkLabel, let linkURL {
-                Button(linkLabel) { Opener.open(linkURL) }
-                    .buttonStyle(.textAction)
-                    .padding(.top, 2)
+                .padding(.top, 5)
+
+            HStack(alignment: .top, spacing: 12) {
+                if choice == .hosted {
+                    RouteOption(
+                        symbol: "person.crop.circle",
+                        title: "Login",
+                        action: continueToForm)
+                    RouteOption(
+                        symbol: "person.badge.plus",
+                        title: "Sign up",
+                        action: { Opener.open(Hosted.signUp) })
+                } else {
+                    RouteOption(
+                        symbol: "checkmark.circle",
+                        title: "i have a squelch server running",
+                        action: continueToForm)
+                    RouteOption(
+                        symbol: "server.rack",
+                        title: "i need to set up my server",
+                        action: showSelfHostGuide)
+                }
             }
+            .padding(.top, 24)
+
+            Button("back", action: back)
+                .padding(.top, 22)
         }
+        .padding(34)
+        #if os(macOS)
+            .frame(width: 680)
+        #else
+            .frame(maxWidth: 680)
+        #endif
+        .passbandGlass(.chrome, cornerRadius: 24, tint: Palette.glassTint.opacity(0.35))
+        .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
     }
 }
 
-/// One numbered step: what it is, why, and the command to copy.
-private struct GuideStep: View {
+private struct RouteOption: View {
+    let symbol: String
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: symbol)
+                    .font(.system(size: 25, weight: .medium))
+                    .foregroundStyle(Palette.accent)
+                    .frame(width: 30)
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+            .padding(.horizontal, 15)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Palette.canvas.opacity(0.62)))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Palette.hairline, lineWidth: 0.75))
+    }
+}
+
+/// Self-hosting stays inside Passband: the shortest complete path from no
+/// daemon to a pairing code, with copyable commands and an explicit handoff to
+/// the form once the server is running.
+private struct SelfHostGuide: View {
+    let back: () -> Void
+    let continueToForm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("set up your server")
+                .font(Typo.serif(34, weight: .medium))
+                .foregroundStyle(Palette.ink)
+            Text("Run squelchd on this Mac, a NAS, or a server you control.")
+                .font(.system(size: 13))
+                .foregroundStyle(Palette.inkFaint)
+                .padding(.top, 5)
+
+            VStack(spacing: 12) {
+                SetupStep(
+                    number: 1,
+                    title: "install squelchd",
+                    detail: "Pull the public image for amd64 or arm64.",
+                    command: "docker pull ghcr.io/braelyn-ai/squelchd")
+                SetupStep(
+                    number: 2,
+                    title: "authorize gmail",
+                    detail: "Complete Google's one-time consent on the server.",
+                    command: "squelchd auth")
+                SetupStep(
+                    number: 3,
+                    title: "pair this device",
+                    detail: "Mint the short code the next screen accepts.",
+                    command: "squelchd pair")
+            }
+            .padding(.top, 22)
+
+            Button("view detailed instructions on GitHub") {
+                Opener.open(
+                    "https://github.com/braelyn-ai/squelch/blob/main/docs/GETTING-STARTED.md")
+            }
+            .buttonStyle(.textAction)
+            .padding(.top, 16)
+
+            HStack {
+                Button("back", action: back)
+                Spacer()
+                Button("my server is running", action: continueToForm)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Palette.accent)
+            }
+            .padding(.top, 22)
+        }
+        .padding(34)
+        #if os(macOS)
+            .frame(width: 620)
+        #else
+            .frame(maxWidth: 620)
+        #endif
+        .passbandGlass(.chrome, cornerRadius: 24, tint: Palette.glassTint.opacity(0.35))
+        .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
+    }
+}
+
+private struct SetupStep: View {
     let number: Int
     let title: String
     let detail: String
@@ -649,50 +882,104 @@ private struct GuideStep: View {
             Text("\(number)")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Palette.accentInk)
-                .frame(width: 22, height: 22)
+                .frame(width: 23, height: 23)
                 .background(Circle().fill(Palette.accent))
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Palette.ink)
                 Text(detail)
                     .font(.system(size: 11))
                     .foregroundStyle(Palette.inkFaint)
-                    .fixedSize(horizontal: false, vertical: true)
-                commandRow
+                HStack(spacing: 8) {
+                    Text(command)
+                        .font(Typo.mono(11))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Button {
+                        Clip.copy(command, flashing: $copied)
+                    } label: {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Palette.canvas.opacity(0.65)))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Palette.hairline, lineWidth: 0.75))
+                .padding(.top, 2)
             }
         }
     }
+}
 
-    private var commandRow: some View {
-        HStack(spacing: 8) {
-            Text(command)
-                .font(Typo.mono(11))
-                .foregroundStyle(Palette.inkDim)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 4)
-            Button {
-                Clip.copy(command, flashing: $copied)
-            } label: {
-                Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(copied ? Palette.positive : Palette.inkFaint)
-            }
-            .buttonStyle(.plain)
-            .help("copy command")
+/// Always reachable during first-run setup, before Settings exists as a
+/// destination. It uses the same persisted preference and flip semantics as
+/// the app-wide keyboard shortcut.
+private struct SetupThemeToggle: View {
+    @Environment(Prefs.self) private var prefs
+
+    private var isDark: Bool {
+        switch prefs.theme {
+        case .dark: true
+        case .light: false
+        case .system: Platform.isDarkAppearance
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6)
+    }
+
+    var body: some View {
+        Button { prefs.flipTheme() } label: {
+            Image(systemName: isDark ? "sun.max.fill" : "moon.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+                .frame(width: 30, height: 30)
+        }
+        .buttonStyle(.plain)
+        .glassCapsule(tint: Palette.glassTint.opacity(0.35))
+        .help(isDark ? "use light mode" : "use dark mode")
+        .accessibilityLabel(isDark ? "Use light mode" : "Use dark mode")
+    }
+}
+
+private struct ChoiceCard: View {
+    let symbol: String
+    let title: String
+    let detail: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 15) {
+                Image(systemName: symbol)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(Palette.accent)
+                    .frame(width: 32)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Palette.ink)
+                    Text(detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Palette.inkFaint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Palette.inkFaintest)
+            }
+            .padding(18)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Palette.canvas.opacity(0.65))
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Palette.canvas.opacity(0.62))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Palette.hairline, lineWidth: 0.75)
         )
-        .padding(.top, 3)
     }
 }
 

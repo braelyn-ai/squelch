@@ -1,6 +1,6 @@
 //! The routes: the signup form, the form post, the public waitlist post, the
-//! console login hop, Google's callback, and liveness. The operator's half of
-//! the waitlist (the dashboard and its two buttons) lives next door in
+//! two login hops, Google's callback, and liveness. The operator's half of the
+//! waitlist (the dashboard and its two buttons) lives next door in
 //! [`crate::admin`].
 //!
 //! THE CONSOLE HOP is the second thing that walks through Google here, and it is
@@ -11,6 +11,23 @@
 //! the warden. The daemon claims it into a device token like any other device.
 //! No new crypto, no new trust relationship, and revocation, audit, one-shot and
 //! TTL are all the ones already shipped.
+//!
+//! THE APP HOP is the third, and it is the console hop with its one input taken
+//! away. `GET /app/auth` accepts nothing: the native app has no label to send
+//! (its user knows their address, not their tenant record) and no console to be
+//! returned to. So the mailbox Google names is looked up in REVERSE to find the
+//! tenant it owns, the same warden mints the same kind of pairing code, and the
+//! page at the end carries a `passband://pair` deep link instead of a redirect
+//! to a console. It exists so that somebody who already has a mailbox never
+//! touches an invite code again: invites provision tenants, and this flow is for
+//! people whose tenant already exists.
+//!
+//! WHY THE REVERSE LOOKUP IS NOT AN ORACLE, which is the question the console
+//! hop's design raises: its key is an address GOOGLE VERIFIED on this request,
+//! so the only mailbox anybody can ask about is the one they just proved they
+//! hold. `/console/auth` had to be careful because a stranger picks the label;
+//! here nobody picks anything, so the app hop can afford to say plainly that a
+//! signed-in account has no mailbox, where the console hop cannot.
 //!
 //! THE REDIRECT IS CONSTRUCTED, NEVER ECHOED. There is no return-URL parameter
 //! on `/console/auth`, so there is no open redirect to find: the destination is
@@ -166,6 +183,27 @@ const CONSOLE_REFUSED: &str = "Check that you opened this from your own mailbox 
 const CONSOLE_SESSION_REFUSED: &str =
     "That sign in could not be verified, or it took too long. Open your console and sign in again.";
 
+/// THE ONE ANSWER the app login gives when Google came back with a mailbox this
+/// deployment does not run a daemon for.
+///
+/// SPECIFIC, unlike its console counterpart, and safely so: the only way to read
+/// it is to have completed a consent AS that Google account, so the only mailbox
+/// it can be asked about is the reader's own. There is no directory here to walk
+/// and nobody else's address to test. Saying "you have no mailbox with us" to
+/// the person who just proved they are that mailbox costs nothing and is the
+/// difference between a dead end and knowing to sign up.
+const APP_NO_TENANT_HEADING: &str = "No Passband mailbox for that Google account";
+const APP_NO_TENANT: &str = "Nothing is set up for the account you signed in with. If you have a \
+     Passband mailbox on another Google account, sign in with that one. If you do not have one \
+     yet, sign up first and come back.";
+
+/// [`CONSOLE_SESSION_REFUSED`] in the app flow's words. Same four causes and the
+/// same single answer; what changes is where it sends you, and an app login's
+/// only way back is the app that started it.
+const APP_SESSION_REFUSED: &str =
+    "That sign in could not be verified, or it took too long. Go back to Passband and sign in \
+     again.";
+
 /// The three answers `POST /waitlist` gives. JSON rather than a page: the only
 /// client is the site's own form, which shows its own copy in its own voice, so
 /// what crosses the wire is a machine reason and never a sentence.
@@ -318,6 +356,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         sid,
         label: label.clone(),
         invite: Some(invite_id),
+        app: false,
         iat: chrono::Utc::now().timestamp(),
     };
     let cookie_value = cookie::sign(&config.cookie_key, &claim);
@@ -518,6 +557,7 @@ pub async fn console_auth(
         // the session's own kind: a cookie that claimed an invite here would be
         // refused as a mismatch.
         invite: None,
+        app: false,
         iat: chrono::Utc::now().timestamp(),
     };
     let cookie_value = cookie::sign(&config.cookie_key, &claim);
@@ -525,6 +565,91 @@ pub async fn console_auth(
     // PRIVACY: the label and a count. Never the session id, the state, or which
     // mailbox owns the label.
     tracing::info!(label = %label, sessions = state.live_sessions(), "console login started");
+
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, consent.url),
+            (
+                header::SET_COOKIE,
+                cookie::set_cookie(&cookie_value, !config.is_insecure()),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// `GET /app/auth` — the app login hop.
+///
+/// THE CONSOLE HOP WITH ITS INPUT REMOVED. `/console/auth` needs a label because
+/// a tenant console is a per-label web page that has to be returned to; the app
+/// is one app for every mailbox, so there is nothing for a caller to name and
+/// this route accepts nothing at all. Which tenant this was for is DISCOVERED
+/// from the mailbox Google names, on the way back.
+///
+/// THAT MAKES IT THE SAFER OF THE TWO, not the looser one. `/console/auth` had
+/// to answer every well-formed label identically to avoid becoming a directory
+/// of which addresses exist; this route takes no label, so there is no question
+/// to answer and nothing to walk. The reverse lookup on the way back is keyed by
+/// a Google-verified address, which means the only mailbox anybody can ask about
+/// is the one they just proved they hold.
+///
+/// NO RETURN URL, and no parameter that could become one, exactly as next door.
+/// The only place it can send anybody is a `passband://` link built from this
+/// deployment's own base domain.
+pub async fn app_auth(State(state): State<ControlState>) -> Response {
+    let config = state.config();
+
+    let (sid, csrf_state) = match (random_token(), random_token()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            tracing::error!("the system random source failed");
+            return app_unavailable();
+        }
+    };
+
+    // Flow::Console: identity alone, online, no refresh token. An app login asks
+    // Google exactly what a console login asks, because it is the same question.
+    let consent = match oauth::consent_url(&endpoints(&state), csrf_state, Flow::Console) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "building the app consent url failed");
+            return app_unavailable();
+        }
+    };
+
+    let inserted = state.sessions().insert(
+        sid.clone(),
+        SessionKind::App,
+        consent.state,
+        consent.pkce_verifier,
+        // EMPTY, and it stays empty: this flow does not know which tenant it is
+        // for until Google answers. The callback holds the cookie's copy of this
+        // against the session's, so an empty label is a fact both sides agree on
+        // rather than a value one of them made up.
+        String::new(),
+        Instant::now(),
+    );
+    if let Err(InsertError::Full) = inserted {
+        tracing::warn!(sessions = state.live_sessions(), "session table full");
+        return app_unavailable();
+    }
+
+    let claim = SessionClaim {
+        sid,
+        label: String::new(),
+        // An app login spends nothing, like a console login.
+        invite: None,
+        // The one thing that tells the two apart from the cookie alone, and it
+        // decides nothing but the wording of a refusal. See `SessionClaim::app`.
+        app: true,
+        iat: chrono::Utc::now().timestamp(),
+    };
+    let cookie_value = cookie::sign(&config.cookie_key, &claim);
+
+    // PRIVACY: a count and nothing else. There is not even a label on this path,
+    // and the mailbox is not known yet.
+    tracing::info!(sessions = state.live_sessions(), "app login started");
 
     (
         StatusCode::FOUND,
@@ -585,25 +710,22 @@ pub async fn oauth_callback(
     // WHICH FLOW THIS IS, for the refusals below. Taken from the cookie only
     // while the cookie is all there is; once the session is in hand it is the
     // authority, here as everywhere else.
-    let claimed_console = claim.invite.is_none();
+    let claimed_voice = Voice::from_cookie(&claim);
     // Bound in its own statement so the session lock is released before
     // anything below can want it again.
     let session = state.sessions().take(&claim.sid, Instant::now());
     let Some(session) = session else {
         // Nothing to hand back: an expired session's hold expired with it, and a
         // replay is finding a session that already spent or released its code.
-        let console_label = claimed_console.then(|| claim.label.clone());
-        return done(refused_session_for(&state, console_label.as_deref()));
+        return done(refused_session_for(&state, claimed_voice));
     };
-    let console_label =
-        matches!(session.kind, SessionKind::Console).then(|| session.label.clone());
-    let console_label = console_label.as_deref();
+    let voice = Voice::from_session(session.kind, &session.label);
 
     // From here the session is gone but a signup's invite is still held, so
     // every exit hands the code back. The holder is recomputed from the session
     // id the cookie carried, which `take` has just proved names a live session.
-    // A console login holds nothing, so `release` is a no-op on that branch and
-    // the exits below do not have to know which flow they are on.
+    // Neither login holds anything, so `release` is a no-op on those branches
+    // and the exits below do not have to know which flow they are on.
     let holder = sessions::fingerprint(&claim.sid);
     let held_invite = session.kind.invite_id();
     let release = || {
@@ -615,31 +737,39 @@ pub async fn oauth_callback(
     if !squelch_httpauth::ct_eq(returned_state.as_bytes(), session.state.as_bytes()) {
         tracing::warn!("callback state mismatch");
         release();
-        return done(refused_session_for(&state, console_label));
+        return done(refused_session_for(&state, voice));
     }
     // The cookie and the server-side session must agree, on the label AND on
     // which flow this is. The session is the authority; this catches a cookie
     // signed by this key for a DIFFERENT session, which is the one forgery a
-    // valid MAC cannot rule out on its own.
-    if claim.label != session.label || claim.invite != held_invite {
+    // valid MAC cannot rule out on its own. An app session's label is empty on
+    // both sides, so this holds it to being empty rather than exempting it.
+    if claim.label != session.label || claim.invite != held_invite || claimed_voice != voice {
         tracing::warn!("callback cookie does not match its session");
         release();
-        return done(refused_session_for(&state, console_label));
+        return done(refused_session_for(&state, voice));
     }
     let Some(code) = code.filter(|c| is_code(c)) else {
         release();
-        return done(refused_session_for(&state, console_label));
+        return done(refused_session_for(&state, voice));
     };
 
     let label = session.label;
 
-    // THE FORK. A console login shares everything above (state, cookie, one-shot
-    // session, code shape) and nothing below: it provisions nothing, seals
-    // nothing, and spends no invite. Destructured rather than tested, so the
-    // signup half below holds an invite id the type system produced instead of
-    // one it was told to assume.
-    let SessionKind::Signup { invite_id } = session.kind else {
-        return done(console_login(&state, &label, code, session.pkce_verifier).await);
+    // THE FORK. Both logins share everything above (state, cookie, one-shot
+    // session, code shape) and nothing below: they provision nothing, seal
+    // nothing, and spend no invite. Matched rather than tested, so the signup
+    // half below holds an invite id the type system produced instead of one it
+    // was told to assume, and so a fourth kind cannot be added without landing
+    // here.
+    let invite_id = match session.kind {
+        SessionKind::Signup { invite_id } => invite_id,
+        SessionKind::Console => {
+            return done(console_login(&state, &label, code, session.pkce_verifier).await);
+        }
+        SessionKind::App => {
+            return done(app_login(&state, code, session.pkce_verifier).await);
+        }
     };
 
     // ---- from here on, the irreversible half ----
@@ -1008,6 +1138,126 @@ async fn console_login(
         .into_response()
 }
 
+/// The app login's half of the callback: prove who is signed in, find the tenant
+/// THAT MAILBOX owns, and hand the browser a deep link the app can take.
+///
+/// THE LOOKUP RUNS THE OTHER WAY from the console login's, and that is the whole
+/// difference between the two. A console login is told a label and asks whether
+/// the Google account owns it; an app login is told nothing and asks which label
+/// the Google account owns. Same table, same `active` requirement, same
+/// one-mailbox-one-daemon rule that [`crate::store::Store::insert_tenant`]
+/// enforces on the way in, so the answer is at most one label.
+///
+/// Reversing it removes the oracle rather than adding one. The key is an address
+/// Google vouched for on this request, so nobody can ask this question about a
+/// mailbox they do not hold, and there is no label space to walk: `/app/auth`
+/// takes no input at all.
+///
+/// Nothing is looked up before Google here for the same reason nothing is on the
+/// console hop: there is no input to look anything up BY.
+async fn app_login(state: &ControlState, code: String, pkce_verifier: String) -> Response {
+    // Identity only, and the function that does it hands back a mailbox rather
+    // than a token: there is no credential on this path for anything downstream
+    // to hold.
+    let account_email = match oauth::verify_identity(&endpoints(state), code, pkce_verifier).await {
+        Ok(email) => email,
+        Err(e) => {
+            // PRIVACY: the error type, which is written to carry no code, no
+            // token, and no provider body.
+            tracing::info!(error = %e, "app login did not complete at Google");
+            return app_refused();
+        }
+    };
+
+    // Normalized the way the store normalizes on insert, so a capitalized Google
+    // answer finds the same row rather than none.
+    let label = match state.store().active_tenant_for_email(&account_email) {
+        Ok(Some(label)) => label,
+        // A real Google account with no mailbox here. Said plainly: see
+        // [`APP_NO_TENANT`] for why that is not an oracle.
+        Ok(None) => {
+            tracing::info!("app login found no active tenant for that mailbox");
+            return pages::console_problem(
+                StatusCode::NOT_FOUND,
+                APP_NO_TENANT_HEADING,
+                APP_NO_TENANT,
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "app tenant lookup failed");
+            return app_unavailable();
+        }
+    };
+
+    // THE TICKET, exactly as next door: an ordinary pairing code for an ordinary
+    // device, one-shot and ten minutes, which the tenant's own daemon claims into
+    // a device token. No new credential type and no new revocation story.
+    let pairing = match state.warden().pair(&label).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, label = %label, "minting the app pairing code failed");
+            return app_unavailable();
+        }
+    };
+
+    // PRIVACY: the label and never the code, which is live for ten minutes and is
+    // the whole credential. The mailbox is not logged either, here as everywhere.
+    tracing::info!(label = %label, "app login complete");
+
+    // The page builds the `passband://` link itself, from this deployment's own
+    // tenant URL and the warden's code. Nothing a caller sent is in it, because
+    // this route accepted nothing a caller sent.
+    let page = pages::app_signed_in(
+        &account_email,
+        &state.config().tenant_url(&label),
+        &pairing.pair_code,
+        PAIRING_MINUTES,
+    );
+    // A live pairing code is on this page. Nothing may cache it, and it must not
+    // ride out as a referer when the deep link is pressed.
+    no_store(page)
+}
+
+/// Stamp a response as uncacheable and referer-free. Both headers exist for the
+/// same one reason on this file's pages: a live pairing code is in the body or
+/// the location.
+fn no_store(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store, no-cache"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    resp
+}
+
+/// The app login's identity refusal: Google did not complete, or answered with
+/// something this service will not treat as an identity. Uniform, like its
+/// console counterpart, and for a smaller reason: there is nothing here it could
+/// usefully distinguish.
+fn app_refused() -> Response {
+    pages::console_problem(
+        StatusCode::BAD_REQUEST,
+        "That sign in could not be completed",
+        "Go back to Passband and sign in again, using the Google account your mailbox belongs to.",
+    )
+}
+
+/// What an app login gets when THIS service could not do its job. Distinct from
+/// [`app_refused`] for the reason [`console_unavailable`] is distinct from
+/// [`console_refused`]: it says "try again", which is true, rather than "check
+/// who you are", which would not be.
+fn app_unavailable() -> Response {
+    pages::console_problem(
+        StatusCode::BAD_GATEWAY,
+        "Sign in is unavailable right now",
+        "Nothing changed. Please try again in a few minutes.",
+    )
+}
+
 /// The one page every identity-shaped console refusal gets. See
 /// [`CONSOLE_REFUSED`].
 fn console_refused() -> Response {
@@ -1100,15 +1350,61 @@ fn refused_session() -> Response {
 /// render signup copy or a link to the signup form: the person on the other end
 /// already has a mailbox and was trying to get into it, and "start again" on the
 /// signup page is an instruction to do the one thing they must not.
-fn refused_session_for(state: &ControlState, console_label: Option<&str>) -> Response {
-    match console_label {
-        Some(label) => pages::console_problem_with_link(
+fn refused_session_for(state: &ControlState, voice: Voice) -> Response {
+    match voice {
+        Voice::Signup => refused_session(),
+        Voice::Console(label) => pages::console_problem_with_link(
             StatusCode::BAD_REQUEST,
             CONSOLE_REFUSED_HEADING,
             CONSOLE_SESSION_REFUSED,
-            &state.config().tenant_url(label),
+            &state.config().tenant_url(&label),
         ),
-        None => refused_session(),
+        // NO LINK. The app is the way back and the app is not a URL this service
+        // can render; the only thing it could link to is a label an app login
+        // does not have.
+        Voice::App => pages::console_problem(
+            StatusCode::BAD_REQUEST,
+            CONSOLE_REFUSED_HEADING,
+            APP_SESSION_REFUSED,
+        ),
+    }
+}
+
+/// WHICH FLOW a refusal should be written in the words of.
+///
+/// Not [`SessionKind`], deliberately: this is the one question the CALLBACK has
+/// to answer when the server-side session is gone, and at that point the cookie
+/// is the only witness left. So it is derivable from either source, the two are
+/// compared once the session is in hand, and it carries the console's label
+/// because that label is the only link a refusal is ever allowed to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Voice {
+    Signup,
+    Console(String),
+    App,
+}
+
+impl Voice {
+    /// What the cookie says this is. TRUSTED FOR COPY ONLY: a forged `app`
+    /// marker or a swapped label buys a differently worded refusal, which is why
+    /// this is used exclusively on paths that are already refusing. Every path
+    /// that acts uses [`Voice::from_session`].
+    fn from_cookie(claim: &SessionClaim) -> Self {
+        match (claim.invite, claim.app) {
+            (Some(_), _) => Voice::Signup,
+            (None, true) => Voice::App,
+            (None, false) => Voice::Console(claim.label.clone()),
+        }
+    }
+
+    /// What the SESSION says this is, which is the authority everywhere it
+    /// exists.
+    fn from_session(kind: SessionKind, label: &str) -> Self {
+        match kind {
+            SessionKind::Signup { .. } => Voice::Signup,
+            SessionKind::Console => Voice::Console(label.to_string()),
+            SessionKind::App => Voice::App,
+        }
     }
 }
 
