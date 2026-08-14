@@ -197,9 +197,12 @@ impl SqliteStore {
             // above exists to prevent. `item_name_msg` names the message whose
             // extraction supplied the CURRENT name, so scrubbing by it is exact:
             // the package survives (it is someone else's row), only the sealed
-            // mail's words go.
+            // mail's words go. `item_name_source` goes back to 'regex' with it:
+            // a source marker whose NAME is gone would otherwise lock the row
+            // out of ever taking a regex-extracted name again.
             tx.execute(
-                "UPDATE shipments SET item_name = '', item_name_msg = NULL
+                "UPDATE shipments SET item_name = '', item_name_msg = NULL,
+                     item_name_source = 'regex'
                  WHERE account_id = ?1 AND item_name_msg = ?2",
                 params![account_id, message_id],
             )?;

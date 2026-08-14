@@ -304,9 +304,17 @@ impl SqliteStore {
         // not preserve half of it. Scrubbing by provenance is exact, and matches
         // what sealing already does in `feedback.rs` — only scoped to the reset
         // set rather than to one message.
-        for table in ["shipments", "shipment_orders"] {
+        //
+        // `shipments` also loses its `item_name_source` marker (back to
+        // 'regex'), for the reason sealing does: a source that outlives its name
+        // would lock the row out of taking a regex name on the next email.
+        // `shipment_orders` has no such column — only the extractor writes it.
+        for (table, source_reset) in [
+            ("shipments", ", item_name_source = 'regex'"),
+            ("shipment_orders", ""),
+        ] {
             let scrub = format!(
-                "UPDATE {table} SET item_name = '', item_name_msg = NULL
+                "UPDATE {table} SET item_name = '', item_name_msg = NULL{source_reset}
                  WHERE account_id = ?1 AND item_name_msg IN ({reset_scope})"
             );
             conn.execute(&scrub, rusqlite::params![account_id, scope_param])?;
