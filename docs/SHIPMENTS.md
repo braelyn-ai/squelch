@@ -139,6 +139,10 @@ ofd_poll_interval_mins = 60
 max_age_days = 45
 # Consecutive permanent failures before a package is retired.
 max_failures = 5
+# Drop a package off both doors' listings after this many days with no news
+# about it at all. 0 disables the filter. A LISTING knob, like max_failures,
+# which is why it lives here rather than in a table of its own.
+stale_after_days = 7
 
 # Each block below is optional, and its presence is what enables that carrier.
 [carriers.ups]
@@ -159,14 +163,17 @@ api_key = "..."
 daily_cap = 200
 ```
 
-The four knobs at the top only pace a poller that credentials have already turned
-on. Setting them without any credentials changes nothing.
+The first four knobs only pace a poller that credentials have already turned on.
+Setting them without any credentials changes nothing. `stale_after_days` is the
+odd one out and applies either way: it is a listing rule, not a polling one, so
+it holds on a daemon that polls no carrier at all.
 
 `poll_interval_hours = 0` or `ofd_poll_interval_mins = 0` is floored to 1 with a
 warning on stderr, because a zero interval is a spin loop against somebody else's
 rate-limited API. `max_failures = 0` is accepted and is a footgun: it makes
 nothing pollable at all and hides every ambiguous row from the listing (see
-[Retirement](#retirement-and-suppression)).
+[Retirement](#retirement-and-suppression)). `stale_after_days = 0` is the
+opposite: it is the documented way to turn the staleness filter off.
 
 ### The environment equivalents
 
@@ -181,6 +188,7 @@ nothing pollable at all and hides every ambiguous row from the listing (see
 | `SQUELCH_CARRIERS_OFD_POLL_INTERVAL_MINS` | `ofd_poll_interval_mins` |
 | `SQUELCH_CARRIERS_MAX_AGE_DAYS` | `max_age_days`, which is also the extractor's horizon (see [Identity](#identity-which-package-is-this)) |
 | `SQUELCH_CARRIERS_MAX_FAILURES` | `max_failures` |
+| `SQUELCH_CARRIERS_STALE_AFTER_DAYS` | `stale_after_days` |
 
 A credential pair set in the environment **materializes a carrier the config file
 never mentions**, so a Docker deployment needs no `config.toml` at all.
@@ -267,6 +275,49 @@ no carrier will acknowledge, was probably never a tracking number. A `1Z…`,
 Retirement is not permanent. The rows stay in the database, the listing filter is
 read-side only, and either a successful poll or a new email that the state
 machine accepts clears the counter and brings the package back.
+
+### Going quiet, and being told to go away
+
+Two more things take a package off the list, and they work the same way
+retirement does: nothing is deleted, nothing stops being polled, and the row
+comes back on its own.
+
+**Staleness.** A row nothing has happened to for `stale_after_days` (default 7)
+drops off both doors' listings. "Nothing has happened" is precise here rather
+than approximate: a shipment's `last_update` only ever moves when something the
+user can see changes, which is its status, its ETA, or the carrier's own status
+string. A poll that confirms what the row already said does not move it. So the
+window is genuinely "seven days without news", not "seven days since we last
+looked". Set `stale_after_days = 0` to switch the filter off entirely and keep
+every package on the list forever.
+
+**A user clear.** `POST /client/shipments/{id}/clear` is the "I do not need to
+see this any more" button. It stamps the row and hides it, and that is all it
+does.
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $SQUELCH_API_TOKEN" \
+  http://127.0.0.1:8848/client/shipments/42/clear
+# => {"cleared":true,"shipment_id":42,"cleared_at":"2026-08-13T18:04:11.512Z"}
+```
+
+Human door only, like every write. It takes no body. Clearing the same row twice
+is fine and simply restamps it. An id this account does not have is a 404.
+
+**Both hidings undo themselves, and there is no un-clear endpoint on purpose.**
+A cleared row is hidden only for as long as it has not moved since you cleared
+it; a stale row is hidden only for as long as it stays silent. The instant
+anything advances the package (a carrier poll that finds it has moved, or a new
+email about it that the state machine accepts), it is back on the list with no
+second call from anybody. That is why the two hidings are a comparison at read
+time rather than a flag: there is no state to get stuck in.
+
+**The rows keep being polled the whole time.** This is the part worth stating
+plainly, because it looks like an obvious thing to optimise away and is not:
+cleared packages and stale packages stay in the poll queue exactly as before.
+The poll is what produces the update that brings them back. Filtering them out of
+the queue would make "hidden" mean "hidden forever", which is the opposite of the
+design.
 
 ### Forcing a pass
 
@@ -497,9 +548,10 @@ not exist yet.
 Three one-shots run on the first daemon start with this build, and then never
 again.
 
-1. **Schema migration.** The poll-state columns, `shipments.order_ref`, the
-   `shipment_orders` table and their indexes are added in place. Additive and
-   silent.
+1. **Schema migration.** The poll-state columns, `shipments.order_ref`,
+   `shipments.cleared_at`, the `shipment_orders` table and their indexes are
+   added in place. Additive and silent, and nothing is backfilled: an existing
+   row has never been polled and nobody has cleared it.
 2. **Phantom cleanup.** Every existing `shipments` row is re-judged against its
    own feeder email under the tightened detector, and rows the detector no longer
    produces are deleted. Rows written by an older daemon that have no feeder

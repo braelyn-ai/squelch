@@ -1083,9 +1083,18 @@ mod tests {
         (store, poller, mock, row)
     }
 
+    /// A policy that hides nothing: these tests are about polling, and several
+    /// deliberately drive `poll_failures` up or leave a row untouched for days.
+    fn keep_all() -> crate::config::ShipmentListPolicy {
+        crate::config::ShipmentListPolicy {
+            suppress_failed_ambiguous_at: u32::MAX,
+            stale_after_days: 0,
+        }
+    }
+
     fn stored(store: &SqliteStore, account_id: AccountId) -> Shipment {
         store
-            .list_shipments(account_id, true, u32::MAX)
+            .list_shipments(account_id, true, keep_all())
             .unwrap()
             .remove(0)
     }

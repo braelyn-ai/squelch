@@ -224,6 +224,12 @@ CREATE TABLE IF NOT EXISTS shipments (
     -- adoption), and sealing a message must scrub the text it contributed
     -- wherever it landed. NULL when no name, or on pre-column rows.
     item_name_msg   INTEGER,
+    -- USER CLEAR (RFC3339, NULL = not cleared): the user said "stop showing me
+    -- this". READ-SIDE ONLY, and it is never un-set: a listing hides the row
+    -- only while `last_update <= cleared_at`, so the moment anything advances
+    -- `last_update` past this stamp the row returns by itself. The row keeps
+    -- being polled the whole time — polling is what produces that update.
+    cleared_at      TEXT,
     UNIQUE(account_id, tracking_number)
 );
 

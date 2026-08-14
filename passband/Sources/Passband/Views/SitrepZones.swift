@@ -65,7 +65,8 @@ struct CalendarZone: View {
 // MARK: - shipments
 
 /// Still-active shipments plus anything delivered TODAY; older deliveries drop
-/// out. No j/k, but each card opens its email and the Track chip is real.
+/// out. No j/k, but each card opens its email, the Track chip is real, and a
+/// context menu clears a package the user is done looking at.
 struct ShipmentsZone: View {
     @Environment(AppStore.self) private var store
     private var shipments: [Shipment] { store.zones.shipments }
@@ -158,6 +159,19 @@ private struct ShipmentCard: View {
         .contentShape(Rectangle())
         .onTapGesture { if let target { store.openThread(target) } }
         .onHover { hovering = $0 }
+        // A CONTEXT MENU rather than a chip or a swipe: the card's whole face is
+        // already spoken for (the tap opens the email, the Track chip is a real
+        // Button that beats it), and this rail is a VStack of cards on both
+        // platforms, not a List — `swipeActions` would do nothing here. Right
+        // click on the Mac, long press on the phone, one gesture neither of the
+        // other two uses.
+        .contextMenu {
+            Button {
+                Task { await store.clearShipment(shipment.id) }
+            } label: {
+                Label("Clear this package", systemImage: "xmark.circle")
+            }
+        }
         .opacity(shipment.status == .delivered ? 0.65 : 1)
     }
 }

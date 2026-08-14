@@ -570,11 +570,15 @@ fn shipments_by_order_ref(
 /// LEFT JOIN: a NULL `last_message_id` (a row written by an older daemon, or one
 /// only a carrier poll has touched) leaves the shipment standing, just with
 /// nowhere to jump to.
-const SHIPMENT_SELECT: &str = "SELECT s.id, s.account_id, s.tracking_number, s.carrier,
+const SHIPMENT_COLUMNS: &str = "s.id, s.account_id, s.tracking_number, s.carrier,
             s.item_name, s.status, s.tracking_url, s.first_seen, s.last_update,
             m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at,
-            s.poll_failures
-     FROM shipments s
+            s.poll_failures";
+
+/// The tables [`SHIPMENT_COLUMNS`] is read from, split out so the listing can
+/// append its own column (`cleared_at`, which the wire type deliberately does
+/// not carry) without a second copy of the projection.
+const SHIPMENT_FROM: &str = "FROM shipments s
      LEFT JOIN messages m ON m.id = s.last_message_id AND m.account_id = s.account_id";
 
 fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipment> {
@@ -802,36 +806,77 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
-        suppress_failed_ambiguous_at: u32,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
         let conn = self.lock()?;
         // No sealed rows: detection never runs on sealed mail, and sealing an
         // already-extracted message deletes its shipment row (correct_triage).
-        let mut sql = format!("{SHIPMENT_SELECT} WHERE s.account_id=?1");
+        // `cleared_at` rides along as an extra column: the read-side policy below
+        // needs it, and the wire type deliberately does not carry it.
+        let mut sql = format!(
+            "SELECT {SHIPMENT_COLUMNS}, s.cleared_at {SHIPMENT_FROM} WHERE s.account_id=?1"
+        );
         if !include_delivered {
             sql.push_str(" AND s.status != 'delivered'");
         }
         sql.push_str(" ORDER BY s.last_update DESC");
         let mut stmt = conn.prepare(&sql)?;
         let out = stmt
-            .query_map(params![account_id], shipment_row)?
+            .query_map(params![account_id], |r| {
+                Ok((shipment_row(r)?, dt_opt(r, 15)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        // READ-SIDE suppression, deliberately not a stored column: the rows stay
-        // live so a later repair pass can still fix or delete them, and one
-        // successful poll (which zeroes `poll_failures`) brings a row straight
-        // back. A carrier that has rejected an ambiguous bare digit-run
-        // `suppress_failed_ambiguous_at` times running is telling us it was
-        // never a tracking number — but only the ambiguous SHAPES can be
-        // phantoms, so a 1Z…/TBA…/IMpb row is never hidden however badly it polls.
-        // NOTE: a cap of 0 hides every ambiguous row, since `poll_failures` is
-        // never negative; callers pass the carrier poller's retirement cap.
+        // EVERY HIDE IN HERE IS READ-SIDE, deliberately not a stored "hidden"
+        // flag: the rows stay live so a later repair pass can still fix them, so
+        // the poller keeps polling them (see `list_pollable_shipments`, which
+        // filters on NONE of this), and so each hide reverses itself the moment
+        // the package does something. One filter, one place.
+        let stale_before = (policy.stale_after_days > 0)
+            .then(|| Utc::now() - chrono::Duration::days(policy.stale_after_days as i64));
         Ok(out
             .into_iter()
-            .filter(|s| {
-                s.poll_failures < suppress_failed_ambiguous_at
-                    || !crate::triage::is_ambiguous_tracking_shape(&s.tracking_number)
+            .filter(|(s, cleared_at)| {
+                // 1. PHANTOM. A carrier that has rejected an ambiguous bare
+                //    digit-run `suppress_failed_ambiguous_at` times running is
+                //    telling us it was never a tracking number — but only the
+                //    ambiguous SHAPES can be phantoms, so a 1Z…/TBA…/IMpb row is
+                //    never hidden however badly it polls. One successful poll
+                //    zeroes the counter and the row is back. NOTE: a cap of 0
+                //    hides every ambiguous row, since `poll_failures` is never
+                //    negative; callers pass the carrier poller's retirement cap.
+                let phantom = s.poll_failures >= policy.suppress_failed_ambiguous_at
+                    && crate::triage::is_ambiguous_tracking_shape(&s.tracking_number);
+                // 2. STALE. `last_update` advances ONLY on a user-visible change
+                //    (status, eta, or the carrier's raw string), so this is
+                //    exactly "nothing has happened to this package in N days".
+                //    An update pulls it back inside the window on its own.
+                let stale = stale_before.is_some_and(|cutoff| s.last_update < cutoff);
+                // 3. CLEARED. The comparison IS the revival: hide only while the
+                //    row has not moved since the user cleared it. Nothing ever
+                //    resets `cleared_at`, and nothing needs to.
+                let cleared = cleared_at.is_some_and(|at| s.last_update <= at);
+                !(phantom || stale || cleared)
             })
+            .map(|(s, _)| s)
             .collect())
+    }
+
+    /// Stamp the user's "stop showing me this" on one shipment. Unconditional so
+    /// a re-clear RESTAMPS (a row revived by an update and cleared again must
+    /// hide against the LATER stamp), which also makes it idempotent. `false`
+    /// means no such row for this account.
+    pub(super) fn clear_shipment(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE shipments SET cleared_at = ?3 WHERE account_id = ?1 AND id = ?2",
+            params![account_id, shipment_id, at.to_rfc3339()],
+        )?;
+        Ok(n > 0)
     }
 
     /// One-shot repair: re-run the (tightened) detector over each shipment row's
@@ -929,8 +974,14 @@ impl SqliteStore {
         // Amazon and "unknown" are excluded by the carrier list: neither has an
         // API to poll. Ordered never-polled first, then least-recently-polled,
         // so a caller taking a prefix spreads its budget evenly.
+        //
+        // NO `cleared_at` AND NO STALENESS PREDICATE HERE, ON PURPOSE. A row the
+        // user cleared, and a row the listing hides as stale, are both still
+        // polled: the poll is what produces the `last_update` that brings them
+        // back, so filtering them out here would make hiding permanent. Only
+        // `list_shipments` filters. Do not "optimize" this.
         let mut stmt = conn.prepare(&format!(
-            "{SHIPMENT_SELECT}
+            "SELECT {SHIPMENT_COLUMNS} {SHIPMENT_FROM}
              WHERE s.account_id=?1
                AND s.status != 'delivered'
                AND s.carrier IN ('ups','usps','fedex','dhl')

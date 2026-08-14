@@ -1538,7 +1538,16 @@ fn build_serve_router(
     api_state: squelch_api::ApiState,
     mcp_cancel: CancellationToken,
 ) -> anyhow::Result<axum::Router> {
-    let mcp_service = squelch_mcp::streamable_http_service(store, account_email, mcp_cancel)?;
+    // The agent door gets the HUMAN DOOR'S OWN listing policy, read back off the
+    // state rather than resolved from config a second time: the two doors must
+    // agree about which packages exist, and the way that broke before was each
+    // side deciding for itself.
+    let mcp_service = squelch_mcp::streamable_http_service(
+        store,
+        account_email,
+        api_state.shipment_policy(),
+        mcp_cancel,
+    )?;
     let app = squelch_api::router(api_state).nest_service(squelch_mcp::MCP_PATH, mcp_service);
     Ok(app)
 }

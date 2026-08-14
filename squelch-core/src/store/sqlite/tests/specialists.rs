@@ -1134,7 +1134,10 @@ fn a_new_email_revives_a_retired_shipment() {
         "retired out of the poll queue"
     );
     assert!(
-        store.list_shipments(acct, false, 5).unwrap().is_empty(),
+        store
+            .list_shipments(acct, false, suppress_at(5))
+            .unwrap()
+            .is_empty(),
         "and out of the lists"
     );
 
@@ -1164,7 +1167,13 @@ fn a_new_email_revives_a_retired_shipment() {
             .any(|s| s.id == sid),
         "the revived row is pollable again"
     );
-    assert_eq!(store.list_shipments(acct, false, 5).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .list_shipments(acct, false, suppress_at(5))
+            .unwrap()
+            .len(),
+        1
+    );
 
     // A REJECTED update is not evidence: a stale "shipped" arriving after the
     // delivery is exactly the mail the merge threw away, and it must not
@@ -1367,7 +1376,7 @@ fn a_capped_ambiguous_row_is_suppressed_but_a_prefixed_one_is_not() {
     fail_polls(&store, acct, phantom, 5);
     fail_polls(&store, acct, real, 5);
 
-    let listed = store.list_shipments(acct, false, 5).unwrap();
+    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
     let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
     assert_eq!(ids, vec![real], "only the ambiguous shape is suppressed");
     assert_eq!(
@@ -1404,7 +1413,7 @@ fn an_ambiguous_row_below_the_cap_still_lists() {
         .unwrap();
     fail_polls(&store, acct, sid, 4);
 
-    let listed = store.list_shipments(acct, false, 5).unwrap();
+    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
     assert_eq!(listed.len(), 1, "cap-1 failures is not yet a phantom");
     assert_eq!(listed[0].poll_failures, 4);
 }
@@ -1426,7 +1435,10 @@ fn a_successful_poll_unsuppresses_an_ambiguous_row() {
         .unwrap();
     fail_polls(&store, acct, sid, 5);
     assert!(
-        store.list_shipments(acct, false, 5).unwrap().is_empty(),
+        store
+            .list_shipments(acct, false, suppress_at(5))
+            .unwrap()
+            .is_empty(),
         "capped out"
     );
 
@@ -1445,9 +1457,263 @@ fn a_successful_poll_unsuppresses_an_ambiguous_row() {
             Utc::now(),
         )
         .unwrap();
-    let listed = store.list_shipments(acct, false, 5).unwrap();
+    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
     assert_eq!(listed.len(), 1, "a successful poll brings the row back");
     assert_eq!(listed[0].poll_failures, 0);
+}
+
+// ---- staleness + user clear --------------------------------------------
+
+/// One en-route row whose `last_update` is `age_days` old, plus its id.
+fn aged_shipment(store: &SqliteStore, acct: AccountId, number: &str, age_days: i64) -> i64 {
+    let mid = store
+        .upsert_message(&triaged(acct, &format!("g-{number}"), "t-stale").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", number, crate::triage::ShipmentStatus::Shipped),
+            Utc::now() - chrono::Duration::days(age_days),
+        )
+        .unwrap()
+}
+
+/// `last_update` advances ONLY on a user-visible change, so "older than N days"
+/// is literally "nothing has happened to this package in N days" — which is what
+/// the timeout is for. 0 turns the whole filter off.
+#[test]
+fn a_shipment_goes_stale_after_the_window_and_zero_disables_it() {
+    let (store, acct) = store();
+    let old = aged_shipment(&store, acct, "1Z999AA10123456784", 8);
+    let recent = aged_shipment(&store, acct, "1Z999AA10123456785", 6);
+
+    let listed = store.list_shipments(acct, false, stale_after(7)).unwrap();
+    let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec![recent], "8 days out is hidden, 6 days out is not");
+
+    assert_eq!(
+        store
+            .list_shipments(acct, false, stale_after(0))
+            .unwrap()
+            .len(),
+        2,
+        "stale_after_days = 0 disables the filter entirely"
+    );
+    assert_eq!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        2,
+        "and the default test policy hides nothing either"
+    );
+
+    // HIDDEN IS NOT RETIRED: the stale row is still in the poll queue, because a
+    // poll is exactly what would bring it back.
+    assert!(
+        store
+            .list_pollable_shipments(acct, Utc::now() - chrono::Duration::days(45), 5)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == old),
+        "a stale row keeps being polled"
+    );
+}
+
+/// The clear, and the whole revival design: there is no un-clear call anywhere in
+/// this test, only an update that moves `last_update` past the stamp.
+#[test]
+fn a_cleared_shipment_hides_until_a_poll_actually_moves_it() {
+    use crate::triage::{CarrierTrack, ShipmentStatus};
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now() - chrono::Duration::hours(3);
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+    // One real poll first, so the row already carries the carrier's words and a
+    // repeat of the same answer is genuinely a no-change poll.
+    let in_transit = CarrierTrack {
+        status: Some(ShipmentStatus::Shipped),
+        carrier_status_raw: "In Transit".into(),
+        eta: None,
+        delivered_at: None,
+    };
+    store
+        .apply_carrier_track(acct, sid, &in_transit, t0 + chrono::Duration::hours(1))
+        .unwrap();
+
+    let cleared_at = t0 + chrono::Duration::hours(2);
+    assert!(store.clear_shipment(acct, sid, cleared_at).unwrap());
+    assert!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty(),
+        "a cleared row leaves the listing"
+    );
+    // STILL POLLED. This is the load-bearing half: filtering the poll queue on
+    // `cleared_at` would make the clear permanent.
+    assert!(
+        store
+            .list_pollable_shipments(acct, t0 - chrono::Duration::days(45), 5)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == sid),
+        "a cleared row keeps being polled"
+    );
+
+    // A poll that CONFIRMS what the row already says moves nothing user-visible,
+    // so `last_update` does not advance and the row stays hidden.
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &in_transit,
+            cleared_at + chrono::Duration::minutes(30),
+        )
+        .unwrap();
+    assert!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty(),
+        "a poll that changed nothing must not un-hide the row"
+    );
+
+    // A poll that MOVES it does, with no un-clear call anywhere: the comparison
+    // in the listing is the whole revival mechanism.
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            cleared_at + chrono::Duration::minutes(45),
+        )
+        .unwrap();
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
+    assert_eq!(listed.len(), 1, "an update revives the row by itself");
+    assert_eq!(listed[0].status, "out_for_delivery");
+}
+
+/// The other revival path: a new email the state machine ACCEPTS advances
+/// `last_update` too, so it un-hides exactly the same way a poll does.
+#[test]
+fn a_new_accepted_email_revives_a_cleared_shipment() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let first = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now() - chrono::Duration::hours(2);
+    let sid = store
+        .upsert_shipment(
+            acct,
+            first,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+    store.clear_shipment(acct, sid, t0).unwrap();
+    assert!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty()
+    );
+
+    let second = store
+        .upsert_message(&triaged(acct, "g2", "t1").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            second,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::OutForDelivery),
+            t0 + chrono::Duration::hours(1),
+        )
+        .unwrap();
+
+    let listed = store
+        .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the ship notice brings the package back");
+    assert_eq!(listed[0].id, sid, "the same row, not a second one");
+}
+
+/// Idempotence, restamping, and the unknown-id answer the endpoint's 404 rests on.
+#[test]
+fn clearing_is_idempotent_restamps_and_reports_an_unknown_id() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    let mid = store
+        .upsert_message(&triaged(acct, "g1", "t1").msg())
+        .unwrap();
+    let t0 = Utc::now() - chrono::Duration::hours(3);
+    let sid = store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::Shipped),
+            t0,
+        )
+        .unwrap();
+
+    assert!(store.clear_shipment(acct, sid, t0).unwrap());
+    assert!(
+        store.clear_shipment(acct, sid, t0).unwrap(),
+        "clearing twice is a no-op success, not an error"
+    );
+    assert!(
+        !store.clear_shipment(acct, sid + 999, Utc::now()).unwrap(),
+        "an unknown id is false, never an error — the door turns this into a 404"
+    );
+
+    // RESTAMPING MATTERS: revive the row, then clear it again. The second clear
+    // must hide it against the LATER stamp, which a "only if NULL" write would
+    // not do.
+    let second = store
+        .upsert_message(&triaged(acct, "g2", "t1").msg())
+        .unwrap();
+    let moved = t0 + chrono::Duration::hours(1);
+    store
+        .upsert_shipment(
+            acct,
+            second,
+            &shipped("ups", "1Z999AA10123456784", ShipmentStatus::OutForDelivery),
+            moved,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store.clear_shipment(acct, sid, moved).unwrap());
+    assert!(
+        store
+            .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .is_empty(),
+        "the re-clear restamped and hid the revived row again"
+    );
 }
 
 // ---- one-shot re-detect cleanup ----------------------------------------
@@ -2113,7 +2379,12 @@ fn a_carrier_confirmed_row_is_never_reaped_as_a_phantom() {
     let (store, acct) = store();
     let mid = ship_queued_msg(&store, acct, "g-fedex", "t1");
     let sid = store
-        .upsert_shipment(acct, mid, &detected("fedex", "123456789012", ""), Utc::now())
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("fedex", "123456789012", ""),
+            Utc::now(),
+        )
         .unwrap();
     store
         .apply_carrier_track(
@@ -2149,7 +2420,12 @@ fn an_extraction_with_no_tracking_number_deletes_nothing() {
     let (store, acct) = store();
     let mid = ship_queued_msg(&store, acct, "g-fedex", "t-ship");
     store
-        .upsert_shipment(acct, mid, &detected("fedex", "123456789012", ""), Utc::now())
+        .upsert_shipment(
+            acct,
+            mid,
+            &detected("fedex", "123456789012", ""),
+            Utc::now(),
+        )
         .unwrap();
 
     store

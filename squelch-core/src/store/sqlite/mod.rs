@@ -482,9 +482,18 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
-        suppress_failed_ambiguous_at: u32,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
-        self.list_shipments(account_id, include_delivered, suppress_failed_ambiguous_at)
+        self.list_shipments(account_id, include_delivered, policy)
+    }
+
+    fn clear_shipment(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.clear_shipment(account_id, shipment_id, at)
     }
 
     fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {

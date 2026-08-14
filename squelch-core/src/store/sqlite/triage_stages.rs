@@ -297,6 +297,23 @@ impl SqliteStore {
              WHERE account_id = ?1 AND last_message_id IN ({reset_scope})"
         );
         conn.execute(&del_orders, rusqlite::params![account_id, scope_param])?;
+        // AND THE NAMES THOSE MESSAGES MERELY DONATED, in both tables. The
+        // `shipments` row itself survives (identity-keyed, poll-bearing), but its
+        // `item_name` is mail-derived and three extractor paths write one onto a
+        // row a DIFFERENT message feeds — which is why `item_name_msg` records
+        // whose extraction supplied it. Without this, a re-extraction that finds
+        // no item name, or decides the mail was never a shipment, leaves the OLD
+        // name on the card forever: re-triage is supposed to redo the verdict,
+        // not preserve half of it. Scrubbing by provenance is exact, and matches
+        // what sealing already does in `feedback.rs` — only scoped to the reset
+        // set rather than to one message.
+        for table in ["shipments", "shipment_orders"] {
+            let scrub = format!(
+                "UPDATE {table} SET item_name = '', item_name_msg = NULL
+                 WHERE account_id = ?1 AND item_name_msg IN ({reset_scope})"
+            );
+            conn.execute(&scrub, rusqlite::params![account_id, scope_param])?;
+        }
         Ok(n as u64)
     }
 

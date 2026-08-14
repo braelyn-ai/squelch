@@ -340,6 +340,15 @@ pub struct CarriersConfig {
     /// Consecutive per-shipment API failures tolerated before it is dropped.
     /// Env: `SQUELCH_CARRIERS_MAX_FAILURES`.
     pub max_failures: u32,
+    /// Hide a shipment from BOTH DOORS' LISTINGS once nothing user-visible has
+    /// changed about it for this many days. A LISTING concern, like
+    /// [`CarriersConfig::max_failures`], which is why it lives here rather than
+    /// in its own table: the same `[carriers]` block already decides when a row
+    /// stops being shown.
+    ///
+    /// `0` DISABLES the filter entirely (nothing is ever hidden for age).
+    /// Env: `SQUELCH_CARRIERS_STALE_AFTER_DAYS`.
+    pub stale_after_days: u32,
     /// `[carriers.ups]`. `None` (or half a pair) => UPS is never polled.
     pub ups: Option<UpsCarrierConfig>,
     /// `[carriers.fedex]`. `None` (or half a pair) => FedEx is never polled.
@@ -357,6 +366,7 @@ impl Default for CarriersConfig {
             ofd_poll_interval_mins: 60,
             max_age_days: 45,
             max_failures: 5,
+            stale_after_days: 7,
             ups: None,
             fedex: None,
             usps: None,
@@ -375,6 +385,44 @@ impl CarriersConfig {
             || self.fedex.as_ref().is_some_and(FedexCarrierConfig::enabled)
             || self.usps.as_ref().is_some_and(UspsCarrierConfig::enabled)
             || self.dhl.as_ref().is_some_and(DhlCarrierConfig::enabled)
+    }
+
+    /// The listing half of this block, as the value both doors carry.
+    pub fn list_policy(&self) -> ShipmentListPolicy {
+        ShipmentListPolicy {
+            suppress_failed_ambiguous_at: self.max_failures,
+            stale_after_days: self.stale_after_days,
+        }
+    }
+}
+
+/// Config-derived listing policy for shipments. Both doors hold one so the
+/// agent door cannot drift from the human door's view (it did: the agent door
+/// used to hardcode the built-in `max_failures` and ignore the operator's).
+///
+/// EVERY RULE IN HERE IS READ-SIDE. Nothing it hides is deleted, nothing it
+/// hides stops being polled, and every hidden row comes back on its own the
+/// moment something about it changes — see
+/// [`Store::list_shipments`](crate::store::Store::list_shipments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShipmentListPolicy {
+    /// Permanent poll failures after which an AMBIGUOUS-shaped tracking number
+    /// is treated as a phantom and hidden. From `[carriers] max_failures`.
+    pub suppress_failed_ambiguous_at: u32,
+    /// Days without a user-visible change after which a row is hidden as stale.
+    /// `0` disables the staleness filter. From `[carriers] stale_after_days`.
+    pub stale_after_days: u32,
+}
+
+impl Default for ShipmentListPolicy {
+    fn default() -> Self {
+        CarriersConfig::default().list_policy()
+    }
+}
+
+impl From<&CarriersConfig> for ShipmentListPolicy {
+    fn from(c: &CarriersConfig) -> Self {
+        c.list_policy()
     }
 }
 
@@ -1347,6 +1395,10 @@ impl Config {
         env_override(
             "SQUELCH_CARRIERS_MAX_FAILURES",
             &mut self.carriers.max_failures,
+        );
+        env_override(
+            "SQUELCH_CARRIERS_STALE_AFTER_DAYS",
+            &mut self.carriers.stale_after_days,
         );
         // Only when DHL already exists: a budget must never conjure a carrier
         // (the api_key override above is the only thing that can).
@@ -2587,6 +2639,7 @@ backfill_days = 90
                 "SQUELCH_CARRIERS_OFD_POLL_INTERVAL_MINS",
                 "SQUELCH_CARRIERS_MAX_AGE_DAYS",
                 "SQUELCH_CARRIERS_MAX_FAILURES",
+                "SQUELCH_CARRIERS_STALE_AFTER_DAYS",
             ] {
                 std::env::remove_var(name);
             }
@@ -2610,11 +2663,58 @@ backfill_days = 90
         assert_eq!(c.carriers.ofd_poll_interval_mins, 60);
         assert_eq!(c.carriers.max_age_days, 45);
         assert_eq!(c.carriers.max_failures, 5);
+        assert_eq!(c.carriers.stale_after_days, 7);
 
         // A config predating the feature has no [carriers] table whatsoever.
         let cfg: Config = toml::from_str("squelch_level = 1\n").unwrap();
         assert_eq!(cfg.carriers, CarriersConfig::default());
         assert!(!cfg.carriers.any_enabled());
+    }
+
+    /// The listing policy both doors carry is derived from `[carriers]`, and its
+    /// `Default` is the config default — so a hand-built `ApiState` or
+    /// `SquelchServer` filters the way an unconfigured daemon does.
+    #[test]
+    fn the_listing_policy_tracks_the_carriers_block() {
+        assert_eq!(
+            ShipmentListPolicy::default(),
+            CarriersConfig::default().list_policy()
+        );
+        assert_eq!(ShipmentListPolicy::default().stale_after_days, 7);
+        assert_eq!(
+            ShipmentListPolicy::default().suppress_failed_ambiguous_at,
+            5
+        );
+
+        let carriers = CarriersConfig {
+            max_failures: 2,
+            stale_after_days: 0,
+            ..CarriersConfig::default()
+        };
+        let policy = ShipmentListPolicy::from(&carriers);
+        assert_eq!(policy.suppress_failed_ambiguous_at, 2);
+        assert_eq!(
+            policy.stale_after_days, 0,
+            "0 is a real value (the filter off), never a fallback to the default"
+        );
+    }
+
+    /// `stale_after_days` is configurable both ways, like every other knob in the
+    /// block — the env form is how a container sets it.
+    #[test]
+    fn stale_after_days_comes_from_toml_or_the_environment() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_carrier_env();
+
+        let cfg: Config = toml::from_str("[carriers]\nstale_after_days = 21\n").unwrap();
+        assert_eq!(cfg.carriers.stale_after_days, 21);
+
+        let mut c = Config::default();
+        // SAFETY: we hold ENV_LOCK.
+        unsafe { std::env::set_var("SQUELCH_CARRIERS_STALE_AFTER_DAYS", "0") };
+        c.apply_env_overrides();
+        assert_eq!(c.carriers.stale_after_days, 0, "0 disables the filter");
+        clear_carrier_env();
     }
 
     #[test]

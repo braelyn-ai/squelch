@@ -355,6 +355,112 @@ async fn shipment_poll_without_a_poller_is_a_200_that_kicked_nothing() {
     assert_eq!(json["carriers"], serde_json::json!([]));
 }
 
+/// The clear endpoint end to end: bearer-gated, idempotent, 404 on an unknown
+/// id, and — the design's whole point — REVERSED BY AN UPDATE with no un-clear
+/// call anywhere. The Passband client builds against this contract.
+#[tokio::test]
+async fn clearing_a_shipment_hides_it_until_an_update_brings_it_back() {
+    use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let mid = store
+            .upsert_message(&msg(acct, "g1", "t1", "shipped", "b"))
+            .unwrap();
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "ups".into(),
+                    tracking_number: "1Z999AA10123456784".into(),
+                    item_name: "Headphones".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            )
+            .unwrap();
+    });
+    let listed = store
+        .list_shipments(acct, false, Default::default())
+        .unwrap();
+    let sid = listed[0].id;
+
+    // Behind the bearer, like everything in the `/client` tree.
+    let unauthed = Request::builder()
+        .method("POST")
+        .uri(format!("/client/shipments/{sid}/clear"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauthed).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", &format!("/client/shipments/{sid}/clear")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["cleared"], true);
+    assert_eq!(json["shipment_id"], sid);
+    let cleared_at = json["cleared_at"]
+        .as_str()
+        .expect("cleared_at rides out as an RFC3339 string")
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .expect("and parses back");
+
+    // Gone from the listing...
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    assert!(
+        body_json(resp).await.as_array().unwrap().is_empty(),
+        "a cleared package leaves the listing"
+    );
+
+    // ...idempotently: a double-tap restamps and still answers 200.
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", &format!("/client/shipments/{sid}/clear")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // An unknown id is a 404, not a 500 and not a `false`.
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", "/client/shipments/999999/clear"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // REVIVAL: one carrier poll that actually moves the package, and the row is
+    // back. No un-clear endpoint was called, because none exists.
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            cleared_at + chrono::Duration::minutes(5),
+        )
+        .unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    let items = body_json(resp).await;
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 1, "an update revives the cleared row");
+    assert_eq!(items[0]["status"], "out_for_delivery");
+}
+
 #[tokio::test]
 async fn receipts_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::triage::ReceiptInfo;

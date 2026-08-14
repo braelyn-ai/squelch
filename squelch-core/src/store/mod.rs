@@ -755,21 +755,55 @@ pub trait Store: Send + Sync {
     /// `include_delivered=false` restricts to en-route (status != 'delivered').
     /// Sealed rows are structurally absent, so no sealed filter is required.
     ///
-    /// `suppress_failed_ambiguous_at` hides rows whose tracking number is an
-    /// AMBIGUOUS SHAPE (anything that does not identify its own carrier — see
-    /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape))
-    /// AND which the carrier has permanently rejected that many times: a number
-    /// no carrier will acknowledge, in a shape a retailer item/order id shares,
-    /// is a phantom. Suppression is READ-SIDE ONLY — the row stays live for the
-    /// repair passes, and one successful poll (which zeroes the counter) brings
-    /// it straight back. Callers pass the carrier poller's retirement cap; 0
-    /// would hide every ambiguous row.
+    /// `policy` carries the three READ-SIDE hides, all of which leave the row
+    /// live in the table and all of which reverse themselves:
+    ///
+    /// * [`suppress_failed_ambiguous_at`] hides rows whose tracking number is an
+    ///   AMBIGUOUS SHAPE (anything that does not identify its own carrier — see
+    ///   [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape))
+    ///   AND which the carrier has permanently rejected that many times: a number
+    ///   no carrier will acknowledge, in a shape a retailer item/order id shares,
+    ///   is a phantom. One successful poll zeroes the counter and brings it back.
+    ///   Callers pass the carrier poller's retirement cap; 0 would hide every
+    ///   ambiguous row.
+    /// * [`stale_after_days`] hides rows whose `last_update` is older than that.
+    ///   `last_update` moves ONLY on a user-visible change, so "stale" is
+    ///   literally "nothing has happened to this package in N days". 0 disables.
+    /// * `cleared_at` hides a row the user cleared, but ONLY while
+    ///   `last_update <= cleared_at`. There is no un-clear: the comparison IS the
+    ///   revival, so the first update to land after the clear brings the row back
+    ///   with no second write anywhere.
+    ///
+    /// NONE of this touches [`Store::list_pollable_shipments`], deliberately: a
+    /// hidden row keeps being polled, because a poll is the most likely source of
+    /// the update that un-hides it.
+    ///
+    /// [`suppress_failed_ambiguous_at`]: crate::config::ShipmentListPolicy::suppress_failed_ambiguous_at
+    /// [`stale_after_days`]: crate::config::ShipmentListPolicy::stale_after_days
     fn list_shipments(
         &self,
         account_id: AccountId,
         include_delivered: bool,
-        suppress_failed_ambiguous_at: u32,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// USER CLEAR: stamp `shipments.cleared_at = at`, taking the row out of
+    /// [`Store::list_shipments`] until something advances its `last_update` past
+    /// that stamp. Returns `false` for an unknown id (or another account's).
+    ///
+    /// IDEMPOTENT, and re-clearing RESTAMPS: a row that was cleared, revived by
+    /// an update, and cleared again must hide against the LATER stamp, so the
+    /// write is unconditional rather than "only if NULL".
+    ///
+    /// There is no `unclear_shipment`, by design. Un-hiding is the comparison in
+    /// the listing, and the events that should un-hide a package (a poll that
+    /// moved it, an email that advanced it) already write `last_update`.
+    fn clear_shipment(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
 
     /// ONE-SHOT REPAIR: re-run shipment detection over every shipment row's
     /// feeder message and delete the rows the current detector no longer yields
@@ -794,6 +828,12 @@ pub trait Store: Send + Sync {
     /// permanent poll failures. Never-polled rows come first, then the
     /// least-recently-polled, so a caller taking a prefix spends its budget
     /// evenly. Sealed rows are structurally absent, as for every shipment read.
+    ///
+    /// DELIBERATELY BLIND TO THE LISTING FILTERS. A row the user cleared, and a
+    /// row hidden as stale, are BOTH still polled — a poll is exactly what
+    /// produces the `last_update` that brings them back, so filtering them here
+    /// would make hiding permanent and silently break revival. Only
+    /// [`Store::list_shipments`] filters. Do not "optimize" this.
     fn list_pollable_shipments(
         &self,
         account_id: AccountId,
@@ -977,7 +1017,12 @@ pub trait Store: Send + Sync {
     /// `marketing` and `shipment_orders` rows (extraction recreates them) and
     /// re-pending any row that ever carried a shipping signal. `shipments` rows
     /// SURVIVE — they are identity-keyed by tracking number and carry
-    /// carrier-poll state no re-run can recover.
+    /// carrier-poll state no re-run can recover — but the ITEM NAMES the reset
+    /// messages contributed are cleared in both shipment tables, by
+    /// `item_name_msg` provenance, exactly as sealing does. A name is a model
+    /// verdict, and re-triage is redoing that verdict; leaving it in place means
+    /// a re-extraction that finds no name (or says it was never a shipment)
+    /// silently keeps the old one forever.
     /// Rule-decided rows (`stage1_model_used='rule'`)
     /// and sealed/sent rows (`'n/a'`) are NEVER touched — rules are authoritative
     /// and sealed mail re-enters no queue. `message_id=None` scopes to the

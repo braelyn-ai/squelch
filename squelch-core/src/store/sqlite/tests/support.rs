@@ -551,8 +551,30 @@ pub(super) fn vec_count_for(store: &SqliteStore, message_id: i64) -> i64 {
     .unwrap()
 }
 
-/// The ambiguous-row suppression cap for listing tests that are NOT about
-/// suppression: `u32::MAX` keeps every row, so the read-side filter can never
-/// perturb a test asking about something else. The suppression tests pass their
-/// own cap.
-pub(super) const KEEP_ALL_SHIPMENTS: u32 = u32::MAX;
+/// The listing policy for shipment tests that are NOT about the read-side
+/// filters: an unreachable failure cap and a disabled staleness window, so
+/// nothing is ever hidden and the filters cannot perturb a test asking about
+/// something else. The suppression, staleness and clear tests build their own.
+pub(super) const KEEP_ALL_SHIPMENTS: crate::config::ShipmentListPolicy =
+    crate::config::ShipmentListPolicy {
+        suppress_failed_ambiguous_at: u32::MAX,
+        stale_after_days: 0,
+    };
+
+/// [`KEEP_ALL_SHIPMENTS`] with a specific ambiguous-suppression cap, for the
+/// tests that ARE about phantom suppression.
+pub(super) fn suppress_at(cap: u32) -> crate::config::ShipmentListPolicy {
+    crate::config::ShipmentListPolicy {
+        suppress_failed_ambiguous_at: cap,
+        ..KEEP_ALL_SHIPMENTS
+    }
+}
+
+/// [`KEEP_ALL_SHIPMENTS`] with a staleness window, for the tests that ARE about
+/// the staleness filter.
+pub(super) fn stale_after(days: u32) -> crate::config::ShipmentListPolicy {
+    crate::config::ShipmentListPolicy {
+        stale_after_days: days,
+        ..KEEP_ALL_SHIPMENTS
+    }
+}

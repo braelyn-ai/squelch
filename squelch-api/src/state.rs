@@ -140,12 +140,12 @@ pub struct ApiState {
     /// is the resting state of every daemon with no carrier credentials — and
     /// the endpoint reports that as `kicked: false` rather than an error.
     pub(crate) shipment_poll: Option<ShipmentPoll>,
-    /// `[carriers] max_failures`, reused as the SUPPRESSION CAP for the shipments
-    /// listing: an ambiguous bare digit-run the carrier has permanently rejected
-    /// this many times has been retired by the poller and is almost certainly a
-    /// retailer item/order id, so the listing stops showing it. Defaults to the
-    /// config default so a hand-built state still filters sensibly.
-    pub(crate) shipment_suppress_failures: u32,
+    /// The READ-SIDE listing policy for `GET /client/shipments`, derived from
+    /// `[carriers]`: the phantom-suppression cap and the staleness window. The
+    /// AGENT DOOR CARRIES THE SAME VALUE (`SquelchServer::with_shipment_policy`),
+    /// so the two doors cannot disagree about which packages exist. Defaults to
+    /// the config default so a hand-built state still filters sensibly.
+    pub(crate) shipment_policy: squelch_core::config::ShipmentListPolicy,
 }
 
 /// What the human door needs to force a carrier pass: the poller's
@@ -332,8 +332,7 @@ impl ApiState {
             ))),
             rule_infer: None,
             shipment_poll: None,
-            shipment_suppress_failures: squelch_core::config::CarriersConfig::default()
-                .max_failures,
+            shipment_policy: squelch_core::config::ShipmentListPolicy::default(),
         }
     }
 
@@ -384,11 +383,22 @@ impl ApiState {
         self
     }
 
-    /// Set the ambiguous-shipment suppression cap from `[carriers] max_failures`.
-    /// See [`ApiState::shipment_suppress_failures`].
-    pub fn with_shipment_suppress_failures(mut self, max_failures: u32) -> Self {
-        self.shipment_suppress_failures = max_failures;
+    /// Set the shipments LISTING policy from `[carriers]`. Pass the SAME value to
+    /// the agent door's `SquelchServer::with_shipment_policy` — the two doors are
+    /// supposed to see the same package list, and once did not.
+    pub fn with_shipment_policy(
+        mut self,
+        policy: squelch_core::config::ShipmentListPolicy,
+    ) -> Self {
+        self.shipment_policy = policy;
         self
+    }
+
+    /// The listing policy this door is serving. Public so the process hosting
+    /// BOTH doors can hand the agent door the human door's own value instead of
+    /// resolving config twice and drifting.
+    pub fn shipment_policy(&self) -> squelch_core::config::ShipmentListPolicy {
+        self.shipment_policy
     }
 
     /// Share the event-notification broadcast so `GET /client/events` wakes
@@ -674,8 +684,8 @@ impl ApiState {
             .with_tracking_base_url(cfg.tracking.base_url.clone())
             // The poller's retirement cap doubles as the listing's suppression
             // cap, so a row the poller gave up on stops being shown at the same
-            // point it stops being polled.
-            .with_shipment_suppress_failures(cfg.carriers.max_failures)
+            // point it stops being polled; the staleness window rides along.
+            .with_shipment_policy(cfg.carriers.list_policy())
             // Rule-disposition inference rides the SAME key/provider the triage
             // stages resolve and the Stage-1 model; no key => `None` => rules
             // that omit a disposition are stored filtered.

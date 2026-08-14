@@ -217,10 +217,14 @@ fn land(
 }
 
 fn row(store: &SqliteStore, acct: i64, number: &str) -> Shipment {
-    // u32::MAX = no ambiguous-row suppression: these tests are about polling,
-    // and several of them deliberately drive `poll_failures` up.
+    // A policy that hides nothing: these tests are about polling, and several of
+    // them deliberately drive `poll_failures` up.
+    let keep_all = squelch_core::config::ShipmentListPolicy {
+        suppress_failed_ambiguous_at: u32::MAX,
+        stale_after_days: 0,
+    };
     store
-        .list_shipments(acct, true, u32::MAX)
+        .list_shipments(acct, true, keep_all)
         .unwrap()
         .into_iter()
         .find(|s| s.tracking_number == number)

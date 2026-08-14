@@ -692,15 +692,58 @@ pub async fn get_shipments(
     // mail, and hand-sealing a message deletes the shipment row it fed
     // (correct_triage), so there is no sealed filtering to apply.
     //
-    // Ambiguous digit-run rows the carrier has permanently rejected up to the
-    // poller's retirement cap ARE filtered — a number no carrier will
-    // acknowledge, in a shape a retailer item id shares, is a phantom. The rows
-    // stay in the store; only this read hides them.
-    let cap = state.shipment_suppress_failures;
+    // The operator's `[carriers]` policy decides the rest: phantom digit-runs the
+    // carrier keeps rejecting, rows nothing has happened to for `stale_after_days`,
+    // and rows the user cleared. Every one of those is a READ-SIDE hide — the rows
+    // stay in the store, keep being polled, and come back on their own the moment
+    // an update lands. The AGENT DOOR carries the same policy value.
+    let policy = state.shipment_policy;
     query(&state, move |store, account_id| {
-        store.list_shipments(account_id, q.include_delivered, cap)
+        store.list_shipments(account_id, q.include_delivered, policy)
     })
     .await
+}
+
+// --- POST /client/shipments/{id}/clear ---------------------------------------
+
+/// "Stop showing me this package." HUMAN DOOR ONLY: writes never go on the agent
+/// door, and this is a statement about what the USER wants to see.
+///
+/// A HIDE, NOT A DELETE, and there is no un-clear endpoint on purpose. The row
+/// stays in the store, keeps being polled, and reappears by itself as soon as
+/// anything advances its `last_update` past the clear stamp — a carrier poll that
+/// moves it, or a new email about it. See [`Store::clear_shipment`].
+///
+/// Idempotent: clearing an already-cleared row RESTAMPS it (a row revived by an
+/// update and cleared again must hide against the later stamp), so a client that
+/// double-taps gets the same 200.
+///
+/// An unknown id is a 404, matching [`set_update_status`]: a path-addressed write
+/// against a row this account does not have is not a success with a `false` in it.
+pub async fn clear_shipment(
+    State(state): State<ApiState>,
+    Path(shipment_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let at = Utc::now();
+    let cleared = store_call(&state, move |store, account_id| {
+        store.clear_shipment(account_id, shipment_id, at)
+    })
+    .await?;
+    if !cleared {
+        return Err(ApiError::not_found());
+    }
+
+    audit_action(
+        &state,
+        "shipment.clear",
+        Some(shipment_id.to_string()),
+        "ok",
+    )
+    .await;
+
+    Ok(Json(
+        json!({ "cleared": true, "shipment_id": shipment_id, "cleared_at": at }),
+    ))
 }
 
 // --- POST /client/shipments/poll --------------------------------------------

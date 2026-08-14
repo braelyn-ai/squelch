@@ -627,6 +627,9 @@ fn migrate_adds_order_ref_and_init_creates_the_orders_staging_table() {
         .collect::<std::result::Result<_, _>>()
         .unwrap();
     assert!(cols.iter().any(|c| c == "order_ref"), "order_ref added");
+    // The user-clear column lands on the same seam, NULL on every historical row
+    // (nobody has cleared anything yet), so no backfill and nothing hidden.
+    assert!(cols.iter().any(|c| c == "cleared_at"), "cleared_at added");
     let staged: i64 = conn
         .query_row("SELECT COUNT(*) FROM shipment_orders", [], |r| r.get(0))
         .unwrap();

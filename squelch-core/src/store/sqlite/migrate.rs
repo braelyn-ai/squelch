@@ -273,6 +273,11 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
 
+    // USER CLEAR. NULL is correct history for every existing row — nobody has
+    // cleared anything yet — and needs no backfill. Read-side only; see the
+    // column comment in schema.sql.
+    add_column_if_missing(conn, "shipments", "cleared_at", "TEXT")?;
+
     // Adding `stage1_model_used` leaves it NULL on every historical row — exactly
     // the Stage-1 queue predicate — so without this backfill the whole mailbox
     // re-classifies through the paid model. Rows already classified or already

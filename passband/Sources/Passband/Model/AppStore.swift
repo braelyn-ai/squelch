@@ -1273,6 +1273,57 @@ final class AppStore {
     /// 10s sitrep poll drives the bands, which change minute to minute).
     private static let zoneTTL: TimeInterval = 45
 
+    /// Dismiss one shipment from the Shipments zone.
+    ///
+    /// OPTIMISTIC, then authoritative: the card leaves the rail on the click,
+    /// because a records rail is polled on a 45s TTL and waiting for the round
+    /// trip would read as the menu item doing nothing. The forced refresh behind
+    /// it is what makes the daemon's list — not this local edit — the thing on
+    /// screen a moment later.
+    ///
+    /// NO UNDO, deliberately: clearing hides a row rather than destroying it, and
+    /// the daemon brings it straight back when the carrier or a new email reports
+    /// something new. A failed request puts the row back instead.
+    func clearShipment(_ id: Int) async {
+        let e = epoch
+        guard let index = zones.shipments.firstIndex(where: { $0.id == id }) else { return }
+        let row = zones.shipments[index]
+        zones.shipments.remove(at: index)
+        do {
+            try await APIClient.shared.clearShipment(id)
+            // The write landed on the OLD account's daemon; this account's rail
+            // knows nothing about it and must not be refreshed on its behalf.
+            guard e == epoch else { return }
+            Analytics.capture("shipment_cleared")
+            pushToast("cleared \(Self.shipmentLabel(row)) · it returns if there's news", .info)
+            await refreshZones(force: true)
+        } catch {
+            guard e == epoch else { return }
+            // Put it back where it was — but only if it is still missing: a zone
+            // refresh can have landed while the request was in flight, and that
+            // list is newer than this snapshot of one row.
+            if !zones.shipments.contains(where: { $0.id == id }) {
+                zones.shipments.insert(row, at: min(index, zones.shipments.count))
+            }
+            if let api = error as? APIError, api.kind == .notFound {
+                // Two ways to earn this: a row this account no longer has, or a
+                // daemon older than the route. The daemon's own word for both is
+                // "not found", which is not a sentence anyone can act on, so say
+                // the one thing that fixes the likelier of the two.
+                pushToast("could not clear that package · update squelchd", .error)
+            } else {
+                pushToast(errText(error, "could not clear that package"), .error)
+            }
+        }
+    }
+
+    /// What a cleared shipment is CALLED in its toast: the card's own title rule
+    /// (item name, else the carrier), kept short enough to sit in one.
+    private static func shipmentLabel(_ s: Shipment) -> String {
+        let trimmed = s.item_name.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? s.carrier.label : trimmed
+    }
+
     // MARK: - the flat mail pages
 
     /// One generous page — the read model is local, so this is cheap.
