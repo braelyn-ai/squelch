@@ -1273,6 +1273,103 @@ final class AppStore {
     /// 10s sitrep poll drives the bands, which change minute to minute).
     private static let zoneTTL: TimeInterval = 45
 
+    /// Dismiss one shipment from the Shipments zone.
+    ///
+    /// OPTIMISTIC, then authoritative: the card leaves the rail on the click,
+    /// because a records rail is polled on a 45s TTL and waiting for the round
+    /// trip would read as the menu item doing nothing. The forced refresh behind
+    /// it is what makes the daemon's list — not this local edit — the thing on
+    /// screen a moment later.
+    ///
+    /// NO UNDO, deliberately: clearing hides a row rather than destroying it, and
+    /// the daemon brings it straight back when the carrier or a new email reports
+    /// something new. A failed request puts the row back instead.
+    func clearShipment(_ id: Int) async {
+        let e = epoch
+        guard let index = zones.shipments.firstIndex(where: { $0.id == id }) else { return }
+        let row = zones.shipments[index]
+        zones.shipments.remove(at: index)
+        do {
+            try await APIClient.shared.clearShipment(id)
+            // The write landed on the OLD account's daemon; this account's rail
+            // knows nothing about it and must not be refreshed on its behalf.
+            guard e == epoch else { return }
+            Analytics.capture("shipment_cleared")
+            pushToast("cleared \(Self.shipmentLabel(row)) · it returns if there's news", .info)
+            await refreshZones(force: true)
+        } catch {
+            guard e == epoch else { return }
+            // Put it back where it was — but only if it is still missing: a zone
+            // refresh can have landed while the request was in flight, and that
+            // list is newer than this snapshot of one row.
+            if !zones.shipments.contains(where: { $0.id == id }) {
+                zones.shipments.insert(row, at: min(index, zones.shipments.count))
+            }
+            if let api = error as? APIError, api.kind == .notFound {
+                // Two ways to earn this: a row this account no longer has, or a
+                // daemon older than the route. The daemon's own word for both is
+                // "not found", which is not a sentence anyone can act on, so say
+                // the one thing that fixes the likelier of the two.
+                pushToast("could not clear that package · update squelchd", .error)
+            } else {
+                pushToast(errText(error, "could not clear that package"), .error)
+            }
+        }
+    }
+
+    /// Ask the daemon to poll every carrier now.
+    ///
+    /// NOTHING IS REFRESHED HERE. The daemon answers before the carrier round
+    /// trips, so a forced zone refresh behind this would repaint the same rows and
+    /// teach the user the button does nothing; the rail's own 45s poll is what
+    /// carries the answers in a few seconds later.
+    ///
+    /// The toast says WHAT WE DID rather than what the carriers will say, because
+    /// those are two different sentences and only the first one is true on a
+    /// daemon with no carrier keys — carrier polling is BYOK, and such a daemon
+    /// runs no poller and does nothing with the kick.
+    func pollShipments() async {
+        do {
+            let kick = try await APIClient.shared.pollShipments()
+            Analytics.capture("shipments_poll_kicked")
+            // A daemon with no carrier credentials answers a normal 200 that
+            // kicked nothing. Saying "checking" there would be a lie the user
+            // cannot see through, since the pass they are waiting on will never
+            // change a single row.
+            if kick.kicked {
+                pushToast("checking \(Self.carrierList(kick.carriers))", .info)
+            } else {
+                pushToast("no carrier keys configured · see docs/SHIPMENTS.md", .info)
+            }
+        } catch {
+            if let api = error as? APIError, api.kind == .notFound {
+                pushToast("this daemon has no carrier polling · update squelchd", .error)
+            } else {
+                pushToast(errText(error, "could not reach the carrier poller"), .error)
+            }
+        }
+    }
+
+    /// The carriers a kick actually reached, as prose. The daemon returns its
+    /// own slugs, so they are labelled through the same `Carrier` vocabulary the
+    /// cards use rather than printed raw.
+    private static func carrierList(_ slugs: [String]) -> String {
+        let names = slugs.map { Carrier(rawValue: $0)?.label ?? $0.uppercased() }
+        switch names.count {
+        case 0: return "the carriers"
+        case 1: return names[0]
+        case 2: return "\(names[0]) and \(names[1])"
+        default: return names.dropLast().joined(separator: ", ") + ", and " + names[names.count - 1]
+        }
+    }
+
+    /// What a cleared shipment is CALLED in its toast: the card's own title rule
+    /// (item name, else the carrier), kept short enough to sit in one.
+    private static func shipmentLabel(_ s: Shipment) -> String {
+        let trimmed = s.item_name.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? s.carrier.label : trimmed
+    }
+
     // MARK: - the flat mail pages
 
     /// One generous page — the read model is local, so this is cheap.

@@ -329,6 +329,22 @@ pub struct Shipment {
     pub thread_id: Option<String>,
     pub first_seen: DateTime<Utc>,
     pub last_update: DateTime<Utc>,
+    /// The carrier's own latest status string, verbatim; `None` until the first
+    /// poll. Present even when it mapped to no `status`, so the client can show
+    /// what the carrier said.
+    pub carrier_status_raw: Option<String>,
+    /// Carrier-estimated delivery; `None` when the carrier gives none.
+    pub eta: Option<DateTime<Utc>>,
+    /// When the package landed, from whichever path saw it first (a delivered
+    /// email or a poll); `None` until it is delivered.
+    pub delivered_at: Option<DateTime<Utc>>,
+    /// Last carrier-API poll ATTEMPT; `None` = never polled.
+    pub last_polled_at: Option<DateTime<Utc>>,
+    /// Consecutive PERMANENT carrier-poll failures (0 until one happens, reset by
+    /// any successful poll). Surfaced because it is EVIDENCE ABOUT THE NUMBER: a
+    /// bare digit-run the carrier keeps rejecting is very likely a retailer item
+    /// or order id that was never a tracking number at all.
+    pub poll_failures: u32,
 }
 
 /// A record of money ALREADY PAID, extracted from NON-SEALED past-transaction

@@ -39,10 +39,19 @@ fn account_email() -> String {
     squelch_core::config::resolve_account_email("me@localhost")
 }
 
+/// The operator's shipments LISTING policy, read from the same config file the
+/// daemon reads. The standalone bin has no `[carriers]` credentials to care
+/// about, but it must still honour `max_failures` / `stale_after_days`: an
+/// agent's package list is supposed to match its user's, and defaulting here
+/// would reintroduce exactly the drift this value exists to remove.
+fn shipment_policy() -> squelch_core::config::ShipmentListPolicy {
+    squelch_core::config::Config::load().carriers.list_policy()
+}
+
 /// Build the server object, so tests can construct it without binding a transport.
 fn build_server() -> anyhow::Result<SquelchServer> {
     let store = Arc::new(SqliteStore::open(db_path())?);
-    SquelchServer::new(store, &account_email())
+    Ok(SquelchServer::new(store, &account_email())?.with_shipment_policy(shipment_policy()))
 }
 
 /// Decide the transport from CLI args and env: `--http [addr]` or
@@ -110,7 +119,12 @@ async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     // Construction errors surface before we bind.
-    let service = streamable_http_service(store, &account_email(), shutdown.child_token())?;
+    let service = streamable_http_service(
+        store,
+        &account_email(),
+        shipment_policy(),
+        shutdown.child_token(),
+    )?;
 
     let router = axum::Router::new().nest_service(HTTP_MCP_PATH, service);
     let listener = tokio::net::TcpListener::bind(addr).await?;

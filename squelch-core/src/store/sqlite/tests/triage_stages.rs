@@ -114,6 +114,289 @@ fn stage1_queue_selects_normal_unrefined_excludes_rule_and_sealed() {
     assert_eq!(q[0].sensitivity, Sensitivity::Normal);
 }
 
+// ---- the SHIPMENTS extractor's own queue --------------------------------
+
+#[test]
+fn ship_extract_queue_keeps_receipt_bearing_rows_and_drops_sealed_and_sent() {
+    let (store, acct) = store();
+
+    // A plain order confirmation with the loose signal -> pending.
+    let plain = triaged_row(acct, "g-ship", "t1", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+
+    // THE WHOLE REASON THIS QUEUE EXISTS: an order confirmation that also
+    // produced a RECEIPT. `extract_queue` drops those, and most order
+    // confirmations are exactly that shape, so it could never serve shipments.
+    let with_receipt = triaged_row(acct, "g-both", "t2", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    store
+        .upsert_receipt(
+            acct,
+            with_receipt,
+            "orders@shop.com",
+            None,
+            &crate::triage::ReceiptInfo {
+                amount: Some(42.0),
+                currency: Some("USD".into()),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    // No shipping signal at ingest -> NULL, never queued.
+    let quiet = triaged_row(acct, "g-quiet", "t3", None, false, Sensitivity::Normal).ingest(&store);
+    // Sealed and sent carry the signal flag but must never queue.
+    let sealed = triaged_row(acct, "g-seal", "t4", None, false, Sensitivity::Sealed)
+        .ship_extract(true)
+        .ingest(&store);
+    let sent = triaged_row(acct, "g-sent", "t5", None, false, Sensitivity::Normal)
+        .is_sent(true)
+        .ship_extract(true)
+        .ingest(&store);
+
+    let q = store.ship_extract_queue(acct, 20).unwrap();
+    let ids: Vec<i64> = q.iter().map(|r| r.message_id).collect();
+    assert_eq!(q.len(), 2, "the two signal-bearing normal rows: {ids:?}");
+    assert!(ids.contains(&plain));
+    assert!(
+        ids.contains(&with_receipt),
+        "a receipt-bearing order confirmation MUST still queue"
+    );
+    assert!(!ids.contains(&quiet), "no shipping signal, no queue");
+    assert!(!ids.contains(&sealed), "sealed mail never reaches an LLM");
+    assert!(!ids.contains(&sent), "the user's own outbox is not tracked");
+    // Queued before Stage-1 ever ran, so the category is still NULL -> "".
+    assert_eq!(q[0].category, "");
+    assert_eq!(q[0].sensitivity, Sensitivity::Normal);
+}
+
+#[test]
+fn ship_extract_mark_removes_the_row_from_the_queue() {
+    let (store, acct) = store();
+    let id = triaged_row(acct, "g-ship", "t1", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    assert_eq!(store.ship_extract_queue(acct, 10).unwrap().len(), 1);
+
+    store
+        .ship_extract_mark(acct, id, "claude-haiku-4-5")
+        .unwrap();
+    assert!(
+        store.ship_extract_queue(acct, 10).unwrap().is_empty(),
+        "a stamped marker takes the row out of the queue"
+    );
+
+    // A sealed row is guarded: the marker never lands on it.
+    let sealed = triaged_row(acct, "g-seal", "t2", None, false, Sensitivity::Sealed).ingest(&store);
+    store.ship_extract_mark(acct, sealed, "stale-skip").unwrap();
+    let conn = store.lock().unwrap();
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT ship_extract_model FROM triage WHERE message_id=?1",
+            params![sealed],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, None, "sensitivity guard holds on the mark");
+}
+
+#[test]
+fn retriage_reset_repends_shipping_rows_and_scrubs_marketing_and_staged_orders() {
+    let (store, acct) = store();
+
+    let shipping = triaged_row(acct, "g-ship", "t1", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    let quiet = triaged_row(acct, "g-quiet", "t2", None, false, Sensitivity::Normal).ingest(&store);
+
+    // The shipments extractor already ruled on the shipping row, and left a
+    // staged order behind; the quiet row picked up a marketing extraction.
+    store.ship_extract_mark(acct, shipping, "claude-x").unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO shipment_orders(account_id, order_ref, item_name, thread_id,
+                                         last_message_id, first_seen, last_update)
+             VALUES(?1, 'ORD-1', 'Anker charger', 't1', ?2, ?3, ?3)",
+            params![acct, shipping, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    }
+    apply_category(&store, acct, quiet, "marketing", false);
+    store
+        .marketing_apply(&crate::store::MarketingApplied {
+            message_id: quiet,
+            account_id: acct,
+            brand: Some("Shop".into()),
+            offer: Some("30% off".into()),
+            discount: None,
+            code: None,
+            expires_at: None,
+            received_at: Utc::now(),
+            extractor_model_used: "m".into(),
+        })
+        .unwrap();
+    assert_eq!(store.marketing_offers(acct, 30, 10).unwrap().len(), 1);
+
+    store.retriage_reset(acct, None, 7).unwrap();
+
+    // The shipping row is PENDING again; the never-signalled row stays NULL —
+    // blanking it would be indistinguishable from "had a signal, un-ruled".
+    let markers = |mid: i64| -> Option<String> {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT ship_extract_model FROM triage WHERE message_id=?1",
+            params![mid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(markers(shipping).as_deref(), Some("pending"));
+    assert_eq!(markers(quiet), None, "a NULL trigger stays NULL");
+    assert_eq!(store.ship_extract_queue(acct, 10).unwrap().len(), 1);
+
+    // Staged orders are re-derivable, so they go...
+    {
+        let conn = store.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shipment_orders WHERE account_id=?1",
+                params![acct],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "staged orders are dropped with the other specialists");
+    }
+    // ...and so does marketing, which the reset used to leave stranded.
+    assert_eq!(
+        store.marketing_offers(acct, 30, 10).unwrap().len(),
+        0,
+        "marketing rows must not survive a re-triage that drops their category"
+    );
+}
+
+#[test]
+fn retriage_reset_keeps_the_shipment_rows_it_cannot_recover() {
+    // `shipments` is identity-keyed by tracking number and carries carrier-poll
+    // state no re-run can rebuild, so unlike every other specialist table it
+    // must SURVIVE a re-triage.
+    use crate::triage::{ShipmentInfo, ShipmentStatus};
+    let (store, acct) = store();
+    let id = triaged_row(acct, "g-ship", "t1", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    store
+        .upsert_shipment(
+            acct,
+            id,
+            &ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: "Anker charger".into(),
+                status: ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+    store.retriage_reset(acct, None, 7).unwrap();
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1,
+        "a tracked package must survive a re-triage"
+    );
+}
+
+/// DEFECT: re-triage cleared the staged orders keyed by `last_message_id` but
+/// left DONATED item names standing. Extraction attaches a name to a shipment
+/// row ANOTHER message feeds and records that in `item_name_msg`; sealing scrubs
+/// those by provenance, and re-triage did not. So a re-extraction that returned
+/// no item name (or said the mail was not a shipment at all) kept showing the old
+/// name forever. Both tables, both scrubbed, and the ROW still survives.
+#[test]
+fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
+    use crate::triage::{ShipmentInfo, ShipmentStatus};
+    let (store, acct) = store();
+
+    // The DONOR is an ordinary LLM-classified row, so it is in the reset scope.
+    let donor = triaged_row(acct, "g-donor", "t1", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    // The FEEDER is rule-decided, so it never resets — which is the whole point:
+    // the rows below survive the reset and must still lose the donated text.
+    let feeder =
+        triaged_row(acct, "g-feeder", "t2", Some(7), true, Sensitivity::Normal).ingest(&store);
+
+    let sid = store
+        .upsert_shipment(
+            acct,
+            feeder,
+            &ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: String::new(),
+                status: ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        // The donation: the donor's extraction named a package another mail feeds.
+        conn.execute(
+            "UPDATE shipments SET item_name='Anker charger', item_name_msg=?2 WHERE id=?1",
+            params![sid, donor],
+        )
+        .unwrap();
+        // The same hole one table over: a staged order the donor named but a
+        // later mail feeds, so the delete-by-`last_message_id` cannot reach it.
+        conn.execute(
+            "INSERT INTO shipment_orders(account_id, order_ref, item_name, item_name_msg,
+                                         thread_id, last_message_id, first_seen, last_update)
+             VALUES(?1, 'ORD-9', 'Anker charger', ?2, 't2', ?3, ?4, ?4)",
+            params![acct, donor, feeder, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    }
+
+    store.retriage_reset(acct, None, 7).unwrap();
+
+    let listed = store
+        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the package itself must survive");
+    assert_eq!(listed[0].item_name, "", "the donated name is gone");
+
+    let conn = store.lock().unwrap();
+    let ship_prov: Option<i64> = conn
+        .query_row(
+            "SELECT item_name_msg FROM shipments WHERE id=?1",
+            params![sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ship_prov, None, "and so is its provenance");
+    let (order_name, order_prov): (String, Option<i64>) = conn
+        .query_row(
+            "SELECT item_name, item_name_msg FROM shipment_orders WHERE account_id=?1",
+            params![acct],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        order_name, "",
+        "the staged order loses the donated name too"
+    );
+    assert_eq!(order_prov, None);
+}
+
 #[test]
 fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
     let (store, acct) = store();

@@ -84,6 +84,17 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         .route("/client/attachments/{id}", get(handlers::get_attachment))
         .route("/client/shipments", get(handlers::get_shipments))
+        // Force a carrier pass. HUMAN DOOR ONLY: the agent door reads the
+        // shipments table and never gets to spend the operator's carrier quota.
+        .route("/client/shipments/poll", post(handlers::poll_shipments_now))
+        // "Stop showing me this package." HUMAN DOOR ONLY, like every write: it
+        // is a statement about what the user wants to see. A read-side hide, not
+        // a delete — the row keeps polling and returns on its own when an update
+        // lands, so there is deliberately no un-clear route to pair with it.
+        .route(
+            "/client/shipments/{id}/clear",
+            post(handlers::clear_shipment),
+        )
         .route("/client/receipts", get(handlers::get_receipts))
         .route("/client/banking", get(handlers::get_banking))
         .route("/client/calendar", get(handlers::get_calendar))

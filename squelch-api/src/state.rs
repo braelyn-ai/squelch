@@ -142,6 +142,28 @@ pub struct ApiState {
     /// `/client/assistant/messages` answers 404 and the app falls back to BYOK.
     /// HUMAN DOOR ONLY: the request spends the tenant's assistant budget.
     pub(crate) assistant: Option<Arc<crate::assistant::AssistantRelay>>,
+    /// The carrier poller's kick handle plus the carriers it was built over,
+    /// behind `POST /client/shipments/poll`. `None` when no poller runs — which
+    /// is the resting state of every daemon with no carrier credentials — and
+    /// the endpoint reports that as `kicked: false` rather than an error.
+    pub(crate) shipment_poll: Option<ShipmentPoll>,
+    /// The READ-SIDE listing policy for `GET /client/shipments`, derived from
+    /// `[carriers]`: the phantom-suppression cap and the staleness window. The
+    /// AGENT DOOR CARRIES THE SAME VALUE (`SquelchServer::with_shipment_policy`),
+    /// so the two doors cannot disagree about which packages exist. Defaults to
+    /// the config default so a hand-built state still filters sensibly.
+    pub(crate) shipment_policy: squelch_core::config::ShipmentListPolicy,
+}
+
+/// What the human door needs to force a carrier pass: the poller's
+/// [`Notify`](tokio::sync::Notify) and the carrier slugs it was built over, so
+/// the response can say WHICH carriers a kick will reach. Cheap to clone, like
+/// every other field on [`ApiState`].
+#[derive(Clone)]
+pub(crate) struct ShipmentPoll {
+    pub(crate) kick: Arc<tokio::sync::Notify>,
+    /// Enabled carrier slugs, sorted and deduplicated at build time.
+    pub(crate) carriers: Arc<[String]>,
 }
 
 /// A fixed-rate token bucket per client address, for the console's
@@ -317,6 +339,8 @@ impl ApiState {
             ))),
             rule_infer: None,
             assistant: None,
+            shipment_poll: None,
+            shipment_policy: squelch_core::config::ShipmentListPolicy::default(),
         }
     }
 
@@ -335,6 +359,54 @@ impl ApiState {
     pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
         self.refresh = Some(refresh);
         self
+    }
+
+    /// Share the carrier poller's kick [`Notify`](tokio::sync::Notify) and the
+    /// carriers it was built over, enabling `POST /client/shipments/poll`. Wire
+    /// the SAME handle the poller handed out
+    /// ([`ShipmentPoller::kick_handle`]), with
+    /// [`ShipmentPoller::enabled_carriers`] as `carriers`.
+    ///
+    /// NOT CALLING THIS IS A SUPPORTED STATE, not a misconfiguration: carrier
+    /// polling is BYOK, so a daemon with no carrier credentials runs no poller
+    /// and the endpoint answers `kicked: false` with an empty carrier list.
+    ///
+    /// The list is sorted and deduplicated here rather than trusted, so the
+    /// response shape does not depend on how the caller assembled it.
+    ///
+    /// [`ShipmentPoller::kick_handle`]: squelch_core::carriers::poller::ShipmentPoller::kick_handle
+    /// [`ShipmentPoller::enabled_carriers`]: squelch_core::carriers::poller::ShipmentPoller::enabled_carriers
+    pub fn with_shipment_poll_kick(
+        mut self,
+        kick: Arc<tokio::sync::Notify>,
+        carriers: Vec<String>,
+    ) -> Self {
+        let mut carriers = carriers;
+        carriers.sort();
+        carriers.dedup();
+        self.shipment_poll = Some(ShipmentPoll {
+            kick,
+            carriers: carriers.into(),
+        });
+        self
+    }
+
+    /// Set the shipments LISTING policy from `[carriers]`. Pass the SAME value to
+    /// the agent door's `SquelchServer::with_shipment_policy` — the two doors are
+    /// supposed to see the same package list, and once did not.
+    pub fn with_shipment_policy(
+        mut self,
+        policy: squelch_core::config::ShipmentListPolicy,
+    ) -> Self {
+        self.shipment_policy = policy;
+        self
+    }
+
+    /// The listing policy this door is serving. Public so the process hosting
+    /// BOTH doors can hand the agent door the human door's own value instead of
+    /// resolving config twice and drifting.
+    pub fn shipment_policy(&self) -> squelch_core::config::ShipmentListPolicy {
+        self.shipment_policy
     }
 
     /// Share the event-notification broadcast so `GET /client/events` wakes
@@ -640,6 +712,10 @@ impl ApiState {
             )
             .with_tracking_base_url(cfg.tracking.base_url.clone())
             .with_console_allow_insecure_cookie(cfg.console.allow_insecure_cookie)
+            // The poller's retirement cap doubles as the listing's suppression
+            // cap, so a row the poller gave up on stops being shown at the same
+            // point it stops being polled; the staleness window rides along.
+            .with_shipment_policy(cfg.carriers.list_policy())
             // Rule-disposition inference rides the SAME key/provider the triage
             // stages resolve and the Stage-1 model; no key => `None` => rules
             // that omit a disposition are stored filtered.

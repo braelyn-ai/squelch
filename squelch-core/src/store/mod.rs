@@ -11,7 +11,8 @@ pub use search_query::{SearchFilter, parse_search_query};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
-use crate::triage::{CalendarInfo, DeadlineHit, ReceiptInfo, ShipmentInfo};
+use crate::triage::extract::shipments::ShipmentsApplied;
+use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, Receipt,
@@ -114,6 +115,14 @@ pub struct TriagedMessage {
     /// A detected shipment/package. Runs independently of the triage tier, and
     /// only ever `Some` for non-sealed mail.
     pub shipment: Option<ShipmentInfo>,
+    /// The LOOSE shipping signal
+    /// ([`has_loose_shipping_signal`](crate::triage::shipment::has_loose_shipping_signal)):
+    /// `true` queues the row for the shipments EXTRACTOR by stamping
+    /// `triage.ship_extract_model='pending'`. Much wider than `shipment`, which
+    /// needs a tracking number the regex could attribute — an order confirmation
+    /// with neither sets this and leaves `shipment` `None`. Always `false` for
+    /// sealed and sent mail, exactly like `shipment`.
+    pub ship_extract: bool,
     /// A detected receipt (money already paid). Independent of the tier AND of
     /// shipment detection — one mail can be both. Only ever `Some` for non-sealed
     /// mail. Ingest AUTO-RESOLVES the triage row (`status='done'`) so a receipt
@@ -741,6 +750,11 @@ pub trait Store: Send + Sync {
     /// refreshing `last_update`/`last_message_id` and adopting a longer
     /// `item_name`.
     ///
+    /// An update the state machine ACCEPTS also resets `poll_failures` to 0 —
+    /// mail is the second witness that un-retires a shipment the carrier has
+    /// been rejecting, since the only other one (a successful poll) is
+    /// unreachable once the row has left the poll queue.
+    ///
     /// SECURITY: callers run this ONLY for non-sealed mail, so `shipments` holds
     /// no sealed rows by construction and reads need no sealed join.
     fn upsert_shipment(
@@ -754,11 +768,132 @@ pub trait Store: Send + Sync {
     /// List shipments for the account, most-recently-updated first;
     /// `include_delivered=false` restricts to en-route (status != 'delivered').
     /// Sealed rows are structurally absent, so no sealed filter is required.
+    ///
+    /// `policy` carries the three READ-SIDE hides, all of which leave the row
+    /// live in the table and all of which reverse themselves:
+    ///
+    /// * [`suppress_failed_ambiguous_at`] hides rows whose tracking number is an
+    ///   AMBIGUOUS SHAPE (anything that does not identify its own carrier — see
+    ///   [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape))
+    ///   AND which the carrier has permanently rejected that many times: a number
+    ///   no carrier will acknowledge, in a shape a retailer item/order id shares,
+    ///   is a phantom. One successful poll zeroes the counter and brings it back.
+    ///   Callers pass the carrier poller's retirement cap; 0 would hide every
+    ///   ambiguous row.
+    /// * [`stale_after_days`] hides rows whose `last_update` is older than that.
+    ///   `last_update` moves ONLY on a user-visible change, so "stale" is
+    ///   literally "nothing has happened to this package in N days". 0 disables.
+    /// * `cleared_at` hides a row the user cleared, but ONLY while
+    ///   `last_update <= cleared_at`. There is no un-clear: the comparison IS the
+    ///   revival, so the first update to land after the clear brings the row back
+    ///   with no second write anywhere.
+    ///
+    /// NONE of this touches [`Store::list_pollable_shipments`], deliberately: a
+    /// hidden row keeps being polled, because a poll is the most likely source of
+    /// the update that un-hides it.
+    ///
+    /// [`suppress_failed_ambiguous_at`]: crate::config::ShipmentListPolicy::suppress_failed_ambiguous_at
+    /// [`stale_after_days`]: crate::config::ShipmentListPolicy::stale_after_days
     fn list_shipments(
         &self,
         account_id: AccountId,
         include_delivered: bool,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// USER CLEAR: stamp `shipments.cleared_at = at`, taking the row out of
+    /// [`Store::list_shipments`] until something advances its `last_update` past
+    /// that stamp. Returns `false` for an unknown id (or another account's).
+    ///
+    /// IDEMPOTENT, and re-clearing RESTAMPS: a row that was cleared, revived by
+    /// an update, and cleared again must hide against the LATER stamp, so the
+    /// write is unconditional rather than "only if NULL".
+    ///
+    /// There is no `unclear_shipment`, by design. Un-hiding is the comparison in
+    /// the listing, and the events that should un-hide a package (a poll that
+    /// moved it, an email that advanced it) already write `last_update`.
+    fn clear_shipment(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// ONE-SHOT REPAIR: re-run shipment detection over every shipment row's
+    /// feeder message and delete the rows the current detector no longer yields
+    /// that number from, returning how many were deleted.
+    ///
+    /// EXACTLY ONCE PER ACCOUNT, and the store enforces it: the pass records its
+    /// own done-flag in the SAME TRANSACTION as its deletions, and every later
+    /// call returns 0 without judging anything. Callers do not gate it. The
+    /// atomicity matters because the keep test is the REGEX detector — rows the
+    /// shipments extractor wrote are precisely the ones it cannot reproduce, so a
+    /// pass that ran but went unrecorded would reap them on the next start.
+    ///
+    /// Rows with no feeder message are left alone, as are rows carrying carrier
+    /// evidence (a raw status or any poll attempt) or extractor evidence (an
+    /// order reference): the one-shot exists to reap pre-tightening regex
+    /// phantoms and nothing else.
+    fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64>;
+
+    /// Shipments worth a carrier-API poll: not yet delivered, on a carrier that
+    /// HAS an API ("ups" | "usps" | "fedex" | "dhl" — Amazon and "unknown" have
+    /// none), first seen at or after `min_first_seen`, and under `max_failures`
+    /// permanent poll failures. Never-polled rows come first, then the
+    /// least-recently-polled, so a caller taking a prefix spends its budget
+    /// evenly. Sealed rows are structurally absent, as for every shipment read.
+    ///
+    /// DELIBERATELY BLIND TO THE LISTING FILTERS. A row the user cleared, and a
+    /// row hidden as stale, are BOTH still polled — a poll is exactly what
+    /// produces the `last_update` that brings them back, so filtering them here
+    /// would make hiding permanent and silently break revival. Only
+    /// [`Store::list_shipments`] filters. Do not "optimize" this.
+    fn list_pollable_shipments(
+        &self,
+        account_id: AccountId,
+        min_first_seen: DateTime<Utc>,
+        max_failures: u32,
+    ) -> Result<Vec<crate::types::Shipment>>;
+
+    /// Apply one carrier-API result to a shipment, returning whether `status`
+    /// changed (`false` for an unknown id). The carrier is ground truth, so the
+    /// status is REPLACED through
+    /// [`ShipmentStatus::reconcile_carrier`](crate::triage::ShipmentStatus::reconcile_carrier)
+    /// rather than ratcheted — except when `track.status` is `None`, which
+    /// leaves it untouched. `carrier_status_raw`/`eta` always take the carrier's
+    /// values, `last_polled_at` always advances, and `poll_failures` resets;
+    /// `delivered_at` fills once and is never overwritten. `last_update` moves
+    /// ONLY when something user-visible changed, so polling does not churn the
+    /// Sitrep sort order.
+    ///
+    /// `last_message_id` is NEVER touched — no message backs a poll, so the
+    /// row's click target stays the last accepted email.
+    fn apply_carrier_track(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        track: &CarrierTrack,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// Record a poll attempt that produced no track. `last_polled_at` always
+    /// advances (so the shipment rotates through the queue); `poll_failures`
+    /// bumps only for a PERMANENT failure — an unknown or expired tracking
+    /// number, not a transient network or rate-limit error.
+    ///
+    /// EVERY ANSWERED ATTEMPT IS RECORDED HERE, permanent or not. A row asked
+    /// about and then left unstamped keeps the head of a queue that sorts
+    /// never-polled first, so it is polled again, and again, ahead of everything
+    /// behind it — one deterministically-failing number would own a carrier's
+    /// entire throughput. Whether the failure counts is the caller's judgment
+    /// (see [`crate::carriers::poller`]); that it happened is not.
+    fn record_poll_outcome(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        polled_at: DateTime<Utc>,
+        permanent_failure: bool,
+    ) -> Result<()>;
 
     /// Upsert a receipt keyed by `(account_id, message_id)` — a re-ingest of the
     /// same message updates in place (idempotent).
@@ -817,9 +952,92 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ExtractQueued>>;
 
+    /// Up to `limit` rows the SHIPMENTS extractor still owes a verdict:
+    /// NON-SEALED, non-sent rows with `ship_extract_model='pending'`, newest
+    /// first. Deliberately NOT [`Store::extract_queue`] — that one routes on
+    /// `triage.category` (no shipping category exists) and excludes
+    /// receipt-bearing messages, which most order confirmations are. The trigger
+    /// is stamped at INGEST from a loose shipping signal, so a queued row may
+    /// still carry a NULL category, surfaced here as `""`.
+    fn ship_extract_queue(&self, account_id: AccountId, limit: usize)
+    -> Result<Vec<ExtractQueued>>;
+
+    /// Stamp `triage.ship_extract_model` with a PROCESSED marker (the extractor
+    /// model id, or a `'stale-skip'` / `'apply-failed'` / `'extract-failed'`
+    /// sentinel), taking the row out of [`Store::ship_extract_queue`]. Guarded by
+    /// `sensitivity='normal'`, exactly like [`Store::extract_mark_processed`].
+    fn ship_extract_mark(&self, account_id: AccountId, message_id: i64, marker: &str)
+    -> Result<()>;
+
+    /// Apply one SHIPMENTS-EXTRACTOR verdict IN ONE TRANSACTION: stamp
+    /// `triage.ship_extract_model` (leaving [`Store::ship_extract_queue`]), then
+    /// reconcile the package IDENTITY the model found against what the regex
+    /// detector already wrote. Returns whether a tracked record was written or
+    /// updated — a `shipments` row, or a staged `shipment_orders` row.
+    ///
+    /// The marker is stamped FIRST, guarded by `sensitivity='normal'`. If that
+    /// guard matches nothing the message was SEALED mid-pass, and the call writes
+    /// NOTHING derived from it and returns `Ok(false)` — the same TOCTOU rule as
+    /// [`Store::stage1_apply`].
+    ///
+    /// DELETION RULE — a row is deleted ONLY on POSITIVE EVIDENCE that it is a
+    /// phantom: the extractor named a DIFFERENT tracking number for this mail, or
+    /// declared it not a shipment at all. An extraction that names NO number is
+    /// silence, not a verdict, and deletes nothing — the detector that minted the
+    /// row already passed a carrier-signal gate, a tracking-label context gate and
+    /// an item/order hard negative, while the extractor drops a number it sees
+    /// echoed in the order field.
+    ///
+    /// Every delete is then bounded three ways: to rows THIS message CREATED
+    /// (`shipments.created_by_message_id`, immutable — `last_message_id` moves to
+    /// the latest feeder and would put another mail's package in range), to
+    /// AMBIGUOUS tracking SHAPES only (see
+    /// [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape)),
+    /// so a model false negative can never destroy a real `1Z…` / `TBA…` / IMpb
+    /// package, and NEVER to a row a carrier has answered about or been polled
+    /// for. Then, by which identity the model found:
+    ///
+    /// * TRACKING NUMBER — upsert the shipment (status still flows through
+    ///   [`ShipmentStatus::merge`](crate::triage::ShipmentStatus::merge), so a
+    ///   delivered package never walks back), overwrite `item_name` with the
+    ///   extractor's (it beats the upsert's longer-name-wins heuristic, which
+    ///   otherwise keeps regex junk), record `order_ref` with its merchant, and
+    ///   PROMOTE any staged `shipment_orders` row under that reference — donating
+    ///   its item name, and that name's PROVENANCE, if the shipment has none —
+    ///   then delete it.
+    /// * ORDER REFERENCE ONLY — adopt the item name onto the shipment already
+    ///   carrying that reference, or STAGE the purchase in `shipment_orders`
+    ///   until a ship notice arrives with a number.
+    /// * NEITHER — name adoption only, and only when the thread holds exactly one
+    ///   shipment and that row has no name. Status, `last_message_id` and
+    ///   `last_update` are never touched: a mail with no identity has no claim on
+    ///   a row's lifecycle.
+    ///
+    /// ORDER REFERENCES ARE MERCHANT-SCOPED. "Order #1042" is unique only within
+    /// the shop that issued it, so both the `shipments` lookup and the staging key
+    /// pair it with `order_merchant`, the registrable domain of the feeding
+    /// message's sender. Where several rows still match (an order that split into
+    /// two packages), the name is donated to NEITHER — ambiguous identity does not
+    /// guess.
+    ///
+    /// `last_message_id` is only ever set by the tracking-number upsert, always to
+    /// a real message id — the seal-time delete keys on it — and every item-name
+    /// write stamps `item_name_msg`, so sealing scrubs a donated name even from a
+    /// row another message feeds.
+    fn shipments_extract_apply(&self, applied: &ShipmentsApplied) -> Result<bool>;
+
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows
-    /// so they re-enter the Stage-1 queue, deleting their stale `banking` rows
-    /// (extraction recreates them). Rule-decided rows (`stage1_model_used='rule'`)
+    /// so they re-enter the Stage-1 queue, deleting their stale `banking`,
+    /// `marketing` and `shipment_orders` rows (extraction recreates them) and
+    /// re-pending any row that ever carried a shipping signal. `shipments` rows
+    /// SURVIVE — they are identity-keyed by tracking number and carry
+    /// carrier-poll state no re-run can recover — but the ITEM NAMES the reset
+    /// messages contributed are cleared in both shipment tables, by
+    /// `item_name_msg` provenance, exactly as sealing does. A name is a model
+    /// verdict, and re-triage is redoing that verdict; leaving it in place means
+    /// a re-extraction that finds no name (or says it was never a shipment)
+    /// silently keeps the old one forever.
+    /// Rule-decided rows (`stage1_model_used='rule'`)
     /// and sealed/sent rows (`'n/a'`) are NEVER touched — rules are authoritative
     /// and sealed mail re-enters no queue. `message_id=None` scopes to the
     /// trailing `days` of inbound mail; `Some(id)` to that one message.

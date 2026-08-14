@@ -164,6 +164,67 @@ impl SqliteStore {
         Ok(out)
     }
 
+    pub(super) fn ship_extract_queue(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<ExtractQueued>> {
+        let conn = self.lock()?;
+        // Same projection as `extract_queue`, DIFFERENT predicate — and
+        // deliberately not that method with another category list. `extract_queue`
+        // routes on `triage.category` (no shipping category exists) and excludes
+        // receipt-bearing messages, which most order confirmations are; both would
+        // silently empty this queue.
+        //
+        // COALESCE on the category because the trigger is stamped at INGEST: a row
+        // can queue here before Stage-1 ever assigns a category, and
+        // `ExtractQueued.category` is a `String`.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject, m.body,
+                    COALESCE(t.category, ''), t.sensitivity, m.received_at
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1
+               AND t.ship_extract_model = 'pending'
+               AND t.sensitivity = 'normal'
+               AND m.is_sent = 0
+             ORDER BY m.received_at DESC
+             LIMIT ?2",
+        )?;
+        let out = stmt
+            .query_map(params![account_id, limit as i64], |r| {
+                Ok(ExtractQueued {
+                    message_id: r.get(0)?,
+                    account_id,
+                    thread_id: r.get(1)?,
+                    from_addr: r.get(2)?,
+                    from_name: r.get(3)?,
+                    subject: r.get(4)?,
+                    body: r.get(5)?,
+                    category: r.get(6)?,
+                    sensitivity: Sensitivity::parse(&r.get::<_, String>(7)?),
+                    received_at: dt(r, 8)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    pub(super) fn ship_extract_mark(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        marker: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE triage SET ship_extract_model = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            params![message_id, account_id, marker],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn retriage_reset(
         &self,
         account_id: AccountId,
@@ -186,9 +247,15 @@ impl SqliteStore {
             Some(id) => id.to_string(),
             None => cutoff,
         };
+        // The shipments trigger is NOT a model marker to clear: NULL means "no
+        // shipping signal at ingest", and blanking it would be indistinguishable
+        // from that. Only a row that EVER carried a signal is re-pended; a NULL
+        // stays NULL and re-enters nothing.
         let update = format!(
             "UPDATE triage SET stage1_model_used = NULL, model_used = NULL,
-                    needs_stage2 = 0, extractor_model_used = NULL
+                    needs_stage2 = 0, extractor_model_used = NULL,
+                    ship_extract_model = CASE
+                        WHEN ship_extract_model IS NOT NULL THEN 'pending' ELSE NULL END
              WHERE account_id = ?1
                AND COALESCE(sensitivity, 'normal') = 'normal'
                AND COALESCE(stage1_model_used, '') NOT IN ('rule', 'n/a', 'human')
@@ -198,19 +265,52 @@ impl SqliteStore {
                )"
         );
         let n = conn.execute(&update, rusqlite::params![account_id, scope_param])?;
-        // Drop stale specialist rows; re-extraction recreates them, possibly
-        // under a different category verdict.
-        let del = format!(
-            "DELETE FROM banking
-             WHERE account_id = ?1
-               AND message_id IN (
-                   SELECT t.message_id FROM triage t
-                   JOIN messages m ON m.id = t.message_id
-                   WHERE t.account_id = ?1 AND t.stage1_model_used IS NULL
-                     AND m.is_sent = 0 AND {scope_sql}
-               )"
+        // The rows the UPDATE just reset (their Stage-1 marker is now NULL),
+        // reused by every specialist cleanup below.
+        let reset_scope = format!(
+            "SELECT t.message_id FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1 AND t.stage1_model_used IS NULL
+               AND m.is_sent = 0 AND {scope_sql}"
         );
-        conn.execute(&del, rusqlite::params![account_id, scope_param])?;
+        // Drop stale specialist rows; re-extraction recreates them, possibly
+        // under a different category verdict. MARKETING is here for the same
+        // reason banking is — it was missing, so re-triage left its rows behind
+        // pointing at a category the row no longer has.
+        for table in ["banking", "marketing"] {
+            let del = format!(
+                "DELETE FROM {table}
+                 WHERE account_id = ?1 AND message_id IN ({reset_scope})"
+            );
+            conn.execute(&del, rusqlite::params![account_id, scope_param])?;
+        }
+        // Staged orders too: they are keyed by the retailer's order reference,
+        // not by a tracking number, so unlike `shipments` they carry no
+        // carrier-poll state worth preserving and the re-run recreates them.
+        // `shipments` rows are deliberately NOT deleted here — identity-keyed and
+        // poll-bearing, they outlive any one email.
+        let del_orders = format!(
+            "DELETE FROM shipment_orders
+             WHERE account_id = ?1 AND last_message_id IN ({reset_scope})"
+        );
+        conn.execute(&del_orders, rusqlite::params![account_id, scope_param])?;
+        // AND THE NAMES THOSE MESSAGES MERELY DONATED, in both tables. The
+        // `shipments` row itself survives (identity-keyed, poll-bearing), but its
+        // `item_name` is mail-derived and three extractor paths write one onto a
+        // row a DIFFERENT message feeds — which is why `item_name_msg` records
+        // whose extraction supplied it. Without this, a re-extraction that finds
+        // no item name, or decides the mail was never a shipment, leaves the OLD
+        // name on the card forever: re-triage is supposed to redo the verdict,
+        // not preserve half of it. Scrubbing by provenance is exact, and matches
+        // what sealing already does in `feedback.rs` — only scoped to the reset
+        // set rather than to one message.
+        for table in ["shipments", "shipment_orders"] {
+            let scrub = format!(
+                "UPDATE {table} SET item_name = '', item_name_msg = NULL
+                 WHERE account_id = ?1 AND item_name_msg IN ({reset_scope})"
+            );
+            conn.execute(&scrub, rusqlite::params![account_id, scope_param])?;
+        }
         Ok(n as u64)
     }
 

@@ -691,10 +691,84 @@ pub async fn get_shipments(
     // The shipments table holds no sealed rows: detection never runs on sealed
     // mail, and hand-sealing a message deletes the shipment row it fed
     // (correct_triage), so there is no sealed filtering to apply.
+    //
+    // The operator's `[carriers]` policy decides the rest: phantom digit-runs the
+    // carrier keeps rejecting, rows nothing has happened to for `stale_after_days`,
+    // and rows the user cleared. Every one of those is a READ-SIDE hide — the rows
+    // stay in the store, keep being polled, and come back on their own the moment
+    // an update lands. The AGENT DOOR carries the same policy value.
+    let policy = state.shipment_policy;
     query(&state, move |store, account_id| {
-        store.list_shipments(account_id, q.include_delivered)
+        store.list_shipments(account_id, q.include_delivered, policy)
     })
     .await
+}
+
+// --- POST /client/shipments/{id}/clear ---------------------------------------
+
+/// "Stop showing me this package." HUMAN DOOR ONLY: writes never go on the agent
+/// door, and this is a statement about what the USER wants to see.
+///
+/// A HIDE, NOT A DELETE, and there is no un-clear endpoint on purpose. The row
+/// stays in the store, keeps being polled, and reappears by itself as soon as
+/// anything advances its `last_update` past the clear stamp — a carrier poll that
+/// moves it, or a new email about it. See [`Store::clear_shipment`].
+///
+/// Idempotent: clearing an already-cleared row RESTAMPS it (a row revived by an
+/// update and cleared again must hide against the later stamp), so a client that
+/// double-taps gets the same 200.
+///
+/// An unknown id is a 404, matching [`set_update_status`]: a path-addressed write
+/// against a row this account does not have is not a success with a `false` in it.
+pub async fn clear_shipment(
+    State(state): State<ApiState>,
+    Path(shipment_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let at = Utc::now();
+    let cleared = store_call(&state, move |store, account_id| {
+        store.clear_shipment(account_id, shipment_id, at)
+    })
+    .await?;
+    if !cleared {
+        return Err(ApiError::not_found());
+    }
+
+    audit_action(
+        &state,
+        "shipment.clear",
+        Some(shipment_id.to_string()),
+        "ok",
+    )
+    .await;
+
+    Ok(Json(
+        json!({ "cleared": true, "shipment_id": shipment_id, "cleared_at": at }),
+    ))
+}
+
+// --- POST /client/shipments/poll --------------------------------------------
+
+/// Poke the carrier poller to run a pass NOW, the shipments-tracker sibling of
+/// [`refresh_now`]. Fire-and-forget: it does not wait for the carrier round
+/// trips, and the kick does NOT bypass per-carrier cooldowns, budgets or
+/// `min_interval` — a user mashing refresh cannot spend a daily cap or earn a
+/// 429.
+///
+/// `kicked: false` with an empty `carriers` is a 200 and a NORMAL answer, not an
+/// error: carrier polling is BYOK, so a daemon with no carrier credentials runs
+/// no poller at all. The client reads the same two fields either way and can
+/// hide the button when the list is empty.
+///
+/// A READ-path trigger, like `refresh` — no write scope, no mutation, nothing to
+/// audit.
+pub async fn poll_shipments_now(State(state): State<ApiState>) -> impl IntoResponse {
+    match &state.shipment_poll {
+        Some(poll) => {
+            poll.kick.notify_one();
+            Json(json!({ "kicked": true, "carriers": &poll.carriers[..] }))
+        }
+        None => Json(json!({ "kicked": false, "carriers": [] })),
+    }
 }
 
 // --- GET /client/receipts ---------------------------------------------------

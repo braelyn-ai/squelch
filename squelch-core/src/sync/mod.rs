@@ -27,7 +27,7 @@ use crate::sync::ingest::{
     RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
 };
 use crate::triage::events;
-use crate::triage::extract::{self, banking, marketing};
+use crate::triage::extract::{self, CategoryExtractor, RowAction, banking, marketing, shipments};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
@@ -91,6 +91,19 @@ enum IngestOrigin {
 /// WITHOUT a model call, keeping its Stage-1 values, so it neither spends budget
 /// nor sits queued forever.
 const STALE_SKIP_MODEL: &str = "stale-skip";
+
+/// The SHIPMENTS extractor's own stale cutoff, from `carriers.max_age_days`.
+///
+/// Deliberately NOT [`PassSetup::stale_cutoff`], which every other pass shares:
+/// that one is the Stage-2 max age (a week), and a week-old ceiling would
+/// stale-skip most of the backfill the shipments trigger exists to catch — a
+/// package ordered three weeks ago is still in flight, and the carrier poller
+/// tracks it for `carriers.max_age_days`. ONE horizon for the whole shipments
+/// feature, so a row the poller would still chase can never have been skipped
+/// unread by the extractor.
+fn ship_stale_cutoff(now: DateTime<Utc>, carrier_max_age_days: u32) -> DateTime<Utc> {
+    now - ChronoDuration::days(carrier_max_age_days as i64)
+}
 
 /// Reconnect / retry backoff bounds for the outer driver loop.
 const BACKOFF_START: Duration = Duration::from_secs(2);
@@ -1554,18 +1567,31 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// Run one SPECIALIST-EXTRACTOR pass over rows whose FINAL category has a
-    /// registered extractor — hence AFTER both stage passes. Per row: sealed
-    /// guard, stale skip, then check + increment the SHARED Stage-1 daily budget
-    /// (extractors run on the Stage-1 model and share its cap) before
-    /// dispatching. Token usage bills to the extractor's OWN ledger category.
-    /// Budget exhaustion defers rows without loss; per-row failures are logged
-    /// redacted and never crash the sync loop. No-op when there is no API key.
+    /// Run one SPECIALIST-EXTRACTOR pass — hence AFTER both stage passes.
+    ///
+    /// TWO SOURCES, run as two sequential sections, deliberately not one SQL
+    /// union: they select on different predicates (a final LLM `category` vs the
+    /// ingest-stamped `ship_extract_model='pending'` trigger), stamp different
+    /// marker columns, and age rows out on different clocks — and one message may
+    /// legitimately appear in both (an order confirmation is a receipt-bearing
+    /// marketing mail as often as not).
+    ///   1. CATEGORY-ROUTED — banking and marketing, via
+    ///      [`Store::extract_queue`](crate::store::Store::extract_queue).
+    ///   2. SHIPMENTS — the trigger queue
+    ///      ([`Store::ship_extract_queue`](crate::store::Store::ship_extract_queue)).
+    ///
+    /// Per row in either: sealed guard, stale skip, then check + increment the
+    /// SHARED Stage-1 daily budget (extractors run on the Stage-1 model and share
+    /// its cap) before dispatching. Token usage bills to the extractor's OWN
+    /// ledger category. Budget exhaustion defers rows without loss; per-row
+    /// failures are logged redacted and never crash the sync loop. No-op when
+    /// there is no API key.
+    ///
+    /// `batch_per_cycle` is PER SOURCE, so a tick can take up to that many
+    /// category rows AND that many shipment rows. That is not a doubled budget:
+    /// the shared Stage-1 daily cap is the real spend bound, and the batch size
+    /// only decides how fast a backlog drains.
     async fn extract_pass(&self) {
-        let categories = extract::extractable_categories();
-        if categories.is_empty() {
-            return;
-        }
         let Some(PassSetup {
             api_key,
             provider,
@@ -1583,51 +1609,69 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let cfg = &self.config.stage1;
         let global_daily_cap = caps.stage1_global_daily_cap.unwrap_or(cfg.global_daily_cap);
 
-        let queued = Self::read_queue(
-            self.store
-                .extract_queue(self.account_id, &categories, cfg.batch_per_cycle),
-            "extract",
-        );
-        if queued.is_empty() {
-            return;
-        }
-
         let mut extracted = 0usize;
         let mut skipped = 0usize;
+        let mut ship_extracted = 0usize;
+        let mut ship_skipped = 0usize;
         let mut in_tok = 0u64;
         let mut out_tok = 0u64;
 
+        // ---- SOURCE 1: the CATEGORY-ROUTED specialists ---------------------
+        let categories = extract::extractable_categories();
+        let queued = if categories.is_empty() {
+            Vec::new()
+        } else {
+            Self::read_queue(
+                self.store
+                    .extract_queue(self.account_id, &categories, cfg.batch_per_cycle),
+                "extract",
+            )
+        };
+
+        // Set when a specialist reports a bad credential. The two sources below
+        // share one resolved key, so a failure in the first is a failure in the
+        // second: without this the shipments queue would spend the whole daily
+        // cap re-proving the same misconfiguration.
+        let mut auth_failed = false;
+
         for row in &queued {
-            // SEALED GUARD: the queue already excludes sealed rows in SQL (they
-            // carry a NULL category); re-check anyway (docs/SECURITY.md).
-            if let Err(e) = extract::extract_sealed_guard(row) {
-                eprintln!("squelch: extract sealed guard tripped ({e}); skipping row");
-                continue;
-            }
-
-            // SKIP-STALE: mark extracted WITHOUT a model call, so an old row
-            // neither spends budget nor sits queued forever.
-            if row.received_at < stale_cutoff {
-                let _ = self.store.extract_mark_processed(
-                    self.account_id,
-                    row.message_id,
-                    STALE_SKIP_MODEL,
-                );
-                skipped += 1;
-                continue;
-            }
-
-            // A row whose category has no handler is marked processed so it
-            // cannot loop.
-            if !banking::CATEGORIES.contains(&row.category.as_str()) {
-                let _ = self.store.extract_mark_processed(
-                    self.account_id,
-                    row.message_id,
-                    "skip-no-extractor",
-                );
-                skipped += 1;
-                continue;
-            }
+            // ONE ORDERED DECISION per row — sealed guard (the queue already
+            // excludes sealed rows in SQL; re-check anyway, docs/SECURITY.md),
+            // then the stale skip, then the extractor lookup. It lives in
+            // `route_extract_row` so a new specialist cannot be added behind a
+            // guard that does not know about it.
+            let extractor = match extract::route_extract_row(row, stale_cutoff) {
+                RowAction::Sealed => {
+                    // Re-run the guard purely to log its redacted message.
+                    if let Err(e) = extract::extract_sealed_guard(row) {
+                        eprintln!("squelch: extract sealed guard tripped ({e}); skipping row");
+                    }
+                    continue;
+                }
+                // SKIP-STALE: mark extracted WITHOUT a model call, so an old row
+                // neither spends budget nor sits queued forever.
+                RowAction::Stale => {
+                    let _ = self.store.extract_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        STALE_SKIP_MODEL,
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                // A row whose category has no handler is marked processed so it
+                // cannot loop.
+                RowAction::NoExtractor => {
+                    let _ = self.store.extract_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        "skip-no-extractor",
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                RowAction::Run(extractor) => extractor,
+            };
 
             // SHARED Stage-1 global budget. Once hit, every remaining row this
             // cycle stays queued, unstamped.
@@ -1640,107 +1684,251 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
             // ROUTE BY CATEGORY: each specialist owns its own prompt, schema and
             // ledger line, so the row's category decides which one runs.
-            if marketing::CATEGORIES.contains(&row.category.as_str()) {
-                match marketing::classify(&self.http, url, api_key, cfg, provider, row).await {
-                    Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
-                        if let Some(u) = usage {
-                            in_tok += u.input_tokens;
-                            out_tok += u.output_tokens;
-                            if let Err(e) = self.store.extract_bump_usage(
-                                self.account_id,
-                                &day,
-                                marketing::LEDGER_CATEGORY,
-                                u.into(),
-                            ) {
-                                eprintln!("squelch: extract usage ledger bump failed ({e})");
+            match extractor {
+                CategoryExtractor::Marketing => {
+                    match marketing::classify(&self.http, url, api_key, cfg, provider, row).await {
+                        Ok(marketing::ExtractOutcome::Ok(out, usage)) => {
+                            if let Some(u) = usage {
+                                in_tok += u.input_tokens;
+                                out_tok += u.output_tokens;
+                                if let Err(e) = self.store.extract_bump_usage(
+                                    self.account_id,
+                                    &day,
+                                    marketing::LEDGER_CATEGORY,
+                                    u.into(),
+                                ) {
+                                    eprintln!("squelch: extract usage ledger bump failed ({e})");
+                                }
+                            }
+                            let applied = marketing::apply_result(row, &out, &cfg.model);
+                            if let Err(e) = self.store.marketing_apply(&applied) {
+                                // The call is already paid for: mark processed rather
+                                // than re-buying it every cycle.
+                                eprintln!(
+                                    "squelch: marketing apply failed ({e}); row marked apply-failed"
+                                );
+                                let _ = self.store.extract_mark_processed(
+                                    self.account_id,
+                                    row.message_id,
+                                    "apply-failed",
+                                );
+                            } else {
+                                extracted += 1;
                             }
                         }
-                        let applied = marketing::apply_result(row, &out, &cfg.model);
-                        if let Err(e) = self.store.marketing_apply(&applied) {
-                            // The call is already paid for: mark processed rather
-                            // than re-buying it every cycle.
+                        Ok(marketing::ExtractOutcome::Failed(kind))
+                            if crate::triage::llm::is_auth_failure(&kind) =>
+                        {
+                            // AUTH FAILURE: a fact about the CREDENTIAL, not
+                            // about this row. Marking it processed would
+                            // foreclose the row forever even after the key is
+                            // fixed, so leave it queued and stop the pass.
                             eprintln!(
-                                "squelch: marketing apply failed ({e}); row marked apply-failed"
+                                "squelch: extract auth failure ({kind}); the resolved LLM key \
+                                 is wrong for the endpoint; rows stay queued"
                             );
+                            auth_failed = true;
+                            break;
+                        }
+                        Ok(marketing::ExtractOutcome::Refused)
+                        | Ok(marketing::ExtractOutcome::Failed(_)) => {
                             let _ = self.store.extract_mark_processed(
                                 self.account_id,
                                 row.message_id,
-                                "apply-failed",
+                                "extract-failed",
                             );
-                        } else {
-                            extracted += 1;
+                            skipped += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("squelch: extract {e}; row stays queued");
                         }
                     }
-                    Ok(marketing::ExtractOutcome::Refused)
-                    | Ok(marketing::ExtractOutcome::Failed(_)) => {
-                        let _ = self.store.extract_mark_processed(
-                            self.account_id,
-                            row.message_id,
-                            "extract-failed",
-                        );
-                        skipped += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("squelch: extract {e}; row stays queued");
+                }
+                CategoryExtractor::Banking => {
+                    let outcome =
+                        banking::classify(&self.http, url, api_key, cfg, provider, row).await;
+                    match outcome {
+                        Ok(banking::ExtractOutcome::Ok(out, usage)) => {
+                            if let Some(u) = usage {
+                                in_tok += u.input_tokens;
+                                out_tok += u.output_tokens;
+                                if let Err(e) = self.store.extract_bump_usage(
+                                    self.account_id,
+                                    &day,
+                                    banking::LEDGER_CATEGORY,
+                                    u.into(),
+                                ) {
+                                    eprintln!("squelch: extract usage ledger bump failed ({e})");
+                                }
+                            }
+                            let applied = banking::apply_result(row, &out, &cfg.model);
+                            if let Err(e) = self.store.banking_apply(&applied) {
+                                // Failure sentinel rather than a re-queue: the call is
+                                // already paid for, a store failure is unlikely to heal
+                                // on a retry, and leaving the row queued would re-buy a
+                                // call every cycle. Only the Banking record is lost — the
+                                // email itself is still in the inbox.
+                                eprintln!(
+                                    "squelch: banking apply failed ({e}); row marked apply-failed"
+                                );
+                                let _ = self.store.extract_mark_processed(
+                                    self.account_id,
+                                    row.message_id,
+                                    "apply-failed",
+                                );
+                            } else {
+                                extracted += 1;
+                            }
+                        }
+                        Ok(banking::ExtractOutcome::Failed(kind))
+                            if crate::triage::llm::is_auth_failure(&kind) =>
+                        {
+                            // See the marketing arm: a bad credential is not a
+                            // verdict about this row, and marking it processed
+                            // would forfeit it permanently.
+                            eprintln!(
+                                "squelch: extract auth failure ({kind}); the resolved LLM key \
+                                 is wrong for the endpoint; rows stay queued"
+                            );
+                            auth_failed = true;
+                            break;
+                        }
+                        Ok(banking::ExtractOutcome::Refused)
+                        | Ok(banking::ExtractOutcome::Failed(_)) => {
+                            // Mark processed so the row cannot loop; no specialist row is
+                            // written, so nothing appears in the Banking zone.
+                            let _ = self.store.extract_mark_processed(
+                                self.account_id,
+                                row.message_id,
+                                "extract-failed",
+                            );
+                            skipped += 1;
+                        }
+                        Err(e) => {
+                            // Retryable class exhausted / transport error: leave the row
+                            // queued (extractor_model_used stays NULL) for a later cycle.
+                            eprintln!("squelch: extract {e}; row stays queued");
+                        }
                     }
                 }
+            }
+        }
+
+        // ---- SOURCE 2: the SHIPMENTS trigger queue -------------------------
+        // Its own stale clock: see `ship_stale_cutoff`.
+        let ship_cutoff = ship_stale_cutoff(Utc::now(), self.config.carriers.max_age_days);
+        let ship_queued = if auth_failed {
+            Vec::new()
+        } else {
+            Self::read_queue(
+                self.store
+                    .ship_extract_queue(self.account_id, cfg.batch_per_cycle),
+                "ship-extract",
+            )
+        };
+
+        for row in &ship_queued {
+            // SEALED GUARD: the queue already excludes sealed rows in SQL;
+            // re-check anyway before every classify call (docs/SECURITY.md).
+            if let Err(e) = extract::extract_sealed_guard(row) {
+                eprintln!("squelch: ship-extract sealed guard tripped ({e}); skipping row");
                 continue;
             }
 
-            let outcome = banking::classify(&self.http, url, api_key, cfg, provider, row).await;
-            match outcome {
-                Ok(banking::ExtractOutcome::Ok(out, usage)) => {
+            // SKIP-STALE: mark processed WITHOUT a model call, so an old row
+            // neither spends budget nor sits queued forever.
+            if row.received_at < ship_cutoff {
+                let _ =
+                    self.store
+                        .ship_extract_mark(self.account_id, row.message_id, STALE_SKIP_MODEL);
+                ship_skipped += 1;
+                continue;
+            }
+
+            // SHARED Stage-1 global budget, incremented before the call.
+            match self.gate_stage1_global_budget(
+                &day,
+                global_daily_cap,
+                "ship-extract",
+                "shipment rows",
+            ) {
+                BudgetGate::Exhausted => break,
+                BudgetGate::SkipRow => continue,
+                BudgetGate::Proceed => {}
+            }
+
+            match shipments::classify(&self.http, url, api_key, cfg, provider, row).await {
+                Ok(shipments::ExtractOutcome::Ok(out, usage)) => {
                     if let Some(u) = usage {
                         in_tok += u.input_tokens;
                         out_tok += u.output_tokens;
                         if let Err(e) = self.store.extract_bump_usage(
                             self.account_id,
                             &day,
-                            banking::LEDGER_CATEGORY,
+                            shipments::LEDGER_CATEGORY,
                             u.into(),
                         ) {
-                            eprintln!("squelch: extract usage ledger bump failed ({e})");
+                            eprintln!("squelch: ship-extract usage ledger bump failed ({e})");
                         }
                     }
-                    let applied = banking::apply_result(row, &out, &cfg.model);
-                    if let Err(e) = self.store.banking_apply(&applied) {
-                        // Failure sentinel rather than a re-queue: the call is
-                        // already paid for, a store failure is unlikely to heal
-                        // on a retry, and leaving the row queued would re-buy a
-                        // call every cycle. Only the Banking record is lost — the
-                        // email itself is still in the inbox.
-                        eprintln!("squelch: banking apply failed ({e}); row marked apply-failed");
-                        let _ = self.store.extract_mark_processed(
-                            self.account_id,
-                            row.message_id,
-                            "apply-failed",
-                        );
-                    } else {
-                        extracted += 1;
+                    let applied = shipments::apply_result(row, &out, &cfg.model);
+                    match self.store.shipments_extract_apply(&applied) {
+                        // The call is already paid for, and a store failure is
+                        // unlikely to heal on a retry: mark the row rather than
+                        // re-buying it every cycle.
+                        Err(e) => {
+                            eprintln!(
+                                "squelch: shipments apply failed ({e}); row marked apply-failed"
+                            );
+                            let _ = self.store.ship_extract_mark(
+                                self.account_id,
+                                row.message_id,
+                                "apply-failed",
+                            );
+                        }
+                        // `false` is a REAL outcome, not a failure: a negative
+                        // verdict (or a row sealed mid-pass) is a decision that
+                        // wrote no tracked record. The marker is already stamped.
+                        Ok(false) => ship_skipped += 1,
+                        Ok(true) => ship_extracted += 1,
                     }
                 }
-                Ok(banking::ExtractOutcome::Refused) | Ok(banking::ExtractOutcome::Failed(_)) => {
-                    // Mark processed so the row cannot loop; no specialist row is
-                    // written, so nothing appears in the Banking zone.
-                    let _ = self.store.extract_mark_processed(
+                Ok(shipments::ExtractOutcome::Failed(kind))
+                    if crate::triage::llm::is_auth_failure(&kind) =>
+                {
+                    // See the marketing arm: the credential is wrong for every
+                    // row, so stamping this one would forfeit a shipping email
+                    // permanently over a config mistake.
+                    eprintln!(
+                        "squelch: ship-extract auth failure ({kind}); the resolved LLM key \
+                         is wrong for the endpoint; rows stay queued"
+                    );
+                    break;
+                }
+                Ok(shipments::ExtractOutcome::Refused)
+                | Ok(shipments::ExtractOutcome::Failed(_)) => {
+                    // Mark processed so the row cannot loop; no shipment record is
+                    // written, so nothing changes in the shipments zone.
+                    let _ = self.store.ship_extract_mark(
                         self.account_id,
                         row.message_id,
                         "extract-failed",
                     );
-                    skipped += 1;
+                    ship_skipped += 1;
                 }
                 Err(e) => {
-                    // Retryable class exhausted / transport error: leave the row
-                    // queued (extractor_model_used stays NULL) for a later cycle.
-                    eprintln!("squelch: extract {e}; row stays queued");
+                    // Retryable class exhausted / transport error: the row stays
+                    // 'pending' and a later cycle retries it.
+                    eprintln!("squelch: ship-extract {e}; row stays queued");
                 }
             }
         }
 
-        if extracted > 0 || skipped > 0 {
+        if extracted > 0 || skipped > 0 || ship_extracted > 0 || ship_skipped > 0 {
             eprintln!(
                 "squelch: extract processed {extracted} rows (model={}, in_tok={in_tok}, \
-                 out_tok={out_tok}); skipped {skipped}",
+                 out_tok={out_tok}); skipped {skipped}; shipments {ship_extracted}, \
+                 skipped {ship_skipped}",
                 cfg.model
             );
         }
@@ -2217,6 +2405,37 @@ mod tests {
     use crate::config::Stage1Config;
     use crate::store::SqliteStore;
     use crate::types::{Disposition, Tier, TriageAxis};
+
+    /// REGRESSION GUARD: the shipments section must NOT age rows out on the
+    /// shared Stage-2 clock. A 30-day-old order confirmation is exactly what the
+    /// trigger's migration backfill exists to catch, and the seven-day window
+    /// every other pass uses would stale-skip it unread.
+    #[test]
+    fn the_shipments_stale_cutoff_is_the_carrier_horizon_not_the_stage2_one() {
+        let cfg = crate::config::Config::default();
+        let now = Utc::now();
+
+        let ship = ship_stale_cutoff(now, cfg.carriers.max_age_days);
+        assert_eq!(ship, now - ChronoDuration::days(45));
+
+        // What `PassSetup` hands the other passes, computed the same way.
+        let stage2 = now - ChronoDuration::days(cfg.stage2.max_age_days as i64);
+        assert!(ship < stage2, "the shipments horizon is the wider one");
+
+        let month_old = now - ChronoDuration::days(30);
+        assert!(
+            month_old >= ship,
+            "a 30-day-old order still reaches the model"
+        );
+        assert!(
+            month_old < stage2,
+            "...though every other pass would skip it"
+        );
+
+        // Tracks the config rather than a constant, so raising the poller's
+        // horizon widens the extractor's with it.
+        assert_eq!(ship_stale_cutoff(now, 10), now - ChronoDuration::days(10));
+    }
 
     /// The 403 split is the whole reason this classifier reads the body: Google
     /// spends one status on "too fast" and on "not allowed", and only the reason

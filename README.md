@@ -256,6 +256,7 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md).
 | [deploy/DOCKER.md](deploy/DOCKER.md) | prebuilt GHCR images, compose file, env-var config |
 | [deploy/DEPLOY.md](deploy/DEPLOY.md) | deployment notes for a Linux server |
 | [SECURITY.md](docs/SECURITY.md) | the threat model and the two-door design |
+| [SHIPMENTS.md](docs/SHIPMENTS.md) | package tracking: BYOK carrier polling and how a package is identified |
 | [TRACKING.md](docs/TRACKING.md) | opt-in read receipts, self-hosted pixel |
 | [BROKER.md](docs/BROKER.md) | why the consent broker is a dead end, and what replaced it |
 
