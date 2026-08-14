@@ -235,13 +235,55 @@ is on the pod and on nothing that publishes it, so no `HUMAN_DOOR_PREFIXES`
 mistake can route to it.
 
 One optional third ingress rule: `SQUELCH_WARDEN_NODE_CIDR`, which allows that
-CIDR to 8848. A kubelet readiness probe originates at the NODE's address and
-matches no pod and no namespace, so a CNI that does not exempt host-originated
-traffic drops every probe and every provision times out on a healthy pod. It is
-opt-in because whether it is needed depends on the CNI, and it admits
-node-originated traffic only: another tenant's pod still arrives from a pod IP
-and is still refused. Check it with a canary before you have tenants; SETUP.md
-step 9 has the procedure and the tenant-to-tenant denial test to run beside it.
+CIDR to 8848 and 9464 — the two ports a kubelet probe can land on, both of them
+whichever probe is currently rendered (see below), because a NetworkPolicy is the
+one object no roll converges and a hole that tracked the probe would have to be
+re-applied by hand, per tenant, in the same edit that moved it. A kubelet
+readiness probe originates at the NODE's address and matches no pod and no
+namespace, so a CNI that does not exempt host-originated traffic drops every
+probe and every provision times out on a healthy pod. It is opt-in because
+whether it is needed depends on the CNI, and it admits node-originated traffic
+only: another tenant's pod still arrives from a pod IP and is still refused.
+Check it with a canary before you have tenants; SETUP.md step 9 has the
+procedure and the tenant-to-tenant denial test to run beside it.
+
+### Readiness, and why the honest probe is opt-in
+
+A tenant's readiness probe is a bare TCP accept on 8848 by default. That answers
+the wrong question, and the gap is real: `squelchd` binds its listeners BEFORE it
+builds its embedder, deliberately, so a first-run model download cannot leave the
+doors unreachable. A probe that only opens a socket therefore calls a tenant
+Ready seconds into a startup that has not happened — and goes on calling one
+Ready whose sync engine died on a credential Google stopped accepting.
+
+`SQUELCH_WARDEN_HTTP_READINESS=on` switches it to an HTTP GET of `/healthz` on
+9464, the metrics port. The daemon answers `200 ok` there only once its sync
+engine is running and its embedder init has settled, `503` until then and `503`
+again if startup comes apart afterwards. Two states, one word, no counts and no
+account information: it is on the unauthenticated listener, so everything it says
+is said to anything that can reach that port. It is on that listener rather than
+on a door for the same reason — the doors serve nothing unauthenticated, and a
+probe holding a bearer token would be a credential in a pod spec.
+
+**Default off is load bearing.** `/healthz` exists only on a daemon image new
+enough to serve it. A tenant still on an older one fails an HTTP probe on every
+period, never reports Ready, is taken out of its own Service for it, and halts
+the roller when it comes round. The order is:
+
+1. Ship the daemon that serves the route (`SQUELCH_WARDEN_IMAGE`).
+2. Let the roller converge the whole fleet onto it, and confirm it did.
+3. Then set `SQUELCH_WARDEN_HTTP_READINESS=on` and converge again.
+
+`deploy/hosted/PRODUCTION.md`, "Rolling the daemon image", is the operator's end
+of that sequence.
+
+Behind both shapes sits `minReadySeconds` (`SQUELCH_WARDEN_MIN_READY_SECS`, 30s):
+the Deployment controller does not count a replica Available until it has stayed
+Ready that long, and `rollout_complete` waits on `availableReplicas` rather than
+`readyReplicas`. Readiness is a snapshot and a daemon that comes up and dies
+passes through it; Available is the count that waits. It costs half a minute per
+tenant on a roll and it is defence in depth behind the roller's own pacing, so it
+holds even for a tenant reconciled by hand.
 
 ## Environment
 
@@ -270,7 +312,9 @@ step 9 has the procedure and the tenant-to-tenant denial test to run beside it.
 | `SQUELCH_WARDEN_USER_NAMESPACES` | `on` | `hostUsers: false`. Turn off only if the cluster cannot do it. |
 | `SQUELCH_WARDEN_MODEL_PVC` | unset | Shared pre-seeded embedding weights; see SETUP.md step 10. |
 | `SQUELCH_WARDEN_IMAGE_PULL_SECRET` | unset | For a private squelchd image. |
-| `SQUELCH_WARDEN_NODE_CIDR` | unset | Lets the node reach 8848, when the CNI drops kubelet probes. |
+| `SQUELCH_WARDEN_NODE_CIDR` | unset | Lets the node reach 8848 and 9464, when the CNI drops kubelet probes. |
+| `SQUELCH_WARDEN_HTTP_READINESS` | `off` | Probe `/healthz` on 9464 instead of accepting on 8848. Turn on only once the whole fleet runs a daemon that serves it. |
+| `SQUELCH_WARDEN_MIN_READY_SECS` | `30` | `minReadySeconds`: how long a pod must stay Ready to count Available. 0 to 300, and below the ready timeout. |
 | `SQUELCH_WARDEN_RUN_AS_UID` | `10001` | uid/gid/fsGroup for tenant pods. Never 0. |
 | `SQUELCH_WARDEN_READY_TIMEOUT_SECS` | `180` | How long provisioning waits for a pod. 10 to 900. |
 | `SQUELCH_WARDEN_PENDING_TTL_SECS` | `86400` | How long an abandoned signup keeps its label. 600 minimum. |
@@ -424,8 +468,10 @@ drift report, then, only if the report has changes, `reconcile`. One tenant at a
 time, and the next one is not touched until this one's ROLLOUT has finished
 (`Cluster::rollout_complete`, not a ready pod — under `Recreate` the pod being
 replaced stays Ready while it terminates, and a roller trusting that would march
-through the fleet on false greens). A tenant blips for one pod restart; the fleet
-is never down.
+through the fleet on false greens). Finished means AVAILABLE, not merely ready:
+the replica has to have stayed up for `SQUELCH_WARDEN_MIN_READY_SECS`, so a
+daemon that comes up and dies cannot buy the run a green. A tenant blips for one
+pod restart; the fleet is never down.
 
 **The Deployment, and only the Deployment.** What decides whether a tenant is
 rolled is the drift report, and a drift report renders and diffs that tenant's

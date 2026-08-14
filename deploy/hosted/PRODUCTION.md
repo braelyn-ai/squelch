@@ -515,6 +515,47 @@ it is worth knowing when a drift run shows a fleet you did not expect: the
 tenants reading as current may be the ones whose keys were rotated last week
 rather than the ones you rolled.
 
+### Turning on the HTTP readiness probe
+
+A knob with an order attached, and the order is the whole warning.
+
+`SQUELCH_WARDEN_HTTP_READINESS` switches every tenant's readiness probe from a
+TCP accept on 8848 to an HTTP GET of `/healthz` on 9464. It is worth having: the
+daemon binds its listeners before it finishes starting (on purpose — a first-run
+model download must not leave the doors unreachable), so an accept calls a tenant
+Ready about two seconds in, and calls one Ready forever whose sync engine died on
+a rejected credential. `/healthz` answers 200 only once the daemon is genuinely
+up.
+
+**Only a daemon that ships the route serves it.** A tenant on an image that
+predates it fails an HTTP probe on every period, never reports Ready, is pulled
+out of its own Service, and halts the next roll. Turning this on before the fleet
+is converged therefore takes every tenant that is behind DOWN, one after another,
+and none of them come back until the knob goes off again.
+
+So, in order, with a roll between each:
+
+1. Bump `SQUELCH_WARDEN_IMAGE` to a daemon that serves `/healthz`, apply, restart
+   the warden — the three steps at the top of this section.
+2. Let the roller converge, and CHECK it did — a clean `roll --dry-run`, or
+   `kubectl -n tenants get deploy -o jsonpath` over the images. Every tenant, not
+   most of them: the ones left behind are exactly the ones the next step breaks.
+3. Set `SQUELCH_WARDEN_HTTP_READINESS: "on"` in `15-warden-config.yaml`, apply,
+   restart the warden, and let the roller converge again. Each tenant's pod
+   restarts once more, because the probe is part of the pod spec.
+
+Backing out is the same edit in reverse and one more roll; nothing about it is
+one-way. And if a tenant does get stranded mid-sequence, the fix is to converge
+it onto the newer daemon rather than to wait: `squelch-control reconcile <label>`.
+
+`SQUELCH_WARDEN_MIN_READY_SECS` (default 30) needs no sequence. It is a
+`minReadySeconds` on the tenant Deployment, so a replica is not Available until
+it has stayed Ready that long, and the roller waits for Available. It applies to
+every daemon image, costs half a minute per tenant on a roll, and has to stay
+below `SQUELCH_WARDEN_READY_TIMEOUT_SECS` — the warden refuses to boot otherwise,
+because a soak the rollout wait cannot outlast would time out on every healthy
+tenant.
+
 ## Cluster secrets
 
 Inventory only. Nothing here should ever be printed into a document, a ticket or

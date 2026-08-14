@@ -30,11 +30,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntr
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
 use crate::config::{
-    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST, DEFAULT_EPHEMERAL_LIMIT,
-    DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS, DEFAULT_INGRESS_NAMESPACE,
-    DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_OAUTH_SECRET_NAME,
-    DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS, DEFAULT_STORAGE_SIZE,
-    DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
+    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST,
+    DEFAULT_EPHEMERAL_LIMIT, DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS,
+    DEFAULT_INGRESS_NAMESPACE, DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_MIN_READY_SECS,
+    DEFAULT_OAUTH_SECRET_NAME, DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS,
+    DEFAULT_STORAGE_SIZE, DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
 };
 use crate::provision::Warden;
 
@@ -72,7 +72,11 @@ pub fn test_config() -> Config {
         user_namespaces: true,
         model_pvc: None,
         node_cidr: None,
+        // Off, like production until the whole fleet is on a daemon that serves
+        // `/healthz`: the tests that render the HTTP probe turn it on.
+        http_readiness: false,
         run_as: DEFAULT_RUN_AS,
+        min_ready_secs: DEFAULT_MIN_READY_SECS,
         ready_timeout: Duration::from_secs(1),
         pending_ttl: Duration::from_secs(DEFAULT_PENDING_TTL_SECS),
         trusted_proxy_hops: 0,
@@ -365,8 +369,8 @@ fn persist(object: Object, ready: bool, rollout_hangs: bool) -> Object {
                 .and_then(|spec| spec.replicas)
                 .unwrap_or(1);
             // The whole status, not just the ready count, because
-            // `rollout_complete` reads all four numbers and a mock that left
-            // three of them absent would report every roll as unfinished.
+            // `rollout_complete` reads all five numbers and a mock that left
+            // four of them absent would report every roll as unfinished.
             //
             // The API server bumps `metadata.generation` on every spec write
             // and the deployment controller copies it into
@@ -381,6 +385,11 @@ fn persist(object: Object, ready: bool, rollout_hangs: bool) -> Object {
                 replicas: Some(desired),
                 updated_replicas: Some(desired),
                 ready_replicas: Some(if ready { desired } else { 0 }),
+                // A pod that stayed Ready long enough for `minReadySeconds`.
+                // The mock has no clock, so a tenant that comes up is one that
+                // stayed up; the soak is a real cluster's to run, and what is
+                // tested here is that the render asks for it.
+                available_replicas: Some(if ready { desired } else { 0 }),
                 ..Default::default()
             });
             Object::Deployment(deployment)

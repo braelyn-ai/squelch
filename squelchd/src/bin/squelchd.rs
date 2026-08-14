@@ -28,6 +28,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// Loopback only, by design: a reverse proxy (`tailscale serve`) fronts this.
@@ -1428,12 +1429,13 @@ fn resolve_metrics_bind(config: &Config) -> Result<Option<SocketAddr>, squelch_c
         .map_err(|e| other_err(format!("invalid metrics bind address `{raw}`: {e}")))
 }
 
-/// Say, at startup, whether anything can scrape this daemon.
+/// Say, at startup, whether anything can scrape or probe this daemon.
 ///
-/// The endpoint is UNAUTHENTICATED — a scraper has no credential to offer — so
-/// its bind address is the whole access control, which is why it prints rather
-/// than hides. It exposes counts and sizes only: no sender, no subject, no
-/// message id ever becomes a label.
+/// Both routes on that listener are UNAUTHENTICATED — neither a scraper nor a
+/// kubelet has a credential to offer — so its bind address is the whole access
+/// control, which is why this prints rather than hides. `/metrics` exposes
+/// counts and sizes only, with no sender, subject or message id ever becoming a
+/// label, and `/healthz` exposes one word out of two.
 fn report_metrics_posture(config: &Config) {
     match config
         .metrics
@@ -1443,11 +1445,84 @@ fn report_metrics_posture(config: &Config) {
         .filter(|s| !s.is_empty())
     {
         Some(addr) => eprintln!(
-            "squelchd: metrics enabled at http://{addr}/metrics (no auth; bind it where only your scraper reaches it)"
+            "squelchd: metrics and readiness enabled at http://{addr}/metrics and /healthz (no auth; bind it where only your scraper reaches it)"
         ),
         None => eprintln!(
-            "squelchd: metrics disabled (set SQUELCH_METRICS_BIND / [metrics] bind, e.g. 127.0.0.1:9848, to serve GET /metrics)"
+            "squelchd: metrics disabled (set SQUELCH_METRICS_BIND / [metrics] bind, e.g. 127.0.0.1:9848, to serve GET /metrics and GET /healthz)"
         ),
+    }
+}
+
+/// Whether the daemon has finished starting, as flags the startup path flips.
+///
+/// The doors bind BEFORE the daemon is up, deliberately (see [`cmd_serve`]), so
+/// "the socket accepts" and "this mailbox is serving" are different questions,
+/// and only the second one is worth an orchestrator's attention. Both flags
+/// start false, which is what makes a startup that FAILS after the bind report
+/// not-ready: a daemon that died on the way up has flipped nothing.
+///
+/// Two conditions, and each rules out a state a bare TCP accept calls healthy:
+///
+/// - **The sync engine is running.** It is spawned before the doors bind and it
+///   is what makes a mailbox a mailbox. When its task ends — a credential the
+///   store has not got, or one Google has stopped accepting, are the ordinary
+///   ways — both doors go on accepting connections in front of a store nothing
+///   is filling, and every probe that only opens a socket passes forever.
+/// - **The background embedder init has settled.** SETTLED, not succeeded: a
+///   first-run model download is the long pole of a cold start and is precisely
+///   what a probe must wait out, but an embedder that can NEVER build (no
+///   egress to the model host, a corrupt cache) leaves a daemon that syncs,
+///   serves both doors and searches by keyword. Refusing to call that ready
+///   would take a working mailbox down over a degraded search index.
+///
+/// The store is deliberately not a flag. `SqliteStore::open` and its migrations
+/// run before the runtime exists and a failure exits the process, so there is
+/// no state in which anything is listening and the store is not open.
+#[derive(Clone, Default)]
+struct Readiness {
+    flags: Arc<ReadinessFlags>,
+}
+
+#[derive(Default)]
+struct ReadinessFlags {
+    sync_running: AtomicBool,
+    embedder_settled: AtomicBool,
+}
+
+/// Clears the sync flag when the sync task ends, HOWEVER it ends: a returned
+/// error, a panic and an abort all drop this, and all three leave a daemon that
+/// is no longer syncing.
+struct SyncRunning(Arc<ReadinessFlags>);
+
+impl Drop for SyncRunning {
+    fn drop(&mut self) {
+        self.0.sync_running.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Readiness {
+    /// Mark the sync engine running, and hand back the guard that unmarks it.
+    ///
+    /// Called BEFORE the task is spawned, with the guard moved into it. Setting
+    /// the flag from inside the task instead would race a sync loop that fails
+    /// on its first tick: its guard would drop before the parent ever set the
+    /// flag, and a dead engine would be reported as a running one for the life
+    /// of the process.
+    fn sync_started(&self) -> SyncRunning {
+        self.flags.sync_running.store(true, Ordering::Relaxed);
+        SyncRunning(self.flags.clone())
+    }
+
+    /// Mark the background embedder init resolved, whichever way it resolved.
+    fn embedder_settled(&self) {
+        self.flags.embedder_settled.store(true, Ordering::Relaxed);
+    }
+
+    /// Both conditions, and nothing derived from either: the caller gets one
+    /// bit because one bit is all `/healthz` may say.
+    fn is_up(&self) -> bool {
+        self.flags.sync_running.load(Ordering::Relaxed)
+            && self.flags.embedder_settled.load(Ordering::Relaxed)
     }
 }
 
@@ -1529,14 +1604,51 @@ async fn serve_metrics(
     )
 }
 
-/// The metrics door: `GET /metrics` and nothing else, on a listener of its own.
-/// Kept off the main router deliberately — the doors sit behind whatever proxy
-/// fronts them, and an unauthenticated scrape route must not inherit that
-/// exposure.
-fn build_metrics_router(state: MetricsState) -> axum::Router {
+/// `GET /healthz`: `200` once the daemon is up, `503` until then, and nothing
+/// else in either direction.
+///
+/// Two states and one word each, because anything that can open the metrics
+/// port can read this: the listener carries no authentication of any kind, so
+/// every byte answered here is a byte an unauthenticated caller gets. A phase
+/// name, a count or a reason would each describe the tenant behind the port,
+/// and none of them tells a probe anything it can act on — a probe has exactly
+/// two moves.
+async fn serve_healthz(
+    axum::extract::State(readiness): axum::extract::State<Readiness>,
+) -> impl axum::response::IntoResponse {
+    if readiness.is_up() {
+        (axum::http::StatusCode::OK, "ok")
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "starting")
+    }
+}
+
+/// The metrics door: `GET /metrics`, `GET /healthz`, and nothing else, on a
+/// listener of its own. Kept off the main router deliberately — the doors sit
+/// behind whatever proxy fronts them, and an unauthenticated scrape route must
+/// not inherit that exposure.
+///
+/// Readiness belongs on THIS listener for the same reason and one more: the
+/// doors serve nothing unauthenticated, so a probe against them would have to
+/// hold a bearer token, and a token an orchestrator holds is a credential in a
+/// pod spec. This listener is already separate, already unauthenticated, and
+/// already the one a scraper is pointed at.
+///
+/// The two routes carry SEPARATE state, which is load bearing rather than tidy.
+/// A scrape reads the store behind [`MetricsState`]'s single permit; a
+/// readiness route that queued on the same permit would answer late whenever
+/// the store is busy, and a late answer is a healthy tenant pulled out of
+/// service. `/healthz` holds no store handle at all, so it cannot acquire that
+/// dependency by a later edit.
+fn build_metrics_router(state: MetricsState, readiness: Readiness) -> axum::Router {
     axum::Router::new()
         .route("/metrics", axum::routing::get(serve_metrics))
         .with_state(state)
+        .merge(
+            axum::Router::new()
+                .route("/healthz", axum::routing::get(serve_healthz))
+                .with_state(readiness),
+        )
 }
 
 /// The router hosting both doors: `/mcp` (agent door, read-only, sealed-absent)
@@ -1640,6 +1752,11 @@ fn cmd_serve(
     // ONE registry for the process: the sync engine writes it, the metrics door
     // reads it. Built here so both sides get the same Arc.
     let sync_metrics = squelch_core::metrics::SyncMetrics::new();
+
+    // Same shape, different question: the startup path below flips these and
+    // the metrics door's `/healthz` reads them. See [`Readiness`] for which
+    // conditions count as up and why.
+    let readiness = Readiness::default();
 
     // The carrier poller keeps the shipments tracker moving between emails.
     // CARRIER CREDENTIALS ARE ITS ONLY FEATURE FLAG: with none configured
@@ -1764,7 +1881,11 @@ fn cmd_serve(
             let refresh = refresh.clone();
             let creds = sync_creds.clone();
             let sync_metrics = sync_metrics.clone();
+            // Taken before the spawn and dropped by the task, so readiness
+            // tracks the engine and not the intention to start one.
+            let sync_running = readiness.sync_started();
             tokio::spawn(async move {
+                let _sync_running = sync_running;
                 SyncEngine::new(store, creds, account_id, email, config)
                     .with_refresh(refresh)
                     .with_metrics(sync_metrics)
@@ -1869,14 +1990,19 @@ fn cmd_serve(
                     .await
                     .map_err(|e| other_err(format!("bind metrics {addr}: {e}")))?;
                 let bound = listener.local_addr().unwrap_or(addr);
-                eprintln!("squelchd: serving metrics http://{bound}/metrics");
-                let app = build_metrics_router(MetricsState {
-                    metrics: sync_metrics.clone(),
-                    store: store.clone(),
-                    account_id,
-                    config: Arc::new(config.clone()),
-                    gate: Arc::new(tokio::sync::Semaphore::new(1)),
-                });
+                eprintln!(
+                    "squelchd: serving metrics http://{bound}/metrics and readiness http://{bound}/healthz"
+                );
+                let app = build_metrics_router(
+                    MetricsState {
+                        metrics: sync_metrics.clone(),
+                        store: store.clone(),
+                        account_id,
+                        config: Arc::new(config.clone()),
+                        gate: Arc::new(tokio::sync::Semaphore::new(1)),
+                    },
+                    readiness.clone(),
+                );
                 // Its own receiver off the sender, so it does not depend on
                 // where in this block the sync engine took the original.
                 let mut shutdown_rx = shutdown_tx.subscribe();
@@ -1903,6 +2029,7 @@ fn cmd_serve(
         {
             let store = store.clone();
             let config = config.clone();
+            let readiness = readiness.clone();
             eprintln!(
                 "squelchd: initializing semantic-recall embedder in the background \
                  (first run downloads the model; the server is already serving, \
@@ -1924,6 +2051,10 @@ fn cmd_serve(
                         "squelchd: embedder init task join error ({e}); search stays keyword-only"
                     ),
                 }
+                // Every arm above, including the ones that gave up: this is the
+                // last step of startup, and readiness waits on it having
+                // HAPPENED rather than on it having worked. See [`Readiness`].
+                readiness.embedder_settled();
             });
         }
 
@@ -2867,14 +2998,9 @@ mod tests {
         assert!(resolve_metrics_bind(&config).is_err());
     }
 
-    /// The metrics door serves `/metrics` and NOTHING else — no door of the
-    /// main router leaks onto this unauthenticated listener.
-    #[tokio::test]
-    async fn metrics_door_serves_only_metrics() {
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use tower::ServiceExt as _;
-
+    /// A metrics door over an empty in-memory store, for the tests that care
+    /// about the router rather than about the numbers.
+    fn test_metrics_state() -> MetricsState {
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
         let account_id = store.ensure_account("me@localhost").expect("account");
         let config = Config {
@@ -2883,13 +3009,24 @@ mod tests {
             db_path: std::env::temp_dir().join("squelch-metrics-door-test.db"),
             ..Config::default()
         };
-        let app = build_metrics_router(MetricsState {
+        MetricsState {
             metrics: squelch_core::metrics::SyncMetrics::new(),
             store,
             account_id,
             config: Arc::new(config),
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        }
+    }
+
+    /// The metrics door serves `/metrics` and `/healthz` and NOTHING else — no
+    /// door of the main router leaks onto this unauthenticated listener.
+    #[tokio::test]
+    async fn metrics_door_serves_only_metrics() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let app = build_metrics_router(test_metrics_state(), Readiness::default());
 
         let resp = app
             .clone()
@@ -2925,5 +3062,60 @@ mod tests {
             StatusCode::NOT_FOUND,
             "the metrics listener hosts no other route"
         );
+    }
+
+    /// `/healthz` has two states and one word, and it reaches the second one
+    /// only when the whole startup path has run.
+    ///
+    /// The first assertion is the bug this route exists for: a daemon that has
+    /// bound its listeners and nothing more is NOT ready, however cleanly it
+    /// accepts a connection.
+    #[tokio::test]
+    async fn healthz_is_up_only_once_startup_finished() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let readiness = Readiness::default();
+        let app = build_metrics_router(test_metrics_state(), readiness.clone());
+        let probe = |app: axum::Router| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/healthz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 10)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        };
+
+        // Bound, and nothing else: the state the old TCP-accept probe called
+        // Ready two seconds in.
+        let (status, body) = probe(app.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.split_whitespace().count(), 1, "one word, no detail");
+
+        // Half started is not started. Each condition alone is still a 503.
+        let sync_running = readiness.sync_started();
+        assert_eq!(probe(app.clone()).await.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        readiness.embedder_settled();
+        let (status, body) = probe(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok");
+
+        // And a startup that came apart AFTER the bind reports 503 rather than
+        // 200, which is the whole point: dropping the guard is what a sync task
+        // that returned, panicked or was aborted does.
+        drop(sync_running);
+        let (status, body) = probe(app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.split_whitespace().count(), 1);
     }
 }

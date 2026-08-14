@@ -256,7 +256,7 @@ pub trait Cluster: Send + Sync {
     /// one broken tenant and all of them.
     ///
     /// The conditions are exactly `kubectl rollout status`', and each of the
-    /// four rules out a different way of being wrong:
+    /// five rules out a different way of being wrong:
     ///
     /// - `status.observedGeneration >= metadata.generation` — the controller
     ///   has SEEN this spec. Until it has, every field below describes the
@@ -272,13 +272,21 @@ pub trait Cluster: Send + Sync {
     ///   serving. Created is not ready: the daemon opens 8848 only after it has
     ///   installed its credential and opened its store, which is precisely the
     ///   step a bad render breaks.
+    /// - `status.availableReplicas == spec.replicas` — the new replicas have
+    ///   STAYED serving, for `spec.minReadySeconds`. Ready is a snapshot and a
+    ///   daemon that comes up and dies passes through it: it reports Ready, the
+    ///   condition above is satisfied, and the process is gone before the next
+    ///   probe. Available is the count that waits, which makes the soak a
+    ///   per-tenant one this loop gets for free and defence in depth behind the
+    ///   roller's own pacing. With `minReadySeconds` unset it is Ready plus the
+    ///   controller's round trip, so it costs nothing to require either way.
     ///
     /// `spec.replicas` absent is 1, Kubernetes' own default, and any missing
     /// status field is 0: a Deployment the controller has not reported on has
     /// not finished anything.
     ///
     /// A desired count BELOW 1 is never complete, whatever the status says. At
-    /// `spec.replicas: 0` all four numbers are 0 and all four conditions hold,
+    /// `spec.replicas: 0` all five numbers are 0 and all five conditions hold,
     /// so a tenant somebody scaled to zero would answer this with "finished" and
     /// no pod - the one answer a caller stepping to the next tenant must never
     /// be given, because it is the shape of a mailbox that is off.
@@ -670,7 +678,7 @@ async fn drain(stream: Option<impl AsyncReadExt + Unpin>) -> String {
 
 /// Whether a Deployment has finished rolling onto the spec it carries.
 ///
-/// The four conditions, and why each one is load bearing, are documented on
+/// The five conditions, and why each one is load bearing, are documented on
 /// [`Cluster::rollout_complete`]. Pure, so both the real poll loop and the test
 /// double answer from the same rule rather than from two readings of it.
 pub(crate) fn rolled_out(deployment: &Deployment) -> bool {
@@ -680,7 +688,7 @@ pub(crate) fn rolled_out(deployment: &Deployment) -> bool {
         .and_then(|spec| spec.replicas)
         .unwrap_or(1);
     // A tenant scaled to zero has no pod, and every count on it is 0 - which
-    // satisfies all four conditions below and reads as a finished rollout. It
+    // satisfies all five conditions below and reads as a finished rollout. It
     // is the opposite: a desired count under 1 is a mailbox that is OFF, and a
     // caller waiting for this tenant to be serving before it touches the next
     // one is entitled to be told no.
@@ -697,6 +705,7 @@ pub(crate) fn rolled_out(deployment: &Deployment) -> bool {
         && count(|s| s.updated_replicas) == desired
         && count(|s| s.replicas) == desired
         && count(|s| s.ready_replicas) == desired
+        && count(|s| s.available_replicas) == desired
 }
 
 /// Whether a pod reports `Ready=True`. Kubernetes says a pod is ready when
@@ -790,12 +799,12 @@ mod tests {
         assert!(!is_ready(&Pod::default()));
     }
 
-    /// The four numbers `kubectl rollout status` waits on, one broken at a
+    /// The five numbers `kubectl rollout status` waits on, one broken at a
     /// time. Each of these is a real moment in a `Recreate` roll, and calling
     /// any of them "done" is what would let a fleet sweep march past a tenant
     /// it had just taken down.
     #[test]
-    fn a_rollout_is_complete_only_when_all_four_numbers_agree() {
+    fn a_rollout_is_complete_only_when_all_five_numbers_agree() {
         use k8s_openapi::api::apps::v1::DeploymentSpec;
 
         let deployment = |generation: i64, status: DeploymentStatus| Deployment {
@@ -814,6 +823,7 @@ mod tests {
             replicas: Some(1),
             updated_replicas: Some(1),
             ready_replicas: Some(1),
+            available_replicas: Some(1),
             ..Default::default()
         };
         assert!(rolled_out(&deployment(3, settled.clone())));
@@ -833,6 +843,7 @@ mod tests {
             DeploymentStatus {
                 updated_replicas: Some(0),
                 ready_replicas: Some(0),
+                available_replicas: Some(0),
                 ..settled.clone()
             }
         )));
@@ -849,6 +860,18 @@ mod tests {
             3,
             DeploymentStatus {
                 ready_replicas: Some(0),
+                available_replicas: Some(0),
+                ..settled.clone()
+            }
+        )));
+        // Ready is not STAYING ready. This is the shape of a daemon that came
+        // up, answered one probe and died, and of one still inside its
+        // `minReadySeconds` soak: the roller must wait through both rather than
+        // step to the next tenant on a green that is seconds old.
+        assert!(!rolled_out(&deployment(
+            3,
+            DeploymentStatus {
+                available_replicas: Some(0),
                 ..settled.clone()
             }
         )));
@@ -868,6 +891,7 @@ mod tests {
                 replicas: Some(1),
                 updated_replicas: Some(1),
                 ready_replicas: Some(1),
+                available_replicas: Some(1),
                 ..Default::default()
             }),
             ..Default::default()
@@ -876,7 +900,7 @@ mod tests {
 
     /// The zero that satisfies every rule and means the opposite of finished.
     ///
-    /// At `spec.replicas: 0` all four numbers agree at 0, so a predicate that
+    /// At `spec.replicas: 0` all five numbers agree at 0, so a predicate that
     /// only compared them would call a tenant with NO POD a completed rollout -
     /// and the caller that acts on the answer would step to the next tenant on
     /// the strength of a mailbox that is off. A desired count under 1 is never
@@ -899,6 +923,7 @@ mod tests {
                 replicas: Some(0),
                 updated_replicas: Some(0),
                 ready_replicas: Some(0),
+                available_replicas: Some(0),
                 ..Default::default()
             }),
         };

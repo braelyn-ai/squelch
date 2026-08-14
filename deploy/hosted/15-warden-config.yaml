@@ -157,6 +157,20 @@ data:
   # Per-tenant user namespaces. Turn this off ONLY if tenant pods fail to start
   # with a hostUsers error; read the isolation section of SETUP.md before you do.
   SQUELCH_WARDEN_USER_NAMESPACES: "on"
+  # How long a tenant's pod must stay Ready before the Deployment controller
+  # calls the replica Available. The roller waits for Available, so this is a
+  # per-tenant soak: a daemon that comes up and dies cannot buy a run a green.
+  # Costs 30s per tenant on a roll and must stay below the ready timeout.
+  SQUELCH_WARDEN_MIN_READY_SECS: "30"
+  # ORDER MATTERS. On, the readiness probe becomes an HTTP GET of the daemon's
+  # /healthz on 9464 instead of a TCP accept on 8848, which is the difference
+  # between "the socket is open" and "the daemon finished starting". The route
+  # exists only on a daemon image that ships it, so a tenant still on an older
+  # one would fail the probe forever, be pulled out of its own Service, and halt
+  # the next roll. Bump SQUELCH_WARDEN_IMAGE first, let the roller converge the
+  # WHOLE fleet, confirm it, and only then flip this and roll again. See
+  # PRODUCTION.md, "Turning on the HTTP readiness probe".
+  SQUELCH_WARDEN_HTTP_READINESS: "off"
   # Uncomment once the shared weights volume exists (SETUP.md step 10).
   # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
   # Uncomment if the squelchd image is private. This is the pull secret for

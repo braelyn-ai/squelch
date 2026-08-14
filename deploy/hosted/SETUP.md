@@ -593,7 +593,10 @@ kubectl -n warden rollout restart deploy/squelch-warden
 ```
 
 Then delete and re-provision the canary. The warden adds one ingress rule to
-every tenant's policy: that CIDR, TCP 8848, nothing else.
+every tenant's policy: that CIDR, TCP 8848 and TCP 9464, nothing else. Both
+ports whichever probe is configured, because 9464 is where the kubelet lands
+once `SQUELCH_WARDEN_HTTP_READINESS` is on and a policy is precisely what no
+roll can backfill — see the warning immediately below.
 
 **Do this before you have real tenants, because this one does not backfill.**
 The rule lands on a tenant's NetworkPolicy, and the fleet roller only ever looks
