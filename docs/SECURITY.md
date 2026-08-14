@@ -271,16 +271,35 @@ shows a browser for what it is.
 | `GET /console/callback?code=` | the same claim, on a code the control plane minted. Nothing about the hop is trusted here: a code that was burned, replayed, expired or never minted fails exactly like a typo |
 | `POST /console/pair`, `POST /console/revoke/{id}`, `POST /console/logout` | a verified session cookie, checked ahead of the handler |
 
-**Cookie posture.** `HttpOnly`, `SameSite=Strict`, `Path=/`, no `Domain`,
-`Secure` whenever the request arrived over https, 30-day `Max-Age`. Deliberately
+**Cookie posture.** `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, `Secure`
+whenever the origin is https, 30-day `Max-Age`. Deliberately
 **not** `__Host-` prefixed: the prefix requires `Secure`, a plain-http loopback
 run cannot set it, and a cookie name that only works in production is a name
 whose absence nobody notices until production — so the two properties the prefix
-would buy are set explicitly instead. Sign-out **revokes** the token rather than
+would buy are set explicitly instead. `Lax` and not `Strict`, which was learned
+live: the SSO landing is a navigation chain that started at accounts.google.com,
+Chrome withholds `Strict` cookies from every request in a cross-site-initiated
+chain including the same-site 303 hop back to `/console`, and the first thing a
+freshly signed-in user saw was the login page again. `Lax` still withholds the
+cookie from cross-site POSTs, and the mutating routes are guarded below
+regardless. Sign-out **revokes** the token rather than
 only dropping the cookie, and every refusal of a cookie that would not verify
 clears it on the way out.
 
-**CSRF, two independent controls.** `SameSite=Strict`, plus an
+**The one escape hatch: `[console] allow_insecure_cookie`.** Off by default and
+meant to stay there. It exists for the self-host serving the console over plain
+http on a LAN, who otherwise has a console that cannot work at all: a browser
+will not store a `Secure` cookie from `http://`. It is read as a statement about
+the whole origin rather than as a cookie flag, so with it on the daemon also
+builds its pairing deep link with `http://`, compares `Origin` against that same
+`http://` origin, and stops offering the SSO link. Those move together
+deliberately: a login page that renders and then refuses the POST from it is not
+a working console. **The cookie is a live device token**, so turning this on puts
+a revocable credential on the wire in the clear for anything on the path to take,
+and it is the reason to prefer TLS or loopback. When it is on, the login page
+carries a banner and the daemon warns at startup.
+
+**CSRF, two independent controls.** `SameSite=Lax`, plus an
 `Origin`/`Sec-Fetch-Site` check in front of every mutating POST — including the
 *unauthenticated* login POST, so a cross-site page cannot sign a browser into an
 account of the attacker's choosing either. `Sec-Fetch-Site` is believed
