@@ -105,10 +105,6 @@ struct ConnectView: View {
     /// Dropped once connect succeeds, and whenever the user edits the url or
     /// the code, since a token one daemon minted is nothing to another.
     @State private var heldToken: String?
-    /// The host a deep link named, when the link did not name this machine's
-    /// own daemon. Shown above the form: pointing this app at someone else's
-    /// server has to be a visible act, not a silently rewritten field.
-    @State private var linkHost: String?
     /// A deep link filled the form and stopped. Rings the button that is
     /// waiting for the press the link will never make for the user.
     @State private var linkArmed = false
@@ -194,7 +190,6 @@ struct ConnectView: View {
     private var connectCard: some View {
             VStack(spacing: 0) {
                 header
-                linkNotice
                 credentialContent
 
                 if let errorText {
@@ -359,36 +354,6 @@ struct ConnectView: View {
         }
     }
 
-    /// Names the server a deep link chose, whenever that server is not this
-    /// machine's own daemon. The code is a credential and this form is where it
-    /// gets typed, so where the link intends to send it is said out loud first.
-    @ViewBuilder private var linkNotice: some View {
-        if let linkHost {
-            HStack(alignment: .top, spacing: 9) {
-                Image(systemName: "exclamationmark.shield.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("This link wants to pair with \(linkHost)")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text(
-                        "That is not this Mac's own daemon. Your code goes to whatever server this form names, so only continue if you know that one."
-                    )
-                    .font(.system(size: 11))
-                    .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .foregroundStyle(Palette.warn)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(Palette.warnSoft)
-            )
-            .padding(.bottom, 16)
-        }
-    }
-
     // MARK: - forms
 
     private var pairForm: some View {
@@ -523,11 +488,9 @@ struct ConnectView: View {
             })
     }
 
-    /// The server-url field, hand-written because a typed edit has to drop two
-    /// things a plain `$url` would leave standing: a token held from an earlier
-    /// claim, which belongs to the daemon that minted it and not to whatever
-    /// host the field now names, and a deep link's notice, which described a
-    /// URL that is no longer what is in the field.
+    /// The server-url field, hand-written because a typed edit has to drop a
+    /// token held from an earlier claim: it belongs to the daemon that minted
+    /// it, not to whatever host the field now names.
     private var urlBinding: Binding<String> {
         Binding(
             get: { url },
@@ -535,15 +498,12 @@ struct ConnectView: View {
                 guard next != url else { return }
                 url = next
                 heldToken = nil
-                linkHost = nil
                 linkArmed = false
             })
     }
 
     /// The pairing-code field. A different code means a different claim, so the
     /// token the last one bought is no longer the thing a press should retry.
-    /// Deliberately does NOT clear `linkHost`: typing the code is exactly the
-    /// moment the warning about where that code is headed has to still be up.
     private var codeBinding: Binding<String> {
         Binding(
             get: { code },
@@ -656,10 +616,6 @@ struct ConnectView: View {
         pairError = nil
         addError = nil
         store.connError = nil
-        // Loopback is the URL `squelchd pair` prints for its own machine, so it
-        // fills quietly. Any other host was chosen by whoever wrote the link,
-        // and gets said out loud before a code is typed at it.
-        linkHost = link.isLoopback ? nil : link.displayHost
         linkArmed = true
         // At the gate the form is the whole screen and Return is the natural
         // next act. The Add Account sheet is raised OVER whatever the human

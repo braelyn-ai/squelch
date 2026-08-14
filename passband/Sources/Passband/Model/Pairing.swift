@@ -61,30 +61,6 @@ struct PairLink: Equatable, Sendable {
         code = normalized
     }
 
-    /// Whether the named server is this machine's own daemon. NO link claims
-    /// itself, loopback or not: a `passband://` URL is openable by any web page
-    /// and every claim spends one of the live code's five attempts, so a link
-    /// only ever fills the form and pairing is always one deliberate press.
-    ///
-    /// What this gates is the NOTICE. A loopback URL is the default `squelchd
-    /// pair` prints for its own machine, so it fills the field quietly; any
-    /// other host came from outside and gets named on screen (see ConnectView),
-    /// because a prefilled remote URL that blends into the form is how a link
-    /// gets a code typed into a server the user never chose.
-    var isLoopback: Bool {
-        guard let host = URLComponents(string: serverURL)?.host?.lowercased() else { return false }
-        return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
-    }
-
-    /// The host to name in that notice. The host alone, because the host is
-    /// what decides where the code goes; the whole string only as a fallback
-    /// this parser makes unreachable (a link with no host never becomes one).
-    var displayHost: String {
-        guard let host = URLComponents(string: serverURL)?.host, !host.isEmpty else {
-            return serverURL
-        }
-        return host
-    }
 }
 
 enum PairError: Error, Equatable {
