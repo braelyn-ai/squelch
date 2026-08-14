@@ -175,34 +175,53 @@ struct ZoneCard<Content: View>: View {
         self.content = content()
     }
 
+    /// The zone's supplementary line, styled once and placed differently per
+    /// shell (see the header below).
+    @ViewBuilder private var subtitleText: some View {
+        if let subtitle {
+            Text(subtitle)
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: symbol)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(tint ?? Palette.accent)
-                Text(title)
-                    .font(Typo.zoneTitle)
-                    .foregroundStyle(Palette.ink)
-                    // Pin the casing: `textCase` is an ENVIRONMENT value, so an
-                    // ancestor could silently uppercase every zone heading.
-                    // Zone titles are sentence case by design.
-                    .textCase(nil)
-                if let count, count > 0 {
-                    Text("\(count)")
-                        .font(Typo.num(11, weight: .semibold))
-                        .foregroundStyle(Palette.inkFaint)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Palette.hairline))
+            // THE SUBTITLE DROPS TO ITS OWN LINE ON THE PHONE. A Mac zone header
+            // is one row because the pane is wide enough to hold title, count,
+            // subtitle and the trailing door side by side. At phone width that
+            // same row wraps the subtitle to three lines and shoves the door off
+            // the edge, so the phone spends a line rather than mangling four
+            // things into one.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(tint ?? Palette.accent)
+                    Text(title)
+                        .font(Typo.zoneTitle)
+                        .foregroundStyle(Palette.ink)
+                        // Pin the casing: `textCase` is an ENVIRONMENT value, so an
+                        // ancestor could silently uppercase every zone heading.
+                        // Zone titles are sentence case by design.
+                        .textCase(nil)
+                    if let count, count > 0 {
+                        Text("\(count)")
+                            .font(Typo.num(11, weight: .semibold))
+                            .foregroundStyle(Palette.inkFaint)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Palette.hairline))
+                    }
+                    #if os(macOS)
+                        subtitleText
+                    #endif
+                    Spacer(minLength: 4)
+                    if let trailing { trailing }
                 }
-                if let subtitle {
-                    Text(subtitle)
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkFaintest)
-                }
-                Spacer(minLength: 4)
-                if let trailing { trailing }
+                #if os(iOS)
+                    subtitleText
+                #endif
             }
             content
         }

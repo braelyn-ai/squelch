@@ -296,7 +296,16 @@ pub struct MetricsConfig {
 /// on a non-loopback origin, which means the cookie (a live device token) can
 /// cross a network in the clear. It exists for the self-host who serves the
 /// console over plain http on a LAN and cannot front it with TLS. Default off,
-/// and the login page says so out loud when it is on.
+/// the login page says so out loud when it is on, and the daemon warns at
+/// startup.
+///
+/// It is READ AS A STATEMENT ABOUT THE WHOLE ORIGIN, not as a cookie flag: the
+/// console also builds its pairing deep link with `http://`, compares `Origin`
+/// against that same `http://` origin for CSRF, and stops offering the SSO link.
+/// The first two are the point (with the hatch shut, a plain-http LAN console
+/// renders a login form and then refuses the POST from it), and the third is the
+/// cost of turning it on somewhere that really is https. `Site::origin_is_https`
+/// in `squelch-api`'s console is the one place all four are decided.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ConsoleConfig {
@@ -304,7 +313,8 @@ pub struct ConsoleConfig {
     /// link (e.g. `https://signup.passband.email`).
     /// Env: `SQUELCH_CONSOLE_SSO_URL`. `None` => no button.
     pub sso_url: Option<String>,
-    /// Allow the console session cookie WITHOUT `Secure` off loopback.
+    /// Declare this console plain-http off loopback: session cookie WITHOUT
+    /// `Secure`, `http://` deep link, `http://` CSRF origin, no SSO link.
     /// Env: `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`, spelled exactly `true`.
     /// Anything else (including `1` and `yes`) leaves it off: an operator who
     /// mistypes this one gets the safe answer.
@@ -823,6 +833,14 @@ pub struct ResolvedLlm {
     pub url: String,
 }
 
+/// The hosted assistant relay's credential + endpoint, resolved by
+/// [`Stage2Config::resolve_assistant`]. Like [`ResolvedLlm`], no `Debug` on
+/// purpose: `api_key` is key material and must never reach a log line.
+pub struct ResolvedAssistant {
+    pub api_key: String,
+    pub url: String,
+}
+
 impl Stage2Config {
     /// Resolve the LLM key, provider, and endpoint in one shot. Key source,
     /// first match wins: `SQUELCH_STAGE2_API_KEY` > `ANTHROPIC_API_KEY` >
@@ -836,6 +854,14 @@ impl Stage2Config {
     /// `anthropic_base_url`, in which case it is `<base>/v1/messages`; the
     /// override never applies to OpenAI. Empty strings count as absent, and key
     /// material is never logged.
+    ///
+    /// HOSTED LEGACY NOTE: a tenant pod rendered before the shared-key bridge
+    /// was removed still carries a raw `ANTHROPIC_API_KEY` alongside the
+    /// gateway base URL, so this resolves the raw key and every call 401s
+    /// against the gateway (which accepts only virtual keys) until
+    /// `squelch-control llm mint` re-applies the Deployment. The sync passes
+    /// treat those 401s as config-level — rows stay queued — so the backlog
+    /// survives until the re-apply; see deploy/hosted/PRODUCTION.md, "History".
     pub fn resolve_llm(&self) -> Option<ResolvedLlm> {
         // Validate the override BEFORE provider inference: a rejected URL is
         // absent everywhere, so it cannot flip a key onto the Anthropic wire
@@ -873,6 +899,23 @@ impl Stage2Config {
             api_key: key,
             provider,
             url,
+        })
+    }
+
+    /// Resolve the hosted assistant relay's key + endpoint. Some ONLY when BOTH
+    /// `SQUELCH_ASSISTANT_API_KEY` and a valid `anthropic_base_url` are present:
+    /// an assistant virtual key only works at the gateway, and without a gateway
+    /// there is nothing to relay to — self-host BYOK lives in the app, not here.
+    /// The URL is `<base>/v1/messages`, exactly as [`Stage2Config::resolve_llm`]
+    /// builds it, and the env var is read lazily at call time like every other
+    /// key source. Empty strings count as absent, and key material is never
+    /// logged.
+    pub fn resolve_assistant(&self) -> Option<ResolvedAssistant> {
+        let base = self.validated_base_url()?;
+        let api_key = env_nonempty("SQUELCH_ASSISTANT_API_KEY")?;
+        Some(ResolvedAssistant {
+            api_key,
+            url: format!("{}/v1/messages", base.trim_end_matches('/')),
         })
     }
 
@@ -2084,6 +2127,7 @@ backfill_days = 90
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("SQUELCH_STAGE2_PROVIDER");
             std::env::remove_var("SQUELCH_ANTHROPIC_BASE_URL");
+            std::env::remove_var("SQUELCH_ASSISTANT_API_KEY");
         }
     }
 
@@ -2108,6 +2152,60 @@ backfill_days = 90
             std::env::remove_var("ANTHROPIC_API_KEY");
         }
         assert!(!c.enabled());
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn assistant_requires_key_and_gateway_together() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        let mut c = Stage2Config::default();
+
+        // Neither => None.
+        assert!(c.resolve_assistant().is_none());
+
+        // Key alone => None: without a gateway there is nothing to relay to.
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "sk-bf-assistant");
+        }
+        assert!(c.resolve_assistant().is_none());
+
+        // Base URL alone => None: no credential to relay with.
+        unsafe {
+            std::env::remove_var("SQUELCH_ASSISTANT_API_KEY");
+        }
+        c.anthropic_base_url = Some("https://gw.example.com".into());
+        assert!(c.resolve_assistant().is_none());
+
+        // Both => Some, with the gateway messages endpoint joined exactly as
+        // resolve_llm builds it (trailing slash folds).
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "sk-bf-assistant");
+        }
+        let r = c.resolve_assistant().expect("key + gateway => Some");
+        assert_eq!(r.api_key, "sk-bf-assistant");
+        assert_eq!(r.url, "https://gw.example.com/v1/messages");
+        c.anthropic_base_url = Some("https://gw.example.com/".into());
+        assert_eq!(
+            c.resolve_assistant().unwrap().url,
+            "https://gw.example.com/v1/messages"
+        );
+
+        // An empty key counts as absent, like every other key source.
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "");
+        }
+        assert!(c.resolve_assistant().is_none());
+
+        // A base URL that fails the transport check is absent everywhere, so it
+        // cannot half-configure the relay.
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "sk-bf-assistant");
+        }
+        c.anthropic_base_url = Some("http://gw.example.com".into());
+        assert!(c.resolve_assistant().is_none());
+
         clear_stage2_env();
     }
 

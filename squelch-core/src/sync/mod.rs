@@ -1470,14 +1470,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     if let Some(u) = usage {
                         in_tok += u.input_tokens;
                         out_tok += u.output_tokens;
-                        if let Err(e) = self.store.stage1_bump_usage(
-                            self.account_id,
-                            &day,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
-                        ) {
+                        if let Err(e) =
+                            self.store
+                                .stage1_bump_usage(self.account_id, &day, u.into())
+                        {
                             eprintln!("squelch: stage-1 usage ledger bump failed ({e})");
                         }
                     }
@@ -1526,6 +1522,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             );
                         }
                     }
+                }
+                Ok(stage1_llm::ClassifyOutcome::Failed(kind))
+                    if crate::triage::llm::is_auth_failure(&kind) =>
+                {
+                    // AUTH FAILURE (401/403): a config problem shared by every
+                    // row. Heuristic fallback is for verdicts about THIS row; a
+                    // bad credential is not one, so leave the row queued
+                    // (stage1_model_used stays NULL) and stop the pass instead
+                    // of burning the cap on calls that fail identically.
+                    eprintln!(
+                        "squelch: stage-1 auth failure ({kind}); the resolved LLM key is \
+                         wrong for the endpoint; rows stay queued"
+                    );
+                    break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
                 | Ok(stage1_llm::ClassifyOutcome::Failed(_)) => {
@@ -1679,10 +1689,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     self.account_id,
                                     &day,
                                     marketing::LEDGER_CATEGORY,
-                                    u.input_tokens,
-                                    u.output_tokens,
-                                    u.cache_creation_input_tokens,
-                                    u.cache_read_input_tokens,
+                                    u.into(),
                                 ) {
                                     eprintln!("squelch: extract usage ledger bump failed ({e})");
                                 }
@@ -1729,10 +1736,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     self.account_id,
                                     &day,
                                     banking::LEDGER_CATEGORY,
-                                    u.input_tokens,
-                                    u.output_tokens,
-                                    u.cache_creation_input_tokens,
-                                    u.cache_read_input_tokens,
+                                    u.into(),
                                 ) {
                                     eprintln!("squelch: extract usage ledger bump failed ({e})");
                                 }
@@ -1825,10 +1829,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             self.account_id,
                             &day,
                             shipments::LEDGER_CATEGORY,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
+                            u.into(),
                         ) {
                             eprintln!("squelch: ship-extract usage ledger bump failed ({e})");
                         }
@@ -2049,14 +2050,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         out_tok += u.output_tokens;
                         // USAGE LEDGER, best-effort: a ledger write failure must
                         // not affect triage.
-                        if let Err(e) = self.store.stage2_bump_usage(
-                            self.account_id,
-                            &day,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.cache_creation_input_tokens,
-                            u.cache_read_input_tokens,
-                        ) {
+                        if let Err(e) =
+                            self.store
+                                .stage2_bump_usage(self.account_id, &day, u.into())
+                        {
                             eprintln!("squelch: stage-2 usage ledger bump failed ({e})");
                         }
                     }
@@ -2114,7 +2111,22 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     );
                 }
                 Ok(ClassifyOutcome::Failed(kind)) => {
-                    // Permanent failure (400/401/truncation/parse): mark the row
+                    // AUTH FAILURE (401/403): the key is wrong for the endpoint,
+                    // a config problem shared by every row — not a fact about
+                    // this one. Leave the row queued and STOP the pass: the
+                    // remaining rows would fail identically while burning the
+                    // daily caps, and a row marked processed here would be
+                    // foreclosed from triage even after the credential is fixed
+                    // (the legacy shared-key-plus-gateway pod is exactly this).
+                    if crate::triage::llm::is_auth_failure(&kind) {
+                        eprintln!(
+                            "squelch: stage-2 auth failure ({kind}); the resolved LLM key is \
+                             wrong for the endpoint; rows stay queued"
+                        );
+                        self.metrics.record_stage2(Stage2Verdict::Retryable);
+                        break;
+                    }
+                    // Permanent failure (400/truncation/parse): mark the row
                     // processed so it cannot loop. `kind` is already redacted.
                     eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
                     self.metrics.record_stage2(Stage2Verdict::Failed);

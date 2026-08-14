@@ -17,6 +17,9 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Utc};
+
+use crate::store::WaitlistRow;
 
 /// The Content-Security-Policy every page carries. The single allowance is the
 /// inline `<style>`; `frame-ancestors 'none'` (with the older `X-Frame-Options`
@@ -106,16 +109,30 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
 body {{ margin: 0; padding: 3rem 1.25rem; background: #fbfaf8; color: #1a1a1a;
   font: 1rem/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
 main {{ max-width: 34rem; margin: 0 auto; }}
+/* The admin dashboard is the one page with a table, and the reading width the
+   rest of the site is set to folds it into three cramped columns. */
+main:has(table) {{ max-width: 44rem; }}
 h1 {{ font-size: 1.35rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 1rem; }}
 h2 {{ font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 0.6rem; }}
 p {{ margin: 0 0 1rem; }}
 ul, ol {{ margin: 0 0 1.25rem; padding-left: 1.2rem; }}
 li {{ margin: 0 0 0.5rem; }}
 label {{ display: block; font-weight: 600; margin: 0 0 0.35rem; }}
-input[type=text] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem; margin: 0 0 1.25rem;
+input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
+  margin: 0 0 1.25rem;
   border: 1px solid #cdc7bd; border-radius: 6px; background: #fff; color: inherit; font: inherit; }}
 button {{ padding: 0.65rem 1.15rem; border: 0; border-radius: 6px; background: #1a1a1a; color: #fbfaf8;
   font: inherit; font-weight: 500; cursor: pointer; }}
+table {{ width: 100%; border-collapse: collapse; margin: 0 0 1.5rem; font-size: 0.95rem; }}
+th {{ font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  color: #6b6b6b; }}
+th, td {{ text-align: left; vertical-align: top; padding: 0.6rem 0.75rem 0.6rem 0;
+  border-bottom: 1px solid #e6e1d9; }}
+td form {{ display: inline; }}
+/* The second button on a row: same shape, less pull. Re-sending is the rarer
+   errand and must not read as the thing to click. */
+button.quiet {{ background: none; color: inherit; border: 1px solid #cdc7bd;
+  padding: 0.35rem 0.6rem; font-size: 0.85rem; font-weight: 400; }}
 .muted {{ color: #6b6b6b; font-size: 0.9rem; }}
 .suffix {{ color: #6b6b6b; }}
 .stop {{ border-left: 3px solid #b3261e; padding: 0.1rem 0 0.1rem 0.85rem; }}
@@ -128,10 +145,12 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   background: #1a1a1a; color: #fbfaf8; text-decoration: none; border-radius: 6px; font-weight: 500; }}
 @media (prefers-color-scheme: dark) {{
   body {{ background: #141414; color: #e8e6e3; }}
-  .muted, .suffix {{ color: #9a9a9a; }}
+  .muted, .suffix, th {{ color: #9a9a9a; }}
   code, .code {{ background: #262626; }}
-  input[type=text] {{ background: #1f1f1f; border-color: #3a3a3a; }}
+  input[type=text], input[type=password] {{ background: #1f1f1f; border-color: #3a3a3a; }}
   button, a.button {{ background: #e8e6e3; color: #141414; }}
+  button.quiet {{ background: none; color: #e8e6e3; border-color: #3a3a3a; }}
+  th, td {{ border-bottom-color: #303030; }}
   .stop {{ border-left-color: #f2b8b5; }}
 }}
 </style>
@@ -144,9 +163,10 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
         status,
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // These pages carry a pairing code and name a mailbox. A shared
-            // cache must not keep them, and the click through to Google must
-            // not carry this URL as a referer.
+            // These pages carry a pairing code, name a mailbox, and on the
+            // admin side list addresses that belong to people who are not
+            // customers. A shared cache must not keep them, and the click
+            // through to Google must not carry this URL as a referer.
             (header::CACHE_CONTROL, "no-store, no-cache"),
             (header::REFERRER_POLICY, "no-referrer"),
             (header::CONTENT_SECURITY_POLICY, CSP),
@@ -166,9 +186,7 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
 /// code is echoed only because the browser already has it, and it is escaped
 /// like everything else.
 pub fn signup_form(base_domain: &str, label: &str, invite: &str, error: Option<&str>) -> Response {
-    let error_html = error
-        .map(|e| format!(r#"<p class="stop"><strong>{}</strong></p>"#, escape_html(e)))
-        .unwrap_or_default();
+    let error_html = stop_note(error);
     page(
         StatusCode::OK,
         "Set up your Passband mailbox",
@@ -306,6 +324,192 @@ pub fn console_problem_with_link(
     )
 }
 
+/// The admin door: one field, and nothing that describes what is behind it.
+///
+/// Anybody can ask for `/admin`, so this page says as little as a page can. It
+/// names no waitlist, no counts, and no operator.
+///
+/// `error` is present only on a refusal, so it decides the status too: a
+/// message rendered here means the request was turned away, and a 200 with a
+/// "not accepted" sentence in it is a lie to everything that reads status
+/// codes.
+pub fn admin_login(error: Option<&str>) -> Response {
+    let status = if error.is_some() {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::OK
+    };
+    page(
+        status,
+        "Passband admin",
+        &format!(
+            r#"<h1>Passband admin</h1>
+{error_html}
+<form method="post" action="/admin/login">
+<label for="token">Admin token</label>
+<input type="password" id="token" name="token" autocomplete="current-password"
+  autocapitalize="off" spellcheck="false" required>
+<button type="submit">Sign in</button>
+</form>"#,
+            error_html = stop_note(error),
+        ),
+    )
+}
+
+/// The CSRF refusal, naming the origin this deployment answers to and the one
+/// the request actually stated.
+///
+/// A 403 with no words is the right shape for a page on some other origin that
+/// pressed these buttons, and the wrong shape for the operator, who meets the
+/// same refusal when an extension, a proxy, or a sandboxed frame rewrites those
+/// headers under an address bar that reads correctly. Both are told the same
+/// thing, because the attacker's half of it is a request they wrote themselves.
+///
+/// `report` arrives already filtered by [`crate::admin`] and is escaped here
+/// too: the rule is that nothing is interpolated raw.
+pub fn admin_cross_origin(expected: &str, report: &str) -> Response {
+    page(
+        StatusCode::FORBIDDEN,
+        "Passband admin",
+        &format!(
+            r#"<h1>That request did not come from this site</h1>
+<p>This page only accepts form posts made by a page loaded from
+<code>{expected}</code>, and this one stated something else. Nothing was
+changed.</p>
+<p class="muted">What arrived: <code>{report}</code></p>
+<p class="muted">A browser on this origin sends its own address here. Something
+between the form and this service rewrote it, which is usually an extension, a
+proxy, or the page running inside a sandboxed frame. Opening
+<code>{expected}/admin</code> in an ordinary tab is the fix.</p>"#,
+            expected = escape_html(expected.trim_end_matches('/')),
+            report = escape_html(report),
+        ),
+    )
+}
+
+/// The dashboard: who is waiting, who has been approved, and the two buttons.
+///
+/// ALWAYS 200, even carrying an `error`. The list under it is correct either
+/// way, and the banner says what the button did NOT do (a row already approved,
+/// an invite already spent); that is a finished page describing a real state,
+/// not a failed request.
+///
+/// THE CODE IS NOT HERE, and cannot be. Only its hash was kept, so the one
+/// remedy for a lost invite is a fresh one, which is what the send buttons are.
+pub fn admin_page(
+    pending: &[WaitlistRow],
+    approved: &[WaitlistRow],
+    error: Option<&str>,
+) -> Response {
+    let waiting: String = pending
+        .iter()
+        .map(|r| {
+            format!(
+                r#"<tr><td>{email}</td><td class="muted">{joined}</td><td>{action}</td></tr>
+"#,
+                email = escape_html(&r.email),
+                joined = day(r.created_at),
+                action = action_form("/admin/approve", r.id, "Approve and email invite", false),
+            )
+        })
+        .collect();
+
+    let history: String = approved
+        .iter()
+        .map(|r| {
+            // Two shapes for one row. A stamped `notified_at` is the quiet
+            // case (the mail went out; the button is there for the person who
+            // lost it), and a missing one is the loud case: this row is
+            // approved and nobody was told.
+            let outcome = match r.notified_at {
+                Some(at) => format!(
+                    r#"<span class="muted">Invited {}</span> {}"#,
+                    day(at),
+                    action_form("/admin/send", r.id, "Send fresh invite", true),
+                ),
+                None => format!(
+                    r#"<span class="stop">email not sent</span> {}"#,
+                    action_form("/admin/send", r.id, "Send new invite", false),
+                ),
+            };
+            let approved_on = r
+                .approved_at
+                .map(|at| format!("<br>approved {}", day(at)))
+                .unwrap_or_default();
+            format!(
+                r#"<tr><td>{email}</td><td class="muted">joined {joined}{approved_on}</td><td>{outcome}</td></tr>
+"#,
+                email = escape_html(&r.email),
+                joined = day(r.created_at),
+            )
+        })
+        .collect();
+
+    page(
+        StatusCode::OK,
+        "Waitlist",
+        &format!(
+            r#"<h1>Waitlist</h1>
+{error_html}
+<h2>Waiting ({waiting_count})</h2>
+{waiting_table}
+<h2>Approved recently</h2>
+{history_table}
+<p class="muted">Approving mints one invite code and emails it. The code works
+once and expires in {ttl} days. Nothing can read it back out of here, so a code
+that was lost is replaced rather than resent.</p>"#,
+            error_html = stop_note(error),
+            waiting_count = pending.len(),
+            waiting_table = table(
+                r#"<th>Email</th><th>Joined</th><th></th>"#,
+                &waiting,
+                "Nobody is waiting.",
+            ),
+            history_table = table(
+                r#"<th>Email</th><th>Dates</th><th>Invite</th>"#,
+                &history,
+                "Nobody has been approved yet.",
+            ),
+            ttl = crate::invites::DEFAULT_TTL_DAYS,
+        ),
+    )
+}
+
+/// One row's button, as its own form. No JavaScript on this page, so a button
+/// that acts is a form that posts, and the row it acts on rides in a hidden
+/// field.
+fn action_form(action: &str, id: i64, label: &str, quiet: bool) -> String {
+    let class = if quiet { r#" class="quiet""# } else { "" };
+    format!(
+        r#"<form method="post" action="{action}"><input type="hidden" name="id" value="{id}"><button type="submit"{class}>{label}</button></form>"#,
+        action = escape_html(action),
+        label = escape_html(label),
+    )
+}
+
+/// A table, or a sentence saying there is nothing to put in one.
+fn table(head: &str, rows: &str, empty: &str) -> String {
+    if rows.is_empty() {
+        format!(r#"<p class="muted">{}</p>"#, escape_html(empty))
+    } else {
+        format!("<table><tr>{head}</tr>\n{rows}</table>")
+    }
+}
+
+/// The error banner every page above renders the same way.
+fn stop_note(error: Option<&str>) -> String {
+    error
+        .map(|e| format!(r#"<p class="stop"><strong>{}</strong></p>"#, escape_html(e)))
+        .unwrap_or_default()
+}
+
+/// A date as the operator reads it. Escaped like everything else: the rule is
+/// that nothing is interpolated raw, and an exception for "this one is only
+/// ever digits" is how the rule stops being one.
+fn day(ts: DateTime<Utc>) -> String {
+    escape_html(&ts.format("%Y-%m-%d").to_string())
+}
+
 /// Something went wrong after the user left for Google. `status` is the HTTP
 /// status; `detail` is a sentence a person can act on and never a machine
 /// reason.
@@ -439,6 +643,75 @@ mod tests {
         assert!(!html.contains("href"), "{html}");
     }
 
+    /// A waitlist row as the store hands one over.
+    fn row(id: i64, email: &str, notified: bool) -> WaitlistRow {
+        // 2026-01-01T00:00:00Z.
+        let at = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        WaitlistRow {
+            id,
+            email: email.to_string(),
+            created_at: at,
+            status: crate::store::WAITLIST_APPROVED.to_string(),
+            approved_at: Some(at),
+            invite_id: Some(7),
+            notified_at: notified.then_some(at),
+        }
+    }
+
+    /// The dashboard is the one page that renders a string a stranger typed
+    /// into a public form, so it is the one page where escaping is the whole
+    /// defense. `<`, `>`, and `"` all survive the address shape check.
+    #[tokio::test]
+    async fn the_dashboard_escapes_an_address_that_is_an_attack() {
+        let hostile = r#""><script>alert(1)</script>@evil.test"#;
+        let html = body_of(admin_page(
+            &[row(1, hostile, false)],
+            &[row(2, hostile, true)],
+            Some("<b>nope</b>"),
+        ))
+        .await;
+        assert!(!html.contains("<script>alert(1)"), "{html}");
+        assert!(!html.contains("<b>nope</b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(html.contains("&quot;&gt;"), "{html}");
+    }
+
+    /// Which button a row gets is the whole state machine the operator sees: a
+    /// stamped row is quiet, an unstamped one is loud and asks to be pressed.
+    #[tokio::test]
+    async fn an_unsent_invite_says_so_and_offers_the_button() {
+        let sent = body_of(admin_page(&[], &[row(1, "ada@example.com", true)], None)).await;
+        assert!(sent.contains("Invited 2026-01-01"), "{sent}");
+        assert!(sent.contains("Send fresh invite"), "{sent}");
+        assert!(!sent.contains("email not sent"), "{sent}");
+
+        let failed = body_of(admin_page(&[], &[row(1, "ada@example.com", false)], None)).await;
+        assert!(failed.contains(r#"<span class="stop">email not sent</span>"#), "{failed}");
+        assert!(failed.contains("Send new invite"), "{failed}");
+
+        let waiting = body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await;
+        assert!(waiting.contains("Approve and email invite"), "{waiting}");
+        assert!(waiting.contains(r#"name="id" value="1""#), "{waiting}");
+        assert!(waiting.contains(r#"action="/admin/approve""#), "{waiting}");
+        // No JavaScript on this page either: a button that acts is a form.
+        assert!(!waiting.contains("<script"), "{waiting}");
+    }
+
+    /// The door names nothing that is behind it, and a refusal is a 401 rather
+    /// than a 200 with bad news in it.
+    #[tokio::test]
+    async fn the_admin_door_says_nothing_and_refuses_with_a_status() {
+        let r = admin_login(None);
+        assert_eq!(r.status(), StatusCode::OK);
+        let html = body_of(r).await;
+        assert!(html.contains(r#"type="password""#), "{html}");
+        assert!(html.contains(r#"action="/admin/login""#), "{html}");
+        assert!(!html.to_lowercase().contains("waitlist"), "{html}");
+
+        let refused = admin_login(Some("That token was not accepted."));
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    }
+
     /// House rule: no em dashes in anything a person reads.
     #[tokio::test]
     async fn no_em_dashes_in_user_facing_copy() {
@@ -447,6 +720,14 @@ mod tests {
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
+            body_of(admin_login(Some("no"))).await,
+            body_of(admin_page(
+                &[row(1, "ada@example.com", false)],
+                &[row(2, "bob@example.com", true)],
+                Some("no"),
+            ))
+            .await,
+            body_of(admin_page(&[], &[], None)).await,
         ] {
             assert!(!html.contains('\u{2014}'), "{html}");
         }
@@ -459,6 +740,8 @@ mod tests {
             success("https://ada.passband.email", "ABCD-EFGH", 10),
             problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
             console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
+            admin_login(None),
+            admin_page(&[row(1, "ada@example.com", false)], &[], None),
         ] {
             let h = r.headers().clone();
             assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");

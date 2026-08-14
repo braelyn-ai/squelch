@@ -64,16 +64,18 @@ enum Command {
 /// governance call and installing is a warden call. They still do NOT need the
 /// OAuth client or the cookie key.
 ///
-/// The key VALUE follows the same rule as everywhere else: it exists between
+/// The key VALUES follow the same rule as everywhere else: each exists between
 /// the mint and the warden PUT and is never printed, stored, or logged. What
 /// these commands print are IDS.
 #[derive(Subcommand)]
 enum LlmCommand {
-    /// Mint a virtual key for a tenant and install it via the warden. A tenant
-    /// that already has one gets a NEW key; the old one stays live in Bifrost
-    /// until revoked there, and its id is printed as a reminder.
+    /// Mint BOTH virtual keys for a tenant — triage and assistant — and
+    /// install them via one warden call. A tenant that already has them gets
+    /// NEW keys; the old ones stay live in Bifrost until revoked there, and
+    /// their ids are printed as a reminder.
     Mint { label: String },
-    /// Revoke a tenant's recorded virtual key in Bifrost and forget it.
+    /// Revoke a tenant's recorded virtual keys — both of them — in Bifrost
+    /// and forget them.
     Revoke { label: String },
 }
 
@@ -223,7 +225,8 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
         anyhow::bail!(
             "the LLM gateway is not configured: set SQUELCH_CONTROL_BIFROST_URL and \
              SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN, the gateway admin's username:password \
-             (and optionally SQUELCH_CONTROL_LLM_BUDGET_USD and SQUELCH_CONTROL_LLM_MODELS)"
+             (and optionally SQUELCH_CONTROL_LLM_BUDGET_USD, SQUELCH_CONTROL_LLM_MODELS, \
+             SQUELCH_CONTROL_ASSISTANT_BUDGET_USD, and SQUELCH_CONTROL_ASSISTANT_MODELS)"
         );
     };
     let (warden_url, warden_token) =
@@ -243,66 +246,110 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
         .build()?;
     runtime.block_on(async {
         match command {
-            LlmCommand::Mint { label } => {
-                llm_mint(&store, &bifrost, &warden, llm.budget_usd, &label).await
-            }
+            LlmCommand::Mint { label } => llm_mint(&store, &bifrost, &warden, &llm, &label).await,
             LlmCommand::Revoke { label } => llm_revoke(&store, &bifrost, &label).await,
         }
     })
 }
 
-/// Mint -> install -> record, the same order signup uses, but FAIL-LOUD: this
-/// is the command an operator runs to fix a keyless or mis-keyed tenant, so a
-/// half-finished rotation must end in an error naming what to do, not a shrug.
+/// Mint both -> record both -> install both, the same order signup uses, but
+/// FAIL-LOUD: this is the command an operator runs to fix a keyless or
+/// mis-keyed tenant, so a half-finished rotation must end in an error naming
+/// what to do, not a shrug.
 async fn llm_mint(
     store: &ControlStore,
     bifrost: &BifrostClient,
     warden: &HttpWarden,
-    budget_usd: f64,
+    llm: &BifrostConfig,
     label: &str,
 ) -> anyhow::Result<()> {
     if !store.label_exists(label)? {
         anyhow::bail!("no tenant `{label}` in the control store");
     }
     let old = store.tenant_vk(label)?;
+    let old_assistant = store.tenant_assistant_vk(label)?;
 
-    let vk = bifrost.mint_virtual_key(label, budget_usd).await?;
-    // Recorded BEFORE the install is attempted: from this moment a key exists
-    // in Bifrost, and whatever happens next, the store must name it so a later
-    // `llm revoke` or `llm mint` can find it. The install failing does not
-    // un-mint it.
+    // Each id is recorded BEFORE the next step is attempted: from the moment a
+    // key exists in Bifrost, whatever happens next, the store must name it so
+    // a later `llm revoke` or `llm mint` can find it. A failed install or a
+    // failed second mint does not un-mint the first.
+    let vk = bifrost.mint_virtual_key(label, llm.budget_usd).await?;
     if !store.set_tenant_vk(label, &vk.id)? {
         anyhow::bail!(
             "tenant `{label}` vanished from the store mid-mint; revoke virtual key {} in Bifrost by hand",
             vk.id
         );
     }
-    if let Err(e) = warden.put_llm_key(label, &vk.value).await {
-        if let Some(old) = &old {
-            // The rotation half-failed: the cluster still runs on the OLD key,
-            // which this store no longer tracks. Its id must not scroll away.
-            eprintln!(
-                "squelch-control: the previous virtual key {old} is still installed and live in \
-                 Bifrost; the store now tracks only the new one."
+    let assistant = match bifrost
+        .mint_assistant_key(label, &llm.assistant_models, llm.assistant_budget_usd)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            if let Some(old) = &old {
+                // The store was repointed at the new triage id above, but the
+                // cluster still runs on the OLD key. The id must not scroll
+                // away, or the operator has nothing to revoke by.
+                eprintln!(
+                    "squelch-control: the previous triage virtual key {old} is still installed \
+                     and live in Bifrost; the store now tracks only the new one."
+                );
+            }
+            anyhow::bail!(
+                "minted triage virtual key {} but the assistant mint failed: {e}. The triage id \
+                 is recorded and its key is NOT yet installed; run `llm mint {label}` again to \
+                 finish the rotation, or `llm revoke {label}` to back out",
+                vk.id
             );
         }
+    };
+    if !store.set_tenant_assistant_vk(label, &assistant.id)? {
         anyhow::bail!(
-            "minted virtual key {} but the warden did not take it: {e}. The id is recorded; \
-             run `llm mint {label}` again to replace it, or `llm revoke {label}` to back out",
-            vk.id
+            "tenant `{label}` vanished from the store mid-mint; revoke virtual keys {} and {} in Bifrost by hand",
+            vk.id,
+            assistant.id
+        );
+    }
+    if let Err(e) = warden.put_llm_key(label, Some(&vk.value), Some(&assistant.value)).await {
+        for (kind, old) in [("triage", &old), ("assistant", &old_assistant)] {
+            if let Some(old) = old {
+                // The rotation half-failed: the cluster still runs on the OLD
+                // keys, which this store no longer tracks. The ids must not
+                // scroll away.
+                eprintln!(
+                    "squelch-control: the previous {kind} virtual key {old} is still installed \
+                     and live in Bifrost; the store now tracks only the new one."
+                );
+            }
+        }
+        anyhow::bail!(
+            "minted virtual keys {} and {} but the warden did not take them: {e}. The ids are \
+             recorded; run `llm mint {label}` again to replace them, or `llm revoke {label}` to \
+             back out",
+            vk.id,
+            assistant.id
         );
     }
 
-    eprintln!("squelch-control: virtual key {} minted and installed for {label}.", vk.id);
-    if let Some(old) = old.filter(|old| *old != vk.id) {
-        eprintln!(
-            "squelch-control: the PREVIOUS virtual key {old} is still live in Bifrost; revoke it \
-             there. This store now tracks only the new key."
-        );
+    eprintln!(
+        "squelch-control: virtual keys {} (triage) and {} (assistant) minted and installed for {label}.",
+        vk.id, assistant.id
+    );
+    for (kind, old, new) in [("triage", old, &vk.id), ("assistant", old_assistant, &assistant.id)] {
+        if let Some(old) = old.filter(|old| old != new) {
+            eprintln!(
+                "squelch-control: the PREVIOUS {kind} virtual key {old} is still live in Bifrost; \
+                 revoke it there. This store now tracks only the new key."
+            );
+        }
     }
     Ok(())
 }
 
+/// Revoke BOTH recorded keys. Each revoke is tolerant of already-gone (the
+/// client maps 404 to Ok), and a failure on one does not stop the other: the
+/// pointer for whichever revoke did land is cleared, so the retry has only the
+/// stragglers left to chase.
 async fn llm_revoke(
     store: &ControlStore,
     bifrost: &BifrostClient,
@@ -311,15 +358,42 @@ async fn llm_revoke(
     if !store.label_exists(label)? {
         anyhow::bail!("no tenant `{label}` in the control store");
     }
-    let Some(id) = store.tenant_vk(label)? else {
-        eprintln!("squelch-control: no virtual key is recorded for {label}; nothing to revoke.");
+    let triage = store.tenant_vk(label)?;
+    let assistant = store.tenant_assistant_vk(label)?;
+    if triage.is_none() && assistant.is_none() {
+        eprintln!("squelch-control: no virtual keys are recorded for {label}; nothing to revoke.");
         return Ok(());
-    };
-    bifrost.revoke_virtual_key(&id).await?;
-    // Cleared only AFTER Bifrost confirms: a revoke that failed must leave the
-    // pointer in place for the retry.
-    store.clear_tenant_vk(label)?;
-    eprintln!("squelch-control: virtual key {id} revoked and forgotten for {label}.");
+    }
+
+    let mut failed = Vec::new();
+    if let Some(id) = triage {
+        match bifrost.revoke_virtual_key(&id).await {
+            Ok(()) => {
+                // Cleared only AFTER Bifrost confirms: a revoke that failed
+                // must leave the pointer in place for the retry.
+                store.clear_tenant_vk(label)?;
+                eprintln!("squelch-control: triage virtual key {id} revoked and forgotten for {label}.");
+            }
+            Err(e) => failed.push(format!("triage key {id}: {e}")),
+        }
+    }
+    if let Some(id) = assistant {
+        match bifrost.revoke_virtual_key(&id).await {
+            Ok(()) => {
+                store.clear_tenant_assistant_vk(label)?;
+                eprintln!(
+                    "squelch-control: assistant virtual key {id} revoked and forgotten for {label}."
+                );
+            }
+            Err(e) => failed.push(format!("assistant key {id}: {e}")),
+        }
+    }
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "not everything was revoked ({}); the ids stay recorded, run `llm revoke {label}` again",
+            failed.join("; ")
+        );
+    }
     Ok(())
 }
 

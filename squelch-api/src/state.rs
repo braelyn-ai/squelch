@@ -108,8 +108,8 @@ pub struct ApiState {
     /// comes back is a pairing code the store adjudicates on its own terms.
     pub(crate) console_sso_url: Option<Arc<str>>,
     /// THE ESCAPE HATCH, from `[console] allow_insecure_cookie` /
-    /// `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`: serve the console session cookie
-    /// without `Secure` on an origin that is not loopback.
+    /// `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`: the operator's declaration that
+    /// this console is served over plain http on an origin that is not loopback.
     ///
     /// OFF BY DEFAULT AND MEANT TO STAY THERE. The cookie IS a device token, so
     /// turning this on puts a live credential on the wire in the clear for
@@ -117,13 +117,14 @@ pub struct ApiState {
     /// console over plain http on a LAN, who would otherwise have a console that
     /// simply does not work (a browser will not store a `Secure` cookie from
     /// `http://`). When it is on, the login page says so where the user can see
-    /// it. See [`crate::console`].
+    /// it, and the daemon warns at startup.
     ///
-    /// NOT YET CONSULTED (issue #46): squelchd never plumbs the config knob in,
-    /// and [`crate::console`]'s `Site::secure()` decides from the request
-    /// authority alone — so today the hatch parses but does nothing. Drop the
-    /// `dead_code` allow when wiring it.
-    #[allow(dead_code)]
+    /// IT IS NOT ONLY THE COOKIE, despite the name. It reaches the console as
+    /// `Site::origin_is_https`, the one answer behind the cookie's `Secure`
+    /// attribute, the scheme of the pairing deep link, the origin the CSRF check
+    /// compares `Origin` against, and whether the SSO link can name a tenant.
+    /// They move together on purpose; `crate::console`'s `Site::origin_is_https`
+    /// has the reasoning and the cost of setting this on a real https origin.
     pub(crate) console_allow_insecure_cookie: bool,
     /// Per-client buckets over the two console routes that reach the store with
     /// no credential in front of them. See
@@ -135,6 +136,12 @@ pub struct ApiState {
     /// inference resolves to `filtered`, which is the safe default. HUMAN DOOR
     /// ONLY, like every other rule write.
     pub(crate) rule_infer: Option<Arc<RuleInferClient>>,
+    /// The hosted assistant relay: forwards the Passband app's Anthropic-shaped
+    /// streaming request to the gateway with a daemon-held credential. `None`
+    /// (no gateway + assistant key configured, and every test harness) means
+    /// `/client/assistant/messages` answers 404 and the app falls back to BYOK.
+    /// HUMAN DOOR ONLY: the request spends the tenant's assistant budget.
+    pub(crate) assistant: Option<Arc<crate::assistant::AssistantRelay>>,
     /// The carrier poller's kick handle plus the carriers it was built over,
     /// behind `POST /client/shipments/poll`. `None` when no poller runs — which
     /// is the resting state of every daemon with no carrier credentials — and
@@ -331,6 +338,7 @@ impl ApiState {
                 crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE,
             ))),
             rule_infer: None,
+            assistant: None,
             shipment_poll: None,
             shipment_policy: squelch_core::config::ShipmentListPolicy::default(),
         }
@@ -450,7 +458,7 @@ impl ApiState {
     }
 
     /// Set the control plane's origin behind the console's Google sign-in link,
-    /// from `SQUELCH_CONSOLE_SSO_URL`.
+    /// from `[console] sso_url` / `SQUELCH_CONSOLE_SSO_URL`.
     ///
     /// Treated exactly like [`ApiState::with_tracking_base_url`]: blank is unset
     /// (an exported-but-empty variable must not become configuration), a trailing
@@ -473,6 +481,14 @@ impl ApiState {
     /// console renders the pasted-code form only, which is the self-host posture.
     pub(crate) fn console_sso_url(&self) -> Option<&str> {
         self.console_sso_url.as_deref()
+    }
+
+    /// Declare that this console is served over plain http, the LAN escape
+    /// hatch. See [`ApiState::console_allow_insecure_cookie`] for what it moves,
+    /// which is more than the cookie.
+    pub fn with_console_allow_insecure_cookie(mut self, allow: bool) -> Self {
+        self.console_allow_insecure_cookie = allow;
+        self
     }
 
     /// Slots for concurrent tracking-pixel writes; see
@@ -507,6 +523,19 @@ impl ApiState {
     /// The rule-disposition classifier, if one is configured.
     pub(crate) fn rule_infer(&self) -> Option<&RuleInferClient> {
         self.rule_infer.as_deref()
+    }
+
+    /// Attach the assistant relay. `None` (no gateway + assistant key) keeps
+    /// `/client/assistant/messages` a 404, which is what tells the app to fall
+    /// back to its own BYOK path.
+    pub fn with_assistant(mut self, relay: Option<crate::assistant::AssistantRelay>) -> Self {
+        self.assistant = relay.map(Arc::new);
+        self
+    }
+
+    /// The assistant relay, if one is configured.
+    pub(crate) fn assistant(&self) -> Option<&Arc<crate::assistant::AssistantRelay>> {
+        self.assistant.as_ref()
     }
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
@@ -682,6 +711,7 @@ impl ApiState {
                 cfg.stage1.global_daily_cap,
             )
             .with_tracking_base_url(cfg.tracking.base_url.clone())
+            .with_console_allow_insecure_cookie(cfg.console.allow_insecure_cookie)
             // The poller's retirement cap doubles as the listing's suppression
             // cap, so a row the poller gave up on stops being shown at the same
             // point it stops being polled; the staleness window rides along.
@@ -689,7 +719,43 @@ impl ApiState {
             // Rule-disposition inference rides the SAME key/provider the triage
             // stages resolve and the Stage-1 model; no key => `None` => rules
             // that omit a disposition are stored filtered.
-            .with_rule_inference(RuleInferClient::from_config(cfg));
+            .with_rule_inference(RuleInferClient::from_config(cfg))
+            // The assistant relay resolves only when BOTH the gateway base URL
+            // and the assistant key are present; anything less is `None` and
+            // the route 404s (see `Stage2Config::resolve_assistant`).
+            .with_assistant(
+                cfg.stage2
+                    .resolve_assistant()
+                    .map(crate::assistant::AssistantRelay::new),
+            );
+
+        // `[console] sso_url` has TWO sources and the FILE IS THE WEAKER ONE.
+        // [`ApiState::from_env`] has already applied the variable, which is what
+        // the warden sets when it provisions a tenant, so a file value fills in
+        // only where that left nothing. Resolving it here rather than in
+        // `from_env` is what makes the file setting reach the console at all:
+        // without this the field parses, and every self-host that put it in
+        // `squelch.toml` instead of the environment gets no button and no reason
+        // why. Env still wins, twice over, since `Config::load` also folds the
+        // variable into `cfg` before this runs.
+        let state = match &cfg.console.sso_url {
+            Some(url) if state.console_sso_url().is_none() => {
+                state.with_console_sso_url(Some(url.clone()))
+            }
+            _ => state,
+        };
+
+        // The hatch is the one setting whose whole job is to weaken a control,
+        // so it says so on the way up. The login page carries the same warning,
+        // but an operator who pairs from the CLI may never load it.
+        if state.console_allow_insecure_cookie {
+            eprintln!(
+                "squelch-api: [console] allow_insecure_cookie is ON, so the console session \
+                 cookie is served without `Secure` and this daemon treats its own origin as \
+                 plain http. The cookie is a live device token: anything on the network path \
+                 can take it. Front the console with TLS or reach it on loopback instead."
+            );
+        }
 
         Ok(match cfg.oauth_client() {
             Ok(client) => state.with_write_credentials(

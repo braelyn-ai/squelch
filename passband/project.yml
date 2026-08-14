@@ -52,7 +52,7 @@ targets:
         # keys to Info.plist, not here.
         INFOPLIST_FILE: Sources/Passband/Info.plist
         # Mirror of ./VERSION, which build.sh reads as the source of truth.
-        MARKETING_VERSION: "1.0.0"
+        MARKETING_VERSION: "0.0.1"
         CURRENT_PROJECT_VERSION: "1"
         COMBINE_HIDPI_IMAGES: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: Passband
@@ -117,11 +117,17 @@ targets:
           # --- phase 4: the remaining destinations ------------------------
           # The rail is the Mac's navigation model; the phone's is the tab bar.
           - "Views/SidebarRail.swift"
-          # All three render inside RoutedHeader, which lives in the excluded
+          # Both render inside RoutedHeader, which lives in the excluded
           # App/RootView.swift. Nothing else about them is macOS-only.
+          #
+          # SettingsView is NOT on this list any more. Its desktop chrome — the
+          # routed header and the 158pt sub-nav column — is fenced behind
+          # #if os(macOS), and the fifteen section structs it declares are now
+          # internal, so Sources/PassbandiOS/Views/AccountPage.swift composes
+          # THE SAME sections behind a navigation list. Settings that forked
+          # into two implementations would drift within a week.
           - "Views/AuthView.swift"
           - "Views/UsageView.swift"
-          - "Views/SettingsView.swift"
       - path: Sources/PassbandiOS
       # The same fonts and chimes the Mac ships, but NOT as one `Resources`
       # folder reference the way the macOS target takes them. An iOS bundle is
@@ -157,9 +163,9 @@ targets:
         # target above. CFBundleURLTypes (passband://) lives there, not here.
         INFOPLIST_FILE: Sources/PassbandiOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOS/PassbandiOS.entitlements
-        # The ios-v* tag overrides this in CI; it exists so an untagged local
+        # The passband-ios-* tag overrides this in CI; it exists so an untagged local
         # build never claims a version ahead of what TestFlight actually has.
-        MARKETING_VERSION: "0.0.1"
+        MARKETING_VERSION: "0.0.2"
         CURRENT_PROJECT_VERSION: "1"
         # iPhone only. The iPad layout is a different design, not a stretch.
         TARGETED_DEVICE_FAMILY: "1"

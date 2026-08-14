@@ -52,7 +52,7 @@ const server = Bun.serve({
     const dl = path.match(/^\/download\/(Passband-(\d+\.\d+\.\d+)\.zip)$/);
     if (dl) {
       return Response.redirect(
-        `https://github.com/braelyn-ai/squelch/releases/download/passband-v${dl[2]}/${dl[1]}`,
+        `https://github.com/braelyn-ai/squelch/releases/download/passband-mac-${dl[2]}/${dl[1]}`,
         302,
       );
     }

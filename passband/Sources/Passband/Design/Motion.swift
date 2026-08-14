@@ -25,4 +25,10 @@ enum Motion {
     /// arriving under it. Slower than the rail because the card travels the
     /// width of the screen and the eye follows it out.
     static let deckCard = Animation.spring(response: 0.38, dampingFraction: 0.86)
+
+    /// A phone tab's content arriving from the side its tab sits on: travel along
+    /// the bar rather than a replacement of what was there. Quick, because a tab
+    /// switch is navigation and not an event: long enough to say which direction
+    /// you moved, short enough that nobody waits through it to start reading.
+    static let tabSlide: Animation = .snappy(duration: 0.2)
 }

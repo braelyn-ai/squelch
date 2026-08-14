@@ -46,7 +46,7 @@ spec:
       containers:
         - name: warden
           # 1. EDIT ME
-          image: ghcr.io/braelyn-ai/squelch-warden:v0.2.6
+          image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -59,7 +59,7 @@ spec:
             # image would silently upgrade every tenant's daemon on any pod
             # restart. The warden refuses to start without one.
             - name: SQUELCH_WARDEN_IMAGE
-              value: ghcr.io/braelyn-ai/squelchd:v0.2.6
+              value: ghcr.io/braelyn-ai/squelchd:daemon-0.0.1
             - name: SQUELCH_WARDEN_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -86,24 +86,18 @@ spec:
             # exits at boot; see google-oauth-client.example.yaml.
             - name: SQUELCH_WARDEN_OAUTH_SECRET_NAME
               value: google-oauth-client
-            # The Secret holding the Anthropic key tenant daemons run Stage-2
-            # triage with, in the tenant namespace. Unlike the OAuth one this
-            # reference is OPTIONAL: no Secret means every tenant still starts
-            # and runs heuristic-only triage. Create it with
-            #   kubectl -n tenants create secret generic anthropic-api-key \
-            #     --from-literal=ANTHROPIC_API_KEY=sk-ant-...
-            # This is the shared-key bridge (issue #33); the relay replaces it.
-            - name: SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME
-              value: anthropic-api-key
-            # The LLM gateway (the relay that replaces the bridge above). With
-            # this set, every tenant pod sends its Anthropic-wire traffic to
-            # Bifrost's /anthropic route with a per-tenant virtual key the
-            # control plane mints at signup (Secret <label>-llm, installed via
-            # PUT /v1/tenants/{label}/llm-key). Unset = no LLM env injected and
-            # llm-key installs refused. Once every tenant is minted, delete the
-            # shared anthropic-api-key Secret: an UNMINTED tenant under the
-            # gateway presents the raw key to a gateway that only takes virtual
-            # keys, and its triage degrades until `squelch-control llm mint`.
+            # The LLM gateway, which is how a hosted tenant gets model triage
+            # at all. With this set, every tenant pod sends its Anthropic-wire
+            # traffic to Bifrost's /anthropic route with a per-tenant virtual
+            # key the control plane mints at signup (Secret <label>-llm,
+            # installed via PUT /v1/tenants/{label}/llm-key). Unset = no LLM
+            # env injected and llm-key installs refused. An UNMINTED tenant
+            # resolves no key at all and runs heuristic-only triage until
+            # `squelch-control llm mint`. True only of tenants THIS warden
+            # rendered: one provisioned before the shared-key bridge was
+            # removed still carries the legacy ANTHROPIC_API_KEY env, and is
+            # 401ing on every Stage-2 call rather than idling, until llm mint
+            # re-applies its Deployment. See PRODUCTION.md, "History".
             - name: SQUELCH_WARDEN_LLM_BASE_URL
               value: https://bifrost.passband.app/anthropic
             # 5. EDIT ME. The control plane's origin, handed to every tenant

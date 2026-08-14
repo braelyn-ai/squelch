@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use squelch_api::{ApiState, router};
-use squelch_core::store::{SqliteStore, Store};
+use squelch_core::store::{SqliteStore, Store, UsageTokens};
 use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
@@ -3966,10 +3966,14 @@ async fn stats_expose_stage2_usage_and_cost() {
         // 2 calls: 1_000_000 in, 200_000 out, 200_000 cache-write, 1_000_000
         // cache-read.
         store
-            .stage2_bump_usage(acct, &day, 600_000, 100_000, 200_000, 1_000_000)
+            .stage2_bump_usage(
+                acct,
+                &day,
+                UsageTokens { input: 600_000, output: 100_000, cache_creation: 200_000, cache_read: 1_000_000 },
+            )
             .unwrap();
         store
-            .stage2_bump_usage(acct, &day, 400_000, 100_000, 0, 0)
+            .stage2_bump_usage(acct, &day, UsageTokens { input: 400_000, output: 100_000, ..Default::default() })
             .unwrap();
     });
 
@@ -4037,10 +4041,14 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // (cache writes at 1.25x, reads at 0.1x of the input price).
     let Harness { app, .. } = harness(|store, acct| {
         store
-            .stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000, 0, 0)
+            .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 400_000, output: 100_000, ..Default::default() })
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000, 400_000, 2_000_000)
+            .stage2_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens { input: 600_000, output: 100_000, cache_creation: 400_000, cache_read: 2_000_000 },
+            )
             .unwrap();
     });
 
@@ -4932,8 +4940,12 @@ async fn triage_config_get_computes_trailing_averages() {
         }
         // One day with 2 calls, 1000 in / 200 out tokens.
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        store.stage2_bump_usage(acct, &day, 600, 120, 0, 0).unwrap();
-        store.stage2_bump_usage(acct, &day, 400, 80, 0, 0).unwrap();
+        store
+            .stage2_bump_usage(acct, &day, UsageTokens { input: 600, output: 120, ..Default::default() })
+            .unwrap();
+        store
+            .stage2_bump_usage(acct, &day, UsageTokens { input: 400, output: 80, ..Default::default() })
+            .unwrap();
     });
 
     let resp = app

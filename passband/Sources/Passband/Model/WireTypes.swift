@@ -525,6 +525,10 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// first fetch has not landed — so nil means "we do not know", never zero.
     /// Callers must have copy for both.
     var inbox_unread: InboxUnread?
+    /// Whether this daemon can relay ⌘K assistant calls to a hosted gateway
+    /// (POST /client/assistant/messages). ABSENT on a daemon too old to say —
+    /// and nil reads exactly like false: BYOK is the only assistant door.
+    var assistant_relay: Bool?
 }
 
 // MARK: - usage

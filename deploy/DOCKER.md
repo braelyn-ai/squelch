@@ -1,10 +1,11 @@
 # Self-hosting squelchd with Docker
 
-The container path: every `v*` tag pushed to this repo publishes
+The container path: every `daemon-X.Y.Z` tag pushed to this repo publishes
 `ghcr.io/braelyn-ai/squelchd` (linux/amd64 + linux/arm64) via
-`.github/workflows/release.yml`. Configuration is environment variables only —
-the full reference table lives in [DEPLOY.md](DEPLOY.md#environment-variables);
-this file covers what the image adds on top.
+`.github/workflows/release-daemon.yml`, as both `:daemon-X.Y.Z` and `:latest`.
+Configuration is environment variables only — the full reference table lives in
+[DEPLOY.md](DEPLOY.md#environment-variables); this file covers what the image
+adds on top.
 
 ## What the image bakes in
 
@@ -146,5 +147,6 @@ the bearer, MCP `initialize` against `/mcp`).
 docker compose pull && docker compose up -d squelchd
 ```
 
-Pin a version (`image: ghcr.io/braelyn-ai/squelchd:0.1.0`) if you'd rather
-upgrades be deliberate; `latest` tracks the newest tag.
+Pin a version (`image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.1`) if you'd
+rather upgrades be deliberate; `latest` tracks the newest tag. Released tags
+carry the `daemon-` prefix — that IS the tag, not a typo for a bare number.

@@ -4,14 +4,15 @@ Push a tag; CI does the rest:
 
 ```sh
 # bump VERSION (and its project.yml mirror), commit, then:
-git tag "passband-v$(cat VERSION)" && git push origin "passband-v$(cat VERSION)"
+git tag "passband-mac-$(cat VERSION)" && git push origin "passband-mac-$(cat VERSION)"
 ```
 
-`.github/workflows/passband-release.yml` builds, signs, notarizes, publishes
-the GitHub release, regenerates the appcast (committed to main, which
+`.github/workflows/release-passband-mac.yml` verifies the tag against both
+`VERSION` and project.yml's macOS target, then builds, signs, notarizes,
+publishes the GitHub release, regenerates the appcast (committed to main, which
 redeploys the site), and bumps the Homebrew cask. It needs five repo
-secrets, listed at the top of the workflow file. The daemon's bare `v*`
-tags are a different workflow; the two never overlap.
+secrets, listed at the top of the workflow file. The daemon ships from
+`daemon-*` tags and iOS from `passband-ios-*`; the three never overlap.
 
 ## Local fallback
 
@@ -32,10 +33,11 @@ whoever holds it can sign updates for every install).
 1. Bump `VERSION` (and its mirror in project.yml), commit.
 2. `./build-release.sh` — signs, notarizes, staples, leaves
    `build/Passband-$VERSION.zip`.
-3. Publish the archive under the passband-v tag (squelchd owns bare `v*` tags):
+3. Publish the archive under the `passband-mac-` tag (the daemon owns
+   `daemon-*`, the phone owns `passband-ios-*`):
 
    ```sh
-   gh release create "passband-v$(cat VERSION)" "build/Passband-$(cat VERSION).zip" \
+   gh release create "passband-mac-$(cat VERSION)" "build/Passband-$(cat VERSION).zip" \
      --title "Passband $(cat VERSION)" --notes "..."
    ```
 

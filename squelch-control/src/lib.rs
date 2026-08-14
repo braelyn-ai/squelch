@@ -23,9 +23,15 @@
 //!
 //! PRIVACY, enforced by review of every `tracing` call in this crate: invite
 //! codes, their hashes, pairing codes, OAuth codes, `state`, PKCE verifiers,
-//! session ids, cookie MACs, the warden bearer, and access/refresh tokens NEVER
-//! reach a log line. Labels, account emails, statuses, and counts may.
+//! session ids, cookie MACs, the warden bearer, the admin token, the Resend
+//! key, and access/refresh tokens NEVER reach a log line. Labels, account
+//! emails, statuses, and counts may.
+//!
+//! A WAITLIST ADDRESS MAY NOT. It belongs to somebody who is not a tenant and
+//! has consented to nothing but being told when there is room, so the waitlist
+//! and admin paths log the ROW ID and never the address they hold.
 
+pub mod admin;
 pub mod bifrost;
 pub mod config;
 pub mod cookie;
@@ -35,6 +41,7 @@ pub mod labels;
 pub mod oauth;
 pub mod pages;
 pub mod ratelimit;
+pub mod resend;
 pub mod seal;
 pub mod sessions;
 pub mod state;
@@ -42,7 +49,7 @@ pub mod store;
 pub mod warden;
 
 pub use config::{Config, ConfigError};
-pub use state::ControlState;
+pub use state::{ControlState, StateError};
 pub use store::ControlStore;
 
 use axum::{
@@ -54,7 +61,7 @@ use axum::{
 
 /// Build the control-plane router.
 ///
-/// Four surfaces, four budgets, because a 429 costs a different thing on each
+/// Seven surfaces, seven budgets, because a 429 costs a different thing on each
 /// (the shape is stolen from `squelch-broker`, which learned it the same way):
 ///
 /// - `GET /` is a page. Browsers prefetch it and link scanners fetch it, and
@@ -70,6 +77,20 @@ use axum::{
 /// - `GET /oauth/callback` is the most generous. Refusing it destroys a consent
 ///   the user has ALREADY granted at Google, which they cannot grant twice
 ///   without walking the whole flow again. Both flows come back through it.
+/// - `POST /waitlist` is small. It is a stranger-facing WRITE, a person joins
+///   once, and everything above the budget is rows of junk for an operator to
+///   read past; a real submitter who is refused loses one retry, because the
+///   answer is the same 200 whether the address was new or not.
+/// - `POST /admin/login` is tight and in its OWN bucket, for the reason
+///   `/console/auth` has one: it is the second route where a stranger guesses at
+///   a secret, and it must not be able to spend the budget the dashboard needs.
+/// - The admin dashboard and its two buttons are generous. One operator with a
+///   cookie, clicking through a list that re-renders after every approval.
+///
+/// THE LAST THREE ARE MOUNTED ONLY WHEN THE WAITLIST IS CONFIGURED. With the
+/// feature off they do not exist, so an unconfigured deployment answers 404 at
+/// an admin URL rather than 403: there is no door to knock on, and no admin
+/// token for a stranger to spend their bucket guessing at.
 ///
 /// `/healthz` sits outside every layer so liveness answers while a client is
 /// throttled.
@@ -105,12 +126,57 @@ pub fn router(state: ControlState) -> Router {
             state.clone(),
             ratelimit::limit_callback,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(handlers::healthz))
         .merge(form)
         .merge(signup)
         .merge(console)
-        .merge(callback)
+        .merge(callback);
+
+    if state.config().waitlist.is_none() {
+        return app;
+    }
+
+    let waitlist = Router::new()
+        .route(
+            "/waitlist",
+            post(handlers::waitlist).options(handlers::waitlist_preflight),
+        )
+        .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_waitlist,
+        ))
+        // OUTERMOST, so the throttle's 429 and the body limit's 413 carry the
+        // CORS headers too. A refusal a browser cannot read is a refusal the
+        // form has to report as a network failure.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            handlers::waitlist_cors,
+        ))
+        .with_state(state.clone());
+
+    let admin_login = Router::new()
+        .route("/admin/login", post(admin::login))
+        .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_admin_login,
+        ))
+        .with_state(state.clone());
+
+    let admin = Router::new()
+        .route("/admin", get(admin::page))
+        .route("/admin/approve", post(admin::approve))
+        .route("/admin/send", post(admin::send))
+        .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_admin,
+        ))
+        .with_state(state);
+
+    app.merge(waitlist).merge(admin_login).merge(admin)
 }

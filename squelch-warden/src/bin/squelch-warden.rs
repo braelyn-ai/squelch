@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let base_domain = config.base_domain.clone();
     let namespace = config.namespace.clone();
     let user_namespaces = config.user_namespaces;
+    let llm_gateway = config.llm_base_url.is_some();
 
     // Fail at startup rather than on the first signup: a warden that cannot
     // reach the API server is a warden that can do nothing at all, and the
@@ -115,6 +116,11 @@ async fn main() -> anyhow::Result<()> {
     if !user_namespaces {
         tracing::warn!(
             "SQUELCH_WARDEN_USER_NAMESPACES is off: tenant pods will share the node's user namespace, so uid isolation is the only boundary left between them"
+        );
+    }
+    if !llm_gateway {
+        tracing::warn!(
+            "no LLM gateway configured (SQUELCH_WARDEN_LLM_BASE_URL unset): every tenant runs heuristic-only triage, and llm-key installs will be refused"
         );
     }
 

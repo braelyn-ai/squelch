@@ -116,6 +116,8 @@ enum Analytics {
             "surface", "squelch", "filtered",
             // assistant_asked models
             "haiku", "opus",
+            // assistant_asked transports
+            "relay", "byok",
         ])
 
     /// Screen views ride at `minimal` alongside lifecycle events.

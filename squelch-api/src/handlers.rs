@@ -928,21 +928,15 @@ struct ResolvedDisposition {
 /// that lands in no category is spend no cap and no report can see.
 const RULE_INFER_LEDGER_CATEGORY: &str = "rule_infer";
 
-/// Bill one inference call. Best-effort by design: the rule is already written
-/// when this runs, and a ledger write that fails must not fail the save. Runs
-/// INSIDE the caller's existing store hop, so it costs no extra blocking task.
+/// Bill one inference call. Best-effort by design: a ledger write that fails
+/// must not fail the save. Callers run it BEFORE the rule write, inside the
+/// same store hop (so it costs no extra blocking task): the model call already
+/// happened, and a store error on the rule row must not orphan the spend.
 fn bill_rule_inference(store: &SqliteStore, account_id: AccountId, usage: Option<Usage>) {
     let Some(u) = usage else { return };
     let day = Utc::now().format("%Y-%m-%d").to_string();
-    if let Err(e) = store.extract_bump_usage(
-        account_id,
-        &day,
-        RULE_INFER_LEDGER_CATEGORY,
-        u.input_tokens,
-        u.output_tokens,
-        u.cache_creation_input_tokens,
-        u.cache_read_input_tokens,
-    ) {
+    if let Err(e) = store.extract_bump_usage(account_id, &day, RULE_INFER_LEDGER_CATEGORY, u.into())
+    {
         eprintln!("squelch: rule inference usage ledger bump failed ({e})");
     }
 }
@@ -1038,8 +1032,12 @@ pub async fn create_rule(
     let sweep = body.sweep;
     let usage = resolved.usage;
     let id = store_call(&state, move |store, account_id| {
-        let id = store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)?;
+        // Bill BEFORE the rule write: the model call already happened, so the
+        // spend must land in the ledger even if set_sender_rule fails. A retry
+        // after such a failure re-runs the inference too, so a second entry
+        // matches a second real spend.
         bill_rule_inference(store, account_id, usage);
+        let id = store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)?;
         Ok(id)
     })
     .await?;
@@ -1097,6 +1095,10 @@ pub async fn update_rule(
     let pattern = body.match_pattern.clone();
     let usage = resolved.usage;
     let updated = store_call(&state, move |store, account_id| {
+        // Billed first, even when the id is bogus or the write fails: the
+        // model call happened and was paid for regardless of what the store
+        // does with the row.
+        bill_rule_inference(store, account_id, usage);
         let updated = store.update_sender_rule(
             account_id,
             id,
@@ -1104,9 +1106,6 @@ pub async fn update_rule(
             &body.want,
             disposition,
         )?;
-        // Billed even when the id was bogus: the model call happened and was
-        // paid for regardless of what the store did with the row.
-        bill_rule_inference(store, account_id, usage);
         Ok(updated)
     })
     .await?;
@@ -1541,6 +1540,10 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
             "fetched_at": unread.fetched_at.to_rfc3339(),
         });
     }
+    // Capability flag for the app: whether /client/assistant/messages will
+    // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
+    // Always present so a client reads an answer, not absence.
+    body["assistant_relay"] = json!(state.assistant().is_some());
     Ok(Json(body))
 }
 

@@ -10,9 +10,12 @@
 // and `revealAsync()` is the one deliberate hole, for Settings'
 // human-initiated Show / Edit.
 //
-// Both LLMProxy entry points hold that line: `complete()` and `stream()` each
+// Every LLMProxy entry point holds that line: `complete()` and `stream()` each
 // read the key inside themselves and hand back only provider output — the key
 // is never a parameter, a returned/yielded value, or anything an error carries.
+// That is also why a caller wanting a one-shot answer gets its entry point HERE
+// rather than building its own request somewhere else: the moment a second file
+// constructs the header, the key has to leave this one.
 
 import Foundation
 import Security
@@ -218,8 +221,16 @@ struct AssistantKeyStatus: Sendable, Equatable {
 enum AssistantKeyStore {
     /// Provider inferred from the key prefix, matching the server-side Stage-2
     /// routing. Never exposes the key value.
-    fileprivate static func provider(forKey key: String) -> AssistantProvider {
-        key.hasPrefix("sk-ant-") ? .anthropic : .openai
+    ///
+    /// `nil` for anything that matches NEITHER prefix, and that is a safety
+    /// property, not pedantry: an iOS keyboard that auto-capitalized a
+    /// hand-typed key ("Sk-ant-…") used to fall through to the OpenAI arm and
+    /// POST an Anthropic key to api.openai.com. An unrecognized key now routes
+    /// nowhere.
+    fileprivate static func provider(forKey key: String) -> AssistantProvider? {
+        if key.hasPrefix("sk-ant-") { return .anthropic }
+        if key.hasPrefix("sk-") { return .openai }
+        return nil
     }
 
     /// No provider's key ever contains whitespace, but a pasted one can — a
@@ -335,11 +346,20 @@ enum LLMProxy {
 
     /// Make ONE completion call. `body` is a fully-formed provider request body
     /// MINUS auth (model, messages, tools, max_tokens, …).
-    static func complete(body: Data) async throws -> LLMResponse {
+    ///
+    /// `require` enforces a provider IN-BAND, at the same keychain read that
+    /// decides the routing: a caller whose body names a Claude model passes
+    /// `.anthropic` and can never race a key swap into posting that body to a
+    /// host that would not understand it. A status() precheck in the caller is
+    /// a courtesy that saves a round trip; this is the guarantee.
+    static func complete(body: Data, require: AssistantProvider? = nil) async throws -> LLMResponse
+    {
         guard let key = AssistantKeyStore.read() else { throw LLMError.noKey }
+        let provider = AssistantKeyStore.provider(forKey: key)
+        if let require, provider != require { throw LLMError.wrongProvider }
 
         var req: URLRequest
-        switch AssistantKeyStore.provider(forKey: key) {
+        switch provider {
         case .anthropic:
             req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
             req.setValue(key, forHTTPHeaderField: "x-api-key")
@@ -347,6 +367,10 @@ enum LLMProxy {
         case .openai:
             req = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
             req.setValue("Bearer \(key)", forHTTPHeaderField: "authorization")
+        case nil:
+            // A key that matches no known prefix routes NOWHERE. See
+            // provider(forKey:) for why this case exists.
+            throw LLMError.wrongProvider
         }
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -464,7 +488,14 @@ enum LLMProxy {
         } catch {
             // A body that died mid-read is still worth parsing.
         }
-        let json = try? JSONSerialization.jsonObject(with: Data(raw))
+        return errorMessage(inJSON: Data(raw))
+    }
+
+    /// The dig itself, shared by the streamed and the buffered paths so both
+    /// quote the provider the same way. Returns nil for anything unparseable;
+    /// never surfaces headers or the key.
+    private static func errorMessage(inJSON data: Data) -> String? {
+        let json = try? JSONSerialization.jsonObject(with: data)
         guard let object = json as? [String: Any],
             let error = object["error"] as? [String: Any],
             let message = error["message"] as? String, !message.isEmpty

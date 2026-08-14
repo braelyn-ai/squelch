@@ -1,6 +1,7 @@
-# Every ios-v* tag archives the iOS client and uploads it to TestFlight.
-# Separate namespace from the daemon's v* tags on purpose: shipping a phone
-# build must never rebuild three Docker images, and vice versa.
+# Every passband-ios-* tag archives the iOS client and uploads it to
+# TestFlight. Separate namespace from the daemon-* and passband-mac-* tags on
+# purpose: shipping a phone build must never rebuild three Docker images, and
+# vice versa.
 #
 # The runner holds NO signing material: passband/release-ios.sh hands the App
 # Store Connect API key to xcodebuild, and cloud signing mints a managed
@@ -13,11 +14,11 @@
 # The key needs the ADMIN role. Apple's docs say App Manager suffices for
 # cloud signing; xcodebuild disagrees and fails with "Cloud signing permission
 # error" on anything below Admin (developer.apple.com/forums/thread/698117).
-name: release-ios
+name: release-passband-ios
 
 on:
   push:
-    tags: ["ios-v*"]
+    tags: ["passband-ios-*"]
 
 permissions:
   contents: read
@@ -32,6 +33,17 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      # App Store Connect rejects a marketing version that ever goes
+      # backwards, so keep the tag pinned to project.yml's iOS target — the
+      # value a local xcodegen build stamps — instead of letting the tag
+      # free-float. awk is scoped to the PassbandiOS target block.
+      - name: Verify tag matches project.yml
+        run: |
+          PROJ=$(awk '/^  PassbandiOS:$/{f=1}
+            f && /MARKETING_VERSION:/ {gsub(/"/,""); print $2; exit}' passband/project.yml)
+          [ "${GITHUB_REF_NAME}" = "passband-ios-$PROJ" ] || {
+            echo "tag ${GITHUB_REF_NAME} != passband-ios-$PROJ (project.yml iOS MARKETING_VERSION)"; exit 1; }
 
       - name: xcodegen
         run: brew install xcodegen
@@ -49,8 +61,8 @@ jobs:
           umask 077
           printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
 
-      # ios-v1.0.1 tags the build 1.0.1; the build number is the UTC minute,
-      # stamped inside the script.
+      # passband-ios-1.0.1 tags the build 1.0.1; the build number is the UTC
+      # minute, stamped inside the script.
       - name: archive, export, upload
         env:
           SQUELCH_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -58,4 +70,4 @@ jobs:
           SQUELCH_ASC_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
           SQUELCH_IOS_VERSION: ${{ github.ref_name }}
         run: |
-          SQUELCH_IOS_VERSION="${SQUELCH_IOS_VERSION#ios-v}" ./passband/release-ios.sh
+          SQUELCH_IOS_VERSION="${SQUELCH_IOS_VERSION#passband-ios-}" ./passband/release-ios.sh

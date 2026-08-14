@@ -605,6 +605,20 @@ pub struct Stage2UsageDay {
     pub cache_read_tokens: u64,
 }
 
+/// One call's token counts, as the ledger records them: `input` is the UNCACHED
+/// prompt remainder, with prompt-cache writes and reads in their own fields
+/// because they price differently. A struct rather than four positional u64s so
+/// a transposed input/output can't compile — which is also why there is no
+/// positional constructor: build it as a field-named literal (production goes
+/// through `From<Usage>`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+}
+
 /// Runtime daily-cap overrides from `app_settings`. `None` means no override
 /// row, so the caller falls back to config/env then the built-in default; only
 /// values parsing as an integer in `1..=100000` are surfaced, a malformed or
@@ -1488,10 +1502,7 @@ pub trait Store: Send + Sync {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()>;
 
     /// Sum the Stage-1 usage ledger over every day `>= since_day`. Drives the
@@ -1501,16 +1512,13 @@ pub trait Store: Send + Sync {
     /// Bump a SPECIALIST-EXTRACTOR usage line for `(account_id, day, category)`.
     /// `category` is the extractor's own ledger label (e.g. `extract_banking`),
     /// kept separate from `stage1`/`stage2` so per-specialist cost stays visible.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // the parts of one usage ledger line
     fn extract_bump_usage(
         &self,
         account_id: AccountId,
         day: &str,
         category: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()>;
 
     /// Stage-1 usage history: the most recent `days` rows, newest-first (sparse).
@@ -1574,10 +1582,7 @@ pub trait Store: Send + Sync {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()>;
 
     /// Read the Stage-2 usage totals for `(account_id, day)`. Returns a zeroed
