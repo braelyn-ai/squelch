@@ -1628,6 +1628,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             )
         };
 
+        // Set when a specialist reports a bad credential. The two sources below
+        // share one resolved key, so a failure in the first is a failure in the
+        // second: without this the shipments queue would spend the whole daily
+        // cap re-proving the same misconfiguration.
+        let mut auth_failed = false;
+
         for row in &queued {
             // ONE ORDERED DECISION per row — sealed guard (the queue already
             // excludes sealed rows in SQL; re-check anyway, docs/SECURITY.md),
@@ -1710,6 +1716,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 extracted += 1;
                             }
                         }
+                        Ok(marketing::ExtractOutcome::Failed(kind))
+                            if crate::triage::llm::is_auth_failure(&kind) =>
+                        {
+                            // AUTH FAILURE: a fact about the CREDENTIAL, not
+                            // about this row. Marking it processed would
+                            // foreclose the row forever even after the key is
+                            // fixed, so leave it queued and stop the pass.
+                            eprintln!(
+                                "squelch: extract auth failure ({kind}); the resolved LLM key \
+                                 is wrong for the endpoint; rows stay queued"
+                            );
+                            auth_failed = true;
+                            break;
+                        }
                         Ok(marketing::ExtractOutcome::Refused)
                         | Ok(marketing::ExtractOutcome::Failed(_)) => {
                             let _ = self.store.extract_mark_processed(
@@ -1760,6 +1780,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 extracted += 1;
                             }
                         }
+                        Ok(banking::ExtractOutcome::Failed(kind))
+                            if crate::triage::llm::is_auth_failure(&kind) =>
+                        {
+                            // See the marketing arm: a bad credential is not a
+                            // verdict about this row, and marking it processed
+                            // would forfeit it permanently.
+                            eprintln!(
+                                "squelch: extract auth failure ({kind}); the resolved LLM key \
+                                 is wrong for the endpoint; rows stay queued"
+                            );
+                            auth_failed = true;
+                            break;
+                        }
                         Ok(banking::ExtractOutcome::Refused)
                         | Ok(banking::ExtractOutcome::Failed(_)) => {
                             // Mark processed so the row cannot loop; no specialist row is
@@ -1784,11 +1817,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // ---- SOURCE 2: the SHIPMENTS trigger queue -------------------------
         // Its own stale clock: see `ship_stale_cutoff`.
         let ship_cutoff = ship_stale_cutoff(Utc::now(), self.config.carriers.max_age_days);
-        let ship_queued = Self::read_queue(
-            self.store
-                .ship_extract_queue(self.account_id, cfg.batch_per_cycle),
-            "ship-extract",
-        );
+        let ship_queued = if auth_failed {
+            Vec::new()
+        } else {
+            Self::read_queue(
+                self.store
+                    .ship_extract_queue(self.account_id, cfg.batch_per_cycle),
+                "ship-extract",
+            )
+        };
 
         for row in &ship_queued {
             // SEALED GUARD: the queue already excludes sealed rows in SQL;
@@ -1855,6 +1892,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         Ok(false) => ship_skipped += 1,
                         Ok(true) => ship_extracted += 1,
                     }
+                }
+                Ok(shipments::ExtractOutcome::Failed(kind))
+                    if crate::triage::llm::is_auth_failure(&kind) =>
+                {
+                    // See the marketing arm: the credential is wrong for every
+                    // row, so stamping this one would forfeit a shipping email
+                    // permanently over a config mistake.
+                    eprintln!(
+                        "squelch: ship-extract auth failure ({kind}); the resolved LLM key \
+                         is wrong for the endpoint; rows stay queued"
+                    );
+                    break;
                 }
                 Ok(shipments::ExtractOutcome::Refused)
                 | Ok(shipments::ExtractOutcome::Failed(_)) => {
