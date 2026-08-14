@@ -109,7 +109,7 @@ monthly dollar budget and installed through the warden as that tenant's
 volume, and refuses a tenant that has blown its budget.
 
 The cluster half of the feature is the `SQUELCH_WARDEN_LLM_*` block in
-`20-warden.yaml`: `SQUELCH_WARDEN_LLM_BASE_URL` (the feature gate — the warden
+`15-warden-config.yaml`: `SQUELCH_WARDEN_LLM_BASE_URL` (the feature gate — the warden
 refuses to boot if any of the rest are set without it),
 `SQUELCH_WARDEN_LLM_STAGE1_MODEL`, `SQUELCH_WARDEN_LLM_STAGE2_MODEL`,
 `SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP`, `SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP`.
@@ -211,10 +211,23 @@ turning binfmt back on.
 > `daemon-*` tag is cut and `20-warden.yaml` is repointed at a tag the registry
 > actually has. From that point on, replacing this node is a pull.
 
-The squelchd and warden tags are both pinned in `20-warden.yaml`, at
-`daemon-*` tags, and again in `90-warden-roller.yaml`, which renders tenants
-with the same code and must therefore carry the same two values. The warden
-refuses to start with an untagged tenant image.
+The two tags live in different places, and the split is deliberate. The squelchd
+image tenants run is `SQUELCH_WARDEN_IMAGE` in `15-warden-config.yaml`, written
+once and read by both processes that render tenants — the serving pod and the
+roller — through `envFrom`. The **warden's own** image is a pod-spec field, which
+no ConfigMap can carry, so it is written twice: in `20-warden.yaml` and in
+`90-warden-roller.yaml`. Those two must name the same tag, because this binary is
+the renderer and a roller on an older one renders older tenants. It is the one
+value in this system that two files still have to agree on by hand:
+
+```sh
+kubectl -n warden get deploy/squelch-warden \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n warden get cronjob/squelch-warden-roll \
+  -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+The warden refuses to start with an untagged tenant image.
 
 ## Shipping a tenant-shape change
 
@@ -254,6 +267,30 @@ waits for the old pod to let go of the `ReadWriteOnce` volume, and applies a
 fresh one — that mailbox is down for the window, and it is the only way those
 fields ever go away (see the open item below for why).
 
+**The roller converges the DEPLOYMENT, and only the Deployment.** This is the
+limit to know before the roll below is trusted with a shape change. What decides
+whether the roller touches a tenant is a drift report, and a drift report renders
+and diffs that tenant's Deployment alone — its Service, Ingress, NetworkPolicy
+and PVC are never rendered and never compared. Delete a tenant's Ingress out of
+band and the roll reports that tenant as **already current** while the mailbox is
+unreachable from the internet; that is verified behaviour, not a worry.
+
+So a change to `SQUELCH_WARDEN_NODE_CIDR` (a NetworkPolicy rule),
+`SQUELCH_WARDEN_TLS_SECRET` or the ingress class (an Ingress field),
+`SQUELCH_WARDEN_STORAGE_*` (the PVC), or a new path in `HUMAN_DOOR_PREFIXES`
+reaches **new signups only, forever**. No roll will ever report an existing
+tenant as drifted for one, and no roll will ever deliver one. The answer is
+manual and per tenant:
+
+```sh
+squelch-control reconcile <label>     # re-applies PVC, NetworkPolicy, Service, Deployment, Ingress
+```
+
+Walk the list from `squelch-control tenants`, one label at a time, watching each
+pod come back. A tenant that happens to be rolled for some Deployment-visible
+reason picks the other four objects up as a side effect, because `reconcile`
+re-applies all five — that is luck, and it is not a plan.
+
 **One tenant at a time, verified.** That is the whole discipline, and the roller
 below is it done by a timer that does not get bored on tenant nine: one
 reconcile, one finished rollout, then the next, and a stop at the first tenant
@@ -268,6 +305,16 @@ old pod to finish terminating and run the same `reconcile` again: a surviving
 Service is how the warden tells an interrupted reconcile from a cancelled
 account, so it resumes rather than refusing. Nothing was lost — the volume, the
 identity and the sealed credential never moved.
+
+That signal has a narrow race in it, and the roller enters the window once per
+active tenant per tick rather than only when a person types the command: a
+reconcile re-applies the Service before it re-reads the Deployment, so a `DELETE`
+landing between those two writes has its Service put back by the reconcile
+itself, and the cancelled mailbox is rebuilt. It takes a cancellation inside a
+few API calls. Cancel deliberately rather than casually — suspend the CronJob, or
+confirm the tenant is still gone once the run finishes
+(`kubectl -n tenants get deploy,svc -l app.kubernetes.io/instance=<label>`).
+`squelch-warden/README.md`, "What the drift report cannot see", has the mechanism.
 
 **The fallback, for what reconcile refuses.** A `pending` tenant, and a
 `stopped` one that was genuinely cancelled (its Service is gone too), come back
@@ -305,17 +352,35 @@ Three steps, and only the middle one is a decision.
    (`docs/RELEASING.md`, surface 1). Nothing on this box moves, and no tenant is
    affected: the registry holding an image is not a deploy.
 2. **A human bumps the pin and applies.** `SQUELCH_WARDEN_IMAGE` in
-   `20-warden.yaml` **and its copy in `90-warden-roller.yaml`** — two halves of
-   one setting, and a difference between them is the flap described in that
-   file's env-block comment. `kubectl apply -f` both. This is the deliberate
-   decision to roll the fleet, and it is the only step with a person in it.
+   `15-warden-config.yaml`, which is one entry in one ConfigMap that both
+   rendering processes read. This is the deliberate decision to roll the fleet,
+   and it is the only step with a person in it:
+
+   ```sh
+   kubectl apply -f deploy/hosted/15-warden-config.yaml
+   kubectl -n warden rollout restart deploy/squelch-warden
+   ```
+
+   The restart is not optional and it is not cosmetic. `envFrom` is read once,
+   when a pod starts: the roller gets the new value on its next tick because
+   every run is a fresh pod, and the serving pod goes on rendering the OLD image
+   into new signups and into every `llm mint` until it is restarted. Both
+   commands, same minute — fifteen minutes is the whole window in which the two
+   disagree.
 3. **The roller converges the fleet.** The CronJob in `90-warden-roller.yaml`
    runs `squelch-warden roll` every 15 minutes, on the warden's image, under the
-   warden's own ServiceAccount, with the warden's own environment. It lists
-   every tenant in the cluster, reconciles the ones whose live Deployment no
-   longer matches today's render, waits for each rollout to actually finish
-   before touching the next tenant, and stops at the first one that does not
-   come back.
+   warden's own ServiceAccount, with the warden's own environment — the same
+   ConfigMap, through the same `envFrom`. It lists every tenant in the cluster,
+   reconciles the ones whose live Deployment no longer matches today's render,
+   waits for each rollout to actually finish before touching the next tenant, and
+   stops at the first one that does not come back.
+
+A **warden** release, as opposed to a daemon one, is the other half: the
+`image:` on the Deployment in `20-warden.yaml` and on the CronJob in
+`90-warden-roller.yaml`, which are two pod-spec fields no ConfigMap can hold.
+Bump both, apply both, and check them against each other (the two `jsonpath`
+lines under "Images"). A roller on an older warden image is an older renderer,
+and it rolls the fleet onto whatever that older code renders.
 
 Nothing in that chain reaches in from outside. It is the warden's binary calling
 its own library code on the box: no credential leaves the cluster to trigger a
@@ -341,22 +406,75 @@ The run's answer is its exit code, which is also the Job's status:
 
 | Exit | Means | What to do |
 |---|---|---|
-| 0 | The fleet is on today's render and serving it. A run with nothing to do is this. | Nothing. |
-| 1 | Not converged, in any of its forms: it halted on a tenant that did not come back; it stopped before applying anything because a tenant already carries today's render and is not serving it; a tenant has no workload behind a live Service; it never started (refused config, unreachable API server); or `--dry-run` found work to do. | Read the log, find the named label, suspend the CronJob while you work. Everything after that tenant in label order was not touched. |
-| 2 | Converged, and at least one tenant was skipped for foreign drift. | Below. Nothing is broken; nothing fixes itself either. |
-| 64 | The Job's argument list is wrong. | Fix `args:` in `90-warden-roller.yaml`. |
+| 0 | The fleet is on today's render and serving it. A run with nothing to do is this, and so is `--dry-run` over a fleet that needs nothing. | Nothing. |
+| 1 | Not converged, in one of five ways. The summary line says which. | Suspend the CronJob while you work; everything after the named tenant in label order was not touched. Then, by case — see the five paragraphs below. |
+| 2 | Converged, and at least one tenant was skipped for foreign drift. | `squelch-control drift <label>`, then `reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. Nothing is broken; nothing fixes itself either. |
+| 64 | The Job's argument list is wrong. | Fix `args:` in `90-warden-roller.yaml`. Nothing was read and nothing was applied. |
+
+The five shapes of a 1, and what each wants:
+
+- **Halted on a tenant** (`HALTED on <label>`) — that tenant's reconcile did not
+  finish. `kubectl -n tenants logs deploy/<label>` and
+  `kubectl -n tenants describe pod -l app.kubernetes.io/instance=<label>`. The
+  tenants before it are on today's render; the ones after it are untouched.
+- **Casualty** (`HALTED before applying anything`) — below.
+- **A tenant DOWN with no workload** — below.
+- **Never started** — a config value the warden refused, or an API server it
+  could not reach. There are no per-tenant lines at all in the log, only the
+  sentence. Nothing was applied.
+- **`--dry-run` found work** — the flag doing its job: the fleet is behind and
+  this run said so without touching anything. Read the `would roll` list.
 
 Anything other than 0 marks the Job **failed**, which is deliberate: a fleet that
 is not converged should be visible as a failure and not as a line in a log
 nobody reads.
 
 ```sh
-kubectl -n warden get cronjob squelch-warden-roll         # last schedule, suspended or not
-kubectl -n warden get jobs                                # one row per run, 3 kept + 5 failed
+kubectl -n warden get cronjob squelch-warden-roll         # last schedule, ACTIVE, suspended or not
+kubectl -n warden get jobs                                # one row per run, 3 kept + 24 failed
 kubectl -n warden logs job/<name>                         # per-tenant lines, then the summary
-kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now   # do not wait
 kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
 ```
+
+**Neither of those last two is what it looks like.** `suspend: true` stops the
+NEXT tick and does nothing to a run already going — that one keeps applying, one
+mailbox at a time, and stopping it means deleting its Job
+(`kubectl -n warden delete job <name>`, which takes the pod with it; the tenants
+already rolled stay rolled and the rest wait for the next run). And
+`kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now` makes
+a **standalone** Job that `concurrencyPolicy: Forbid` does not count, so it can
+walk the fleet beside a scheduled tick, at a different offset, with two mailboxes
+down at once. Suspend first, confirm nothing is active, create, then clean up and
+unsuspend:
+
+```sh
+kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
+kubectl -n warden get cronjob squelch-warden-roll -o jsonpath='{.status.active}{"\n"}'   # empty
+kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now
+kubectl -n warden logs -f job/roll-now
+kubectl -n warden delete job roll-now      # nothing else collects it, and the name is taken
+kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":false}}'
+```
+
+**A run that halts on the SAME label every tick is a render the cluster refuses,
+not a flaky tenant.** A rejected apply writes nothing, so that tenant is still
+drifted, so it is first in the queue again fifteen minutes later and rejected
+again — ~96 failed Jobs a day and not one tenant converged in any of them. Unlike
+a casualty, this one never moves on its own.
+
+A reconcile applies a tenant's PVC, NetworkPolicy and Service before its
+Deployment, so the object the API server refuses is often not the thing that
+queued the tenant: raise `SQUELCH_WARDEN_STORAGE_SIZE` in the same edit as an
+image bump, on a storage class with no `allowVolumeExpansion`, and every drifted
+tenant dies at `volume_failed` on a PVC the image bump had nothing to do with.
+The machine reason in the log names the object (`volume_failed`,
+`network_policy_failed`, `service_failed`, `workload_failed`, `ingress_failed`,
+and `render_rejected` for a render the dry run refused before anything was
+applied). Suspend, put back whatever changed in `15-warden-config.yaml`, restart
+the warden, unsuspend. `squelch-control reconcile <label>` on that one tenant
+reproduces the refusal with the API server's own message when the reason word is
+not enough. `failedJobsHistoryLimit: 24` is what keeps six hours of that evidence
+readable instead of an hour of it.
 
 **A run that stops before applying anything is the halt doing its job across
 runs.** The roller reads every tenant before it writes to any of them, and a
@@ -578,11 +696,12 @@ would happily stream over the real history.
   covered: the roller (see "Rolling the daemon image") walks the fleet every 15
   minutes and fixes what it can. What is missing is anybody finding out when it
   cannot. A halt or a foreign-drift skip is a failed Job in ns `warden` and
-  nothing else — no email, no dashboard panel, and `failedJobsHistoryLimit: 5`
-  runs of head start before the evidence rotates away. kube-state-metrics is
-  already scraped off this box, so the alert is
+  nothing else — no email, no dashboard panel, and `failedJobsHistoryLimit: 24`
+  runs, six hours at this schedule, before the evidence rotates away.
+  kube-state-metrics is already scraped off this box, so the alert is
   `kube_job_status_failed{namespace="warden"} > 0` plus a panel; it wants
-  writing, not inventing.
+  writing, not inventing. The history limit buys reading time; it is not the
+  alert.
 
   Two facts about repairing a foreign-owned field worth keeping written down,
   because the shape of the fix is not the obvious one. **Re-running phase two's server-side applies

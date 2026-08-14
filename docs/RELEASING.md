@@ -51,11 +51,14 @@ wrong number somewhere:
   the same things locally. The Sparkle ordering key is the BUILD number
   (`git rev-list --count HEAD`), which is why marketing versions can move
   backwards without stranding installs.
-- **Deploy pins** — `deploy/hosted/20-warden.yaml` pins the warden image and
-  `SQUELCH_WARDEN_IMAGE` (the tenant image), both at `daemon-*` tags, and
-  `deploy/hosted/90-warden-roller.yaml` carries the same two values because the
-  roller renders tenants with the same code. `deploy/hosted/60-models.yaml` pins
-  the model-warm job's image separately and is easy to forget.
+- **Deploy pins** — the tenant image is `SQUELCH_WARDEN_IMAGE` in
+  `deploy/hosted/15-warden-config.yaml`, written once and read by both processes
+  that render tenants. The **warden's own** image is a pod-spec field, so it is
+  written twice, in `deploy/hosted/20-warden.yaml` and
+  `deploy/hosted/90-warden-roller.yaml`, and those two must name the same
+  `daemon-*` tag: the roller runs this binary, and an older one renders older
+  tenants. `deploy/hosted/60-models.yaml` pins the model-warm job's image
+  separately and is easy to forget.
 
 **The 2026-08 consolidation.** The tag namespaces used to be `v*` (daemon),
 `passband-v*` (Mac) and `ios-v*` (iOS), and the numbers had drifted apart badly
@@ -128,12 +131,17 @@ The order matters: images first (above), then the box.
 
 ```sh
 ssh carrier
-# 1. Repoint pins, then apply in numbered order (SETUP.md "Apply" section):
-#    20-warden.yaml: warden image tag + SQUELCH_WARDEN_IMAGE
-#    90-warden-roller.yaml: the SAME two values (see below)
+# 1. Repoint pins, then apply in numbered order (SETUP.md §8):
+#    15-warden-config.yaml: SQUELCH_WARDEN_IMAGE, the image TENANTS run
+#    20-warden.yaml + 90-warden-roller.yaml: the warden's own image, the SAME
+#      tag in both (see below)
 #    60-models.yaml: model-warm job tag (chronically forgotten)
+kubectl apply -f deploy/hosted/15-warden-config.yaml
 kubectl apply -f deploy/hosted/20-warden.yaml
 kubectl apply -f deploy/hosted/90-warden-roller.yaml
+# The ConfigMap is read once, when a pod starts: the roller gets it on its next
+# tick, the serving warden only here.
+kubectl -n warden rollout restart deploy/squelch-warden
 kubectl -n warden rollout status deploy/squelch-warden
 curl -sS https://warden.passband.app/healthz   # -> ok
 ```
@@ -150,12 +158,20 @@ tenant that does not come back. Each tenant blips for one pod restart; the fleet
 is never down; no mail is lost, because Gmail is the source of truth and the
 daemon resumes syncing on its next tick.
 
-Three things about it that will surprise you anyway:
+Four things about it that will surprise you anyway:
 
-- **The roller's env block is a copy of the warden Deployment's, by hand.** Both
-  processes render tenants from it, so a difference between the two files means
-  they render different Deployments for the same tenant and take turns rewriting
-  it, forever, 15 minutes apart. Bump `SQUELCH_WARDEN_IMAGE` in both, always.
+- **The serving warden does not see a ConfigMap change until it restarts.**
+  `envFrom` is read at pod start. The roller is a fresh pod every 15 minutes and
+  picks the new pin up on its own; the warden keeps rendering the old one into
+  new signups and into every `llm mint` until
+  `kubectl -n warden rollout restart deploy/squelch-warden`. Apply and restart
+  together.
+- **The roller converges the DEPLOYMENT only.** Drift is computed from that one
+  object, so a release that changes a tenant's Service, Ingress, NetworkPolicy
+  or PVC lands on new signups and on nobody else — the roll will report those
+  tenants as already current. Those releases need `squelch-control reconcile`
+  per tenant, which re-applies all five objects. Check the diff before you
+  assume the timer has it.
 - **A skipped tenant stays skipped.** The roller refuses to touch a Deployment
   another field manager owns fields on (`kubectl set env` is the usual way to
   get one), because the only repair is deleting it — a real outage window for
@@ -171,14 +187,23 @@ Watch it converge, or push it along:
 ```sh
 kubectl -n warden get jobs                            # one row per run
 kubectl -n warden logs job/<name>                     # per-tenant lines, then a summary
-kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now
 kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
 ```
 
-Exit 0 is a converged fleet (nothing to do counts), 1 halted, 2 converged with
-tenants skipped for foreign drift; anything but 0 marks the Job failed on
-purpose. PRODUCTION.md, "Rolling the daemon image", has the full table and what
-to do about each.
+Suspending stops the next tick and not the run in flight, and
+`kubectl create job --from=cronjob` makes a standalone Job that
+`concurrencyPolicy: Forbid` does not count — two rollers, two mailboxes down at
+once. The safe manual-run recipe is in `90-warden-roller.yaml`'s header and in
+PRODUCTION.md.
+
+Exit 0 is a converged fleet (nothing to do counts, and so does a clean
+`--dry-run`); 1 is not converged in any of its five forms — halted on a tenant,
+stopped before applying anything because a tenant carries today's render and is
+not serving it, a tenant DOWN with no workload behind a live Service, never
+started, or a `--dry-run` that found work; 2 is converged with tenants skipped
+for foreign drift; 64 is a bad argument list. Anything but 0 marks the Job failed
+on purpose. PRODUCTION.md, "Rolling the daemon image", has the full table and
+what to do about each.
 
 If the release touched monitoring (scrape config, dashboards):
 
@@ -339,10 +364,12 @@ roll the carrier promptly.
 
 1. No CI test gate on any tag path — the tag workflows verify versions, not
    behavior. The preflight above is the gate.
-2. Nothing checks that `20-warden.yaml`'s pins name tags that exist in GHCR;
-   that one is still hand-checked. (The tag-to-`Cargo.toml` half is closed —
-   `release-daemon.yml` verifies it.)
-3. `60-models.yaml` pins drift behind `20-warden.yaml` (they did already).
+2. Nothing checks that the deploy pins name tags that exist in GHCR — neither
+   `SQUELCH_WARDEN_IMAGE` in `15-warden-config.yaml` nor the warden image in
+   `20-warden.yaml` and `90-warden-roller.yaml`; those are still hand-checked,
+   and so is the fact that the last two agree with each other. (The
+   tag-to-`Cargo.toml` half is closed — `release-daemon.yml` verifies it.)
+3. `60-models.yaml` pins drift behind the warden's (they did already).
 4. The warden image on carrier predates the CI job: the running
    `squelch-warden:v0.2.0` in containerd was hand-built and exists in no
    registry — that tag is from the retired numbering and nothing will ever
@@ -352,6 +379,7 @@ roll the carrier promptly.
 5. Nothing alerts when a roll does not converge. The roller walks the fleet
    every 15 minutes and halts on the first tenant that does not come back, which
    is the right behavior and is invisible: it shows up as a failed Job in ns
-   `warden` and nowhere else, with five runs of history before the evidence
-   rotates away. kube-state-metrics is already scraped off carrier, so the alert
-   is `kube_job_status_failed{namespace="warden"} > 0`; it wants writing.
+   `warden` and nowhere else, with 24 runs of history — six hours at this
+   schedule — before the evidence rotates away. kube-state-metrics is already
+   scraped off carrier, so the alert is
+   `kube_job_status_failed{namespace="warden"} > 0`; it wants writing.

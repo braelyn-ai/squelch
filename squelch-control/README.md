@@ -217,6 +217,11 @@ rollout finished before the next is touched, a halt on the first tenant that
 does not come back, and no repair at all on a tenant where the repair means
 deleting a live workload — which is precisely the case this command exists for.
 
+That sweep is the **Deployment** and nothing else, because that is all a drift
+report covers. `reconcile` re-applies all five of a tenant's objects, so a change
+to a tenant's Service, Ingress, NetworkPolicy or PVC reaches an existing tenant
+through this command and through no timer.
+
 The `llm` commands need the Bifrost trio, the warden pair, and the store — but
 still no OAuth client or cookie key. `llm mint` backfills a tenant that signed
 up while Bifrost was down (signup is fail-soft about the key: an outage costs

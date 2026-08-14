@@ -144,9 +144,9 @@ than a must. It lets each tenant pod get its own user namespace, so root inside
 a tenant's container maps to an unprivileged id on the node. It needs a kernel
 with idmapped mounts (6.3+ is comfortable; trixie ships 6.12) and a container
 runtime that supports it. If tenant pods fail to start with a `hostUsers`
-complaint, set `SQUELCH_WARDEN_USER_NAMESPACES=off` in `20-warden.yaml`, restart
-the warden, and read "What this does and does not isolate" below to understand
-what you gave up.
+complaint, set `SQUELCH_WARDEN_USER_NAMESPACES` to `"off"` in
+`15-warden-config.yaml`, apply it, restart the warden, and read "What this does
+and does not isolate" below to understand what you gave up.
 
 ## Tenant data on a block volume
 
@@ -279,7 +279,9 @@ means a node that has seen the name will not re-pull it, and the two together
 are a rollout that appears to work and changes nothing.
 
 If the packages are private, create the pull secret and uncomment
-`SQUELCH_WARDEN_IMAGE_PULL_SECRET` in `20-warden.yaml`:
+`SQUELCH_WARDEN_IMAGE_PULL_SECRET` in `15-warden-config.yaml` (that one is for
+TENANT pods; the warden's own pod and the roller's take `imagePullSecrets` in
+`20-warden.yaml` and `90-warden-roller.yaml`):
 
 ```sh
 kubectl -n tenants create secret docker-registry ghcr \
@@ -391,7 +393,7 @@ The gateway, on Railway:
 
 Then point both planes at it:
 
-- Warden (`20-warden.yaml`): `SQUELCH_WARDEN_LLM_BASE_URL` =
+- Warden (`15-warden-config.yaml`): `SQUELCH_WARDEN_LLM_BASE_URL` =
   `https://<the-bifrost-domain>/anthropic`. This is the feature gate — with it
   unset the warden injects no LLM env at all and refuses llm-key installs, and
   it refuses to boot if any of the tuning knobs
@@ -434,11 +436,12 @@ you apply them**; the shipped numbers assume the 2 vCPU / 4 GB floor above and
 are deliberately conservative.
 
 The warden already puts requests and limits on both containers of every tenant
-pod (`SQUELCH_WARDEN_CPU_REQUEST` and friends in `20-warden.yaml`, defaulting to
-100m/256Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on the pod's `/tmp`
-and an ephemeral-storage bound so a runaway tenant cannot fill the node's root
-filesystem). This file is the layer under that: defaults for anything that lands
-in the namespace without bounds of its own, and an aggregate ceiling.
+pod (`SQUELCH_WARDEN_CPU_REQUEST` and friends in `15-warden-config.yaml`,
+defaulting to 100m/256Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on
+the pod's `/tmp` and an ephemeral-storage bound so a runaway tenant cannot fill
+the node's root filesystem). This file is the layer under that: defaults for
+anything that lands in the namespace without bounds of its own, and an aggregate
+ceiling.
 
 Sizing, in the order that matters:
 
@@ -462,16 +465,26 @@ A tenant refused by the quota looks like a provision that times out
 
 ## 8. The warden
 
-Edit `20-warden.yaml`: the four places marked `EDIT ME` (the warden image, your
-base domain, the squelchd image tenants run, and the warden's hostname in two
-spots on the Ingress). Then the same values again in `90-warden-roller.yaml`,
-whose environment block is a copy of the warden's and has to stay one — it is
-the same code rendering the same tenants, and two renders that disagree take
-turns rewriting them. Then:
+Three edits, in two files:
+
+- `15-warden-config.yaml` — the three places marked `EDIT ME`: your base domain,
+  the squelchd image tenants run, and the control plane's origin. This ConfigMap
+  is every knob the warden reads, and BOTH processes that render tenants read it
+  through `envFrom` — the serving pod and the fleet roller. That is the whole
+  reason it is a separate object: two env blocks that disagree render two
+  different Deployments for the same tenant and take turns rewriting it, and a
+  tenant image bumped in one and not the other silently pins the fleet backwards.
+- `20-warden.yaml` — the warden's own `image:`, and its hostname in two spots on
+  the Ingress.
+- `90-warden-roller.yaml` — the same warden `image:` as `20-warden.yaml`, and
+  nothing else. An image is a pod-spec field, so it is the one value the
+  ConfigMap cannot hold for both; this binary is the renderer, and a roller on an
+  older one renders older tenants.
 
 ```sh
 kubectl apply -f deploy/hosted/10-warden-rbac.yaml
 kubectl apply -f deploy/hosted/30-tenants-default-deny.yaml
+kubectl apply -f deploy/hosted/15-warden-config.yaml
 kubectl apply -f deploy/hosted/20-warden.yaml
 
 # Check the API server's in-cluster address matches the policy before applying it.
@@ -485,6 +498,19 @@ kubectl apply -f deploy/hosted/90-warden-roller.yaml
 
 kubectl -n warden rollout status deploy/squelch-warden
 ```
+
+The ConfigMap goes on before the two things that consume it. From then on, every
+change to it is two commands rather than one:
+
+```sh
+kubectl apply -f deploy/hosted/15-warden-config.yaml
+kubectl -n warden rollout restart deploy/squelch-warden
+```
+
+`envFrom` is read once, when a pod starts. The roller picks a change up on its
+next tick because every run is a fresh pod; the serving warden does not, and goes
+on rendering the old values into new signups until it is restarted. Same minute,
+not same afternoon.
 
 Confirm it is up and refuses strangers:
 
@@ -561,13 +587,21 @@ dropped. Set the node network on the warden and re-apply:
 
 ```sh
 kubectl get node -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'; echo
-# put that address as a /32 in SQUELCH_WARDEN_NODE_CIDR in 20-warden.yaml
-kubectl apply -f deploy/hosted/20-warden.yaml
+# put that address as a /32 in SQUELCH_WARDEN_NODE_CIDR in 15-warden-config.yaml
+kubectl apply -f deploy/hosted/15-warden-config.yaml
 kubectl -n warden rollout restart deploy/squelch-warden
 ```
 
 Then delete and re-provision the canary. The warden adds one ingress rule to
 every tenant's policy: that CIDR, TCP 8848, nothing else.
+
+**Do this before you have real tenants, because this one does not backfill.**
+The rule lands on a tenant's NetworkPolicy, and the fleet roller only ever looks
+at Deployments — so no roll will report an existing tenant as drifted for it, and
+no roll will deliver it. Tenants that already exist need
+`squelch-control reconcile <label>` each, which re-applies all five of their
+objects. Same for `SQUELCH_WARDEN_TLS_SECRET`, the ingress settings and
+`SQUELCH_WARDEN_STORAGE_*`.
 
 The tradeoff, stated: it admits traffic originating at the node's address, which
 is the kubelet and anything else with a shell on the node. Anything with a shell
@@ -646,10 +680,13 @@ kubectl -n tenants exec squelch-models-seed -- ls /seed
 kubectl -n tenants delete pod squelch-models-seed
 ```
 
-Then uncomment the `SQUELCH_WARDEN_MODEL_PVC` env entry in `20-warden.yaml`,
+Then uncomment the `SQUELCH_WARDEN_MODEL_PVC` entry in `15-warden-config.yaml`,
 re-apply it, and `kubectl -n warden rollout restart deploy/squelch-warden`. Every
-tenant provisioned after that skips the download. Tenants that already have their
-own copy are unaffected.
+tenant provisioned after that skips the download; a tenant that already has its
+own copy keeps it, and the init container leaves it alone. The mount is part of a
+tenant's pod spec, so the roller reads it as drift and every existing tenant
+takes one pod restart for it within a tick or two — expected, and worth knowing
+before you watch the fleet cycle.
 
 The `ReadWriteOnce` volume is mounted by many pods, which is legal because they
 are all on the one node. **If you ever add a second node, this stops working.**
@@ -1256,14 +1293,18 @@ The rule that falls out of it, worth knowing before you need it:
 exec'ing into the tenant's pod. This supersedes the previous one, which is the
 daemon's documented behaviour: one live pairing code per account.
 
-**Upgrading the daemon.** Change `SQUELCH_WARDEN_IMAGE` in `20-warden.yaml` and
-in `90-warden-roller.yaml`, and apply both. Existing tenants do NOT move on the
-warden's rollout, by design: it writes a tenant's objects at provision time and
-never revisits them. The roller is what moves them, one tenant at a time, each
-rollout finished before the next is touched, halting on the first tenant that
-does not come back — never all at once, because an upgrade that touches every
-mailbox in one pass is an outage waiting for a bad release. Exit codes and the
-levers: `PRODUCTION.md`, "Rolling the daemon image".
+**Upgrading the daemon.** Change `SQUELCH_WARDEN_IMAGE` in
+`15-warden-config.yaml`, apply it, and restart the warden — one value, in the one
+object both renderers read. Existing tenants do NOT move on the warden's
+rollout, by design: it writes a tenant's objects at provision time and never
+revisits them. The roller is what moves them, one tenant at a time, each rollout
+finished before the next is touched, halting on the first tenant that does not
+come back — never all at once, because an upgrade that touches every mailbox in
+one pass is an outage waiting for a bad release. It moves them onto a new
+DEPLOYMENT only: a change that lands on a tenant's Service, Ingress,
+NetworkPolicy or PVC is invisible to it and wants `squelch-control reconcile`
+per tenant. Exit codes and the levers: `PRODUCTION.md`, "Rolling the daemon
+image".
 
 **Backups.** Three things, of very different sizes:
 

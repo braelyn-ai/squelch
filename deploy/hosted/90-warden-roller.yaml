@@ -1,20 +1,30 @@
 # The fleet roller: the timer that puts every tenant onto today's render.
 #
 # The warden writes a tenant's objects once, at provision time, and never
-# revisits them. So bumping `SQUELCH_WARDEN_IMAGE` in `20-warden.yaml` changes
-# what the NEXT signup gets and nothing at all about the tenants already
+# revisits them. So bumping `SQUELCH_WARDEN_IMAGE` in `15-warden-config.yaml`
+# changes what the NEXT signup gets and nothing at all about the tenants already
 # running. This CronJob is what closes that gap: it runs the warden's own binary
 # as `squelch-warden roll`, which walks every tenant in the cluster, reconciles
-# the ones whose live Deployment no longer matches the render, and waits for
+# the ones whose live DEPLOYMENT no longer matches the render, and waits for
 # each rollout to finish before it touches the next one.
 #
-# Numbered 90 because it sorts after everything it depends on: the ServiceAccount
-# it runs as (10), the Deployment whose environment it mirrors (20), and the
-# tenant-side objects (30-80) it converges. A roller that fired before those
-# existed would be a job that halts on an empty cluster for no reason.
+# The Deployment and nothing else, which is the limit worth knowing before this
+# timer is trusted with a shape change: a drift report renders and diffs a
+# tenant's Deployment alone, so a change that lands on a tenant's Service,
+# Ingress, NetworkPolicy or PVC never registers as drift and never triggers a
+# roll. Those reach new signups only; existing tenants take them from
+# `squelch-control reconcile <label>`, which re-applies all five objects.
 #
-# EDIT BEFORE APPLYING: the same two placeholders `20-warden.yaml` has, plus its
-# whole env block. See the next comment, which is the sharpest edge in this file.
+# Numbered 90 because it sorts after everything it depends on: the ServiceAccount
+# it runs as (10), the ConfigMap it renders tenants from (15), the warden itself
+# (20), and the tenant-side objects (30-80) it converges. A roller that fired
+# before those existed would be a job that halts on an empty cluster for no
+# reason.
+#
+# EDIT BEFORE APPLYING: one value, the `image:` below, and it must be the same
+# tag `20-warden.yaml` names. Everything else this process is configured with
+# comes from `15-warden-config.yaml` through `envFrom`, which is what keeps the
+# roller's render and the warden's identical by construction.
 #
 # ## Pull-based, and in-cluster, on purpose
 #
@@ -34,16 +44,79 @@
 # first tenant that does not come back ends the run. A bad render costs exactly
 # one tenant.
 #
-# ## Levers
+# ## Levers, and what each one does not do
 #
-#   kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now
-#   kubectl -n warden logs job/roll-now
+#   kubectl -n warden get cronjob squelch-warden-roll   # last schedule, ACTIVE, suspended
+#   kubectl -n warden get jobs                          # one row per run
+#   kubectl -n warden logs job/<name>                   # per-tenant lines, then the summary
 #   kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
+#   kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now
 #
-# The last one stops the fleet converging while you investigate something, and
-# is the right first move on a halted run you do not yet understand. Unsuspend
-# with `false`. `deploy/hosted/PRODUCTION.md` has the exit codes and what to do
-# about each.
+# `concurrencyPolicy: Forbid` below covers exactly one case - a scheduled run
+# that overruns its own schedule - and neither lever is that case:
+#
+#   - **`suspend: true` stops the NEXT tick. It does not stop the run in
+#     flight.** A roll that is halfway through the fleet keeps going, keeps
+#     applying, and keeps taking one mailbox down at a time. Suspending is the
+#     right first move on a halt you do not understand, and it is not a stop
+#     button. To stop a run that is already going, delete its Job
+#     (`kubectl -n warden delete job <name>`), which takes its pod with it: the
+#     tenants already rolled stay rolled, the rest are picked up by the next run,
+#     and the fleet is split-version until then.
+#   - **`create job --from=cronjob` is not counted by Forbid.** That command
+#     makes a STANDALONE Job with no owner reference back to this CronJob, and
+#     the controller counts only the Jobs it owns as active. So a manual run and
+#     a scheduled tick can walk the fleet at the same time, at different offsets,
+#     with two mailboxes down at once and two writers converging on one tenant.
+#     Nothing in the code prevents this; only the recipe below does.
+#
+# ## Running one by hand, safely
+#
+#   kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
+#   kubectl -n warden get cronjob squelch-warden-roll -o jsonpath='{.status.active}{"\n"}'
+#   # empty (or `[]`) means no scheduled run is going. If one is, let it finish.
+#   kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now
+#   kubectl -n warden logs -f job/roll-now
+#   kubectl -n warden delete job roll-now
+#   kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":false}}'
+#
+# Suspend FIRST, then check, then create: suspending after the create leaves a
+# tick free to start beside the manual run. The delete at the end is not tidiness
+# either - a standalone Job is not owned by this CronJob, so no history limit
+# collects it, and the next `roll-now` fails on the name that is still there.
+#
+# ## A run that halts on the same tenant every tick
+#
+# That signature - the SAME label, run after run, at the same point in the walk -
+# is a render the cluster REFUSES, not a flaky tenant. The two stops look alike
+# in the summary and are nothing alike underneath:
+#
+#   - A tenant whose ROLLOUT timed out has already received the render, so its
+#     drift is clean, and the run after it stops before applying anything and
+#     names it as a casualty. That one moves: the tenant comes back, or a person
+#     goes and looks at it.
+#   - A tenant whose APPLY was rejected received nothing, so it is still drifted,
+#     so it is first in the queue again on the next tick and is rejected again.
+#     ~96 failed Jobs a day and not one tenant converged in any of them, at the
+#     same label every time.
+#
+# A reconcile applies a tenant's PVC, NetworkPolicy and Service before its
+# Deployment, so the refusal is often not about the thing that queued the tenant.
+# Raise `SQUELCH_WARDEN_STORAGE_SIZE` in the same edit as an image bump, against
+# a storage class with no `allowVolumeExpansion`, and every drifted tenant dies
+# at `volume_failed` on the PVC that a growing image bump had nothing to do with.
+# (Alone, that same edit does nothing at all: a PVC is not part of the Deployment
+# a drift report diffs, so no tenant is ever queued for it.)
+#
+# The machine reason in the log says which object the API server refused
+# (`volume_failed`, `network_policy_failed`, `service_failed`, `workload_failed`,
+# `ingress_failed`, and `render_rejected` for one the dry run already refused in
+# the read pass). Suspend, fix the render - usually by putting back whatever was
+# changed in `15-warden-config.yaml`, and restarting the warden - then unsuspend.
+# `squelch-control reconcile <label>` on that one tenant reproduces the refusal
+# with the API server's own message when the reason word is not enough.
+#
+# `deploy/hosted/PRODUCTION.md` has the exit codes and what to do about each.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -53,7 +126,7 @@ metadata:
     app.kubernetes.io/name: squelch-warden-roll
 spec:
   # Every 15 minutes. The two things this is trading off: a human who bumps
-  # `SQUELCH_WARDEN_IMAGE` and applies `20-warden.yaml` should not have to
+  # `SQUELCH_WARDEN_IMAGE` and applies `15-warden-config.yaml` should not have to
   # remember a second command afterwards, and a converged fleet should cost
   # nothing. Fifteen minutes bounds the wait after a deliberate bump, and a run
   # with nothing to do is one short-lived pod plus a handful of reads per tenant
@@ -63,6 +136,8 @@ spec:
   schedule: "*/15 * * * *"
   # Two rollers walking one fleet is two writers on one mailbox. Forbid means a
   # run that overruns its schedule skips the next tick rather than doubling up.
+  # It counts the Jobs this CronJob OWNS and nothing else, so it is no defence
+  # against a hand-made `create job --from=cronjob`; see "Levers" in the header.
   concurrencyPolicy: Forbid
   # A missed schedule (a rebooted node, a paused controller) is worth catching up
   # on once, not stampeding. Bounded rather than unset: with no deadline the
@@ -71,8 +146,17 @@ spec:
   startingDeadlineSeconds: 300
   # A failed roll is the one somebody reads tomorrow; a successful one is a line
   # in a log nobody needs twice.
+  #
+  # Twenty-four failures kept, because the failure that matters most is the one
+  # that repeats: a roll the cluster refuses fails identically every 15 minutes,
+  # which is 96 Jobs a day, and a handful of slots means the evidence is gone
+  # within the hour and long before anyone reads it. Twenty-four is six hours of
+  # ticks. Each one is a completed pod holding a few kilobytes of log on a node
+  # that carries tenants, which is what stops this being a much larger number;
+  # the real fix is an alert on `kube_job_status_failed{namespace="warden"}`,
+  # which is an open item in PRODUCTION.md.
   successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 24
   jobTemplate:
     spec:
       # A halted roll wants a human, not a retry loop. Whatever stopped it -
@@ -127,34 +211,20 @@ spec:
               # would change and change nothing - useful for a week after a
               # shape change lands, and useless as a permanent setting.
               args: ["roll"]
-              # =============================================================
-              # THIS ENV BLOCK IS A COPY OF THE WARDEN DEPLOYMENT'S, IN
-              # `20-warden.yaml`. KEEP IT IDENTICAL. Diff the two whenever you
-              # touch either.
-              #
-              # Nearly every value here is an input to the tenant Deployment
-              # this process renders. If the roller's copy drifts from the
-              # warden's, the two render different Deployments for the same
-              # tenant and take turns rewriting it: the roller rolls the fleet
-              # onto its render, the next signup, `llm mint` or `reconcile`
-              # writes the warden's back, and the next tick rolls it again.
-              # Pods restart every 15 minutes forever and every drift report
-              # says the fleet is behind. Nothing in the code can catch it,
-              # because each half is behaving correctly.
-              #
-              # (Two of these are inert on this path - the pending sweep and
-              # the rate limiter only exist in the serving process - and they
-              # are copied anyway so the two blocks diff clean.)
-              # =============================================================
+              # Every knob this process reads, from `15-warden-config.yaml`:
+              # the same object the warden Deployment reads, which is what makes
+              # "the roller renders what the warden renders" a property of the
+              # cluster rather than of an operator diffing two files. Nearly
+              # every value in it is an input to the tenant Deployment this
+              # process renders, and two copies that disagree take turns
+              # rewriting the same tenant every quarter hour with each half
+              # behaving correctly. Nothing is restated below: a container `env:`
+              # name outranks the same name from `envFrom`, silently, and one
+              # override here is that divergence with extra steps.
+              envFrom:
+                - configMapRef:
+                    name: squelch-warden-config
               env:
-                # 2. EDIT ME
-                - name: SQUELCH_WARDEN_BASE_DOMAIN
-                  value: passband.email
-                # 3. EDIT ME. The tenant image, and the reason this job exists:
-                # changing it here and in `20-warden.yaml` is what a daemon
-                # rollout IS.
-                - name: SQUELCH_WARDEN_IMAGE
-                  value: ghcr.io/braelyn-ai/squelchd:daemon-0.0.1
                 # `roll` serves nothing and checks no bearer, but the config
                 # validator requires a token of real length before anything
                 # starts. The real one, not a placeholder: a second secret to
@@ -164,56 +234,6 @@ spec:
                     secretKeyRef:
                       name: squelch-warden
                       key: token
-                - name: SQUELCH_WARDEN_TENANT_NAMESPACE
-                  value: tenants
-                - name: SQUELCH_WARDEN_INGRESS_CLASS
-                  value: traefik
-                - name: SQUELCH_WARDEN_INGRESS_NAMESPACE
-                  value: kube-system
-                - name: SQUELCH_WARDEN_INGRESS_POD_LABEL
-                  value: app.kubernetes.io/name=traefik
-                - name: SQUELCH_WARDEN_TLS_SECRET
-                  value: passband-wildcard-tls
-                - name: SQUELCH_WARDEN_STORAGE_CLASS
-                  value: local-path
-                - name: SQUELCH_WARDEN_STORAGE_SIZE
-                  value: 10Gi
-                - name: SQUELCH_WARDEN_OAUTH_SECRET_NAME
-                  value: google-oauth-client
-                - name: SQUELCH_WARDEN_LLM_BASE_URL
-                  value: https://bifrost.passband.app/anthropic
-                # 5. EDIT ME
-                - name: SQUELCH_WARDEN_CONSOLE_SSO_URL
-                  value: https://signup.passband.app
-                - name: SQUELCH_WARDEN_CPU_REQUEST
-                  value: 100m
-                - name: SQUELCH_WARDEN_CPU_LIMIT
-                  value: 1000m
-                - name: SQUELCH_WARDEN_MEMORY_REQUEST
-                  value: 256Mi
-                - name: SQUELCH_WARDEN_MEMORY_LIMIT
-                  value: 1Gi
-                - name: SQUELCH_WARDEN_EPHEMERAL_REQUEST
-                  value: 256Mi
-                - name: SQUELCH_WARDEN_EPHEMERAL_LIMIT
-                  value: 1Gi
-                - name: SQUELCH_WARDEN_TMP_SIZE
-                  value: 512Mi
-                - name: SQUELCH_WARDEN_PENDING_TTL_SECS
-                  value: "86400"
-                - name: SQUELCH_WARDEN_TRUSTED_PROXY_HOPS
-                  value: "1"
-                # UNCOMMENT ONLY IF the warden's copy is uncommented.
-                # - name: SQUELCH_WARDEN_NODE_CIDR
-                #   value: 10.0.0.5/32
-                - name: SQUELCH_WARDEN_USER_NAMESPACES
-                  value: "on"
-                # Uncomment once the shared weights volume exists (SETUP.md step 10).
-                # - name: SQUELCH_WARDEN_MODEL_PVC
-                #   value: squelch-models
-                # Uncomment if the squelchd image is private.
-                # - name: SQUELCH_WARDEN_IMAGE_PULL_SECRET
-                #   value: ghcr
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true

@@ -9,9 +9,10 @@
 //! behind today's render back onto it, one at a time; then the process exits
 //! with a code that says whether the fleet converged. That is what the CronJob
 //! in `deploy/hosted/90-warden-roller.yaml` runs, on the same image, the same
-//! ServiceAccount and the same environment as the serving pod - the same
-//! environment because both paths render tenants from it, and two renders that
-//! disagree would take turns rewriting the same Deployments forever.
+//! ServiceAccount and the same environment as the serving pod - one ConfigMap
+//! (`deploy/hosted/15-warden-config.yaml`) behind both pods' `envFrom`, because
+//! both paths render tenants from these values and two renders that disagree
+//! take turns rewriting the same Deployments forever.
 //!
 //! It is a library call and not an HTTP route on purpose. A converging pass over
 //! every tenant is the most powerful thing this service can do, and it stays
@@ -215,7 +216,7 @@ async fn shutdown_signal() {
 /// tenant's Deployment is rendered from this config, so a roller built from a
 /// different one would apply a different render than the warden that serves
 /// signups, and the two would flip every tenant back and forth between them.
-/// The manifests keep the environments identical; this keeps the code that
+/// One ConfigMap keeps the two environments identical; this keeps the code that
 /// reads them identical.
 async fn connect() -> anyhow::Result<Arc<Warden>> {
     let config = Config::from_env().map_err(|e| anyhow::anyhow!("squelch-warden: {e}"))?;

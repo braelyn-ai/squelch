@@ -281,6 +281,12 @@ Every one of these is validated at boot, and a bad value is a refusal to start
 with a sentence rather than a kube error on the first signup hours later. The
 table of refusals is a test (`config.rs`).
 
+On the hosted install they are one ConfigMap, `deploy/hosted/15-warden-config.yaml`,
+which both the serving pod and the roller pod take through `envFrom`. Two
+processes render tenants from these values, so one object is what stops them
+rendering different ones; the bearer token (a Secret) and each pod's own
+container image are the only things outside it.
+
 ## State
 
 There is none, and one timer. No database, no state file, no port allocator, no
@@ -319,7 +325,9 @@ drift) and `squelch-control reconcile <label>` are the other end of both routes.
 
 The fleet gets walked too, by a timer rather than by a route — `squelch-warden
 roll`, below. It is a caller of `reconcile` and not a controller: it walks the
-fleet once, in order, and exits.
+fleet once, in order, and exits. It converges what a drift report can see, which
+is the Deployment; the Ingress, the NetworkPolicy, the Service and the PVC reach
+an existing tenant only through a `reconcile` somebody asks for.
 
 #### Two detectors, because each kind of drift is invisible to the other
 
@@ -402,7 +410,10 @@ squelch-warden roll --dry-run   # every read, no writes: what a roll would move
 
 The same binary, a different job, run by the CronJob in
 `deploy/hosted/90-warden-roller.yaml` on the warden's image, ServiceAccount and
-environment. Not a route and not a bearer-authed call: a converging pass over
+environment — the environment literally, one ConfigMap
+(`deploy/hosted/15-warden-config.yaml`) behind both pods' `envFrom`, because two
+copies of these values are two different renders of the same tenant taking turns
+rewriting it. Not a route and not a bearer-authed call: a converging pass over
 every tenant is the most powerful thing this service can do, so it stays inside
 the cluster, where no credential and no CI job can reach it.
 
@@ -415,6 +426,13 @@ time, and the next one is not touched until this one's ROLLOUT has finished
 replaced stays Ready while it terminates, and a roller trusting that would march
 through the fleet on false greens). A tenant blips for one pod restart; the fleet
 is never down.
+
+**The Deployment, and only the Deployment.** What decides whether a tenant is
+rolled is the drift report, and a drift report renders and diffs that tenant's
+Deployment alone. So a change that lands anywhere else — a tenant's Service,
+Ingress, NetworkPolicy or PVC — is invisible to this pass and always will be. See
+"What the drift report cannot see", below, where it is the first limit listed
+and the one most likely to be mistaken for a converged fleet.
 
 **What it refuses to touch, and this is the important half.** A Deployment
 another field manager owns fields on is SKIPPED and never repaired. `reconcile`
@@ -436,14 +454,60 @@ that fails halts it too — a tenant this warden could not even inspect is not o
 it may step past, because the next tenant would be rolled on the strength of a
 cluster that has just stopped answering.
 
-The exit code is the whole interface for whatever scheduled it: `0` converged
-(nothing to do counts), `1` halted or never started, `2` converged with tenants
-skipped for foreign drift, `64` a bad argument list. `deploy/hosted/PRODUCTION.md`,
-"Rolling the daemon image", is the operator's end of it.
+The exit code is the whole interface for whatever scheduled it, and anything
+other than `0` marks the Job failed on purpose:
 
-### What the report still cannot see
+| Exit | The run | What it wants |
+|---|---|---|
+| `0` | The fleet is on today's render and serving it. A run with nothing to do is this, and so is a `--dry-run` over a fleet that needs nothing. | Nothing. |
+| `1` | Not converged, in any of its five forms. | Read the log for the named label, and suspend the CronJob while you work: everything after that tenant in label order was not touched. **Halted** — the tenant did not come back; look at that pod. **Casualty** (`HALTED before applying anything`) — the tenant already carries today's render and is not serving it, so nothing was applied anywhere; the render is the suspect, not the tenant. **DOWN** — no workload behind a live Service, an unfinished reconcile; `squelch-control reconcile <label>` finishes it. **Never started** — a refused config value or an API server it could not reach; the log line is the sentence. **`--dry-run` found work** — this is the flag doing its job; read what it would roll. |
+| `2` | Converged, and at least one tenant was left alone because another field manager owns part of its Deployment. | `squelch-control drift <label>` to see who owns what, then `squelch-control reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. Until then every run reports it again. |
+| `64` | The argument list was none of the three this binary accepts. | Fix `args:` on the CronJob. Deliberately outside the 0–2 range: a mistyped argument is not a verdict on the fleet. |
+
+A run that halts on the SAME label every tick is a render the cluster refuses
+rather than a flaky tenant — the apply was rejected, so nothing was written, so
+that tenant is still drifted and first in the queue again fifteen minutes later.
+`deploy/hosted/90-warden-roller.yaml` has the signature and the fix, and
+`deploy/hosted/PRODUCTION.md`, "Rolling the daemon image", is the operator's end
+of all of it.
+
+### What the drift report cannot see
 
 Worth knowing before the answer "clean" is trusted too far.
+
+**It sees a tenant's DEPLOYMENT and nothing else.** `Warden::drift` renders that
+one object, dry-run applies it, and diffs the result; a tenant's Service,
+Ingress, NetworkPolicy and PVC are never rendered and never compared. So none of
+them can ever appear as drift, and none of them can trigger a roll. Delete a
+tenant's Ingress out of band and both the report and the roll say that tenant is
+already current, with the mailbox unreachable from the internet.
+
+The consequence for configuration is the one to hold on to: a change to
+`SQUELCH_WARDEN_TLS_SECRET`, `SQUELCH_WARDEN_NODE_CIDR`, the three
+`SQUELCH_WARDEN_INGRESS_*` values, `SQUELCH_WARDEN_STORAGE_*` or
+`HUMAN_DOOR_PREFIXES` reaches **new signups only,
+forever**. The roller will not carry it, and will not mention it. The manual
+answer is `squelch-control reconcile <label>` per tenant, which re-applies all
+five objects in provision order; a tenant being rolled for some Deployment-visible
+reason picks the rest up as a side effect of that, which is luck rather than
+coverage.
+
+**`reconcile`'s anti-resurrection guard has a narrow race, and the roller enters
+it once per active tenant per tick.** A tenant with no Deployment is either a
+cancelled account or a reconcile that died mid-repair, and the two are told apart
+by whether the Service is still standing (`Warden::interrupted`) — `DELETE`
+removes the Service before the Deployment, so a surviving Service means nobody
+cancelled this account. The check is sound at the top of the route, where nothing
+has been written yet. The second one is not: `reconcile` re-applies the Service
+before it reads the Deployment, so a `DELETE` that lands in the window between
+those two writes has its Service put back **by this reconcile**, and the
+deployment-gone branch then reads that Service as consent and rebuilds a mailbox
+somebody just cancelled. The window is a few API calls wide and needs a
+cancellation landing inside it. What the roller changes is the frequency: the
+window opens once per active tenant per run, every 15 minutes, rather than when a
+person types a command. Cancelling an account while a roll is walking the fleet is
+therefore worth doing deliberately — suspend the CronJob, or confirm the tenant
+is gone afterwards.
 
 **`status: active` in a reconcile's answer is weaker than it sounds.** It means
 a pod matching the tenant's selector reported Ready, not that the pod running
