@@ -4,8 +4,12 @@ The cluster-side tenant provisioner for hosted Passband. One single-node k3s
 box, one warden pod, one squelchd pod per tenant, each with its own volume, its
 own age identity, its own NetworkPolicy, and its own subdomain.
 
-The control plane (`squelch-control`, on Railway) is the only caller. It makes
-two calls to create a tenant, and three more to run one.
+The control plane (`squelch-control`, on Railway) is the only caller of the API.
+It makes two calls to create a tenant, and three more to run one.
+
+One other thing runs this binary, and it is not a caller: `squelch-warden roll`,
+a CronJob on the same image that converges the fleet onto today's render from
+inside the cluster. See "The roller", below.
 
 Runbook for a fresh box: [`deploy/hosted/SETUP.md`](../deploy/hosted/SETUP.md).
 Architecture and the decisions behind it: [`docs/HOSTED.md`](../docs/HOSTED.md).
@@ -309,11 +313,13 @@ What it is instead is two routes an operator drives:
   Read-only; the only write it makes is a dry run.
 - **`POST /v1/tenants/{label}/reconcile`** — put it back on today's render.
 
-On demand and per label, not a controller, deliberately: a loop that re-applies
-to every tenant is a loop that can take every mailbox down on one bad render,
-whereas a route an operator drives is run against one tenant, verified, and then
-walked across the list. `squelch-control drift` (fleet-wide, exits 1 on drift)
-and `squelch-control reconcile <label>` are the other end of both.
+Per label, and driven: nothing watches these objects and nothing re-applies to a
+tenant because a second went by. `squelch-control drift` (fleet-wide, exits 1 on
+drift) and `squelch-control reconcile <label>` are the other end of both routes.
+
+The fleet gets walked too, by a timer rather than by a route — `squelch-warden
+roll`, below. It is a caller of `reconcile` and not a controller: it walks the
+fleet once, in order, and exits.
 
 #### Two detectors, because each kind of drift is invisible to the other
 
@@ -387,6 +393,54 @@ and the LLM key are read back only to re-derive the two SHA-256 annotations on
 the pod template, so the render is the one that tenant is entitled to rather
 than a new one, and a re-render on its own does not roll the pod.
 
+#### The roller: the whole fleet, one tenant at a time
+
+```sh
+squelch-warden roll             # converge every tenant onto today's render
+squelch-warden roll --dry-run   # every read, no writes: what a roll would move
+```
+
+The same binary, a different job, run by the CronJob in
+`deploy/hosted/90-warden-roller.yaml` on the warden's image, ServiceAccount and
+environment. Not a route and not a bearer-authed call: a converging pass over
+every tenant is the most powerful thing this service can do, so it stays inside
+the cluster, where no credential and no CI job can reach it.
+
+**What it converges.** Every tenant the CLUSTER holds — the identity Secrets
+carrying `MANAGED_SELECTOR`, sorted, so two runs are comparable and a tenant with
+no row in the control plane's table is still seen. For each: the status, then a
+drift report, then, only if the report has changes, `reconcile`. One tenant at a
+time, and the next one is not touched until this one's ROLLOUT has finished
+(`Cluster::rollout_complete`, not a ready pod — under `Recreate` the pod being
+replaced stays Ready while it terminates, and a roller trusting that would march
+through the fleet on false greens). A tenant blips for one pod restart; the fleet
+is never down.
+
+**What it refuses to touch, and this is the important half.** A Deployment
+another field manager owns fields on is SKIPPED and never repaired. `reconcile`
+purges a foreign field the only way SSA allows, by deleting the Deployment and
+applying a fresh one, which is a defensible call for an operator reading one
+drift report and an indefensible one for a timer walking a fleet: it takes a live
+mailbox down to remove a field a person put there on purpose. Foreign drift is a
+page for a human. `pending` and `stopped` tenants are skipped for the reason
+`reconcile` refuses them — a signup to finish and an account to reopen are not
+shapes to converge — which leaves `active` and `failed`, and `failed` is
+deliberate, because a tenant a previous render broke is the one a new render is
+most likely to fix.
+
+**Halting is the safety property.** The first tenant that does not converge ends
+the run: it is named in the summary, and every tenant after it in fleet order is
+left exactly as it was. A render that cannot come up therefore costs exactly one
+tenant, which is what makes running this unattended defensible at all. A read
+that fails halts it too — a tenant this warden could not even inspect is not one
+it may step past, because the next tenant would be rolled on the strength of a
+cluster that has just stopped answering.
+
+The exit code is the whole interface for whatever scheduled it: `0` converged
+(nothing to do counts), `1` halted or never started, `2` converged with tenants
+skipped for foreign drift, `64` a bad argument list. `deploy/hosted/PRODUCTION.md`,
+"Rolling the daemon image", is the operator's end of it.
+
 ### What the report still cannot see
 
 Worth knowing before the answer "clean" is trusted too far.
@@ -406,17 +460,20 @@ diff. PodSpec validation permits it (last one wins at runtime) and a hand edit
 is the likeliest way to get one. The ledger still names the manager that wrote
 it, so the tenant is not silently clean — but the value is not shown.
 
-**The fleet walk only knows tenants the control store knows.** `drift` with no
-label enumerates the control plane's rows, and a tenant provisioned into the
-cluster without a row — which `squelch-control`'s own signup path can produce
-and logs as `PROVISIONED BUT NOT RECORDED` — is invisible to it forever. Per
-label it works fine. A cluster-side enumeration by `MANAGED_SELECTOR`, the way
-the pending sweep already lists, is what would close that.
+**`squelch-control drift` with no label only knows tenants the control store
+knows.** It enumerates the control plane's rows, and a tenant provisioned into
+the cluster without one — which `squelch-control`'s own signup path can produce
+and logs as `PROVISIONED BUT NOT RECORDED` — is invisible to that command
+forever. Per label it works fine, and the roller does not share the blind spot:
+it enumerates the cluster by `MANAGED_SELECTOR`, the way the pending sweep
+lists, so the tenant most likely to have been finished by hand is the one it
+still sees.
 
-**The walk is one request per tenant against a 120/minute bucket** shared by
-everything reaching the warden through that ingress. Somewhere above a hundred
-tenants a full sweep will start meeting its own rate limit, and a 429 is
-reported as "could not be checked" rather than as drift.
+**That walk is also one request per tenant against a 120/minute bucket** shared
+by everything reaching the warden through that ingress. Somewhere above a
+hundred tenants a full sweep will start meeting its own rate limit, and a 429 is
+reported as "could not be checked" rather than as drift. The roller is a library
+call in the cluster and meets no limiter at all.
 
 ## Logging
 
@@ -449,9 +506,15 @@ that a new ciphertext rolls the pod and a stopped tenant can be
 re-credentialed, that a drift report names the manager behind a hand edit and
 says nothing about the three owners every healthy Deployment has, that a
 reconcile converges a clean tenant, delete-recreates one another manager owns,
-refuses to apply while the old pod still holds the volume, and refuses a tenant
-with no workload at all, that the sweep collects abandoned pending tenants and
-nothing else, every 4xx path, that DELETE keeps the volume and both Secrets, a 401 for
-every way of getting the bearer wrong, that a cluster error never reaches a log
-line verbatim, the boot-refusal table for every environment variable, and the
-pairing parser against a captured copy of the daemon's real output.
+refuses to apply while the old pod still holds the volume, refuses a tenant
+with no workload at all, and answers only once the rollout is complete rather
+than on the first Ready pod, that a fleet roll walks every tenant in the cluster
+in sorted order and moves only the drifted ones, leaves the ones another manager
+owns and the ones with no workload where they are, halts on the first tenant
+whose rollout does not finish and names it, and writes nothing at all in a dry
+run, that the sweep collects abandoned pending tenants and nothing else, every
+4xx path, that DELETE keeps the volume and both Secrets, a 401 for every way of
+getting the bearer wrong, that a cluster error never reaches a log line
+verbatim, the boot-refusal table for every environment variable, the binary's
+argument grammar and the exit code each roll outcome maps to, and the pairing
+parser against a captured copy of the daemon's real output.

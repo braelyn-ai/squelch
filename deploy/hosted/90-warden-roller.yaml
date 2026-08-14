@@ -1,0 +1,294 @@
+# The fleet roller: the timer that puts every tenant onto today's render.
+#
+# The warden writes a tenant's objects once, at provision time, and never
+# revisits them. So bumping `SQUELCH_WARDEN_IMAGE` in `20-warden.yaml` changes
+# what the NEXT signup gets and nothing at all about the tenants already
+# running. This CronJob is what closes that gap: it runs the warden's own binary
+# as `squelch-warden roll`, which walks every tenant in the cluster, reconciles
+# the ones whose live Deployment no longer matches the render, and waits for
+# each rollout to finish before it touches the next one.
+#
+# Numbered 90 because it sorts after everything it depends on: the ServiceAccount
+# it runs as (10), the Deployment whose environment it mirrors (20), and the
+# tenant-side objects (30-80) it converges. A roller that fired before those
+# existed would be a job that halts on an empty cluster for no reason.
+#
+# EDIT BEFORE APPLYING: the same two placeholders `20-warden.yaml` has, plus its
+# whole env block. See the next comment, which is the sharpest edge in this file.
+#
+# ## Pull-based, and in-cluster, on purpose
+#
+# It is the warden's own binary under the warden's own ServiceAccount, calling
+# library code - not an HTTP route, not a bearer token, not a CI job with a
+# kubeconfig. Converging every tenant is the most powerful thing this system can
+# do, and nothing outside this box can ask for it: no credential leaves the
+# cluster to trigger a roll, and the control plane's bearer token buys no part
+# of one.
+#
+# ## Sequential, one tenant at a time
+#
+# Zero downtime for a single tenant is not on offer - the strategy is
+# `Recreate`, the volume is `ReadWriteOnce`, and the store is one SQLite file,
+# so two daemons on one mailbox would corrupt it. What IS on offer is that the
+# FLEET is never down: one tenant, a verified rollout, then the next, and the
+# first tenant that does not come back ends the run. A bad render costs exactly
+# one tenant.
+#
+# ## Levers
+#
+#   kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now
+#   kubectl -n warden logs job/roll-now
+#   kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
+#
+# The last one stops the fleet converging while you investigate something, and
+# is the right first move on a halted run you do not yet understand. Unsuspend
+# with `false`. `deploy/hosted/PRODUCTION.md` has the exit codes and what to do
+# about each.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: squelch-warden-roll
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: squelch-warden-roll
+spec:
+  # Every 15 minutes. The two things this is trading off: a human who bumps
+  # `SQUELCH_WARDEN_IMAGE` and applies `20-warden.yaml` should not have to
+  # remember a second command afterwards, and a converged fleet should cost
+  # nothing. Fifteen minutes bounds the wait after a deliberate bump, and a run
+  # with nothing to do is one short-lived pod plus a handful of reads per tenant
+  # (a status, a drift report - and a drift report's apply is `dryRun=All`, which
+  # the API server merges and throws away). If you want it sooner than the next
+  # tick, use the `create job --from=cronjob` line in the header.
+  schedule: "*/15 * * * *"
+  # Two rollers walking one fleet is two writers on one mailbox. Forbid means a
+  # run that overruns its schedule skips the next tick rather than doubling up.
+  concurrencyPolicy: Forbid
+  # A missed schedule (a rebooted node, a paused controller) is worth catching up
+  # on once, not stampeding. Bounded rather than unset: with no deadline the
+  # controller counts every missed start since the last one and stops scheduling
+  # entirely past a hundred of them, which is a timer that silently retires.
+  startingDeadlineSeconds: 300
+  # A failed roll is the one somebody reads tomorrow; a successful one is a line
+  # in a log nobody needs twice.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      # A halted roll wants a human, not a retry loop. Whatever stopped it -
+      # a render that will not come up, an API server that stopped answering -
+      # is not fixed by running the same pass again ten seconds later, and the
+      # next scheduled tick is a retry anyway once somebody has looked.
+      backoffLimit: 0
+      # The ceiling on one pass, so a wedged run cannot hold the `Forbid` lock
+      # forever and quietly stop the fleet converging at all. Size it above
+      # SQUELCH_WARDEN_READY_TIMEOUT_SECS times the number of tenants that could
+      # be drifted at once, or a growing fleet starts getting cut off mid-walk.
+      # Being cut off is safe but not free: the tenants already rolled stay
+      # rolled, the rest are picked up by the next run, and the fleet is
+      # split-version until then.
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          # NOT `app.kubernetes.io/name: squelch-warden`. That label is the
+          # `squelch-warden` Service's selector, and a roller pod carrying it
+          # would be enrolled as an endpoint of the warden's ClusterIP - so some
+          # fraction of the control plane's calls would be routed to a pod that
+          # serves nothing and exits in a minute. The NetworkPolicy at the
+          # bottom of this file is what covers this label instead.
+          labels:
+            app.kubernetes.io/name: squelch-warden-roll
+        spec:
+          restartPolicy: Never
+          serviceAccountName: squelch-warden
+          # It talks to the API server, so it needs the token, exactly as the
+          # serving pod does. It needs NO new RBAC: `roll` calls `list`/`get` on
+          # Secrets, `get` on Services and Deployments, and server-side applies
+          # (including the drift report's dry run) on the five tenant objects -
+          # every one of them a verb already in `10-warden-rbac.yaml`. It never
+          # execs and it never deletes a Deployment, because it skips the
+          # tenants where a repair would mean deleting one.
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10002
+            runAsGroup: 10002
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: roll
+              # 1. EDIT ME. The SAME warden image as `20-warden.yaml`, always.
+              # This binary is the renderer; a roller on an older image renders
+              # older tenants.
+              image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.1
+              imagePullPolicy: IfNotPresent
+              # The image's entrypoint IS the binary, so this is the whole
+              # command line. Add `--dry-run` to make the timer report what it
+              # would change and change nothing - useful for a week after a
+              # shape change lands, and useless as a permanent setting.
+              args: ["roll"]
+              # =============================================================
+              # THIS ENV BLOCK IS A COPY OF THE WARDEN DEPLOYMENT'S, IN
+              # `20-warden.yaml`. KEEP IT IDENTICAL. Diff the two whenever you
+              # touch either.
+              #
+              # Nearly every value here is an input to the tenant Deployment
+              # this process renders. If the roller's copy drifts from the
+              # warden's, the two render different Deployments for the same
+              # tenant and take turns rewriting it: the roller rolls the fleet
+              # onto its render, the next signup, `llm mint` or `reconcile`
+              # writes the warden's back, and the next tick rolls it again.
+              # Pods restart every 15 minutes forever and every drift report
+              # says the fleet is behind. Nothing in the code can catch it,
+              # because each half is behaving correctly.
+              #
+              # (Two of these are inert on this path - the pending sweep and
+              # the rate limiter only exist in the serving process - and they
+              # are copied anyway so the two blocks diff clean.)
+              # =============================================================
+              env:
+                # 2. EDIT ME
+                - name: SQUELCH_WARDEN_BASE_DOMAIN
+                  value: passband.email
+                # 3. EDIT ME. The tenant image, and the reason this job exists:
+                # changing it here and in `20-warden.yaml` is what a daemon
+                # rollout IS.
+                - name: SQUELCH_WARDEN_IMAGE
+                  value: ghcr.io/braelyn-ai/squelchd:daemon-0.0.1
+                # `roll` serves nothing and checks no bearer, but the config
+                # validator requires a token of real length before anything
+                # starts. The real one, not a placeholder: a second secret to
+                # keep in sync would be a second thing to get wrong.
+                - name: SQUELCH_WARDEN_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: squelch-warden
+                      key: token
+                - name: SQUELCH_WARDEN_TENANT_NAMESPACE
+                  value: tenants
+                - name: SQUELCH_WARDEN_INGRESS_CLASS
+                  value: traefik
+                - name: SQUELCH_WARDEN_INGRESS_NAMESPACE
+                  value: kube-system
+                - name: SQUELCH_WARDEN_INGRESS_POD_LABEL
+                  value: app.kubernetes.io/name=traefik
+                - name: SQUELCH_WARDEN_TLS_SECRET
+                  value: passband-wildcard-tls
+                - name: SQUELCH_WARDEN_STORAGE_CLASS
+                  value: local-path
+                - name: SQUELCH_WARDEN_STORAGE_SIZE
+                  value: 10Gi
+                - name: SQUELCH_WARDEN_OAUTH_SECRET_NAME
+                  value: google-oauth-client
+                - name: SQUELCH_WARDEN_LLM_BASE_URL
+                  value: https://bifrost.passband.app/anthropic
+                # 5. EDIT ME
+                - name: SQUELCH_WARDEN_CONSOLE_SSO_URL
+                  value: https://signup.passband.app
+                - name: SQUELCH_WARDEN_CPU_REQUEST
+                  value: 100m
+                - name: SQUELCH_WARDEN_CPU_LIMIT
+                  value: 1000m
+                - name: SQUELCH_WARDEN_MEMORY_REQUEST
+                  value: 256Mi
+                - name: SQUELCH_WARDEN_MEMORY_LIMIT
+                  value: 1Gi
+                - name: SQUELCH_WARDEN_EPHEMERAL_REQUEST
+                  value: 256Mi
+                - name: SQUELCH_WARDEN_EPHEMERAL_LIMIT
+                  value: 1Gi
+                - name: SQUELCH_WARDEN_TMP_SIZE
+                  value: 512Mi
+                - name: SQUELCH_WARDEN_PENDING_TTL_SECS
+                  value: "86400"
+                - name: SQUELCH_WARDEN_TRUSTED_PROXY_HOPS
+                  value: "1"
+                # UNCOMMENT ONLY IF the warden's copy is uncommented.
+                # - name: SQUELCH_WARDEN_NODE_CIDR
+                #   value: 10.0.0.5/32
+                - name: SQUELCH_WARDEN_USER_NAMESPACES
+                  value: "on"
+                # Uncomment once the shared weights volume exists (SETUP.md step 10).
+                # - name: SQUELCH_WARDEN_MODEL_PVC
+                #   value: squelch-models
+                # Uncomment if the squelchd image is private.
+                # - name: SQUELCH_WARDEN_IMAGE_PULL_SECRET
+                #   value: ghcr
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              # It spends its life waiting on rollouts. The same bounds the
+              # serving pod runs under are more than enough.
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+          volumes:
+            # Nothing is written to disk. This exists so the read-only root
+            # filesystem has somewhere for a library to put a scratch file.
+            - name: tmp
+              emptyDir: {}
+---
+# The roller's own policy, because the roller's own pod label keeps it out of
+# the warden's (`50-warden-networkpolicy.yaml`) - and a pod holding an API token
+# that no policy selects is a pod with unrestricted egress.
+#
+# Strictly less than the warden's: no ingress rule at all, because this pod
+# listens on nothing and answers nobody. Egress is DNS and the API server,
+# which is the entire list of things a roll touches.
+#
+# CHECK BOTH CIDRS. They are the same two addresses as in
+# `50-warden-networkpolicy.yaml`, for the same reason (kube-router filters
+# egress AFTER the Service VIP is DNATed, so both the VIP and the real endpoint
+# have to be allowed). Change one file's copy and you have to change the other's;
+# the symptom of forgetting is every roll halting on the first tenant with
+# `fleet_list_failed`.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: squelch-warden-roll
+  namespace: warden
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: squelch-warden-roll
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        # CHECK ME. The API server's Service VIP, kept for CNIs that evaluate
+        # pre-DNAT.
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        # CHECK ME. The API server's real endpoint - on a single-node k3s, the
+        # node's own IP, which is what kube-router actually filters on.
+        - ipBlock:
+            cidr: 5.78.205.240/32
+      ports:
+        - protocol: TCP
+          port: 6443

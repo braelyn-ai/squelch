@@ -464,7 +464,10 @@ A tenant refused by the quota looks like a provision that times out
 
 Edit `20-warden.yaml`: the four places marked `EDIT ME` (the warden image, your
 base domain, the squelchd image tenants run, and the warden's hostname in two
-spots on the Ingress). Then:
+spots on the Ingress). Then the same values again in `90-warden-roller.yaml`,
+whose environment block is a copy of the warden's and has to stay one — it is
+the same code rendering the same tenants, and two renders that disagree take
+turns rewriting them. Then:
 
 ```sh
 kubectl apply -f deploy/hosted/10-warden-rbac.yaml
@@ -474,6 +477,11 @@ kubectl apply -f deploy/hosted/20-warden.yaml
 # Check the API server's in-cluster address matches the policy before applying it.
 kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}'; echo
 kubectl apply -f deploy/hosted/50-warden-networkpolicy.yaml
+
+# The fleet roller: the same image on a timer, walking existing tenants onto the
+# warden's current render one at a time. Nothing to converge yet on a fresh box,
+# which is the cheapest possible first run. Same two CIDRs to check as above.
+kubectl apply -f deploy/hosted/90-warden-roller.yaml
 
 kubectl -n warden rollout status deploy/squelch-warden
 ```
@@ -1248,10 +1256,14 @@ The rule that falls out of it, worth knowing before you need it:
 exec'ing into the tenant's pod. This supersedes the previous one, which is the
 daemon's documented behaviour: one live pairing code per account.
 
-**Upgrading the daemon.** Change `SQUELCH_WARDEN_IMAGE` and restart the warden,
-then re-apply each tenant. Existing tenants do NOT move on their own, by design.
-There is no "upgrade all tenants" button and that is deliberate: an upgrade that
-touches every mailbox at once is an outage waiting for a bad release.
+**Upgrading the daemon.** Change `SQUELCH_WARDEN_IMAGE` in `20-warden.yaml` and
+in `90-warden-roller.yaml`, and apply both. Existing tenants do NOT move on the
+warden's rollout, by design: it writes a tenant's objects at provision time and
+never revisits them. The roller is what moves them, one tenant at a time, each
+rollout finished before the next is touched, halting on the first tenant that
+does not come back — never all at once, because an upgrade that touches every
+mailbox in one pass is an outage waiting for a bad release. Exit codes and the
+levers: `PRODUCTION.md`, "Rolling the daemon image".
 
 **Backups.** Three things, of very different sizes:
 

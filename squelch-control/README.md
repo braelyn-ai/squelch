@@ -207,8 +207,15 @@ nobody to read it.
 field back from another manager means deleting the Deployment and applying it
 fresh, so it rolls that tenant's pod and their mailbox is offline until it
 returns. Converge one, verify it, then walk the list; a command that swept the
-fleet would turn one bad render into a fleet-wide outage at the speed an
-operator can press return.
+fleet from here would turn one bad render into a fleet-wide outage at the speed
+an operator can press return.
+
+The fleet IS swept, in the cluster, by `squelch-warden roll`
+(`deploy/hosted/90-warden-roller.yaml`), and it earns that by doing what an
+operator pressing return cannot be relied on to do: one tenant at a time, each
+rollout finished before the next is touched, a halt on the first tenant that
+does not come back, and no repair at all on a tenant where the repair means
+deleting a live workload — which is precisely the case this command exists for.
 
 The `llm` commands need the Bifrost trio, the warden pair, and the store — but
 still no OAuth client or cookie key. `llm mint` backfills a tenant that signed
