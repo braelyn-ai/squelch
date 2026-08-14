@@ -1,0 +1,16 @@
+[package]
+name = "squelch-ratelimit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "squelch_ratelimit"
+path = "src/lib.rs"
+
+[dependencies]
+# The ONLY dependency, deliberately, and a types-only one. squelch-relay and
+# squelch-broker both link this crate and both run on shared public
+# infrastructure; they must stay blind (no store, no mail, no credentials),
+# which is why the shared limiter does not live in squelch-core.
+http = "1"
