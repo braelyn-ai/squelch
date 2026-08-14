@@ -302,19 +302,42 @@ frame-ancestors 'none'; base-uri 'none'` and fetch no script, font or image.
 **The Google hop is the control plane's, and it is hosted-only.** Google forbids
 wildcard redirect URIs, so a per-tenant hostname cannot run OAuth itself. The
 login page links to `GET /console/auth?tenant=<label>` on `squelch-control`,
-which: is rate-limited on the **signup** budget (the other route that opens a
-server-side session); validates the label and looks the tenant up **before**
-sending anyone to Google; **discovers** the mailbox from Google and compares it
-constant-time against the store's owner for that label, and only then calls the
-warden — so guessing a real label cannot make a pairing code exist, let alone
-show one; and takes **no** `return` or `next` parameter anywhere in the flow, so
-there is no open redirect: the destination is constructed from this deployment's
-own base domain and the validated label. The redirect carrying the live code is
-`Cache-Control: no-store, no-cache` and `Referrer-Policy: no-referrer`. Every
-identity-shaped refusal is one page. The link renders only when
-`SQUELCH_CONSOLE_SSO_URL` is set — hosted tenants get it from the warden
-(`SQUELCH_WARDEN_CONSOLE_SSO_URL`), a self-host never sets it, and without it the
-console is the pasted-code form alone.
+which: is rate-limited on **its own** budget, tighter than signup's, shared with
+`/app/auth` below (they are the only two routes that open a server-side session
+with nothing presented at all); sends **every well-formed label** to Google
+without looking it up, because answering a real label differently from an
+unprovisioned one is a directory of which hosted addresses exist; **discovers**
+the mailbox from Google on the way back and compares it constant-time against the
+store's owner for that label, and only then calls the warden — so guessing a real
+label cannot make a pairing code exist, let alone show one; and takes **no**
+`return` or `next` parameter anywhere in the flow, so there is no open redirect:
+the destination is constructed from this deployment's own base domain and the
+validated label. The redirect carrying the live code is `Cache-Control:
+no-store, no-cache` and `Referrer-Policy: no-referrer`. Every identity-shaped
+refusal is one page. The link renders only when `SQUELCH_CONSOLE_SSO_URL` is set
+— hosted tenants get it from the warden (`SQUELCH_WARDEN_CONSOLE_SSO_URL`), a
+self-host never sets it, and without it the console is the pasted-code form
+alone.
+
+**`GET /app/auth` is that hop with its input removed, for the native app.** The
+app has no label to send (its user knows their address, not their tenant record)
+and no console to be returned to, so this route accepts **nothing** — no query
+string at all — and the tenant is found by **reverse lookup** on the address
+Google verified (`active_tenant_for_email`, `status = 'active'` part of the
+question). Same consent (`openid email`, online, no refresh token), same session
+table, same warden-minted **pairing code** as the ticket; what differs is the
+ending, a page carrying a `passband://pair?url=…&code=…` deep link built from
+this deployment's own tenant URL, under the same `no-store` / `no-referrer`
+headers. **Taking no input is what removes the oracle rather than adding one:**
+the lookup key is an address Google vouched for on this request, so the only
+mailbox anybody can ask about is the one they just proved they hold, and there is
+no label space to walk. That is why this route may say plainly that a signed-in
+account has no mailbox here, where `/console/auth` may not. Both logins share one
+rate-limit bucket and one carve-out of the session table
+(`MAX_IDENTITY_SESSIONS`), so alternating them cannot buy a flooder a second
+budget or crowd a paying signup out. It exists so somebody who already has a
+mailbox never touches an invite code: invites provision tenants, and this flow is
+for people whose tenant already runs.
 
 **Local drafts (human-door-only table).** `drafts`
 (`squelch-core/src/store/sqlite/drafts.rs`, served only by `/client/drafts`) holds

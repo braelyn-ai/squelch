@@ -269,15 +269,66 @@ device in.</p>"#,
     )
 }
 
-/// The console login's own problem page: the same shell as [`problem`] with NO
-/// link out.
+/// Where an app login ends: signed in, and one press from a connected app.
+///
+/// THE DEEP LINK IS THE PAGE. Everything else on it exists for the cases the
+/// link cannot cover: a browser that will not hand a custom scheme to the OS, a
+/// sign in finished on a phone for a Mac, an app that is not installed yet. So
+/// the code and the server are on it as `user-select: all` text too, exactly as
+/// they are on [`success`], and for the same reason: the link is the fast path
+/// and typing is the path that always works.
+///
+/// NO AUTOMATIC REDIRECT, and that is deliberate rather than unfinished. This
+/// page carries a live pairing code, and a redirect that fires on load would
+/// hand it to whatever claims `passband://` the moment the browser renders,
+/// before the person reading has agreed to anything. A press is one act more and
+/// it is the act that says which device this code is for.
+///
+/// The mailbox is named on it because this is the one screen that can say it: an
+/// app login never asked who the person was, so "signed in as" is the only
+/// confirmation they get that Google picked the account they meant.
+pub fn app_signed_in(
+    account_email: &str,
+    tenant_url: &str,
+    pair_code: &str,
+    minutes: i64,
+) -> Response {
+    let link = deep_link(tenant_url, pair_code);
+    page(
+        StatusCode::OK,
+        "Signed in",
+        &format!(
+            r#"<h1>Signed in as {email}</h1>
+<p>Your mailbox is at <code>{url}</code>. One press connects Passband to it.</p>
+<p><a class="button" href="{link}">Open Passband</a></p>
+<h2>If that button does nothing</h2>
+<p>Passband may not be installed on this device, or your browser may not open
+app links. Open Passband yourself, choose hosted, and enter these:</p>
+<p><code>{url}</code></p>
+<p><span class="code">{code}</span></p>
+<p class="muted">The code is good for {minutes} minutes and works once. If it
+expires before you get to it, come back here and sign in again.</p>
+<p class="muted">Keep the code to yourself while it is live. It is what lets a
+device in.</p>"#,
+            email = escape_html(account_email),
+            url = escape_html(tenant_url),
+            code = escape_html(pair_code),
+            link = escape_html(&link),
+            minutes = minutes,
+        ),
+    )
+}
+
+/// The page BOTH logins get when they are refused: the same shell as [`problem`]
+/// with NO link out.
 ///
 /// Two reasons it is not [`problem`]. The link there goes to the signup form,
 /// which is the wrong place to send somebody who already has a mailbox and was
 /// trying to sign in to it. And the only honest link back would be built from
 /// the label this request named, which on a uniform refusal is a label that may
 /// not exist: rendering it would answer, in an `href`, the question the refusal
-/// exists to leave unanswered.
+/// exists to leave unanswered. An app login has it worse still: it never named a
+/// label at all, so there is not even a wrong link to render.
 pub fn console_problem(status: StatusCode, heading: &str, detail: &str) -> Response {
     page(
         status,

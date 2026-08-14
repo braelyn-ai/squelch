@@ -667,6 +667,7 @@ async fn a_signup_cookie_is_not_an_admin_cookie() {
             sid: "s".repeat(43),
             label: "ada".into(),
             invite: Some(1),
+            app: false,
             iat: chrono::Utc::now().timestamp(),
         },
     );

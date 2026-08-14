@@ -19,6 +19,21 @@
 
 import SwiftUI
 
+/// The hosted control plane, and the two doors it opens.
+///
+/// SIGN IN is for somebody whose mailbox already exists: Google names them, the
+/// control plane finds the daemon that mailbox owns, and the browser comes back
+/// with a `passband://pair` link. No invite code anywhere in it, because an
+/// invite provisions a tenant and this person's tenant is already running.
+///
+/// SIGN UP is the invite-code form, and it is the only place a code is asked
+/// for. The two are one screen apart here for the same reason they are two
+/// routes over there: they answer different questions about the same person.
+private enum Hosted {
+    static let signIn = "https://signup.passband.app/app/auth"
+    static let signUp = "https://signup.passband.app"
+}
+
 /// Which way in the screen is showing.
 private enum ConnectMode: Hashable { case pair, token }
 
@@ -243,7 +258,7 @@ struct ConnectView: View {
     private var headerSubtitle: String {
         switch hostingChoice {
         case .hosted:
-            return "Use the link from hosted setup, or enter its server and credential here."
+            return "Sign in with the Google account your mailbox belongs to, and we will connect this device."
         case .selfHosted:
             return "Run squelchd pair on your server, then enter what it prints."
         case nil:
@@ -253,13 +268,27 @@ struct ConnectView: View {
 
     @ViewBuilder private var credentialContent: some View {
         if hostingChoice == .hosted {
-            Button("Continue in your browser") {
-                Opener.open("https://signup.passband.app")
+            // THE WHOLE HOSTED SIGN IN. It leaves the app because Google's
+            // consent has to run in a real browser the user can inspect, and it
+            // comes back on its own: the page at the end of it carries a
+            // `passband://pair` link, which lands in `applyPairLink` below and
+            // fills the form under this button. Nothing is asked for here in the
+            // meantime, which is the point — an existing account has no invite
+            // code to find and no pairing code to go and mint.
+            Button("sign in with google") {
+                Opener.open(Hosted.signIn)
             }
             .buttonStyle(.borderedProminent)
             .tint(Palette.accent)
             .controlSize(.large)
             .frame(maxWidth: .infinity)
+
+            Text("Your browser opens, you pick your Google account, and the page it lands on brings you back here.")
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.inkFaintest)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 9)
 
             HStack(spacing: 10) {
                 Rectangle().fill(Palette.hairline).frame(height: 0.75)
@@ -416,9 +445,12 @@ struct ConnectView: View {
         }
     }
 
-    /// Hosted's manual escape hatch. Device and account names keep their safe
-    /// defaults; hiding those optional fields makes this visibly secondary to
-    /// the browser handoff instead of presenting another full setup ceremony.
+    /// Hosted's manual escape hatch, for the cases the sign in above cannot
+    /// cover: a browser that will not open app links, a sign in finished on a
+    /// phone for a Mac, or a code from the console's own Add Device button.
+    /// Device and account names keep their safe defaults; hiding those optional
+    /// fields makes this visibly secondary to the browser handoff instead of
+    /// presenting another full setup ceremony.
     private var hostedManualForm: some View {
         VStack(alignment: .leading, spacing: 10) {
             Field(label: "server url") {
@@ -718,7 +750,7 @@ private struct RouteGate: View {
                     RouteOption(
                         symbol: "person.badge.plus",
                         title: "Sign up",
-                        action: { Opener.open("https://signup.passband.app") })
+                        action: { Opener.open(Hosted.signUp) })
                 } else {
                     RouteOption(
                         symbol: "checkmark.circle",

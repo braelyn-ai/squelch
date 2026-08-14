@@ -69,14 +69,17 @@ use axum::{
 /// - `POST /signup` is tight. It validates an invite code, so it is the one
 ///   route where a stranger can guess at a secret, and a real human posts it
 ///   once.
-/// - `GET /console/auth` is TIGHTER, in its OWN bucket. It is the only route
-///   that opens a server-side session with nothing presented at all, so it is
-///   the cheapest thing here to loop; a real human hits it once per sign in, and
-///   anything sustained above it is somebody walking the label space. It used to
-///   share signup's budget, which meant console traffic could spend it.
+/// - `GET /console/auth` and `GET /app/auth` are TIGHTER, and share ONE bucket.
+///   They are the only routes that open a server-side session with nothing
+///   presented at all, so they are the cheapest things here to loop; a real
+///   human hits one of them once per sign in, and anything sustained above the
+///   budget is somebody walking the label space. They share a bucket because
+///   they are the same errand through the same consent: a budget each would let
+///   one client spend twice by alternating them. The pair used to share
+///   signup's budget, which meant login traffic could spend it.
 /// - `GET /oauth/callback` is the most generous. Refusing it destroys a consent
 ///   the user has ALREADY granted at Google, which they cannot grant twice
-///   without walking the whole flow again. Both flows come back through it.
+///   without walking the whole flow again. All three flows come back through it.
 /// - `POST /waitlist` is small. It is a stranger-facing WRITE, a person joins
 ///   once, and everything above the budget is rows of junk for an operator to
 ///   read past; a real submitter who is refused loses one retry, because the
@@ -112,8 +115,12 @@ pub fn router(state: ControlState) -> Router {
         ))
         .with_state(state.clone());
 
+    // BOTH LOGIN HOPS, on ONE bucket. They are the same errand through the same
+    // consent, and a limiter each would let the same client spend twice by
+    // alternating them.
     let console = Router::new()
         .route("/console/auth", get(handlers::console_auth))
+        .route("/app/auth", get(handlers::app_auth))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::limit_console_auth,
