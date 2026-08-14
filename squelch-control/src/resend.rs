@@ -119,10 +119,11 @@ impl ResendClient {
 
     /// Mail one invite code to one address.
     ///
-    /// `signup_url` is where the code is redeemed; it is rendered as a plain
-    /// link and the code is NOT put in it. A code in a query string is a code
-    /// in an edge log, a referrer header, and a browser history, which is the
-    /// one place this crate promises it never goes.
+    /// `signup_url` is where the code is redeemed. The message carries it BOTH
+    /// ways: a one-click link with the code in a query string (see
+    /// [`invite_link`], which is where that trade is written down), and the bare
+    /// URL beside the bare code, for a client that mangles the link or a person
+    /// finishing on another device.
     ///
     /// Returns `Ok(())` once the provider has ACCEPTED the message. That is not
     /// delivery, and the caller's stamp says exactly that much.

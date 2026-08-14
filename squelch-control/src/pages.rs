@@ -118,7 +118,7 @@ p {{ margin: 0 0 1rem; }}
 ul, ol {{ margin: 0 0 1.25rem; padding-left: 1.2rem; }}
 li {{ margin: 0 0 0.5rem; }}
 label {{ display: block; font-weight: 600; margin: 0 0 0.35rem; }}
-input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
+input[type=text], input[type=password], input[type=email] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
   margin: 0 0 1.25rem;
   border: 1px solid #cdc7bd; border-radius: 6px; background: #fff; color: inherit; font: inherit; }}
 button {{ padding: 0.65rem 1.15rem; border: 0; border-radius: 6px; background: #1a1a1a; color: #fbfaf8;
@@ -147,7 +147,7 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   body {{ background: #141414; color: #e8e6e3; }}
   .muted, .suffix, th {{ color: #9a9a9a; }}
   code, .code {{ background: #262626; }}
-  input[type=text], input[type=password] {{ background: #1f1f1f; border-color: #3a3a3a; }}
+  input[type=text], input[type=password], input[type=email] {{ background: #1f1f1f; border-color: #3a3a3a; }}
   button, a.button {{ background: #e8e6e3; color: #141414; }}
   button.quiet {{ background: none; color: #e8e6e3; border-color: #3a3a3a; }}
   th, td {{ border-bottom-color: #303030; }}
@@ -734,6 +734,21 @@ mod tests {
         assert!(!html.contains("<b>nope</b>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(html.contains("&quot;&gt;"), "{html}");
+    }
+
+    /// The direct-invite form is ON the dashboard, and it is styled: the shared
+    /// stylesheet named two input types by hand, so an `email` input rendered as
+    /// an unstyled browser default next to the ones that are not.
+    #[tokio::test]
+    async fn the_dashboard_carries_a_styled_form_for_inviting_directly() {
+        let page = body_of(admin_page(&[], &[], None)).await;
+        assert!(page.contains(r#"action="/admin/invite""#), "{page}");
+        assert!(page.contains(r#"name="email""#), "{page}");
+        assert!(page.contains("Mint and email an invite"), "{page}");
+        assert!(page.contains("input[type=email]"), "{page}");
+        // Both palettes, or it is an unstyled box in one of them.
+        assert_eq!(page.matches("input[type=email]").count(), 2, "{page}");
+        assert!(!page.contains("<script"), "{page}");
     }
 
     /// Which button a row gets is the whole state machine the operator sees: a
