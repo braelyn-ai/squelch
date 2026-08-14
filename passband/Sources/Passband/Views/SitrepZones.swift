@@ -71,13 +71,30 @@ struct ShipmentsZone: View {
     @Environment(AppStore.self) private var store
     private var shipments: [Shipment] { store.zones.shipments }
 
+    /// A delivered package survives the DAY IT LANDED, and that day is
+    /// `delivered_at`. `last_update` only stood in for it: it is the row's last
+    /// user-visible change, so a parcel dropped at 11pm and seen by the small-hours
+    /// poll wears tomorrow's stamp and would linger a whole extra day. Rows from a
+    /// daemon older than the field keep the clock they have always been judged by.
     private var rows: [Shipment] {
-        shipments.filter { $0.status != .delivered || Fmt.isToday($0.last_update) }
+        shipments.filter {
+            $0.status != .delivered || Fmt.isToday($0.delivered_at ?? $0.last_update)
+        }
     }
 
     var body: some View {
         ZoneCard(
-            symbol: "shippingbox", title: "Shipments", count: rows.count, tint: Palette.warn
+            symbol: "shippingbox", title: "Shipments", count: rows.count, tint: Palette.warn,
+            // GLOBAL, which is why it hangs off the zone and not off a card: the
+            // kick asks every carrier about every package. Answers arrive on the
+            // rail's own poll, so nothing here waits for one.
+            trailing: AnyView(
+                ChromeChip(
+                    text: "check now", icon: "arrow.clockwise",
+                    help: "ask the carriers for an update now"
+                ) {
+                    Task { await store.pollShipments() }
+                })
         ) {
             if rows.isEmpty {
                 EmptyNote("Nothing en route.")
@@ -121,6 +138,95 @@ private struct ShipmentCard: View {
         return tid
     }
 
+    /// How far ahead a weekday name still names one day. Past it "Tue" is a
+    /// guess about which Tuesday, so the date is the shorter sentence.
+    private static let weekdayWindow = 6
+    /// Two, not one: a single rejection is the ordinary gap between a retailer
+    /// printing a label and a carrier scanning the parcel.
+    private static let noRecordAfter = 2
+    /// Layout guard on somebody else's text, not a copy budget.
+    private static let carrierWordsCap = 64
+
+    /// Nearby days as words, distant ones as dates.
+    private func dayWord(_ iso: String?) -> String {
+        guard let then = Fmt.date(iso) else { return "" }
+        if Fmt.isToday(iso) { return "today" }
+        let cal = Calendar.current
+        let days =
+            cal.dateComponents(
+                [.day], from: cal.startOfDay(for: Date()), to: cal.startOfDay(for: then)
+            ).day ?? 0
+        return abs(days) <= Self.weekdayWindow ? Fmt.weekday(iso) : Fmt.shortDate(iso)
+    }
+
+    /// The status chip's words. Delivered earns a WHEN, and since the zone keeps
+    /// only the day's own deliveries that when is an hour; `last_update` stands in
+    /// for a row written before `delivered_at` existed.
+    private var statusText: String {
+        let label = shipment.status.label
+        guard shipment.status == .delivered else { return label }
+        let landed = shipment.delivered_at ?? shipment.last_update
+        guard Fmt.date(landed) != nil else { return label }
+        return "\(label) \(Fmt.isToday(landed) ? Fmt.timeOfDay(landed) : dayWord(landed))"
+    }
+
+    /// The arrival estimate, which only a carrier poll ever supplies. Silent on a
+    /// delivered package — an estimate for something already on the porch is
+    /// noise — and silent under "out for delivery" when it estimates today, which
+    /// is the one thing that chip already says.
+    private var etaText: String? {
+        guard shipment.status != .delivered, let eta = shipment.eta, let day = Fmt.date(eta)
+        else { return nil }
+        if shipment.status == .outForDelivery, Fmt.isToday(eta) { return nil }
+        // A date that has passed is still what the carrier says, but "arrives" is
+        // the wrong tense for it — and it takes the DATE rather than the weekday
+        // `dayWord` would give, because backwards "Tue" names no particular one.
+        if day < Calendar.current.startOfDay(for: Date()) {
+            return "expected \(Fmt.shortDate(eta))"
+        }
+        return "arrives \(dayWord(eta))"
+    }
+
+    /// Today's estimate is the one worth an eye; the rest sit back.
+    private var etaTone: Color {
+        Fmt.isToday(shipment.eta) ? Palette.accent : Palette.inkFaint
+    }
+
+    /// ONE muted line under the chips, at most. The pre-manifest hint outranks the
+    /// carrier's words because `poll_failures` counts CONSECUTIVE rejections:
+    /// anything the carrier once said is older than "we have no record of this".
+    private var note: String? {
+        if shipment.status != .delivered,
+            (shipment.poll_failures ?? 0) >= Self.noRecordAfter
+        {
+            return "carrier has no record yet"
+        }
+        return carrierWords
+    }
+
+    /// The carrier's own words, kept only where our five-rung ladder could not say
+    /// the same thing — "Held at customs" has no rung, "DL Delivered" is a second
+    /// copy of the chip. Containment BOTH ways, because the ladder's label is
+    /// sometimes the longer string and sometimes the shorter one.
+    private var carrierWords: String? {
+        guard
+            let raw = shipment.carrier_status_raw?.trimmingCharacters(
+                in: .whitespacesAndNewlines), !raw.isEmpty
+        else { return nil }
+        let label = shipment.status.label
+        let lowered = raw.lowercased()
+        guard !lowered.contains(label), !label.contains(lowered) else { return nil }
+        return raw.flattenedLine(cap: Self.carrierWordsCap)
+    }
+
+    /// The poll clock rides in the tooltip: real information, worth no card space.
+    /// Nothing is appended when no carrier was ever asked, which is the resting
+    /// state of a daemon holding no carrier keys.
+    private var titleHelp: String {
+        guard shipment.last_polled_at != nil else { return title }
+        return "\(title) · checked \(Fmt.lastChecked(shipment.last_polled_at))"
+    }
+
     var body: some View {
         // The whole card opens the email; the Track chip is a real Button inside
         // it. The card is a tap gesture, not an outer Button, because a Button
@@ -134,13 +240,16 @@ private struct ShipmentCard: View {
                     .foregroundStyle(Palette.ink)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(title)
+                    .help(titleHelp)
             }
             HStack(spacing: 7) {
                 Chip(
-                    text: shipment.status.label, tone: tone,
+                    text: statusText, tone: tone,
                     symbol: shipment.status == .delivered ? "checkmark.circle.fill" : nil,
                     filled: shipment.status == .outForDelivery)
+                if let etaText {
+                    Chip(text: etaText, tone: etaTone)
+                }
                 Spacer(minLength: 0)
                 if let url = shipment.tracking_url {
                     ChromeChip(
@@ -148,6 +257,12 @@ private struct ShipmentCard: View {
                         help: "track \(shipment.tracking_number) · \(shipment.carrier.label)"
                     ) { Opener.open(url) }
                 }
+            }
+            if let note {
+                Text(note)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+                    .lineLimit(1)
             }
         }
         .padding(9)
