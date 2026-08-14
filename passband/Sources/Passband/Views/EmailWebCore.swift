@@ -295,7 +295,7 @@ struct EmailWebView: View {
                         Button {
                             Opener.open(link.href)
                         } label: {
-                            Text(Newsletters.truncate(link.text, 42))
+                            Text(Fmt.truncate(link.text, 42))
                                 .font(Typo.micro)
                                 .lineLimit(1)
                                 .padding(.horizontal, 8)

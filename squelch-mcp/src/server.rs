@@ -130,20 +130,6 @@ pub struct SetSenderRuleParams {
     pub disposition: String,
 }
 
-/// Truncate `s` to at most `max` characters (not bytes), appending a single
-/// ellipsis when it was cut. Keeps audit `detail` bounded.
-fn truncate_chars(s: &str, max: usize) -> String {
-    let mut it = s.char_indices();
-    match it.nth(max) {
-        Some((idx, _)) => {
-            let mut out = s[..idx].to_string();
-            out.push('…');
-            out
-        }
-        None => s.to_string(),
-    }
-}
-
 impl SquelchServer {
     /// Build a server over an already-open store, resolving `account_email` to
     /// an account id (creating the account row if needed).
@@ -383,7 +369,7 @@ impl SquelchServer {
         let detail = format!(
             "{}: {}",
             disposition.as_str(),
-            truncate_chars(&params.want, 120)
+            squelch_core::text::truncate_ellipsis(&params.want, 120)
         );
         let audit = NewAuditEntry {
             actor: "agent".to_string(),
