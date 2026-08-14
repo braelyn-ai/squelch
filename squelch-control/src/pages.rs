@@ -356,6 +356,37 @@ pub fn admin_login(error: Option<&str>) -> Response {
     )
 }
 
+/// The CSRF refusal, naming the origin this deployment answers to and the one
+/// the request actually stated.
+///
+/// A 403 with no words is the right shape for a page on some other origin that
+/// pressed these buttons, and the wrong shape for the operator, who meets the
+/// same refusal when an extension, a proxy, or a sandboxed frame rewrites those
+/// headers under an address bar that reads correctly. Both are told the same
+/// thing, because the attacker's half of it is a request they wrote themselves.
+///
+/// `report` arrives already filtered by [`crate::admin`] and is escaped here
+/// too: the rule is that nothing is interpolated raw.
+pub fn admin_cross_origin(expected: &str, report: &str) -> Response {
+    page(
+        StatusCode::FORBIDDEN,
+        "Passband admin",
+        &format!(
+            r#"<h1>That request did not come from this site</h1>
+<p>This page only accepts form posts made by a page loaded from
+<code>{expected}</code>, and this one stated something else. Nothing was
+changed.</p>
+<p class="muted">What arrived: <code>{report}</code></p>
+<p class="muted">A browser on this origin sends its own address here. Something
+between the form and this service rewrote it, which is usually an extension, a
+proxy, or the page running inside a sandboxed frame. Opening
+<code>{expected}/admin</code> in an ordinary tab is the fix.</p>"#,
+            expected = escape_html(expected.trim_end_matches('/')),
+            report = escape_html(report),
+        ),
+    )
+}
+
 /// The dashboard: who is waiting, who has been approved, and the two buttons.
 ///
 /// ALWAYS 200, even carrying an `error`. The list under it is correct either

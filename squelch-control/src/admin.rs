@@ -98,14 +98,60 @@ const INVITE_HELD: &str =
 /// the way. A request with neither header is not a browser making it, and the
 /// cookie is still required.
 fn same_origin(state: &ControlState, headers: &HeaderMap) -> bool {
+    origin_matches(&state.config().public_url, headers)
+}
+
+/// [`same_origin`] against a stated origin, so it can be tested without a
+/// deployment's whole config behind it.
+///
+/// The trailing slash is trimmed off BOTH sides. A serialized origin has no
+/// path, so no browser sends one, but a proxy or an extension that rewrites the
+/// header is not a browser and does not always agree; matching on that is a
+/// lockout with no error to read, which is exactly the failure this module has
+/// already cost an operator once.
+fn origin_matches(expected: &str, headers: &HeaderMap) -> bool {
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        return origin == state.config().public_url.trim_end_matches('/');
+        return origin.trim_end_matches('/') == expected.trim_end_matches('/');
     }
     match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         // "none" is a typed URL or a bookmark, which no other page can forge.
         Some(site) => site == "same-origin" || site == "none",
         None => true,
     }
+}
+
+/// Ceiling on an echoed header value. An origin is a scheme, a host, and maybe
+/// a port; anything past this is not one, and the operator reading it does not
+/// need the rest to recognize what their client is doing.
+const MAX_ECHOED: usize = 128;
+
+/// The two headers the refusal turned on, as a line a log and a page can both
+/// carry.
+///
+/// These are the CALLER'S bytes, so they are filtered to the characters an
+/// origin is made of before they go anywhere. Nothing here is a secret: it is
+/// what the client itself sent, and the deployment's own origin is the URL in
+/// the address bar and in every invite email.
+fn origin_report(headers: &HeaderMap) -> String {
+    let field = |name: &str| -> String {
+        let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
+            return "absent".to_string();
+        };
+        let mut out: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "-_.:/[]".contains(*c))
+            .take(MAX_ECHOED)
+            .collect();
+        if out.is_empty() {
+            out.push_str("unreadable");
+        }
+        out
+    };
+    format!(
+        "Origin: {} / Sec-Fetch-Site: {}",
+        field("origin"),
+        field("sec-fetch-site")
+    )
 }
 
 /// `GET /admin` — the dashboard, or the door.
@@ -129,7 +175,7 @@ pub async fn login(
         return StatusCode::NOT_FOUND.into_response();
     };
     if !same_origin(&state, &headers) {
-        return cross_origin();
+        return cross_origin(&state, &headers);
     }
 
     let presented = field_capped(&body, "token", MAX_TOKEN);
@@ -174,7 +220,7 @@ pub async fn approve(
         return signed_out(&state);
     }
     if !same_origin(&state, &headers) {
-        return cross_origin();
+        return cross_origin(&state, &headers);
     }
     let Some(id) = row_id(&body) else {
         return dashboard(&state, Some(NO_SUCH_ROW));
@@ -207,7 +253,7 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
         return signed_out(&state);
     }
     if !same_origin(&state, &headers) {
-        return cross_origin();
+        return cross_origin(&state, &headers);
     }
     let Some(id) = row_id(&body) else {
         return dashboard(&state, Some(NO_SUCH_ROW));
@@ -446,12 +492,19 @@ fn signed_out(state: &ControlState) -> Response {
     resp
 }
 
-/// A POST that some other origin's page made this browser send. Bare, because
-/// there is nobody to explain it to: the operator never sees this, and the page
-/// that caused it is not owed a reason.
-fn cross_origin() -> Response {
-    tracing::warn!("admin action refused: cross-origin");
-    StatusCode::FORBIDDEN.into_response()
+/// A POST that did not come from this origin's own page.
+///
+/// This used to be a bare 403 on the theory that the operator never sees it and
+/// the page that caused it is not owed a reason. The first half was wrong: an
+/// extension, a proxy, or a sandboxed frame rewrites these headers on a page
+/// whose address bar looks correct, and then the only person reading this is
+/// the operator, locked out with nothing to act on. The second half still
+/// holds, which is why the page says what was expected and what arrived and
+/// nothing else: an attacker learns their own request back.
+fn cross_origin(state: &ControlState, headers: &HeaderMap) -> Response {
+    let report = origin_report(headers);
+    tracing::warn!(%report, "admin action refused: cross-origin");
+    pages::admin_cross_origin(&state.config().public_url, &report)
 }
 
 /// Every action that did something ends here rather than rendering, so a
@@ -469,6 +522,102 @@ fn row_id(body: &Bytes) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    const HERE: &str = "https://signup.passband.app";
+
+    #[test]
+    fn takes_this_origin_however_it_is_spelled() {
+        assert!(origin_matches(HERE, &headers(&[("origin", HERE)])));
+        // A rewritten header with a path separator on the end is still this
+        // origin, and refusing it locks the operator out over a slash.
+        assert!(origin_matches(
+            HERE,
+            &headers(&[("origin", "https://signup.passband.app/")])
+        ));
+        assert!(origin_matches(
+            &format!("{HERE}/"),
+            &headers(&[("origin", HERE)])
+        ));
+    }
+
+    #[test]
+    fn refuses_every_other_origin() {
+        for bad in [
+            "https://passband.app",
+            "https://warden.passband.app",
+            "http://signup.passband.app",
+            "null",
+            "https://signup.passband.app.evil.test",
+        ] {
+            assert!(
+                !origin_matches(HERE, &headers(&[("origin", bad)])),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn falls_back_to_the_fetch_metadata_only_with_no_origin() {
+        assert!(origin_matches(
+            HERE,
+            &headers(&[("sec-fetch-site", "same-origin")])
+        ));
+        assert!(origin_matches(
+            HERE,
+            &headers(&[("sec-fetch-site", "none")])
+        ));
+        assert!(!origin_matches(
+            HERE,
+            &headers(&[("sec-fetch-site", "cross-site")])
+        ));
+        // Not a browser at all. The cookie is still required.
+        assert!(origin_matches(HERE, &headers(&[])));
+        // The stated origin decides on its own: a browser that names another
+        // origin is refused however friendly its fetch metadata reads.
+        assert!(!origin_matches(
+            HERE,
+            &headers(&[
+                ("origin", "https://passband.app"),
+                ("sec-fetch-site", "same-origin")
+            ])
+        ));
+    }
+
+    #[test]
+    fn reports_both_headers_and_keeps_nothing_that_could_end_a_page() {
+        assert_eq!(
+            origin_report(&headers(&[
+                ("origin", HERE),
+                ("sec-fetch-site", "cross-site")
+            ])),
+            "Origin: https://signup.passband.app / Sec-Fetch-Site: cross-site"
+        );
+        assert_eq!(
+            origin_report(&headers(&[])),
+            "Origin: absent / Sec-Fetch-Site: absent"
+        );
+        let nasty = origin_report(&headers(&[("origin", "<script>alert(1)</script>")]));
+        assert!(!nasty.contains('<'), "{nasty}");
+        assert!(!nasty.contains('>'), "{nasty}");
+        let long = "https://".to_string() + &"a".repeat(400);
+        let capped = origin_report(&headers(&[("origin", &long)]));
+        assert!(
+            capped.contains(&"a".repeat(MAX_ECHOED - "https://".len())),
+            "kept what fits"
+        );
+        assert!(!capped.contains(&"a".repeat(MAX_ECHOED)), "and no more");
+    }
 
     #[test]
     fn reads_the_row_a_button_was_on() {
