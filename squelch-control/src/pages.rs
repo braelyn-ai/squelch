@@ -6,6 +6,14 @@
 //! third party can watch, and the one thing a user does here is decide whether
 //! to hand over access to their mail.
 //!
+//! THE LOGO IS SUBJECT TO THAT RULE RATHER THAN AN EXCEPTION TO IT. These pages
+//! carry the Passband masthead so that arriving from the landing page does not
+//! feel like leaving the product, and the mark reaches them as an inline `<svg>`
+//! element ([`MARK`]) because that is markup rather than a fetch: `img-src` is
+//! still `'none'` and the CSP did not have to move an inch to let a logo in. The
+//! wordmark's serif is the platform's, for the same reason there is no webfont
+//! anywhere here.
+//!
 //! Everything interpolated goes through [`escape_html`], including strings that
 //! were validated elsewhere: "this one was checked already" is how the
 //! exception becomes the rule.
@@ -93,7 +101,66 @@ pub fn console_callback_url(tenant_url: &str, pair_code: &str) -> String {
     )
 }
 
+/// The Passband mark, inline, in one colour.
+///
+/// INLINE AND MONOCHROME BECAUSE OF THE CSP AT THE TOP OF THIS FILE. `img-src`
+/// is `'none'`, so there is no `<img src>` to point at `mark.svg` and no data
+/// URI either; an inline `<svg>` element is markup rather than a fetch, so it is
+/// the one way a logo reaches these pages without opening a hole for a third
+/// party to be watching from. `currentColor` on both the fill and the stroke
+/// makes the whole thing take its colour from CSS, which is what lets one copy
+/// serve the light and dark grounds.
+///
+/// GENERATED, NOT DRAWN. The bars are `brand/svg/mark-mono.svg`'s verbatim, and
+/// the curve is that file's path run through Douglas-Peucker at a tolerance of
+/// one canvas unit: 350 points become 39, 4.5 kB becomes 0.3 kB, and at masthead
+/// size (one unit is 0.025 px there) the two are the same picture. `brand/`
+/// remains the source; if the geometry ever moves, this is regenerated from it
+/// rather than edited.
+///
+/// THE SIMPLIFICATION KEEPS THE RULE `brand/generate.ts` FAILS ITS BUILD OVER:
+/// no bar breaches the line, because the curve is the filter admitting the bars
+/// and not a decoration laid over them. Checked against every bar across its
+/// full width, the original clears by 0.59 units and this by 0.32; a cheaper
+/// simplification that looked identical at 26 px put three bars through the
+/// right shoulder, which is why the tolerance is where it is.
+///
+/// `aria-hidden` because the wordmark beside it already says Passband, and a
+/// screen reader should not say it twice.
+const MARK: &str = concat!(
+    r#"<svg viewBox="0 221 1024 557" aria-hidden="true" fill="currentColor"><g>"#,
+    r#"<rect x="129.8" y="697.3" width="44.4" height="74.7" rx="22.2"/>"#,
+    r#"<rect x="189.8" y="600.7" width="44.4" height="171.3" rx="22.2"/>"#,
+    r#"<rect x="249.8" y="550.1" width="44.4" height="221.9" rx="22.2"/>"#,
+    r#"<rect x="309.8" y="420.4" width="44.4" height="351.6" rx="22.2"/>"#,
+    r#"<rect x="369.8" y="297.4" width="44.4" height="474.6" rx="22.2"/>"#,
+    r#"<rect x="429.8" y="370.0" width="44.4" height="402.0" rx="22.2"/>"#,
+    r#"<rect x="489.8" y="253.1" width="44.4" height="518.9" rx="22.2"/>"#,
+    r#"<rect x="549.8" y="329.5" width="44.4" height="442.5" rx="22.2"/>"#,
+    r#"<rect x="609.8" y="356.3" width="44.4" height="415.7" rx="22.2"/>"#,
+    r#"<rect x="669.8" y="362.2" width="44.4" height="409.8" rx="22.2"/>"#,
+    r#"<rect x="729.8" y="555.9" width="44.4" height="216.1" rx="22.2"/>"#,
+    r#"<rect x="789.8" y="619.1" width="44.4" height="152.9" rx="22.2"/>"#,
+    r#"<rect x="849.8" y="699.3" width="44.4" height="72.7" rx="22.2"/>"#,
+    r#"</g><path fill="none" stroke="currentColor" stroke-width="12" "#,
+    r#"stroke-linecap="round" stroke-linejoin="round" d="#,
+    r#"M-12 768L12 765L33 760L54 752L69 745L87 733L102 721L117 707L135 686"#,
+    r#"L159 653L189 602L279 420L309 364L339 316L369 279L384 265L399 254"#,
+    r#"L414 244L429 238L462 229L501 227L552 228L588 235L606 242L621 251"#,
+    r#"L636 262L651 275L681 311L711 357L744 418L834 600L861 646L888 685"#,
+    r#"L918 718L936 733L954 744L972 753L993 760L1035 768"/></svg>"#,
+);
+
 /// The shell every page shares.
+///
+/// THE MASTHEAD IS PART OF THE SHELL, so every page carries it: the mark, then
+/// the name in the brand's serif, top left. It is NOT A LINK, deliberately. The
+/// obvious `href` is the marketing site, and the page this sits on hardest is
+/// the one where somebody is deciding whether to hand over their mail; a way out
+/// in the top left corner of that decision buys continuity with the landing page
+/// at the cost of a door out of the flow, and the flow is the thing. Being
+/// link-free also keeps it free of configuration, which is what lets the shell
+/// carry it rather than every call site having to pass an origin down.
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let title = escape_html(title);
     let html = format!(
@@ -105,10 +172,29 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
 <meta name="robots" content="noindex, nofollow">
 <title>{title}</title>
 <style>
-:root {{ color-scheme: light dark; }}
-body {{ margin: 0; padding: 3rem 1.25rem; background: #fbfaf8; color: #1a1a1a;
+/* THE BRAND ACCENT, stated once. `--brand` is the mark's ink ramp on a light
+   ground and its lit ramp on a dark one (brand/README.md's palette), and it is
+   the only colour on these pages that is the product's rather than the
+   document's: the mark, the links, and the focus ring. The button stays neutral
+   because the landing page has no primary button in this blue and inventing one
+   here would match nothing. */
+:root {{ color-scheme: light dark; --brand: #1f7099; }}
+body {{ margin: 0; padding: 2.25rem 1.25rem 3rem; background: #fbfaf8; color: #1a1a1a;
   font: 1rem/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
 main {{ max-width: 34rem; margin: 0 auto; }}
+/* The masthead, aligned to the reading column rather than to the viewport, so
+   it sits over the content instead of drifting off into the margin on a wide
+   window. On a phone the two are the same corner. */
+.brand {{ display: flex; align-items: center; gap: 0.55rem; margin: 0 0 2.25rem; }}
+.brand svg {{ height: 1.5rem; width: auto; flex: none; color: var(--brand); }}
+/* The brand's ONE serif moment, rationed the way the site and the Swift
+   client's Typo ration it: Newsreader for the wordmark and nowhere else, since
+   a display serif spread further becomes wallpaper. The webfont itself cannot
+   be fetched under this page's CSP, so it is named first for the reader who
+   happens to have it installed and the stack falls through to the platform's
+   own serif for everybody else. */
+.wordmark {{ font-family: "Newsreader", ui-serif, Georgia, "Times New Roman", serif;
+  font-size: 1.32rem; font-weight: 500; letter-spacing: -0.005em; }}
 /* The admin dashboard is the one page with a table, and the reading width the
    rest of the site is set to folds it into three cramped columns. */
 main:has(table) {{ max-width: 44rem; }}
@@ -117,7 +203,7 @@ h2 {{ font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 0.6rem; }}
 p {{ margin: 0 0 1rem; }}
 ul, ol {{ margin: 0 0 1.25rem; padding-left: 1.2rem; }}
 li {{ margin: 0 0 0.5rem; }}
-a {{ color: inherit; text-underline-offset: 0.15em; }}
+a {{ color: var(--brand); text-underline-offset: 0.15em; }}
 label {{ display: block; font-weight: 600; margin: 0 0 0.35rem; }}
 input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
   margin: 0 0 1.25rem;
@@ -127,7 +213,7 @@ button {{ padding: 0.65rem 1.15rem; border: 0; border-radius: 6px; background: #
 /* One ring for every interactive thing, drawn OUTSIDE the control so it never
    changes the layout it lands on. Keyboard-only (`:focus-visible`), so clicking
    a button does not leave it haloed. */
-:is(input, button, a, summary):focus-visible {{ outline: 2px solid #1a1a1a; outline-offset: 2px; }}
+:is(input, button, a, summary):focus-visible {{ outline: 2px solid var(--brand); outline-offset: 2px; }}
 /* THE FORM IS THE PAGE. The signup form asks for two things and everything else
    on the page is context for them, so the fields sit on their own ground and
    the prose does not. */
@@ -172,24 +258,35 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 
   background: #efece7; padding: 0.1em 0.35em; border-radius: 3px; word-break: break-all; }}
 a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1.15rem;
   background: #1a1a1a; color: #fbfaf8; text-decoration: none; border-radius: 6px; font-weight: 500; }}
+/* THE DARK GROUND IS THE LANDING PAGE'S GROUND, value for value: #0f0f10 under
+   #f5f5f7, cards and inputs as the white washes it builds them from, and the
+   mark's lit ramp for the accent. Almost everybody who arrives here arrived
+   from that page, which has no light mode at all, so this is the transition
+   they actually see. The light ground stays the warm paper it was: there is no
+   landing page in light mode to match it to. */
 @media (prefers-color-scheme: dark) {{
-  body {{ background: #141414; color: #e8e6e3; }}
-  .muted, .suffix, .hint, th {{ color: #9a9a9a; }}
-  code, .code {{ background: #262626; }}
-  input[type=text], input[type=password] {{ background: #1f1f1f; border-color: #3a3a3a; }}
-  button, a.button {{ background: #e8e6e3; color: #141414; }}
-  button.quiet {{ background: none; color: #e8e6e3; border-color: #3a3a3a; }}
-  th, td {{ border-bottom-color: #303030; }}
+  :root {{ --brand: #7cc8eb; }}
+  body {{ background: #0f0f10; color: #f5f5f7; }}
+  .muted, .suffix, .hint, th {{ color: #a0a0a7; }}
+  code, .code {{ background: rgba(255, 255, 255, 0.07); }}
+  input[type=text], input[type=password] {{ background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.14); }}
+  button, a.button {{ background: #f5f5f7; color: #0f0f10; }}
+  button.quiet {{ background: none; color: #f5f5f7; border-color: rgba(255, 255, 255, 0.14); }}
+  th, td {{ border-bottom-color: rgba(255, 255, 255, 0.11); }}
   .stop {{ border-left-color: #f2b8b5; }}
-  .card {{ background: #1b1b1b; border-color: #303030; }}
-  .alt, details {{ border-color: #303030; }}
-  :is(input, button, a, summary):focus-visible {{ outline-color: #e8e6e3; }}
+  .card {{ background: rgba(255, 255, 255, 0.055); border-color: rgba(255, 255, 255, 0.11); }}
+  .alt, details {{ border-color: rgba(255, 255, 255, 0.11); }}
 }}
 </style>
 </head>
-<body><main>{body}</main></body>
+<body><main><header class="brand">{mark}<span class="wordmark">Passband</span></header>
+{body}</main></body>
 </html>
-"#
+"#,
+        title = title,
+        mark = MARK,
+        body = body,
     );
     (
         status,
@@ -888,6 +985,53 @@ mod tests {
         ] {
             assert!(!html.contains('\u{2014}'), "{html}");
         }
+    }
+
+    /// The masthead is part of the shell, so it is on every page, and it is
+    /// MARKUP rather than anything the browser has to go and get: no `src`, no
+    /// `url()`, no scheme anywhere in it. That is the whole reason the logo
+    /// could be added without touching a CSP that says `default-src 'none'`.
+    #[tokio::test]
+    async fn every_page_wears_the_mark_and_fetches_nothing_to_do_it() {
+        for html in [
+            body_of(signup_form("passband.email", None, "", "", None)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
+            body_of(console_problem(
+                StatusCode::BAD_REQUEST,
+                "Nope",
+                "Try again.",
+            ))
+            .await,
+            body_of(admin_login(None)).await,
+            body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await,
+        ] {
+            assert!(html.contains(r#"<header class="brand">"#), "{html}");
+            assert!(
+                html.contains(r#"<span class="wordmark">Passband</span>"#),
+                "{html}"
+            );
+            assert!(html.contains("<svg"), "{html}");
+            // Inline, not fetched: an `<img src>` or a `url()` here would be a
+            // request `default-src 'none'` refuses, i.e. a broken logo.
+            assert!(!html.contains("<img"), "{html}");
+            assert!(!html.contains("url("), "{html}");
+            assert!(!html.contains("http://"), "{html}");
+        }
+    }
+
+    /// The masthead does not link out. The one honest `href` would be the
+    /// marketing site, and the page it sits on hardest is the one where somebody
+    /// is deciding whether to hand over their mail; a door out of that decision
+    /// is not what the top left corner is for. The console refusal leans on
+    /// this: it asserts it offers NO way onward, and a linked masthead would
+    /// have made that false everywhere at once.
+    #[tokio::test]
+    async fn the_masthead_is_not_a_way_out_of_the_flow() {
+        let html = body_of(signup_form("passband.email", None, "", "", None)).await;
+        let (masthead, _) = html.split_once("</header>").expect("{html}");
+        assert!(!masthead.contains("<a "), "{masthead}");
+        assert!(!masthead.contains("href"), "{masthead}");
     }
 
     #[tokio::test]

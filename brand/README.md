@@ -72,6 +72,7 @@ groundless marks stay SVG — which is the correct format for a logo regardless.
 | destination | source | why there |
 |---|---|---|
 | `passband-site/icon.svg` | `svg/icon.svg` | favicon + hero. The site's Docker context is `passband-site/`, so its assets cannot be referenced out of this directory |
+| `squelch-control/src/pages.rs` (`MARK`) | `svg/mark-mono.svg` | the signup masthead, pasted into the Rust source rather than copied as a file. Those pages serve under `default-src 'none'`, so a logo has to be inline markup instead of something the browser fetches. The bars are verbatim; the curve is simplified to 39 points (see the const's own comment), which keeps the no-breach rule this generator enforces |
 | `passband-site/icon-180.png` | `png/icon-180.png` | `apple-touch-icon` |
 | `passband-site/icon-512.png` | `png/icon-512.png` | link unfurls |
 | `passband/Passband.icon/Assets/signal.png` | `png/icon-1024.png` | Icon Composer layer, Mac + iOS |

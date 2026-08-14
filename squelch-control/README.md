@@ -214,7 +214,12 @@ is `deploy/hosted/PRODUCTION.md`.
 ## Notes on the surface
 
 - No JavaScript, no external assets, `default-src 'none'` CSP, `no-store`, and
-  `X-Frame-Options: DENY` on every page.
+  `X-Frame-Options: DENY` on every page. The Passband masthead in the top left
+  is subject to that rather than an exception to it: the mark is an inline
+  `<svg>` (markup, not a fetch, so `img-src` stays `'none'`) and the wordmark's
+  serif is whatever the reader's platform has, because there is no webfont here
+  either. It is not a link; the one honest destination would be the marketing
+  site, and that is a door out of a signup, not a masthead.
 - Per-route rate limits: the form is metered like a page, `POST /signup` is
   tight (it is the one route where a stranger can guess at a secret), and
   `/oauth/callback` is the most generous, because refusing it destroys a consent
