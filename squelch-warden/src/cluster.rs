@@ -276,6 +276,12 @@ pub trait Cluster: Send + Sync {
     /// `spec.replicas` absent is 1, Kubernetes' own default, and any missing
     /// status field is 0: a Deployment the controller has not reported on has
     /// not finished anything.
+    ///
+    /// A desired count BELOW 1 is never complete, whatever the status says. At
+    /// `spec.replicas: 0` all four numbers are 0 and all four conditions hold,
+    /// so a tenant somebody scaled to zero would answer this with "finished" and
+    /// no pod - the one answer a caller stepping to the next tenant must never
+    /// be given, because it is the shape of a mailbox that is off.
     async fn rollout_complete(&self, name: &str, within: Duration) -> Result<(), ClusterError>;
 
     /// Block until NO pod matches `selector`. [`ClusterError::Timeout`] after
@@ -673,6 +679,14 @@ pub(crate) fn rolled_out(deployment: &Deployment) -> bool {
         .as_ref()
         .and_then(|spec| spec.replicas)
         .unwrap_or(1);
+    // A tenant scaled to zero has no pod, and every count on it is 0 - which
+    // satisfies all four conditions below and reads as a finished rollout. It
+    // is the opposite: a desired count under 1 is a mailbox that is OFF, and a
+    // caller waiting for this tenant to be serving before it touches the next
+    // one is entitled to be told no.
+    if desired < 1 {
+        return false;
+    }
     let generation = deployment.metadata.generation.unwrap_or(0);
     let status = deployment.status.as_ref();
     // A field the controller has not written is 0, never "assume it is fine":
@@ -858,6 +872,41 @@ mod tests {
             }),
             ..Default::default()
         }));
+    }
+
+    /// The zero that satisfies every rule and means the opposite of finished.
+    ///
+    /// At `spec.replicas: 0` all four numbers agree at 0, so a predicate that
+    /// only compared them would call a tenant with NO POD a completed rollout -
+    /// and the caller that acts on the answer would step to the next tenant on
+    /// the strength of a mailbox that is off. A desired count under 1 is never
+    /// a finished rollout, whatever the status says.
+    #[test]
+    fn a_tenant_scaled_to_zero_has_not_finished_rolling_out() {
+        use k8s_openapi::api::apps::v1::DeploymentSpec;
+
+        let off = |replicas: i32| Deployment {
+            metadata: ObjectMeta {
+                generation: Some(2),
+                ..Default::default()
+            },
+            spec: Some(DeploymentSpec {
+                replicas: Some(replicas),
+                ..Default::default()
+            }),
+            status: Some(DeploymentStatus {
+                observed_generation: Some(2),
+                replicas: Some(0),
+                updated_replicas: Some(0),
+                ready_replicas: Some(0),
+                ..Default::default()
+            }),
+        };
+        assert!(!rolled_out(&off(0)));
+        // The same object with the count it is meant to have is the ordinary
+        // "not ready yet", which proves the assertion above is the zero and
+        // not the shape.
+        assert!(!rolled_out(&off(1)));
     }
 
     /// What reaches a log line. The API server's message never does: it can

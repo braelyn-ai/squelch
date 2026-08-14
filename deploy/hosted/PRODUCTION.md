@@ -341,8 +341,8 @@ The run's answer is its exit code, which is also the Job's status:
 
 | Exit | Means | What to do |
 |---|---|---|
-| 0 | The fleet is on today's render. A run with nothing to do is this. | Nothing. |
-| 1 | Not converged: it halted on a tenant that did not come back, or never started (refused config, unreachable API server). | Read the log, find the halted label, suspend the CronJob while you work. Everything after that tenant in label order was not touched. |
+| 0 | The fleet is on today's render and serving it. A run with nothing to do is this. | Nothing. |
+| 1 | Not converged, in any of its forms: it halted on a tenant that did not come back; it stopped before applying anything because a tenant already carries today's render and is not serving it; a tenant has no workload behind a live Service; it never started (refused config, unreachable API server); or `--dry-run` found work to do. | Read the log, find the named label, suspend the CronJob while you work. Everything after that tenant in label order was not touched. |
 | 2 | Converged, and at least one tenant was skipped for foreign drift. | Below. Nothing is broken; nothing fixes itself either. |
 | 64 | The Job's argument list is wrong. | Fix `args:` in `90-warden-roller.yaml`. |
 
@@ -357,6 +357,24 @@ kubectl -n warden logs job/<name>                         # per-tenant lines, th
 kubectl -n warden create job --from=cronjob/squelch-warden-roll roll-now   # do not wait
 kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
 ```
+
+**A run that stops before applying anything is the halt doing its job across
+runs.** The roller reads every tenant before it writes to any of them, and a
+tenant that carries today's render and is not serving it stops the run where it
+stands: that render was applied there and the mailbox did not come back, so no
+other mailbox is getting it. The summary says `HALTED before applying anything`
+and names the tenant. Look at that one tenant first (`kubectl -n tenants logs
+deploy/<label>`, `squelch-control drift <label>`); the fleet is exactly as the
+previous run left it, and it stays that way until the tenant is serving again or
+you suspend the CronJob. A tenant that is down for its own reasons blocks a roll
+the same way, which is deliberate: the fleet is not rolled while a mailbox is
+down.
+
+**A tenant reported as DOWN with no workload** is a reconcile that did not
+finish: its Service, volume and sealed credential are standing and only the
+Deployment is missing. The roller will not finish somebody else's half-done
+repair unattended, so it names the tenant and leaves it. `squelch-control
+reconcile <label>` is the finish.
 
 **A foreign-drift skip (exit 2) is a page for a person, not a bug.** The roller
 refuses to repair a Deployment another field manager owns fields on, because the

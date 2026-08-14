@@ -48,20 +48,28 @@ usage:
   squelch-warden roll              converge every tenant onto today's render, one at a time
   squelch-warden roll --dry-run    report what a roll would change, and change nothing
 
-`roll` exits 0 converged (nothing to do counts), 1 halted on a tenant that did
-not converge, 2 converged with tenants skipped for foreign drift.
+`roll` exits 0 converged (nothing to do counts), 1 not converged (it halted, it
+never started, a tenant is down, or a dry run found work), 2 converged with
+tenants skipped for foreign drift.
 ";
 
 // `roll`'s exit status is the CronJob's entire interface to a run: the pod's
 // log says what happened, and this says what to do about it.
 
-/// The fleet is on today's render. A run with nothing to do is this.
+/// The fleet is on today's render and every tenant is serving it. A run with
+/// nothing to do is this; a run that would have had something to do is not.
 const EXIT_CONVERGED: u8 = 0;
-/// The fleet is NOT converged: the roll halted on a tenant that did not come
-/// back, or it never started at all (a refused config, an API server it could
-/// not reach). Both want the same thing - a person reading the log before
-/// anything else is applied - so both are one code.
-const EXIT_HALTED: u8 = 1;
+/// The fleet is NOT converged, in any of the four ways that can be true: the
+/// roll halted on a tenant that did not come back, it stopped on a casualty of
+/// an earlier run, it never started at all (a refused config, an API server it
+/// could not reach), or it found a tenant with no workload behind a live
+/// Service. A dry run that would roll anything is here too - it has just
+/// reported that the fleet is behind, and reporting that as converged is the
+/// one answer that would make `--dry-run` worse than useless.
+///
+/// All of them want the same thing, which is a person reading the log before
+/// anything else is applied, so all of them are one code.
+const EXIT_NOT_CONVERGED: u8 = 1;
 /// Everything this run could converge did, and at least one tenant was left
 /// alone because another field manager owns part of its Deployment. Nothing is
 /// broken, and nothing will fix itself either; see
@@ -92,11 +100,19 @@ fn command(args: &[String]) -> Option<Command> {
 }
 
 /// What the run's outcome means to whoever scheduled it. See the exit-code
-/// constants; a halt outranks a skip, because a fleet that stopped converging
-/// is the more urgent of the two facts.
-fn verdict(rolled: &Rolled) -> u8 {
-    if rolled.halted_on.is_some() {
-        EXIT_HALTED
+/// constants; not-converged outranks a skip, because a fleet that is not on
+/// today's render is the more urgent of the two facts.
+///
+/// `dry_run` is an input to the verdict and not a detail of the report, because
+/// the same summary means opposite things in the two modes. A real run that
+/// rolled three tenants converged them; a dry run that would have rolled three
+/// tenants converged nothing and has just said so. Without this, the run the
+/// CronJob comments recommend before a pin bump - the one whose entire job is
+/// to warn - would exit exactly like a fleet that needs nothing.
+fn verdict(rolled: &Rolled, dry_run: bool) -> u8 {
+    let would_roll = dry_run && !rolled.rolled.is_empty();
+    if rolled.halted_on.is_some() || !rolled.stranded.is_empty() || would_roll {
+        EXIT_NOT_CONVERGED
     } else if !rolled.skipped_foreign.is_empty() {
         EXIT_SKIPPED
     } else {
@@ -132,11 +148,26 @@ fn summarize(rolled: &Rolled, dry_run: bool) -> String {
     }
     if !rolled.skipped_inactive.is_empty() {
         out.push_str(&format!(
-            "  no workload to converge (pending or stopped): {}\n",
+            "  no workload to converge (pending or cancelled): {}\n",
             rolled.skipped_inactive.join(", ")
         ));
     }
-    if let Some(label) = &rolled.halted_on {
+    if !rolled.stranded.is_empty() {
+        out.push_str(&format!(
+            "  DOWN (no workload, still routed; an unfinished reconcile): {}\n",
+            rolled.stranded.join(", ")
+        ));
+    }
+    // The casualty line replaces the halt line rather than joining it: they name
+    // the same tenant, and the two stops want different things done about them.
+    // A halt is "this tenant did not come back"; a casualty is "this tenant
+    // already has what you were about to hand everybody else".
+    if let Some(label) = &rolled.casualty {
+        out.push_str(&format!(
+            "  HALTED before applying anything: {label} carries today's render and is not \
+             serving it\n"
+        ));
+    } else if let Some(label) = &rolled.halted_on {
         out.push_str(&format!(
             "  HALTED on {label}; the tenants after it were not touched\n"
         ));
@@ -212,7 +243,7 @@ async fn roll(dry_run: bool) -> anyhow::Result<ExitCode> {
         .await
         .map_err(|e| anyhow::anyhow!("squelch-warden roll: {e}"))?;
     eprint!("{}", summarize(&rolled, dry_run));
-    Ok(ExitCode::from(verdict(&rolled)))
+    Ok(ExitCode::from(verdict(&rolled, dry_run)))
 }
 
 /// Serve until the kubelet stops us.
@@ -349,15 +380,18 @@ mod tests {
 
     #[test]
     fn a_converged_fleet_including_an_empty_one_exits_zero() {
-        assert_eq!(verdict(&Rolled::default()), EXIT_CONVERGED);
+        assert_eq!(verdict(&Rolled::default(), false), EXIT_CONVERGED);
         assert_eq!(
-            verdict(&Rolled {
-                checked: 3,
-                rolled: vec!["alice".into()],
-                current: 2,
-                skipped_inactive: vec!["bob".into()],
-                ..Rolled::default()
-            }),
+            verdict(
+                &Rolled {
+                    checked: 3,
+                    rolled: vec!["alice".into()],
+                    current: 2,
+                    skipped_inactive: vec!["bob".into()],
+                    ..Rolled::default()
+                },
+                false
+            ),
             EXIT_CONVERGED
         );
     }
@@ -370,32 +404,114 @@ mod tests {
             skipped_foreign: vec!["alice".into()],
             ..Rolled::default()
         };
-        assert_eq!(verdict(&skipped), EXIT_SKIPPED);
+        assert_eq!(verdict(&skipped, false), EXIT_SKIPPED);
 
         let halted = Rolled {
             halted_on: Some("bob".into()),
             ..skipped
         };
-        assert_eq!(verdict(&halted), EXIT_HALTED);
+        assert_eq!(verdict(&halted, false), EXIT_NOT_CONVERGED);
+    }
+
+    /// A dry run's whole job is to warn before a pin bump. One that would roll
+    /// the entire fleet must not exit like a fleet with nothing to do, because
+    /// the CronJob comments tell an operator to run it and read the code.
+    #[test]
+    fn a_dry_run_with_work_to_do_is_not_a_converged_fleet() {
+        let would_roll = Rolled {
+            checked: 2,
+            rolled: vec!["alice".into()],
+            current: 1,
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&would_roll, true), EXIT_NOT_CONVERGED);
+        // The same summary from a real run is the opposite verdict: those
+        // tenants were rolled, and the fleet is on today's render.
+        assert_eq!(verdict(&would_roll, false), EXIT_CONVERGED);
+
+        // A dry run over a converged fleet still exits 0, which is the answer
+        // that makes the flag worth running.
+        let nothing_to_do = Rolled {
+            checked: 2,
+            current: 2,
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&nothing_to_do, true), EXIT_CONVERGED);
+    }
+
+    /// A tenant with no workload behind a live Service is DOWN, and the roll
+    /// deliberately does not repair it. Exiting green on that would leave a
+    /// dark mailbox reported by nothing at all, while a cosmetic foreign skip
+    /// raised a code.
+    #[test]
+    fn a_stranded_tenant_outranks_a_foreign_skip() {
+        let stranded = Rolled {
+            checked: 2,
+            current: 1,
+            stranded: vec!["alice".into()],
+            skipped_foreign: vec!["bob".into()],
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&stranded, false), EXIT_NOT_CONVERGED);
+
+        // A cancelled account and a pending signup are not that: nothing is
+        // down, and nothing is expected to be running.
+        let inactive = Rolled {
+            checked: 2,
+            current: 1,
+            skipped_inactive: vec!["alice".into()],
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&inactive, false), EXIT_CONVERGED);
     }
 
     #[test]
     fn the_summary_names_every_tenant_a_person_has_to_act_on() {
         let out = summarize(
             &Rolled {
-                checked: 4,
+                checked: 5,
                 rolled: vec!["alice".into()],
                 current: 1,
                 skipped_foreign: vec!["bob".into()],
                 skipped_inactive: vec!["carol".into()],
+                stranded: vec!["erin".into()],
                 halted_on: Some("dave".into()),
+                casualty: None,
             },
             false,
         );
-        for expected in ["alice", "bob", "carol", "dave", "4 checked", "HALTED"] {
+        for expected in [
+            "alice",
+            "bob",
+            "carol",
+            "dave",
+            "erin",
+            "5 checked",
+            "HALTED",
+        ] {
             assert!(out.contains(expected), "{expected} missing from:\n{out}");
         }
+        assert!(out.contains("DOWN"), "{out}");
         assert!(!out.contains("dry run"));
+    }
+
+    /// The two stops read differently on purpose: one tenant did not come back,
+    /// versus one tenant already has the render nobody else should be given.
+    #[test]
+    fn a_casualty_says_that_nothing_was_applied() {
+        let out = summarize(
+            &Rolled {
+                checked: 1,
+                halted_on: Some("alice".into()),
+                casualty: Some("alice".into()),
+                ..Rolled::default()
+            },
+            false,
+        );
+        assert!(out.contains("HALTED before applying anything"), "{out}");
+        assert!(out.contains("alice"), "{out}");
+        // One line about the stop, not two about the same tenant.
+        assert_eq!(out.matches("HALTED").count(), 1, "{out}");
     }
 
     #[test]

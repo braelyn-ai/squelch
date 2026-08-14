@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
 use crate::config::{
@@ -142,6 +143,9 @@ struct MockInner {
     create_loses_race: bool,
     /// A kind whose deletes all fail, for the partial-teardown paths.
     fail_delete: Option<Kind>,
+    /// A tenant whose Deployment gains a foreign field manager the moment
+    /// anything is applied.
+    foreign_on_apply: Option<String>,
 }
 
 /// A cluster that records instead of connecting.
@@ -232,6 +236,21 @@ impl MockCluster {
         self.lock().create_loses_race = true;
     }
 
+    /// A field manager arrives MID-RUN: the next apply of anything stamps
+    /// `label`'s stored Deployment with a foreign owner, once.
+    ///
+    /// The window it models is the one a caller cannot close by reading first.
+    /// A fleet roll reads a tenant's drift, finds nobody else on it, and calls
+    /// a reconcile that reads the same object again several API calls later;
+    /// somebody running `kubectl set env` in between is invisible to the first
+    /// read and present at the second. Hooked to an apply because that is the
+    /// only event between the two that this mock can see, and because it puts
+    /// the edit exactly where a test needs it: after the read pass, before the
+    /// write pass looks.
+    pub fn foreign_arrives_on_next_apply(&self, label: &str) {
+        self.lock().foreign_on_apply = Some(label.to_string());
+    }
+
     /// What the next `squelchd pair` prints.
     pub fn exec_prints(&self, stdout: &str) {
         let mut inner = self.lock();
@@ -293,7 +312,37 @@ impl MockCluster {
         inner
             .objects
             .insert(key, persist(object, ready, rollout_hangs));
+        // After the store, so an apply of the Deployment itself is stamped
+        // rather than stamping the object it replaced.
+        if let Some(label) = inner.foreign_on_apply.take()
+            && let Some(Object::Deployment(deployment)) =
+                inner.objects.get_mut(&(Kind::Deployment, label))
+        {
+            stamp_foreign(deployment);
+        }
     }
+}
+
+/// Give a stored Deployment a field manager that is not the warden.
+///
+/// The shape is what the API server records for a `kubectl set env`: an `Update`
+/// entry owning one field inside the pod template. Only the LEDGER is written,
+/// not the field it claims - what [`crate::drift::foreign_managers`] reads is
+/// the ledger, and a test double that had to reproduce a real edit as well
+/// would be reproducing the part that does not decide anything.
+fn stamp_foreign(deployment: &mut Deployment) {
+    deployment.metadata.managed_fields = Some(vec![ManagedFieldsEntry {
+        manager: Some("kubectl-set".to_string()),
+        operation: Some("Update".to_string()),
+        fields_v1: Some(FieldsV1(serde_json::json!({
+            "f:spec": { "f:template": { "f:spec": {
+                "f:containers": {
+                    "k:{\"name\":\"squelchd\"}": { "f:env": {} }
+                }
+            }}}
+        }))),
+        ..Default::default()
+    }]);
 }
 
 /// Imitate the API server: `stringData` is folded into `data`, and an applied
