@@ -7,6 +7,15 @@
         <title>Passband</title>
         <link>https://passband.app/appcast.xml</link>
         <item>
+            <title>0.0.2</title>
+            <pubDate>Fri, 14 Aug 2026 15:53:12 +0000</pubDate>
+            <sparkle:version>528</sparkle:version>
+            <sparkle:shortVersionString>0.0.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://passband.app/download/Passband-0.0.2.zip" length="6154612" type="application/octet-stream" sparkle:edSignature="AY9QcsOYGaUU9Dcz9aML0lgA9fCncQEpXnwvwfwQC9181HvQclk88hhByose62nG6CVF11mRGo0A0EiZXpgWCA=="/>
+        </item>
+        <item>
             <title>0.0.1</title>
             <pubDate>Thu, 13 Aug 2026 03:42:29 +0000</pubDate>
             <sparkle:version>447</sparkle:version>
