@@ -1,6 +1,6 @@
 # PR gate: build + test the Rust workspace on every PR and on main, and run
 # the Passband swiftc test suites when the client changes. Release publishing
-# stays in release.yml / release-ios.yml; this workflow never pushes anything.
+# stays in the release-*.yml workflows; this workflow never pushes anything.
 #
 # WHAT IS DELIBERATELY ABSENT:
 #

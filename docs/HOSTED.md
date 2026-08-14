@@ -321,9 +321,11 @@ The actual path, in order:
    with both clients. Longest lead time, zero code. **Still open**, and it is the
    gate on user 101: the unverified cap is 100, and nothing below moves it.
 2. **Phase 1 — self-host as a product: SHIPPED.** GHCR multi-arch image on every
-   `v*` tag, `auth --export`/`--import` consent, first-run auth UX. It shipped value
-   to real users while verification grinds and de-risked the consent patterns hosted
-   signup reuses, which was the whole point of ordering it first.
+   daemon tag (`v*` then, `daemon-X.Y.Z` since the 2026-08 consolidation —
+   `docs/RELEASING.md`), `auth --export`/`--import` consent, first-run auth UX.
+   It shipped value to real users while verification grinds and de-risked the
+   consent patterns hosted signup reuses, which was the whole point of ordering
+   it first.
    The broker is implemented in-repo as `squelch-broker` (2026-08-04) per
    `docs/BROKER.md` but blocked for this tier; it ships with the hosted callback
    instead.

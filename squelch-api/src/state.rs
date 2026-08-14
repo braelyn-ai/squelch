@@ -136,6 +136,12 @@ pub struct ApiState {
     /// inference resolves to `filtered`, which is the safe default. HUMAN DOOR
     /// ONLY, like every other rule write.
     pub(crate) rule_infer: Option<Arc<RuleInferClient>>,
+    /// The hosted assistant relay: forwards the Passband app's Anthropic-shaped
+    /// streaming request to the gateway with a daemon-held credential. `None`
+    /// (no gateway + assistant key configured, and every test harness) means
+    /// `/client/assistant/messages` answers 404 and the app falls back to BYOK.
+    /// HUMAN DOOR ONLY: the request spends the tenant's assistant budget.
+    pub(crate) assistant: Option<Arc<crate::assistant::AssistantRelay>>,
 }
 
 /// A fixed-rate token bucket per client address, for the console's
@@ -310,6 +316,7 @@ impl ApiState {
                 crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE,
             ))),
             rule_infer: None,
+            assistant: None,
         }
     }
 
@@ -444,6 +451,19 @@ impl ApiState {
     /// The rule-disposition classifier, if one is configured.
     pub(crate) fn rule_infer(&self) -> Option<&RuleInferClient> {
         self.rule_infer.as_deref()
+    }
+
+    /// Attach the assistant relay. `None` (no gateway + assistant key) keeps
+    /// `/client/assistant/messages` a 404, which is what tells the app to fall
+    /// back to its own BYOK path.
+    pub fn with_assistant(mut self, relay: Option<crate::assistant::AssistantRelay>) -> Self {
+        self.assistant = relay.map(Arc::new);
+        self
+    }
+
+    /// The assistant relay, if one is configured.
+    pub(crate) fn assistant(&self) -> Option<&Arc<crate::assistant::AssistantRelay>> {
+        self.assistant.as_ref()
     }
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
@@ -623,7 +643,15 @@ impl ApiState {
             // Rule-disposition inference rides the SAME key/provider the triage
             // stages resolve and the Stage-1 model; no key => `None` => rules
             // that omit a disposition are stored filtered.
-            .with_rule_inference(RuleInferClient::from_config(cfg));
+            .with_rule_inference(RuleInferClient::from_config(cfg))
+            // The assistant relay resolves only when BOTH the gateway base URL
+            // and the assistant key are present; anything less is `None` and
+            // the route 404s (see `Stage2Config::resolve_assistant`).
+            .with_assistant(
+                cfg.stage2
+                    .resolve_assistant()
+                    .map(crate::assistant::AssistantRelay::new),
+            );
 
         // `[console] sso_url` has TWO sources and the FILE IS THE WEAKER ONE.
         // [`ApiState::from_env`] has already applied the variable, which is what

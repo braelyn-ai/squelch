@@ -29,6 +29,12 @@
 //!   signup needs.
 //! - `GET /oauth/callback` is the most generous. Refusing it destroys a consent
 //!   the user has ALREADY granted at Google.
+//! - `POST /waitlist` is stranger-facing and writes a row. A person joins once,
+//!   from a form on another origin.
+//! - The admin page is one operator clicking, so its budget is generous, and
+//!   `POST /admin/login` gets its OWN tight bucket beside it for the same reason
+//!   `GET /console/auth` has one: it is the one route where a stranger guesses
+//!   at a secret.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -61,6 +67,26 @@ pub const CONSOLE_AUTH_REQUESTS_PER_MINUTE: f64 = 10.0;
 /// The same, for `GET /oauth/callback`. The highest number here because it is
 /// the one route whose refusal costs a user something they cannot get back.
 pub const CALLBACK_REQUESTS_PER_MINUTE: f64 = 240.0;
+
+/// The same, for `POST /waitlist`. A stranger-facing write: a person joins the
+/// list once, and the only thing sustained traffic here buys is rows of junk
+/// for an operator to read past. Small, and the answer above it is the same
+/// 200 whether the address was new or not, so a refusal costs a real submitter
+/// nothing but a retry.
+pub const WAITLIST_REQUESTS_PER_MINUTE: f64 = 10.0;
+
+/// The same, for the admin page and its actions. Generous because the only
+/// client is one operator with a cookie, clicking through a list and watching
+/// it re-render after every approval; this bucket exists to bound a loop, not
+/// to pace a human.
+pub const ADMIN_REQUESTS_PER_MINUTE: f64 = 120.0;
+
+/// The same, for `POST /admin/login`, in its OWN bucket and tight. It is the
+/// one route on this service where a stranger can guess at the admin token, the
+/// same reasoning as [`CONSOLE_AUTH_REQUESTS_PER_MINUTE`]: an operator signs in
+/// once every twelve hours, and anything sustained above this is somebody
+/// working through a wordlist.
+pub const ADMIN_LOGIN_REQUESTS_PER_MINUTE: f64 = 10.0;
 
 /// Buckets idle longer than this are dropped on the next prune. An idle bucket
 /// has refilled to capacity anyway, so forgetting it costs nothing.
@@ -204,6 +230,34 @@ pub async fn limit_callback(
     next: Next,
 ) -> Result<Response, StatusCode> {
     gate(&state, ControlState::check_callback_rate, req, next).await
+}
+
+/// Middleware: the same for `POST /waitlist`, against its own small bucket.
+pub async fn limit_waitlist(
+    State(state): State<ControlState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, ControlState::check_waitlist_rate, req, next).await
+}
+
+/// Middleware: the same for the admin page and its actions.
+pub async fn limit_admin(
+    State(state): State<ControlState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, ControlState::check_admin_rate, req, next).await
+}
+
+/// Middleware: the same for `POST /admin/login`, against its own bucket. NOT
+/// the admin page's: see [`ADMIN_LOGIN_REQUESTS_PER_MINUTE`].
+pub async fn limit_admin_login(
+    State(state): State<ControlState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, ControlState::check_admin_login_rate, req, next).await
 }
 
 /// Which identity a request is metered under.

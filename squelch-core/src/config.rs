@@ -557,6 +557,14 @@ pub struct ResolvedLlm {
     pub url: String,
 }
 
+/// The hosted assistant relay's credential + endpoint, resolved by
+/// [`Stage2Config::resolve_assistant`]. Like [`ResolvedLlm`], no `Debug` on
+/// purpose: `api_key` is key material and must never reach a log line.
+pub struct ResolvedAssistant {
+    pub api_key: String,
+    pub url: String,
+}
+
 impl Stage2Config {
     /// Resolve the LLM key, provider, and endpoint in one shot. Key source,
     /// first match wins: `SQUELCH_STAGE2_API_KEY` > `ANTHROPIC_API_KEY` >
@@ -607,6 +615,23 @@ impl Stage2Config {
             api_key: key,
             provider,
             url,
+        })
+    }
+
+    /// Resolve the hosted assistant relay's key + endpoint. Some ONLY when BOTH
+    /// `SQUELCH_ASSISTANT_API_KEY` and a valid `anthropic_base_url` are present:
+    /// an assistant virtual key only works at the gateway, and without a gateway
+    /// there is nothing to relay to — self-host BYOK lives in the app, not here.
+    /// The URL is `<base>/v1/messages`, exactly as [`Stage2Config::resolve_llm`]
+    /// builds it, and the env var is read lazily at call time like every other
+    /// key source. Empty strings count as absent, and key material is never
+    /// logged.
+    pub fn resolve_assistant(&self) -> Option<ResolvedAssistant> {
+        let base = self.validated_base_url()?;
+        let api_key = env_nonempty("SQUELCH_ASSISTANT_API_KEY")?;
+        Some(ResolvedAssistant {
+            api_key,
+            url: format!("{}/v1/messages", base.trim_end_matches('/')),
         })
     }
 
@@ -1716,6 +1741,7 @@ backfill_days = 90
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("SQUELCH_STAGE2_PROVIDER");
             std::env::remove_var("SQUELCH_ANTHROPIC_BASE_URL");
+            std::env::remove_var("SQUELCH_ASSISTANT_API_KEY");
         }
     }
 
@@ -1740,6 +1766,60 @@ backfill_days = 90
             std::env::remove_var("ANTHROPIC_API_KEY");
         }
         assert!(!c.enabled());
+        clear_stage2_env();
+    }
+
+    #[test]
+    fn assistant_requires_key_and_gateway_together() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_stage2_env();
+        let mut c = Stage2Config::default();
+
+        // Neither => None.
+        assert!(c.resolve_assistant().is_none());
+
+        // Key alone => None: without a gateway there is nothing to relay to.
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "sk-bf-assistant");
+        }
+        assert!(c.resolve_assistant().is_none());
+
+        // Base URL alone => None: no credential to relay with.
+        unsafe {
+            std::env::remove_var("SQUELCH_ASSISTANT_API_KEY");
+        }
+        c.anthropic_base_url = Some("https://gw.example.com".into());
+        assert!(c.resolve_assistant().is_none());
+
+        // Both => Some, with the gateway messages endpoint joined exactly as
+        // resolve_llm builds it (trailing slash folds).
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "sk-bf-assistant");
+        }
+        let r = c.resolve_assistant().expect("key + gateway => Some");
+        assert_eq!(r.api_key, "sk-bf-assistant");
+        assert_eq!(r.url, "https://gw.example.com/v1/messages");
+        c.anthropic_base_url = Some("https://gw.example.com/".into());
+        assert_eq!(
+            c.resolve_assistant().unwrap().url,
+            "https://gw.example.com/v1/messages"
+        );
+
+        // An empty key counts as absent, like every other key source.
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "");
+        }
+        assert!(c.resolve_assistant().is_none());
+
+        // A base URL that fails the transport check is absent everywhere, so it
+        // cannot half-configure the relay.
+        unsafe {
+            std::env::set_var("SQUELCH_ASSISTANT_API_KEY", "sk-bf-assistant");
+        }
+        c.anthropic_base_url = Some("http://gw.example.com".into());
+        assert!(c.resolve_assistant().is_none());
+
         clear_stage2_env();
     }
 

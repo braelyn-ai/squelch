@@ -40,7 +40,7 @@ use crate::store::{
     MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, SealedBody, SealedMessage,
     SearchFilter, SentMessage, SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued,
     Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
-    TrackedMessage, TriageDebug, TriagedMessage,
+    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -896,44 +896,24 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
-        self.stage1_bump_usage(
-            account_id,
-            day,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        self.stage1_bump_usage(account_id, day, tokens)
     }
 
     fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
         self.stage1_usage_since(account_id, since_day)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extract_bump_usage(
         &self,
         account_id: AccountId,
         day: &str,
         category: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
-        self.extract_bump_usage(
-            account_id,
-            day,
-            category,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        self.extract_bump_usage(account_id, day, category, tokens)
     }
 
     fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
@@ -982,19 +962,9 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
-        self.stage2_bump_usage(
-            account_id,
-            day,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        self.stage2_bump_usage(account_id, day, tokens)
     }
 
     fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage> {

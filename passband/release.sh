@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cut a Passband release, end to end: notarized build, GitHub release under
-# the passband-v tag, regenerated Sparkle appcast, site push, Homebrew cask
+# the passband-mac- tag, regenerated Sparkle appcast, site push, Homebrew cask
 # bump. RELEASING.md describes the same steps; this script IS the ritual.
 #
 #   ./release.sh          release $(cat VERSION)
@@ -18,7 +18,7 @@ DRY=0
 [ "${1:-}" = "--dry" ] && DRY=1
 
 VERSION=$(cat VERSION)
-TAG="passband-v$VERSION"
+TAG="passband-mac-$VERSION"
 ZIP="build/Passband-$VERSION.zip"
 SITE_DIR="../passband-site"
 TAP_REPO="braelyn-ai/homebrew-tap"
@@ -39,8 +39,12 @@ if gh release view "$TAG" >/dev/null 2>&1; then
   exit 1
 fi
 # project.yml mirrors VERSION by hand; a release is where drift would ship.
-if ! grep -q "MARKETING_VERSION: \"$VERSION\"" project.yml; then
-  echo "error: project.yml MARKETING_VERSION != $VERSION; keep them in step" >&2
+# Scoped to the macOS target block — a bare grep would pass whenever the iOS
+# target's version happens to match.
+PROJ=$(awk '/^  Passband:$/{f=1} /^  PassbandiOS:$/{f=0}
+  f && /MARKETING_VERSION:/ {gsub(/"/,""); print $2; exit}' project.yml)
+if [ "$PROJ" != "$VERSION" ]; then
+  echo "error: project.yml macOS MARKETING_VERSION $PROJ != $VERSION; keep them in step" >&2
   exit 1
 fi
 

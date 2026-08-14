@@ -1,5 +1,7 @@
-//! The Bifrost governance client: one virtual key per tenant, minted at signup
-//! and handed straight to the warden.
+//! The Bifrost governance client: two virtual keys per tenant — triage
+//! (`tenant-<label>`) and assistant (`tenant-<label>-assistant`), each with
+//! its own budget and model list — minted at signup and handed straight to
+//! the warden.
 //!
 //! Bifrost is the LLM gateway the hosted tier fronts every tenant daemon with.
 //! This module speaks three of its routes: list the provider keys a virtual
@@ -117,7 +119,8 @@ pub struct VirtualKey {
 /// `key_ids` and a non-empty `allowed_models` or the key cannot serve.
 #[derive(Serialize)]
 struct MintRequest {
-    /// `tenant-<label>`, so the gateway's own listing names the tenant.
+    /// `tenant-<label>` (triage) or `tenant-<label>-assistant`, so the
+    /// gateway's own listing names the tenant and the key's job.
     name: String,
     description: String,
     provider_configs: Vec<ProviderConfig>,
@@ -187,7 +190,8 @@ pub struct BifrostClient {
     /// `Basic base64(username:password)`, precomputed once. As secret as the
     /// admin credential it encodes: never logged.
     auth_header: String,
-    /// `allowed_models` for every minted key. Config guarantees non-empty.
+    /// `allowed_models` for every minted TRIAGE key; the assistant's list
+    /// arrives per mint. Config guarantees non-empty.
     models: Vec<String>,
     http: reqwest::Client,
 }
@@ -195,7 +199,8 @@ pub struct BifrostClient {
 impl BifrostClient {
     /// `base_url` is a canonical origin (no trailing slash); `admin_token` is
     /// the gateway admin's `username:password` (validated by config), sent as
-    /// HTTP Basic; `models` becomes `allowed_models` on every minted key.
+    /// HTTP Basic; `models` becomes `allowed_models` on every minted triage
+    /// key.
     pub fn new(
         base_url: String,
         admin_token: String,
@@ -256,12 +261,39 @@ impl BifrostClient {
         }
     }
 
-    /// Mint a virtual key named `tenant-<label>` with a monthly budget of
-    /// `budget_usd`, attached to every provider key the gateway lists and
-    /// allowed exactly the configured models.
+    /// Mint the TRIAGE virtual key, named `tenant-<label>`, with a monthly
+    /// budget of `budget_usd`, attached to every provider key the gateway
+    /// lists and allowed exactly the configured triage models.
     pub async fn mint_virtual_key(
         &self,
         label: &str,
+        budget_usd: f64,
+    ) -> Result<VirtualKey, BifrostError> {
+        let models = self.models.clone();
+        self.mint(label, "", &models, budget_usd).await
+    }
+
+    /// Mint the ASSISTANT virtual key, named `tenant-<label>-assistant`: the
+    /// second key every tenant gets, with its own budget and model list,
+    /// because the assistant's on-demand spend must not eat triage's budget
+    /// (or vice versa) and wants models triage never calls.
+    pub async fn mint_assistant_key(
+        &self,
+        label: &str,
+        models: &[String],
+        budget_usd: f64,
+    ) -> Result<VirtualKey, BifrostError> {
+        self.mint(label, "-assistant", models, budget_usd).await
+    }
+
+    /// One mint for both key kinds, so the unbudgeted-echo guardrail and the
+    /// shape checks below cannot drift between them. `suffix` is this crate's
+    /// own constant (`""` or `"-assistant"`), never input.
+    async fn mint(
+        &self,
+        label: &str,
+        suffix: &str,
+        models: &[String],
         budget_usd: f64,
     ) -> Result<VirtualKey, BifrostError> {
         // Validated upstream, asserted here: the label lands verbatim in the
@@ -275,12 +307,12 @@ impl BifrostClient {
             .post(self.url("/api/governance/virtual-keys"))
             .header(reqwest::header::AUTHORIZATION, &self.auth_header)
             .json(&MintRequest {
-                name: format!("tenant-{label}"),
-                description: format!("Passband hosted tenant {label}"),
+                name: format!("tenant-{label}{suffix}"),
+                description: format!("Passband hosted tenant {label}{suffix}"),
                 provider_configs: vec![ProviderConfig {
                     provider: PROVIDER,
                     weight: 1,
-                    allowed_models: self.models.clone(),
+                    allowed_models: models.to_vec(),
                     key_ids,
                 }],
                 budgets: vec![Budget {
@@ -561,6 +593,51 @@ mod tests {
         assert_eq!(pc["weight"], 1);
         assert_eq!(pc["key_ids"], json!(["ANTHROPIC_API_KEY_auto_detected"]));
         assert_eq!(pc["allowed_models"], json!(["claude-haiku-4-5", "claude-sonnet-5"]));
+    }
+
+    /// The assistant mint rides the same wire with its OWN name, models, and
+    /// budget: `tenant-<label>-assistant`, the per-mint list rather than the
+    /// client's, and the amount this call names.
+    #[tokio::test]
+    async fn mints_an_assistant_key_with_its_own_name_models_and_budget() {
+        let rec: Shared = Arc::new(Mutex::new(Recorder::default()));
+        let c = client_for(&rec).await;
+
+        let models = vec!["claude-opus-4-8".to_string()];
+        let key = c.mint_assistant_key("ada", &models, 10.0).await.unwrap();
+        assert_eq!(key.id, "vk-123");
+        assert_eq!(key.value, "sk-bf-THE-KEY-VALUE");
+
+        let r = rec.lock().unwrap();
+        assert_eq!(r.auths, vec![expected_auth(), expected_auth()]);
+        let body = &r.mint_bodies[0];
+        assert_eq!(body["name"], "tenant-ada-assistant");
+        assert_eq!(body["budgets"].as_array().unwrap().len(), 1);
+        assert_eq!(body["budgets"][0]["max_limit"], 10.0);
+        assert_eq!(body["budgets"][0]["reset_duration"], "1M");
+        let pc = &body["provider_configs"][0];
+        assert_eq!(pc["provider"], "anthropic");
+        assert_eq!(pc["key_ids"], json!(["ANTHROPIC_API_KEY_auto_detected"]));
+        // NOT the client's triage list: the assistant models the caller named.
+        assert_eq!(pc["allowed_models"], json!(["claude-opus-4-8"]));
+    }
+
+    /// The unbudgeted-echo guardrail covers the assistant mint too: shared
+    /// wire, shared refusal, and the orphan is revoked the same way.
+    #[tokio::test]
+    async fn refuses_and_revokes_an_assistant_key_minted_without_its_budget() {
+        let rec: Shared = Arc::new(Mutex::new(Recorder::default()));
+        rec.lock().unwrap().mint_response = Some((
+            200,
+            json!({"virtual_key": {"id": "vk-123", "value": "sk-bf-x"}}).to_string(),
+        ));
+        let c = client_for(&rec).await;
+        let models = vec!["claude-opus-4-8".to_string()];
+        assert!(matches!(
+            c.mint_assistant_key("ada", &models, 10.0).await,
+            Err(BifrostError::Unbudgeted)
+        ));
+        assert_eq!(rec.lock().unwrap().revoked_ids, vec!["vk-123".to_string()]);
     }
 
     /// A success status carrying garbage — not JSON, the wrong shape, or a key

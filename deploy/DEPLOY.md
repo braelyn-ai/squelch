@@ -10,7 +10,7 @@ Both bind to loopback `127.0.0.1:8848` by default; `tailscale serve` fronts them
 so only your tailnet can reach the box. Everything here also runs on macOS for
 dev — the only Linux-specifics are systemd and the `file` credential backend.
 
-Prefer containers? Every `v*` tag publishes a prebuilt multi-arch image to
+Prefer containers? Every `daemon-X.Y.Z` tag publishes a prebuilt multi-arch image to
 GHCR — see [DOCKER.md](DOCKER.md) and skip §1/§2/§5 entirely.
 
 ---

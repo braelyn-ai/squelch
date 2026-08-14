@@ -1,7 +1,8 @@
-# Every passband-v* tag builds, signs, notarizes, and publishes the Mac
+# Every passband-mac-* tag builds, signs, notarizes, and publishes the Mac
 # client, then regenerates the Sparkle appcast (pushed to main, which
-# redeploys the site) and bumps the Homebrew cask. The daemon's bare v* tags
-# are release.yml and the two never overlap.
+# redeploys the site) and bumps the Homebrew cask. The daemon's daemon-* tags
+# are release-daemon.yml, iOS ships from passband-ios-* via
+# release-passband-ios.yml, and the three never overlap.
 #
 # Secrets (see passband/RELEASING.md for how each is produced):
 #   PASSBAND_CERT_P12        base64 .p12 export of the Developer ID cert
@@ -9,11 +10,11 @@
 #   APPLE_APP_PASSWORD       app-specific password for notarytool
 #   SPARKLE_PRIVATE_KEY      the EdDSA private key (generate_keys -x output)
 #   TAP_PUSH_TOKEN           fine-grained PAT, contents:write on homebrew-tap
-name: passband-release
+name: release-passband-mac
 
 on:
   push:
-    tags: ["passband-v*"]
+    tags: ["passband-mac-*"]
 
 permissions:
   contents: write
@@ -32,11 +33,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify tag matches VERSION
+      # Two sources of truth have to agree with the tag: passband/VERSION
+      # (what build.sh stamps into the app) and project.yml's macOS target
+      # (what a from-scratch xcodegen build would stamp). The awk is scoped to
+      # the Passband target block — a bare grep would pass whenever the iOS
+      # target's version happens to match.
+      - name: Verify tag matches VERSION and project.yml
         run: |
           VERSION=$(cat passband/VERSION)
-          [ "${GITHUB_REF_NAME}" = "passband-v$VERSION" ] || {
-            echo "tag ${GITHUB_REF_NAME} != passband-v$VERSION (passband/VERSION)"; exit 1; }
+          [ "${GITHUB_REF_NAME}" = "passband-mac-$VERSION" ] || {
+            echo "tag ${GITHUB_REF_NAME} != passband-mac-$VERSION (passband/VERSION)"; exit 1; }
+          PROJ=$(awk '/^  Passband:$/{f=1} /^  PassbandiOS:$/{f=0}
+            f && /MARKETING_VERSION:/ {gsub(/"/,""); print $2; exit}' passband/project.yml)
+          [ "$PROJ" = "$VERSION" ] || {
+            echo "project.yml macOS MARKETING_VERSION $PROJ != $VERSION (passband/VERSION)"; exit 1; }
 
       - name: Import signing certificate
         env:
@@ -90,7 +100,7 @@ jobs:
           cd passband
           mkdir -p releases
           gh release list --limit 100 --json tagName \
-            --jq '.[].tagName | select(startswith("passband-v"))' \
+            --jq '.[].tagName | select(startswith("passband-mac-"))' \
           | while read -r tag; do
               gh release download "$tag" --pattern 'Passband-*.zip' \
                 --dir releases --skip-existing
@@ -112,7 +122,7 @@ jobs:
           git switch main
           cp "$RUNNER_TEMP/appcast.xml" passband-site/appcast.xml
           git add passband-site/appcast.xml
-          git commit -m "passband-site: appcast for ${GITHUB_REF_NAME#passband-v}"
+          git commit -m "passband-site: appcast for ${GITHUB_REF_NAME#passband-mac-}"
           git pull --rebase origin main
           git push origin main
 
