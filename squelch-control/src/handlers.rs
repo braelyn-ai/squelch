@@ -182,7 +182,30 @@ pub async fn healthz() -> &'static str {
 
 /// `GET /` — the form.
 pub async fn signup_form(State(state): State<ControlState>) -> Response {
-    pages::signup_form(&state.config().base_domain, "", "", None)
+    let config = state.config();
+    pages::signup_form(
+        &config.base_domain,
+        waitlist_url(&state).as_deref(),
+        "",
+        "",
+        None,
+    )
+}
+
+/// Where the form sends somebody who has no invite code, or `None` on a
+/// deployment that has no waitlist to send them to.
+///
+/// Read from `config.waitlist` rather than [`ControlState::waitlist`]: that
+/// accessor also requires the Resend client, because the paths that MAIL an
+/// invite need both. This is a link on a page, and a deployment whose sender is
+/// misconfigured should still show the way to the list rather than quietly drop
+/// the only route a person without a code has.
+fn waitlist_url(state: &ControlState) -> Option<String> {
+    state
+        .config()
+        .waitlist
+        .as_ref()
+        .map(crate::config::WaitlistConfig::join_url)
 }
 
 /// `POST /signup` — validate, open a session, and send the user to Google.
@@ -192,9 +215,18 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     let raw_invite = field(&body, "invite");
 
     // The form is re-rendered on every refusal with both fields echoed, so a
-    // person fixes one thing rather than retyping everything.
+    // person fixes one thing rather than retyping everything. The waitlist link
+    // rides along with it, because "that code is not usable" is exactly the
+    // moment somebody discovers they do not have a working one.
+    let waitlist = waitlist_url(&state);
     let reject = |error: &str, label: &str| {
-        pages::signup_form(&config.base_domain, label, &raw_invite, Some(error))
+        pages::signup_form(
+            &config.base_domain,
+            waitlist.as_deref(),
+            label,
+            &raw_invite,
+            Some(error),
+        )
     };
 
     let label = match labels::parse(&raw_label) {

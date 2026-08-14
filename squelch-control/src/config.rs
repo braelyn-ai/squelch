@@ -248,6 +248,26 @@ pub struct WaitlistConfig {
     pub resend_url: String,
 }
 
+impl WaitlistConfig {
+    /// Where a person with no invite code is sent: the join form on the
+    /// marketing site.
+    ///
+    /// BUILT FROM [`Self::allowed_origin`] BECAUSE THAT IS ALREADY THE ANSWER to
+    /// "which site owns the public waitlist form". That origin is the one the
+    /// CORS answer names, so it is by definition the site whose form posts to
+    /// `POST /waitlist`; a second variable naming the same site is a second
+    /// thing to get wrong at deploy time, and the failure would be a signup page
+    /// linking somewhere the form does not live.
+    ///
+    /// The path is fixed rather than configured for the same reason: the site
+    /// serves that page at `/waitlist` (see `passband-site/main.tsx`, which
+    /// picks the page off `location.pathname`), and the two move together or
+    /// neither does.
+    pub fn join_url(&self) -> String {
+        format!("{}/waitlist", self.allowed_origin)
+    }
+}
+
 impl std::fmt::Debug for WaitlistConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitlistConfig")

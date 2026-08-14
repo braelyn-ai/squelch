@@ -112,17 +112,46 @@ main {{ max-width: 34rem; margin: 0 auto; }}
 /* The admin dashboard is the one page with a table, and the reading width the
    rest of the site is set to folds it into three cramped columns. */
 main:has(table) {{ max-width: 44rem; }}
-h1 {{ font-size: 1.35rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 1rem; }}
+h1 {{ font-size: 1.6rem; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 0.75rem; }}
 h2 {{ font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 0.6rem; }}
 p {{ margin: 0 0 1rem; }}
 ul, ol {{ margin: 0 0 1.25rem; padding-left: 1.2rem; }}
 li {{ margin: 0 0 0.5rem; }}
+a {{ color: inherit; text-underline-offset: 0.15em; }}
 label {{ display: block; font-weight: 600; margin: 0 0 0.35rem; }}
 input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
   margin: 0 0 1.25rem;
   border: 1px solid #cdc7bd; border-radius: 6px; background: #fff; color: inherit; font: inherit; }}
 button {{ padding: 0.65rem 1.15rem; border: 0; border-radius: 6px; background: #1a1a1a; color: #fbfaf8;
   font: inherit; font-weight: 500; cursor: pointer; }}
+/* One ring for every interactive thing, drawn OUTSIDE the control so it never
+   changes the layout it lands on. Keyboard-only (`:focus-visible`), so clicking
+   a button does not leave it haloed. */
+:is(input, button, a, summary):focus-visible {{ outline: 2px solid #1a1a1a; outline-offset: 2px; }}
+/* THE FORM IS THE PAGE. The signup form asks for two things and everything else
+   on the page is context for them, so the fields sit on their own ground and
+   the prose does not. */
+.card {{ background: #fff; border: 1px solid #e6e1d9; border-radius: 10px;
+  padding: 1.35rem 1.35rem 1.1rem; margin: 0 0 1.5rem; }}
+.card > :last-child {{ margin-bottom: 0; }}
+/* A field's hint belongs TO the input, not to the gap under it: the input's own
+   bottom margin is dropped so the two read as one block. */
+.field {{ margin: 0 0 1.25rem; }}
+.field input {{ margin-bottom: 0.4rem; }}
+.field .hint {{ margin: 0; }}
+.hint {{ color: #6b6b6b; font-size: 0.9rem; }}
+/* The second route off this page: a border rather than a second filled button,
+   because there is exactly one primary action here and it is not this one. */
+.alt {{ border: 1px solid #e6e1d9; border-radius: 10px; padding: 0.9rem 1.1rem;
+  margin: 0 0 1.75rem; font-size: 0.95rem; }}
+/* Collapsed by default and it stays that way on a submit, because a form post
+   that fails re-renders a fresh page: whoever opened this read it already. */
+details {{ border-top: 1px solid #e6e1d9; padding: 1rem 0 0; margin: 0 0 1.5rem; }}
+/* The line under the button explains what pressing it does, so it sits close to
+   it, but not touching: the button has no margin of its own. */
+button + .hint {{ margin-top: 0.9rem; }}
+summary {{ cursor: pointer; font-weight: 600; }}
+details > :not(summary) {{ margin-top: 0.9rem; }}
 table {{ width: 100%; border-collapse: collapse; margin: 0 0 1.5rem; font-size: 0.95rem; }}
 th {{ font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
   color: #6b6b6b; }}
@@ -145,13 +174,16 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   background: #1a1a1a; color: #fbfaf8; text-decoration: none; border-radius: 6px; font-weight: 500; }}
 @media (prefers-color-scheme: dark) {{
   body {{ background: #141414; color: #e8e6e3; }}
-  .muted, .suffix, th {{ color: #9a9a9a; }}
+  .muted, .suffix, .hint, th {{ color: #9a9a9a; }}
   code, .code {{ background: #262626; }}
   input[type=text], input[type=password] {{ background: #1f1f1f; border-color: #3a3a3a; }}
   button, a.button {{ background: #e8e6e3; color: #141414; }}
   button.quiet {{ background: none; color: #e8e6e3; border-color: #3a3a3a; }}
   th, td {{ border-bottom-color: #303030; }}
   .stop {{ border-left-color: #f2b8b5; }}
+  .card {{ background: #1b1b1b; border-color: #303030; }}
+  .alt, details {{ border-color: #303030; }}
+  :is(input, button, a, summary):focus-visible {{ outline-color: #e8e6e3; }}
 }}
 </style>
 </head>
@@ -179,14 +211,51 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
 
 /// The signup form.
 ///
-/// It states the Google grant in plain words BEFORE the button, because the
-/// consent screen that follows is Google's and says it in Google's vocabulary.
+/// TWO FIELDS AND ONE BUTTON ARE THE PAGE, and everything else is arranged
+/// around that. The form sits on its own card so the thing to do is the thing
+/// that looks like it; each input carries its own hint, tied to it with
+/// `aria-describedby` rather than left as loose prose a screen reader reads as
+/// an unrelated paragraph.
+///
+/// THE GRANT IS STILL STATED BEFORE THE BUTTON, in one line naming all three
+/// permissions, because the consent screen that follows is Google's and says it
+/// in Google's vocabulary. What moved is the LONG version: three paragraphs of
+/// scope detail above the fold pushed the form off a phone screen and read as
+/// the page's subject, which it is not. It is a `<details>` now, shut by
+/// default, open to anybody who wants it, and made of the same markup as before
+/// (native disclosure, no JavaScript, nothing to fetch).
+///
+/// `waitlist_url` is THE OTHER WAY OFF THIS PAGE: somebody who has no invite
+/// code cannot get one here, and until this link existed their only move was to
+/// guess at the field or close the tab. It is rendered UNCONDITIONALLY when the
+/// waitlist is configured, never only on a refusal, so it answers nothing about
+/// whether the code that was just typed exists. `None` (a deployment with no
+/// waitlist configured) renders no link rather than a dead one.
+///
 /// `error` re-renders the form with what went wrong; `label` and `invite` are
 /// echoed back so a person does not retype the half that was fine. The invite
 /// code is echoed only because the browser already has it, and it is escaped
 /// like everything else.
-pub fn signup_form(base_domain: &str, label: &str, invite: &str, error: Option<&str>) -> Response {
+pub fn signup_form(
+    base_domain: &str,
+    waitlist_url: Option<&str>,
+    label: &str,
+    invite: &str,
+    error: Option<&str>,
+) -> Response {
     let error_html = stop_note(error);
+    // The link out, or nothing at all. Built from the configured origin, which
+    // this crate owns; it is escaped anyway, because the rule is that nothing is
+    // interpolated raw.
+    let waitlist_html = waitlist_url
+        .map(|url| {
+            format!(
+                r#"<p class="alt">No invite code yet? <a href="{url}">Join the waitlist</a> and we
+will email you one when there is room.</p>"#,
+                url = escape_html(url),
+            )
+        })
+        .unwrap_or_default();
     page(
         StatusCode::OK,
         "Set up your Passband mailbox",
@@ -196,18 +265,30 @@ pub fn signup_form(base_domain: &str, label: &str, invite: &str, error: Option<&
 matters from what does not, and serves the result to the Passband app, where you
 archive, label, and reply.</p>
 {error_html}
-<form method="post" action="/signup">
+<form class="card" method="post" action="/signup">
+<div class="field">
 <label for="invite">Invite code</label>
-<input type="text" id="invite" name="invite" value="{invite}" placeholder="XXXX-XXXX"
-  autocomplete="off" autocapitalize="off" spellcheck="false" required>
+<input type="text" id="invite" name="invite" value="{invite}" placeholder="XXXX-XXXX-XXXX-XXXX"
+  aria-describedby="invite-hint" autocomplete="off" autocapitalize="off" spellcheck="false"
+  autofocus required>
+<p class="hint" id="invite-hint">The code from your invite email. Capitals, dashes,
+and spaces do not matter.</p>
+</div>
+<div class="field">
 <label for="label">Choose your address</label>
 <input type="text" id="label" name="label" value="{label}" placeholder="yourname"
-  autocomplete="off" autocapitalize="off" spellcheck="false" required>
-<p class="muted">Your mailbox will live at <span class="suffix">https://</span>yourname<span class="suffix">.{domain}</span>.
+  aria-describedby="label-hint" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+<p class="hint" id="label-hint">Your mailbox will live at <span class="suffix">https://</span>yourname<span class="suffix">.{domain}</span>.
 Lowercase letters, numbers, and hyphens, 3 to 30 characters.</p>
+</div>
 <button type="submit">Continue to Google</button>
+<p class="hint">Google will ask you to approve three Gmail permissions: reading
+your mail, changing it to archive and label, and sending so you can reply.
+Passband needs all three. Nothing is set up until you approve them.</p>
 </form>
-<h2>What Google will ask you to approve</h2>
+{waitlist_html}
+<details>
+<summary>What Google will ask you to approve</summary>
 <p>Three permissions, on one screen. Passband needs all three, so leave every box
 checked. If one is missing we will send you back rather than set up a mailbox
 that half works.</p>
@@ -221,12 +302,14 @@ Permanent deletion is not included and Passband never asks for it.</li>
 replying from the app. Nothing is ever sent that you did not write and send
 yourself.</li>
 </ul>
+</details>
 <p class="muted">Your mail is read by a daemon that runs only for you, in its own
 process, with its own database. Signing up means we hold your Google refresh
 token, encrypted, so that daemon can keep syncing while you are away. If you
 would rather nobody held it, run Passband yourself: the self-hosted daemon talks
 to Google directly and our servers are never in the path.</p>"#,
             error_html = error_html,
+            waitlist_html = waitlist_html,
             invite = escape_html(invite),
             label = escape_html(label),
             domain = escape_html(base_domain),
@@ -497,9 +580,19 @@ fn table(head: &str, rows: &str, empty: &str) -> String {
 }
 
 /// The error banner every page above renders the same way.
+///
+/// `role="alert"` because these pages have no JavaScript and a refusal is a
+/// whole new document: without it, a screen reader lands the user back at the
+/// top of a page that looks identical to the one they just submitted, with the
+/// one sentence that changed sitting silently in the middle of it.
 fn stop_note(error: Option<&str>) -> String {
     error
-        .map(|e| format!(r#"<p class="stop"><strong>{}</strong></p>"#, escape_html(e)))
+        .map(|e| {
+            format!(
+                r#"<p class="stop" role="alert"><strong>{}</strong></p>"#,
+                escape_html(e)
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -573,7 +666,7 @@ mod tests {
     /// are named and each says what it is for.
     #[tokio::test]
     async fn the_form_states_all_three_grants_and_the_base_domain() {
-        let html = body_of(signup_form("passband.email", "", "", None)).await;
+        let html = body_of(signup_form("passband.email", None, "", "", None)).await;
         assert!(html.contains("gmail.readonly"));
         assert!(html.contains("gmail.modify"));
         assert!(html.contains("gmail.send"));
@@ -588,11 +681,67 @@ mod tests {
         assert!(!html.contains("http://"));
     }
 
+    /// The scope detail may be folded away, but all three permissions are named
+    /// in the open, above the button, where somebody deciding whether to press
+    /// it will read them. The `<details>` block is the long version and is shut
+    /// by default; the summary line is not.
+    #[tokio::test]
+    async fn the_form_names_all_three_permissions_outside_the_disclosure() {
+        let html = body_of(signup_form("passband.email", None, "", "", None)).await;
+        let (before_details, details) = html.split_once("<details>").expect("{html}");
+        assert!(before_details.contains("three Gmail permissions"), "{html}");
+        for word in ["reading", "archive and label", "sending"] {
+            assert!(before_details.contains(word), "{word} -> {html}");
+        }
+        // Shut by default: `open` is what would render it expanded.
+        assert!(!details.contains("<details open"), "{html}");
+        assert!(!html.contains("<details open"), "{html}");
+        // A disclosure is markup, not script. This page still has none.
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    /// The invite field shows the shape of a code this deployment actually
+    /// mints. It used to show the eight-symbol shape that predates
+    /// [`crate::invites::CODE_LEN`], which is a placeholder no live code has
+    /// looked like since.
+    #[tokio::test]
+    async fn the_invite_placeholder_is_the_shape_a_minted_code_has() {
+        let html = body_of(signup_form("passband.email", None, "", "", None)).await;
+        let minted = crate::invites::mint().unwrap().code;
+        let shape: String = minted
+            .chars()
+            .map(|c| if c == '-' { '-' } else { 'X' })
+            .collect();
+        assert!(
+            html.contains(&format!(r#"placeholder="{shape}""#)),
+            "{html}"
+        );
+    }
+
+    /// The way off this page for somebody who has no code, and the reason it is
+    /// not conditional on anything the user typed: rendering it only on an
+    /// invite refusal would make its presence an answer about the code space.
+    #[tokio::test]
+    async fn the_form_offers_the_waitlist_whether_or_not_anything_was_refused() {
+        let url = "https://passband.app/waitlist";
+        for error in [None, Some("That invite code is not usable.")] {
+            let html = body_of(signup_form("passband.email", Some(url), "", "", error)).await;
+            assert!(html.contains(&format!(r#"href="{url}""#)), "{html}");
+            assert!(html.contains("No invite code yet?"), "{html}");
+        }
+        // A deployment with no waitlist configured links nowhere at all rather
+        // than to a page that does not exist.
+        let bare = body_of(signup_form("passband.email", None, "", "", None)).await;
+        assert!(!bare.contains("waitlist"), "{bare}");
+        assert!(!bare.contains("No invite code"), "{bare}");
+    }
+
     /// Both fields are echoed back into the form, so both are escape paths.
     #[tokio::test]
     async fn the_form_escapes_what_it_echoes() {
         let html = body_of(signup_form(
             "passband.email",
+            Some(r#"https://evil.test/" onmouseover="alert(3)"#),
             r#""><script>alert(1)</script>"#,
             r#""onfocus="alert(2)"#,
             Some("<b>nope</b>"),
@@ -600,6 +749,7 @@ mod tests {
         .await;
         assert!(!html.contains("<script>alert(1)"));
         assert!(!html.contains(r#"onfocus="alert(2)"#));
+        assert!(!html.contains(r#"onmouseover="alert(3)"#));
         assert!(!html.contains("<b>nope</b>"));
         assert!(html.contains("&lt;script&gt;"));
     }
@@ -716,7 +866,14 @@ mod tests {
     #[tokio::test]
     async fn no_em_dashes_in_user_facing_copy() {
         for html in [
-            body_of(signup_form("passband.email", "ada", "ABCD-EFGH", Some("no"))).await,
+            body_of(signup_form(
+                "passband.email",
+                Some("https://passband.app/waitlist"),
+                "ada",
+                "ABCD-EFGH",
+                Some("no"),
+            ))
+            .await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
@@ -736,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn every_page_carries_the_security_headers() {
         for r in [
-            signup_form("passband.email", "", "", None),
+            signup_form("passband.email", None, "", "", None),
             success("https://ada.passband.email", "ABCD-EFGH", 10),
             problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
             console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),

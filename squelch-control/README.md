@@ -17,11 +17,20 @@ Where the code comes from, when the waitlist is configured (the trio in the
 table below; unset, none of it is mounted and both URLs are a 404):
 
 ```
+browser  ── GET  /  ──────────► "No invite code yet? Join the waitlist",
+                                linking to <WAITLIST_ORIGIN>/waitlist
 site     ── POST /waitlist ──► one row per address, same 200 for a duplicate
 operator ── GET  /admin ──────► token login, then the list
          ── POST /admin/approve ──► mint an invite, email it through Resend
          ── POST /admin/send ─────► revoke that code, mint and mail a fresh one
 ```
+
+That link closes the one loop the signup form used to leave open: a person
+with no code could not get one from the page that demands it. It is built from
+`SQUELCH_CONTROL_WAITLIST_ORIGIN` (the same origin the CORS answer names, so
+the link and the form it leads to cannot drift apart) and is rendered on every
+signup page, refused or not, so its presence never answers whether a code that
+was just typed exists. With the waitlist unconfigured the form links nowhere.
 
 The admin POSTs take a `SameSite=Strict` session cookie AND a same-origin
 `Origin`/`Sec-Fetch-Site`, because "same site" includes every sibling
@@ -116,7 +125,7 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | `SQUELCH_CONTROL_ADMIN_TOKEN` | trio | The operator's password for `/admin`, where waitlist rows are approved. At least 32 characters: `openssl rand -base64 32`. With the two below it is all-or-nothing: all three set mounts the waitlist and admin routes, none set leaves them unmounted (a 404, not a 403), anything partial refuses to boot. |
 | `SQUELCH_CONTROL_RESEND_API_KEY` | trio | Resend sending key, used for the one call that mails an approved applicant their invite. Printable ASCII, no spaces. Mint it sending-only and domain-restricted. |
 | `SQUELCH_CONTROL_INVITE_FROM` | trio | The `From:` invites are sent as, e.g. `Passband <invites@passband.app>`. Must be an address on a domain **verified at Resend** or every send is refused. |
-| `SQUELCH_CONTROL_WAITLIST_ORIGIN` | no | The one browser origin allowed to post the public waitlist form, echoed as `Access-Control-Allow-Origin` on that route only. Default `https://passband.app`. Only meaningful with the trio above set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_WAITLIST_ORIGIN` | no | The one browser origin allowed to post the public waitlist form, echoed as `Access-Control-Allow-Origin` on that route only, and the origin the signup page's "join the waitlist" link is built from (`<origin>/waitlist`). Default `https://passband.app`. Only meaningful with the trio above set; set alone it refuses to boot. |
 | `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS` | no | How many proxies write `X-Forwarded-For` in front of this listener. `0` (default) meters the TCP peer, which behind a platform edge means one shared rate-limit bucket. Set `1` on Railway. |
 | `SQUELCH_CONTROL_LOG` | no | `tracing` filter. Default `info`. |
 
