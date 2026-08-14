@@ -19,10 +19,16 @@
 //!
 //! THE PLAINTEXT INVITE CODE EXISTS BETWEEN TWO LINES OF [`mint_and_send`]:
 //! [`crate::invites::mint`] produces it and the Resend request body consumes it.
-//! It is never rendered into a page, never put in a URL, and never logged, so
-//! "resend the invite" is not a thing this service can do. What the buttons do
-//! instead is revoke the old code and mint a new one, which is the same outcome
-//! for the person waiting and a much smaller promise for this crate to keep.
+//! It is never rendered into a page and never logged, so "resend the invite" is
+//! not a thing this service can do. What the buttons do instead is revoke the
+//! old code and mint a new one, which is the same outcome for the person
+//! waiting and a much smaller promise for this crate to keep.
+//!
+//! It IS put in a URL, in one place: the emailed link carries `?invite=` so the
+//! signup form arrives filled in. That reverses this crate's original rule and
+//! the reasons for the rule did not go away, so they are written down where the
+//! link is built ([`crate::resend`]) and where it is read
+//! ([`crate::handlers::signup_form`]) rather than only here.
 //!
 //! PRIVACY: a waitlist address is shown on the dashboard and nowhere else. Every
 //! log line here names the ROW ID.
@@ -78,6 +84,17 @@ const INVITE_SPENT: &str =
      issue a code with the CLI.";
 
 const STORE_TROUBLE: &str = "The store did not answer. Nothing changed, so try again.";
+
+/// A direct invite typed as something that is not an address. Says what is
+/// wrong, unlike the refusals above it: this one is the operator's own typo and
+/// there is nobody to keep it from.
+const INVALID_ADDRESS: &str = "That is not an email address. Nothing was sent.";
+
+/// A direct invite for somebody already approved. The row is on the page below
+/// the banner, with the button that replaces a lost code.
+const ALREADY_INVITED: &str =
+    "That address has already been invited, so nothing extra was sent. Its row is below, and \
+     \"Send fresh invite\" replaces a code that never arrived.";
 
 /// The compare-and-swap in [`mint_and_send`], reported. Two presses of the same
 /// button raced and the other one won: its code is the one on the row and the
@@ -224,6 +241,52 @@ pub async fn login(
         ],
     )
         .into_response()
+}
+
+/// `POST /admin/invite` — invite an address that never asked.
+///
+/// The waitlist is a queue of people who found the site first. This is the
+/// other direction: someone the operator already knows, invited by typing their
+/// address. It lands on the SAME ledger as an approved waitlist row, so the
+/// history, the "email not sent" badge, and the re-send button all work on it
+/// without knowing which door it came in by.
+pub async fn invite(State(state): State<ControlState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !is_admin(&state, &headers) {
+        return signed_out(&state);
+    }
+    if !same_origin(&state, &headers) {
+        return cross_origin(&state, &headers);
+    }
+
+    // Capped one over the limit so a value AT the limit is still whole and an
+    // address longer than we accept is refused rather than truncated into a
+    // different, deliverable one.
+    let email = field_capped(&body, "email", crate::handlers::MAX_EMAIL + 1);
+    if !crate::handlers::is_email(&email) {
+        return dashboard(&state, Some(INVALID_ADDRESS));
+    }
+
+    let id = match state.store().invite_directly(&email, Utc::now()) {
+        Ok(Some(id)) => id,
+        // Already on the approved half. Not an error worth a red banner, but
+        // not silence either: the row is on the page with its own button, and
+        // saying so is what stops the operator from typing it again.
+        Ok(None) => return dashboard(&state, Some(ALREADY_INVITED)),
+        Err(e) => {
+            tracing::error!(error = %e, "recording a direct invite failed");
+            return dashboard(&state, Some(STORE_TROUBLE));
+        }
+    };
+
+    // PRIVACY: the row id, like every other line in this module. The address is
+    // in scope right here and does not go in the log.
+    tracing::info!(id, "invited an address directly");
+    // A row that was just created or just promoted names no invite yet, which
+    // is the NULL this mint expects to replace.
+    match mint_and_send(&state, id, None).await {
+        Some(problem) => dashboard(&state, Some(problem)),
+        None => back_to_dashboard(),
+    }
 }
 
 /// `POST /admin/approve` — let one person in.

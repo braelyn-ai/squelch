@@ -141,7 +141,7 @@ const MAX_CODE: usize = 512;
 /// truncated address is a well-formed address belonging to somebody else, and
 /// silently mailing an invite there is the one failure mode worth spending a
 /// constant on.
-const MAX_EMAIL: usize = 254;
+pub(crate) const MAX_EMAIL: usize = 254;
 
 /// Entropy behind a session id and behind the CSRF `state`. 32 bytes is 43
 /// unpadded base64url characters.
@@ -218,9 +218,33 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `GET /` — the form.
-pub async fn signup_form(State(state): State<ControlState>) -> Response {
-    pages::signup_form(&state.config().base_domain, "", "", None)
+/// `GET /` — the form, with the invite filled in when the link carried one.
+///
+/// `?invite=` IS THE EMAILED LINK, and it is a deliberate reversal of this
+/// crate's older rule that a code never appears in a URL. The cost is real and
+/// unchanged: the query string reaches the edge's access log, the recipient's
+/// history, and any proxy between them, and what sits there is a live code
+/// until it is redeemed or expires. What buys it is the click: an invite that
+/// has to be copied out of an email and pasted into a field loses people who
+/// would otherwise have finished. The code is single use, and the operator
+/// chose this trade knowing where it is written down (2026-08-14).
+///
+/// A value that is not shaped like a code renders an EMPTY field rather than
+/// itself. It is escaped either way, so this is not what stops a script; it is
+/// what stops the page from repeating an arbitrary stranger-supplied string
+/// back to whoever was sent the link.
+/// Any other parameter a link picked up on the way (a mail client's own
+/// tracking cruft) is ignored rather than refused: it must not be able to break
+/// a signup.
+pub async fn signup_form(
+    State(state): State<ControlState>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let invite = param(query.as_deref(), "invite")
+        .map(|code| code.chars().take(MAX_FIELD).collect::<String>())
+        .filter(|code| invites::is_plausible(code))
+        .unwrap_or_default();
+    pages::signup_form(&state.config().base_domain, "", &invite, None)
 }
 
 /// `POST /signup` — validate, open a session, and send the user to Google.
@@ -1519,7 +1543,7 @@ pub(crate) fn field_capped(body: &Bytes, name: &str, cap: usize) -> String {
 /// name the operator might recognize, and a provider that parses the shape
 /// mails the invite to the part after the angle bracket. Separators go with it,
 /// because a comma or a semicolon is how a second recipient gets in.
-fn is_email(email: &str) -> bool {
+pub(crate) fn is_email(email: &str) -> bool {
     const REFUSED: &[char] = &['<', '>', ',', ';', ':', '"', '(', ')', '[', ']', '\\', '`'];
     if !(3..=MAX_EMAIL).contains(&email.len())
         || !email.bytes().all(|b| b.is_ascii_graphic())

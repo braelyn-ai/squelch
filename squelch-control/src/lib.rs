@@ -176,6 +176,7 @@ pub fn router(state: ControlState) -> Router {
 
     let admin = Router::new()
         .route("/admin", get(admin::page))
+        .route("/admin/invite", post(admin::invite))
         .route("/admin/approve", post(admin::approve))
         .route("/admin/send", post(admin::send))
         .layer(DefaultBodyLimit::max(handlers::MAX_BODY))

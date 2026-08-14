@@ -504,6 +504,15 @@ pub fn admin_page(
 {error_html}
 <h2>Waiting ({waiting_count})</h2>
 {waiting_table}
+<h2>Invite someone directly</h2>
+<form method="post" action="/admin/invite">
+<label for="email">Email address</label>
+<input type="email" id="email" name="email" placeholder="them@example.com"
+  autocomplete="off" autocapitalize="off" spellcheck="false" required>
+<button type="submit">Mint and email an invite</button>
+</form>
+<p class="muted">They do not have to be on the list. The address lands under
+Approved below, with the same re-send button as everybody else.</p>
 <h2>Approved recently</h2>
 {history_table}
 <p class="muted">Approving mints one invite code and emails it. The code works

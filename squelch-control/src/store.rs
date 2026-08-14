@@ -641,6 +641,43 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
+    /// Put an address straight onto the approved half, whether or not it ever
+    /// asked. `Some(id)` is the row this call approved and is the caller's to
+    /// mint for; `None` means it was approved already and there is nothing new
+    /// to send.
+    ///
+    /// ONE STATEMENT, because the operator typing an address and the operator
+    /// clicking Approve on that same address are the same race
+    /// [`approve_waitlist`] guards, and it has to hold across an INSERT the
+    /// second one turns into an UPDATE. The upsert's `WHERE` is the guard: it
+    /// promotes a pending row and refuses an approved one, so two presses mint
+    /// exactly one invite between them, and `RETURNING` hands back the winner's
+    /// id without a second lookup that another writer could invalidate.
+    ///
+    /// A direct invite is recorded as a waitlist row on purpose. The alternative
+    /// is a second ledger with the same columns, and then two places to look for
+    /// "did we already invite them", two things to page, and one of them
+    /// silently missing the re-send button.
+    pub fn invite_directly(&self, email: &str, now: DateTime<Utc>) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "INSERT INTO waitlist(email, created_at, status, approved_at)
+                      VALUES(?1, ?2, ?3, ?2)
+                 ON CONFLICT(email) DO UPDATE SET status = ?3, approved_at = ?2
+                      WHERE waitlist.status = ?4
+                 RETURNING id",
+                params![
+                    normalize_email(email),
+                    stamp(now),
+                    WAITLIST_APPROVED,
+                    WAITLIST_PENDING
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// The admin page's listing: EVERY row still waiting, oldest first, then
     /// the most recently approved as history.
     ///

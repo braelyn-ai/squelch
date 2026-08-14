@@ -180,21 +180,45 @@ fn is_recipient(to: &str) -> bool {
         && to.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// The one-click link: the signup page with the code already in the field.
+///
+/// THE CODE IS IN A QUERY STRING, which this crate's first draft refused to do.
+/// Every reason it gave still holds: the edge's access log, the recipient's
+/// history, and any proxy between them each keep a live code until it is
+/// redeemed or lapses. It is a recorded trade for the click, made 2026-08-14,
+/// and the code being single use is what bounds it. See
+/// [`crate::handlers::signup_form`], which reads the parameter back.
+///
+/// Percent encoded even though a code is only ever Crockford base32 and dashes:
+/// "only ever, today" is the assumption that breaks quietly later.
+fn invite_link(code: &str, signup_url: &str) -> String {
+    format!(
+        "{}/?invite={}",
+        signup_url.trim_end_matches('/'),
+        crate::pages::percent_encode(code)
+    )
+}
+
 /// The plain-text part. The code sits on its own line so that every mail client
-/// in the world lets someone select it.
+/// in the world lets someone select it, because the link above it is the fast
+/// path and not the only one: a client that mangles long URLs, a forwarded
+/// message, and a code typed on a different device all land on the same field.
 fn text_body(code: &str, signup_url: &str) -> String {
     format!(
         "you're in.
 
-here is your Passband invite code:
+open this and your invite code will already be filled in:
+
+{link}
+
+or go to {signup_url} and paste it in yourself:
 
 {code}
-
-paste it at {signup_url} to set up your hosted mailbox.
 
 the code works once and expires in {ttl} days. if it lapses, just ask again and
 we will send a fresh one.
 ",
+        link = invite_link(code, signup_url),
         ttl = crate::invites::DEFAULT_TTL_DAYS,
     )
 }
@@ -203,14 +227,17 @@ we will send a fresh one.
 /// crate produced itself: "this one was checked already" is how the exception
 /// becomes the rule.
 fn html_body(code: &str, signup_url: &str) -> String {
+    let link = escape_html(&invite_link(code, signup_url));
     let code = escape_html(code);
     let url = escape_html(signup_url);
     format!(
         r#"<div style="font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a;">
 <p>you're in.</p>
-<p>here is your Passband invite code:</p>
+<p>Passband runs a mailbox daemon for you. This link opens the signup page with
+your invite code already filled in:</p>
+<p><a href="{link}" style="display: inline-block; background: #1a1a1a; color: #fbfaf8; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 500;">Set up your mailbox</a></p>
+<p style="color: #6b6b6b;">or go to <a href="{url}">{url}</a> and paste the code in yourself:</p>
 <p style="font: 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; background: #f3f1ed; border-radius: 8px; padding: 14px 16px; display: inline-block;">{code}</p>
-<p>paste it at <a href="{url}">{url}</a> to set up your hosted mailbox.</p>
 <p style="color: #6b6b6b;">the code works once and expires in {ttl} days. if it lapses, just ask again and we will send a fresh one.</p>
 </div>
 "#,

@@ -20,13 +20,27 @@ table below; unset, none of it is mounted and both URLs are a 404):
 site     ── POST /waitlist ──► one row per address, same 200 for a duplicate
 operator ── GET  /admin ──────► token login, then the list
          ── POST /admin/approve ──► mint an invite, email it through Resend
+         ── POST /admin/invite ───► the same, for an address that never joined
          ── POST /admin/send ─────► revoke that code, mint and mail a fresh one
 ```
+
+A direct invite is recorded as a waitlist row that starts out approved, so one
+table answers "have we invited them" however they arrived and the re-send button
+works on both. Typing an address that is already waiting approves the row it has
+rather than making a second one.
+
+The emailed link is `/?invite=CODE`, and `GET /` fills the form in from it. That
+reverses this crate's first rule, which was that a code never appears in a URL:
+the query string reaches the edge's access log, the recipient's history, and any
+proxy between them, and a live code sits in all three until it is redeemed or
+lapses. It is a deliberate trade for the click, taken 2026-08-14, bounded by the
+code being single use. A parameter not shaped like a code renders an empty field.
 
 The admin POSTs take a `SameSite=Strict` session cookie AND a same-origin
 `Origin`/`Sec-Fetch-Site`, because "same site" includes every sibling
 `passband.app` name and a page on one of those could otherwise press these
-buttons.
+buttons. An `Origin` of `null` names nothing, so it is decided by
+`Sec-Fetch-Site`, which no page can write.
 
 ## Provisioning is two calls
 
