@@ -40,10 +40,6 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure request shaping (unit-testable, no network).
-// ---------------------------------------------------------------------------
-
 /// The modify JSON body. Empty arrays are still sent (harmless no-ops) so the
 /// shape is uniform.
 pub fn modify_body(add: &[String], remove: &[String]) -> Value {
@@ -259,10 +255,6 @@ pub fn build_references(parent_message_id: Option<&str>, parent_references: Opti
         (None, None) => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Network executor. Holds a Write-bound credential store; nothing else.
-// ---------------------------------------------------------------------------
 
 /// Gmail metadata headers we read (with the WRITE token) to thread a reply and
 /// to derive who it goes to.
