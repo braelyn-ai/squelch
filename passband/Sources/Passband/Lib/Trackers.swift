@@ -157,8 +157,6 @@ enum Trackers {
     /// gifs. Protocol-relative srcs resolve to https.
     static func extractHeroSrc(_ html: String) -> String? {
         var hero: String?
-        // Read-only pass: the spliced html is discarded, `.stop` just ends the
-        // walk at the first hero the way an early `return` used to.
         _ = HTMLImg.walk(strip(html).html) { tag in
             guard var src = attrValue(tag, "src")?.trimmingCharacters(in: .whitespaces),
                 !src.isEmpty

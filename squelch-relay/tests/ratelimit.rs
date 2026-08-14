@@ -2,7 +2,7 @@
 //!
 //! The router is driven as a `Service` rather than over a socket, so the peer
 //! address is a value the test picks: that is the only way to prove the peer
-//! still decides the bucket when no proxy is trusted, and no longer does when
+//! decides the bucket when no proxy is trusted, and yields to the header when
 //! one is.
 
 use std::net::SocketAddr;
@@ -125,8 +125,8 @@ async fn pixel_is_limited(app: &Router, peer: &str, xff: Option<&str>) -> bool {
     false
 }
 
-/// The default is exactly the old behaviour: the peer decides, and the header is
-/// not read at all.
+/// With no trusted hops configured, the peer decides and the header is not read
+/// at all.
 #[tokio::test]
 async fn hops_zero_keys_on_the_peer_address() {
     let app = relay(0);

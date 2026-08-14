@@ -108,9 +108,8 @@ refuses it before the handler is reached).
   pixel still needs remote images on before it fetches. `allowTrackers` is part of
   `Prepared.cacheKey`, and `ImageWarmer` always prefetches the STRIPPED body so
   warming can never report an open the reader never made.
-- **The auth half of the gate** (closes issue #10 — the `From` header alone is
-  free text, so the contact half by itself let anyone who knows one of the user's
-  correspondents spoof their way past the strip).
+- **The auth half of the gate.** The `From` header is free text, so contact
+  membership alone cannot authorize a tracker bypass.
   `squelch-core/src/sync/ingest.rs:extract_auth_pass` computes the verdict once at
   ingest into `messages.auth_pass`;
   `squelch-api/src/handlers.rs:get_thread` ANDs it into `sender_known`. Gated
@@ -171,9 +170,8 @@ refuses it before the handler is reached).
   **last**. Trackers first so a pixel can never be the "first occurrence" that
   suppresses a real image; rewrite last because after it nothing recognises a
   reference as remote.
-- Never put `http:`/`https:` back in `img-src`. That one change turns every missed
-  rewrite from a broken-image glyph into an un-proxied request, and reopens the
-  CSS-background gap `html.rs` used to document as a KNOWN TRADE-OFF.
+- Never put `http:`/`https:` in `img-src`. A missed rewrite must fail closed
+  instead of becoming an un-proxied request.
 - Keep the signature check: without it a hand-written `url(passband-img://…)` in a
   kept `<style>` fetches a tracker while the UI says the mail has no remote content.
 - `auth_pass` is three-valued and the comparison must stay `== Some(true)`. Any

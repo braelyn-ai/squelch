@@ -362,8 +362,8 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// The default must be exactly the old behaviour: the header is not read at
-    /// all, however well-formed it looks.
+    /// With no trusted hops configured, the header is not read at all, however
+    /// well-formed it looks.
     #[test]
     fn hops_zero_meters_the_peer() {
         assert_eq!(client_ip(&headers(&[]), PEER, 0), PEER);

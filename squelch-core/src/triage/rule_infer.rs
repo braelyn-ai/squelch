@@ -579,10 +579,7 @@ mod tests {
         assert_eq!(d, Disposition::Filtered);
     }
 
-    // ---- the wall-clock budget ---------------------------------------------
-
-    /// A server that accepts the connection and then says NOTHING, forever: the
-    /// shape that used to park the save behind the full retry ladder.
+    /// A server that accepts connections without responding.
     async fn mock_stalls_forever() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
