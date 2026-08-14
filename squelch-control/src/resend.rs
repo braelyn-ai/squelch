@@ -205,9 +205,7 @@ fn invite_link(code: &str, signup_url: &str) -> String {
 /// message, and a code typed on a different device all land on the same field.
 fn text_body(code: &str, signup_url: &str) -> String {
     format!(
-        "you're in.
-
-open this and your invite code will already be filled in:
+        "open this and your invite code will already be filled in:
 
 {link}
 
@@ -223,16 +221,40 @@ we will send a fresh one.
     )
 }
 
+/// Where the mark is served from. Hardcoded to the project's own site rather
+/// than derived from the deployment's origin, because that is the only host
+/// `brand/build.sh` publishes to; a self-hoster's own origin would 404. The
+/// tradeoff is that a self-hoster's recipients fetch an image from us, which is
+/// part of why the wordmark beside it is live text — see [`html_body`].
+///
+/// The groundless mark, not the icon: a mail body is white, so a tile would put
+/// a light rectangle on a light page. The 512px asset is deliberately larger
+/// than the 56px it renders at, because mail reaches retina screens.
+const MARK_URL: &str = "https://passband.app/mark.png";
+
 /// The HTML part. Everything interpolated is escaped, including values this
 /// crate produced itself: "this one was checked already" is how the exception
 /// becomes the rule.
+///
+/// The mark is a remote image, so assume it will not load: mail clients block
+/// remote content by default, and the ones that do not may proxy and pre-fetch
+/// it. The wordmark beside it is live text rather than part of the image, so a
+/// blocked mark leaves the name standing on its own instead of leaving a hole
+/// where the branding was. Its `alt` is empty for the same reason — with the
+/// name already in text, alt text would render it twice.
+///
+/// Laid out as a table because that is the only horizontal alignment Outlook
+/// honours; float and inline-block both collapse there.
 fn html_body(code: &str, signup_url: &str) -> String {
     let link = escape_html(&invite_link(code, signup_url));
     let code = escape_html(code);
     let url = escape_html(signup_url);
     format!(
         r#"<div style="font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a;">
-<p>you're in.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin: 0 0 24px;"><tr>
+<td style="padding-right: 12px;"><img src="{mark}" alt="" width="56" height="30" style="display: block; border: 0;"></td>
+<td style="font: 21px/1 Georgia, 'Times New Roman', serif; color: #1a1a1a; vertical-align: middle;">Passband</td>
+</tr></table>
 <p>Passband runs a mailbox daemon for you. This link opens the signup page with
 your invite code already filled in:</p>
 <p><a href="{link}" style="display: inline-block; background: #1a1a1a; color: #fbfaf8; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 500;">Set up your mailbox</a></p>
@@ -241,6 +263,7 @@ your invite code already filled in:</p>
 <p style="color: #6b6b6b;">the code works once and expires in {ttl} days. if it lapses, just ask again and we will send a fresh one.</p>
 </div>
 "#,
+        mark = MARK_URL,
         ttl = crate::invites::DEFAULT_TTL_DAYS,
     )
 }

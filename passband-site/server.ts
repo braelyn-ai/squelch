@@ -26,6 +26,8 @@ const pages: Record<string, string> = {
   "/icon-dark.svg": "icon-dark.svg",
   // Groundless, for the landing page's own dark field.
   "/mark.svg": "mark.svg",
+  // The same mark as raster, for the invite email. No mail client renders SVG.
+  "/mark.png": "mark.png",
   "/icon-180.png": "icon-180.png",
   "/icon-512.png": "icon-512.png",
   // Newsreader, subset to Latin from the same TTF the Swift client bundles.
