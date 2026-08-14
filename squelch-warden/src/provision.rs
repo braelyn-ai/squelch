@@ -378,26 +378,7 @@ impl Warden {
         // rotation would find nothing to differ from. The Secret can only
         // exist if `llm_base_url` was configured when `set_llm_key` accepted
         // it, so this pickup cannot stamp the annotation with the feature off.
-        let llm_hash = self
-            .cluster
-            .get_secret(&name.llm_secret())
-            .await
-            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
-            .as_ref()
-            .and_then(|secret| {
-                // Both data keys, through the same combined hash `set_llm_key`
-                // stamps ([`objects::llm_keys_hash`]): a pickup that hashed
-                // only the triage key would differ from every hash a keyed
-                // rotation writes, and the first rotation after provisioning
-                // would roll the pod for nothing — or worse, a real rotation
-                // would land on a pod already carrying its hash and not roll.
-                // Either slot alone is enough: a half-failed mint can leave a
-                // Secret holding only one of the two.
-                let api_key = secret_value(secret, objects::LLM_API_KEY_KEY);
-                let assistant = secret_value(secret, objects::ASSISTANT_API_KEY_KEY);
-                (api_key.is_some() || assistant.is_some())
-                    .then(|| objects::llm_keys_hash(api_key.as_deref(), assistant.as_deref()))
-            });
+        let llm_hash = self.llm_hash(&name).await?;
         // The hash of what was just stored, not of what is running: this is the
         // whole mechanism by which a re-consent reaches the daemon.
         self.apply(
@@ -649,19 +630,13 @@ impl Warden {
             );
             return Err(WardenError::cluster("credential_missing"));
         };
-        let llm_key = self
-            .cluster
-            .get_secret(&name.llm_secret())
-            .await
-            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
-            .as_ref()
-            .and_then(|secret| secret_value(secret, objects::LLM_API_KEY_KEY));
+        let llm_hash = self.llm_hash(&name).await?;
 
         let rendered = objects::deployment(
             &self.config,
             &name,
             &objects::credential_hash(&ciphertext),
-            llm_key.as_deref().map(objects::credential_hash).as_deref(),
+            llm_hash.as_deref(),
         );
         let merged = self
             .cluster
@@ -802,13 +777,7 @@ impl Warden {
             );
             return Err(WardenError::cluster("credential_missing"));
         };
-        let llm_key = self
-            .cluster
-            .get_secret(&name.llm_secret())
-            .await
-            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
-            .as_ref()
-            .and_then(|secret| secret_value(secret, objects::LLM_API_KEY_KEY));
+        let llm_hash = self.llm_hash(&name).await?;
 
         // The same order phase two applies in, for the same reasons: the volume
         // exists before anything wants it, the NetworkPolicy before the pod it
@@ -838,7 +807,7 @@ impl Warden {
             &self.config,
             &name,
             &objects::credential_hash(&ciphertext),
-            llm_key.as_deref().map(objects::credential_hash).as_deref(),
+            llm_hash.as_deref(),
         );
         let live = self
             .cluster
@@ -1091,6 +1060,35 @@ impl Warden {
             // whatever the first one sealed.
             _ => Err(WardenError::Conflict),
         }
+    }
+
+    /// The pod-template hash for whatever LLM keys this tenant currently holds,
+    /// or `None` for a tenant holding neither.
+    ///
+    /// Every path that RE-RENDERS an existing tenant's Deployment has to derive
+    /// this the same way [`Warden::set_llm_key`] stamps it, and "the same way"
+    /// means over BOTH slots through [`objects::llm_keys_hash`]. A caller that
+    /// hashed only the triage key would produce a value no rotation ever
+    /// writes, which makes every keyed tenant read as permanently drifted and
+    /// makes a reconcile roll the pod onto a hash the next rotation disagrees
+    /// with. Either slot alone is enough to have a hash: a half-failed mint
+    /// leaves a Secret holding one of the two.
+    ///
+    /// It lives here rather than inline because it is the third caller that
+    /// made the first two disagree.
+    async fn llm_hash(&self, name: &TenantName) -> Result<Option<String>, WardenError> {
+        Ok(self
+            .cluster
+            .get_secret(&name.llm_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| {
+                let api_key = secret_value(secret, objects::LLM_API_KEY_KEY);
+                let assistant = secret_value(secret, objects::ASSISTANT_API_KEY_KEY);
+                (api_key.is_some() || assistant.is_some())
+                    .then(|| objects::llm_keys_hash(api_key.as_deref(), assistant.as_deref()))
+            }))
     }
 
     /// Whether a [`TenantStatus::Stopped`] tenant was stopped by an
@@ -2340,7 +2338,7 @@ mod tests {
             .set_credentials("alice", &armored("alice"))
             .await
             .unwrap();
-        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+        h.warden.set_llm_key("alice", Some("sk-vk-first"), None).await.unwrap();
 
         let report = h.warden.drift("alice").await.unwrap();
         assert_eq!(report.changes, Vec::new());
@@ -2720,18 +2718,23 @@ mod tests {
             .set_credentials("alice", &armored("alice"))
             .await
             .unwrap();
-        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-first"), None)
+            .await
+            .unwrap();
         let credential = pod_annotation(&h);
+        // Whatever `set_llm_key` stamped, rather than a hash spelled out here:
+        // a reconcile must reproduce the keyed pod EXACTLY, and a test that
+        // recomputed the hash its own way would keep passing while the two
+        // drifted apart. That is the bug this assertion exists to catch.
+        let keyed = llm_annotation(&h).unwrap();
 
         hand_edit_the_deployment(&h).await;
         assert_eq!(
             h.warden.reconcile("alice").await.unwrap().deployment,
             "recreated"
         );
-        assert_eq!(
-            llm_annotation(&h).unwrap(),
-            objects::credential_hash("sk-vk-first")
-        );
+        assert_eq!(llm_annotation(&h).unwrap(), keyed);
         assert_eq!(pod_annotation(&h), credential);
     }
 
