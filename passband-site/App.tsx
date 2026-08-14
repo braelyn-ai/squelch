@@ -96,9 +96,15 @@ const styles = {
     justifyContent: "center",
     gap: "1rem",
   },
+  // The brand's one serif moment, rationed exactly as Typo does it in the
+  // Swift client: Newsreader for the wordmark and nowhere else. Spread
+  // further, a display serif becomes wallpaper. Weight 500 matches
+  // Typo.hero's .medium; the font's opsz axis does the rest on its own.
   title: {
-    fontSize: "3rem",
-    fontWeight: 600,
+    fontFamily: '"Newsreader", ui-serif, Georgia, serif',
+    fontSize: "3.4rem",
+    fontWeight: 500,
+    letterSpacing: "-0.005em",
     margin: 0,
     color: "#f5f5f7",
   },
@@ -525,12 +531,13 @@ export function App() {
       <FakeInbox />
       <div style={styles.frost} />
       <div style={styles.content}>
+        {/* The mark on its own, no tile: the page is already a dark field, so
+            the icon's ground would just be a lighter rectangle sitting on it. */}
         <img
-          src="/knob.png"
+          src="/mark.svg"
           alt="Passband"
-          width={112}
-          height={112}
-          style={{ borderRadius: "1.5rem" }}
+          width={180}
+          height={98}
         />
         <h1 style={styles.title}>Passband</h1>
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
@@ -583,11 +590,10 @@ export function WaitlistPage() {
           }}
         >
           <img
-            src="/knob.png"
+            src="/mark.svg"
             alt="Passband"
-            width={112}
-            height={112}
-            style={{ borderRadius: "1.5rem" }}
+            width={180}
+            height={98}
           />
           <h1 style={styles.title}>Passband</h1>
         </a>
