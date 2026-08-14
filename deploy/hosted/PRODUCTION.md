@@ -117,7 +117,17 @@ Install procedure: `SETUP.md` → "LLM triage through the gateway".
 
 > **History.** Before the gateway, keyed tenants ran on a shared
 > `anthropic-api-key` Secret in ns `tenants` — the pre-gateway bridge, removed
-> 2026-08-13.
+> from the warden 2026-08-13. Removing the code touches no tenant that already
+> exists (see "Shipping a tenant-shape change" below): a tenant provisioned
+> while the bridge existed still carries the `ANTHROPIC_API_KEY` env from its
+> old rendered spec, and with the gateway base URL alongside it the daemon
+> resolves that raw key and every Stage-2 call 401s against the gateway —
+> failing, not idle. `squelch-control llm mint <label>` converges a legacy
+> tenant: it re-applies the whole Deployment via server-side apply, which
+> installs the virtual key and strips the legacy env in one roll. Once
+> `kubectl -n tenants get deploy -o yaml | grep -c ANTHROPIC_API_KEY` says 0,
+> finish the job by deleting the Secret itself:
+> `kubectl -n tenants delete secret anthropic-api-key`.
 
 ## DNS
 
@@ -196,8 +206,10 @@ tenant's pod against those objects; nothing reconciles those objects against the
 warden's current code.
 
 So anything that changes the SHAPE of a tenant — a new Ingress path prefix, a new
-environment variable in the pod (`SQUELCH_CONSOLE_SSO_URL` and the
-`SQUELCH_WARDEN_LLM_*` block are both this), a changed NetworkPolicy peer, new
+environment variable in the pod (`SQUELCH_CONSOLE_SSO_URL` and the LLM gateway
+block — `SQUELCH_ANTHROPIC_BASE_URL`, `SQUELCH_STAGE2_PROVIDER`,
+`SQUELCH_STAGE2_API_KEY`, the pod-side names the warden's `SQUELCH_WARDEN_LLM_*`
+config renders to — are both this), a changed NetworkPolicy peer, new
 resource bounds — lands on new
 signups and on nobody else, silently. Check what a live tenant actually has
 before assuming a deploy reached it:

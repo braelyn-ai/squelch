@@ -1510,6 +1510,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         }
                     }
                 }
+                Ok(stage1_llm::ClassifyOutcome::Failed(kind))
+                    if crate::triage::llm::is_auth_failure(&kind) =>
+                {
+                    // AUTH FAILURE (401/403): a config problem shared by every
+                    // row. Heuristic fallback is for verdicts about THIS row; a
+                    // bad credential is not one, so leave the row queued
+                    // (stage1_model_used stays NULL) and stop the pass instead
+                    // of burning the cap on calls that fail identically.
+                    eprintln!(
+                        "squelch: stage-1 auth failure ({kind}); the resolved LLM key is \
+                         wrong for the endpoint; rows stay queued"
+                    );
+                    break;
+                }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
                 | Ok(stage1_llm::ClassifyOutcome::Failed(_)) => {
                     // HEURISTIC FALLBACK: keep the seed values and mark processed
@@ -1958,7 +1972,22 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     );
                 }
                 Ok(ClassifyOutcome::Failed(kind)) => {
-                    // Permanent failure (400/401/truncation/parse): mark the row
+                    // AUTH FAILURE (401/403): the key is wrong for the endpoint,
+                    // a config problem shared by every row — not a fact about
+                    // this one. Leave the row queued and STOP the pass: the
+                    // remaining rows would fail identically while burning the
+                    // daily caps, and a row marked processed here would be
+                    // foreclosed from triage even after the credential is fixed
+                    // (the legacy shared-key-plus-gateway pod is exactly this).
+                    if crate::triage::llm::is_auth_failure(&kind) {
+                        eprintln!(
+                            "squelch: stage-2 auth failure ({kind}); the resolved LLM key is \
+                             wrong for the endpoint; rows stay queued"
+                        );
+                        self.metrics.record_stage2(Stage2Verdict::Retryable);
+                        break;
+                    }
+                    // Permanent failure (400/truncation/parse): mark the row
                     // processed so it cannot loop. `kind` is already redacted.
                     eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
                     self.metrics.record_stage2(Stage2Verdict::Failed);

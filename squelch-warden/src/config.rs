@@ -532,6 +532,17 @@ impl Config {
                 }
             }
         }
+        // Tombstone for the shared-key bridge: the var no longer exists, and a
+        // manifest that still sets it belongs to an operator who believes the
+        // shared Secret still feeds new tenants. Same posture as the inert
+        // tuning vars above — refuse to boot rather than silently ignore.
+        if var(get, "SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME").is_some() {
+            return Err(ConfigError::invalid(
+                "SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME was removed with the shared-key bridge; \
+                 the gateway (SQUELCH_WARDEN_LLM_BASE_URL) is the only LLM path now. Remove the \
+                 var, then delete the anthropic-api-key Secret once no legacy pod still mounts it",
+            ));
+        }
 
         Ok(Self {
             bind,
@@ -992,6 +1003,9 @@ mod tests {
             ("SQUELCH_WARDEN_LLM_STAGE2_MODEL", "claude-sonnet-4-5"),
             ("SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP", "200"),
             ("SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP", "40"),
+            // The shared-key bridge's var, removed with the bridge: a manifest
+            // still setting it believes the shared Secret feeds new tenants.
+            ("SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME", "anthropic-api-key"),
         ];
         for (key, value) in table {
             assert!(with(key, value).is_err(), "{key}=`{value}` was accepted");

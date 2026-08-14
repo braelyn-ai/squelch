@@ -599,26 +599,15 @@ pub struct Stage2UsageDay {
 /// One call's token counts, as the ledger records them: `input` is the UNCACHED
 /// prompt remainder, with prompt-cache writes and reads in their own fields
 /// because they price differently. A struct rather than four positional u64s so
-/// a transposed input/output can't compile.
+/// a transposed input/output can't compile — which is also why there is no
+/// positional constructor: build it as a field-named literal (production goes
+/// through `From<Usage>`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageTokens {
     pub input: u64,
     pub output: u64,
     pub cache_creation: u64,
     pub cache_read: u64,
-}
-
-impl UsageTokens {
-    /// Counts in ledger-column order: uncached input, output, cache write,
-    /// cache read.
-    pub fn new(input: u64, output: u64, cache_creation: u64, cache_read: u64) -> Self {
-        Self {
-            input,
-            output,
-            cache_creation,
-            cache_read,
-        }
-    }
 }
 
 /// Runtime daily-cap overrides from `app_settings`. `None` means no override

@@ -568,6 +568,14 @@ impl Stage2Config {
     /// `anthropic_base_url`, in which case it is `<base>/v1/messages`; the
     /// override never applies to OpenAI. Empty strings count as absent, and key
     /// material is never logged.
+    ///
+    /// HOSTED LEGACY NOTE: a tenant pod rendered before the shared-key bridge
+    /// was removed still carries a raw `ANTHROPIC_API_KEY` alongside the
+    /// gateway base URL, so this resolves the raw key and every call 401s
+    /// against the gateway (which accepts only virtual keys) until
+    /// `squelch-control llm mint` re-applies the Deployment. The sync passes
+    /// treat those 401s as config-level — rows stay queued — so the backlog
+    /// survives until the re-apply; see deploy/hosted/PRODUCTION.md, "History".
     pub fn resolve_llm(&self) -> Option<ResolvedLlm> {
         // Validate the override BEFORE provider inference: a rejected URL is
         // absent everywhere, so it cannot flip a key onto the Anthropic wire
