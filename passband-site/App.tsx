@@ -166,15 +166,6 @@ const styles = {
     fontSize: "0.9rem",
     textAlign: "center",
   },
-  button: {
-    padding: "0.55rem 1.4rem",
-    borderRadius: "0.6rem",
-    background: "#f5f5f7",
-    color: "#111",
-    textDecoration: "none",
-    fontSize: "0.9rem",
-    fontWeight: 500,
-  },
   corner: {
     position: "absolute",
     bottom: "1.25rem",
@@ -262,6 +253,250 @@ function FakeInbox() {
   );
 }
 
+// Brass and steel lifted off the app icon. Nothing else on the page carries a
+// hue, so this accent belongs to the button alone and reads as the one lit
+// instrument in a dark room.
+const BRASS = "240, 204, 128";
+
+const DOWNLOAD_CSS = `
+.pb-dl {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.65rem;
+  padding: 0.9rem 1.9rem 1.3rem;
+  border-radius: 0.9rem;
+  overflow: hidden;
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.015em;
+  color: #e9e2d4;
+  background: linear-gradient(180deg, #1e1e22, #131315);
+  border: 1px solid rgba(${BRASS}, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 12px 30px rgba(0, 0, 0, 0.5);
+  transition:
+    transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-color 0.4s ease,
+    box-shadow 0.4s ease,
+    color 0.4s ease;
+}
+.pb-dl:hover,
+.pb-dl:focus-visible {
+  color: #fff6e4;
+  transform: translateY(-2px);
+  border-color: rgba(${BRASS}, 0.62);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 0 34px -6px rgba(${BRASS}, 0.45),
+    0 16px 38px rgba(0, 0, 0, 0.55);
+}
+.pb-dl:active { transform: translateY(0) scale(0.995); }
+.pb-dl:focus-visible {
+  outline: 2px solid rgba(${BRASS}, 0.75);
+  outline-offset: 3px;
+}
+/* Machined top edge: a filament that comes up with the rest of the hardware. */
+.pb-dl::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  z-index: 2;
+  opacity: 0.45;
+  background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
+  transition: opacity 0.4s ease;
+}
+.pb-dl:hover::before,
+.pb-dl:focus-visible::before { opacity: 1; }
+.pb-dl-meter {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+}
+.pb-dl-arrow,
+.pb-dl-label { position: relative; z-index: 1; }
+.pb-dl-arrow { transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.pb-dl:hover .pb-dl-arrow,
+.pb-dl:focus-visible .pb-dl-arrow { transform: translateY(2px); }
+@media (prefers-reduced-motion: reduce) {
+  .pb-dl,
+  .pb-dl-arrow { transition-duration: 0.01ms; }
+  .pb-dl:hover,
+  .pb-dl:focus-visible,
+  .pb-dl:hover .pb-dl-arrow,
+  .pb-dl:focus-visible .pb-dl-arrow { transform: none; }
+}
+`;
+
+// The one piece of hardware on the page. At rest the meter shows a noise floor
+// (the same slop scrolling behind the frost); on hover the filter closes and
+// only the passband survives, lit in the icon's brass. The animation is the
+// product's own metaphor, which is the price of putting motion here at all.
+function DownloadButton() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Hover lives in a ref, not state: the rAF loop reads it every frame and CSS
+  // already owns the chrome, so a re-render would buy nothing.
+  const hovered = useRef(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // Each bar drifts on its own beat so the floor shimmers rather than
+    // marching in step. Sized to the widest bar count the button can ask for.
+    const POOL = 96;
+    const phase = Array.from({ length: POOL }, () => Math.random() * Math.PI * 2);
+    const speed = Array.from({ length: POOL }, () => 0.7 + Math.random() * 1.9);
+
+    // The filter's frequency response: flat across the middle third, steep
+    // skirts either side. This curve is the passband the product is named for.
+    const band = (x: number) => Math.exp(-Math.pow(Math.abs(x - 0.5) / 0.19, 4));
+
+    let width = 0;
+    let height = 0;
+    let gate = 0; // 0 = wide open (noise), 1 = filtered down to the passband
+
+    const render = (t: number) => {
+      ctx.clearRect(0, 0, width, height);
+      const bars = Math.max(16, Math.min(POOL, Math.round(width / 5.5)));
+      const step = width / bars;
+      const barW = Math.max(1.5, step - 2);
+      const maxH = height * 0.44;
+
+      // Trace the response curve only once the filter is closing, so it reads
+      // as the cause of the collapse rather than as decoration.
+      if (gate > 0.01) {
+        const top = (x: number) =>
+          height - (0.06 + 0.94 * band(x / width)) * maxH;
+        ctx.beginPath();
+        ctx.moveTo(0, height);
+        for (let x = 0; x <= width; x += 2) ctx.lineTo(x, top(x));
+        ctx.lineTo(width, height);
+        const fill = ctx.createLinearGradient(0, height - maxH, 0, height);
+        fill.addColorStop(0, `rgba(${BRASS}, ${0.16 * gate})`);
+        fill.addColorStop(1, `rgba(${BRASS}, 0)`);
+        ctx.fillStyle = fill;
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(0, top(0));
+        for (let x = 2; x <= width; x += 2) ctx.lineTo(x, top(x));
+        ctx.strokeStyle = `rgba(${BRASS}, ${0.45 * gate})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      for (let i = 0; i < bars; i++) {
+        const x = bars > 1 ? i / (bars - 1) : 0.5;
+        const response = band(x);
+        // Two incommensurate beats per bar: busy, but never repeating.
+        const noise =
+          0.5 +
+          0.5 *
+            Math.sin(t * speed[i] + phase[i]) *
+            Math.cos(t * speed[i] * 0.61 + phase[i] * 1.7);
+        const open = 0.12 + 0.3 * noise;
+        const filtered = 0.04 + 0.96 * response * (0.55 + 0.45 * noise);
+        const barH = Math.max(1, (open * (1 - gate) + filtered * gate) * maxH);
+
+        // Warmth is gated response: only bars the filter passes light up.
+        const warm = gate * response;
+        const mix = (cold: number, hot: number) =>
+          Math.round(cold + (hot - cold) * warm);
+        ctx.fillStyle = `rgba(${mix(124, 240)}, ${mix(124, 204)}, ${mix(134, 128)}, ${0.4 + 0.55 * warm})`;
+        ctx.shadowBlur = warm > 0.25 ? 10 * warm : 0;
+        ctx.shadowColor = `rgba(${BRASS}, ${0.7 * warm})`;
+        const bx = i * step + (step - barW) / 2;
+        ctx.beginPath();
+        ctx.roundRect(bx, height - barH, barW, barH, barW / 2);
+        ctx.fill();
+      }
+      ctx.shadowBlur = 0;
+    };
+
+    const resize = () => {
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const rect = canvas.getBoundingClientRect();
+      width = rect.width;
+      height = rect.height;
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      // Resizing clears the bitmap, and with no loop running nothing would
+      // repaint it.
+      if (reduce) render(0);
+    };
+
+    let raf = 0;
+    let last = 0;
+    const loop = (now: number) => {
+      const dt = last ? Math.min(0.05, (now - last) / 1000) : 0;
+      last = now;
+      // Exponential approach, so the ease is the same at 60Hz and 120Hz.
+      gate += ((hovered.current ? 1 : 0) - gate) * (1 - Math.exp(-dt * 9));
+      render(now / 1000);
+      raf = requestAnimationFrame(loop);
+    };
+
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(canvas);
+    // Reduced motion still gets the meter, just held on a single frame.
+    if (reduce) render(0);
+    else raf = requestAnimationFrame(loop);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      observer.disconnect();
+    };
+  }, []);
+
+  return (
+    <>
+      {/* href + precedence is React 19's hoist path: the rules land in <head>
+          and dedupe by href instead of sitting loose in the body. */}
+      <style href="pb-download" precedence="default">
+        {DOWNLOAD_CSS}
+      </style>
+      <a
+        className="pb-dl"
+        href="/download/latest"
+        onPointerEnter={() => (hovered.current = true)}
+        onPointerLeave={() => (hovered.current = false)}
+        onFocus={() => (hovered.current = true)}
+        onBlur={() => (hovered.current = false)}
+      >
+        <canvas ref={canvasRef} className="pb-dl-meter" aria-hidden="true" />
+        <svg
+          className="pb-dl-arrow"
+          width="14"
+          height="15"
+          viewBox="0 0 14 15"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M7 1.5v8.2m0 0 3.3-3.3M7 9.7 3.7 6.4" />
+          <path d="M1.4 13.2h11.2" />
+        </svg>
+        <span className="pb-dl-label">download the client</span>
+      </a>
+    </>
+  );
+}
+
 // Same corner links on every React page, so /waitlist reads as a sibling of
 // the homepage rather than a detour off the site.
 function CornerLinks() {
@@ -299,12 +534,7 @@ export function App() {
         />
         <h1 style={styles.title}>Passband</h1>
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <a style={{ ...styles.button, marginTop: "0.5rem" }} href="/download/latest">
-          download the client
-        </a>
-        <a style={styles.link} href="/waitlist">
-          want it hosted? join the waitlist
-        </a>
+        <DownloadButton />
       </div>
       <CornerLinks />
     </main>
