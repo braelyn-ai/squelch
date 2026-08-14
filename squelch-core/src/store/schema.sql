@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS triage (
     -- a 'skip-*' sentinel. Queue predicate: `category IN (<extractable>) AND
     -- extractor_model_used IS NULL AND sensitivity='normal'`.
     extractor_model_used TEXT,
+    -- SHIPMENTS-EXTRACTOR trigger + marker, stamped at INGEST from a LOOSE
+    -- shipping signal (`triage::shipment::has_loose_shipping_signal`) rather than
+    -- from an LLM category:
+    --   NULL        no shipping signal at ingest — this row never queues.
+    --   'pending'   queued for the shipments extractor.
+    --   anything    a processed marker: the extractor model id, or one of the
+    --               'stale-skip' / 'apply-failed' / 'extract-failed' sentinels.
+    -- Its own column and its own queue BECAUSE the extract queue routes on
+    -- `triage.category` (there is no shipping category) and excludes
+    -- receipt-bearing rows, which most order confirmations are. Re-ingest
+    -- PRESERVES a processed marker and only refreshes 'pending'; sealing NULLs
+    -- it, and retriage re-pends it.
+    ship_extract_model TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,
@@ -169,10 +182,98 @@ CREATE TABLE IF NOT EXISTS shipments (
     last_message_id INTEGER,
     first_seen      TEXT NOT NULL,
     last_update     TEXT NOT NULL,
+    -- CARRIER POLLING. Everything below is filled by the carrier API, never by
+    -- mail, and NULL/0 until the first poll. The carrier is ground truth for
+    -- `status` (see `triage::shipment::ShipmentStatus::reconcile_carrier`), but
+    -- a poll NEVER moves `last_message_id` — no message backs it.
+    --
+    -- The carrier's own latest status string, verbatim. Recorded even when it
+    -- maps to no `status` value, so the client can show what the carrier said.
+    carrier_status_raw TEXT,
+    -- Carrier-estimated delivery; NULL when the carrier gives none.
+    eta             TEXT,
+    -- When the package landed, stamped by whichever path saw it first (a
+    -- delivered email or a poll) and never overwritten after.
+    delivered_at    TEXT,
+    -- Last poll ATTEMPT, success or permanent failure. NULL = never polled.
+    last_polled_at  TEXT,
+    -- Consecutive PERMANENT poll failures (an unknown/expired number), the
+    -- retirement cap for the poll queue. Transient errors do not count, and a
+    -- successful poll resets it to 0.
+    poll_failures   INTEGER NOT NULL DEFAULT 0,
+    -- The RETAILER's identifier for the purchase ("112-3456789-1234567"), when
+    -- the mail carried one. NOT a dedupe key — `tracking_number` still is — but
+    -- the join back to `shipment_orders`, so a tracking-bearing email can absorb
+    -- the staged order it belongs to. NULL when no order reference was found.
+    order_ref       TEXT,
+    -- The MERCHANT NAMESPACE for `order_ref`: the registrable domain of the
+    -- feeding message's sender, lowercased. An order reference is only unique
+    -- WITHIN a merchant — "Order #1042" from two shops is two purchases — so
+    -- every order_ref lookup is scoped by this column. NULL alongside a NULL
+    -- order_ref, and on rows written before the column existed.
+    order_merchant  TEXT,
+    -- IMMUTABLE PROVENANCE: the message that CREATED this row, written once on
+    -- INSERT and never updated. `last_message_id` moves to whichever mail most
+    -- recently advanced the row, so it answers "who touched this last", not
+    -- "who minted this" — and the extractor's phantom reaping must only ever
+    -- reach rows the message in hand actually created.
+    created_by_message_id INTEGER,
+    -- Which message's extraction supplied the CURRENT `item_name`. Usually
+    -- `last_message_id`, but three paths DONATE a name onto a row another mail
+    -- feeds (staged-order promotion, the order-ref-only adoption, the thread
+    -- adoption), and sealing a message must scrub the text it contributed
+    -- wherever it landed. NULL when no name, or on pre-column rows.
+    item_name_msg   INTEGER,
+    -- USER CLEAR (RFC3339, NULL = not cleared): the user said "stop showing me
+    -- this". READ-SIDE ONLY, and it is never un-set: a listing hides the row
+    -- only while `last_update <= cleared_at`, so the moment anything advances
+    -- `last_update` past this stamp the row returns by itself. The row keeps
+    -- being polled the whole time — polling is what produces that update.
+    cleared_at      TEXT,
     UNIQUE(account_id, tracking_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(account_id, status);
+-- `idx_shipments_order_ref ON shipments(account_id, order_ref)` is created in
+-- migrate.rs, NOT here. This file runs in full on every open, BEFORE the column
+-- migrations, so an index over a migrated column would fail ("no such column:
+-- order_ref") on every pre-existing DB and make the store unopenable.
+
+-- ORDERS STAGING. A purchase the shipments extractor recognized but that carries
+-- NO TRACKING NUMBER yet (the order confirmation arrives days before the ship
+-- notice). Keyed by (account, merchant, order_ref) instead of a tracking number,
+-- so it cannot live in `shipments` — that table's identity IS the tracking
+-- number. When the ship notice lands with both the order reference and a number,
+-- the staged row is promoted into `shipments` and deleted here.
+--
+-- The MERCHANT is part of the key on purpose: "Order #1042" is unique only
+-- within the shop that issued it, and an unnamespaced key lets one retailer's
+-- confirmation donate its product name onto another retailer's package.
+-- `order_merchant` is NOT NULL (defaulting to '' for an underivable sender)
+-- because SQLite treats every NULL in a UNIQUE index as distinct, which would
+-- silently disable the staging upsert's ON CONFLICT.
+--
+-- SECURITY: written only from the shipments extractor, whose queue gates on
+-- sensitivity='normal', so this table has no sealed rows BY CONSTRUCTION.
+-- Sealing a message still deletes the rows it fed and scrubs the names it merely
+-- donated (`item_name_msg`), and so does a re-triage.
+CREATE TABLE IF NOT EXISTS shipment_orders (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    order_ref TEXT NOT NULL,
+    order_merchant TEXT NOT NULL DEFAULT '',
+    item_name TEXT NOT NULL DEFAULT '',
+    thread_id TEXT NOT NULL DEFAULT '',
+    last_message_id INTEGER,
+    -- Which message's extraction supplied the CURRENT `item_name` — the pointer
+    -- above moves to the latest feeder, so it cannot answer that on its own.
+    item_name_msg INTEGER,
+    first_seen TEXT NOT NULL,
+    last_update TEXT NOT NULL,
+    UNIQUE(account_id, order_merchant, order_ref)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shipment_orders_msg ON shipment_orders(account_id, last_message_id);
 
 -- RECEIPTS. One row per (account, message): money ALREADY PAID, extracted from
 -- NON-SEALED past-transaction mail. Records, not obligations — auto-resolved

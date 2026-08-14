@@ -164,7 +164,8 @@ impl SqliteStore {
         // extracted rows.
         if matches!(axis, TriageAxis::Sensitivity) && to_value == "sealed" {
             tx.execute(
-                "UPDATE triage SET category = NULL, extractor_model_used = NULL
+                "UPDATE triage SET category = NULL, extractor_model_used = NULL,
+                        ship_extract_model = NULL
                  WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
@@ -185,6 +186,36 @@ impl SqliteStore {
             // seal, same as the draft below.
             tx.execute(
                 "DELETE FROM shipments WHERE account_id = ?1 AND last_message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            // AND THE NAMES IT MERELY DONATED. The delete above only reaches rows
+            // whose LATEST feeder is this message, but three extractor paths write
+            // an item name onto a row a DIFFERENT message feeds (a promoted staged
+            // order, the order-reference adoption, the thread adoption). Without
+            // this, text extracted from mail the user just called auth keeps
+            // rendering on the Sitrep and both doors — the exact leak the delete
+            // above exists to prevent. `item_name_msg` names the message whose
+            // extraction supplied the CURRENT name, so scrubbing by it is exact:
+            // the package survives (it is someone else's row), only the sealed
+            // mail's words go.
+            tx.execute(
+                "UPDATE shipments SET item_name = '', item_name_msg = NULL
+                 WHERE account_id = ?1 AND item_name_msg = ?2",
+                params![account_id, message_id],
+            )?;
+            // Staged orders go with them, for the same reason and with less to
+            // weigh: a `shipment_orders` row is nothing BUT mail-derived content
+            // (order reference, item name, thread) and carries no poll state.
+            tx.execute(
+                "DELETE FROM shipment_orders WHERE account_id = ?1 AND last_message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            // Same donation hole one table over: a staging row's pointer moves to
+            // the latest mail about that order, so a name an earlier one wrote
+            // outlives its seal unless it is scrubbed by provenance too.
+            tx.execute(
+                "UPDATE shipment_orders SET item_name = '', item_name_msg = NULL
+                 WHERE account_id = ?1 AND item_name_msg = ?2",
                 params![account_id, message_id],
             )?;
             // And the LOCAL DRAFT replying to it, for the same reason: `put_draft`

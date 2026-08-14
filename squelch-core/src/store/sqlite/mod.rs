@@ -482,8 +482,51 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
-        self.list_shipments(account_id, include_delivered)
+        self.list_shipments(account_id, include_delivered, policy)
+    }
+
+    fn clear_shipment(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.clear_shipment(account_id, shipment_id, at)
+    }
+
+    fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {
+        self.shipments_redetect_cleanup(account_id)
+    }
+
+    fn list_pollable_shipments(
+        &self,
+        account_id: AccountId,
+        min_first_seen: DateTime<Utc>,
+        max_failures: u32,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        self.list_pollable_shipments(account_id, min_first_seen, max_failures)
+    }
+
+    fn apply_carrier_track(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        track: &crate::triage::CarrierTrack,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.apply_carrier_track(account_id, shipment_id, track, polled_at)
+    }
+
+    fn record_poll_outcome(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        polled_at: DateTime<Utc>,
+        permanent_failure: bool,
+    ) -> Result<()> {
+        self.record_poll_outcome(account_id, shipment_id, polled_at, permanent_failure)
     }
 
     fn upsert_receipt(
@@ -516,6 +559,30 @@ impl Store for SqliteStore {
         limit: usize,
     ) -> Result<Vec<ExtractQueued>> {
         self.extract_queue(account_id, categories, limit)
+    }
+
+    fn ship_extract_queue(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<ExtractQueued>> {
+        self.ship_extract_queue(account_id, limit)
+    }
+
+    fn ship_extract_mark(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        marker: &str,
+    ) -> Result<()> {
+        self.ship_extract_mark(account_id, message_id, marker)
+    }
+
+    fn shipments_extract_apply(
+        &self,
+        applied: &crate::triage::extract::shipments::ShipmentsApplied,
+    ) -> Result<bool> {
+        self.shipments_extract_apply(applied)
     }
 
     fn retriage_reset(

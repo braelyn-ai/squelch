@@ -104,19 +104,41 @@ fn same_origin(state: &ControlState, headers: &HeaderMap) -> bool {
 /// [`same_origin`] against a stated origin, so it can be tested without a
 /// deployment's whole config behind it.
 ///
+/// TWO SOURCES, AND THE STATED ORIGIN IS NOT ALWAYS THE BETTER ONE. `Origin` is
+/// the specific answer when it names something, and `Sec-Fetch-Site` is the
+/// unforgeable one: it is a `Sec-` prefixed forbidden header name, so no page,
+/// no script, and no `fetch` option can write it, and only the browser that
+/// built the request decides its value. That is why the fallbacks below lean on
+/// it rather than on failing closed.
+///
 /// The trailing slash is trimmed off BOTH sides. A serialized origin has no
-/// path, so no browser sends one, but a proxy or an extension that rewrites the
-/// header is not a browser and does not always agree; matching on that is a
-/// lockout with no error to read, which is exactly the failure this module has
-/// already cost an operator once.
+/// path, so no browser sends one, but something that rewrites the header in
+/// flight is not a browser and does not always agree; matching on that is a
+/// lockout with no error to read.
 fn origin_matches(expected: &str, headers: &HeaderMap) -> bool {
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        return origin.trim_end_matches('/') == expected.trim_end_matches('/');
-    }
-    match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+    let site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
         // "none" is a typed URL or a bookmark, which no other page can forge.
-        Some(site) => site == "same-origin" || site == "none",
-        None => true,
+        .map(|site| site == "same-origin" || site == "none");
+
+    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        // `null` is an origin the browser declined to NAME: a sandboxed frame,
+        // a redirect chain, or a header rewritten by a proxy between the form
+        // and this service. It is the absence of a stated origin rather than a
+        // statement of a different one, so matching it against ours refuses a
+        // request the browser itself calls same-origin. Deciding it on fetch
+        // metadata is not a loosening: a cross-site page's POST arrives with
+        // `cross-site` written by the browser and is refused here, and an
+        // attacker cannot write that header at all. Absent metadata IS refused,
+        // which is stricter than the no-Origin case below: a client that sends
+        // `null` and no metadata is claiming an opaque origin with nothing to
+        // corroborate it. Found live 2026-08-14, on an operator's own browser.
+        Some("null") => site.unwrap_or(false),
+        Some(origin) => origin.trim_end_matches('/') == expected.trim_end_matches('/'),
+        // Nothing stated at all. A request with neither header is not a browser
+        // making it, and the cookie is still required.
+        None => site.unwrap_or(true),
     }
 }
 
@@ -549,6 +571,33 @@ mod tests {
             &format!("{HERE}/"),
             &headers(&[("origin", HERE)])
         ));
+    }
+
+    #[test]
+    fn an_unnamed_origin_is_decided_by_the_header_no_page_can_write() {
+        // The browser calls it same-origin; the Origin header did not survive
+        // whatever sat between the form and here.
+        assert!(origin_matches(
+            HERE,
+            &headers(&[("origin", "null"), ("sec-fetch-site", "same-origin")])
+        ));
+        assert!(origin_matches(
+            HERE,
+            &headers(&[("origin", "null"), ("sec-fetch-site", "none")])
+        ));
+        // A sandboxed frame on somebody else's page is still somebody else's
+        // page, and the browser says so.
+        assert!(!origin_matches(
+            HERE,
+            &headers(&[("origin", "null"), ("sec-fetch-site", "cross-site")])
+        ));
+        assert!(!origin_matches(
+            HERE,
+            &headers(&[("origin", "null"), ("sec-fetch-site", "same-site")])
+        ));
+        // Opaque and uncorroborated: refused, where a request stating no origin
+        // at all is not. Nothing that reaches here is a browser.
+        assert!(!origin_matches(HERE, &headers(&[("origin", "null")])));
     }
 
     #[test]

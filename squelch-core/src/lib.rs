@@ -4,6 +4,7 @@
 //! redacted — see docs/SECURITY.md §4, [`store`], and [`triage::seal`].
 
 pub mod auth;
+pub mod carriers;
 pub mod config;
 pub mod credentials;
 pub mod embed;

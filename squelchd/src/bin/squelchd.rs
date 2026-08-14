@@ -1538,7 +1538,16 @@ fn build_serve_router(
     api_state: squelch_api::ApiState,
     mcp_cancel: CancellationToken,
 ) -> anyhow::Result<axum::Router> {
-    let mcp_service = squelch_mcp::streamable_http_service(store, account_email, mcp_cancel)?;
+    // The agent door gets the HUMAN DOOR'S OWN listing policy, read back off the
+    // state rather than resolved from config a second time: the two doors must
+    // agree about which packages exist, and the way that broke before was each
+    // side deciding for itself.
+    let mcp_service = squelch_mcp::streamable_http_service(
+        store,
+        account_email,
+        api_state.shipment_policy(),
+        mcp_cancel,
+    )?;
     let app = squelch_api::router(api_state).nest_service(squelch_mcp::MCP_PATH, mcp_service);
     Ok(app)
 }
@@ -1622,6 +1631,31 @@ fn cmd_serve(
     // reads it. Built here so both sides get the same Arc.
     let sync_metrics = squelch_core::metrics::SyncMetrics::new();
 
+    // The carrier poller keeps the shipments tracker moving between emails.
+    // CARRIER CREDENTIALS ARE ITS ONLY FEATURE FLAG: with none configured
+    // `from_config` returns None and no carrier API is ever contacted. Built
+    // after the metrics registry so its polls land in the same scrape as
+    // everything else.
+    let shipment_poller = match squelch_core::carriers::poller::ShipmentPoller::from_config(
+        store.clone() as Arc<dyn squelch_core::store::Store>,
+        account_id,
+        &config,
+    ) {
+        Ok(poller) => poller.map(|p| p.with_metrics(sync_metrics.clone())),
+        Err(e) => {
+            eprintln!(
+                "squelchd: shipment poller NOT started: carriers are configured but the poller could not be built: {e}"
+            );
+            None
+        }
+    };
+    // The kick handle + the carriers behind it, for `POST /client/shipments/poll`.
+    // Taken here because `run` consumes the poller below; `None` when no poller
+    // was built, which the endpoint reports as `kicked: false`.
+    let shipment_kick = shipment_poller
+        .as_ref()
+        .map(|p| (p.kick_handle(), p.enabled_carriers()));
+
     // The human door SERVES WITH OR WITHOUT SQUELCH_API_TOKEN. Without it the
     // door accepts only the per-device tokens in the store, and a daemon with
     // neither still comes up 401ing everything: pairing is how the first
@@ -1633,6 +1667,13 @@ fn cmd_serve(
         .map_err(|e| other_err(format!("{e}")))?
         .with_refresh(refresh.clone())
         .with_event_notifier(event_tx);
+    // Carrier polling is BYOK, so the no-poller path is the common one and is
+    // spelled out rather than left implicit: the door still serves
+    // `/client/shipments/poll`, it just answers `kicked: false`.
+    let api_state = match shipment_kick {
+        Some((kick, carriers)) => api_state.with_shipment_poll_kick(kick, carriers),
+        None => api_state,
+    };
 
     let runtime = build_runtime()?;
     runtime.block_on(async move {
@@ -1674,6 +1715,27 @@ fn cmd_serve(
             None => {
                 eprintln!(
                     "squelchd: opens poller disabled (no SQUELCH_RELAY_URL / [pusher] relay_url)"
+                );
+                None
+            }
+        };
+
+        // Polls the carrier APIs for shipments detected in mail. Same shape as
+        // the two above: shares the shutdown watch, awaited on the way out.
+        let shipment_handle = match shipment_poller {
+            Some(poller) => {
+                eprintln!(
+                    "squelchd: shipment poller enabled (carriers: {})",
+                    poller.enabled_carriers().join(", ")
+                );
+                let shutdown_rx = shutdown_rx.clone();
+                Some(tokio::spawn(async move { poller.run(shutdown_rx).await }))
+            }
+            None => {
+                // The normal case — carrier polling is BYOK — so a detail, not a
+                // warning.
+                eprintln!(
+                    "squelchd: shipment poller disabled (no carrier credentials in [carriers])"
                 );
                 None
             }
@@ -1725,6 +1787,31 @@ fn cmd_serve(
                     eprintln!(
                         "squelchd: sent-recipients backfill incomplete (retries next start): {e}"
                     );
+                }
+            });
+        }
+
+        // One-shot shipment re-detect: the tracking-number detector was tightened
+        // (eBay item ids and marketing digit-runs used to mint phantom rows), so
+        // every existing row is re-judged against its own feeder message ONCE and
+        // the ones the detector no longer produces are deleted. Store-only and
+        // fast, so it runs inline on a blocking thread rather than on a delay —
+        // no network, no Gmail quota.
+        //
+        // The ONCE is the store's job, not this call site's: it checks and writes
+        // its own done-flag in the SAME TRANSACTION as the deletions, so the pass
+        // cannot complete without being recorded. A re-run that skipped an
+        // unrecorded pass would reap the rows the extractor has since written,
+        // which no regex can reproduce. A failure here simply retries next start.
+        {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                match store.shipments_redetect_cleanup(account_id) {
+                    // Count only — a tracking number is never logged.
+                    Ok(n) => {
+                        eprintln!("squelchd: shipment re-detect removed {n} stale shipment row(s)")
+                    }
+                    Err(_) => eprintln!("squelchd: shipment re-detect failed (retries next start)"),
                 }
             });
         }
@@ -1865,6 +1952,13 @@ fn cmd_serve(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("squelchd: opens poller ended with error: {e}"),
                 Err(e) => eprintln!("squelchd: opens poller task join error: {e}"),
+            }
+        }
+        if let Some(handle) = shipment_handle {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("squelchd: shipment poller ended with error: {e}"),
+                Err(e) => eprintln!("squelchd: shipment poller task join error: {e}"),
             }
         }
         if let Some(handle) = metrics_handle {

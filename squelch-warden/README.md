@@ -146,9 +146,10 @@ unbounded tenant is every other tenant's problem. The daemon's numbers come from
 config; the init container's are fixed and tiny. The namespace-wide ceiling is
 `deploy/hosted/70-tenant-limits.yaml`.
 
-Its environment carries the tenant's mailbox address, the Google OAuth client and
-the Anthropic API key by `secretKeyRef` only, never inline: an address in a pod
-spec is an address in `kubectl get deploy -o yaml`, and so is a client secret.
+Its environment carries the tenant's mailbox address, the Google OAuth client
+and, when a gateway is configured, the tenant's virtual LLM key — each by
+`secretKeyRef` only, never inline: an address in a pod spec is an address in
+`kubectl get deploy -o yaml`, and so is a client secret.
 
 The image's entrypoint is bypassed (`command: /usr/local/bin/squelchd`,
 `args: serve`) because `docker-entrypoint.sh` starts as root to chown the volume
@@ -184,6 +185,13 @@ reference is **optional**: an unminted tenant resolves no key at all and runs
 heuristic-only triage, rather than wedging in `CreateContainerConfigError`. No
 tenant ever holds a real provider key; the gateway holds the one real key and
 meters each virtual key against its budget.
+
+Both claims hold for every pod this warden renders — and only those. A tenant
+provisioned before the shared-key bridge was removed still carries the legacy
+`ANTHROPIC_API_KEY` env from its old spec, and its Stage-2 calls are failing
+with 401s rather than idling, until `squelch-control llm mint` re-applies its
+Deployment. The migration steps live in `deploy/hosted/PRODUCTION.md`,
+"History".
 
 ### The console's Google link
 

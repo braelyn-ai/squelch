@@ -197,6 +197,12 @@ enum Fmt {
         then.formatted(.dateTime.month(.abbreviated).day().hour().minute())
     }
 
+    /// Weekday alone, like "Tue". Only unambiguous inside a week of today, so
+    /// the caller owns the window and falls back to `shortDate` outside it.
+    static func weekday(_ iso: String?) -> String {
+        rendered(iso, "w|") { $0.formatted(.dateTime.weekday(.abbreviated)) }
+    }
+
     /// Time-of-day like "3:00 PM" (calendar rail).
     static func timeOfDay(_ iso: String?) -> String {
         rendered(iso, "t|") { $0.formatted(.dateTime.hour().minute()) }

@@ -45,7 +45,7 @@ numbered as the source comments number them:
    `WKUserScript` is governed separately and still runs.
 3. CSP injected as the FIRST child of `<head>` by
    `Coordinator.document(html:allowRemote:)`: `default-src 'none'; style-src
-   'unsafe-inline'; img-src squelch-img: data:` (or `img-src data:` alone when
+   'unsafe-inline'; img-src passband-img: data:` (or `img-src data:` alone when
    remote images are off), plus `<meta name="referrer" content="no-referrer">`. No
    `script-src`, and no `http:`/`https:` anywhere in the policy.
 4. Navigation refused. `Coordinator.decideNavigation` allows exactly the loads we
@@ -103,7 +103,7 @@ refuses it before the handler is reached).
   email-authentication verdict is a pass. When it is true
   `EmailWebView.Prepared.make` renders the unstripped body: someone the user
   writes to is allowed to learn they opened the mail. The bypass is scoped to
-  `Trackers.strip` ALONE — `ImageProxy.rewrite`, the `squelch-img:` CSP, the
+  `Trackers.strip` ALONE — `ImageProxy.rewrite`, the `passband-img:` CSP, the
   ingest sanitizer, and the remote-images default all still apply, so an allowed
   pixel still needs remote images on before it fetches. `allowTrackers` is part of
   `Prepared.cacheKey`, and `ImageWarmer` always prefetches the STRIPPED body so
@@ -149,15 +149,17 @@ refuses it before the handler is reached).
     relationship is checked here instead of assumed.
 - `Lib/ImageProxy.swift:rewrite` rewrites every http(s) image reference — `<img
   src>`, `style="…"` `url()`, `<style>` block CSS — to
-  `squelch-img://local/<hmac>?u=<encoded>`. `@import`/`@font-face` are skipped on
-  purpose: they load no image, are dead under `default-src 'none'`, and rewriting
-  them would hand the launch warmer requests the reader never made.
+  `passband-img://local/<hmac>?u=<encoded>`. Default-port `http://` targets are
+  upgraded by splicing only the scheme to satisfy App Transport Security without
+  normalizing or otherwise changing the source URL. `@import`/`@font-face` are
+  skipped on purpose: they load no image, are dead under `default-src 'none'`,
+  and rewriting them would hand the launch warmer requests the reader never made.
 - `Model/ImageSchemeHandler.swift` is the only responder and
   `ImageProxy.original(from:)` its only parser: it requires this launch's HMAC and
   an http(s) target. The key is 256 random bits per process, never written down, so
   a signature cannot be replayed across launches. Provenance, not secrecy — mail can
-  spell `squelch-img:` itself in a kept `<style>` block, which `rewrite` neuters to
-  `squelch-img-blocked:` before minting anything.
+  spell `passband-img:` itself in a kept `<style>` block, which `rewrite` neuters to
+  `passband-img-blocked:` before minting anything.
 - `Model/ImageStore.swift` owns the fetch: ephemeral session, no cookies, empty
   referrer, `image/*` only, redirects re-guarded per hop, files named `sha256(url)`
   and a manifest holding **no URLs** — a directory listing the reader's mail URLs
@@ -172,7 +174,7 @@ refuses it before the handler is reached).
 - Never put `http:`/`https:` back in `img-src`. That one change turns every missed
   rewrite from a broken-image glyph into an un-proxied request, and reopens the
   CSS-background gap `html.rs` used to document as a KNOWN TRADE-OFF.
-- Keep the signature check: without it a hand-written `url(squelch-img://…)` in a
+- Keep the signature check: without it a hand-written `url(passband-img://…)` in a
   kept `<style>` fetches a tracker while the UI says the mail has no remote content.
 - `auth_pass` is three-valued and the comparison must stay `== Some(true)`. Any
   rewrite that treats NULL as a pass — `!= Some(false)`, `unwrap_or(true)`, a
@@ -183,12 +185,6 @@ refuses it before the handler is reached).
   `Message::header_raw` resolves to the LAST occurrence — the forgeable one — and
   `headers_raw()` DROPS non-UTF-8 headers, which would let an attacker hide the
   genuine verdict and promote one they wrote.
-- **Stale comment, flagged:** `Lib/Trackers.swift`'s header still calls the CSP
-  `img-src http:/https:/data:` — that predates `ImageProxy`; the live policy is
-  `squelch-img: data:`. Its argument still holds (a host-agnostic CSP cannot tell
-  a tracker from a hero image, so the strip pass is the only seam that can); only
-  the parenthetical is wrong.
-
 ## 4. Sealed mail and the two-door split
 
 **Invariant.** Auth mail (OTPs, password resets, magic links, login alerts,
@@ -271,16 +267,35 @@ shows a browser for what it is.
 | `GET /console/callback?code=` | the same claim, on a code the control plane minted. Nothing about the hop is trusted here: a code that was burned, replayed, expired or never minted fails exactly like a typo |
 | `POST /console/pair`, `POST /console/revoke/{id}`, `POST /console/logout` | a verified session cookie, checked ahead of the handler |
 
-**Cookie posture.** `HttpOnly`, `SameSite=Strict`, `Path=/`, no `Domain`,
-`Secure` whenever the request arrived over https, 30-day `Max-Age`. Deliberately
+**Cookie posture.** `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, `Secure`
+whenever the origin is https, 30-day `Max-Age`. Deliberately
 **not** `__Host-` prefixed: the prefix requires `Secure`, a plain-http loopback
 run cannot set it, and a cookie name that only works in production is a name
 whose absence nobody notices until production — so the two properties the prefix
-would buy are set explicitly instead. Sign-out **revokes** the token rather than
+would buy are set explicitly instead. `Lax` and not `Strict`, which was learned
+live: the SSO landing is a navigation chain that started at accounts.google.com,
+Chrome withholds `Strict` cookies from every request in a cross-site-initiated
+chain including the same-site 303 hop back to `/console`, and the first thing a
+freshly signed-in user saw was the login page again. `Lax` still withholds the
+cookie from cross-site POSTs, and the mutating routes are guarded below
+regardless. Sign-out **revokes** the token rather than
 only dropping the cookie, and every refusal of a cookie that would not verify
 clears it on the way out.
 
-**CSRF, two independent controls.** `SameSite=Strict`, plus an
+**The one escape hatch: `[console] allow_insecure_cookie`.** Off by default and
+meant to stay there. It exists for the self-host serving the console over plain
+http on a LAN, who otherwise has a console that cannot work at all: a browser
+will not store a `Secure` cookie from `http://`. It is read as a statement about
+the whole origin rather than as a cookie flag, so with it on the daemon also
+builds its pairing deep link with `http://`, compares `Origin` against that same
+`http://` origin, and stops offering the SSO link. Those move together
+deliberately: a login page that renders and then refuses the POST from it is not
+a working console. **The cookie is a live device token**, so turning this on puts
+a revocable credential on the wire in the clear for anything on the path to take,
+and it is the reason to prefer TLS or loopback. When it is on, the login page
+carries a banner and the daemon warns at startup.
+
+**CSRF, two independent controls.** `SameSite=Lax`, plus an
 `Origin`/`Sec-Fetch-Site` check in front of every mutating POST — including the
 *unauthenticated* login POST, so a cross-site page cannot sign a browser into an
 account of the attacker's choosing either. `Sec-Fetch-Site` is believed

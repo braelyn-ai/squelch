@@ -4,7 +4,7 @@
 //! asserts on what arrived, or on what deliberately did not.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -21,6 +21,11 @@ use common::{authed, state_with};
 
 /// How long a read waits before the test calls the stream hung.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Total budget for a shutdown to actually close a body. Longer than
+/// [`READ_TIMEOUT`] on purpose: this one is only ever spent in full when the
+/// test is about to FAIL, so it buys tolerance for a loaded CI runner at no
+/// cost to the passing path, and the failure it reports is unambiguous.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long "nothing should arrive" waits before believing it.
 const QUIET: Duration = Duration::from_millis(300);
 
@@ -160,6 +165,35 @@ impl Reader {
         self.next_within(READ_TIMEOUT)
             .await
             .unwrap_or_else(|| panic!("expected an SSE frame (stream ended: {})", self.ended))
+    }
+
+    /// Read until the body ENDS, up to `wait` in total, returning whatever
+    /// arrived first. Panics if the stream is still open when the budget runs
+    /// out, which is the one failure worth telling apart: a HUNG connection.
+    ///
+    /// Shutdown is a race the test must not care about. The signal and the
+    /// replay drain are two arms of one `select!`, so a frame already queued
+    /// when the flag flips is allowed out ahead of the close, and a busy runner
+    /// can put the whole thing after an arbitrary scheduling delay. Neither is
+    /// a bug. Asserting on a SINGLE read conflates all three of "a frame came
+    /// first", "the scheduler was slow" and "the connection hung", because
+    /// [`Reader::next_within`] answers `None` to the first two as well.
+    async fn drain_until_end(&mut self, wait: Duration) -> Vec<Frame> {
+        let deadline = Instant::now() + wait;
+        let mut frames = Vec::new();
+        while !self.ended {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "stream still open after {wait:?}, not ended"
+            );
+            if let Some(frame) = self.next_within(left).await {
+                frames.push(frame);
+            } else {
+                assert!(self.ended, "stream still open after {wait:?}, not ended");
+            }
+        }
+        frames
     }
 
     /// Assert nothing arrives for `QUIET`.
@@ -427,11 +461,12 @@ async fn stream_ends_when_the_daemon_shuts_down() {
 
     h.shutdown.send(true).unwrap();
 
+    // The body must actually END, not just go quiet: `drain_until_end` panics
+    // rather than returning if it is still open when the budget runs out.
     assert!(
-        r.next_within(READ_TIMEOUT).await.is_none(),
+        r.drain_until_end(SHUTDOWN_TIMEOUT).await.is_empty(),
         "no further frames"
     );
-    assert!(r.ended, "the body must actually END, not just go quiet");
 }
 
 #[tokio::test]
@@ -441,11 +476,10 @@ async fn a_stream_opened_after_shutdown_ends_immediately() {
     h.shutdown.send(true).unwrap();
 
     // `wait_for` checks the CURRENT value first, so an already-flipped signal
-    // closes the stream instead of being missed until the next change.
+    // closes the stream instead of being missed until the next change. Whether
+    // the seeded event escapes ahead of the close is the `select!` arms racing
+    // and is not what this asserts: already-shutting-down means END, not a hung
+    // connection, and `drain_until_end` panics on the hang.
     let mut r = open(&h, "/client/events?after=0").await;
-    let _ = r.next_within(READ_TIMEOUT).await;
-    assert!(
-        r.ended,
-        "already-shutting-down means end, not a hung connection"
-    );
+    r.drain_until_end(SHUTDOWN_TIMEOUT).await;
 }
