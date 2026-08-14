@@ -14,6 +14,8 @@ pub const ENV_DB_PATH_LEGACY: &str = "SQUELCH_DB";
 pub const ENV_ACCOUNT_EMAIL: &str = "SQUELCH_ACCOUNT_EMAIL";
 /// Legacy alias for [`ENV_ACCOUNT_EMAIL`], silently accepted with a deprecation note.
 pub const ENV_ACCOUNT_EMAIL_LEGACY: &str = "SQUELCH_ACCOUNT";
+/// Account every binary falls back to when neither env var is set.
+pub const DEFAULT_ACCOUNT_EMAIL: &str = "me@localhost";
 /// Comma-separated extra hostnames for the agent door's DNS-rebinding guard,
 /// additive to the loopback defaults (a `tailscale serve` proxy rewrites `Host`).
 pub const ENV_MCP_ALLOWED_HOSTS: &str = "SQUELCH_MCP_ALLOWED_HOSTS";
@@ -62,6 +64,13 @@ pub fn resolve_db_path() -> PathBuf {
 pub fn resolve_account_email(default_email: &str) -> String {
     env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY)
         .unwrap_or_else(|| default_email.to_string())
+}
+
+/// [`resolve_account_email`] against [`DEFAULT_ACCOUNT_EMAIL`]. The single
+/// source of truth for every binary, so they cannot drift onto separate
+/// accounts.
+pub fn account_email() -> String {
+    resolve_account_email(DEFAULT_ACCOUNT_EMAIL)
 }
 
 /// The agent-door DNS-rebinding allow-list: rmcp's loopback defaults PLUS

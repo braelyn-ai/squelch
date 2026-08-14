@@ -123,10 +123,6 @@ pub fn build_user_message(want_text: &str) -> String {
     out
 }
 
-// ===========================================================================
-// Output schema + parsed struct.
-// ===========================================================================
-
 /// The JSON schema constraining the model's output: one closed enum, so parsing
 /// is a lookup and a rogue value is a `Failed` (hence `Filtered`), never a guess.
 pub fn output_schema() -> serde_json::Value {
@@ -151,10 +147,6 @@ pub struct RuleInferOutput {
 
 /// The outcome of one [`classify_at`] call.
 pub type InferOutcome = LlmOutcome<Disposition>;
-
-// ===========================================================================
-// The client handle.
-// ===========================================================================
 
 /// Everything one inference call needs: the shared reqwest client, the resolved
 /// key + provider, and the model id. Built once at startup and cloned into the
@@ -235,10 +227,6 @@ impl RuleInferClient {
         &self.model
     }
 }
-
-// ===========================================================================
-// Inference.
-// ===========================================================================
 
 /// Classify one `want_text` against an explicit endpoint. The raw form: it
 /// distinguishes a refusal from a failure so tests can assert both. Callers on
@@ -579,10 +567,7 @@ mod tests {
         assert_eq!(d, Disposition::Filtered);
     }
 
-    // ---- the wall-clock budget ---------------------------------------------
-
-    /// A server that accepts the connection and then says NOTHING, forever: the
-    /// shape that used to park the save behind the full retry ladder.
+    /// A server that accepts connections without responding.
     async fn mock_stalls_forever() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

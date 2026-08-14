@@ -4356,11 +4356,9 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
 async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
     // Blocking a sender from an email marks that email done; a surface rule is
     // tuning, not a verdict, and must leave its source open.
-    // Ids captured from the seeder, not inferred from a search ordering. They
-    // used to be taken as max/min, which had them BACKWARDS — spam is seeded
-    // first and therefore holds the LOWER id. Nothing caught it while the
-    // handler resolved whatever message id it was handed; resolving by sender
-    // reads the from_addr, so the mix-up became visible immediately.
+    // Ids captured from the seeder, not inferred from a search ordering: spam
+    // is seeded first and therefore holds the LOWER id, so max/min would have
+    // them backwards.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = harness(|store, acct| {
         seeded.borrow_mut().push(seed_unsub_msg(

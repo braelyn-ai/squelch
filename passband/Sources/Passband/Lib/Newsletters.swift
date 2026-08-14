@@ -227,12 +227,6 @@ enum Newsletters {
         out = out.replacing(/(?i)^\w[\w ]{0,24}?\bpromotion\s+(for|from|of)\s+/, with: "")
         out = out.trimmingCharacters(in: .whitespaces)
         if out.isEmpty { return summary.trimmingCharacters(in: .whitespaces) }
-        return out.prefix(1).uppercased() + out.dropFirst()
-    }
-
-    /// Truncate with an ellipsis, matching the card's copy budget.
-    static func truncate(_ s: String, _ n: Int) -> String {
-        guard s.count > n else { return s }
-        return s.prefix(n - 1).trimmingCharacters(in: .whitespaces) + "…"
+        return Fmt.capitalizingFirst(out)
     }
 }

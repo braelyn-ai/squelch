@@ -1,11 +1,10 @@
 //! GET /client/usage — the spend report.
 //!
 //! THE CONTRACT UNDER TEST is that the endpoint ENUMERATES the usage ledger
-//! rather than naming the categories it knows. It used to name `stage1` and
-//! `stage2` in a literal map, and `extract_banking` — written by an extractor
-//! added later — accrued for ten days without ever reaching the cost tab. So
-//! the load-bearing case here is a category this file invents: if that reports,
-//! an extractor added next year reports too, with no edit to the endpoint.
+//! rather than naming the categories it knows. A literal map of known
+//! categories silently drops whatever an extractor added later accrues. So the
+//! load-bearing case here is a category this file invents: if that reports, an
+//! extractor added next year reports too, with no edit to the endpoint.
 
 mod common;
 

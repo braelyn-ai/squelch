@@ -401,13 +401,7 @@ fn noise(cfg: &Stage1Config, subject: &str, reason: &str) -> Stage1Result {
 fn short_subject(subject: &str) -> String {
     let s = subject.trim();
     let s = if s.is_empty() { "(no subject)" } else { s };
-    const MAX: usize = 120;
-    if s.chars().count() > MAX {
-        let truncated: String = s.chars().take(MAX - 1).collect();
-        format!("{truncated}…")
-    } else {
-        s.to_string()
-    }
+    crate::text::truncate_ellipsis(s, 120)
 }
 
 /// The first sender rule matching `from_addr`, plus its disposition. Prefer

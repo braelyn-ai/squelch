@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod push;
 pub mod store;
 pub mod sync;
+pub mod text;
 pub mod tracking;
 pub mod triage;
 pub mod types;

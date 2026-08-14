@@ -151,10 +151,6 @@ macro_rules! classify_entrypoint {
 }
 pub(crate) use classify_entrypoint;
 
-// ===========================================================================
-// Anthropic Messages API wire types.
-// ===========================================================================
-
 #[derive(Debug, Serialize)]
 struct MessagesRequest<'a> {
     model: &'a str,
@@ -318,10 +314,6 @@ impl From<Usage> for crate::store::UsageTokens {
         }
     }
 }
-
-// ===========================================================================
-// Provider paths.
-// ===========================================================================
 
 async fn classify_anthropic(
     http: &reqwest::Client,

@@ -3,7 +3,6 @@
 //! `--http [addr]` / `SQUELCH_MCP_HTTP`. Tool logic lives in [`server`].
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
@@ -28,17 +27,6 @@ enum Transport {
     Http(SocketAddr),
 }
 
-/// Resolve the SQLite path: `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` > XDG default.
-fn db_path() -> PathBuf {
-    squelch_core::config::resolve_db_path()
-}
-
-/// The account this server operates on: `SQUELCH_ACCOUNT_EMAIL` > legacy
-/// `SQUELCH_ACCOUNT` > default. Multi-account selection is future work.
-fn account_email() -> String {
-    squelch_core::config::resolve_account_email("me@localhost")
-}
-
 /// The operator's shipments LISTING policy, read from the same config file the
 /// daemon reads. The standalone bin has no `[carriers]` credentials to care
 /// about, but it must still honour `max_failures` / `stale_after_days`: an
@@ -50,8 +38,8 @@ fn shipment_policy() -> squelch_core::config::ShipmentListPolicy {
 
 /// Build the server object, so tests can construct it without binding a transport.
 fn build_server() -> anyhow::Result<SquelchServer> {
-    let store = Arc::new(SqliteStore::open(db_path())?);
-    Ok(SquelchServer::new(store, &account_email())?.with_shipment_policy(shipment_policy()))
+    let store = Arc::new(SqliteStore::open(squelch_core::config::resolve_db_path())?);
+    Ok(SquelchServer::new(store, &squelch_core::config::account_email())?.with_shipment_policy(shipment_policy()))
 }
 
 /// Decide the transport from CLI args and env: `--http [addr]` or
@@ -115,13 +103,13 @@ async fn main() -> anyhow::Result<()> {
 
 /// Serve the MCP Streamable HTTP transport on `addr` until ctrl-c.
 async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
-    let store = Arc::new(SqliteStore::open(db_path())?);
+    let store = Arc::new(SqliteStore::open(squelch_core::config::resolve_db_path())?);
 
     let shutdown = CancellationToken::new();
     // Construction errors surface before we bind.
     let service = streamable_http_service(
         store,
-        &account_email(),
+        &squelch_core::config::account_email(),
         shipment_policy(),
         shutdown.child_token(),
     )?;

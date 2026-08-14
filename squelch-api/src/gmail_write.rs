@@ -40,10 +40,6 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure request shaping (unit-testable, no network).
-// ---------------------------------------------------------------------------
-
 /// The modify JSON body. Empty arrays are still sent (harmless no-ops) so the
 /// shape is uniform.
 pub fn modify_body(add: &[String], remove: &[String]) -> Value {
@@ -259,10 +255,6 @@ pub fn build_references(parent_message_id: Option<&str>, parent_references: Opti
         (None, None) => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Network executor. Holds a Write-bound credential store; nothing else.
-// ---------------------------------------------------------------------------
 
 /// Gmail metadata headers we read (with the WRITE token) to thread a reply and
 /// to derive who it goes to.
@@ -698,9 +690,8 @@ impl GmailWriteClient {
         })
     }
 
-    /// Read one message `format=raw` with the WRITE token. Used to echo a
-    /// just-sent message into the local store; the read credential never sees
-    /// Sent mail between polls.
+    /// Read a just-sent message with the WRITE token, to echo it into the local
+    /// store: the read credential does not see Sent mail between polls.
     pub async fn fetch_raw(&self, gmail_msg_id: &str) -> Result<FetchedRaw, WriteError> {
         let url = format!("{}/messages/{gmail_msg_id}?format=raw", self.base);
         let msg: GmailMessage = self.get_json(&url).await?;

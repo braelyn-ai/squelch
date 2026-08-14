@@ -133,10 +133,6 @@ pub fn build_system_prompt() -> &'static str {
     SYSTEM_PROMPT
 }
 
-// ===========================================================================
-// Output schema + parsed struct.
-// ===========================================================================
-
 /// The JSON schema constraining the Stage-1 model's output. Numeric min/max is
 /// not expressible here, so `importance`'s range is validated after parse.
 pub fn output_schema() -> serde_json::Value {
@@ -287,10 +283,6 @@ pub fn normalize_category(raw: &str) -> String {
     }
 }
 
-// ===========================================================================
-// classify() — delegates transport to [`crate::triage::llm`].
-// ===========================================================================
-
 /// The outcome of a single Stage-1 [`classify`] call: parsed, schema-valid
 /// output (importance range validated) + usage, or a refusal / permanent
 /// failure, both of which keep the heuristic seed values (the caller stamps
@@ -340,10 +332,6 @@ pub async fn classify_at(
     })
     .await
 }
-
-// ===========================================================================
-// apply_result() — map parsed output onto the triage update. Pure (no I/O).
-// ===========================================================================
 
 /// Map a parsed [`Stage1Output`] onto a [`Stage1Applied`] update. Pure: `now` is
 /// injected for deterministic deadline math. The deadline sanity bounds and the

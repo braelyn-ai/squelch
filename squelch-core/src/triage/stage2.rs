@@ -245,10 +245,6 @@ pub fn build_user_message(ctx: &RowContext) -> String {
     out
 }
 
-// ===========================================================================
-// Output schema (structured output; validate importance range client-side).
-// ===========================================================================
-
 /// The JSON schema constraining the model's output. Structured output does not
 /// support numerical minimum/maximum, so `importance`'s 0-100 range is validated
 /// client-side after parse.
@@ -339,10 +335,6 @@ pub struct Stage2Output {
     pub exception: bool,
 }
 
-// ===========================================================================
-// classify() — delegates transport to [`crate::triage::llm`].
-// ===========================================================================
-
 /// The outcome of a single [`classify`] call: parsed, schema-valid output
 /// (importance range validated) + usage; a refusal, which keeps Stage-1 values
 /// and marks the row processed; or a permanent (non-retryable, e.g. 400/401)
@@ -392,11 +384,6 @@ pub(crate) fn check_importance(importance: i64) -> std::result::Result<(), Strin
         Err("importance_out_of_range".to_string())
     }
 }
-
-// ===========================================================================
-// apply_result() — map parsed output onto the triage/deadlines updates.
-// Pure (no I/O) for testability.
-// ===========================================================================
 
 /// Map a parsed [`Stage2Output`] onto a [`Stage2Applied`] update. Pure: `now` is
 /// injected for deterministic deadline math.

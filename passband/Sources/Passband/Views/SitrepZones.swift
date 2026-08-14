@@ -531,7 +531,7 @@ private struct NewsletterCard: View {
     @State private var hovering = false
 
     private var summaryText: String {
-        Newsletters.truncate(Newsletters.cleanSummary(newsletter.summary), 90)
+        Fmt.truncate(Newsletters.cleanSummary(newsletter.summary), 90)
     }
 
     /// How often this sender wrote, SPELLED OUT on the Mac and a bare multiplier
