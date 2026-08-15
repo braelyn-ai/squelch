@@ -134,12 +134,12 @@ const RANDOM_BYTES: usize = 32;
 /// used", "expired", "held by another signup", "revoked", and "not even shaped
 /// like a code", because anything that tells those apart is an oracle for the
 /// code space.
-const INVITE_REFUSED: &str = "That invite code is not usable. Check it and try again.";
+const INVITE_REFUSED: &str = "That invite code is not usable.";
 
 /// What a claimed label says, whichever authority reported it. Both this
 /// control plane's record and the warden's answer produce it, so a person
 /// cannot tell which of the two knows about an address.
-const LABEL_TAKEN: &str = "That address is already taken. Pick another one.";
+const LABEL_TAKEN: &str = "That address is already taken.";
 
 /// What every failure of a pending session says on the callback. Expired,
 /// missing, tampered, and state-mismatched are one answer for the same reason.

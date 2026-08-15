@@ -886,7 +886,7 @@ async fn the_signup_page_sends_someone_with_no_code_to_the_waitlist() {
         body.contains(&format!(r#"href="{ORIGIN}/waitlist""#)),
         "{body}"
     );
-    assert!(body.contains("No invite code yet?"), "{body}");
+    assert!(body.contains("No invite code?"), "{body}");
 }
 
 /// The same link on a refusal, and that is the point of it being unconditional:

@@ -322,6 +322,14 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
 /// default, open to anybody who wants it, and made of the same markup as before
 /// (native disclosure, no JavaScript, nothing to fetch).
 ///
+/// THE COPY IS DELIBERATELY SHORT, and the cuts were length rather than
+/// substance. Every disclosure this page ever made it still makes: all three
+/// scope names, what each one is for, that a partial grant is refused, and that
+/// we hold the refresh token with self-hosting as the way out. What went is the
+/// prose around them, because a wall of text in front of a two-field form is
+/// read by nobody and so discloses nothing. Anything added here should be a
+/// clause, not a paragraph.
+///
 /// `waitlist_url` is THE OTHER WAY OFF THIS PAGE: somebody who has no invite
 /// code cannot get one here, and until this link existed their only move was to
 /// guess at the field or close the tab. It is rendered UNCONDITIONALLY when the
@@ -347,8 +355,7 @@ pub fn signup_form(
     let waitlist_html = waitlist_url
         .map(|url| {
             format!(
-                r#"<p class="alt">No invite code yet? <a href="{url}">Join the waitlist</a> and we
-will email you one when there is room.</p>"#,
+                r#"<p class="alt">No invite code? <a href="{url}">Join the waitlist</a>.</p>"#,
                 url = escape_html(url),
             )
         })
@@ -357,10 +364,8 @@ will email you one when there is room.</p>"#,
         StatusCode::OK,
         "Set up your Passband mailbox",
         &format!(
-            r#"<h1>Set up your Passband mailbox</h1>
-<p>Passband runs a mailbox daemon for you. It reads your Gmail, sorts what
-matters from what does not, and serves the result to the Passband app, where you
-archive, label, and reply.</p>
+            r#"<h1>Set up your mailbox</h1>
+<p>Passband triages your Gmail and serves it to the app.</p>
 {error_html}
 <form class="card" method="post" action="/signup">
 <div class="field">
@@ -368,43 +373,31 @@ archive, label, and reply.</p>
 <input type="text" id="invite" name="invite" value="{invite}" placeholder="XXXX-XXXX-XXXX-XXXX"
   aria-describedby="invite-hint" autocomplete="off" autocapitalize="off" spellcheck="false"
   autofocus required>
-<p class="hint" id="invite-hint">The code from your invite email. Capitals, dashes,
-and spaces do not matter.</p>
+<p class="hint" id="invite-hint">Case and dashes do not matter.</p>
 </div>
 <div class="field">
 <label for="label">Choose your address</label>
 <input type="text" id="label" name="label" value="{label}" placeholder="yourname"
   aria-describedby="label-hint" autocomplete="off" autocapitalize="off" spellcheck="false" required>
-<p class="hint" id="label-hint">Your mailbox will live at <span class="suffix">https://</span>yourname<span class="suffix">.{domain}</span>.
-Lowercase letters, numbers, and hyphens, 3 to 30 characters.</p>
+<p class="hint" id="label-hint">Lives at <span class="suffix">https://</span>yourname<span class="suffix">.{domain}</span>.
+Lowercase, numbers, hyphens, 3 to 30 characters.</p>
 </div>
 <button type="submit">Continue to Google</button>
-<p class="hint">Google will ask you to approve three Gmail permissions: reading
-your mail, changing it to archive and label, and sending so you can reply.
-Passband needs all three. Nothing is set up until you approve them.</p>
+<p class="hint">Next, Google asks to read, change, and send your Gmail. Passband
+needs all three.</p>
 </form>
 {waitlist_html}
 <details>
 <summary>What Google will ask you to approve</summary>
-<p>Three permissions, on one screen. Passband needs all three, so leave every box
-checked. If one is missing we will send you back rather than set up a mailbox
-that half works.</p>
 <ul>
-<li><strong>Read your Gmail</strong> (<code>gmail.readonly</code>): every message,
-every attachment, and your mail settings. This is what the triage runs on.</li>
-<li><strong>Change your Gmail</strong> (<code>gmail.modify</code>): archiving and
-labeling, so the app can act on a message instead of only showing it to you.
-Permanent deletion is not included and Passband never asks for it.</li>
-<li><strong>Send mail as you</strong> (<code>gmail.send</code>): composing and
-replying from the app. Nothing is ever sent that you did not write and send
-yourself.</li>
+<li><strong>Read</strong> (<code>gmail.readonly</code>): what the triage runs on.</li>
+<li><strong>Change</strong> (<code>gmail.modify</code>): archiving and labeling. Never deletion.</li>
+<li><strong>Send</strong> (<code>gmail.send</code>): replying from the app.</li>
 </ul>
+<p>Leave every box checked. A partial grant is sent back.</p>
 </details>
-<p class="muted">Your mail is read by a daemon that runs only for you, in its own
-process, with its own database. Signing up means we hold your Google refresh
-token, encrypted, so that daemon can keep syncing while you are away. If you
-would rather nobody held it, run Passband yourself: the self-hosted daemon talks
-to Google directly and our servers are never in the path.</p>"#,
+<p class="muted">We hold your Google refresh token, encrypted, so your daemon can
+sync while you are away. Self-host if you would rather we did not.</p>"#,
             error_html = error_html,
             waitlist_html = waitlist_html,
             invite = escape_html(invite),
@@ -786,10 +779,11 @@ mod tests {
     async fn the_form_names_all_three_permissions_outside_the_disclosure() {
         let html = body_of(signup_form("passband.email", None, "", "", None)).await;
         let (before_details, details) = html.split_once("<details>").expect("{html}");
-        assert!(before_details.contains("three Gmail permissions"), "{html}");
-        for word in ["reading", "archive and label", "sending"] {
-            assert!(before_details.contains(word), "{word} -> {html}");
-        }
+        assert!(
+            before_details.contains("read, change, and send your Gmail"),
+            "{html}"
+        );
+        assert!(before_details.contains("needs all three"), "{html}");
         // Shut by default: `open` is what would render it expanded.
         assert!(!details.contains("<details open"), "{html}");
         assert!(!html.contains("<details open"), "{html}");
@@ -824,7 +818,7 @@ mod tests {
         for error in [None, Some("That invite code is not usable.")] {
             let html = body_of(signup_form("passband.email", Some(url), "", "", error)).await;
             assert!(html.contains(&format!(r#"href="{url}""#)), "{html}");
-            assert!(html.contains("No invite code yet?"), "{html}");
+            assert!(html.contains("No invite code?"), "{html}");
         }
         // A deployment with no waitlist configured links nowhere at all rather
         // than to a page that does not exist.
