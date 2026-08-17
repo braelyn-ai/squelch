@@ -46,3 +46,9 @@ run_suite subject-text \
 run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
   Tests/EmailImagesTests.swift
+
+# The thread minimap's window math. CoreGraphics only — the rail that draws it
+# is SwiftUI, the arithmetic that aims it is not.
+run_suite minimap-geometry \
+  Sources/Passband/Lib/MinimapGeometry.swift \
+  Tests/MinimapGeometryTests.swift

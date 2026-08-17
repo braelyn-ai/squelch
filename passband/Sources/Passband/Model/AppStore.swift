@@ -369,6 +369,36 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
+    /// WHERE THE READER IS IN ITS FLIGHT. `settled` is where it lives and is the
+    /// default, because opening an email is navigation: a surface people enter
+    /// and leave all day should just BE there. The other two are the done+next
+    /// flight, and it is deliberately a position rather than a SwiftUI
+    /// transition — a transition is chosen by the framework at the moment a view
+    /// is inserted or removed, and when it declines to use the one you gave it
+    /// you get its default crossfade and no way to argue. An offset is not
+    /// negotiable.
+    ///
+    /// ThreadViewer drives it in two beats: `departing` lifts the email you
+    /// finished off the top of the window, then the next one mounts `entering`
+    /// from an edge and is walked home. See `doneAndNext`.
+    var threadFlight: ThreadFlight = .settled
+
+    enum ThreadFlight: Sendable, Equatable {
+        /// In the window, where the reader belongs.
+        case settled
+        /// Lifted out through the top: the email you just finished.
+        case departing
+        /// Parked one window outside the frame, waiting to be walked in.
+        case entering(ThreadEdge)
+    }
+
+    /// Which side a thread arrives from. The bottom is a new subject; the
+    /// trailing edge is MORE MAIL FROM THE SAME SENDER, because that is the next
+    /// item in a pile rather than the next thing to think about.
+    enum ThreadEdge: Sendable, Equatable {
+        case bottom
+        case trailing
+    }
     /// What that thread IS, once it has landed — written by the viewer. nil
     /// while a thread is loading. READ IT THROUGH `currentThreadSummary`: this
     /// is the raw last write, and the writer is a network callback.
@@ -1117,7 +1147,10 @@ final class AppStore {
 
     /// Open the fullscreen reader. `replyTo` is the unified `r` verb: the message
     /// id the reader should open its inline composer on once the thread loads.
-    func openThread(_ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil) {
+    func openThread(
+        _ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil,
+        entering edge: ThreadEdge? = nil
+    ) {
         // from_noise: an open from below the squelch line — someone digging for
         // mail the triage muted, which is the false-negative signal.
         Analytics.capture(
@@ -1134,6 +1167,10 @@ final class AppStore {
         if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
         self.threadQueue = queue
+        // An ordinary open puts the reader straight in the window — opening an
+        // email is a jump. Only done+next passes an edge, and it walks the
+        // reader home itself a frame later.
+        self.threadFlight = edge.map { .entering($0) } ?? .settled
         // HERE, not in the search panel's open path: the reader can be opened
         // from anywhere (ask-bar cards, citations) while fullscreen search sits
         // underneath, and it insets by only the STRIP — a still-expanded panel
@@ -1152,6 +1189,9 @@ final class AppStore {
     func closeThread() {
         threadId = nil
         threadQueue = []
+        // The flight is deliberately left where it is: the last email of a queue
+        // is mid-departure when this runs, and there is nothing left to put back
+        // in the window. `openThread` resets it for whatever comes next.
         openThreadSummary = nil
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil

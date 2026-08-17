@@ -35,6 +35,7 @@
 		2785F1AA75B655313673E0D0 /* Trackers.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEFA34554013DFB615774309 /* Trackers.swift */; };
 		2AE0CB107FAB86784BE5C0F4 /* Updater.swift in Sources */ = {isa = PBXBuildFile; fileRef = D179CAC9853B13A5FBFD968E /* Updater.swift */; };
 		2F363EB80C61955DE11D0702 /* TourOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 627B000AA2D3694B771F50B0 /* TourOverlay.swift */; };
+		3036D5EBC31C8F05D10AAC8E /* MinimapGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */; };
 		30B0B95981F83062CAD29D3F /* ReadReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 759702EBD03C1CECFD041E57 /* ReadReceipt.swift */; };
 		331C84737DCE609E6D6C6980 /* ListRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A52E20474A0D6F31073DA61 /* ListRow.swift */; };
 		334AB5C57D2B2C941C5EEA02 /* Resources in Resources */ = {isa = PBXBuildFile; fileRef = 168312D5219614E1F658480C /* Resources */; };
@@ -61,6 +62,7 @@
 		4B52BE6DB257F23A493F4B02 /* ThreadViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BD37CBEFEA8CEB215E3247 /* ThreadViewer.swift */; };
 		4BF112500D334A129834AAEB /* MobileToastHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0318A22219D3A1E36429C76 /* MobileToastHost.swift */; };
 		4C489FDA815D1AA53534BA7B /* Quotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30CE0F7FB80B319544FD62FA /* Quotes.swift */; };
+		4C66C7F7C1AB185340BCC719 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
 		4D086E1491D67B05B2626B90 /* KeyDispatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2AB71004C775ABFABB73D9 /* KeyDispatch.swift */; };
 		4D1913697E7DE1A0B25EFDC4 /* Avatar.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0ADC18AA758296235E8F59 /* Avatar.swift */; };
 		4D885CFF844970680B6C93DA /* EmailWebViewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DD489E941E602E585098D3F /* EmailWebViewiOS.swift */; };
@@ -127,6 +129,7 @@
 		99109D16A6A60C17BEB753BE /* AuthArrival.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE241E317BA5B3B4D25B892E /* AuthArrival.swift */; };
 		99CFBE791F3799FBEFB5D213 /* ComposePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */; };
 		99E823237BD7F3F4EE5C26DF /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
+		9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
 		9EA7C093CFE335E233A6411C /* AuthCodeModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */; };
 		9F54901230BBCD7044B85B48 /* Haptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */; };
 		A19640E9DA24D6C6F85E215C /* RelayProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A07093A9D416AD79A642B3A3 /* RelayProxy.swift */; };
@@ -204,6 +207,7 @@
 		EE3332829811091CAA50A0C0 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */; };
 		EF23C4EDACBC4D1216F580D5 /* RulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE9B2C6A8850905B874A1ED /* RulesView.swift */; };
 		F19396496FB9FFA6061B7E1A /* Raster.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4382469FC056D0CD54B22F3 /* Raster.swift */; };
+		F203E4786137371093270AB6 /* MinimapGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */; };
 		F3193F08328E9F5CC6BFCE27 /* RecipientField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 327BC236C39F192198AFEF7D /* RecipientField.swift */; };
 		F364D1469A2AA0C9E4B38DED /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78527CBD27E00907F26B9E79 /* Security.framework */; };
 		F38B78086DC5EBF798FFE3A1 /* Assistant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EC7EBBF801C0364D402F94D /* Assistant.swift */; };
@@ -233,6 +237,7 @@
 		00D13052ED3A4D60224B1B18 /* MainWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindow.swift; sourceTree = "<group>"; };
 		05270E444AAA1678F50EC0F0 /* ImageSchemeHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageSchemeHandler.swift; sourceTree = "<group>"; };
 		06A50E65F84872DFA0504B96 /* DraftSaver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraftSaver.swift; sourceTree = "<group>"; };
+		06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadMinimap.swift; sourceTree = "<group>"; };
 		070286D5016F78C93DC49070 /* Opener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Opener.swift; sourceTree = "<group>"; };
 		10544C7DF8CDBA851AF0D9D8 /* Actions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Actions.swift; sourceTree = "<group>"; };
 		12468DFB107CC662204BCE84 /* MobileRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRootView.swift; sourceTree = "<group>"; };
@@ -273,6 +278,7 @@
 		4D74815E3375EAC96A4841CF /* AskBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskBar.swift; sourceTree = "<group>"; };
 		4E2AB71004C775ABFABB73D9 /* KeyDispatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyDispatch.swift; sourceTree = "<group>"; };
 		4EE9B2C6A8850905B874A1ED /* RulesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RulesView.swift; sourceTree = "<group>"; };
+		4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MinimapGeometry.swift; sourceTree = "<group>"; };
 		50EA4F5B8A98576A0355A528 /* Glass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Glass.swift; sourceTree = "<group>"; };
 		5283FAB3FFAED5F77BF41F71 /* TourController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TourController.swift; sourceTree = "<group>"; };
 		54C5FAF93A0E521B9AA4DB60 /* PassbandiOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = PassbandiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -412,6 +418,7 @@
 				992EA99CCF93A2EA929D6E3B /* SidePanel.swift */,
 				2B0750416DB37BFF3B78457B /* SitrepView.swift */,
 				22B6CF4EF83BEF15EB372184 /* SitrepZones.swift */,
+				06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */,
 				F2BD37CBEFEA8CEB215E3247 /* ThreadViewer.swift */,
 				627B000AA2D3694B771F50B0 /* TourOverlay.swift */,
 				B2556C9BFD81BFC2EEAFB3B0 /* TrackerToggle.swift */,
@@ -436,6 +443,7 @@
 				EFF2F03B0D68F54C0DC28777 /* ImageRepeats.swift */,
 				1A74374DEAEE21CDF9A5067D /* Loadable.swift */,
 				BE74212A3CE62E8F28EC8D7E /* Markdown.swift */,
+				4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */,
 				47779240FEC7579D6A0072CB /* Newsletters.swift */,
 				070286D5016F78C93DC49070 /* Opener.swift */,
 				37AEAA24984488DA00EBD6C4 /* Platform.swift */,
@@ -799,6 +807,7 @@
 				C14EABCB7D1F6C3C4B800311 /* Markdown.swift in Sources */,
 				F9571C6567D29994CCF6DBB2 /* MarkdownStyle.swift in Sources */,
 				7D46E9FB21A567E94CE3D748 /* MarkdownTextView.swift in Sources */,
+				F203E4786137371093270AB6 /* MinimapGeometry.swift in Sources */,
 				6FFB126258C28AC3F2E63D01 /* Motion.swift in Sources */,
 				513F475DB3A83BED4F68A57D /* Newsletters.swift in Sources */,
 				414E8ACA8519A3B26F50F066 /* Notifier.swift in Sources */,
@@ -828,6 +837,7 @@
 				22511E51CB7D38C82320FE21 /* SitrepView.swift in Sources */,
 				61E6D7AA7EB53F8AEE04063C /* SitrepZones.swift in Sources */,
 				EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */,
+				4C66C7F7C1AB185340BCC719 /* ThreadMinimap.swift in Sources */,
 				AB169C9A19D62418DBAD4C3D /* ThreadPrefetch.swift in Sources */,
 				764A73259735A815192E7EE0 /* ThreadViewer.swift in Sources */,
 				C58CC1F4A47B52230CEDC9A3 /* TourController.swift in Sources */,
@@ -899,6 +909,7 @@
 				063C1CF09D6E7CE57C547486 /* Markdown.swift in Sources */,
 				84F6860CDCC32C143703EF41 /* MarkdownStyle.swift in Sources */,
 				E4B1EE75A584D999AA58B0E2 /* MarkdownTextViewiOS.swift in Sources */,
+				3036D5EBC31C8F05D10AAC8E /* MinimapGeometry.swift in Sources */,
 				BE9C340C64913DE9154BDCF0 /* MobileAgentView.swift in Sources */,
 				921ACE1D761AE0AD1F714980 /* MobileAuthView.swift in Sources */,
 				EB3A6A193AE3E0C7EDD7E459 /* MobileRecordsView.swift in Sources */,
@@ -934,6 +945,7 @@
 				B6F86A1B7C9CECBF25C347FA /* SitrepZones.swift in Sources */,
 				C47E10D8934D830B5018DC8B /* SubjectText.swift in Sources */,
 				C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */,
+				9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */,
 				40E611424100EA3551AB3477 /* ThreadPrefetch.swift in Sources */,
 				4B52BE6DB257F23A493F4B02 /* ThreadViewer.swift in Sources */,
 				EDA32122902CA1F3C0A3B33A /* TourController.swift in Sources */,

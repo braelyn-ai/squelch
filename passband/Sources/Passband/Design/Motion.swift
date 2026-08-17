@@ -26,6 +26,14 @@ enum Motion {
     /// width of the screen and the eye follows it out.
     static let deckCard = Animation.spring(response: 0.38, dampingFraction: 0.86)
 
+    /// THE EMAIL YOU JUST FINISHED, leaving the reader through the top. easeIn
+    /// so it accelerates away rather than drifting: the verb was "done", and the
+    /// eye should not have to follow it out. `departTime` MUST match the
+    /// duration — the reader waits exactly this long before putting the next
+    /// email in the window, so a change to one is a change to both.
+    static let depart = Animation.easeIn(duration: 0.22)
+    static let departTime: Duration = .milliseconds(220)
+
     /// A phone tab's content arriving from the side its tab sits on: travel along
     /// the bar rather than a replacement of what was there. Quick, because a tab
     /// switch is navigation and not an event: long enough to say which direction
