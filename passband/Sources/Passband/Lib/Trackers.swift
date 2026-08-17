@@ -171,32 +171,4 @@ enum Trackers {
         return hero
     }
 
-    /// Anchor hrefs in document order, de-duped by href, labelled with the
-    /// visible link text (empty text falls back to the host). Only http(s)
-    /// survives here, and Opener re-guards it anyway.
-    static func extractLinks(_ html: String) -> [EmailLink] {
-        var out: [EmailLink] = []
-        var seen = Set<String>()
-        for m in html.matches(of: /(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)<\/a>/) {
-            let href = String(m.1).trimmingCharacters(in: .whitespaces)
-            guard href.lowercased().hasPrefix("http"), !seen.contains(href) else { continue }
-            seen.insert(href)
-            let text =
-                String(m.2)
-                .replacing(/<[^>]+>/, with: " ")
-                .replacing(/&nbsp;/, with: " ")
-                .replacing(/\s+/, with: " ")
-                .trimmingCharacters(in: .whitespaces)
-            let label = text.isEmpty ? (URL(string: href)?.host ?? href) : text
-            out.append(EmailLink(href: href, text: label))
-        }
-        return out
-    }
-}
-
-/// An extracted, de-duped outbound link: the http(s) href + its visible text.
-struct EmailLink: Identifiable, Hashable, Sendable {
-    var href: String
-    var text: String
-    var id: String { href }
 }
