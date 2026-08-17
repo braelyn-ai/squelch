@@ -13,6 +13,35 @@ browser ── GET /  ──► signup form (invite code + address)
                                    SEAL to it, INSTALL credential, success page
 ```
 
+Where the code comes from, when the waitlist is configured (the trio in the
+table below; unset, none of it is mounted and both URLs are a 404):
+
+```
+site     ── POST /waitlist ──► one row per address, same 200 for a duplicate
+operator ── GET  /admin ──────► token login, then the list
+         ── POST /admin/approve ──► mint an invite, email it through Resend
+         ── POST /admin/invite ───► the same, for an address that never joined
+         ── POST /admin/send ─────► revoke that code, mint and mail a fresh one
+```
+
+A direct invite is recorded as a waitlist row that starts out approved, so one
+table answers "have we invited them" however they arrived and the re-send button
+works on both. Typing an address that is already waiting approves the row it has
+rather than making a second one.
+
+The emailed link is `/?invite=CODE`, and `GET /` fills the form in from it. That
+reverses this crate's first rule, which was that a code never appears in a URL:
+the query string reaches the edge's access log, the recipient's history, and any
+proxy between them, and a live code sits in all three until it is redeemed or
+lapses. It is a deliberate trade for the click, taken 2026-08-14, bounded by the
+code being single use. A parameter not shaped like a code renders an empty field.
+
+The admin POSTs take a `SameSite=Strict` session cookie AND a same-origin
+`Origin`/`Sec-Fetch-Site`, because "same site" includes every sibling
+`passband.app` name and a page on one of those could otherwise press these
+buttons. An `Origin` of `null` names nothing, so it is decided by
+`Sec-Fetch-Site`, which no page can write.
+
 ## Provisioning is two calls
 
 Wire v2 splits provisioning so that no single key opens two mailboxes:
@@ -94,8 +123,14 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | `SQUELCH_CONTROL_DB_PATH` | no | Control store. Default `/data/control.sqlite3`. |
 | `SQUELCH_CONTROL_BIFROST_URL` | pair | The Bifrost LLM gateway's governance origin, `https://` only. With the token below it is all-or-nothing: both set mints a per-tenant virtual key at signup, neither set provisions keyless tenants, anything partial (including a budget or model list on their own) refuses to boot. |
 | `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` | pair | The gateway admin's `username:password`, sent as HTTP Basic on every governance call (a session bearer expires after 30 days and does not belong here). Exactly one `:` between two nonempty halves, at least 32 characters total. It can mint unbounded LLM spend; treat it like the warden bearer. |
-| `SQUELCH_CONTROL_LLM_BUDGET_USD` | no | Monthly USD budget stamped on each minted key. Default `5.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
-| `SQUELCH_CONTROL_LLM_MODELS` | no | Comma-separated model allow-list stamped on each minted key. Default `claude-haiku-4-5,claude-sonnet-5`. Never empty (the gateway treats an empty list as deny-all). Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_LLM_BUDGET_USD` | no | Monthly USD budget stamped on each minted triage key. Default `5.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_LLM_MODELS` | no | Comma-separated model allow-list stamped on each minted triage key. Default `claude-haiku-4-5,claude-sonnet-5`. Never empty (the gateway treats an empty list as deny-all). Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_ASSISTANT_BUDGET_USD` | no | Monthly USD budget stamped on each minted assistant key (`tenant-<label>-assistant`, the tenant's second key). Default `10.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_ASSISTANT_MODELS` | no | Comma-separated model allow-list stamped on each minted assistant key. Default `claude-haiku-4-5,claude-opus-4-8`. Never empty. Only meaningful with the gateway pair set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_ADMIN_TOKEN` | trio | The operator's password for `/admin`, where waitlist rows are approved. At least 32 characters: `openssl rand -base64 32`. With the two below it is all-or-nothing: all three set mounts the waitlist and admin routes, none set leaves them unmounted (a 404, not a 403), anything partial refuses to boot. |
+| `SQUELCH_CONTROL_RESEND_API_KEY` | trio | Resend sending key, used for the one call that mails an approved applicant their invite. Printable ASCII, no spaces. Mint it sending-only and domain-restricted. |
+| `SQUELCH_CONTROL_INVITE_FROM` | trio | The `From:` invites are sent as, e.g. `Passband <invites@passband.app>`. Must be an address on a domain **verified at Resend** or every send is refused. |
+| `SQUELCH_CONTROL_WAITLIST_ORIGIN` | no | The one browser origin allowed to post the public waitlist form, echoed as `Access-Control-Allow-Origin` on that route only. Default `https://passband.app`. Only meaningful with the trio above set; set alone it refuses to boot. |
 | `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS` | no | How many proxies write `X-Forwarded-For` in front of this listener. `0` (default) meters the TCP peer, which behind a platform edge means one shared rate-limit bucket. Set `1` on Railway. |
 | `SQUELCH_CONTROL_LOG` | no | `tracing` filter. Default `info`. |
 

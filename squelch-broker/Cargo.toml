@@ -27,6 +27,10 @@ url = { workspace = true }
 # SHA-256 of the presented claim token. The only cryptography here: the broker
 # holds no signing key and no client secret.
 sha2 = "0.10"
+# The token-bucket engine and the X-Forwarded-For policy, shared byte-for-byte
+# with the other public-facing service. A leaf crate whose only dep is `http`:
+# these binaries stay blind, so they link this and NOT squelch-core.
+squelch-ratelimit = { path = "../squelch-ratelimit" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

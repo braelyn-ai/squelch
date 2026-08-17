@@ -36,7 +36,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = "0.7"
 # Gmail write ops: HTTP client (rustls, no native-tls) mirroring the read
 # engine, base64url for send payloads, regex for the outbound secret guard.
-reqwest = { workspace = true }
+# `stream` on top of the workspace set: the assistant relay hands the upstream
+# SSE body to axum verbatim, and `Response::bytes_stream` is feature-gated.
+reqwest = { workspace = true, features = ["stream"] }
 base64 = { workspace = true }
 regex = { workspace = true }
 # Markdown → HTML for the send path's multipart/alternative body. `html` only;

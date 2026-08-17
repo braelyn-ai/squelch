@@ -197,6 +197,12 @@ enum Fmt {
         then.formatted(.dateTime.month(.abbreviated).day().hour().minute())
     }
 
+    /// Weekday alone, like "Tue". Only unambiguous inside a week of today, so
+    /// the caller owns the window and falls back to `shortDate` outside it.
+    static func weekday(_ iso: String?) -> String {
+        rendered(iso, "w|") { $0.formatted(.dateTime.weekday(.abbreviated)) }
+    }
+
     /// Time-of-day like "3:00 PM" (calendar rail).
     static func timeOfDay(_ iso: String?) -> String {
         rendered(iso, "t|") { $0.formatted(.dateTime.hour().minute()) }
@@ -246,6 +252,21 @@ enum Fmt {
     /// Today's date, "Mon, Jul 27" — the sitrep masthead stamp.
     static func todayStamp(now: Date = Date()) -> String {
         now.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+    }
+
+    /// Truncate into a copy budget of `n` characters, the ellipsis included, so
+    /// a cut announces itself rather than landing mid-word the way the system's
+    /// own truncation does.
+    static func truncate(_ s: String, _ n: Int) -> String {
+        guard n > 0 else { return "" }
+        guard s.count > n else { return s }
+        return String(s.prefix(n - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// Uppercase the first character, leaving the rest alone — for text that
+    /// starts a sentence after a leading label was stripped off it.
+    static func capitalizingFirst(_ s: String) -> String {
+        s.prefix(1).uppercased() + s.dropFirst()
     }
 }
 

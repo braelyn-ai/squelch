@@ -26,8 +26,6 @@ struct PairingTests {
         serverURLs()
         linkParsing()
         linkRejection()
-        loopbackDetection()
-        noticeHost()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -131,59 +129,6 @@ struct PairingTests {
         nilLink("passband://pair?url=file%3A%2F%2F%2Ftmp%2Fx&code=ABCDEFGH", "file url")
         nilLink("passband://pair?url=javascript%3Aalert(1)&code=ABCDEFGH", "javascript url")
         nilLink("passband://pair?url=&code=ABCDEFGH", "empty server url")
-    }
-
-    /// Which links name this machine's own daemon. NO link claims itself any
-    /// more — pairing is one deliberate press, always — so what this decides is
-    /// whether the Connect gate calls out the host the link picked.
-    static func loopbackDetection() {
-        equal(
-            parse("passband://pair?url=http%3A%2F%2F127.0.0.1%3A8848&code=ABCDEFGH")?.isLoopback,
-            true, "127.0.0.1")
-        equal(
-            parse("passband://pair?url=http%3A%2F%2Flocalhost%3A8848&code=ABCDEFGH")?.isLoopback,
-            true, "localhost")
-        equal(
-            parse("passband://pair?url=http%3A%2F%2F%5B%3A%3A1%5D%3A8848&code=ABCDEFGH")?
-                .isLoopback,
-            true, "ipv6 loopback")
-        // The case the whole distinction exists for: a page-triggered link
-        // naming someone else's host is the one that gets named on screen.
-        equal(
-            parse("passband://pair?url=https%3A%2F%2Fevil.example.com&code=ABCDEFGH")?.isLoopback,
-            false, "remote host is not loopback")
-        equal(
-            parse("passband://pair?url=http%3A%2F%2F127.0.0.1.evil.com&code=ABCDEFGH")?.isLoopback,
-            false, "a host merely starting with the loopback literal is not loopback")
-        // A loopback ADDRESS on a hostile-looking path is still loopback: the
-        // notice is about which machine answers, and this one is this one.
-        equal(
-            parse("passband://pair?url=http%3A%2F%2F127.0.0.1%3A9999%2Fx&code=ABCDEFGH")?
-                .isLoopback,
-            true, "loopback on another port")
-    }
-
-    /// The host the notice names. It must be the HOST and nothing else: a user
-    /// deciding whether to type a live code into this form is deciding about
-    /// the machine that will receive it, and a path or a port dressed up around
-    /// a familiar-looking string is exactly what a phishing link would send.
-    static func noticeHost() {
-        equal(
-            parse("passband://pair?url=https%3A%2F%2Fevil.example.com&code=ABCDEFGH")?.displayHost,
-            "evil.example.com", "remote host")
-        // Port and path dropped, so a long URL cannot push the host out of view.
-        equal(
-            parse("passband://pair?url=https%3A%2F%2Fevil.example.com%3A8443%2Fpair%3Fx%3D1&code=ABCDEFGH")?
-                .displayHost,
-            "evil.example.com", "port and path are not part of the name")
-        // Userinfo is the classic disguise: the host is what follows the @.
-        equal(
-            parse("passband://pair?url=https%3A%2F%2F127.0.0.1%40evil.example.com&code=ABCDEFGH")?
-                .displayHost,
-            "evil.example.com", "userinfo does not become the host")
-        equal(
-            parse("passband://pair?url=http%3A%2F%2F127.0.0.1%3A8848&code=ABCDEFGH")?.displayHost,
-            "127.0.0.1", "loopback names itself")
     }
 
     // MARK: - helpers

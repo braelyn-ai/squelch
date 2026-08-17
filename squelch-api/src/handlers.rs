@@ -691,10 +691,84 @@ pub async fn get_shipments(
     // The shipments table holds no sealed rows: detection never runs on sealed
     // mail, and hand-sealing a message deletes the shipment row it fed
     // (correct_triage), so there is no sealed filtering to apply.
+    //
+    // The operator's `[carriers]` policy decides the rest: phantom digit-runs the
+    // carrier keeps rejecting, rows nothing has happened to for `stale_after_days`,
+    // and rows the user cleared. Every one of those is a READ-SIDE hide — the rows
+    // stay in the store, keep being polled, and come back on their own the moment
+    // an update lands. The AGENT DOOR carries the same policy value.
+    let policy = state.shipment_policy;
     query(&state, move |store, account_id| {
-        store.list_shipments(account_id, q.include_delivered)
+        store.list_shipments(account_id, q.include_delivered, policy)
     })
     .await
+}
+
+// --- POST /client/shipments/{id}/clear ---------------------------------------
+
+/// "Stop showing me this package." HUMAN DOOR ONLY: writes never go on the agent
+/// door, and this is a statement about what the USER wants to see.
+///
+/// A HIDE, NOT A DELETE, and there is no un-clear endpoint on purpose. The row
+/// stays in the store, keeps being polled, and reappears by itself as soon as
+/// anything advances its `last_update` past the clear stamp — a carrier poll that
+/// moves it, or a new email about it. See [`Store::clear_shipment`].
+///
+/// Idempotent: clearing an already-cleared row RESTAMPS it (a row revived by an
+/// update and cleared again must hide against the later stamp), so a client that
+/// double-taps gets the same 200.
+///
+/// An unknown id is a 404, matching [`set_update_status`]: a path-addressed write
+/// against a row this account does not have is not a success with a `false` in it.
+pub async fn clear_shipment(
+    State(state): State<ApiState>,
+    Path(shipment_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let at = Utc::now();
+    let cleared = store_call(&state, move |store, account_id| {
+        store.clear_shipment(account_id, shipment_id, at)
+    })
+    .await?;
+    if !cleared {
+        return Err(ApiError::not_found());
+    }
+
+    audit_action(
+        &state,
+        "shipment.clear",
+        Some(shipment_id.to_string()),
+        "ok",
+    )
+    .await;
+
+    Ok(Json(
+        json!({ "cleared": true, "shipment_id": shipment_id, "cleared_at": at }),
+    ))
+}
+
+// --- POST /client/shipments/poll --------------------------------------------
+
+/// Poke the carrier poller to run a pass NOW, the shipments-tracker sibling of
+/// [`refresh_now`]. Fire-and-forget: it does not wait for the carrier round
+/// trips, and the kick does NOT bypass per-carrier cooldowns, budgets or
+/// `min_interval` — a user mashing refresh cannot spend a daily cap or earn a
+/// 429.
+///
+/// `kicked: false` with an empty `carriers` is a 200 and a NORMAL answer, not an
+/// error: carrier polling is BYOK, so a daemon with no carrier credentials runs
+/// no poller at all. The client reads the same two fields either way and can
+/// hide the button when the list is empty.
+///
+/// A READ-path trigger, like `refresh` — no write scope, no mutation, nothing to
+/// audit.
+pub async fn poll_shipments_now(State(state): State<ApiState>) -> impl IntoResponse {
+    match &state.shipment_poll {
+        Some(poll) => {
+            poll.kick.notify_one();
+            Json(json!({ "kicked": true, "carriers": &poll.carriers[..] }))
+        }
+        None => Json(json!({ "kicked": false, "carriers": [] })),
+    }
 }
 
 // --- GET /client/receipts ---------------------------------------------------
@@ -854,21 +928,15 @@ struct ResolvedDisposition {
 /// that lands in no category is spend no cap and no report can see.
 const RULE_INFER_LEDGER_CATEGORY: &str = "rule_infer";
 
-/// Bill one inference call. Best-effort by design: the rule is already written
-/// when this runs, and a ledger write that fails must not fail the save. Runs
-/// INSIDE the caller's existing store hop, so it costs no extra blocking task.
+/// Bill one inference call. Best-effort by design: a ledger write that fails
+/// must not fail the save. Callers run it BEFORE the rule write, inside the
+/// same store hop (so it costs no extra blocking task): the model call already
+/// happened, and a store error on the rule row must not orphan the spend.
 fn bill_rule_inference(store: &SqliteStore, account_id: AccountId, usage: Option<Usage>) {
     let Some(u) = usage else { return };
     let day = Utc::now().format("%Y-%m-%d").to_string();
-    if let Err(e) = store.extract_bump_usage(
-        account_id,
-        &day,
-        RULE_INFER_LEDGER_CATEGORY,
-        u.input_tokens,
-        u.output_tokens,
-        u.cache_creation_input_tokens,
-        u.cache_read_input_tokens,
-    ) {
+    if let Err(e) = store.extract_bump_usage(account_id, &day, RULE_INFER_LEDGER_CATEGORY, u.into())
+    {
         eprintln!("squelch: rule inference usage ledger bump failed ({e})");
     }
 }
@@ -964,8 +1032,12 @@ pub async fn create_rule(
     let sweep = body.sweep;
     let usage = resolved.usage;
     let id = store_call(&state, move |store, account_id| {
-        let id = store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)?;
+        // Bill BEFORE the rule write: the model call already happened, so the
+        // spend must land in the ledger even if set_sender_rule fails. A retry
+        // after such a failure re-runs the inference too, so a second entry
+        // matches a second real spend.
         bill_rule_inference(store, account_id, usage);
+        let id = store.set_sender_rule(account_id, &body.match_pattern, &body.want, disposition)?;
         Ok(id)
     })
     .await?;
@@ -1023,6 +1095,10 @@ pub async fn update_rule(
     let pattern = body.match_pattern.clone();
     let usage = resolved.usage;
     let updated = store_call(&state, move |store, account_id| {
+        // Billed first, even when the id is bogus or the write fails: the
+        // model call happened and was paid for regardless of what the store
+        // does with the row.
+        bill_rule_inference(store, account_id, usage);
         let updated = store.update_sender_rule(
             account_id,
             id,
@@ -1030,9 +1106,6 @@ pub async fn update_rule(
             &body.want,
             disposition,
         )?;
-        // Billed even when the id was bogus: the model call happened and was
-        // paid for regardless of what the store did with the row.
-        bill_rule_inference(store, account_id, usage);
         Ok(updated)
     })
     .await?;
@@ -1467,6 +1540,10 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
             "fetched_at": unread.fetched_at.to_rfc3339(),
         });
     }
+    // Capability flag for the app: whether /client/assistant/messages will
+    // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
+    // Always present so a client reads an answer, not absence.
+    body["assistant_relay"] = json!(state.assistant().is_some());
     Ok(Json(body))
 }
 

@@ -1,18 +1,18 @@
 {
   "fill" : {
-    "solid" : "srgb:0.16863,0.14902,0.10196,1.00000"
+    "solid" : "srgb:0.78824,0.82745,0.85882,1.00000"
   },
   "groups" : [
     {
       "layers" : [
         {
-          "image-name" : "knob.png",
-          "name" : "knob"
+          "image-name" : "signal.png",
+          "name" : "signal"
         }
       ],
       "shadow" : {
         "kind" : "neutral",
-        "opacity" : 0.5
+        "opacity" : 0.0
       },
       "translucency" : {
         "enabled" : false,

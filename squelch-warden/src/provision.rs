@@ -126,6 +126,11 @@ pub enum WardenError {
     InvalidCiphertext(#[from] CiphertextError),
     #[error("invalid api_key: {0}")]
     InvalidApiKey(#[from] ApiKeyError),
+    /// The llm-key body named neither slot. An absent slot means "leave it as
+    /// it is", so a request with both absent would install nothing and roll
+    /// nothing; that is a caller bug worth naming, not a no-op to swallow.
+    #[error("no keys in the request")]
+    NoKeys,
     #[error("label already exists")]
     Conflict,
     #[error("no such tenant")]
@@ -337,13 +342,26 @@ impl Warden {
         // rotation would find nothing to differ from. The Secret can only
         // exist if `llm_base_url` was configured when `set_llm_key` accepted
         // it, so this pickup cannot stamp the annotation with the feature off.
-        let llm_key = self
+        let llm_hash = self
             .cluster
             .get_secret(&name.llm_secret())
             .await
             .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
             .as_ref()
-            .and_then(|secret| secret_value(secret, objects::LLM_API_KEY_KEY));
+            .and_then(|secret| {
+                // Both data keys, through the same combined hash `set_llm_key`
+                // stamps ([`objects::llm_keys_hash`]): a pickup that hashed
+                // only the triage key would differ from every hash a keyed
+                // rotation writes, and the first rotation after provisioning
+                // would roll the pod for nothing — or worse, a real rotation
+                // would land on a pod already carrying its hash and not roll.
+                // Either slot alone is enough: a half-failed mint can leave a
+                // Secret holding only one of the two.
+                let api_key = secret_value(secret, objects::LLM_API_KEY_KEY);
+                let assistant = secret_value(secret, objects::ASSISTANT_API_KEY_KEY);
+                (api_key.is_some() || assistant.is_some())
+                    .then(|| objects::llm_keys_hash(api_key.as_deref(), assistant.as_deref()))
+            });
         // The hash of what was just stored, not of what is running: this is the
         // whole mechanism by which a re-consent reaches the daemon.
         self.apply(
@@ -352,7 +370,7 @@ impl Warden {
                 &self.config,
                 &name,
                 &objects::credential_hash(&ciphertext),
-                llm_key.as_deref().map(objects::credential_hash).as_deref(),
+                llm_hash.as_deref(),
             ))),
             "workload_failed",
         )
@@ -375,37 +393,86 @@ impl Warden {
         Ok(pairing)
     }
 
-    /// Store or rotate the tenant's LLM gateway virtual key.
+    /// Store or rotate the tenant's LLM gateway virtual keys: whichever of the
+    /// triage and assistant relay slots the control plane sent, and at least
+    /// one of them.
+    ///
+    /// `None` means "leave that slot as it is", and that promise has to be
+    /// kept HERE: the apply below is a server-side apply with force under one
+    /// field manager ([`crate::cluster`]), so a data key absent from the
+    /// applied Secret is REMOVED, and a triage-only rotation that rendered
+    /// only the triage key would silently clear an installed assistant key.
+    /// So the stored Secret is read first and every slot the request did not
+    /// provide is carried forward: what gets applied is always the union, and
+    /// the roll hash is computed over that same union.
     ///
     /// Legal at any point after phase one, deliberately: the control plane
-    /// mints the key alongside the signup, so "PUT llm-key then PUT
+    /// mints the keys alongside the signup, so "PUT llm-key then PUT
     /// credentials" must birth a keyed pod, and a rotation against a running
     /// tenant must reach the daemon. The second half works exactly like a
-    /// re-consent does — the key's hash rides on the pod template
-    /// ([`objects::LLM_KEY_HASH_ANNOTATION`]), so when a Deployment exists it
-    /// is rebuilt and re-applied here and the changed annotation rolls the
-    /// pod. With no Deployment yet, storing the Secret is the whole job;
-    /// [`Warden::set_credentials`] picks the key up when the workload is
-    /// applied.
+    /// re-consent does — the combined hash of BOTH keys rides on the pod
+    /// template ([`objects::LLM_KEY_HASH_ANNOTATION`] via
+    /// [`objects::llm_keys_hash`], so rotating either one is a changed pod
+    /// spec), and when a Deployment exists it is rebuilt and re-applied here
+    /// and the changed annotation rolls the pod. With no Deployment yet,
+    /// storing the Secret is the whole job; [`Warden::set_credentials`] picks
+    /// the keys up when the workload is applied.
     ///
-    /// The key is a live credential: never logged, never returned, stored
+    /// The keys are live credentials: never logged, never returned, stored
     /// verbatim in the tenant's Secret and read back only as a hash.
-    pub async fn set_llm_key(&self, raw_label: &str, raw_api_key: &str) -> Result<(), WardenError> {
-        // Feature gate first: with no gateway URL configured, the env this key
-        // would feed is never rendered ([`objects::daemon_env`]), so storing it
-        // would only roll pods onto a value they cannot use.
+    pub async fn set_llm_key(
+        &self,
+        raw_label: &str,
+        raw_api_key: Option<&str>,
+        raw_assistant_api_key: Option<&str>,
+    ) -> Result<(), WardenError> {
+        // Feature gate first: with no gateway URL configured, the env these
+        // keys would feed is never rendered ([`objects::daemon_env`]), so
+        // storing them would only roll pods onto values they cannot use.
         if self.config.llm_base_url.is_none() {
             return Err(WardenError::LlmNotConfigured);
         }
         let name = TenantName::parse(raw_label)?;
-        let api_key = validate::validate_llm_api_key(raw_api_key)?;
+        if raw_api_key.is_none() && raw_assistant_api_key.is_none() {
+            return Err(WardenError::NoKeys);
+        }
+        // Both slots held to the same constraints: both become env values
+        // through the same secretKeyRef mechanism.
+        let api_key = raw_api_key
+            .map(validate::validate_llm_api_key)
+            .transpose()?;
+        let assistant_api_key = raw_assistant_api_key
+            .map(validate::validate_llm_api_key)
+            .transpose()?;
         if self.identity(&name).await?.is_none() {
             return Err(WardenError::NotFound);
         }
 
+        // The union with what is already stored: the apply below force-owns
+        // the whole Secret, so a slot missing from it would be DELETED, and a
+        // one-slot rotation must not clear the other slot. A stored value was
+        // validated on its way in, so it is carried forward verbatim.
+        let existing = self
+            .cluster
+            .get_secret(&name.llm_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        let api_key =
+            api_key.or_else(|| existing.as_ref().and_then(|s| secret_value(s, objects::LLM_API_KEY_KEY)));
+        let assistant_api_key = assistant_api_key.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|s| secret_value(s, objects::ASSISTANT_API_KEY_KEY))
+        });
+
         self.apply(
             &name,
-            Object::Secret(Box::new(objects::llm_secret(&self.config, &name, &api_key))),
+            Object::Secret(Box::new(objects::llm_secret(
+                &self.config,
+                &name,
+                api_key.as_deref(),
+                assistant_api_key.as_deref(),
+            ))),
             "llm_key_write_failed",
         )
         .await?;
@@ -443,7 +510,12 @@ impl Warden {
                     &self.config,
                     &name,
                     &objects::credential_hash(&ciphertext),
-                    Some(&objects::credential_hash(&api_key)),
+                    // Over the UNION just applied, not the request: the pod
+                    // must be rolled for what the Secret now holds.
+                    Some(&objects::llm_keys_hash(
+                        api_key.as_deref(),
+                        assistant_api_key.as_deref(),
+                    )),
                 ))),
                 "workload_failed",
             )
@@ -1038,7 +1110,10 @@ mod tests {
             .create_tenant("alice", "alice@example.com")
             .await
             .unwrap();
-        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-first"), None)
+            .await
+            .unwrap();
         // Stored, and nothing rolled: there is no workload yet to roll.
         assert!(h.cluster.secret("alice-llm").is_some());
         assert!(!h.cluster.exists(Kind::Deployment, "alice"));
@@ -1048,7 +1123,33 @@ mod tests {
             .await
             .unwrap();
         let hash = llm_annotation(&h).expect("the pod was born without the key hash");
-        assert_eq!(hash, objects::credential_hash("sk-vk-first"));
+        assert_eq!(hash, objects::llm_keys_hash(Some("sk-vk-first"), None));
+    }
+
+    /// The same pickup with both keys stored: the pod is born carrying the
+    /// combined hash — the exact one a later rotation recomputes, so the two
+    /// sites agree on what "unchanged" means.
+    #[tokio::test]
+    async fn a_pre_stored_assistant_key_reaches_the_pod_being_born() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage"), Some("sk-vk-assistant"))
+            .await
+            .unwrap();
+
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        let hash = llm_annotation(&h).expect("the pod was born without the key hash");
+        assert_eq!(
+            hash,
+            objects::llm_keys_hash(Some("sk-vk-triage"), Some("sk-vk-assistant"))
+        );
     }
 
     /// Rotation against a running tenant: the new key's hash is a new pod
@@ -1068,21 +1169,192 @@ mod tests {
         assert!(llm_annotation(&h).is_none());
         let credential = pod_annotation(&h);
 
-        h.warden.set_llm_key("alice", "sk-vk-first").await.unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-first"), None)
+            .await
+            .unwrap();
         let first = llm_annotation(&h).expect("the rotation did not reach the pod");
         assert_eq!(pod_annotation(&h), credential, "the seed hash must not move");
 
-        h.warden.set_llm_key("alice", "sk-vk-second").await.unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-second"), None)
+            .await
+            .unwrap();
         assert_ne!(
             first,
             llm_annotation(&h).unwrap(),
             "a new key must be a new pod spec"
         );
-        // The stored Secret is the new key, verbatim.
+        // The stored Secret is the new key, verbatim — and only the one data
+        // key: no assistant key was sent, so none is stored.
         let stored = h.cluster.secret("alice-llm").unwrap();
         assert_eq!(
             crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
             "sk-vk-second"
+        );
+        assert!(
+            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).is_none()
+        );
+    }
+
+    /// Rotating ONLY the assistant key must roll the pod: the combined hash is
+    /// the mechanism, and this is the test that proves the assistant half
+    /// participates in it. Same triage key throughout.
+    #[tokio::test]
+    async fn rotating_only_the_assistant_key_rolls_a_running_tenant() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        let credential = pod_annotation(&h);
+
+        // Triage key alone, then the assistant key arrives: a new pod spec.
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage"), None)
+            .await
+            .unwrap();
+        let unkeyed = llm_annotation(&h).unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage"), Some("sk-vk-assistant-1"))
+            .await
+            .unwrap();
+        let first = llm_annotation(&h).unwrap();
+        assert_ne!(unkeyed, first, "minting the assistant key must roll");
+
+        // Assistant-only rotation: triage unchanged, hash moves anyway.
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage"), Some("sk-vk-assistant-2"))
+            .await
+            .unwrap();
+        assert_ne!(
+            first,
+            llm_annotation(&h).unwrap(),
+            "an assistant-only rotation must be a new pod spec"
+        );
+        // Re-sending the same pair is the same pod spec: no spurious roll.
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage"), Some("sk-vk-assistant-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            llm_annotation(&h).unwrap(),
+            objects::llm_keys_hash(Some("sk-vk-triage"), Some("sk-vk-assistant-2"))
+        );
+        assert_eq!(pod_annotation(&h), credential, "the seed hash must not move");
+
+        // Both keys in the Secret, verbatim.
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
+            "sk-vk-triage"
+        );
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).unwrap(),
+            "sk-vk-assistant-2"
+        );
+    }
+
+    /// The leave-it-alone contract: a PUT that names one slot must not touch
+    /// the other. The apply is a force server-side apply, so this only holds
+    /// because `set_llm_key` carries the stored slot forward — a regression
+    /// here silently clears a live credential.
+    #[tokio::test]
+    async fn a_one_slot_put_preserves_the_other_slot() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage-1"), Some("sk-vk-assistant-1"))
+            .await
+            .unwrap();
+
+        // Triage-only rotation: the assistant slot survives, and the roll
+        // hash is over the resulting union, not the request.
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage-2"), None)
+            .await
+            .unwrap();
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
+            "sk-vk-triage-2"
+        );
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).unwrap(),
+            "sk-vk-assistant-1",
+            "a triage-only PUT must not clear the assistant slot"
+        );
+        assert_eq!(
+            llm_annotation(&h).unwrap(),
+            objects::llm_keys_hash(Some("sk-vk-triage-2"), Some("sk-vk-assistant-1"))
+        );
+
+        // Assistant-only rotation: the triage slot survives, same union hash.
+        h.warden
+            .set_llm_key("alice", None, Some("sk-vk-assistant-2"))
+            .await
+            .unwrap();
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
+            "sk-vk-triage-2",
+            "an assistant-only PUT must not clear the triage slot"
+        );
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).unwrap(),
+            "sk-vk-assistant-2"
+        );
+        assert_eq!(
+            llm_annotation(&h).unwrap(),
+            objects::llm_keys_hash(Some("sk-vk-triage-2"), Some("sk-vk-assistant-2"))
+        );
+    }
+
+    /// The half-failed-mint order: an assistant key can land before any triage
+    /// key exists, and the Secret holds just that one slot until the triage
+    /// mint catches up.
+    #[tokio::test]
+    async fn an_assistant_key_can_land_before_the_triage_key() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_llm_key("alice", None, Some("sk-vk-assistant"))
+            .await
+            .unwrap();
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert!(crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).is_none());
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).unwrap(),
+            "sk-vk-assistant"
+        );
+
+        // The triage key arriving later completes the pair.
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-triage"), None)
+            .await
+            .unwrap();
+        let stored = h.cluster.secret("alice-llm").unwrap();
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
+            "sk-vk-triage"
+        );
+        assert_eq!(
+            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).unwrap(),
+            "sk-vk-assistant"
         );
     }
 
@@ -1090,7 +1362,10 @@ mod tests {
     async fn an_llm_key_refuses_an_unknown_label_and_a_broken_key() {
         let h = Harness::with_config(llm_test_config());
         assert_eq!(
-            h.warden.set_llm_key("nobody", "sk-vk").await.unwrap_err(),
+            h.warden
+                .set_llm_key("nobody", Some("sk-vk"), None)
+                .await
+                .unwrap_err(),
             WardenError::NotFound
         );
         h.warden
@@ -1098,10 +1373,26 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            h.warden.set_llm_key("alice", "sk\nvk").await.unwrap_err(),
+            h.warden
+                .set_llm_key("alice", Some("sk\nvk"), None)
+                .await
+                .unwrap_err(),
             WardenError::InvalidApiKey(_)
         ));
-        // Neither call put anything past the identity.
+        // The assistant key is held to the same constraints as the triage key.
+        assert!(matches!(
+            h.warden
+                .set_llm_key("alice", Some("sk-vk"), Some("sk\nassistant"))
+                .await
+                .unwrap_err(),
+            WardenError::InvalidApiKey(_)
+        ));
+        // A body naming neither slot would install nothing: refused by name.
+        assert_eq!(
+            h.warden.set_llm_key("alice", None, None).await.unwrap_err(),
+            WardenError::NoKeys
+        );
+        // None of the calls put anything past the identity.
         assert_eq!(h.cluster.applied_names(), vec!["alice-identity"]);
     }
 
@@ -1116,7 +1407,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            h.warden.set_llm_key("alice", "sk-vk").await.unwrap_err(),
+            h.warden
+                .set_llm_key("alice", Some("sk-vk"), None)
+                .await
+                .unwrap_err(),
             WardenError::LlmNotConfigured
         );
         assert!(h.cluster.secret("alice-llm").is_none());

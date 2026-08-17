@@ -146,9 +146,10 @@ unbounded tenant is every other tenant's problem. The daemon's numbers come from
 config; the init container's are fixed and tiny. The namespace-wide ceiling is
 `deploy/hosted/70-tenant-limits.yaml`.
 
-Its environment carries the tenant's mailbox address, the Google OAuth client and
-the Anthropic API key by `secretKeyRef` only, never inline: an address in a pod
-spec is an address in `kubectl get deploy -o yaml`, and so is a client secret.
+Its environment carries the tenant's mailbox address, the Google OAuth client
+and, when a gateway is configured, the tenant's virtual LLM key — each by
+`secretKeyRef` only, never inline: an address in a pod spec is an address in
+`kubectl get deploy -o yaml`, and so is a client secret.
 
 The image's entrypoint is bypassed (`command: /usr/local/bin/squelchd`,
 `args: serve`) because `docker-entrypoint.sh` starts as root to chown the volume
@@ -174,15 +175,23 @@ choice: a Google refresh token only works for the client that minted it, and
 already admits to, and on its own it opens no mailbox. See
 `deploy/hosted/SETUP.md`, "The Google OAuth client".
 
-### The Anthropic key
+### The LLM key
 
-Stage-2 triage needs one, and hosted tenants get it from a Secret shared by the
-namespace (`SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME`, key `ANTHROPIC_API_KEY`). The
-reference is **optional**: no Secret means the variable is simply unset and that
-tenant runs heuristic-only triage, rather than every pod in the namespace
-wedging in `CreateContainerConfigError`. It is the shared-key bridge production
-already ran as a hand patch, written down; when the relay ships, tenants stop
-holding a key at all.
+Stage-2 triage needs one, and hosted tenants each get their own: a per-tenant
+virtual key for the LLM gateway, minted by the control plane and installed as
+that tenant's `<label>-llm` Secret (key `api-key`), injected as
+`SQUELCH_STAGE2_API_KEY` when `SQUELCH_WARDEN_LLM_BASE_URL` is set. The
+reference is **optional**: an unminted tenant resolves no key at all and runs
+heuristic-only triage, rather than wedging in `CreateContainerConfigError`. No
+tenant ever holds a real provider key; the gateway holds the one real key and
+meters each virtual key against its budget.
+
+Both claims hold for every pod this warden renders — and only those. A tenant
+provisioned before the shared-key bridge was removed still carries the legacy
+`ANTHROPIC_API_KEY` env from its old spec, and its Stage-2 calls are failing
+with 401s rather than idling, until `squelch-control llm mint` re-applies its
+Deployment. The migration steps live in `deploy/hosted/PRODUCTION.md`,
+"History".
 
 ### The console's Google link
 
@@ -242,7 +251,6 @@ step 9 has the procedure and the tenant-to-tenant denial test to run beside it.
 | `SQUELCH_WARDEN_INGRESS_POD_LABEL` | `app.kubernetes.io/name=traefik` | Which pods there may reach a tenant. |
 | `SQUELCH_WARDEN_TLS_SECRET` | `passband-wildcard-tls` | The wildcard certificate, in the tenant namespace. |
 | `SQUELCH_WARDEN_OAUTH_SECRET_NAME` | `google-oauth-client` | Secret holding the web client tenant daemons refresh with. |
-| `SQUELCH_WARDEN_ANTHROPIC_SECRET_NAME` | `anthropic-api-key` | Secret holding the Stage-2 API key, referenced `optional: true`. |
 | `SQUELCH_WARDEN_CONSOLE_SSO_URL` | unset | Control plane origin, passed on as `SQUELCH_CONSOLE_SSO_URL`. Origin only. |
 | `SQUELCH_WARDEN_STORAGE_CLASS` | `local-path` | k3s's built-in provisioner. |
 | `SQUELCH_WARDEN_STORAGE_SIZE` | `10Gi` | Per-tenant volume. |

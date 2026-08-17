@@ -108,9 +108,8 @@ refuses it before the handler is reached).
   pixel still needs remote images on before it fetches. `allowTrackers` is part of
   `Prepared.cacheKey`, and `ImageWarmer` always prefetches the STRIPPED body so
   warming can never report an open the reader never made.
-- **The auth half of the gate** (closes issue #10 — the `From` header alone is
-  free text, so the contact half by itself let anyone who knows one of the user's
-  correspondents spoof their way past the strip).
+- **The auth half of the gate.** The `From` header is free text, so contact
+  membership alone cannot authorize a tracker bypass.
   `squelch-core/src/sync/ingest.rs:extract_auth_pass` computes the verdict once at
   ingest into `messages.auth_pass`;
   `squelch-api/src/handlers.rs:get_thread` ANDs it into `sender_known`. Gated
@@ -171,9 +170,8 @@ refuses it before the handler is reached).
   **last**. Trackers first so a pixel can never be the "first occurrence" that
   suppresses a real image; rewrite last because after it nothing recognises a
   reference as remote.
-- Never put `http:`/`https:` back in `img-src`. That one change turns every missed
-  rewrite from a broken-image glyph into an un-proxied request, and reopens the
-  CSS-background gap `html.rs` used to document as a KNOWN TRADE-OFF.
+- Never put `http:`/`https:` in `img-src`. A missed rewrite must fail closed
+  instead of becoming an un-proxied request.
 - Keep the signature check: without it a hand-written `url(passband-img://…)` in a
   kept `<style>` fetches a tracker while the UI says the mail has no remote content.
 - `auth_pass` is three-valued and the comparison must stay `== Some(true)`. Any
@@ -267,16 +265,35 @@ shows a browser for what it is.
 | `GET /console/callback?code=` | the same claim, on a code the control plane minted. Nothing about the hop is trusted here: a code that was burned, replayed, expired or never minted fails exactly like a typo |
 | `POST /console/pair`, `POST /console/revoke/{id}`, `POST /console/logout` | a verified session cookie, checked ahead of the handler |
 
-**Cookie posture.** `HttpOnly`, `SameSite=Strict`, `Path=/`, no `Domain`,
-`Secure` whenever the request arrived over https, 30-day `Max-Age`. Deliberately
+**Cookie posture.** `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, `Secure`
+whenever the origin is https, 30-day `Max-Age`. Deliberately
 **not** `__Host-` prefixed: the prefix requires `Secure`, a plain-http loopback
 run cannot set it, and a cookie name that only works in production is a name
 whose absence nobody notices until production — so the two properties the prefix
-would buy are set explicitly instead. Sign-out **revokes** the token rather than
+would buy are set explicitly instead. `Lax` and not `Strict`, which was learned
+live: the SSO landing is a navigation chain that started at accounts.google.com,
+Chrome withholds `Strict` cookies from every request in a cross-site-initiated
+chain including the same-site 303 hop back to `/console`, and the first thing a
+freshly signed-in user saw was the login page again. `Lax` still withholds the
+cookie from cross-site POSTs, and the mutating routes are guarded below
+regardless. Sign-out **revokes** the token rather than
 only dropping the cookie, and every refusal of a cookie that would not verify
 clears it on the way out.
 
-**CSRF, two independent controls.** `SameSite=Strict`, plus an
+**The one escape hatch: `[console] allow_insecure_cookie`.** Off by default and
+meant to stay there. It exists for the self-host serving the console over plain
+http on a LAN, who otherwise has a console that cannot work at all: a browser
+will not store a `Secure` cookie from `http://`. It is read as a statement about
+the whole origin rather than as a cookie flag, so with it on the daemon also
+builds its pairing deep link with `http://`, compares `Origin` against that same
+`http://` origin, and stops offering the SSO link. Those move together
+deliberately: a login page that renders and then refuses the POST from it is not
+a working console. **The cookie is a live device token**, so turning this on puts
+a revocable credential on the wire in the clear for anything on the path to take,
+and it is the reason to prefer TLS or loopback. When it is on, the login page
+carries a banner and the daemon warns at startup.
+
+**CSRF, two independent controls.** `SameSite=Lax`, plus an
 `Origin`/`Sec-Fetch-Site` check in front of every mutating POST — including the
 *unauthenticated* login POST, so a cross-site page cannot sign a browser into an
 account of the attacker's choosing either. `Sec-Fetch-Site` is believed
@@ -298,19 +315,42 @@ frame-ancestors 'none'; base-uri 'none'` and fetch no script, font or image.
 **The Google hop is the control plane's, and it is hosted-only.** Google forbids
 wildcard redirect URIs, so a per-tenant hostname cannot run OAuth itself. The
 login page links to `GET /console/auth?tenant=<label>` on `squelch-control`,
-which: is rate-limited on the **signup** budget (the other route that opens a
-server-side session); validates the label and looks the tenant up **before**
-sending anyone to Google; **discovers** the mailbox from Google and compares it
-constant-time against the store's owner for that label, and only then calls the
-warden — so guessing a real label cannot make a pairing code exist, let alone
-show one; and takes **no** `return` or `next` parameter anywhere in the flow, so
-there is no open redirect: the destination is constructed from this deployment's
-own base domain and the validated label. The redirect carrying the live code is
-`Cache-Control: no-store, no-cache` and `Referrer-Policy: no-referrer`. Every
-identity-shaped refusal is one page. The link renders only when
-`SQUELCH_CONSOLE_SSO_URL` is set — hosted tenants get it from the warden
-(`SQUELCH_WARDEN_CONSOLE_SSO_URL`), a self-host never sets it, and without it the
-console is the pasted-code form alone.
+which: is rate-limited on **its own** budget, tighter than signup's, shared with
+`/app/auth` below (they are the only two routes that open a server-side session
+with nothing presented at all); sends **every well-formed label** to Google
+without looking it up, because answering a real label differently from an
+unprovisioned one is a directory of which hosted addresses exist; **discovers**
+the mailbox from Google on the way back and compares it constant-time against the
+store's owner for that label, and only then calls the warden — so guessing a real
+label cannot make a pairing code exist, let alone show one; and takes **no**
+`return` or `next` parameter anywhere in the flow, so there is no open redirect:
+the destination is constructed from this deployment's own base domain and the
+validated label. The redirect carrying the live code is `Cache-Control:
+no-store, no-cache` and `Referrer-Policy: no-referrer`. Every identity-shaped
+refusal is one page. The link renders only when `SQUELCH_CONSOLE_SSO_URL` is set
+— hosted tenants get it from the warden (`SQUELCH_WARDEN_CONSOLE_SSO_URL`), a
+self-host never sets it, and without it the console is the pasted-code form
+alone.
+
+**`GET /app/auth` is that hop with its input removed, for the native app.** The
+app has no label to send (its user knows their address, not their tenant record)
+and no console to be returned to, so this route accepts **nothing** — no query
+string at all — and the tenant is found by **reverse lookup** on the address
+Google verified (`active_tenant_for_email`, `status = 'active'` part of the
+question). Same consent (`openid email`, online, no refresh token), same session
+table, same warden-minted **pairing code** as the ticket; what differs is the
+ending, a page carrying a `passband://pair?url=…&code=…` deep link built from
+this deployment's own tenant URL, under the same `no-store` / `no-referrer`
+headers. **Taking no input is what removes the oracle rather than adding one:**
+the lookup key is an address Google vouched for on this request, so the only
+mailbox anybody can ask about is the one they just proved they hold, and there is
+no label space to walk. That is why this route may say plainly that a signed-in
+account has no mailbox here, where `/console/auth` may not. Both logins share one
+rate-limit bucket and one carve-out of the session table
+(`MAX_IDENTITY_SESSIONS`), so alternating them cannot buy a flooder a second
+budget or crowd a paying signup out. It exists so somebody who already has a
+mailbox never touches an invite code: invites provision tenants, and this flow is
+for people whose tenant already runs.
 
 **Local drafts (human-door-only table).** `drafts`
 (`squelch-core/src/store/sqlite/drafts.rs`, served only by `/client/drafts`) holds

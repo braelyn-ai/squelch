@@ -3,6 +3,14 @@
 // explainer, caps + spend estimate, ranking blend), assistant (BYOK key, model),
 // account. Escape is the only key bound here, so global 1..5 / ⌘[ ] nav keeps
 // working and the dispatcher's input guard covers the typed fields.
+//
+// `SettingsView` ITSELF IS THE MAC'S SHELL — a fixed nav column beside a scroll
+// pane, which is a window shape and only a window shape. The phone's shell is
+// Sources/PassbandiOS/Views/AccountPage.swift, which files these panes under the
+// person rather than beside the mail. What crosses is everything
+// BELOW this struct: the section cards, which compile for both and are composed
+// by whichever shell is on screen. So this file still has to build for iOS, and
+// the two lines that cannot (the routed header) are fenced rather than moved.
 
 import SwiftUI
 
@@ -13,7 +21,12 @@ struct SettingsView: View {
     var body: some View {
         @Bindable var prefs = prefs
         VStack(spacing: 0) {
-            RoutedHeader(title: "Settings")
+            // RoutedHeader lives in App/RootView.swift, which is the Mac's window
+            // shell and is excluded from the iOS target. The phone titles this
+            // screen with a navigation bar instead.
+            #if os(macOS)
+                RoutedHeader(title: "Settings")
+            #endif
             HStack(alignment: .top, spacing: 0) {
                 nav
                 ScrollView {
@@ -48,6 +61,10 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+            // Outside the ScrollView and outside the section switch, so it sits
+            // still in the corner on every tab instead of scrolling away with
+            // whichever one is showing.
+            .overlay(alignment: .bottomTrailing) { versionStamp }
         }
         // Escape is exempt from the dispatcher's input guard precisely so a
         // surface this full of text fields can still be left.
@@ -55,6 +72,25 @@ struct SettingsView: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
         ])
+    }
+
+    /// Which build this is, in the corner of every settings tab.
+    ///
+    /// Selectable on purpose: the first thing anybody is asked for in a bug
+    /// report is the version, and a number you can only retype is a number that
+    /// arrives wrong. Read from the bundle rather than a constant, so it is
+    /// whatever this copy actually is and cannot drift from what shipped.
+    private var versionStamp: some View {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return Text("Passband \(version) (\(build))")
+            .font(.system(size: 10))
+            .foregroundStyle(Palette.inkFaintest)
+            .textSelection(.enabled)
+            .padding(.trailing, 14)
+            .padding(.bottom, 10)
+            .accessibilityLabel("Passband version \(version), build \(build)")
     }
 
     private var nav: some View {
@@ -133,6 +169,12 @@ struct SecretField: View {
             input
                 .textFieldStyle(.plain)
                 .autocorrectionDisabled()
+                // The phone keyboard arms the shift key at the start of every
+                // empty field, and a capitalized "Sk-ant-…" is a key no
+                // provider check recognizes. Secrets are never sentences.
+                #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                #endif
                 .onSubmit { focused = false }
                 .onChange(of: focused) { _, nowFocused in
                     if !nowFocused { Task { await commit() } }
@@ -262,9 +304,21 @@ struct InlineRow<Content: View>: View {
     }
 }
 
+// MARK: - the sections
+
+// EVERY SECTION BELOW IS INTERNAL, NOT private, AND THAT IS THE POINT. Two
+// shells compose them — the Mac's sub-nav column above, the phone's navigation
+// list in Sources/PassbandiOS/Views/AccountPage.swift — off one set of
+// structs, so a fix to what a switch writes or what a hint promises lands on
+// both at once. The shells own the ARRANGEMENT (which pane holds what, how you
+// get to it); the sections own the behavior, and behavior cannot fork.
+//
+// Where a section's own layout is genuinely window-shaped it says so inline with
+// an #if, rather than growing a second copy of itself.
+
 // MARK: - general
 
-private struct ConnectionSection: View {
+struct ConnectionSection: View {
     @Environment(AppStore.self) private var store
     @State private var url = ""
     @State private var token = ""
@@ -312,8 +366,10 @@ private struct ConnectionSection: View {
                     EmptyView()
                 }
             }
+            // "your keychain" and not "your macOS keychain": the same card is on
+            // screen on a phone now, where the store behind it is the iOS one.
             SettingsHint(
-                "Saved when you click away. The token lives in your macOS keychain and is sent only as a bearer header — never logged."
+                "Saved as soon as you leave the field. The token lives in your keychain and is sent only as a bearer header, never logged."
             )
         }
         .onAppear {
@@ -342,7 +398,7 @@ private struct ConnectionSection: View {
     }
 }
 
-private struct AppearanceSection: View {
+struct AppearanceSection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
@@ -360,7 +416,7 @@ private struct AppearanceSection: View {
 
 /// The banner chime. Picking an option plays it once, right here — judging a
 /// half-second sound from its name alone is not a thing.
-private struct NotificationsSection: View {
+struct NotificationsSection: View {
     @Environment(Prefs.self) private var prefs
     /// Held for the duration of playback: the sound stops when deallocated.
     @State private var player: PlatformSound?
@@ -393,7 +449,7 @@ private struct NotificationsSection: View {
 
 /// The first-run walkthrough, on demand. Replay leaves Settings for the sitrep,
 /// which four of the seven steps are about.
-private struct TourSection: View {
+struct TourSection: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
@@ -413,7 +469,7 @@ private struct TourSection: View {
 /// Dev mode adds re-triage affordances (sitrep masthead, thread viewer) that
 /// reset LLM verdicts so the pipeline re-runs. Rule-decided and sealed rows are
 /// never touched.
-private struct DeveloperSection: View {
+struct DeveloperSection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
@@ -432,7 +488,7 @@ private struct DeveloperSection: View {
     }
 }
 
-private struct YouSection: View {
+struct YouSection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
@@ -452,7 +508,7 @@ private struct YouSection: View {
 /// Remote images: "Always" renders them in every email, "On demand" blocks them
 /// at the frame CSP until the reader opts in per message. Tracking pixels are
 /// stripped either way — see docs/SECURITY.md.
-private struct MailSection: View {
+struct MailSection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
@@ -474,51 +530,72 @@ private struct MailSection: View {
 /// same function that builds the HTML half of every outgoing email, so the
 /// right side is what the recipient gets, not a second interpretation. Saved
 /// on every keystroke (UserDefaults) — client-side, like the display name.
-private struct SignatureSection: View {
+///
+/// SIDE BY SIDE ON THE MAC, STACKED ON THE PHONE. The pairing is the whole idea
+/// here — you type on one side and watch the other become what the recipient
+/// gets — and it survives the stack, because "below" reads as the same
+/// before/after relation "beside" does. Two columns on a 390pt screen would not:
+/// each half lands near 170pt, which is neither an editor nor a preview.
+struct SignatureSection: View {
     @Environment(Prefs.self) private var prefs
 
     @State private var previewHTML = ""
     @State private var previewFailed = false
 
     var body: some View {
-        @Bindable var prefs = prefs
         SectionCard(label: "Signature") {
-            HStack(alignment: .top, spacing: 14) {
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 6) {
-                        Text("markdown, like the composer:")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaint)
-                        Text("**bold**, *italic*, `code`, [links](url)")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaintest)
-                    }
-                    MarkdownTextView(text: $prefs.signature)
-                        .frame(height: 140)
-                        .padding(8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .fill(Palette.canvas.opacity(0.65))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+            // Same two panes, same debounce, same renderer — only the axis moves.
+            #if os(iOS)
+                VStack(alignment: .leading, spacing: 14) {
+                    editorColumn
+                    previewColumn
                 }
-                .frame(maxWidth: .infinity)
-
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("as the recipient sees it")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkFaint)
-                    previewPane
+            #else
+                HStack(alignment: .top, spacing: 14) {
+                    editorColumn
+                    previewColumn
                 }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-            }
+            #endif
             SettingsHint(
                 "Added under new messages and replies as you draft them. It is part of the body, so you can edit or delete it per email. Leave this empty for no signature."
             )
         }
         .task(id: prefs.signature) { await refreshPreview() }
+    }
+
+    private var editorColumn: some View {
+        @Bindable var prefs = prefs
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Text("markdown, like the composer:")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaint)
+                Text("**bold**, *italic*, `code`, [links](url)")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+            }
+            MarkdownTextView(text: $prefs.signature)
+                .frame(height: 140)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Palette.canvas.opacity(0.65))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var previewColumn: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("as the recipient sees it")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaint)
+            previewPane
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     @ViewBuilder private var previewPane: some View {
@@ -564,7 +641,7 @@ private struct SignatureSection: View {
 ///
 /// The whole card is replaced by an explainer when the daemon has no tracking
 /// base_url, because there the answer is "no" whatever this says.
-private struct ReadTrackingSection: View {
+struct ReadTrackingSection: View {
     @Environment(AppStore.self) private var store
     @State private var busy = false
     @State private var error: String?
@@ -621,7 +698,7 @@ private struct ReadTrackingSection: View {
 /// The "how triage works" explainer above the budget fields. Stage cards show
 /// live model names and daily caps from GET /client/triage-config, fetched here
 /// rather than shared with the budget section.
-private struct TriagePipelineSection: View {
+struct TriagePipelineSection: View {
     @State private var config: TriageConfig?
 
     var body: some View {
@@ -701,7 +778,7 @@ private struct TriagePipelineSection: View {
 /// Daily caps for both triage stages, plus a spend estimate from trailing-14d
 /// usage and configured prices. Stage 1 runs on every email (one cap), stage 2
 /// only on escalations (thread/sender/global). Save posts only changed fields.
-private struct TriageBudgetSection: View {
+struct TriageBudgetSection: View {
     @Environment(AppStore.self) private var store
 
     @State private var config: TriageConfig?
@@ -932,7 +1009,7 @@ private struct TriageBudgetSection: View {
 /// The blend ordering the sitrep "For your eyes" zone: one slider between time
 /// and severity. The stored pref is the *urgency* share, and the slider is
 /// inverted so dragging right toward "severity" lowers it. No save button.
-private struct RankingSection: View {
+struct RankingSection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
@@ -961,12 +1038,19 @@ private struct RankingSection: View {
 
 // MARK: - assistant
 
-/// BYOK settings for the ⌘K assistant: the user's own Anthropic key, kept in the
-/// OS keychain and never sent to the squelch server. It rests masked and is read
-/// back only through `AssistantKeyStore.revealAsync`, the one sanctioned way for
-/// a view to hold it; the request path never does — `LLMProxy` reads the keychain.
-private struct AssistantSection: View {
+/// Settings for the ⌘K assistant. On a daemon that advertises the hosted relay
+/// (`store.relayAvailable`) a transport switch appears: "Passband relay" sends
+/// chats through the daemon on the plan's budget, "My own key" is BYOK. A
+/// daemon that never advertises it renders exactly the BYOK card that always
+/// existed — no dead switch (the read-tracking section's posture).
+///
+/// The BYOK key is the user's own Anthropic key, kept in the OS keychain and
+/// never sent to the squelch server. It rests masked and is read back only
+/// through `AssistantKeyStore.revealAsync`, the one sanctioned way for a view
+/// to hold it; the request path never does — `LLMProxy` reads the keychain.
+struct AssistantSection: View {
     @Environment(Prefs.self) private var prefs
+    @Environment(AppStore.self) private var store
 
     @State private var status = AssistantKeyStatus.absent
     @State private var keyInput = ""
@@ -979,42 +1063,44 @@ private struct AssistantSection: View {
         case err(String)
     }
 
+    /// What the hint calls the thing this key pays for. The chord IS the Mac's
+    /// name for it; a phone has no chords, so it gets the plain noun. Both
+    /// platforms have exactly one spender: nothing else in the app makes a model
+    /// call on the user's behalf, which is what lets "used only for X" be the
+    /// whole truth of what the key is spent on.
+    #if os(macOS)
+        private let assistantName = "the ⌘K assistant"
+    #else
+        private let assistantName = "the assistant"
+    #endif
+
+    /// Whether the key affordances render. True the moment the daemon offers
+    /// no relay: there the pref (whatever it says) cannot mean relay, and the
+    /// section must look exactly like it always has.
+    private var byokMode: Bool {
+        !store.relayAvailable || prefs.assistantTransport == .byok
+    }
+
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Assistant") {
-            SecretField(
-                label: "api key (yours)", placeholder: "sk-ant-…",
-                hasStored: status.present,
-                load: { await AssistantKeyStore.revealAsync() },
-                onCommit: { await saveKey($0) },
-                text: $keyInput, editing: $editingKey
-            )
-            .onChange(of: keyInput) { _, _ in note = nil }
-            HStack(spacing: 10) {
-                if busy {
-                    Text("saving…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                }
-                if status.present {
-                    StatusDot(
-                        color: Palette.positive,
-                        label: "key set" + (status.provider.map { " · \($0.label)" } ?? ""))
-                    Button("forget") { Task { await forgetKey() } }
-                        .buttonStyle(.plain)
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.danger)
-                }
-                switch note {
-                case .ok(let text):
-                    Text(text).font(Typo.micro).foregroundStyle(Palette.positive)
-                case .err(let text):
-                    Text(text).font(Typo.micro).foregroundStyle(Palette.danger)
-                case nil:
-                    EmptyView()
+            if store.relayAvailable {
+                InlineRow(key: "chats via") {
+                    GlassSegmented(
+                        options: AssistantTransport.allCases.map { ($0, $0.label) },
+                        selection: $prefs.assistantTransport)
                 }
             }
-            SettingsHint(
-                "Saved when you click away. Your key stays on this machine (macOS keychain) and is used only for the ⌘K assistant — never sent to the squelch server."
-            )
+            if byokMode {
+                byokFields
+            } else {
+                // The BYOK hint's "never sent to the squelch server" is FALSE
+                // here — the daemon is exactly where a relayed chat goes — so
+                // relay mode says what actually happens instead.
+                SettingsHint(
+                    "Chats go through your Passband daemon and count against your plan's monthly assistant budget."
+                )
+            }
 
             InlineRow(key: "model") {
                 GlassSegmented(
@@ -1024,6 +1110,45 @@ private struct AssistantSection: View {
             SettingsHint(prefs.assistantModel.label)
         }
         .task { status = await AssistantKeyStore.statusAsync() }
+    }
+
+    /// The BYOK card as it has always been: the masked key field, its status
+    /// row, and the on-this-machine promise (true only of this mode).
+    @ViewBuilder
+    private var byokFields: some View {
+        SecretField(
+            label: "api key (yours)", placeholder: "sk-ant-…",
+            hasStored: status.present,
+            load: { await AssistantKeyStore.revealAsync() },
+            onCommit: { await saveKey($0) },
+            text: $keyInput, editing: $editingKey
+        )
+        .onChange(of: keyInput) { _, _ in note = nil }
+        HStack(spacing: 10) {
+            if busy {
+                Text("saving…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            }
+            if status.present {
+                StatusDot(
+                    color: Palette.positive,
+                    label: "key set" + (status.provider.map { " · \($0.label)" } ?? ""))
+                Button("forget") { Task { await forgetKey() } }
+                    .buttonStyle(.plain)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.danger)
+            }
+            switch note {
+            case .ok(let text):
+                Text(text).font(Typo.micro).foregroundStyle(Palette.positive)
+            case .err(let text):
+                Text(text).font(Typo.micro).foregroundStyle(Palette.danger)
+            case nil:
+                EmptyView()
+            }
+        }
+        SettingsHint(
+            "Saved as soon as you leave the field. Your key stays on this device (your keychain) and is used only for \(assistantName), never sent to the squelch server."
+        )
     }
 
     /// Called by the field on blur. Clearing `keyInput` afterwards keeps the
@@ -1061,7 +1186,7 @@ private struct AssistantSection: View {
 
 /// The developer-telemetry level. Opt-out (Full is the default); the gate
 /// itself lives in Analytics, which reads the pref on every event.
-private struct PrivacySection: View {
+struct PrivacySection: View {
     @Environment(Prefs.self) private var prefs
 
     var body: some View {
@@ -1089,7 +1214,7 @@ private struct PrivacySection: View {
 /// re-renders constantly and a keychain read can raise the system's access
 /// panel, so the host each row shows is the non-secret one the index carries
 /// (see `AccountRecord.displayHost`).
-private struct AccountSection: View {
+struct AccountSection: View {
     @Environment(AppStore.self) private var store
     @State private var usage: UsageResponse?
 
@@ -1105,18 +1230,29 @@ private struct AccountSection: View {
                         isOnly: accounts.count == 1)
                     if account.id != accounts.last?.id { Hairline() }
                 }
-                HStack(spacing: 12) {
-                    Button("Add Account…") { store.addAccountSheetOpen = true }
-                        .buttonStyle(.glassProminent)
-                        .tint(Palette.accent)
-                    Text("one daemon per mailbox, each with its own rules and triage")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkFaintest)
-                }
-                .padding(.top, 4)
-                SettingsHint(
-                    "⌘1 through ⌘9 switch accounts in the order listed here. Tokens live in your macOS keychain, one pair of slots per account."
-                )
+                // ADD IS MAC-ONLY, AND THE BUTTON SAYS SO BY NOT BEING HERE.
+                // `addAccountSheetOpen` is presented by the Mac's action layer;
+                // nothing on the phone mounts that sheet, so shipping the button
+                // would ship a control that sets a flag into the void. Every
+                // other verb on this pane (rename, make active, remove) is
+                // AccountManager and works identically on both.
+                #if os(macOS)
+                    HStack(spacing: 12) {
+                        Button("Add Account…") { store.addAccountSheetOpen = true }
+                            .buttonStyle(.glassProminent)
+                            .tint(Palette.accent)
+                        Text("one daemon per mailbox, each with its own rules and triage")
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaintest)
+                    }
+                    .padding(.top, 4)
+                    SettingsHint(
+                        "⌘1 through ⌘9 switch accounts in the order listed here. Tokens live in your keychain, one pair of slots per account."
+                    )
+                #else
+                    SettingsHint("Adding accounts happens in the Mac app for now.")
+                    SettingsHint("Tokens live in your keychain, one pair of slots per account.")
+                #endif
             }
             SectionCard(label: "Live account") {
                 meta("server", store.settings?.serverURL ?? "—")
@@ -1143,7 +1279,7 @@ private struct AccountSection: View {
 
 /// One account: its dot, its editable name, the daemon behind it, and the two
 /// things you can do to it.
-private struct AccountRow: View {
+struct AccountRow: View {
     @Environment(AppStore.self) private var store
     let account: AccountRecord
     /// Position in the list, which IS the ⌘number.
@@ -1167,56 +1303,108 @@ private struct AccountRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            // Live or not. A dot rather than a word: the row is already dense,
-            // and the Make Active button says the rest.
-            Circle()
-                .fill(isActive ? Palette.positive : Palette.hairline)
-                .frame(width: 7, height: 7)
-            TextField(account.displayHost.isEmpty ? "account \(number)" : account.displayHost,
-                text: $label)
-                .textFieldStyle(.plain)
-                .autocorrectionDisabled()
-                .focused($labelFocused)
-                .onSubmit { labelFocused = false }
-                .frame(width: 150)
-                .fieldWell()
-            Text(account.displayHost.isEmpty ? "—" : account.displayHost)
-                .font(Typo.mono(11))
-                .foregroundStyle(Palette.inkDim)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
-            if number <= 9 {
-                Text("⌘\(number)")
-                    .font(Typo.mono(10))
-                    .foregroundStyle(Palette.inkFaintest)
+        layout
+            // Seeded per account id, so a removal that re-uses this row's slot in
+            // the list cannot leave the previous account's name in the field.
+            .task(id: account.id) { label = account.label }
+            .onChange(of: labelFocused) { _, nowFocused in
+                guard !nowFocused else { return }
+                AccountManager.shared.rename(account.id, to: label.trimmed)
             }
-            if !isActive {
-                Button("make active") {
-                    Task { await AccountManager.shared.switchTo(account.id) }
+            // Past the ninth there is no chord to name, so the tooltip does not
+            // promise one. Pointer-only: a phone has neither hover nor chords.
+            #if os(macOS)
+                .help(
+                    isActive
+                        ? "the account on screen"
+                        : (number <= 9
+                            ? "switch to this account, or ⌘\(number)"
+                            : "switch to this account")
+                )
+            #endif
+    }
+
+    /// ONE ROW ON A MAC, TWO LINES ON A PHONE, and that is the only difference:
+    /// a window fits the dot, a 150pt name field, the host, the chord badge and
+    /// both verbs across one line, while a 390pt screen would spend the whole
+    /// width on the field and truncate the host to a couple of characters. So
+    /// the phone gives identity its own line and puts the verbs under it.
+    @ViewBuilder private var layout: some View {
+        #if os(iOS)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    liveDot
+                    nameField
+                    host
                 }
-                .buttonStyle(.textAction)
+                HStack(spacing: 16) {
+                    verbs
+                    Spacer(minLength: 0)
+                }
             }
-            Button(removeLabel) { remove() }
-                .buttonStyle(.textAction)
-                .foregroundStyle(Palette.danger)
-        }
-        .padding(.vertical, 4)
-        // Seeded per account id, so a removal that re-uses this row's slot in
-        // the list cannot leave the previous account's name in the field.
-        .task(id: account.id) { label = account.label }
-        .onChange(of: labelFocused) { _, nowFocused in
-            guard !nowFocused else { return }
-            AccountManager.shared.rename(account.id, to: label.trimmed)
-        }
-        // Past the ninth there is no chord to name, so the tooltip does not
-        // promise one.
-        .help(
-            isActive
-                ? "the account on screen"
-                : (number <= 9 ? "switch to this account, or ⌘\(number)" : "switch to this account")
+            .padding(.vertical, 6)
+        #else
+            HStack(spacing: 10) {
+                liveDot
+                nameField
+                host
+                Spacer(minLength: 8)
+                if number <= 9 {
+                    Text("⌘\(number)")
+                        .font(Typo.mono(10))
+                        .foregroundStyle(Palette.inkFaintest)
+                }
+                verbs
+            }
+            .padding(.vertical, 4)
+        #endif
+    }
+
+    /// Live or not. A dot rather than a word: the row is already dense, and the
+    /// Make Active button says the rest.
+    private var liveDot: some View {
+        Circle()
+            .fill(isActive ? Palette.positive : Palette.hairline)
+            .frame(width: 7, height: 7)
+    }
+
+    private var nameField: some View {
+        TextField(
+            account.displayHost.isEmpty ? "account \(number)" : account.displayHost,
+            text: $label
         )
+        .textFieldStyle(.plain)
+        .autocorrectionDisabled()
+        .focused($labelFocused)
+        .onSubmit { labelFocused = false }
+        // A window can spare a fixed column; a phone line takes what the host
+        // beside it leaves.
+        #if os(macOS)
+            .frame(width: 150)
+        #else
+            .frame(maxWidth: .infinity)
+        #endif
+        .fieldWell()
+    }
+
+    private var host: some View {
+        Text(account.displayHost.isEmpty ? "—" : account.displayHost)
+            .font(Typo.mono(11))
+            .foregroundStyle(Palette.inkDim)
+            .lineLimit(1)
+            .truncationMode(.middle)
+    }
+
+    @ViewBuilder private var verbs: some View {
+        if !isActive {
+            Button("make active") {
+                Task { await AccountManager.shared.switchTo(account.id) }
+            }
+            .buttonStyle(.textAction)
+        }
+        Button(removeLabel) { remove() }
+            .buttonStyle(.textAction)
+            .foregroundStyle(Palette.danger)
     }
 
     private func remove() {

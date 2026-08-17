@@ -257,20 +257,26 @@ A wildcard takes a minute or two the first time while ACME waits for DNS.
 
 ## 4. Images
 
-Two images: the daemon every tenant runs, and the warden.
+Two images: the daemon every tenant runs, and the warden. CI publishes both on
+every `daemon-X.Y.Z` tag (`.github/workflows/release-daemon.yml`), tagged with
+the git tag verbatim, so the normal path is to pull `daemon-0.0.1` rather than
+build anything. By hand, from a checkout:
 
 ```sh
 git clone https://github.com/braelyn-ai/squelch && cd squelch
 
-docker build -f squelchd/Dockerfile -t ghcr.io/braelyn-ai/squelchd:v0.1.0 .
-docker build -f Dockerfile.warden -t ghcr.io/braelyn-ai/squelch-warden:v0.1.0 .
-docker push ghcr.io/braelyn-ai/squelchd:v0.1.0
-docker push ghcr.io/braelyn-ai/squelch-warden:v0.1.0
+docker build -f squelchd/Dockerfile -t ghcr.io/braelyn-ai/squelchd:daemon-0.0.1 .
+docker build -f Dockerfile.warden -t ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.1 .
+docker push ghcr.io/braelyn-ai/squelchd:daemon-0.0.1
+docker push ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.1
 ```
 
 Tag them. The warden refuses to start with an untagged tenant image, because an
 untagged image means every tenant's daemon silently changes version on any pod
-restart, which is an upgrade nobody scheduled and nobody can roll back.
+restart, which is an upgrade nobody scheduled and nobody can roll back. Never
+reuse a tag either: GHCR lets you move one, `imagePullPolicy: IfNotPresent`
+means a node that has seen the name will not re-pull it, and the two together
+are a rollout that appears to work and changes nothing.
 
 If the packages are private, create the pull secret and uncomment
 `SQUELCH_WARDEN_IMAGE_PULL_SECRET` in `20-warden.yaml`:
@@ -406,8 +412,16 @@ and triages on rules alone, the control plane logs the miss loudly, and
 squelch-control llm mint <label>
 ```
 
-backfills the key later — the same command rotates a key (it prints the old
-Bifrost key id; revoke it there) and keys tenants that predate the gateway.
+backfills the keys later — the same command rotates them (it prints the old
+Bifrost key ids; revoke them there) and keys tenants that predate the gateway.
+
+Every mint is TWO virtual keys: the triage key and the assistant key
+(`tenant-<label>-assistant`, its own budget and model list). The assistant key
+never leaves the pod: the daemon holds it and proxies the Passband app's
+assistant chats through `/client/assistant/messages`, so the app spends
+against the tenant's assistant budget without ever seeing a credential. A
+tenant minted before the assistant era keeps working; the app's relay option
+simply does not appear until the tenant is re-minted.
 
 ## 7. Tenant limits
 

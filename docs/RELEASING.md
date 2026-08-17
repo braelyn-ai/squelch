@@ -1,15 +1,20 @@
 # Releasing
 
-The system has four release surfaces that move independently, on different
+The system has five release surfaces that move independently, on different
 triggers, with different blast radii. A "release" is usually one of these, not
 all of them; know which one you are doing before you start.
 
 | Surface | Trigger | What ships | Who is affected |
 |---|---|---|---|
-| Server images | push tag `v*` | `ghcr.io/braelyn-ai/{squelchd,squelch-warden,squelch-control}` | nobody, until a deploy points at the tag |
+| Server images | push tag `daemon-X.Y.Z` | `ghcr.io/braelyn-ai/{squelchd,squelch-warden,squelch-control}` | nobody, until a deploy points at the tag |
 | Hosted carrier | manual ops on `carrier` | warden + tenant pods | every hosted tenant |
-| Passband app | push tag `passband-v*` | GitHub Release + appcast + Homebrew cask | every Mac user, via Sparkle |
+| Passband for Mac | push tag `passband-mac-X.Y.Z` | GitHub Release + appcast + Homebrew cask | every Mac user, via Sparkle |
+| Passband for iOS | push tag `passband-ios-X.Y.Z` | a TestFlight build | every TestFlight tester |
 | Railway services | git push to `main`, or `railway up` | control, landing site, relay, monitoring | signup, passband.app, push relay |
+
+Every tag namespace names its surface, and the three never overlap: pushing a
+phone build never rebuilds three Docker images, and cutting a daemon never
+asks Apple for anything.
 
 Existing per-surface runbooks this document links instead of duplicating:
 [`passband/RELEASING.md`](../passband/RELEASING.md) (the app),
@@ -25,27 +30,49 @@ There is no single version. Keep the map in your head or you will ship the
 wrong number somewhere:
 
 - **Rust workspace** — `Cargo.toml` `[workspace.package] version`, inherited by
-  every crate. This is what `squelchd_build_info{version=...}` reports on the
-  dashboard, so bump it with the tag or Grafana cannot tell your releases
-  apart. Nothing enforces this; it is on you.
-- **Image tags** — the git tag itself. `v0.3.0` publishes `0.3.0`, `0.3`,
-  `v0.3.0`, and moves `latest` (verified against GHCR; self-host docs depend
-  on `latest`).
-- **Passband** — `passband/VERSION` is the marketing version;
-  `project.yml` `MARKETING_VERSION` must mirror it (release.sh preflights
-  this; CI does NOT, so check it before tagging). The Sparkle ordering key is
-  the BUILD number (`git rev-list --count HEAD`), which is why the marketing
-  version going backwards once (1.0.0 → 0.0.2) did not strand updaters. Do
-  not rely on that accident twice.
+  every crate. This is what `squelchd_build_info{version=...}` reports, so bump
+  it with the tag or the metric lies about what is running. `release-daemon.yml`
+  now enforces it: a `verify` job fails the release, before any registry write,
+  unless the tag is exactly `daemon-<workspace version>`.
+- **Image tags** — the git tag, verbatim. `daemon-0.0.1` publishes
+  `ghcr.io/braelyn-ai/squelchd:daemon-0.0.1` (same for warden and control) and
+  moves `latest`. There are no bare numeric image tags any more — no `0.0.1`,
+  no `0.0`, no `v0.0.1` — on purpose: GHCR tags are mutable and the carrier
+  node pulls `IfNotPresent`, so a recycled number would silently pin a stale
+  image, and the prefixed form cannot collide with the retired ones. `latest`
+  is published explicitly on every daemon tag, because the self-host docs
+  depend on it.
+- **Passband** — `passband/VERSION` is the Mac marketing version;
+  `project.yml`'s macOS `MARKETING_VERSION` must mirror it, and the iOS target
+  carries its own. CI verifies all of it now: `release-passband-mac.yml`
+  refuses a tag that is not `passband-mac-<VERSION>` with project.yml agreeing,
+  and `release-passband-ios.yml` refuses a tag that is not
+  `passband-ios-<project.yml iOS MARKETING_VERSION>`. `release.sh` preflights
+  the same things locally. The Sparkle ordering key is the BUILD number
+  (`git rev-list --count HEAD`), which is why marketing versions can move
+  backwards without stranding installs.
 - **Deploy pins** — `deploy/hosted/20-warden.yaml` pins the warden image and
-  `SQUELCH_WARDEN_IMAGE` (the tenant image). `deploy/hosted/60-models.yaml`
-  pins the model-warm job's image separately and is easy to forget.
+  `SQUELCH_WARDEN_IMAGE` (the tenant image), both at `daemon-*` tags.
+  `deploy/hosted/60-models.yaml` pins the model-warm job's image separately and
+  is easy to forget.
+
+**The 2026-08 consolidation.** The tag namespaces used to be `v*` (daemon),
+`passband-v*` (Mac) and `ios-v*` (iOS), and the numbers had drifted apart badly
+enough that nothing lined up with anything (`passband/VERSION` said 0.0.2 while
+project.yml said 1.0.0; a Mac release had already walked 1.0.0 → 0.0.2). All
+three were retired, every old tag deleted, and all three versions restarted at
+`0.0.1` — Cargo workspace, `passband/VERSION`, and both project.yml targets.
+Sparkle orders by build number, so the Mac reset strands nobody. Old numeric
+GHCR image tags (`0.2.x`, `v0.2.6`, `v0.1.0`) still exist on the registry as
+frozen history: deployments pinned to them keep working, and they are never
+written again — repoint to a `daemon-*` tag at the next rollout.
 
 ## Preflight, before any tag
 
-There is no CI test gate. A `v*` tag publishes whatever compiles; a
-`passband-v*` tag ships whatever notarizes. The tests run on this desk or not
-at all:
+No tag path runs the test suite. The only thing CI checks at tag time is that
+the version numbers agree; past that, a `daemon-*` tag publishes whatever
+compiles and a `passband-mac-*` tag ships whatever notarizes. Tests run on PRs
+(`ci.yml`) and on this desk, or not at all:
 
 ```sh
 DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --workspace
@@ -58,23 +85,26 @@ Then:
    working tree. Everything you are about to tag must be committed and pushed;
    everything you are NOT releasing must not be tangled into those commits.
 2. Version sync: workspace `Cargo.toml` version matches the tag you are about
-   to cut; for the app, `passband/VERSION` matches `project.yml`.
+   to cut; for the app, `passband/VERSION` matches `project.yml`. CI checks
+   both, but it checks them after you have pushed a tag, and a failed tag is a
+   tag you have to delete before you can retry it.
 3. Skim `git log <last-tag>..HEAD` for one-way doors (see Rollback below):
    schema changes that rebuild tables, changed env-var names, changed defaults
    that self-hosters inherit.
 
-## Surface 1: server images (`v*` tag)
+## Surface 1: server images (`daemon-*` tag)
 
 ```sh
-git tag v0.X.Y && git push origin v0.X.Y
+git tag daemon-0.X.Y && git push origin daemon-0.X.Y   # must equal Cargo.toml
 ```
 
-`.github/workflows/release.yml` builds all three images and pushes to GHCR. No
-secrets beyond `GITHUB_TOKEN`. **squelchd is amd64 + arm64** (its Dockerfile
-cross-compiles, so one runner covers both); **warden and control are amd64
-only**, because they build natively and emulating their ONNX build risks the
-six-hour job ceiling in a token-holding job. The one box that runs them is
-amd64. There is no QEMU step in this workflow, and re-adding one is not how
+`.github/workflows/release-daemon.yml` verifies the tag against the workspace
+version, then builds all three images and pushes them to GHCR under the tag
+itself plus `latest`. No secrets beyond `GITHUB_TOKEN`. **squelchd is amd64 +
+arm64** (its Dockerfile cross-compiles, so one runner covers both); **warden
+and control are amd64 only**, because they build natively and emulating their
+ONNX build risks the six-hour job ceiling in a token-holding job. The one box
+that runs them is amd64. There is no QEMU step in this workflow, and re-adding one is not how
 arm64 comes back — a native arm runner or a cross-compiling Dockerfile is.
 
 Verify (the failure mode is a half-published release):
@@ -133,13 +163,16 @@ history (PRODUCTION.md, backups section). Read the drill before you need it.
 
 Post-rollout verification, per tenant:
 
-- Pod Ready and the dashboard's "Inside squelchd" row: sync staleness under a
-  few minutes, `squelchd_build_info` showing the new version.
+- Pod Ready and the dashboard's "Inside squelchd" row healthy: sync staleness
+  under a few minutes, errors flat. The dashboard has no version panel, so
+  confirm what is actually running from the pod itself —
+  `kubectl -n tenants get pod <label>-... -o jsonpath='{..image}'`, or scrape
+  `squelchd_build_info` off port 9464 from the monitoring namespace.
 - `curl -sS https://<tenant-host>/client/stats` with a bearer -> 200.
 
-## Surface 3: Passband app (`passband-v*` tag)
+## Surface 3: Passband for Mac (`passband-mac-*` tag)
 
-The canonical path is the tag; CI (`passband-release.yml`) builds, signs,
+The canonical path is the tag; CI (`release-passband-mac.yml`) builds, signs,
 notarizes, staples, creates the GitHub Release, regenerates the appcast
 against ALL prior releases, commits it to `main` (which redeploys the site,
 which publishes the feed), and bumps the Homebrew cask. Local fallback:
@@ -148,9 +181,10 @@ which publishes the feed), and bumps the Homebrew cask. Local fallback:
 
 Things that bite:
 
-- CI checks the tag against `passband/VERSION` but NOT against
-  `project.yml` — keep them mirrored by hand (release.sh checks both, so a
-  local `--dry` run is a cheap preflight even when CI does the release).
+- CI checks the tag against BOTH `passband/VERSION` and `project.yml`'s macOS
+  target before it builds anything, so drift is now a failed release rather
+  than a wrong number in the wild. `release.sh --dry` checks the same pair
+  locally, which is the cheaper place to find out.
 - The Sparkle EdDSA private key exists in this Mac's login keychain and as the
   `SPARKLE_PRIVATE_KEY` repo secret. Losing both means every installed app
   rejects every future update. It is not in the repo, on purpose.
@@ -160,7 +194,21 @@ Things that bite:
 - Verify after: `curl -s https://passband.app/appcast.xml | grep <VERSION>`,
   then Passband → Check for Updates on a machine running the previous build.
 
-## Surface 4: Railway services
+## Surface 4: Passband for iOS (`passband-ios-*` tag)
+
+`release-passband-ios.yml` verifies the tag against `project.yml`'s iOS
+`MARKETING_VERSION`, archives, exports, and uploads to TestFlight. Local
+equivalent: `passband/release-ios.sh`. Two things differ from the Mac path:
+
+- **No signing material anywhere.** Three App Store Connect secrets
+  (`ASC_KEY_ID`, `ASC_KEY_ISSUER_ID`, `ASC_KEY_P8`) go to xcodebuild and cloud
+  signing mints a managed distribution certificate per run. Nothing to lose,
+  nothing to rotate on a schedule.
+- **The build number is the UTC minute**, not the commit count, and App Store
+  Connect refuses a marketing version that ever goes backwards. The verify job
+  exists so the tag cannot free-float away from what a local build would stamp.
+
+## Surface 5: Railway services
 
 | Service | Deploys when |
 |---|---|
@@ -176,11 +224,11 @@ the wrong image. `Dockerfile.broker` has no railway toml yet — create
 `railway.broker.toml` before its first deploy.
 
 Note that `control` deploying on every push to `main` means server-side
-changes land on signup as soon as they merge, independent of any `v*` tag.
-If a control change must move in lockstep with a carrier rollout, push and
+changes land on signup as soon as they merge, independent of any `daemon-*`
+tag. If a control change must move in lockstep with a carrier rollout, push and
 roll the carrier promptly.
 
-## Self-host compatibility (checked at every `v*` tag)
+## Self-host compatibility (checked at every `daemon-*` tag)
 
 - **Schema is forward-only.** `schema.sql` applies on every open
   (`CREATE IF NOT EXISTS` + additive `PRAGMA table_info` migrations, no
@@ -203,15 +251,21 @@ roll the carrier promptly.
 
 ## Rollback, per surface
 
-- **Images:** repoint the deploy at the previous tag (tags are immutable,
-  nothing to rebuild). For hosted tenants this is the same per-tenant
-  re-apply cost as the upgrade was.
+- **Images:** repoint the deploy at the previous `daemon-*` tag and re-apply;
+  nothing to rebuild. GHCR would happily let you move a tag instead — never do
+  it, because a tag that is written once is the only reason a repoint IS a
+  rollback under `imagePullPolicy: IfNotPresent`. Deployments still pinned to a
+  pre-consolidation numeric tag can roll back to one of those; the old images
+  were not deleted from the registry. For hosted tenants this is the same
+  per-tenant re-apply cost as the upgrade was.
 - **Data:** the schema has no downgrade path. If the bad release wrote
   something an old binary chokes on, rollback is the litestream restore drill
   (per tenant) — a tag repoint alone is not a rollback after a one-way door.
 - **Passband:** Sparkle does not downgrade (build number is the commit count
-  and only goes up). Rolling back means shipping a NEW `passband-v*` release
-  containing the old behavior. Budget an hour, not a minute.
+  and only goes up). Rolling back means shipping a NEW `passband-mac-*` release
+  containing the old behavior. Budget an hour, not a minute. iOS is the same
+  shape with Apple in the loop: a new `passband-ios-*` build, or expire the bad
+  one in TestFlight.
 - **Railway:** each service's dashboard can redeploy the previous deployment;
   for repo-connected services, revert the commit on `main`.
 - **Control DB** (`/data/control.sqlite3` on Railway) has no backups today.
@@ -220,15 +274,17 @@ roll the carrier promptly.
 
 ## Known gaps (fix or at least know)
 
-1. No CI test gate on either tag path. The preflight above is the gate.
-2. Nothing ties workspace `Cargo.toml` to the `v*` tag, or `20-warden.yaml`
-   pins to tags that exist in GHCR. Both are hand-checked.
+1. No CI test gate on any tag path — the tag workflows verify versions, not
+   behavior. The preflight above is the gate.
+2. Nothing checks that `20-warden.yaml`'s pins name tags that exist in GHCR;
+   that one is still hand-checked. (The tag-to-`Cargo.toml` half is closed —
+   `release-daemon.yml` verifies it.)
 3. `60-models.yaml` pins drift behind `20-warden.yaml` (they did already).
 4. The warden image on carrier predates the CI job: the running
    `squelch-warden:v0.2.0` in containerd was hand-built and exists in no
-   registry. Do not delete it from containerd until the first post-CI tag is
-   cut and `20-warden.yaml` is repointed (PRODUCTION.md, registry-gap note).
-5. `passband/VERSION` and `project.yml` currently disagree (0.0.2 vs 1.0.0);
-   `release.sh` will refuse to run until reconciled, and CI will not notice.
-6. There is no fleet-upgrade lever for tenants; every daemon rollout is
+   registry — that tag is from the retired numbering and nothing will ever
+   publish it. Do not delete it from containerd until a `daemon-*` tag is cut
+   and `20-warden.yaml` is repointed at a tag the registry actually holds
+   (PRODUCTION.md, registry-gap note).
+5. There is no fleet-upgrade lever for tenants; every daemon rollout is
    O(tenants) manual re-applies until a reconcile loop exists.

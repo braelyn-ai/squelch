@@ -40,7 +40,7 @@ use crate::store::{
     MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, SealedBody, SealedMessage,
     SearchFilter, SentMessage, SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued,
     Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState,
-    TrackedMessage, TriageDebug, TriagedMessage,
+    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -482,8 +482,51 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
-        self.list_shipments(account_id, include_delivered)
+        self.list_shipments(account_id, include_delivered, policy)
+    }
+
+    fn clear_shipment(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.clear_shipment(account_id, shipment_id, at)
+    }
+
+    fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {
+        self.shipments_redetect_cleanup(account_id)
+    }
+
+    fn list_pollable_shipments(
+        &self,
+        account_id: AccountId,
+        min_first_seen: DateTime<Utc>,
+        max_failures: u32,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        self.list_pollable_shipments(account_id, min_first_seen, max_failures)
+    }
+
+    fn apply_carrier_track(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        track: &crate::triage::CarrierTrack,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.apply_carrier_track(account_id, shipment_id, track, polled_at)
+    }
+
+    fn record_poll_outcome(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+        polled_at: DateTime<Utc>,
+        permanent_failure: bool,
+    ) -> Result<()> {
+        self.record_poll_outcome(account_id, shipment_id, polled_at, permanent_failure)
     }
 
     fn upsert_receipt(
@@ -516,6 +559,30 @@ impl Store for SqliteStore {
         limit: usize,
     ) -> Result<Vec<ExtractQueued>> {
         self.extract_queue(account_id, categories, limit)
+    }
+
+    fn ship_extract_queue(
+        &self,
+        account_id: AccountId,
+        limit: usize,
+    ) -> Result<Vec<ExtractQueued>> {
+        self.ship_extract_queue(account_id, limit)
+    }
+
+    fn ship_extract_mark(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        marker: &str,
+    ) -> Result<()> {
+        self.ship_extract_mark(account_id, message_id, marker)
+    }
+
+    fn shipments_extract_apply(
+        &self,
+        applied: &crate::triage::extract::shipments::ShipmentsApplied,
+    ) -> Result<bool> {
+        self.shipments_extract_apply(applied)
     }
 
     fn retriage_reset(
@@ -896,44 +963,24 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
-        self.stage1_bump_usage(
-            account_id,
-            day,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        self.stage1_bump_usage(account_id, day, tokens)
     }
 
     fn stage1_usage_since(&self, account_id: AccountId, since_day: &str) -> Result<Stage2Usage> {
         self.stage1_usage_since(account_id, since_day)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extract_bump_usage(
         &self,
         account_id: AccountId,
         day: &str,
         category: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
-        self.extract_bump_usage(
-            account_id,
-            day,
-            category,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        self.extract_bump_usage(account_id, day, category, tokens)
     }
 
     fn list_usage_stage1(&self, account_id: AccountId, days: u32) -> Result<Vec<Stage2UsageDay>> {
@@ -982,19 +1029,9 @@ impl Store for SqliteStore {
         &self,
         account_id: AccountId,
         day: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
+        tokens: UsageTokens,
     ) -> Result<()> {
-        self.stage2_bump_usage(
-            account_id,
-            day,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        )
+        self.stage2_bump_usage(account_id, day, tokens)
     }
 
     fn stage2_usage_today(&self, account_id: AccountId, day: &str) -> Result<Stage2Usage> {

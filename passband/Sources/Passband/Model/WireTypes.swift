@@ -294,6 +294,34 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     var thread_id: String?
     var first_seen: String
     var last_update: String
+    /// THE CARRIER-POLL FIELDS. Every one of them is absent from an older
+    /// daemon's rows, so every one is optional and every reader must render the
+    /// pre-poll card when it is nil.
+    ///
+    /// Carrier-estimated delivery; nil when the carrier gives none. A POLL is
+    /// the only thing that ever sets it — no email carries one.
+    var eta: String?
+    /// The carrier's own status words, verbatim, including the ones our five-rung
+    /// `status` could not express. Nil until the first poll. SOMEBODY ELSE'S
+    /// TEXT: flatten and cap it before drawing it.
+    var carrier_status_raw: String?
+    /// When it landed, from whichever path saw it first; nil until delivered.
+    var delivered_at: String?
+    /// Last carrier poll ATTEMPT; nil = never asked.
+    var last_polled_at: String?
+    /// Consecutive polls the carrier answered with "no record of this number".
+    /// Rate limits and transport errors never count, which is what makes a
+    /// nonzero value evidence about the NUMBER rather than about the network.
+    var poll_failures: Int?
+}
+
+/// What `POST /client/shipments/poll` answers. `kicked` is false, with an empty
+/// `carriers`, on a daemon holding no carrier credentials: polling is BYOK, so
+/// that is the ordinary state and not an error, but it does mean nothing
+/// happened and the UI must not claim otherwise.
+struct ShipmentPollKick: Codable, Sendable {
+    var kicked: Bool
+    var carriers: [String]
 }
 
 // MARK: - receipts / calendar / banking
@@ -497,6 +525,10 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// first fetch has not landed — so nil means "we do not know", never zero.
     /// Callers must have copy for both.
     var inbox_unread: InboxUnread?
+    /// Whether this daemon can relay ⌘K assistant calls to a hosted gateway
+    /// (POST /client/assistant/messages). ABSENT on a daemon too old to say —
+    /// and nil reads exactly like false: BYOK is the only assistant door.
+    var assistant_relay: Bool?
 }
 
 // MARK: - usage

@@ -15,6 +15,13 @@
 //! handles lives in memory for the length of one request and leaves as age
 //! armor addressed to one tenant. There is nothing at rest on Railway that opens a
 //! mailbox.
+//!
+//! THE ONE EXCEPTION IS `waitlist`, and it is a deliberate one: it holds the
+//! addresses of people who have asked for the hosted tier and are not tenants
+//! yet. They are stored through [`normalize_email`] like every other address
+//! here, they are shown only on the operator's admin page, and they never reach
+//! a log line: a waitlist log carries the ROW ID and a count, never the address
+//! and never the code that was mailed to it.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -34,6 +41,25 @@ const BUSY_TIMEOUT_MS: u64 = 5_000;
 /// of what the control plane last did, not a lock.
 pub const STATUS_ACTIVE: &str = "active";
 
+/// A waitlist row nobody has acted on yet.
+pub const WAITLIST_PENDING: &str = "pending";
+
+/// A waitlist row an operator has approved. The invite may or may not have
+/// reached them; `notified_at` is what says which.
+pub const WAITLIST_APPROVED: &str = "approved";
+
+/// How many APPROVED rows one listing carries as history. The pending half is
+/// NOT capped by this: a row that falls off the page is a person the operator
+/// never approves, and a repairable failed send is an approved row, so the
+/// history half is the only one a cap may touch.
+pub const WAITLIST_APPROVED_LIMIT: i64 = 50;
+
+/// The ceiling on the pending half. Not a page size: a hundred-user beta cannot
+/// produce a pathological count, so this is the bound that stops one listing
+/// from being unbounded memory, set where reaching it means something other
+/// than signups happened.
+pub const WAITLIST_PENDING_LIMIT: i64 = 500;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tenants (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,11 +67,14 @@ CREATE TABLE IF NOT EXISTS tenants (
     account_email TEXT NOT NULL,
     status        TEXT NOT NULL,
     created_at    TEXT NOT NULL,
-    -- The Bifrost virtual-key ID installed for this tenant, and when it was
-    -- minted. THE ID ONLY: the key's value is the tenant's LLM bearer, and it
-    -- passes through this process without ever reaching this file.
-    bifrost_vk_id TEXT,
-    vk_minted_at  TEXT
+    -- The Bifrost virtual-key IDs installed for this tenant — triage and
+    -- assistant — and when each was minted. THE IDS ONLY: the keys' values
+    -- are the tenant's LLM bearers, and they pass through this process
+    -- without ever reaching this file.
+    bifrost_vk_id           TEXT,
+    vk_minted_at            TEXT,
+    bifrost_assistant_vk_id TEXT,
+    assistant_vk_minted_at  TEXT
 );
 -- One mailbox, one daemon. A PARTIAL unique index rather than a plain one, so a
 -- tenant that has been torn down frees its address for a later signup while an
@@ -67,6 +96,25 @@ CREATE TABLE IF NOT EXISTS invite_codes (
     reserved_by    TEXT,
     reserved_until TEXT
 );
+
+-- People who asked for the hosted tier before there was a code to give them.
+-- One row per address, UNIQUE so a second submission of the same address is a
+-- no-op rather than a second entry for the operator to work through.
+CREATE TABLE IF NOT EXISTS waitlist (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    email       TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    -- 'pending' | 'approved'. The approval transition is the guard that makes
+    -- one click mint one invite; see `approve_waitlist`.
+    status      TEXT NOT NULL,
+    approved_at TEXT,
+    -- The invite row minted for this person at approval. THE ID ONLY: the code
+    -- and its hash live where every other invite's do.
+    invite_id   INTEGER,
+    -- When Resend accepted the send. NULL on an approved row means the email
+    -- did not go out and the operator has a button to try again.
+    notified_at TEXT
+);
 ";
 
 /// Columns added to `invite_codes` after the first deployment, with the type
@@ -79,10 +127,14 @@ const ADDED_COLUMNS: [(&str, &str); 3] = [
     ("reserved_until", "TEXT"),
 ];
 
-/// The same, for `tenants`: the virtual-key columns arrived after the first
-/// hosted deployment.
-const TENANT_ADDED_COLUMNS: [(&str, &str); 2] =
-    [("bifrost_vk_id", "TEXT"), ("vk_minted_at", "TEXT")];
+/// The same, for `tenants`: the triage virtual-key columns arrived after the
+/// first hosted deployment, and the assistant pair after them.
+const TENANT_ADDED_COLUMNS: [(&str, &str); 4] = [
+    ("bifrost_vk_id", "TEXT"),
+    ("vk_minted_at", "TEXT"),
+    ("bifrost_assistant_vk_id", "TEXT"),
+    ("assistant_vk_minted_at", "TEXT"),
+];
 
 /// Store errors. `Sqlite` carries rusqlite's message, which never contains a
 /// code or a token: the only values bound into these statements are hashes,
@@ -115,6 +167,27 @@ pub struct InviteRow {
     pub expires_at: Option<DateTime<Utc>>,
     pub used_at: Option<DateTime<Utc>>,
     pub used_by_label: Option<String>,
+}
+
+/// One waitlist row, as the admin page renders it.
+///
+/// NO `Debug`: the whole row is somebody's address, and a derived `Debug` is
+/// how it would reach a log line the day a handler formats an error with the
+/// row in scope.
+#[derive(Clone)]
+pub struct WaitlistRow {
+    pub id: i64,
+    /// Normalized (lowercased, trimmed), the way it was stored.
+    pub email: String,
+    pub created_at: DateTime<Utc>,
+    /// [`WAITLIST_PENDING`] or [`WAITLIST_APPROVED`].
+    pub status: String,
+    pub approved_at: Option<DateTime<Utc>>,
+    /// The invite minted at approval, by id.
+    pub invite_id: Option<i64>,
+    /// When the invite email was accepted for delivery. `None` on an approved
+    /// row is the "email not sent" case.
+    pub notified_at: Option<DateTime<Utc>>,
 }
 
 /// One tenant row.
@@ -318,6 +391,51 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
+    /// Revoke an unspent code UNLESS a signup is holding it right now.
+    ///
+    /// [`Self::revoke_invite`] deliberately ignores reservations, because an
+    /// operator running the CLI is overriding on purpose. The admin page is not:
+    /// a re-send that revokes a held code destroys a signup that has already
+    /// reached Google consent, and the person loses a grant they cannot give
+    /// twice without walking the whole flow again.
+    ///
+    /// ONE STATEMENT, and that is the whole point of it existing. Asking
+    /// [`Self::invite_is_held`] first and deleting second is two statements with
+    /// the lock released in between, which is exactly long enough for a signup
+    /// to take the hold the check just said was absent. The condition has to
+    /// travel WITH the delete.
+    ///
+    /// `false` covers spent, held, and never-there alike. The caller may then
+    /// ask which, because by then nothing destructive is left to do and a race
+    /// only changes the sentence the operator reads.
+    pub fn revoke_unheld_invite(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+        let changed = self.lock().execute(
+            "DELETE FROM invite_codes
+              WHERE id = ?1 AND used_at IS NULL
+                AND (reserved_until IS NULL OR reserved_until <= ?2)",
+            params![id, stamp(now)],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Whether a signup session is holding this code RIGHT NOW.
+    ///
+    /// Diagnosis only, for the sentence the dashboard shows after
+    /// [`Self::revoke_unheld_invite`] declined. NEVER a guard in front of a
+    /// delete: see that method for why the condition has to travel with it.
+    pub fn invite_is_held(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT 1 FROM invite_codes
+                  WHERE id = ?1 AND used_at IS NULL AND reserved_until > ?2",
+                params![id, stamp(now)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     // ---- tenants ---------------------------------------------------------
 
     /// Whether this control plane has already recorded a tenant with `label`.
@@ -458,6 +576,244 @@ impl ControlStore {
         )?;
         Ok(changed == 1)
     }
+
+    /// Record the ASSISTANT virtual-key id, the same way and under the same
+    /// rule as [`Self::set_tenant_vk`]: the id only, stamped RFC3339.
+    /// Returns whether a tenant row with `label` existed to take it.
+    pub fn set_tenant_assistant_vk(&self, label: &str, vk_id: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tenants SET bifrost_assistant_vk_id = ?2, assistant_vk_minted_at = ?3
+              WHERE label = ?1",
+            params![label, vk_id, stamp(Utc::now())],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The assistant virtual-key id recorded for `label`. `None` covers both
+    /// "no such tenant" and "tenant with no key", like [`Self::tenant_vk`].
+    pub fn tenant_assistant_vk(&self, label: &str) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT bifrost_assistant_vk_id FROM tenants WHERE label = ?1",
+                params![label],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Forget the recorded assistant key, after a revoke has landed in
+    /// Bifrost. Returns whether there was a recorded key to forget.
+    pub fn clear_tenant_assistant_vk(&self, label: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tenants SET bifrost_assistant_vk_id = NULL, assistant_vk_minted_at = NULL
+              WHERE label = ?1 AND bifrost_assistant_vk_id IS NOT NULL",
+            params![label],
+        )?;
+        Ok(changed == 1)
+    }
+
+    // ---- waitlist --------------------------------------------------------
+
+    /// Record an address that asked for the hosted tier. `true` means this
+    /// submission created the row.
+    ///
+    /// `INSERT OR IGNORE` rather than a SELECT then an INSERT: the form is
+    /// public, so two submissions can race, and a UNIQUE column plus a
+    /// tolerated conflict is the only shape where the loser is a no-op instead
+    /// of an error. The caller answers the SAME thing either way, so the
+    /// boolean is for counting, not for the page: a route that said "already on
+    /// the list" would tell a stranger who else is.
+    ///
+    /// THE TIMING SIDE CHANNEL IS ACCEPTED, and named here so the acceptance is
+    /// visible: an ignored conflict skips the WAL write, so a duplicate answers
+    /// measurably faster than a new address and a determined prober can ask
+    /// whether one address is on the list. Closing it would mean writing on
+    /// every submission (a row per guess) or padding the response, and neither
+    /// is worth it for a list whose members are a marketing signup; the route's
+    /// own rate bucket is what bounds the probing.
+    pub fn add_to_waitlist(&self, email: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "INSERT OR IGNORE INTO waitlist(email, created_at, status) VALUES(?1, ?2, ?3)",
+            params![normalize_email(email), stamp(Utc::now()), WAITLIST_PENDING],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Put an address straight onto the approved half, whether or not it ever
+    /// asked. `Some(id)` is the row this call approved and is the caller's to
+    /// mint for; `None` means it was approved already and there is nothing new
+    /// to send.
+    ///
+    /// ONE STATEMENT, because the operator typing an address and the operator
+    /// clicking Approve on that same address are the same race
+    /// [`approve_waitlist`] guards, and it has to hold across an INSERT the
+    /// second one turns into an UPDATE. The upsert's `WHERE` is the guard: it
+    /// promotes a pending row and refuses an approved one, so two presses mint
+    /// exactly one invite between them, and `RETURNING` hands back the winner's
+    /// id without a second lookup that another writer could invalidate.
+    ///
+    /// A direct invite is recorded as a waitlist row on purpose. The alternative
+    /// is a second ledger with the same columns, and then two places to look for
+    /// "did we already invite them", two things to page, and one of them
+    /// silently missing the re-send button.
+    pub fn invite_directly(&self, email: &str, now: DateTime<Utc>) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "INSERT INTO waitlist(email, created_at, status, approved_at)
+                      VALUES(?1, ?2, ?3, ?2)
+                 ON CONFLICT(email) DO UPDATE SET status = ?3, approved_at = ?2
+                      WHERE waitlist.status = ?4
+                 RETURNING id",
+                params![
+                    normalize_email(email),
+                    stamp(now),
+                    WAITLIST_APPROVED,
+                    WAITLIST_PENDING
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The admin page's listing: EVERY row still waiting, oldest first, then
+    /// the most recently approved as history.
+    ///
+    /// TWO STATEMENTS BECAUSE THE TWO HALVES ARE CAPPED DIFFERENTLY. One
+    /// listing capped as a whole loses pending rows once the history fills it,
+    /// and a pending row that is not on the page is a person nobody approves.
+    /// So the waiting half is bounded only by [`WAITLIST_PENDING_LIMIT`], which
+    /// a beta cannot reach, and the cap that bites is on history.
+    ///
+    /// Ordered by id rather than by `created_at` because the id IS the arrival
+    /// order (AUTOINCREMENT, one insert per submission) and two rows written in
+    /// the same millisecond would otherwise tie.
+    pub fn list_waitlist(&self) -> Result<Vec<WaitlistRow>> {
+        let conn = self.lock();
+        let mut rows = select_waitlist(
+            &conn,
+            "SELECT id, email, created_at, status, approved_at, invite_id, notified_at
+               FROM waitlist WHERE status = ?1 ORDER BY id ASC LIMIT ?2",
+            params![WAITLIST_PENDING, WAITLIST_PENDING_LIMIT],
+        )?;
+        rows.extend(select_waitlist(
+            &conn,
+            "SELECT id, email, created_at, status, approved_at, invite_id, notified_at
+               FROM waitlist WHERE status <> ?1 ORDER BY id DESC LIMIT ?2",
+            params![WAITLIST_PENDING, WAITLIST_APPROVED_LIMIT],
+        )?);
+        Ok(rows)
+    }
+
+    /// One waitlist row by id, or `None` when there is no such row.
+    pub fn waitlist_entry(&self, id: i64) -> Result<Option<WaitlistRow>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT id, email, created_at, status, approved_at, invite_id, notified_at
+                   FROM waitlist WHERE id = ?1",
+                params![id],
+                waitlist_row,
+            )
+            .optional()?)
+    }
+
+    /// Move a row from pending to approved, atomically. `true` means THIS call
+    /// made the transition.
+    ///
+    /// `status = 'pending'` in the WHERE clause is the whole guard: approving
+    /// mints an invite and sends an email, and an operator double-clicking the
+    /// button (or a replayed POST) must mint exactly one. The loser gets
+    /// `Ok(false)` and says "already approved" rather than minting a second
+    /// code nobody asked for.
+    pub fn approve_waitlist(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE waitlist SET status = ?1, approved_at = ?2
+              WHERE id = ?3 AND status = ?4",
+            params![WAITLIST_APPROVED, stamp(now), id, WAITLIST_PENDING],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Point a waitlist row at the invite minted for it, CLEARING the notified
+    /// stamp in the same statement: a fresh code has not been delivered yet,
+    /// and a stamp left over from the previous one would show "invited" for an
+    /// email that has not gone out.
+    ///
+    /// A COMPARE-AND-SWAP, and that is what makes it the gate on the email.
+    /// `expected_prior` is the pointer the caller read off the row, so the
+    /// write lands only if nothing moved it in between: two sends racing (one
+    /// button, two clicks, no JavaScript to stop the second) both mint, and
+    /// exactly one wins the pointer. `Ok(true)` means THIS caller won and its
+    /// code is the one the row names; the loser revokes what it minted and
+    /// mails nothing, because a live code no row points at is a code the
+    /// dashboard cannot name and no button can revoke.
+    ///
+    /// `IS` rather than `=`, so a `None` expectation matches the NULL a row
+    /// carries before its first invite; rusqlite binds `None` as NULL.
+    pub fn set_waitlist_invite(
+        &self,
+        id: i64,
+        invite_id: i64,
+        expected_prior: Option<i64>,
+    ) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE waitlist SET invite_id = ?2, notified_at = NULL
+              WHERE id = ?1 AND invite_id IS ?3",
+            params![id, invite_id, expected_prior],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Stamp the moment the provider accepted the invite email. Returns whether
+    /// this stamp was the one the row wanted.
+    ///
+    /// NAMES THE INVITE IT IS STAMPING FOR. The send is awaited, so the row can
+    /// move while a request is in flight: a second re-send can replace the
+    /// pointer and start its own send, and a bare stamp by row id would let the
+    /// FIRST request's success mark the SECOND request's code as delivered.
+    /// The row would then read "invited" for an email that may still fail, and
+    /// the badge that would have told the operator to press the button again is
+    /// the one thing this page cannot afford to get wrong.
+    pub fn mark_waitlist_notified(
+        &self,
+        id: i64,
+        invite_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE waitlist SET notified_at = ?3 WHERE id = ?1 AND invite_id = ?2",
+            params![id, invite_id, stamp(now)],
+        )?;
+        Ok(changed == 1)
+    }
+}
+
+/// Run one of the listing statements above under a lock the caller already
+/// holds, so both halves of a listing read the same snapshot.
+fn select_waitlist(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<WaitlistRow>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, waitlist_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One `waitlist` row in the column order every statement above selects.
+fn waitlist_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WaitlistRow> {
+    Ok(WaitlistRow {
+        id: r.get(0)?,
+        email: r.get(1)?,
+        created_at: parse_ts(r.get::<_, String>(2)?),
+        status: r.get(3)?,
+        approved_at: r.get::<_, Option<String>>(4)?.map(parse_ts),
+        invite_id: r.get(5)?,
+        notified_at: r.get::<_, Option<String>>(6)?.map(parse_ts),
+    })
 }
 
 /// Bring an older store's `invite_codes` up to the schema above.
@@ -859,6 +1215,54 @@ mod tests {
         assert_eq!(s.tenant_vk("ghost").unwrap(), None);
     }
 
+    /// The raw `assistant_vk_minted_at` cell for `label`.
+    fn assistant_vk_minted_at(s: &ControlStore, label: &str) -> Option<String> {
+        s.lock()
+            .query_row(
+                "SELECT assistant_vk_minted_at FROM tenants WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The assistant vk id rides its own columns, independently of the triage
+    /// one: setting, rotating, and clearing either leaves the other alone.
+    #[test]
+    fn the_assistant_vk_id_rides_its_own_columns() {
+        let s = store();
+        s.insert_tenant("ada", "ada@example.com").unwrap();
+
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert_eq!(assistant_vk_minted_at(&s, "ada"), None);
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a1".to_string())
+        );
+        // Same stamp convention as every other timestamp in this file.
+        let minted = assistant_vk_minted_at(&s, "ada").expect("stamped alongside the id");
+        assert_eq!(stamp(parse_ts(minted.clone())), minted, "{minted}");
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a2").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a2".to_string())
+        );
+
+        // The two pointers are independent: the triage key is untouched by
+        // anything the assistant one does, and vice versa.
+        assert!(s.set_tenant_vk("ada", "vk-t1").unwrap());
+        assert!(s.clear_tenant_assistant_vk("ada").unwrap());
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert_eq!(assistant_vk_minted_at(&s, "ada"), None, "cleared with the id");
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-t1".to_string()));
+        assert!(!s.clear_tenant_assistant_vk("ada").unwrap());
+        assert!(s.clear_tenant_vk("ada").unwrap());
+
+        assert!(!s.set_tenant_assistant_vk("ghost", "vk-9").unwrap());
+        assert_eq!(s.tenant_assistant_vk("ghost").unwrap(), None);
+    }
+
     /// A tenants table written before the vk columns existed opens, gains
     /// them, and takes a key id like any other row.
     #[test]
@@ -885,6 +1289,47 @@ mod tests {
         assert_eq!(s.tenant_vk("ada").unwrap(), None, "migrated, keyless");
         assert!(s.set_tenant_vk("ada", "vk-1").unwrap());
         assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-1".to_string()));
+        // ...including the assistant pair, which arrived after the triage one.
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a1".to_string())
+        );
+    }
+
+    /// A table from the triage-only era — vk columns present, assistant
+    /// columns not — gains exactly the missing pair and keeps its data.
+    #[test]
+    fn a_triage_era_tenants_table_gains_the_assistant_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tenants (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 label         TEXT NOT NULL UNIQUE,
+                 account_email TEXT NOT NULL,
+                 status        TEXT NOT NULL,
+                 created_at    TEXT NOT NULL,
+                 bifrost_vk_id TEXT,
+                 vk_minted_at  TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tenants(label, account_email, status, created_at, bifrost_vk_id, vk_minted_at)
+             VALUES('ada', 'ada@example.com', 'active', ?1, 'vk-old', ?1)",
+            params![stamp(Utc::now())],
+        )
+        .unwrap();
+
+        let s = ControlStore::init(conn).unwrap();
+        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-old".to_string()), "kept");
+        assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
+        assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
+        assert_eq!(
+            s.tenant_assistant_vk("ada").unwrap(),
+            Some("vk-a1".to_string())
+        );
     }
 
     /// What a console login asks the store, both times it asks: the label's
@@ -907,6 +1352,167 @@ mod tests {
             )
             .unwrap();
         assert_eq!(s.active_tenant_email("ada").unwrap(), None);
+    }
+
+    /// The public form can be submitted twice, from two tabs, with two
+    /// capitalizations. The operator sees ONE person to approve.
+    #[test]
+    fn an_address_joins_the_waitlist_once() {
+        let s = store();
+        assert!(s.add_to_waitlist("Ada@Example.com").unwrap());
+        assert!(!s.add_to_waitlist("ada@example.com").unwrap());
+        assert!(!s.add_to_waitlist("  ADA@EXAMPLE.COM  ").unwrap());
+
+        let rows = s.list_waitlist().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].email, "ada@example.com");
+        assert_eq!(rows[0].status, WAITLIST_PENDING);
+        assert_eq!(rows[0].approved_at, None);
+        assert_eq!(rows[0].invite_id, None);
+        assert_eq!(rows[0].notified_at, None);
+    }
+
+    /// THE RACE THE ADMIN PAGE IS ABOUT: one row, two clicks. Only the first
+    /// transition wins, so only one invite is ever minted for one person.
+    #[test]
+    fn a_waitlist_row_is_approved_exactly_once() {
+        let s = store();
+        s.add_to_waitlist("ada@example.com").unwrap();
+        let id = s.list_waitlist().unwrap()[0].id;
+        let now = now();
+
+        assert!(s.approve_waitlist(id, now).unwrap());
+        assert!(
+            !s.approve_waitlist(id, now + days(1)).unwrap(),
+            "the second click mints nothing"
+        );
+        let row = s.waitlist_entry(id).unwrap().expect("still there");
+        assert_eq!(row.status, WAITLIST_APPROVED);
+        assert_eq!(row.approved_at, Some(now), "and keeps the first stamp");
+
+        assert!(!s.approve_waitlist(id + 1, now).unwrap(), "no such row");
+        assert!(s.waitlist_entry(id + 1).unwrap().is_none());
+    }
+
+    /// The invite pointer and the delivery stamp round-trip in the same
+    /// RFC3339 shape every other timestamp column here uses, and a re-send
+    /// clears the old stamp so a row cannot show "invited" for a code that has
+    /// not gone out.
+    #[test]
+    fn the_invite_and_its_delivery_stamp_ride_on_the_row() {
+        let s = store();
+        s.add_to_waitlist("ada@example.com").unwrap();
+        let id = s.list_waitlist().unwrap()[0].id;
+        let now = now();
+        s.approve_waitlist(id, now).unwrap();
+
+        assert!(s.set_waitlist_invite(id, 7, None).unwrap());
+        let row = s.waitlist_entry(id).unwrap().unwrap();
+        assert_eq!(row.invite_id, Some(7));
+        assert_eq!(row.notified_at, None, "nothing sent yet");
+
+        assert!(s.mark_waitlist_notified(id, 7, now).unwrap());
+        assert_eq!(
+            s.waitlist_entry(id).unwrap().unwrap().notified_at,
+            Some(now)
+        );
+
+        // A fresh invite for the same person: new pointer, no stamp.
+        assert!(s.set_waitlist_invite(id, 9, Some(7)).unwrap());
+        let row = s.waitlist_entry(id).unwrap().unwrap();
+        assert_eq!(row.invite_id, Some(9));
+        assert_eq!(row.notified_at, None, "the old delivery is not this one");
+
+        // A send for the code the row has MOVED OFF stamps nothing: its
+        // delivery is not the one this row is waiting on.
+        assert!(!s.mark_waitlist_notified(id, 7, now).unwrap());
+        assert_eq!(
+            s.waitlist_entry(id).unwrap().unwrap().notified_at,
+            None,
+            "the row still wants to hear about the code it names"
+        );
+        assert!(s.mark_waitlist_notified(id, 9, now).unwrap());
+
+        assert!(
+            !s.set_waitlist_invite(id + 1, 7, None).unwrap(),
+            "no such row"
+        );
+        assert!(!s.mark_waitlist_notified(id + 1, 7, now).unwrap());
+    }
+
+    /// The reservation check has to travel WITH the delete, because two
+    /// statements leave a gap a signup can take the hold in.
+    #[test]
+    fn a_held_invite_survives_the_admin_revoke() {
+        let s = store();
+        let now = now();
+        let id = s
+            .insert_invite("a".repeat(64).as_str(), now + days(30))
+            .unwrap();
+
+        // Held by a signup that is off at Google right now.
+        assert!(
+            s.reserve_invite(&"a".repeat(64), "holder", now, now + days(1))
+                .is_ok()
+        );
+        assert!(
+            !s.revoke_unheld_invite(id, now).unwrap(),
+            "the hold refuses the delete"
+        );
+        assert!(s.invite_is_held(id, now).unwrap(), "and it is still there");
+
+        // Once the hold lapses, the same call takes it.
+        assert!(s.revoke_unheld_invite(id, now + days(2)).unwrap());
+        assert!(s.list_invites().unwrap().is_empty());
+    }
+
+    /// The compare-and-swap that decides which of two racing sends gets to mail
+    /// its code: the one whose expectation still matches the row.
+    #[test]
+    fn a_stale_expectation_loses_the_pointer() {
+        let s = store();
+        s.add_to_waitlist("ada@example.com").unwrap();
+        let id = s.list_waitlist().unwrap()[0].id;
+        s.approve_waitlist(id, now()).unwrap();
+
+        // Both callers read the same empty pointer. The first wins it.
+        assert!(s.set_waitlist_invite(id, 11, None).unwrap());
+        assert!(
+            !s.set_waitlist_invite(id, 12, None).unwrap(),
+            "the second read a pointer that has since moved"
+        );
+        assert_eq!(
+            s.waitlist_entry(id).unwrap().unwrap().invite_id,
+            Some(11),
+            "and the loser left the row alone"
+        );
+
+        // A caller that read the CURRENT pointer replaces it, which is the
+        // re-send path.
+        assert!(s.set_waitlist_invite(id, 13, Some(11)).unwrap());
+        assert_eq!(s.waitlist_entry(id).unwrap().unwrap().invite_id, Some(13));
+    }
+
+    /// What the operator reads top to bottom: everyone still waiting, oldest
+    /// first (the longest wait is the next thing to do), then the most recent
+    /// approvals as history.
+    #[test]
+    fn the_listing_puts_the_longest_wait_first() {
+        let s = store();
+        for who in ["a@example.com", "b@example.com", "c@example.com"] {
+            s.add_to_waitlist(who).unwrap();
+        }
+        let ids: Vec<i64> = s.list_waitlist().unwrap().iter().map(|r| r.id).collect();
+        s.approve_waitlist(ids[0], now()).unwrap();
+        s.approve_waitlist(ids[1], now()).unwrap();
+
+        let rows = s.list_waitlist().unwrap();
+        let emails: Vec<&str> = rows.iter().map(|r| r.email.as_str()).collect();
+        assert_eq!(
+            emails,
+            vec!["c@example.com", "b@example.com", "a@example.com"],
+            "pending oldest-first, then approved newest-first"
+        );
     }
 
     /// One mailbox, one daemon, however the address is capitalized.

@@ -1,8 +1,9 @@
-// USAGE — server-side triage spend (GET /client/usage) plus the client-side BYOK
+// USAGE — server-side triage spend (GET /client/usage) plus the client-side
 // assistant tally. The triage pipeline reports its stages as separate ledger
 // categories; this view loops over whatever arrives and falls back to the flat
-// single-category shape older servers send. Assistant calls go straight from
-// here to the reader's own provider key — the server never sees them.
+// single-category shape older servers send. BYOK assistant calls go straight
+// from here to the reader's own provider key — the server never sees them;
+// relayed calls go through the daemon, which meters the money server-side.
 
 import SwiftUI
 
@@ -184,8 +185,12 @@ struct UsageView: View {
 
     private var assistantSection: some View {
         SectionCard(label: "Assistant", note: assistant.lastModel) {
+            // "Your own key" is only claimed once a BYOK ask is actually in
+            // the tally: a relay-only (or empty) ledger gets the neutral line.
             Text(
-                "The ⌘K \"ask your inbox\" assistant (your own key, tracked on this machine)."
+                assistant.asks > assistant.relayAsks
+                    ? "The ⌘K \"ask your inbox\" assistant (your own key, tracked on this machine)."
+                    : "The ⌘K \"ask your inbox\" assistant, tracked on this machine."
             )
             .font(Typo.micro)
             .foregroundStyle(Palette.inkFaint)
@@ -198,6 +203,13 @@ struct UsageView: View {
                     tokens: assistant.inputTokens + assistant.outputTokens,
                     cost: assistant.estimatedCost,
                     callsLabel: "asks")
+                if assistant.relayAsks > 0 {
+                    Text(
+                        "Relay asks are metered by Passband against your plan's monthly assistant budget. The cost estimate covers only asks made with your own key."
+                    )
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaint)
+                }
             }
         }
     }

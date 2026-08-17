@@ -16,6 +16,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use squelch_core::config::ShipmentListPolicy;
 use squelch_core::error::CoreError;
 use squelch_core::store::{NewAuditEntry, SqliteStore, Store};
 use squelch_core::types::{AccountId, Disposition, ThreadView, Update};
@@ -26,6 +27,17 @@ use squelch_core::types::{AccountId, Disposition, ThreadView, Update};
 pub struct SquelchServer {
     store: Arc<SqliteStore>,
     account_id: AccountId,
+    /// The operator's `[carriers]` LISTING policy, carried so `get_shipments`
+    /// hides exactly what `GET /client/shipments` hides. Defaults to the config
+    /// default; wire the real one with
+    /// [`SquelchServer::with_shipment_policy`].
+    ///
+    /// This field exists because the agent door once hardcoded the BUILT-IN
+    /// retirement cap and ignored the operator's, so an operator who set
+    /// `max_failures = 1` kept seeing retired phantoms through their agent for
+    /// four more failures, and one who set `10` had live packages hidden from it
+    /// at five. Two doors, one view.
+    shipment_policy: ShipmentListPolicy,
     // Read only by the macro-generated `ServerHandler`, so dead-code analysis
     // can't see the use.
     #[allow(dead_code)]
@@ -98,6 +110,13 @@ pub struct ShipmentHit {
     pub tracking_number: String,
     pub tracking_url: Option<String>,
     pub last_update: DateTime<Utc>,
+    /// Carrier-estimated delivery; `None` when the carrier gives none (and
+    /// always `None` on a daemon that polls no carrier).
+    pub eta: Option<DateTime<Utc>>,
+    /// The carrier's own latest status string, verbatim; `None` until the first
+    /// poll. Carried because our five-rung ladder loses detail the agent can
+    /// usefully relay ("Delivered to neighbor", "Held at customs").
+    pub carrier_status_raw: Option<String>,
 }
 
 /// Parameters for `set_sender_rule`.
@@ -111,20 +130,6 @@ pub struct SetSenderRuleParams {
     pub disposition: String,
 }
 
-/// Truncate `s` to at most `max` characters (not bytes), appending a single
-/// ellipsis when it was cut. Keeps audit `detail` bounded.
-fn truncate_chars(s: &str, max: usize) -> String {
-    let mut it = s.char_indices();
-    match it.nth(max) {
-        Some((idx, _)) => {
-            let mut out = s[..idx].to_string();
-            out.push('…');
-            out
-        }
-        None => s.to_string(),
-    }
-}
-
 impl SquelchServer {
     /// Build a server over an already-open store, resolving `account_email` to
     /// an account id (creating the account row if needed).
@@ -133,8 +138,21 @@ impl SquelchServer {
         Ok(Self {
             store,
             account_id,
+            shipment_policy: ShipmentListPolicy::default(),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Carry the operator's `[carriers]` listing policy into `get_shipments`.
+    ///
+    /// A BUILDER RATHER THAN AN ARGUMENT to [`SquelchServer::new`] deliberately,
+    /// matching how `ApiState` takes its optional wiring: the default is a
+    /// working server, and the daemon adds the configured value on the way past.
+    /// Pass the SAME value you give `ApiState::with_shipment_policy` — the whole
+    /// point is that the two doors agree on which packages exist.
+    pub fn with_shipment_policy(mut self, policy: ShipmentListPolicy) -> Self {
+        self.shipment_policy = policy;
+        self
     }
 
     /// Map a core error onto the MCP wire. NotFound becomes `resource_not_found`;
@@ -286,19 +304,28 @@ impl SquelchServer {
         name = "get_shipments",
         description = "Tracked packages/shipments. Returns en-route packages by \
                        default (item_name, carrier, status, tracking_number, \
-                       tracking_url, last_update); pass include_delivered=true to \
-                       also include delivered ones. Extracted from shipping mail; \
-                       auth/verification emails are never represented."
+                       tracking_url, last_update, eta, carrier_status_raw); pass \
+                       include_delivered=true to also include delivered ones. \
+                       eta and carrier_status_raw come from the carrier's own API \
+                       and are null until the package has been polled. Extracted \
+                       from shipping mail; auth/verification emails are never \
+                       represented."
     )]
     async fn get_shipments(
         &self,
         Parameters(params): Parameters<GetShipmentsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let include_delivered = params.include_delivered.unwrap_or(false);
-        // No sealed row to filter: detection never runs on sealed mail.
+        // No sealed row to filter: detection never runs on sealed mail. The
+        // OPERATOR'S listing policy does the rest — phantom digit-runs the
+        // carrier keeps rejecting, rows nothing has happened to for
+        // `stale_after_days`, and rows the user cleared — and it is the SAME
+        // value the human door holds, so an agent and its user see the same
+        // packages. Every hide is read-side: the rows keep being polled and come
+        // back on their own.
         let shipments = self
             .store
-            .list_shipments(self.account_id, include_delivered)
+            .list_shipments(self.account_id, include_delivered, self.shipment_policy)
             .map_err(Self::map_err)?;
         let out: Vec<ShipmentHit> = shipments
             .into_iter()
@@ -309,6 +336,8 @@ impl SquelchServer {
                 tracking_number: s.tracking_number,
                 tracking_url: s.tracking_url,
                 last_update: s.last_update,
+                eta: s.eta,
+                carrier_status_raw: s.carrier_status_raw,
             })
             .collect();
         Self::ok_json(out)
@@ -340,7 +369,7 @@ impl SquelchServer {
         let detail = format!(
             "{}: {}",
             disposition.as_str(),
-            truncate_chars(&params.want, 120)
+            squelch_core::text::truncate_ellipsis(&params.want, 120)
         );
         let audit = NewAuditEntry {
             actor: "agent".to_string(),
@@ -748,11 +777,12 @@ mod tests {
     }
 
     /// get_shipments returns en-route packages by default and includes delivered
-    /// ones only when asked. Shipments are structurally sealed-free (never built
-    /// from sealed mail), so there is no sealed row to exclude here.
+    /// ones only when asked, and carries the carrier's ETA + verbatim status for
+    /// a polled row. Shipments are structurally sealed-free (never built from
+    /// sealed mail), so there is no sealed row to exclude here.
     #[tokio::test]
     async fn get_shipments_en_route_by_default_and_delivered_with_flag() {
-        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
+        use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@localhost").unwrap();
         let mid = seed_msg(
@@ -764,7 +794,8 @@ mod tests {
             Sensitivity::Normal,
             None,
         );
-        store
+        let eta = Utc::now() + chrono::Duration::hours(6);
+        let ups = store
             .upsert_shipment(
                 acct,
                 mid,
@@ -774,6 +805,19 @@ mod tests {
                     item_name: "Headphones".into(),
                     status: ShipmentStatus::Shipped,
                     tracking_url: Some("https://www.ups.com/track?tracknum=1Z".into()),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .apply_carrier_track(
+                acct,
+                ups,
+                &CarrierTrack {
+                    status: None,
+                    carrier_status_raw: "Held at customs".into(),
+                    eta: Some(eta),
+                    delivered_at: None,
                 },
                 Utc::now(),
             )
@@ -808,8 +852,22 @@ mod tests {
         assert_eq!(hits.len(), 1, "delivered excluded by default");
         assert_eq!(hits[0]["status"], "shipped");
         assert_eq!(hits[0]["tracking_number"], "1Z999AA10123456784");
-        // SUMMARY-ONLY shape: no body key.
+        // The carrier's own words survive a status it does not map onto our
+        // ladder ("Held at customs" left the row `shipped`), and the ETA rides
+        // out as a timestamp the agent can parse back.
+        assert_eq!(hits[0]["carrier_status_raw"], "Held at customs");
+        assert_eq!(
+            hits[0]["eta"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .unwrap(),
+            eta
+        );
+        // SUMMARY-ONLY shape: no body key. The agent door stays minimal — no
+        // thread_id, no ids, nothing to pivot into a message with.
         assert!(hits[0].get("body").is_none());
+        assert!(hits[0].get("thread_id").is_none());
 
         // With the flag: both.
         let res = server
@@ -821,6 +879,160 @@ mod tests {
         let text = res.content[0].as_text().unwrap().text.as_str();
         let v: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
+    /// Read the tracking numbers `get_shipments` returned, for the policy test.
+    async fn agent_door_numbers(server: &SquelchServer) -> Vec<String> {
+        let res = server
+            .get_shipments(Parameters(GetShipmentsParams {
+                include_delivered: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = res.content[0].as_text().unwrap().text.as_str();
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["tracking_number"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// DEFECT (P1): the agent door hardcoded the BUILT-IN retirement cap and
+    /// ignored the operator's `[carriers] max_failures`, so with `max_failures=1`
+    /// an agent kept reporting phantoms four failures after the human door had
+    /// retired them, and with `10` it lost live packages the human door still
+    /// showed. Now it carries the policy, and both doors are asserted to agree
+    /// given the same one.
+    #[tokio::test]
+    async fn get_shipments_honors_a_non_default_policy_and_matches_the_human_door() {
+        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        let mid = seed_msg(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "shipped",
+            Sensitivity::Normal,
+            None,
+        );
+
+        // An AMBIGUOUS bare digit-run with ONE permanent rejection against it.
+        let ambiguous = store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "fedex".into(),
+                    tracking_number: "123456789012".into(),
+                    item_name: "Maybe a package".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .record_poll_outcome(acct, ambiguous, Utc::now(), true)
+            .unwrap();
+
+        // A TIGHT policy (retire at 1) must hide it on the agent door too. The
+        // default cap of 5 is what the old code used, and under it this row is
+        // still visible — so a stale hardcode fails this assertion.
+        let tight = ShipmentListPolicy {
+            suppress_failed_ambiguous_at: 1,
+            stale_after_days: 0,
+        };
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(tight);
+        assert!(
+            agent_door_numbers(&server).await.is_empty(),
+            "the operator's max_failures=1 must retire the phantom on the agent door"
+        );
+
+        // TWO DOORS, ONE VIEW: same policy, same rows, whichever door asks.
+        let human = store.list_shipments(acct, true, tight).unwrap();
+        assert!(
+            human.is_empty(),
+            "the human door hides it under the same policy"
+        );
+
+        // And a LOOSE policy keeps it, on both doors.
+        let loose = ShipmentListPolicy {
+            suppress_failed_ambiguous_at: 10,
+            stale_after_days: 0,
+        };
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(loose);
+        assert_eq!(agent_door_numbers(&server).await, vec!["123456789012"]);
+        assert_eq!(
+            store
+                .list_shipments(acct, true, loose)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.tracking_number)
+                .collect::<Vec<_>>(),
+            vec!["123456789012"],
+            "and the human door agrees under that one too"
+        );
+    }
+
+    /// The staleness half of the same contract: an agent must not report a
+    /// package nothing has happened to for longer than the operator's window.
+    #[tokio::test]
+    async fn get_shipments_hides_a_stale_package_from_the_agent_too() {
+        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        let mid = seed_msg(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "shipped",
+            Sensitivity::Normal,
+            None,
+        );
+        let ship = |number: &str| ShipmentInfo {
+            carrier: "ups".into(),
+            tracking_number: number.into(),
+            item_name: "Headphones".into(),
+            status: ShipmentStatus::Shipped,
+            tracking_url: None,
+        };
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ship("1Z999AA10123456784"),
+                Utc::now() - chrono::Duration::days(8),
+            )
+            .unwrap();
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ship("1Z999AA10123456785"),
+                Utc::now() - chrono::Duration::days(6),
+            )
+            .unwrap();
+
+        let policy = ShipmentListPolicy {
+            suppress_failed_ambiguous_at: u32::MAX,
+            stale_after_days: 7,
+        };
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        assert_eq!(
+            agent_door_numbers(&server).await,
+            vec!["1Z999AA10123456785"],
+            "8 days silent is hidden, 6 days silent is not"
+        );
     }
 
     /// FAIL-CLOSED: an invalid disposition never reaches the store, so no rule and

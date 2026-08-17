@@ -6,7 +6,7 @@
 
 squelch reads your Gmail (read-only), decides what actually deserves attention, catches bills and deadlines, and serves that intelligence over MCP to an agent you already run. Your agent never holds your Gmail credential and never gets raw access to your mailbox.
 
-[![release](https://github.com/braelyn-ai/squelch/actions/workflows/release.yml/badge.svg)](https://github.com/braelyn-ai/squelch/actions/workflows/release.yml)
+[![release](https://github.com/braelyn-ai/squelch/actions/workflows/release-daemon.yml/badge.svg)](https://github.com/braelyn-ai/squelch/actions/workflows/release-daemon.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](Cargo.toml)
 [![container](https://img.shields.io/badge/ghcr.io-braelyn--ai%2Fsquelchd-2496ED.svg)](deploy/DOCKER.md)
@@ -256,6 +256,7 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md).
 | [deploy/DOCKER.md](deploy/DOCKER.md) | prebuilt GHCR images, compose file, env-var config |
 | [deploy/DEPLOY.md](deploy/DEPLOY.md) | deployment notes for a Linux server |
 | [SECURITY.md](docs/SECURITY.md) | the threat model and the two-door design |
+| [SHIPMENTS.md](docs/SHIPMENTS.md) | package tracking: BYOK carrier polling and how a package is identified |
 | [TRACKING.md](docs/TRACKING.md) | opt-in read receipts, self-hosted pixel |
 | [BROKER.md](docs/BROKER.md) | why the consent broker is a dead end, and what replaced it |
 

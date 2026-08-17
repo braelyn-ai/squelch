@@ -1032,6 +1032,7 @@ pub fn ingest(
             matched_rule: None,
             deadline: None,
             shipment: None,
+            ship_extract: false,
             receipt: None,
             calendar: None,
             attachments,
@@ -1059,6 +1060,7 @@ pub fn ingest(
             matched_rule: None,
             deadline: None,
             shipment: None,
+            ship_extract: false,
             receipt: None,
             calendar: None,
             attachments,
@@ -1077,6 +1079,14 @@ pub fn ingest(
     // package tracker. Only ever runs here, on the NON-SEALED path — a sealed OTP
     // short-circuited above and never reaches this line.
     let shipment = shipment::detect_shipment(&from_addr, &subject, &text);
+
+    // SHIPMENTS-EXTRACTOR TRIGGER, next to detection and on the SAME non-sealed,
+    // non-sent path: the LOOSE signal (no tracking number required) that stamps
+    // `triage.ship_extract_model='pending'` so the shipments specialist picks the
+    // row up. Wider than `detect_shipment` on purpose — an order confirmation
+    // with no number is exactly the mail the regex cannot handle and the model
+    // can. Sealed mail short-circuited above, so this never sees sealed content.
+    let ship_extract = shipment::has_loose_shipping_signal(&from_addr, &subject, &text);
 
     // RECEIPT DETECTION runs INDEPENDENTLY of the triage tier AND of shipment
     // detection: a receipt (record of money already paid) is noise-tier for the
@@ -1115,6 +1125,7 @@ pub fn ingest(
         matched_rule: result.matched_rule,
         deadline: result.deadline,
         shipment,
+        ship_extract,
         receipt,
         calendar,
         attachments,
@@ -1948,7 +1959,7 @@ mod tests {
         extract_auth_pass(&parsed, &from)
     }
 
-    /// HIGH 1. Gmail echoes the envelope MAIL FROM verbatim into
+    /// Gmail echoes the envelope MAIL FROM verbatim into
     /// `smtp.mailfrom=`, so a sender using
     /// `MAIL FROM:<"x; dmarc=pass y"@attacker.tld>` puts a semicolon inside a
     /// quoted string in Gmail's own GENUINE, CORRECT verdict. A splitter with no
@@ -2012,7 +2023,7 @@ mod tests {
         assert_eq!(auth_results_verdict(ar, "billing@bank.com"), Some(true));
     }
 
-    /// HIGH 2a. `dmarc=pass` is a statement about the domain in its own
+    /// `dmarc=pass` is a statement about the domain in its own
     /// `header.from=`. An attacker who owns `attacker.tld` passes DMARC there
     /// GENUINELY; unbound, that verdict would be read as a pass for whatever
     /// From header the message carries.
@@ -2032,7 +2043,7 @@ mod tests {
         assert_eq!(auth_results_verdict(ar, "pal@friend.com"), Some(false));
     }
 
-    /// HIGH 2b. `Message::from` resolves to the LAST `From` while the verdict
+    /// `Message::from` resolves to the LAST `From` while the verdict
     /// comes from the FIRST `Authentication-Results`, so two From headers let a
     /// sender who authenticates as their own domain have that verdict credited
     /// to a domain they do not own.
@@ -2059,10 +2070,10 @@ mod tests {
         assert_eq!(auth_pass_of(single.as_bytes()), Some(false));
     }
 
-    /// MEDIUM 3. `headers_raw()` is a `filter_map` that DROPS undecodable
-    /// headers, so an attacker who gets a high byte echoed into Gmail's own
-    /// verdict (the `smtp.mailfrom=` of HIGH 1) would see it skipped and their
-    /// own copy below promoted to "topmost".
+    /// `headers_raw()` is a `filter_map` that DROPS undecodable headers, so an
+    /// attacker who gets a high byte echoed into Gmail's own verdict (via the
+    /// `smtp.mailfrom=` echo) would see it skipped and their own copy below
+    /// promoted to "topmost".
     #[test]
     fn an_undecodable_topmost_verdict_is_unknown_not_a_look_further_down() {
         let mut eml: Vec<u8> = GOOGLE_PREAMBLE.as_bytes().to_vec();
@@ -2088,7 +2099,7 @@ mod tests {
         );
     }
 
-    /// MEDIUM 4. `mx.google.com` as an authserv-id is just a string the sender
+    /// `mx.google.com` as an authserv-id is just a string the sender
     /// typed unless Google's own headers corroborate that Google handled the
     /// message. Gmail runs no inbound authentication on POP-pulled mail or on
     /// `users.messages.import`/`insert`.
@@ -2127,7 +2138,7 @@ mod tests {
         assert_eq!(auth_pass_of(eml.as_bytes()), None);
     }
 
-    /// LOW 1. Alignment consults no public-suffix list, so it accepts only the
+    /// Alignment consults no public-suffix list, so it accepts only the
     /// parent->child direction: a signature from a SUBDOMAIN must not stand in
     /// for its parent, which on a multi-tenant suffix is the reachable attack.
     #[test]
@@ -2157,7 +2168,7 @@ mod tests {
         assert_eq!(auth_results_verdict(&ar, "pal@mail.friend.com"), Some(true));
     }
 
-    /// LOW 2. `header.i` is the AUID the SIGNER chooses; accepting it alone
+    /// `header.i` is the AUID the SIGNER chooses; accepting it alone
     /// delegates to Gmail's RFC 6376 enforcement. When `header.d` is also
     /// present that relationship is checked here instead of assumed.
     #[test]
@@ -2173,8 +2184,8 @@ mod tests {
         assert_eq!(auth_results_verdict(&ar, "pal@friend.com"), Some(true));
     }
 
-    /// LOW 3. An unbalanced open paren used to run to end-of-value, silently
-    /// discarding every field after it.
+    /// An unbalanced open paren or quote makes the whole value malformed. It
+    /// must not run to end-of-value, silently discarding every field after it.
     #[test]
     fn an_unterminated_comment_or_quote_is_malformed_not_truncated() {
         let ar = "mx.google.com; dkim=fail (unclosed; dmarc=fail header.from=friend.com";
@@ -2193,21 +2204,21 @@ mod tests {
         fn no_confirmed_bypass_produces_a_pass() {
             let victim = "pal@friend.com";
             let headers = [
-                // HIGH 1: quoted ';' in the echoed envelope sender.
+                // A quoted ';' in the echoed envelope sender.
                 "mx.google.com;\r\n dkim=fail header.i=@friend.com header.s=s1;\r\n \
                  spf=pass (google.com: domain of \"x; dmarc=pass y\"@attacker.tld \
                  designates 1.2.3.4 as permitted sender) \
                  smtp.mailfrom=\"x; dmarc=pass y\"@attacker.tld;\r\n \
                  dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=friend.com",
-                // HIGH 2a: a genuine pass for a domain the attacker owns.
+                // A genuine pass for a domain the attacker owns.
                 "mx.google.com; dkim=pass header.i=@attacker.tld header.s=s1; \
                  spf=pass smtp.mailfrom=bob@attacker.tld; \
                  dmarc=pass (p=NONE) header.from=attacker.tld",
-                // LOW 1: a subdomain signature standing in for its parent.
+                // A subdomain signature standing in for its parent.
                 "mx.google.com; dkim=pass header.d=evil.friend.com.attacker.tld",
-                // LOW 2: an AUID naming a domain the signature does not cover.
+                // An AUID naming a domain the signature does not cover.
                 "mx.google.com; dkim=pass header.i=@friend.com header.d=attacker.tld",
-                // LOW 3: an unbalanced paren hiding the fields that follow.
+                // An unbalanced paren hiding the fields that follow.
                 "mx.google.com; dkim=fail (unclosed; dmarc=pass header.from=friend.com",
             ];
             for ar in headers {
@@ -2223,13 +2234,13 @@ mod tests {
                         Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
                         \r\n\
                         check this out\r\n";
-            // HIGH 2b: two From headers over a genuine attacker-domain verdict.
+            // Two From headers over a genuine attacker-domain verdict.
             let ar = "Authentication-Results: mx.google.com; dkim=pass \
                       header.i=@attacker.tld header.s=s1; spf=pass \
                       smtp.mailfrom=bob@attacker.tld; dmarc=pass (p=NONE) \
                       header.from=attacker.tld\r\n";
             let two_from = format!("{GOOGLE_PREAMBLE}{ar}From: Evil <evil@attacker.tld>\r\n{tail}");
-            // MEDIUM 4: a forged verdict with no Google header above it.
+            // A forged verdict with no Google header above it.
             let uncorroborated = format!(
                 "Delivered-To: me@example.com\r\n\
                  Authentication-Results: mx.google.com; dkim=pass header.i=@friend.com; \
@@ -2243,8 +2254,8 @@ mod tests {
                 );
             }
 
-            // MEDIUM 3: an undecodable genuine verdict must not promote the
-            // forged copy below it.
+            // An undecodable genuine verdict must not promote the forged copy
+            // below it.
             let mut eml: Vec<u8> = GOOGLE_PREAMBLE.as_bytes().to_vec();
             eml.extend_from_slice(
                 b"Authentication-Results: mx.google.com; dkim=fail header.i=@friend.com; \

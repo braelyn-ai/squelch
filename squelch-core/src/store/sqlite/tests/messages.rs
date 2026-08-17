@@ -519,6 +519,53 @@ fn reingest_preserves_llm_classification_but_refreshes_heuristic_rows() {
 }
 
 #[test]
+fn reingest_preserves_a_processed_ship_marker_but_refreshes_pending() {
+    let (store, acct) = store();
+    let marker = |mid: i64| -> Option<String> {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT ship_extract_model FROM triage WHERE message_id=?1",
+            params![mid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    // --- Row A: PROCESSED by the shipments extractor, then re-delivered. ---
+    let a = triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    store
+        .ship_extract_mark(acct, a, "claude-haiku-4-5")
+        .unwrap();
+    triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    assert_eq!(
+        marker(a).as_deref(),
+        Some("claude-haiku-4-5"),
+        "a paid verdict is not re-spent on the same mail"
+    );
+
+    // --- Row B: still 'pending' -> the fresh detection wins. Here the signal
+    //     goes AWAY (a detector fix), and the row must leave the queue. ---
+    let b = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    assert_eq!(marker(b).as_deref(), Some("pending"));
+    triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal).ingest(&store);
+    assert_eq!(marker(b), None, "a still-pending trigger refreshes");
+
+    // --- Row C: no signal at first, then one -> newly queued. ---
+    let c = triaged_row(acct, "g-c", "t-c", None, false, Sensitivity::Normal).ingest(&store);
+    assert_eq!(marker(c), None);
+    triaged_row(acct, "g-c", "t-c", None, false, Sensitivity::Normal)
+        .ship_extract(true)
+        .ingest(&store);
+    assert_eq!(marker(c).as_deref(), Some("pending"));
+}
+
+#[test]
 fn a_received_sighting_pins_is_sent_to_zero_across_re_upserts() {
     // is_sent=1 removes a message from every listing surface, so one
     // mislabeled SENT sighting flipping a received row would vanish inbound

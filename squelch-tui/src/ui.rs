@@ -147,7 +147,10 @@ fn render_row(
                 "{cursor}{glyph} [{:>3}] {} — {}",
                 u.importance, u.sender, u.one_line
             );
-            Line::from(Span::styled(crate::truncate(text, width), style))
+            Line::from(Span::styled(
+                squelch_core::text::truncate_ellipsis(&text, width),
+                style,
+            ))
         }
         Row::Sealed(s) => {
             let kind = s.sealed_kind.as_deref().unwrap_or("sealed");
@@ -165,7 +168,10 @@ fn render_row(
             }
             let rel = crate::app::relative_time(s.received_at, now);
             let text = format!("{cursor}\u{1f512} {} [{}] {} ({rel})", s.from_addr, kind, body);
-            Line::from(Span::styled(crate::truncate(text, width), style))
+            Line::from(Span::styled(
+                squelch_core::text::truncate_ellipsis(&text, width),
+                style,
+            ))
         }
         Row::SquelchLine => {
             let dashes = "\u{2500}".repeat(width.saturating_sub(15).max(3));

@@ -34,6 +34,10 @@ jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"
 # with squelch-api. A leaf crate whose only dep is `subtle`: the relay must stay
 # blind, so it links this and NOT squelch-core.
 squelch-httpauth = { path = "../squelch-httpauth" }
+# The token-bucket engine and the X-Forwarded-For policy, shared byte-for-byte
+# with the other public-facing service. A leaf crate whose only dep is `http`:
+# these binaries stay blind, so they link this and NOT squelch-core.
+squelch-ratelimit = { path = "../squelch-ratelimit" }
 # The open buffer, and the only state the relay holds. `bundled` (the workspace
 # default) links SQLite itself, so the container needs no system libsqlite.
 rusqlite = { workspace = true }

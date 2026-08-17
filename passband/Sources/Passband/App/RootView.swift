@@ -144,8 +144,21 @@ struct MainShell: View {
                     Color.clear
                         .frame(width: SidebarRail.railWidth)
                         .allowsHitTesting(false)
-                    ThreadViewer(threadId: threadId)
-                        .id(threadId)
+                    // THE READER'S FLIGHT, and it is a plain offset: the email
+                    // you finished is lifted out through the top, the next one
+                    // is put one window away and walked in. ThreadViewer moves
+                    // the state; this is only where it lands. A ZStack so the
+                    // offsets have somewhere to move WITHIN, and a clip so a
+                    // reader in flight never paints over the rail beside it.
+                    ZStack {
+                        ThreadViewer(threadId: threadId)
+                            .id(threadId)
+                            .offset(store.threadFlight.offset(in: geo.size))
+                            .scaleEffect(store.threadFlight.scale)
+                            .opacity(store.threadFlight.opacity)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
                     if store.sideView.isOpen {
                         // Reserves the strip without taking clicks off the panel
                         // sitting under it.
@@ -184,7 +197,9 @@ struct MainShell: View {
         // The BOOL, never the ComposeState: the state changes on every
         // keystroke, and animating that would smear typing.
         .animation(.smooth(duration: 0.22), value: store.compose != nil)
-        // threadId is deliberately NOT animated — opening a thread is a jump.
+        // threadId is deliberately NOT animated HERE — opening a thread is a
+        // jump. The one motion it has is the done+next flight, and that one is
+        // animated at the call site, where the direction is known.
         .keyBindings(.global, globalBindings)
         .onChange(of: store.sitrep.sealed) { _, sealed in
             AuthArrival.shared.observe(sealed: sealed)
@@ -334,4 +349,26 @@ extension RoutedHeader where Trailing == EmptyView {
     init(title: String) {
         self.init(title: title) { EmptyView() }
     }
+}
+
+// MARK: - how the reader changes threads
+
+extension AppStore.ThreadFlight {
+    /// WHERE THE READER SITS for each beat of the flight, a full window away in
+    /// whichever direction it is travelling — far enough that the email is
+    /// genuinely off the screen rather than peeking in at an edge.
+    func offset(in window: CGSize) -> CGSize {
+        switch self {
+        case .settled: .zero
+        case .departing: CGSize(width: 0, height: -window.height)
+        case .entering(.bottom): CGSize(width: 0, height: window.height)
+        case .entering(.trailing): CGSize(width: window.width, height: 0)
+        }
+    }
+
+    /// Only the departure fades and shrinks, and both are slight: enough for the
+    /// email to read as leaving the reader's plane rather than merely sliding,
+    /// not so much that it becomes a card trick. What arrives arrives whole.
+    var opacity: Double { self == .departing ? 0 : 1 }
+    var scale: CGFloat { self == .departing ? 0.96 : 1 }
 }

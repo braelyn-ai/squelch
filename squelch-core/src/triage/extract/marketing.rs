@@ -68,10 +68,6 @@ pub fn build_system_prompt() -> &'static str {
     SYSTEM_PROMPT
 }
 
-// ===========================================================================
-// Output schema + parsed struct.
-// ===========================================================================
-
 pub fn output_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -154,10 +150,6 @@ pub fn sanitize_expiry(raw: Option<&str>, received_at: DateTime<Utc>) -> Option<
     Some(date.format("%Y-%m-%d").to_string())
 }
 
-// ===========================================================================
-// classify()
-// ===========================================================================
-
 /// The outcome of a single marketing [`classify`] call: parsed, schema-valid
 /// output + usage, or a refusal / permanent (non-retryable) failure — on either
 /// of which the caller marks the row processed so it cannot loop.
@@ -202,10 +194,6 @@ pub async fn classify_at(
     // [`apply_result`], so the parsed record IS the outcome.
     llm::classify_into(http, url, api_key, provider, &req, Ok::<MarketingOutput, _>).await
 }
-
-// ===========================================================================
-// apply_result() — pure mapping onto the store update.
-// ===========================================================================
 
 /// Map parsed output onto a [`MarketingApplied`]. Pure. Every text field is
 /// bounded, `code` and `expires_at` are shape-validated, and `auto_resolve` is

@@ -122,10 +122,6 @@ impl StoredToken {
 /// Refresh grace window: refresh when within 60s of expiry.
 const REFRESH_SKEW_SECS: i64 = 60;
 
-// ---------------------------------------------------------------------------
-// Shared refresh logic.
-// ---------------------------------------------------------------------------
-
 /// A refresh response: the fresh token, plus the scopes Google named on it.
 ///
 /// The scopes ride alongside rather than inside [`StoredToken`], which is a
@@ -262,10 +258,6 @@ fn validate_or_refresh(
     Ok(stored.into_oauth())
 }
 
-// ---------------------------------------------------------------------------
-// Keyring backend.
-// ---------------------------------------------------------------------------
-
 /// Persist a token into the OS keyring at `(service = "squelch", slot)` where
 /// `slot` = email + kind suffix.
 pub fn store_token(account_email: &str, kind: CredentialKind, token: &StoredToken) -> Result<()> {
@@ -385,10 +377,6 @@ impl CredentialStore for KeyringCredentialStore {
             .map_err(|e| CoreError::Credential(format!("join error: {e}")))?
     }
 }
-
-// ---------------------------------------------------------------------------
-// File backend (headless Linux: no Secret Service).
-// ---------------------------------------------------------------------------
 
 // --- encryption at rest (hosted only) --------------------------------------
 //
@@ -854,10 +842,6 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Backend-agnostic persistence helpers (used by the auth subcommand).
-// ---------------------------------------------------------------------------
-
 use crate::config::CredentialBackend;
 
 /// Persist a freshly-minted token into whichever backend is configured.
@@ -987,10 +971,6 @@ pub fn read_store_for_backend(
         )),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Env-var stub (tests / CI without any backend).
-// ---------------------------------------------------------------------------
 
 /// Env-var backed stub for the v0 skeleton. Still handy for tests / CI without a
 /// keyring. Real deployments use [`KeyringCredentialStore`] / [`FileCredentialStore`].

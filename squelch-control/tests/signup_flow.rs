@@ -42,7 +42,9 @@ use axum::{
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
-use squelch_control::config::{BifrostConfig, Config, DEFAULT_LLM_BUDGET_USD};
+use squelch_control::config::{
+    BifrostConfig, Config, DEFAULT_ASSISTANT_BUDGET_USD, DEFAULT_LLM_BUDGET_USD,
+};
 use squelch_control::warden::HttpWarden;
 use squelch_control::{ControlState, ControlStore, invites, router, seal};
 use tower::ServiceExt as _;
@@ -84,13 +86,17 @@ struct Recorder {
     /// Recorded BEFORE the mock decides whether to fail, so a failed install is
     /// still visible to the assertions.
     credential_puts: Vec<(String, Value)>,
-    /// `(label, api_key)` seen on `PUT /v1/tenants/{label}/llm-key`.
-    llm_key_puts: Vec<(String, String)>,
+    /// `(label, body)` seen on `PUT /v1/tenants/{label}/llm-key`. The whole
+    /// body, so absence of a slot can be asserted, not just presence.
+    llm_key_puts: Vec<(String, Value)>,
     /// Bodies posted to the mock Bifrost's mint route.
     bifrost_mint_bodies: Vec<Value>,
     /// Authorization headers the mock Bifrost saw, on every route. The live
     /// gateway takes HTTP Basic with the admin `username:password`.
     bifrost_auths: Vec<String>,
+    /// Key NAMES the mock Bifrost should refuse to mint, so one of a signup's
+    /// two mints can fail while the other lands.
+    bifrost_fail_names: Vec<String>,
     /// Bearer values the warden saw, on every route.
     warden_bearers: Vec<String>,
     /// Labels asked about via `GET /v1/tenants/{label}`.
@@ -292,7 +298,7 @@ async fn spawn_warden(rec: Shared) -> String {
                     let mut r = rec.lock().unwrap();
                     // Recorded BEFORE the mock decides whether to fail, so a
                     // refused install is still visible to the assertions.
-                    r.llm_key_puts.push((label, str_field(&parsed, "api_key")));
+                    r.llm_key_puts.push((label, parsed));
                     r.warden_bearers.push(bearer_of(&headers));
                     if r.fail_llm_key {
                         return json_status(StatusCode::SERVICE_UNAVAILABLE, "llm_not_configured");
@@ -325,10 +331,17 @@ async fn spawn_warden(rec: Shared) -> String {
     spawn(app).await
 }
 
-/// The value the mock Bifrost mints. The control plane must forward it to the
-/// warden and keep no other copy.
-const VK_VALUE: &str = "sk-bf-THE-VIRTUAL-KEY-VALUE";
-const VK_ID: &str = "vk-mock-1";
+/// The id and value the mock Bifrost mints, derived from the requested key
+/// NAME so a signup's two mints — `tenant-<label>` and
+/// `tenant-<label>-assistant` — stay distinguishable end to end. The control
+/// plane must forward each value to the warden and keep no other copy.
+fn vk_id_for(name: &str) -> String {
+    format!("vk-{name}")
+}
+
+fn vk_value_for(name: &str) -> String {
+    format!("sk-bf-KEY-FOR-{name}")
+}
 
 /// The Bifrost admin credential the harness configures: `username:password`,
 /// sent by the client as HTTP Basic on every governance call.
@@ -367,16 +380,22 @@ async fn spawn_bifrost(rec: Shared) -> String {
             post(
                 |AxumState(rec): AxumState<Shared>, headers: HeaderMap, body: String| async move {
                     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let name = str_field(&parsed, "name");
                     let mut r = rec.lock().unwrap();
+                    // Recorded BEFORE the mock decides whether to fail, so a
+                    // refused mint is still visible to the assertions.
                     r.bifrost_mint_bodies.push(parsed);
                     r.bifrost_auths.push(bearer_of(&headers));
+                    if r.bifrost_fail_names.contains(&name) {
+                        return json_status(StatusCode::INTERNAL_SERVER_ERROR, "mint_failed");
+                    }
                     (
                         StatusCode::OK,
                         Json(json!({
                             "message": "Virtual key created successfully",
                             "virtual_key": {
-                                "id": VK_ID,
-                                "value": VK_VALUE,
+                                "id": vk_id_for(&name),
+                                "value": vk_value_for(&name),
                                 "budgets": [{ "max_limit": DEFAULT_LLM_BUDGET_USD, "reset_duration": "1M" }],
                                 "provider_configs": [{ "provider": "anthropic", "weight": 1 }],
                             },
@@ -463,7 +482,12 @@ impl Harness {
                 admin_token: BIFROST_ADMIN.into(),
                 budget_usd: DEFAULT_LLM_BUDGET_USD,
                 models: vec!["claude-haiku-4-5".into(), "claude-sonnet-5".into()],
+                assistant_budget_usd: DEFAULT_ASSISTANT_BUDGET_USD,
+                assistant_models: vec!["claude-haiku-4-5".into(), "claude-opus-4-8".into()],
             }),
+            // The signup flow does not touch the waitlist; feature off, so
+            // those routes are not mounted at all.
+            waitlist: None,
         };
 
         let store = ControlStore::open_in_memory().unwrap();
@@ -1264,24 +1288,30 @@ async fn a_wider_grant_than_we_asked_for_is_accepted() {
     assert!(body.contains("ABCD-EFGH"), "{body}");
 }
 
-/// With the Bifrost trio configured, signup mints one virtual key per tenant,
-/// hands the VALUE to the warden, and keeps only the ID. The value never
-/// reaches the page or the store.
+/// With the Bifrost trio configured, signup mints TWO virtual keys per tenant
+/// — triage and assistant, each with its own name, budget, and model list —
+/// hands both VALUES to the warden in one PUT, and keeps only the IDS. The
+/// values never reach the page or the store.
 #[tokio::test]
 async fn signup_mints_and_installs_a_tenant_llm_key() {
     let h = Harness::with_bifrost(Bifrost::Mock).await;
     let invite = h.invite_code.clone();
     let (status, body) = h.run_signup("ada", &invite).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!body.contains(VK_VALUE), "the key value must never reach a page");
+    assert!(
+        !body.contains(&vk_value_for("tenant-ada")),
+        "the key value must never reach a page"
+    );
+    assert!(
+        !body.contains(&vk_value_for("tenant-ada-assistant")),
+        "the assistant key value must never reach a page"
+    );
 
     let rec = h.rec.lock().unwrap();
-    // TWO governance requests — the provider-key listing, then the one mint —
-    // both carrying HTTP Basic with the admin `username:password`.
-    assert_eq!(
-        rec.bifrost_auths,
-        vec![bifrost_basic_auth(), bifrost_basic_auth()]
-    );
+    // FOUR governance requests — a provider-key listing then a mint, twice —
+    // all carrying HTTP Basic with the admin `username:password`.
+    assert_eq!(rec.bifrost_auths, vec![bifrost_basic_auth(); 4]);
+    assert_eq!(rec.bifrost_mint_bodies.len(), 2);
     let mint = &rec.bifrost_mint_bodies[0];
     assert_eq!(mint["name"], "tenant-ada");
     // `budgets` is an ARRAY on the live gateway; a singular `budget` object
@@ -1299,22 +1329,41 @@ async fn signup_mints_and_installs_a_tenant_llm_key() {
         pc["allowed_models"],
         json!(["claude-haiku-4-5", "claude-sonnet-5"])
     );
-    // The VALUE went to the warden, once, for this tenant.
+    // The SECOND mint is the assistant's: its own name, its own budget, its
+    // own model list.
+    let mint = &rec.bifrost_mint_bodies[1];
+    assert_eq!(mint["name"], "tenant-ada-assistant");
+    assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
+    assert_eq!(mint["budgets"][0]["max_limit"], DEFAULT_ASSISTANT_BUDGET_USD);
+    assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
+    let pc = &mint["provider_configs"][0];
+    assert_eq!(pc["provider"], "anthropic");
+    assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
     assert_eq!(
-        rec.llm_key_puts,
-        vec![("ada".to_string(), VK_VALUE.to_string())]
+        pc["allowed_models"],
+        json!(["claude-haiku-4-5", "claude-opus-4-8"])
     );
+    // BOTH values went to the warden, in ONE put, for this tenant.
+    assert_eq!(rec.llm_key_puts.len(), 1);
+    let (label, put) = &rec.llm_key_puts[0];
+    assert_eq!(label, "ada");
+    assert_eq!(put["api_key"], vk_value_for("tenant-ada"));
+    assert_eq!(put["assistant_api_key"], vk_value_for("tenant-ada-assistant"));
     drop(rec);
-    // The store kept the ID, and only the ID.
+    // The store kept the IDS, and only the IDS.
     assert_eq!(
         h.state.store().tenant_vk("ada").unwrap(),
-        Some(VK_ID.to_string())
+        Some(vk_id_for("tenant-ada"))
+    );
+    assert_eq!(
+        h.state.store().tenant_assistant_vk("ada").unwrap(),
+        Some(vk_id_for("tenant-ada-assistant"))
     );
 }
 
-/// THE ORPHAN PROMISE: Bifrost minted the key but the warden would not take
-/// it. The signup still completes — fail-soft, exactly like an outage — AND
-/// the vk id is still recorded on the tenant row, because a key that is live
+/// THE ORPHAN PROMISE: Bifrost minted the keys but the warden would not take
+/// them. The signup still completes — fail-soft, exactly like an outage — AND
+/// the vk ids are still recorded on the tenant row, because a key that is live
 /// in Bifrost with no record is one no operator can ever find to revoke.
 #[tokio::test]
 async fn a_failed_key_install_still_records_the_vk_id() {
@@ -1325,26 +1374,33 @@ async fn a_failed_key_install_still_records_the_vk_id() {
     let (status, body) = h.run_signup("ada", &invite).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("ABCD-EFGH"), "{body}");
-    assert!(!body.contains(VK_VALUE), "the key value must never reach a page");
+    assert!(
+        !body.contains(&vk_value_for("tenant-ada")),
+        "the key value must never reach a page"
+    );
 
     {
         let rec = h.rec.lock().unwrap();
-        assert_eq!(rec.bifrost_mint_bodies.len(), 1, "the mint happened");
+        assert_eq!(rec.bifrost_mint_bodies.len(), 2, "both mints happened");
         assert_eq!(rec.llm_key_puts.len(), 1, "the install was attempted");
         assert_eq!(rec.credential_puts.len(), 1, "the mailbox still provisioned");
     }
-    // The id is on the row for the manual `llm revoke` or `llm mint` the log
+    // The ids are on the row for the manual `llm revoke` or `llm mint` the log
     // line points the operator at.
     assert_eq!(
         h.state.store().tenant_vk("ada").unwrap(),
-        Some(VK_ID.to_string())
+        Some(vk_id_for("tenant-ada"))
+    );
+    assert_eq!(
+        h.state.store().tenant_assistant_vk("ada").unwrap(),
+        Some(vk_id_for("tenant-ada-assistant"))
     );
     // ...and the signup was a real one: the invite is spent.
     assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
 }
 
-/// THE FAIL-SOFT PROMISE: a Bifrost outage costs the tenant its LLM key, never
-/// the signup. Triage is not mail custody, and `llm mint` backfills.
+/// THE FAIL-SOFT PROMISE: a Bifrost outage costs the tenant its LLM keys,
+/// never the signup. Triage is not mail custody, and `llm mint` backfills.
 #[tokio::test]
 async fn a_bifrost_outage_does_not_refuse_a_signup() {
     let h = Harness::with_bifrost(Bifrost::Down).await;
@@ -1357,10 +1413,86 @@ async fn a_bifrost_outage_does_not_refuse_a_signup() {
     assert!(rec.llm_key_puts.is_empty(), "no key existed to install");
     assert_eq!(rec.credential_puts.len(), 1, "the mailbox still provisioned");
     drop(rec);
-    // Nothing was minted, so nothing is recorded: `tenant_vk` stays empty
-    // rather than naming a key that does not exist.
+    // Nothing was minted, so nothing is recorded: both pointers stay empty
+    // rather than naming keys that do not exist.
     assert_eq!(h.state.store().tenant_vk("ada").unwrap(), None);
+    assert_eq!(h.state.store().tenant_assistant_vk("ada").unwrap(), None);
     // ...and the signup was a real one: the invite is spent.
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+}
+
+/// THE INDEPENDENCE PROMISE, one way: the assistant mint fails, and the tenant
+/// still signs up WITH its triage key installed. The one warden PUT carries
+/// only the key that exists — no `assistant_api_key` slot at all, not a null —
+/// and no assistant id is recorded, so nothing points at a key that was never
+/// minted.
+#[tokio::test]
+async fn an_assistant_mint_failure_still_installs_the_triage_key() {
+    let h = Harness::with_bifrost(Bifrost::Mock).await;
+    h.rec
+        .lock()
+        .unwrap()
+        .bifrost_fail_names
+        .push("tenant-ada-assistant".to_string());
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("ABCD-EFGH"), "{body}");
+
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.bifrost_mint_bodies.len(), 2, "both mints were attempted");
+        assert_eq!(rec.llm_key_puts.len(), 1, "one PUT, with what succeeded");
+        let (label, put) = &rec.llm_key_puts[0];
+        assert_eq!(label, "ada");
+        assert_eq!(put["api_key"], vk_value_for("tenant-ada"));
+        assert!(
+            put.get("assistant_api_key").is_none(),
+            "the missing key must be absent, not null: {put}"
+        );
+    }
+    assert_eq!(
+        h.state.store().tenant_vk("ada").unwrap(),
+        Some(vk_id_for("tenant-ada"))
+    );
+    assert_eq!(h.state.store().tenant_assistant_vk("ada").unwrap(), None);
+    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+}
+
+/// ...and the other way: the triage mint fails, and the assistant key is still
+/// minted, installed, and recorded. The PUT carries only `assistant_api_key`.
+#[tokio::test]
+async fn a_triage_mint_failure_still_installs_the_assistant_key() {
+    let h = Harness::with_bifrost(Bifrost::Mock).await;
+    h.rec
+        .lock()
+        .unwrap()
+        .bifrost_fail_names
+        .push("tenant-ada".to_string());
+
+    let invite = h.invite_code.clone();
+    let (status, body) = h.run_signup("ada", &invite).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("ABCD-EFGH"), "{body}");
+
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.bifrost_mint_bodies.len(), 2, "both mints were attempted");
+        assert_eq!(rec.llm_key_puts.len(), 1, "one PUT, with what succeeded");
+        let (label, put) = &rec.llm_key_puts[0];
+        assert_eq!(label, "ada");
+        assert!(
+            put.get("api_key").is_none(),
+            "the missing key must be absent, not null: {put}"
+        );
+        assert_eq!(put["assistant_api_key"], vk_value_for("tenant-ada-assistant"));
+    }
+    assert_eq!(h.state.store().tenant_vk("ada").unwrap(), None);
+    assert_eq!(
+        h.state.store().tenant_assistant_vk("ada").unwrap(),
+        Some(vk_id_for("tenant-ada-assistant"))
+    );
     assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
 }
 

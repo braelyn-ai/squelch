@@ -22,7 +22,9 @@ pub(crate) mod text;
 pub use calendar::{CalendarInfo, CalendarKind, detect_calendar};
 pub use deadline::DeadlineHit;
 pub use receipt::{ReceiptInfo, detect_receipt};
-pub use shipment::{ShipmentInfo, ShipmentStatus, detect_shipment};
+pub use shipment::{
+    CarrierTrack, ShipmentInfo, ShipmentStatus, detect_shipment, is_ambiguous_tracking_shape,
+};
 
 use crate::config::Stage1Config;
 use crate::error::CoreError;
@@ -399,13 +401,7 @@ fn noise(cfg: &Stage1Config, subject: &str, reason: &str) -> Stage1Result {
 fn short_subject(subject: &str) -> String {
     let s = subject.trim();
     let s = if s.is_empty() { "(no subject)" } else { s };
-    const MAX: usize = 120;
-    if s.chars().count() > MAX {
-        let truncated: String = s.chars().take(MAX - 1).collect();
-        format!("{truncated}…")
-    } else {
-        s.to_string()
-    }
+    crate::text::truncate_ellipsis(s, 120)
 }
 
 /// The first sender rule matching `from_addr`, plus its disposition. Prefer

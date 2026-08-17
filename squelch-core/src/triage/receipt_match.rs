@@ -81,7 +81,11 @@ pub fn normalize_merchant(name: &str) -> String {
 /// The registrable-ish domain of an email address, lowercased: the last two
 /// labels, or three when the last two are a known public suffix. `None` when
 /// there is no `@` or too few labels to compare.
-fn registrable_domain(addr: &str) -> Option<String> {
+///
+/// Public because merchant identity is needed beyond bill matching — the
+/// shipments store namespaces order references by it — and two definitions of
+/// "same merchant" would drift apart.
+pub fn registrable_domain(addr: &str) -> Option<String> {
     let domain = addr
         .rsplit('@')
         .next()

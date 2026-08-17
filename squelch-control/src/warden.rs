@@ -132,10 +132,18 @@ struct CredentialsRequest<'a> {
 }
 
 /// `PUT /v1/tenants/{label}/llm-key` request body. NO Debug derive, unlike its
-/// siblings: the field is the tenant's live LLM bearer.
+/// siblings: both fields are the tenant's live LLM bearers. Each is serialized
+/// only when present — a mint that half-failed installs the half that exists,
+/// and a field that never rides the wire keeps it clean for wardens that
+/// predate it (they ignore unknown fields, but hygiene is cheap).
 #[derive(Serialize)]
 struct LlmKeyRequest<'a> {
-    api_key: &'a str,
+    /// The TRIAGE key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<&'a str>,
+    /// The ASSISTANT key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assistant_api_key: Option<&'a str>,
 }
 
 /// `PUT /v1/tenants/{label}/credentials` 200 body, and the same shape
@@ -190,10 +198,17 @@ pub trait Warden: Send + Sync {
         cred_read_ciphertext: &str,
     ) -> Result<Pairing, WardenError>;
 
-    /// Install or rotate the tenant's LLM-gateway virtual key. The value is
-    /// SECRET: held for the length of this call, never logged, and nothing of
-    /// it comes back.
-    async fn put_llm_key(&self, label: &str, api_key: &str) -> Result<(), WardenError>;
+    /// Install or rotate the tenant's LLM-gateway virtual keys — triage
+    /// (`api_key`) and assistant — in one call. `None` skips a slot rather
+    /// than clearing it, so a half-failed mint installs the half that exists;
+    /// both `None` is a caller bug and refused. The values are SECRET: held
+    /// for the length of this call, never logged, and nothing comes back.
+    async fn put_llm_key(
+        &self,
+        label: &str,
+        api_key: Option<&str>,
+        assistant_api_key: Option<&str>,
+    ) -> Result<(), WardenError>;
 
     /// The tenant's state, or `None` when the warden has never heard of it.
     /// Used before consent to check that a label is free.
@@ -333,20 +348,35 @@ impl Warden for HttpWarden {
         }
     }
 
-    async fn put_llm_key(&self, label: &str, api_key: &str) -> Result<(), WardenError> {
+    async fn put_llm_key(
+        &self,
+        label: &str,
+        api_key: Option<&str>,
+        assistant_api_key: Option<&str>,
+    ) -> Result<(), WardenError> {
         // The label goes into a URL path, same as the other routes.
         crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
-        // The Bifrost client shape-checks what it mints; this holds every
-        // OTHER caller to the same bar, before the socket is opened.
-        if api_key.is_empty() || !api_key.bytes().all(|b| b.is_ascii_graphic()) {
+        // A call with nothing to install is a bug, not a no-op to swallow.
+        if api_key.is_none() && assistant_api_key.is_none() {
             return Err(WardenError::BadApiKey);
+        }
+        // The Bifrost client shape-checks what it mints; this holds every
+        // OTHER caller to the same bar, before the socket is opened. Both
+        // slots, one bar.
+        for key in [api_key, assistant_api_key].into_iter().flatten() {
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(WardenError::BadApiKey);
+            }
         }
 
         let resp = self
             .http
             .put(self.url(&format!("/v1/tenants/{label}/llm-key")))
             .bearer_auth(&self.token)
-            .json(&LlmKeyRequest { api_key })
+            .json(&LlmKeyRequest {
+                api_key,
+                assistant_api_key,
+            })
             .send()
             .await
             .map_err(|_| WardenError::Unreachable)?;
@@ -572,7 +602,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    w.put_llm_key(bad, "sk-bf-key").await,
+                    w.put_llm_key(bad, Some("sk-bf-key"), Some("sk-bf-key-a")).await,
                     Err(WardenError::LabelRefused)
                 ),
                 "{bad:?}"
@@ -589,19 +619,34 @@ mod tests {
     }
 
     /// An empty key, or one carrying whitespace or control bytes, is refused
-    /// before any socket is opened: it is a bug here, not a 422 there.
+    /// before any socket is opened: it is a bug here, not a 422 there. The
+    /// same bar for BOTH slots, and a call with neither is a bug too.
     #[tokio::test]
     async fn refuses_an_api_key_it_would_not_present() {
         let w = offline_client();
         for bad in ["", "with space", "with\nnewline", "with\ttab"] {
             assert!(
                 matches!(
-                    w.put_llm_key("ada", bad).await,
+                    w.put_llm_key("ada", Some(bad), None).await,
                     Err(WardenError::BadApiKey)
                 ),
                 "{bad:?}"
             );
+            assert!(
+                matches!(
+                    w.put_llm_key("ada", Some("sk-bf-fine"), Some(bad)).await,
+                    Err(WardenError::BadApiKey)
+                ),
+                "assistant: {bad:?}"
+            );
         }
+        assert!(
+            matches!(
+                w.put_llm_key("ada", None, None).await,
+                Err(WardenError::BadApiKey)
+            ),
+            "nothing to install is a bug, not a no-op"
+        );
     }
 
     /// The llm-key route on the wire: the key rides as `{"api_key": ...}` with
@@ -674,26 +719,49 @@ mod tests {
         )
         .unwrap();
 
-        w.put_llm_key("okay", "sk-bf-THE-KEY").await.unwrap();
+        w.put_llm_key("okay", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
+            .await
+            .unwrap();
         assert!(matches!(
-            w.put_llm_key("ghost", "sk-bf-THE-KEY").await,
+            w.put_llm_key("ghost", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
+                .await,
             Err(WardenError::UnknownTenant)
         ));
         assert!(matches!(
-            w.put_llm_key("nollm", "sk-bf-THE-KEY").await,
+            w.put_llm_key("nollm", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
+                .await,
             Err(WardenError::LlmNotConfigured)
         ));
         assert!(matches!(
-            w.put_llm_key("other", "sk-bf-THE-KEY").await,
+            w.put_llm_key("other", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
+                .await,
             Err(WardenError::Failed)
         ));
 
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 4);
-        for (bearer, body) in seen.iter() {
-            assert_eq!(bearer, "Bearer token");
-            assert_eq!(body["api_key"], "sk-bf-THE-KEY");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 4);
+            for (bearer, body) in seen.iter() {
+                assert_eq!(bearer, "Bearer token");
+                assert_eq!(body["api_key"], "sk-bf-THE-KEY");
+                assert_eq!(body["assistant_api_key"], "sk-bf-THE-ASSISTANT-KEY");
+            }
         }
+
+        // A half-present pair serializes ONLY the half that exists: an absent
+        // slot must not ride as null, which a strict warden could read as
+        // "clear it".
+        w.put_llm_key("okay", None, Some("sk-bf-THE-ASSISTANT-KEY"))
+            .await
+            .unwrap();
+        w.put_llm_key("okay", Some("sk-bf-THE-KEY"), None).await.unwrap();
+        let seen = seen.lock().unwrap();
+        let (_, assistant_only) = &seen[4];
+        assert!(assistant_only.get("api_key").is_none(), "{assistant_only}");
+        assert_eq!(assistant_only["assistant_api_key"], "sk-bf-THE-ASSISTANT-KEY");
+        let (_, triage_only) = &seen[5];
+        assert_eq!(triage_only["api_key"], "sk-bf-THE-KEY");
+        assert!(triage_only.get("assistant_api_key").is_none(), "{triage_only}");
     }
 
     /// The pairing route answers with the same shape call 2 does, and it is held

@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use squelch_api::{ApiState, router};
-use squelch_core::store::{SqliteStore, Store};
+use squelch_core::store::{SqliteStore, Store, UsageTokens};
 use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
@@ -194,6 +194,271 @@ async fn shipments_returns_en_route_by_default_and_delivered_with_flag() {
         2,
         "delivered included with flag"
     );
+}
+
+/// WIRE CONTRACT: the four carrier-poll fields ride out on `/client/shipments`
+/// verbatim, so the client can show an ETA and the carrier's own words. A row
+/// that has never been polled still carries all four KEYS, as nulls — a client
+/// decoding them must never have to distinguish "absent" from "not yet polled".
+#[tokio::test]
+async fn shipments_carry_the_carrier_poll_fields() {
+    use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
+    let t0 = chrono::Utc::now();
+    let eta = t0 + chrono::Duration::hours(6);
+    let polled = t0 + chrono::Duration::minutes(3);
+
+    let Harness { app, .. } = harness(|store, acct| {
+        let mid = store
+            .upsert_message(&msg(acct, "g1", "t1", "shipped", "b"))
+            .unwrap();
+        let polled_id = store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "ups".into(),
+                    tracking_number: "1Z999AA10123456784".into(),
+                    item_name: "Headphones".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                t0,
+            )
+            .unwrap();
+        // A second row that no poll has ever touched, for the null case.
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "usps".into(),
+                    tracking_number: "9400111899223817428490".into(),
+                    item_name: "Book".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                t0,
+            )
+            .unwrap();
+        store
+            .apply_carrier_track(
+                acct,
+                polled_id,
+                &CarrierTrack {
+                    status: Some(ShipmentStatus::OutForDelivery),
+                    carrier_status_raw: "Out For Delivery".into(),
+                    eta: Some(eta),
+                    delivered_at: None,
+                },
+                polled,
+            )
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+
+    let polled_row = items
+        .iter()
+        .find(|i| i["tracking_number"] == "1Z999AA10123456784")
+        .expect("the polled shipment");
+    assert_eq!(polled_row["status"], "out_for_delivery");
+    assert_eq!(polled_row["carrier_status_raw"], "Out For Delivery");
+    // Timestamps go out as strings the client parses back to the same instant.
+    let parse = |v: &Value| {
+        v.as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    };
+    assert_eq!(parse(&polled_row["eta"]), eta);
+    assert_eq!(parse(&polled_row["last_polled_at"]), polled);
+    assert!(
+        polled_row["delivered_at"].is_null(),
+        "out for delivery is not delivered"
+    );
+
+    let unpolled = items
+        .iter()
+        .find(|i| i["tracking_number"] == "9400111899223817428490")
+        .expect("the never-polled shipment");
+    for field in [
+        "carrier_status_raw",
+        "eta",
+        "delivered_at",
+        "last_polled_at",
+    ] {
+        assert!(
+            unpolled.get(field).is_some_and(Value::is_null),
+            "{field} must be present and null before the first poll"
+        );
+    }
+}
+
+/// A configured kick reaches the poller's `Notify` and reports the carriers it
+/// will hit. `notify_one` parks a permit when nobody is waiting yet, so awaiting
+/// AFTER the request still completes — the timeout is what makes a missed poke
+/// a failure rather than a hang.
+#[tokio::test]
+async fn shipment_poll_kicks_the_poller_and_lists_its_carriers() {
+    let kick = Arc::new(tokio::sync::Notify::new());
+    let (state, _store, _acct) = common::state_with(|_, _| {});
+    // Deliberately unsorted + duplicated: the response must not depend on how
+    // the caller assembled the list.
+    let app = router(
+        state.with_shipment_poll_kick(kick.clone(), vec!["ups".into(), "dhl".into(), "ups".into()]),
+    );
+
+    let resp = app
+        .oneshot(authed("POST", "/client/shipments/poll"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["kicked"], true);
+    assert_eq!(json["carriers"], serde_json::json!(["dhl", "ups"]));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), kick.notified())
+        .await
+        .expect("the poller's kick must have been notified");
+}
+
+/// Carrier polling is BYOK, so no poller is the RESTING STATE, not an error: the
+/// route serves 200 with `kicked: false` and an empty list, which is how the
+/// client knows to hide the button. Still behind the bearer, like everything in
+/// the `/client` tree.
+#[tokio::test]
+async fn shipment_poll_without_a_poller_is_a_200_that_kicked_nothing() {
+    let Harness { app, .. } = harness(|_, _| {});
+
+    let unauthed = Request::builder()
+        .method("POST")
+        .uri("/client/shipments/poll")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauthed).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .oneshot(authed("POST", "/client/shipments/poll"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["kicked"], false);
+    assert_eq!(json["carriers"], serde_json::json!([]));
+}
+
+/// The clear endpoint end to end: bearer-gated, idempotent, 404 on an unknown
+/// id, and — the design's whole point — REVERSED BY AN UPDATE with no un-clear
+/// call anywhere. The Passband client builds against this contract.
+#[tokio::test]
+async fn clearing_a_shipment_hides_it_until_an_update_brings_it_back() {
+    use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let mid = store
+            .upsert_message(&msg(acct, "g1", "t1", "shipped", "b"))
+            .unwrap();
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &ShipmentInfo {
+                    carrier: "ups".into(),
+                    tracking_number: "1Z999AA10123456784".into(),
+                    item_name: "Headphones".into(),
+                    status: ShipmentStatus::Shipped,
+                    tracking_url: None,
+                },
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            )
+            .unwrap();
+    });
+    let listed = store
+        .list_shipments(acct, false, Default::default())
+        .unwrap();
+    let sid = listed[0].id;
+
+    // Behind the bearer, like everything in the `/client` tree.
+    let unauthed = Request::builder()
+        .method("POST")
+        .uri(format!("/client/shipments/{sid}/clear"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(unauthed).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", &format!("/client/shipments/{sid}/clear")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["cleared"], true);
+    assert_eq!(json["shipment_id"], sid);
+    let cleared_at = json["cleared_at"]
+        .as_str()
+        .expect("cleared_at rides out as an RFC3339 string")
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .expect("and parses back");
+
+    // Gone from the listing...
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    assert!(
+        body_json(resp).await.as_array().unwrap().is_empty(),
+        "a cleared package leaves the listing"
+    );
+
+    // ...idempotently: a double-tap restamps and still answers 200.
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", &format!("/client/shipments/{sid}/clear")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // An unknown id is a 404, not a 500 and not a `false`.
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", "/client/shipments/999999/clear"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // REVIVAL: one carrier poll that actually moves the package, and the row is
+    // back. No un-clear endpoint was called, because none exists.
+    store
+        .apply_carrier_track(
+            acct,
+            sid,
+            &CarrierTrack {
+                status: Some(ShipmentStatus::OutForDelivery),
+                carrier_status_raw: "Out For Delivery".into(),
+                eta: None,
+                delivered_at: None,
+            },
+            cleared_at + chrono::Duration::minutes(5),
+        )
+        .unwrap();
+    let resp = app
+        .oneshot(authed("GET", "/client/shipments"))
+        .await
+        .unwrap();
+    let items = body_json(resp).await;
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 1, "an update revives the cleared row");
+    assert_eq!(items[0]["status"], "out_for_delivery");
 }
 
 #[tokio::test]
@@ -3701,10 +3966,14 @@ async fn stats_expose_stage2_usage_and_cost() {
         // 2 calls: 1_000_000 in, 200_000 out, 200_000 cache-write, 1_000_000
         // cache-read.
         store
-            .stage2_bump_usage(acct, &day, 600_000, 100_000, 200_000, 1_000_000)
+            .stage2_bump_usage(
+                acct,
+                &day,
+                UsageTokens { input: 600_000, output: 100_000, cache_creation: 200_000, cache_read: 1_000_000 },
+            )
             .unwrap();
         store
-            .stage2_bump_usage(acct, &day, 400_000, 100_000, 0, 0)
+            .stage2_bump_usage(acct, &day, UsageTokens { input: 400_000, output: 100_000, ..Default::default() })
             .unwrap();
     });
 
@@ -3772,10 +4041,14 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // (cache writes at 1.25x, reads at 0.1x of the input price).
     let Harness { app, .. } = harness(|store, acct| {
         store
-            .stage2_bump_usage(acct, "2026-07-08", 400_000, 100_000, 0, 0)
+            .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 400_000, output: 100_000, ..Default::default() })
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", 600_000, 100_000, 400_000, 2_000_000)
+            .stage2_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens { input: 600_000, output: 100_000, cache_creation: 400_000, cache_read: 2_000_000 },
+            )
             .unwrap();
     });
 
@@ -4083,11 +4356,9 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
 async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
     // Blocking a sender from an email marks that email done; a surface rule is
     // tuning, not a verdict, and must leave its source open.
-    // Ids captured from the seeder, not inferred from a search ordering. They
-    // used to be taken as max/min, which had them BACKWARDS — spam is seeded
-    // first and therefore holds the LOWER id. Nothing caught it while the
-    // handler resolved whatever message id it was handed; resolving by sender
-    // reads the from_addr, so the mix-up became visible immediately.
+    // Ids captured from the seeder, not inferred from a search ordering: spam
+    // is seeded first and therefore holds the LOWER id, so max/min would have
+    // them backwards.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = harness(|store, acct| {
         seeded.borrow_mut().push(seed_unsub_msg(
@@ -4667,8 +4938,12 @@ async fn triage_config_get_computes_trailing_averages() {
         }
         // One day with 2 calls, 1000 in / 200 out tokens.
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        store.stage2_bump_usage(acct, &day, 600, 120, 0, 0).unwrap();
-        store.stage2_bump_usage(acct, &day, 400, 80, 0, 0).unwrap();
+        store
+            .stage2_bump_usage(acct, &day, UsageTokens { input: 600, output: 120, ..Default::default() })
+            .unwrap();
+        store
+            .stage2_bump_usage(acct, &day, UsageTokens { input: 400, output: 80, ..Default::default() })
+            .unwrap();
     });
 
     let resp = app
