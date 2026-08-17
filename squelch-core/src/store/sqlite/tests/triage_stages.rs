@@ -1895,8 +1895,25 @@ fn an_escalated_row_carries_its_reason_and_the_senders_record() {
 
     let q = store.stage2_queue(acct, 10).unwrap();
     assert_eq!(q[0].escalation_reason.as_deref(), Some("buried_bill"));
-    assert!(
-        q[0].sender_history.total >= 1,
-        "the sender's own prior mail counts toward their record"
+    // The row under judgement is NOT its own history: reporting "1 previous
+    // message" for a first-time sender says the opposite of the truth.
+    assert_eq!(
+        q[0].sender_history.total, 0,
+        "a first message from a sender has no history"
     );
+
+    // A second message from the same sender DOES see the first.
+    let second = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, second],
+        )
+        .unwrap();
+    let q = store.stage2_queue(acct, 10).unwrap();
+    let row = q.iter().find(|r| r.message_id == second).unwrap();
+    assert_eq!(row.sender_history.total, 1);
 }

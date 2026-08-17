@@ -50,7 +50,11 @@ fn sender_history_conn(
     conn: &Connection,
     account_id: AccountId,
     from_addr: &str,
+    exclude_message_id: i64,
 ) -> Result<SenderHistory> {
+    // The row under judgement is excluded. Counting it would report "1 previous
+    // message" for a sender who has never written before, which is the opposite
+    // of the fact this field exists to convey.
     let (total, surfaced): (i64, i64) = conn.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(CASE WHEN t.tier IN ('signal','deadline','past_due')
@@ -59,9 +63,10 @@ fn sender_history_conn(
          JOIN triage t ON t.message_id = m.id
          WHERE m.account_id = ?1
            AND m.from_addr = ?2 COLLATE NOCASE
+           AND m.id != ?3
            AND m.is_sent = 0
            AND t.sensitivity = 'normal'",
-        params![account_id, from_addr],
+        params![account_id, from_addr, exclude_message_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let corrected: i64 = conn.query_row(
@@ -951,7 +956,8 @@ impl SqliteStore {
 
         // ---- The context an escalation is actually buying --------------------
         for row in &mut out {
-            row.sender_history = sender_history_conn(&conn, account_id, &row.from_addr)?;
+            row.sender_history =
+                sender_history_conn(&conn, account_id, &row.from_addr, row.message_id)?;
             row.thread = thread_siblings_conn(
                 &conn,
                 account_id,
