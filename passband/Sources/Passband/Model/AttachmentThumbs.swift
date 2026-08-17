@@ -1,9 +1,14 @@
-// ATTACHMENT TILE CACHE — each attachment's 38pt tile resolved ONCE per id
-// (negative results included, so a failed tile is not re-fetched on every scroll
-// pass), downsampled at decode time so the bytes kept are the bytes drawn, and
-// rendered in a detached task with only encoded Data crossing back. Bytes ride
-// the authenticated door via APIClient — a bearer token cannot ride an <img src>,
+// ATTACHMENT ART CACHE — each attachment resolved ONCE per id per SIZE (negative
+// results included, so a failed tile is not re-fetched on every scroll pass),
+// downsampled at decode time so the bytes kept are the bytes drawn, and rendered
+// in a detached task with only encoded Data crossing back. Bytes ride the
+// authenticated door via APIClient — a bearer token cannot ride an <img src>,
 // and this cache never learns it. The caller picks the bucket.
+//
+// TWO SIZES, two tables: the 38pt chip tile and the column-width inline
+// rendering. They are not the same picture scaled — the tile is a recognition
+// aid a mailbox-walk fills by the hundred, the inline art is the message itself
+// and costs ~200x as much to keep, so they are bounded separately.
 
 import CoreGraphics
 import Foundation
@@ -24,14 +29,32 @@ final class AttachmentThumbs {
     /// display class this app ships on. `nonisolated` for the detached render task.
     private nonisolated static let maxPixel = 76
 
+    /// The INLINE rendering's ceiling in PIXELS: the message column at 2x. Big
+    /// enough to read a photo somebody sent, bounded so a 4000px original never
+    /// sits in memory at full size. ImageIO does NOT upscale past a source's own
+    /// dimensions, so a small signature logo asked for at this size comes back
+    /// small rather than blurry — which is why one ceiling serves both.
+    private nonisolated static let inlinePixel = 1200
+
     /// How many resolved tiles to keep. Each is a 76px thumbnail, so this is a
     /// few megabytes at worst — deep enough that walking a mailbox never
     /// re-downloads, bounded so a long session cannot grow forever.
     private static let cacheMax = 512
 
+    /// Far shallower, because each entry is ~200x the size: a 1200px bitmap is a
+    /// few megabytes DECODED. This is "the thread being read stays warm", not the
+    /// mailbox — a thread with more photos than this re-fetches the oldest, which
+    /// is the right trade against holding a gallery in memory.
+    private static let inlineCacheMax = 8
+
     /// attachment id -> verdict, `.blank` included. Membership IS "already
     /// resolved", which is what makes the negative cache work.
     private let memo = AsyncMemo<Int, Tile>(limit: cacheMax)
+
+    /// The same verdicts at column size. A separate table rather than a wider
+    /// key: promoting a 38pt tile into the column would be an upscale of art we
+    /// already know how to fetch properly.
+    private let inlineMemo = AsyncMemo<Int, Tile>(limit: inlineCacheMax)
 
     private init() {}
 
@@ -40,22 +63,43 @@ final class AttachmentThumbs {
     /// re-confirms what we hold. nil means "not resolved yet", NOT "no art".
     func cached(_ id: Int) -> Tile? { memo.cached(id) }
 
+    /// The column-sized art, without starting work. Same contract as `cached`.
+    func cachedInline(_ id: Int) -> Tile? { inlineMemo.cached(id) }
+
     /// Forget every resolved tile. An account switch: attachment ids are one
     /// daemon's SQLite ints, so a surviving entry would not merely be stale —
-    /// id 91 in the new account would render the old account's attachment.
-    func wipe() { memo.clear() }
+    /// id 91 in the new account would render the old account's attachment. BOTH
+    /// tables, for exactly that reason.
+    func wipe() {
+        memo.clear()
+        inlineMemo.clear()
+    }
 
     /// Resolve one tile, deduped and memoized.
     @discardableResult
     func resolve(_ attachment: Attachment, as source: Source) async -> Tile {
-        await memo.resolve(attachment.id) { await Self.fetch(attachment, source) }
+        await memo.resolve(attachment.id) {
+            await Self.fetch(attachment, source, maxPixel: Self.maxPixel)
+        }
+    }
+
+    /// Resolve one image attachment at column size. Images only: a PDF's first
+    /// page is a recognition aid at tile size, not something the thread pastes
+    /// across its full width.
+    @discardableResult
+    func resolveInline(_ attachment: Attachment) async -> Tile {
+        await inlineMemo.resolve(attachment.id) {
+            await Self.fetch(attachment, .image, maxPixel: Self.inlinePixel)
+        }
     }
 
     // MARK: - resolution
 
     /// Bytes -> rasterized tile. Every failure is a negative cache entry, not a
     /// retry loop: a PDF that CoreGraphics refuses once will refuse forever.
-    private static func fetch(_ attachment: Attachment, _ source: Source) async -> Tile {
+    private static func fetch(_ attachment: Attachment, _ source: Source, maxPixel: Int) async
+        -> Tile
+    {
         guard
             let fetched = try? await APIClient.shared.fetchAttachment(
                 attachment.id, fallbackName: attachment.filename)
