@@ -217,15 +217,27 @@ pub trait Cluster: Send + Sync {
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError>;
 
-    /// The tenant's Service, if one exists.
+    /// Write or remove ONE annotation on a Secret, leaving every other field on
+    /// that object exactly as it is. `None` removes it.
     ///
-    /// One caller, and it is asking a question the status word cannot answer.
-    /// A tenant with no Deployment reads [`crate::TenantStatus::Stopped`]
-    /// whether its workload was cancelled or merely interrupted, and those two
-    /// want opposite treatment. [`crate::Warden::delete`] takes the Service down
-    /// with the Deployment, so a surviving Service means nobody cancelled this
-    /// tenant and the missing Deployment is a job somebody did not finish.
-    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError>;
+    /// A merge patch and not [`Cluster::apply`], and the difference is a
+    /// tenant's mail. The warden's apply is server-side apply with force under
+    /// one field manager, so it declares the whole object: an apply carrying
+    /// only metadata would take the identity Secret's `data` with it, and that
+    /// Secret holds the age key every credential this tenant ever had was
+    /// sealed to. A merge patch touches the one path it names and nothing else.
+    ///
+    /// A Secret that is not there is SUCCESS. The only marker this writes lives
+    /// on the identity Secret ([`crate::objects::CANCELLED_AT_ANNOTATION`]), and
+    /// a tenant whose identity Secret is gone is refused by every path that
+    /// would read one - it is in no fleet, and it cannot be reconciled or
+    /// reopened - so there is no state a missing target could leave behind.
+    async fn annotate_secret(
+        &self,
+        name: &str,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), ClusterError>;
 
     /// Delete by name. A missing object is success: every caller is either
     /// tearing down or retrying a teardown.
@@ -519,8 +531,27 @@ impl Cluster for KubeCluster {
         optional(self.api::<Deployment>().get(name).await, "get deployment")
     }
 
-    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
-        optional(self.api::<Service>().get(name).await, "get service")
+    async fn annotate_secret(
+        &self,
+        name: &str,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), ClusterError> {
+        // A JSON merge patch: the named path is set, a null REMOVES the key,
+        // and every other field of the object is left alone. Under the warden's
+        // own field manager, the one that already owns this Secret.
+        let patch = serde_json::json!({ "metadata": { "annotations": { key: value } } });
+        let params = PatchParams {
+            field_manager: Some(FIELD_MANAGER.to_string()),
+            ..Default::default()
+        };
+        optional(
+            self.api::<Secret>()
+                .patch(name, &params, &Patch::Merge(&patch))
+                .await,
+            "annotate secret",
+        )
+        .map(|_| ())
     }
 
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {

@@ -49,9 +49,11 @@ usage:
   squelch-warden roll              converge every tenant onto today's render, one at a time
   squelch-warden roll --dry-run    report what a roll would change, and change nothing
 
-`roll` exits 0 converged (nothing to do counts), 1 not converged (it halted, it
-never started, a tenant is down, or a dry run found work), 2 converged with
-tenants skipped for foreign drift.
+`roll` rolls AT MOST ONE tenant per run: the next tick takes the next one, so a
+fleet with N tenants behind needs N runs. It exits 0 converged (nothing to do
+counts), 1 not converged (it halted, it never started, a tenant is down, or a
+dry run found work), 2 nothing left it can fix on its own (foreign drift, an
+unreadable label), 3 it rolled a tenant and more are queued behind it.
 ";
 
 // `roll`'s exit status is the CronJob's entire interface to a run: the pod's
@@ -71,11 +73,29 @@ const EXIT_CONVERGED: u8 = 0;
 /// All of them want the same thing, which is a person reading the log before
 /// anything else is applied, so all of them are one code.
 const EXIT_NOT_CONVERGED: u8 = 1;
-/// Everything this run could converge did, and at least one tenant was left
-/// alone because another field manager owns part of its Deployment. Nothing is
-/// broken, and nothing will fix itself either; see
-/// [`squelch_warden::Warden::roll`] for why a timer must not repair one.
+/// Everything this run could converge did, and at least one tenant is left that
+/// this timer will NEVER converge, however many times it runs: another field
+/// manager owns part of its Deployment (see [`squelch_warden::Warden::roll`]
+/// for why a timer must not repair one), or its identity Secret carries a label
+/// that does not validate, so no run can even address it. Both want a person,
+/// and neither wants one tonight.
 const EXIT_SKIPPED: u8 = 2;
+/// The run rolled a tenant and there are more behind it. Working exactly as
+/// designed: see [`squelch_warden::Warden::roll`] for why one tenant per run is
+/// the safety model, and expect one of these per remaining tenant after every
+/// image bump.
+///
+/// Its own code rather than folded into either neighbour, because it is the one
+/// outcome that is both "the fleet is not on today's render" and "no human
+/// should do anything". Reporting it as 0 would make `roll` unable to say when
+/// a bump has finished landing; reporting it as 1 would spend the alarm that
+/// [`EXIT_NOT_CONVERGED`] is for on the normal case.
+///
+/// The Job is still marked Failed - Kubernetes knows zero and non-zero and
+/// nothing else - so a fleet mid-roll leaves failed Jobs in its history by
+/// design. `deploy/hosted/PRODUCTION.md` says what that looks like and how an
+/// alert should tell it from the real thing.
+const EXIT_PROGRESSING: u8 = 3;
 /// The argument list was none of the three this binary accepts (`EX_USAGE`).
 /// Deliberately outside the 0-2 range: a mistyped CronJob argument must not
 /// read as a verdict on the fleet.
@@ -101,20 +121,30 @@ fn command(args: &[String]) -> Option<Command> {
 }
 
 /// What the run's outcome means to whoever scheduled it. See the exit-code
-/// constants; not-converged outranks a skip, because a fleet that is not on
-/// today's render is the more urgent of the two facts.
+/// constants.
+///
+/// Ranked by what a person has to do and how soon, most urgent first: something
+/// is wrong (1), the machine is mid-job and will carry on (3), the machine is
+/// done and something is left that it cannot do (2), nothing to do (0). A fleet
+/// that is not on today's render outranks a skip, for the reason it always did:
+/// it is the more urgent of the two facts, and [`EXIT_PROGRESSING`] inherits
+/// that rank for the same reason.
 ///
 /// `dry_run` is an input to the verdict and not a detail of the report, because
 /// the same summary means opposite things in the two modes. A real run that
-/// rolled three tenants converged them; a dry run that would have rolled three
-/// tenants converged nothing and has just said so. Without this, the run the
-/// CronJob comments recommend before a pin bump - the one whose entire job is
-/// to warn - would exit exactly like a fleet that needs nothing.
+/// rolled a tenant converged it; a dry run that would have rolled three tenants
+/// converged nothing and has just said so. Without this, the run the CronJob
+/// comments recommend before a pin bump - the one whose entire job is to warn -
+/// would exit exactly like a fleet that needs nothing. A dry run never sets
+/// [`squelch_warden::Rolled::remaining`], so it can never be PROGRESSING: it
+/// made no progress, which is the whole idea.
 fn verdict(rolled: &Rolled, dry_run: bool) -> u8 {
     let would_roll = dry_run && !rolled.rolled.is_empty();
     if rolled.halted_on.is_some() || !rolled.stranded.is_empty() || would_roll {
         EXIT_NOT_CONVERGED
-    } else if !rolled.skipped_foreign.is_empty() {
+    } else if rolled.remaining > 0 {
+        EXIT_PROGRESSING
+    } else if !rolled.skipped_foreign.is_empty() || rolled.unreadable > 0 {
         EXIT_SKIPPED
     } else {
         EXIT_CONVERGED
@@ -141,10 +171,28 @@ fn summarize(rolled: &Rolled, dry_run: bool) -> String {
     if !rolled.rolled.is_empty() {
         out.push_str(&format!("  {verb}: {}\n", rolled.rolled.join(", ")));
     }
+    // The pacing, said out loud. A run that converged a tenant and left nine is
+    // doing its job, and the number is the only thing that says how many more
+    // ticks the bump has left in it.
+    if rolled.remaining > 0 {
+        out.push_str(&format!(
+            "  still behind, one per run: {} more, the next at the next tick\n",
+            rolled.remaining
+        ));
+    }
     if !rolled.skipped_foreign.is_empty() {
         out.push_str(&format!(
             "  needs a person (another field manager owns part of the Deployment): {}\n",
             rolled.skipped_foreign.join(", ")
+        ));
+    }
+    // A COUNT and never the names: the name is the string that failed
+    // validation, and this text goes to a terminal.
+    if rolled.unreadable > 0 {
+        out.push_str(&format!(
+            "  needs a person (identity Secrets whose label does not validate, so no run can \
+             ever address them): {}\n",
+            rolled.unreadable
         ));
     }
     if !rolled.skipped_inactive.is_empty() {
@@ -155,7 +203,8 @@ fn summarize(rolled: &Rolled, dry_run: bool) -> String {
     }
     if !rolled.stranded.is_empty() {
         out.push_str(&format!(
-            "  DOWN (no workload, still routed; an unfinished reconcile): {}\n",
+            "  DOWN (no workload, and nothing recorded a cancellation; a job that did not \
+             finish): {}\n",
             rolled.stranded.join(", ")
         ));
     }
@@ -170,7 +219,7 @@ fn summarize(rolled: &Rolled, dry_run: bool) -> String {
         ));
     } else if let Some(label) = &rolled.halted_on {
         out.push_str(&format!(
-            "  HALTED on {label}; the tenants after it were not touched\n"
+            "  HALTED on {label}; nothing else was touched, and it is back on the queue\n"
         ));
     }
     out
@@ -466,16 +515,80 @@ mod tests {
         assert_eq!(verdict(&inactive, false), EXIT_CONVERGED);
     }
 
+    /// A run that rolled a tenant and has more queued is PROGRESSING: not
+    /// converged, and not a problem either. Getting this wrong in either
+    /// direction is what the code exists to prevent - green would make `roll`
+    /// unable to say when a bump has landed, and [`EXIT_NOT_CONVERGED`] would
+    /// spend the alarm on every normal tick of every normal image bump.
+    #[test]
+    fn a_paced_run_with_more_to_do_is_neither_converged_nor_a_problem() {
+        let mid_roll = Rolled {
+            checked: 3,
+            rolled: vec!["alice".into()],
+            remaining: 2,
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&mid_roll, false), EXIT_PROGRESSING);
+
+        // The last tick of that same bump: nothing left behind it.
+        let finished = Rolled {
+            checked: 3,
+            rolled: vec!["carol".into()],
+            current: 2,
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&finished, false), EXIT_CONVERGED);
+
+        // Something being wrong still outranks the pacing. A run that rolled a
+        // tenant, has more queued, and found a mailbox down wants a person now.
+        let mid_roll_with_a_casualty = Rolled {
+            stranded: vec!["erin".into()],
+            ..mid_roll.clone()
+        };
+        assert_eq!(
+            verdict(&mid_roll_with_a_casualty, false),
+            EXIT_NOT_CONVERGED
+        );
+
+        // And the pacing outranks a skip, the same way not-converged does: the
+        // foreign tenant is not going anywhere, and the run is still working.
+        let mid_roll_with_a_skip = Rolled {
+            skipped_foreign: vec!["bob".into()],
+            ..mid_roll.clone()
+        };
+        assert_eq!(verdict(&mid_roll_with_a_skip, false), EXIT_PROGRESSING);
+    }
+
+    /// A tenant this warden can see and can never address is a fleet that is
+    /// not on today's render, permanently. The failure mode being fixed is
+    /// SILENCE, so the one thing it may not do is exit green.
+    #[test]
+    fn an_unreadable_label_cannot_exit_converged() {
+        let unreadable = Rolled {
+            checked: 1,
+            current: 1,
+            unreadable: 1,
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&unreadable, false), EXIT_SKIPPED);
+
+        // Including on a dry run, which is where an operator would go looking
+        // for exactly this before a bump.
+        assert_eq!(verdict(&unreadable, true), EXIT_SKIPPED);
+    }
+
     #[test]
     fn the_summary_names_every_tenant_a_person_has_to_act_on() {
         let out = summarize(
             &Rolled {
                 checked: 5,
                 rolled: vec!["alice".into()],
+                remaining: 2,
                 current: 1,
                 skipped_foreign: vec!["bob".into()],
                 skipped_inactive: vec!["carol".into()],
                 stranded: vec!["erin".into()],
+                unreadable: 3,
                 halted_on: Some("dave".into()),
                 casualty: None,
             },
@@ -488,11 +601,13 @@ mod tests {
             "dave",
             "erin",
             "5 checked",
+            "2 more",
             "HALTED",
         ] {
             assert!(out.contains(expected), "{expected} missing from:\n{out}");
         }
         assert!(out.contains("DOWN"), "{out}");
+        assert!(out.contains("does not validate"), "{out}");
         assert!(!out.contains("dry run"));
     }
 

@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
@@ -150,6 +150,9 @@ struct MockInner {
     /// A tenant whose Deployment gains a foreign field manager the moment
     /// anything is applied.
     foreign_on_apply: Option<String>,
+    /// Whether the annotation patch fails, for the teardown that cannot record
+    /// its own cancellation.
+    fail_annotate: bool,
 }
 
 /// A cluster that records instead of connecting.
@@ -231,6 +234,14 @@ impl MockCluster {
     /// this decides how far it got.
     pub fn fail_delete_of(&self, kind: Kind) {
         self.lock().fail_delete = Some(kind);
+    }
+
+    /// Every `annotate_secret` fails. The one thing `delete` does before it
+    /// deletes anything, so this is how a test reaches the teardown that could
+    /// not write its own marker - the state the whole ordering exists to make
+    /// impossible.
+    pub fn fail_annotate(&self) {
+        self.lock().fail_annotate = true;
     }
 
     /// The next `create` loses a race, the way a second signup for one label
@@ -483,14 +494,30 @@ impl Cluster for MockCluster {
         })
     }
 
-    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
+    /// The one write that is not an apply: the named annotation moves and
+    /// nothing else about the Secret does. A Secret that is not stored is
+    /// success, the way a merge patch of a missing object is treated by its
+    /// caller — see [`Cluster::annotate_secret`].
+    async fn annotate_secret(
+        &self,
+        name: &str,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), ClusterError> {
+        let mut inner = self.lock();
+        if inner.fail_annotate {
+            return Err(ClusterError::Timeout(Duration::from_secs(1)));
         }
-        Ok(match self.object(Kind::Service, name) {
-            Some(Object::Service(service)) => Some(*service),
-            _ => None,
-        })
+        let Some(Object::Secret(secret)) = inner.objects.get_mut(&(Kind::Secret, name.to_string()))
+        else {
+            return Ok(());
+        };
+        let annotations = secret.metadata.annotations.get_or_insert_with(BTreeMap::new);
+        match value {
+            Some(value) => annotations.insert(key.to_string(), value.to_string()),
+            None => annotations.remove(key),
+        };
+        Ok(())
     }
 
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {

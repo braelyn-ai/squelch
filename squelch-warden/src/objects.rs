@@ -176,6 +176,29 @@ pub const LLM_KEY_HASH_ANNOTATION: &str = "passband.email/llm-key-hash";
 /// tenant's own record of one lives.
 pub const CREATED_AT_ANNOTATION: &str = "passband.email/created-at";
 
+/// Annotation on the identity Secret recording that this account was
+/// CANCELLED, as Unix seconds. Present means cancelled; the value is for a
+/// person reading `kubectl get secret -o yaml`, and no code compares it.
+///
+/// It is a record of INTENT, and that is what makes it worth an annotation
+/// rather than a shape somebody works out from the objects that are left.
+/// [`crate::provision::Warden::delete`] removes four objects one at a time and
+/// stops at its first error, so a cancellation can leave any prefix of that
+/// teardown standing - a Deployment still running with its Service and Ingress
+/// already gone, for instance. Every reader that has to tell "this account is
+/// closed" from "this repair did not finish" was reading that wreckage, and
+/// wreckage cannot say which one it is: the same missing Deployment is both.
+/// So `delete` stamps this FIRST, before it removes anything, and the readers
+/// ask the marker. A stopped tenant carrying it is a closed account; one
+/// without it is an unfinished job.
+///
+/// On the identity Secret because that is the one object of a tenant's that
+/// `delete` deliberately keeps ([`identity_secret`]) - a marker on anything the
+/// teardown removes would be a marker the teardown erases. Cleared by
+/// [`crate::provision::Warden::set_credentials`], which is the reopen path: a
+/// tenant that has just been re-credentialed is not cancelled any more.
+pub const CANCELLED_AT_ANNOTATION: &str = "passband.email/cancelled-at";
+
 /// Selects everything this warden created, for the pending sweep. Matches the
 /// managed-by label [`labels`] puts on every tenant object.
 pub const MANAGED_SELECTOR: &str = "app.kubernetes.io/managed-by=squelch-warden";
