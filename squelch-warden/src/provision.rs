@@ -1625,6 +1625,25 @@ impl Warden {
                 Err(WardenError::Cluster {
                     reason: RECREATE_REFUSED,
                 }) => summary.skipped_foreign.push(label),
+                // This tenant stopped being a shape to converge between the
+                // read pass and the write - almost always a cancellation that
+                // landed in the gap, which `reconcile` refuses at its own read
+                // of the marker and again if the workload disappears under it.
+                //
+                // A SKIP and not a halt, and the distinction is a page nobody
+                // should get: somebody closing their account while a roll is in
+                // flight is the system working, and reporting it as "the fleet
+                // roll halted" would put an operator in front of a log at
+                // midnight to discover exactly that. Nothing was applied that
+                // matters, the next tick's read pass files the tenant as
+                // inactive without ever queueing it, and the run says so here.
+                Err(WardenError::NotReconcilable) => {
+                    tracing::info!(
+                        tenant = %first,
+                        "the tenant this run took is no longer a shape to converge; skipping it"
+                    );
+                    summary.skipped_inactive.push(label);
+                }
                 // The reconcile already logged what failed and why, through
                 // `fail`. What this adds is that this tenant is going back on
                 // the queue rather than being counted as done, which is the
@@ -4212,6 +4231,47 @@ mod tests {
             workload_applies_for("bob")
         );
         assert_eq!(daemon_image(&h, "bob"), h.config.image);
+    }
+
+    /// An account cancelled WHILE the run was rolling it. The reconcile refuses
+    /// it - the marker goes on before the workload comes down, so the arm that
+    /// finds the Deployment missing finds the marker too - and the run files it
+    /// as inactive rather than as a halt.
+    ///
+    /// Which is the point of the test. A halt is `HALTED on <label>`, exit 1,
+    /// and a person reading a log at midnight to discover that somebody closed
+    /// their account. Nothing here is wrong, and the run has to be able to say
+    /// so.
+    #[tokio::test]
+    async fn an_account_cancelled_mid_roll_is_a_skip_and_not_a_halt() {
+        let h = Harness::new();
+        for label in ["alice", "bob"] {
+            serving_tenant(&h, label).await;
+            age_the_render(&h, label).await;
+        }
+        // Alice reads clean and is queued; the DELETE lands the moment the
+        // write pass starts moving.
+        h.cluster.cancelled_arrives_on_next_apply("alice");
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.skipped_inactive, vec!["alice"]);
+        assert_eq!(rolled.halted_on, None);
+        assert_eq!(rolled.casualty, None);
+        assert_eq!(rolled.rolled, Vec::<String>::new());
+        assert_eq!(rolled.remaining, 1);
+        assert_eq!(rolled.checked, 2);
+
+        // Her workload was NOT rebuilt, which is the safety half: the reconcile
+        // was mid-flight when the cancellation landed and it did not put the
+        // mailbox back.
+        assert!(!h.cluster.exists(Kind::Deployment, "alice"));
+
+        // And the next tick never queues her at all, so this costs one tick and
+        // not a stall.
+        let second = h.warden.roll(false).await.unwrap();
+        assert_eq!(second.skipped_inactive, vec!["alice"]);
+        assert_eq!(second.rolled, vec!["bob"]);
+        assert_eq!(second.halted_on, None);
     }
 
     /// The two entry points, on one hand-edited tenant. An unattended caller

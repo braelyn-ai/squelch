@@ -153,6 +153,10 @@ struct MockInner {
     /// Whether the annotation patch fails, for the teardown that cannot record
     /// its own cancellation.
     fail_annotate: bool,
+    /// A tenant whose account is CANCELLED the moment anything is applied: the
+    /// marker goes on and the Deployment goes away, the way a real `DELETE`
+    /// landing mid-reconcile leaves things.
+    cancel_on_apply: Option<String>,
 }
 
 /// A cluster that records instead of connecting.
@@ -266,6 +270,20 @@ impl MockCluster {
         self.lock().foreign_on_apply = Some(label.to_string());
     }
 
+    /// An account is CANCELLED mid-run: the next apply of anything stamps
+    /// `label`'s identity Secret with the cancellation marker and removes its
+    /// Deployment, once.
+    ///
+    /// Both halves, because that is what a real `DELETE` landing in this window
+    /// does - it writes the marker first and then takes the workload - and
+    /// either half alone would model a state no caller can produce. The window
+    /// is the one a reconcile cannot close by reading first: it checks the
+    /// marker, then applies the volume, the policy and the Service, and only
+    /// then reads the Deployment it is about to replace.
+    pub fn cancelled_arrives_on_next_apply(&self, label: &str) {
+        self.lock().cancel_on_apply = Some(label.to_string());
+    }
+
     /// What the next `squelchd pair` prints.
     pub fn exec_prints(&self, stdout: &str) {
         let mut inner = self.lock();
@@ -331,9 +349,22 @@ impl MockCluster {
         // rather than stamping the object it replaced.
         if let Some(label) = inner.foreign_on_apply.take()
             && let Some(Object::Deployment(deployment)) =
-                inner.objects.get_mut(&(Kind::Deployment, label))
+                inner.objects.get_mut(&(Kind::Deployment, label.clone()))
         {
             stamp_foreign(deployment);
+        }
+        if let Some(label) = inner.cancel_on_apply.take() {
+            if let Some(Object::Secret(identity)) = inner
+                .objects
+                .get_mut(&(Kind::Secret, format!("{label}-identity")))
+            {
+                identity
+                    .metadata
+                    .annotations
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(crate::objects::CANCELLED_AT_ANNOTATION.to_string(), "1".to_string());
+            }
+            inner.objects.remove(&(Kind::Deployment, label));
         }
     }
 }
