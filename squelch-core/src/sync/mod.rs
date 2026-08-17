@@ -9,6 +9,7 @@
 pub mod html;
 pub mod ingest;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,7 +22,7 @@ use serde::Deserialize;
 use crate::config::{Config, ResolvedLlm, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
-use crate::metrics::{GmailErrorKind, Stage1Verdict, Stage2Verdict, SyncMetrics};
+use crate::metrics::{GmailErrorKind, RevisitVerdict, Stage1Verdict, Stage2Verdict, SyncMetrics};
 use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState};
 use crate::sync::ingest::{
     RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
@@ -1197,6 +1198,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// see [`events::current_rule`] for why a queued row cannot answer this
     /// itself. A store error reads as "no rule"; the surrounding pass has already
     /// logged any real store trouble by then.
+    ///
+    /// PER ROW, DELIBERATELY, and asked ONCE per row rather than the two or three
+    /// times it used to be. Hoisting it to one read per pass would be cheaper
+    /// still, and would break the case the freshness exists for: a pass spends a
+    /// model call per row, so a batch can be minutes wide, and the reactive
+    /// squelch — the user blocking a sender whose mail is being classified right
+    /// now — must land on the rows still ahead of it. A verdict is stamped once,
+    /// so a rule missed here is missed until a re-triage, not until the next tick.
     fn current_rule(&self, from_addr: &str) -> Option<crate::types::Disposition> {
         let rules = self.store.list_sender_rules(self.account_id).ok()?;
         events::current_rule(from_addr, &rules)
@@ -1225,6 +1234,49 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 "squelch: append_event failed ({e}); no notification for message {}",
                 ev.message_id
             ),
+        }
+    }
+
+    /// Emit for a Stage-1 row whose model call did NOT produce a verdict, from
+    /// the heuristic seed the row still carries. The decision itself is
+    /// [`events::seed_context`]; this reads the seed and does the emitting.
+    ///
+    /// Only the fallback path calls this. The stale-skip path has no
+    /// notification to lose: a row older than `stage2.max_age_days` is days
+    /// outside `notify.freshness_window_secs`, so the storm guard would drop the
+    /// event whichever site offered it.
+    fn emit_seed_event(&self, row: &crate::store::Stage1Queued) {
+        let seed = match self
+            .store
+            .triage_seed_verdict(self.account_id, row.message_id)
+        {
+            Ok(Some(s)) => s,
+            // Missing or sealed: nothing to notify about, and a store error here
+            // is never worth failing triage over.
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("squelch: seed read failed ({e}); no notification for that row");
+                return;
+            }
+        };
+        // The seed's deadline, in the shape the emission decision reads. Only
+        // `due_at` is consulted (kind and amount are the extractors' business),
+        // so this carries the date and says plainly where it came from.
+        let deadline = seed.deadline.map(|due_at| crate::triage::DeadlineHit {
+            kind: "bill".to_string(),
+            amount: None,
+            currency: None,
+            due_at,
+            past_due: seed.tier == crate::types::Tier::PastDue,
+            source: "heuristic-seed".to_string(),
+        });
+        if let Some(ctx) = events::seed_context(
+            row,
+            &seed,
+            deadline.as_ref(),
+            self.current_rule(&row.from_addr),
+        ) {
+            self.emit_event(&ctx, Utc::now());
         }
     }
 
@@ -1498,11 +1550,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         // ---- The staleness sweep --------------------------------------------
         // Rows in the standing band that nobody has acted on and nothing has
-        // scheduled. After long enough, such a row is either misfiled or
-        // finished; either way the user is looking at something they should not
-        // be. Scheduled at `now`, so it is picked up by the read just below.
-        if rcfg.fye_stale_days > 0 {
-            let older_than = now - ChronoDuration::days(rcfg.fye_stale_days);
+        // looked at in a full window. After long enough, such a row is either
+        // misfiled or finished; either way the user is looking at something they
+        // should not be. Scheduled at `now`, so it is picked up by the read just
+        // below — and `older_than` is the query's cooldown too, which is what
+        // keeps a row swept this tick from being swept again on the next one.
+        if let Some(window) = rcfg.fye_stale_window() {
+            let older_than = now - window;
             match self.store.revisit_stale_standing(
                 self.account_id,
                 older_than,
@@ -1515,7 +1569,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             at: now,
                             why: format!(
                                 "no action taken in {} days; check whether this still matters",
-                                rcfg.fye_stale_days
+                                window.num_days()
                             ),
                             source: crate::triage::revisit::RevisitSource::FyeStale,
                         }];
@@ -1546,11 +1600,24 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
 
         let mut rescored = 0usize;
+        // ONE RE-EVALUATION PER MESSAGE PER PASS. A message can hold several
+        // pending revisits (`max_per_message`), and after an outage they all come
+        // due together — but the first one's apply rebuilds the schedule and
+        // DELETES the rest, so the others would each spend a frontier-model call
+        // to overwrite the verdict that just landed, reasoning from a
+        // `prior_tier` the batch read before any of this happened.
+        let mut seen_messages: HashSet<i64> = HashSet::new();
         for row in &queued {
             // SEALED GUARD: the queue excludes sealed rows in SQL; re-check
             // before every classify call (docs/SECURITY.md).
             if row.sensitivity != Sensitivity::Normal {
                 eprintln!("squelch: revisit sealed guard tripped; skipping row");
+                continue;
+            }
+            // Leave the duplicate PENDING rather than firing it: if this pass's
+            // apply landed, `schedule_revisits` has already removed it, and if it
+            // did not, the row deserves its own turn on a later cycle.
+            if !seen_messages.insert(row.message_id) {
                 continue;
             }
 
@@ -1593,23 +1660,33 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             u.into(),
                         );
                     }
+                    // FIRE BEFORE RE-SCHEDULING, because `schedule_revisits`
+                    // deletes every PENDING revisit for this message — this one
+                    // included — and a deleted row can no longer be marked fired.
+                    // Firing is what charges `triage.revisit_count`, so the other
+                    // order silently spends nothing: the lifetime budget stays at
+                    // zero forever and a row that keeps asking to be looked at
+                    // again never terminates.
+                    fire("apply");
                     let applied = stage1_llm::apply_revisit_result(
                         row,
                         &out,
                         &cfg.model,
                         cfg.known_contact_importance,
+                        self.current_rule(&row.from_addr),
                         &self.config.router(),
                         Utc::now(),
                     );
                     match self.store.revisit_apply(&applied) {
                         Err(e) => eprintln!("squelch: revisit apply failed ({e})"),
-                        // The row was sealed or hand-corrected between the queue
-                        // read and the apply. Nothing landed, and the schedule
-                        // must not be rebuilt from a verdict that did not stick.
+                        // The row was sealed, resolved, or hand-corrected between
+                        // the queue read and the apply. Nothing landed, and the
+                        // schedule must not be rebuilt from a verdict that did
+                        // not stick.
                         Ok(false) => {}
                         Ok(true) => {
                             rescored += 1;
-                            self.metrics.record_stage1(Stage1Verdict::Ok);
+                            self.metrics.record_revisit(RevisitVerdict::Ok);
                             self.schedule_revisits(
                                 row.message_id,
                                 &out.revisit,
@@ -1618,7 +1695,6 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             );
                         }
                     }
-                    fire("apply");
                 }
                 Ok(stage1_llm::ClassifyOutcome::Failed(kind))
                     if crate::triage::llm::is_auth_failure(&kind) =>
@@ -1633,7 +1709,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
                 | Ok(stage1_llm::ClassifyOutcome::Failed(_)) => {
-                    self.metrics.record_stage1(Stage1Verdict::Fallback);
+                    self.metrics.record_revisit(RevisitVerdict::Fallback);
                     fire("refusal/permanent failure");
                 }
                 Err(e) => {
@@ -1735,13 +1811,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                     // The rule as it stands NOW, not as it stood at ingest: a
                     // rule the user added since must still be honored, and one
-                    // they deleted must stop being.
+                    // they deleted must stop being. Asked ONCE for the row, and
+                    // used by both the apply and the emission below — the two
+                    // are one decision and must not be able to disagree.
+                    let rule = self.current_rule(&row.from_addr);
                     let applied = stage1_llm::apply_result_with_rule(
                         row,
                         &out,
                         &cfg.model,
                         cfg.known_contact_importance,
-                        self.current_rule(&row.from_addr),
+                        rule,
                         &self.config.router(),
                         Utc::now(),
                     );
@@ -1778,9 +1857,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     // The Stage-1 queue selects `m.is_sent = 0`.
                                     is_sent: false,
                                     // The queue only excludes rows a rule decided
-                                    // AT INGEST, so read the rule list as it
-                                    // stands NOW to catch rules added since.
-                                    rule: self.current_rule(&row.from_addr),
+                                    // AT INGEST, so this is the rule as it stands
+                                    // NOW, catching rules added since.
+                                    rule,
                                     tier: applied.tier,
                                     importance: applied.importance,
                                     deadline: applied.deadline.as_ref(),
@@ -1816,6 +1895,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     );
                     fallback += 1;
                     self.metrics.record_stage1(Stage1Verdict::Fallback);
+                    // AND THE SEED NOTIFIES, because nothing else will. Ingest
+                    // now defers its emission to this pass on the promise that a
+                    // model verdict is coming; a refusal or a permanent failure
+                    // is that promise breaking, and `UNIQUE(message_id)` means a
+                    // notification skipped here is skipped forever. So this is
+                    // the "no model to wait for" case after all, and the seed is
+                    // authoritative exactly as it is with no API key configured.
+                    self.emit_seed_event(row);
                 }
                 Err(e) => {
                     // Retryable class exhausted / transport error. Leave the row

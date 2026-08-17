@@ -249,7 +249,10 @@ pub struct RevisitPassConfig {
     /// `SQUELCH_REVISIT_BATCH_PER_CYCLE`.
     pub batch_per_cycle: usize,
     /// Per-account-per-day cap on re-evaluation calls, counted in the same
-    /// `wake_budget` ledger as the stages. Env: `SQUELCH_REVISIT_DAILY_CAP`.
+    /// `wake_budget` ledger as the stages but on its OWN key — revisit spend is
+    /// additional to [`Stage1Config::global_daily_cap`], not inside it, so this
+    /// number is its own dollar ceiling at the Stage-1 per-call price.
+    /// Env: `SQUELCH_REVISIT_DAILY_CAP`.
     pub daily_cap: u32,
     /// Revisits stored per message per pass. Env: `SQUELCH_REVISIT_MAX_PER_MESSAGE`.
     pub max_per_message: usize,
@@ -279,7 +282,10 @@ impl Default for RevisitPassConfig {
         Self {
             enabled: true,
             batch_per_cycle: 10,
-            daily_cap: 100,
+            // ~$2/day at the Stage-1 per-call price. Re-evaluation is a trickle
+            // by design — a handful of rows come due on any given day — so a cap
+            // this size is a runaway guard, not a working budget.
+            daily_cap: 50,
             max_per_message: 4,
             max_per_message_lifetime: 6,
             min_lead_hours: 1,
@@ -296,18 +302,59 @@ impl Default for RevisitPassConfig {
 
 impl RevisitPassConfig {
     /// The planner's view of these settings.
+    ///
+    /// Every duration goes through the fallible constructor. `Duration::days`
+    /// PANICS out of range, and these numbers come from an operator's TOML or
+    /// env: `SQUELCH_REVISIT_MAX_HORIZON_DAYS` with one too many digits would
+    /// otherwise take down the sync task the first time a verdict scheduled
+    /// anything. Every other bound in this module is defensive against a hostile
+    /// model; a typo deserves the same treatment, and the default is a better
+    /// answer than a crash.
     pub fn planner(&self) -> crate::triage::revisit::RevisitConfig {
-        use chrono::Duration;
+        let d = crate::triage::revisit::RevisitConfig::default();
         crate::triage::revisit::RevisitConfig {
             max_per_message: self.max_per_message,
-            min_lead: Duration::hours(self.min_lead_hours.max(0)),
-            max_horizon: Duration::days(self.max_horizon_days.max(1)),
-            deadline_grace: Duration::hours(self.deadline_grace_hours.max(0)),
-            dedupe_window: Duration::hours(self.dedupe_window_hours.max(0)),
+            min_lead: hours_or(self.min_lead_hours, d.min_lead),
+            max_horizon: days_or(self.max_horizon_days, d.max_horizon),
+            deadline_grace: hours_or(self.deadline_grace_hours, d.deadline_grace),
+            dedupe_window: hours_or(self.dedupe_window_hours, d.dedupe_window),
             max_per_message_lifetime: self.max_per_message_lifetime,
-            max_why_chars: 120,
+            max_why_chars: d.max_why_chars,
         }
     }
+
+    /// The staleness window as a duration, or `None` when the sweep is off.
+    /// Clamped like the planner's knobs and for the same reason: the sync task
+    /// subtracts this from `now`, and that subtraction panics out of range.
+    pub fn fye_stale_window(&self) -> Option<chrono::Duration> {
+        if self.fye_stale_days <= 0 {
+            return None;
+        }
+        Some(days_or(
+            self.fye_stale_days,
+            chrono::Duration::days(Self::default().fye_stale_days),
+        ))
+    }
+}
+
+/// The furthest out any revisit knob may reach, in days. A decade is already
+/// past the point where "look again then" means anything, and the ceiling is
+/// what keeps `now + horizon` inside the range [`chrono::DateTime`] can hold —
+/// that addition panics on overflow, and it runs on the sync task.
+const REVISIT_MAX_DAYS: i64 = 3650;
+
+/// `hours` as a [`chrono::Duration`], clamped to [`REVISIT_MAX_DAYS`] and
+/// floored at zero; `fallback` if it somehow still does not fit.
+fn hours_or(hours: i64, fallback: chrono::Duration) -> chrono::Duration {
+    let bounded = hours.clamp(0, REVISIT_MAX_DAYS * 24);
+    chrono::Duration::try_hours(bounded).unwrap_or(fallback)
+}
+
+/// `days` as a [`chrono::Duration`], clamped to [`REVISIT_MAX_DAYS`] and floored
+/// at one; `fallback` if it somehow still does not fit.
+fn days_or(days: i64, fallback: chrono::Duration) -> chrono::Duration {
+    let bounded = days.clamp(1, REVISIT_MAX_DAYS);
+    chrono::Duration::try_days(bounded).unwrap_or(fallback)
 }
 
 /// APNs pusher config; see [`crate::push`] for the task itself.
@@ -798,7 +845,17 @@ pub struct Stage1Config {
     /// `SQUELCH_STAGE1_BATCH_PER_CYCLE`.
     pub batch_per_cycle: usize,
     /// Global per-account-per-day call cap — the only cap Stage-1 has, since it
-    /// must see every email. Env: `SQUELCH_STAGE1_GLOBAL_DAILY_CAP`.
+    /// must see every email, and SHARED with the specialist extractors.
+    ///
+    /// THIS IS A DOLLAR CEILING WEARING A COUNT. At the defaults below (opus-5 at
+    /// $5/$25 per MTok, a 6000-char body, and thinking billing against
+    /// [`crate::triage::llm::MAX_TOKENS`]) a Stage-1 call runs on the order of
+    /// four cents, so this number times four cents is the most one account can
+    /// spend here in a day. It was 1000 when the pass ran a small model with a
+    /// 400-token ceiling and a 1500-char body; the model swap changed the price
+    /// per call on four axes at once, and the cap had to come down with it.
+    /// Re-derive it whenever `model`, `max_body_chars`, or the prices move.
+    /// Env: `SQUELCH_STAGE1_GLOBAL_DAILY_CAP`.
     pub global_daily_cap: u32,
     /// Per-million-input-token price (USD) for the Stage-1 model. Default 5.0
     /// (claude-opus-5). Env: `SQUELCH_STAGE1_PRICE_IN_PER_MTOK`.
@@ -831,7 +888,11 @@ impl Default for Stage1Config {
             // now has a 1M window.
             max_body_chars: 6000,
             batch_per_cycle: 10,
-            global_daily_cap: 1000,
+            // ~$20/day worst case at ~4c a call. Comfortably above what even a
+            // heavy mailbox spends (Stage-1 sees every inbound message, and the
+            // extractors share this counter), and low enough that a runaway
+            // cannot quietly bill an order of magnitude more than the pass costs.
+            global_daily_cap: 500,
             price_in_per_mtok: 5.0,
             price_out_per_mtok: 25.0,
         }
@@ -890,7 +951,10 @@ pub struct Stage2Config {
     pub thread_daily_cap: u32,
     /// Global per-account-per-day API-call cap. Same increment-before
     /// discipline, counted via a `thread_id='__global__'` sentinel row in
-    /// `wake_budget`.
+    /// `wake_budget`. Like Stage-1's, this is a dollar ceiling in disguise: an
+    /// escalated call carries a 12000-char body plus thread and sender context
+    /// and thinks at `xhigh`, so it runs around a dime. See
+    /// [`Stage1Config::global_daily_cap`].
     pub global_daily_cap: u32,
     /// Per-sender-per-day API-call cap, so one chatty sender fanning many
     /// threads cannot burn the budget. Counted via a `thread_id='sender:<addr>'`
@@ -925,7 +989,8 @@ impl Default for Stage2Config {
             max_body_chars: 12_000,
             batch_per_cycle: 10,
             thread_daily_cap: 3,
-            global_daily_cap: 200,
+            // ~$12/day worst case at ~10c a call; see the field doc.
+            global_daily_cap: 120,
             sender_daily_cap: 5,
             max_age_days: 7,
             // claude-opus-5 per-MTok (input / output).
@@ -2243,7 +2308,7 @@ backfill_days = 90
         assert_eq!(c.max_body_chars, 12_000);
         assert_eq!(c.batch_per_cycle, 10);
         assert_eq!(c.thread_daily_cap, 3);
-        assert_eq!(c.global_daily_cap, 200);
+        assert_eq!(c.global_daily_cap, 120);
         assert_eq!(c.sender_daily_cap, 5);
         assert_eq!(c.max_age_days, 7);
         assert_eq!(c.price_in_per_mtok, 5.0);
@@ -2255,11 +2320,38 @@ backfill_days = 90
         let c = Stage1Config::default();
         assert_eq!(c.model, "claude-opus-5");
         assert_eq!(c.effort.as_deref(), Some("low"));
-        assert_eq!(c.global_daily_cap, 1000);
+        assert_eq!(c.global_daily_cap, 500);
         assert_eq!(c.batch_per_cycle, 10);
         assert_eq!(c.max_body_chars, 6000);
         assert_eq!(c.price_in_per_mtok, 5.0);
         assert_eq!(c.price_out_per_mtok, 25.0);
+    }
+
+    /// An operator typo in a revisit knob must not be able to panic the sync
+    /// task: `Duration::days` and `now + duration` both blow up out of range.
+    #[test]
+    fn absurd_revisit_knobs_clamp_instead_of_panicking() {
+        let cfg = RevisitPassConfig {
+            min_lead_hours: i64::MIN,
+            max_horizon_days: i64::MAX,
+            deadline_grace_hours: i64::MAX,
+            dedupe_window_hours: -5,
+            ..RevisitPassConfig::default()
+        };
+        let planner = cfg.planner();
+        assert_eq!(planner.min_lead, chrono::Duration::zero());
+        assert_eq!(planner.dedupe_window, chrono::Duration::zero());
+        assert_eq!(
+            planner.max_horizon,
+            chrono::Duration::days(REVISIT_MAX_DAYS)
+        );
+        assert_eq!(
+            planner.deadline_grace,
+            chrono::Duration::days(REVISIT_MAX_DAYS)
+        );
+        // The addition the planner actually performs, which is what panics.
+        let now = chrono::Utc::now();
+        let _ = now + planner.max_horizon;
     }
 
     /// Both stages run the SAME model on purpose: escalation buys context and

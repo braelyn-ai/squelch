@@ -500,7 +500,7 @@ message, so a false negative cannot destroy a real `1Z…` package.
 - **On the Stage-1 model** (default `claude-opus-5`), with a 3000-character
   body budget spent on the regions of the mail that actually carry numbers.
 - **Against the shared Stage-1 daily cap.** `stage1.global_daily_cap` (default
-  1000) is one counter, shared by Stage-1 triage itself and by all three
+  500) is one counter, shared by Stage-1 triage itself and by all three
   extractors. Shipments extraction does not get its own allowance; it competes
   with triage for that one.
 - **Billed to its own ledger line**, `extract_shipments`, so you can see what it

@@ -38,10 +38,10 @@ use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, ExtractQueued,
     InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
     MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued, SealedBody,
-    SealedMessage, SearchFilter, SenderHistory, SentMessage, SentMissingRecipients, SitrepBand,
-    Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage,
-    Stage2UsageDay, Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug, TriagedMessage,
-    UsageTokens,
+    SealedMessage, SearchFilter, SeedVerdict, SenderHistory, SentMessage, SentMissingRecipients,
+    SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued,
+    Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug,
+    TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -958,6 +958,14 @@ impl Store for SqliteStore {
         stage1_model_used: &str,
     ) -> Result<()> {
         self.stage1_mark_processed(account_id, message_id, stage1_model_used)
+    }
+
+    fn triage_seed_verdict(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<SeedVerdict>> {
+        self.triage_seed_verdict(account_id, message_id)
     }
 
     fn revisits_schedule(

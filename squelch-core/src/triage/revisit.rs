@@ -160,8 +160,39 @@ pub fn plan(
     }
 
     out.sort_by_key(|r| r.at);
-    out.truncate(cfg.max_per_message);
+    truncate_keeping_deadline(&mut out, cfg.max_per_message);
     out
+}
+
+/// Cap the list at `max`, but never at the cost of the automatic deadline entry.
+///
+/// A plain `truncate` drops the LATEST entries, and the deadline revisit is
+/// usually the latest — an obligation is normally further out than the turning
+/// points the model names on the way to it. That entry exists precisely because
+/// the model cannot be relied on to remember the due date, so letting a verbose
+/// model evict it would remove the belt at exactly the moment the braces failed.
+/// The cap is therefore spent on MODEL entries first: the last model entry yields
+/// its slot.
+fn truncate_keeping_deadline(out: &mut Vec<RevisitRequest>, max: usize) {
+    if out.len() <= max {
+        return;
+    }
+    if max == 0 {
+        out.clear();
+        return;
+    }
+    // Only the entries past the cap are at risk; one below it needs nothing.
+    let doomed = out
+        .iter()
+        .position(|r| r.source == RevisitSource::Deadline)
+        .filter(|&i| i >= max)
+        .map(|i| out.remove(i));
+    out.truncate(max);
+    if let Some(deadline) = doomed {
+        out.pop();
+        out.push(deadline);
+        out.sort_by_key(|r| r.at);
+    }
 }
 
 /// Append unless an existing entry sits within the dedupe window.
@@ -383,6 +414,28 @@ mod tests {
         assert!(
             plan.windows(2).all(|w| w[0].at <= w[1].at),
             "ascending: {plan:?}"
+        );
+    }
+
+    /// The cap is spent on MODEL entries: a verbose model cannot crowd out the
+    /// one entry that exists because models forget due dates.
+    #[test]
+    fn a_full_list_of_model_dates_cannot_evict_the_deadline() {
+        let due = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let entries: Vec<RevisitOut> = (12..=18)
+            .step_by(2)
+            .map(|d| model(&format!("2026-07-{d:02}T00:00:00Z"), "x"))
+            .collect();
+        assert_eq!(entries.len(), cfg().max_per_message);
+        let plan = plan(&entries, Some(&hit(due)), &cfg(), now());
+        assert_eq!(plan.len(), cfg().max_per_message);
+        assert!(
+            plan.iter().any(|r| r.source == RevisitSource::Deadline),
+            "the deadline revisit survives the cap: {plan:?}"
+        );
+        assert!(
+            plan.windows(2).all(|w| w[0].at <= w[1].at),
+            "still ascending: {plan:?}"
         );
     }
 

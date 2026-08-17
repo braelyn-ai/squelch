@@ -389,11 +389,19 @@ pub async fn classify_revisit_at(
 /// Map a re-evaluated verdict onto a [`Stage1Applied`], reusing the first-pass
 /// apply path wholesale. A revisit produces an ordinary verdict — including an
 /// ordinary routing decision — so nothing here forks.
+///
+/// `rule` is the sender's disposition AS IT STANDS NOW, and it is not optional
+/// bookkeeping: a re-evaluation writes the same columns a first pass does, so an
+/// apply that forgot the rule would quietly undo it. A squelched sender whose
+/// bill carries a deadline schedules a revisit (the deadline arm is deliberately
+/// kept on squelched rows) — and that revisit is exactly the moment the squelch
+/// would be dropped and the sender would climb back into the standing band.
 pub fn apply_revisit_result(
     queued: &RevisitQueued,
     out: &Stage1Output,
     model: &str,
     known_contact_floor: u8,
+    rule: Option<crate::types::Disposition>,
     router_cfg: &RouterConfig,
     now: DateTime<Utc>,
 ) -> Stage1Applied {
@@ -409,7 +417,15 @@ pub fn apply_revisit_result(
         sender_corrected: queued.sender_corrected,
         sensitivity: queued.sensitivity,
     };
-    let mut applied = apply_result(&as_stage1, out, model, known_contact_floor, router_cfg, now);
+    let mut applied = apply_result_with_rule(
+        &as_stage1,
+        out,
+        model,
+        known_contact_floor,
+        rule,
+        router_cfg,
+        now,
+    );
     // Say so in the stored reason: a verdict that changed under the user without
     // explanation reads as a bug, and "re-evaluated" is the explanation.
     applied.reason = truncate_reason(&format!("re-evaluated; {}", applied.reason));
@@ -1147,6 +1163,61 @@ mod tests {
             "the obligation outlives the visibility rule"
         );
         assert_eq!(a.tier, Tier::Noise, "but it is still not shown");
+    }
+
+    /// AND IT SURVIVES THE RE-EVALUATION THAT DEADLINE SCHEDULES.
+    ///
+    /// The two halves of the previous test combine into a trap: keeping the
+    /// deadline on a squelched row means the row schedules a revisit, and the
+    /// revisit rewrites the same columns the first pass wrote. An apply that
+    /// forgot the rule would hand the sender their visibility back at the moment
+    /// the obligation came due — the owner's standing instruction undone by a
+    /// mechanism that exists to honor the obligation it carries.
+    #[test]
+    fn a_re_evaluation_still_honors_the_owners_squelch_rule() {
+        let q = queued(true);
+        let revisit = RevisitQueued {
+            revisit_id: 1,
+            message_id: q.message_id,
+            account_id: q.account_id,
+            thread_id: q.thread_id.clone(),
+            from_addr: q.from_addr.clone(),
+            subject: q.subject.clone(),
+            body: q.body.clone(),
+            sensitivity: q.sensitivity,
+            received_at: q.received_at,
+            revisit_at: now(),
+            reason: "the stated due date has passed".into(),
+            source: "deadline".into(),
+            prior_tier: Tier::Noise,
+            prior_importance: 0,
+            prior_one_line: "squelched".into(),
+            is_known_contact: q.is_known_contact,
+            sender_corrected: q.sender_corrected,
+        };
+        let o = out(80, true);
+
+        let kept = apply_revisit_result(
+            &revisit,
+            &o,
+            "m",
+            70,
+            Some(Disposition::Squelch),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(
+            kept.tier,
+            Tier::Noise,
+            "the squelch still decides visibility"
+        );
+        assert_eq!(kept.importance, 0);
+
+        // Control: with no rule the same verdict lands at the model's score, so
+        // the assertion above is testing the rule and not the model's output.
+        let unruled =
+            apply_revisit_result(&revisit, &o, "m", 70, None, &RouterConfig::default(), now());
+        assert_eq!(unruled.importance, 80);
     }
 
     /// A squelched row never escalates: a second, costlier opinion cannot change

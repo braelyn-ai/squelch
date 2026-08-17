@@ -311,11 +311,24 @@ pub fn build_user_message(ctx: &RowContext) -> String {
     // hostile subject line in a sibling would be reading as trusted context
     // while the hostile body it came with was correctly fenced.
     if let Some(esc) = &ctx.escalation {
-        out.push_str("\nescalation: this email was flagged for a closer look.\n");
-        if let Some(reason) = esc.reason {
-            out.push_str("  flagged_because: ");
-            out.push_str(escalation_reason_gloss(reason));
-            out.push('\n');
+        // A REASON IS NOT GUARANTEED, and claiming one that does not exist is
+        // worse than claiming none. A Filtered-rule row is sent straight to
+        // Stage-2 at ingest without ever passing the router, so it arrives here
+        // with no arm to name; the header used to assert it "was flagged" and
+        // then say nothing about by what, leaving the model to invent the
+        // premise. The context below is worth just as much on those rows — it is
+        // what the second pass buys — so only the sentence changes.
+        match esc.reason {
+            Some(reason) => {
+                out.push_str("\nescalation: this email was flagged for a closer look.\n");
+                out.push_str("  flagged_because: ");
+                out.push_str(escalation_reason_gloss(reason));
+                out.push('\n');
+            }
+            None => out.push_str(
+                "\nsecond_pass: this email is being read a second time, with the extra \
+                 context below.\n",
+            ),
         }
         let h = esc.sender_history;
         if h.total > 0 {
@@ -2243,6 +2256,42 @@ mod tests {
         assert!(msg.contains("flagged_because:"));
         assert!(msg.contains("Decide which is right"));
         assert!(msg.contains("this message stands alone"));
+    }
+
+    /// A ROW WITH NO ROUTER ARM IS NOT TOLD IT WAS FLAGGED.
+    ///
+    /// A Filtered-rule row goes straight to Stage-2 at ingest without ever
+    /// passing the router, so it has no reason to name. Announcing an escalation
+    /// and then failing to say by what leaves the model to supply the missing
+    /// premise itself, on exactly the rows whose real instruction is the owner's
+    /// own `want_text` above.
+    #[test]
+    fn a_row_with_no_router_arm_is_not_told_it_was_flagged() {
+        let history = crate::store::SenderHistory::default();
+        let ctx = RowContext {
+            from_addr: "news@shop.example",
+            subject: "s",
+            body: "b",
+            is_known_contact: false,
+            rule_want_text: Some("only tell me about the invoices"),
+            revisit: None,
+            escalation: Some(EscalationContext {
+                reason: None,
+                sender_history: &history,
+                thread: &[],
+            }),
+            max_body_chars: 4000,
+        };
+        let msg = build_user_message(&ctx);
+        assert!(
+            !msg.contains("was flagged for a closer look"),
+            "no arm fired, so nothing claims one did: {msg}"
+        );
+        assert!(!msg.contains("flagged_because:"));
+        assert!(msg.contains("second_pass:"));
+        // The context an escalation buys is still delivered.
+        assert!(msg.contains("this_sender_history:"));
+        assert!(msg.contains("only tell me about the invoices"));
     }
 
     /// A thread the owner has written in is the single most useful bit of

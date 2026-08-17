@@ -520,6 +520,23 @@ pub struct Stage1Queued {
     pub sensitivity: Sensitivity,
 }
 
+/// A triage row's HEURISTIC SEED verdict, read back when the Stage-1 model call
+/// did not produce one. Just enough to decide a notification: the seed is what
+/// the user will actually see on that row, so it is what the notification has to
+/// describe.
+#[derive(Debug, Clone)]
+pub struct SeedVerdict {
+    pub tier: Tier,
+    pub importance: u8,
+    pub one_line: String,
+    /// The ingest-time escalation seed, which is the STORED form of the
+    /// heuristic's own confidence (`needs_stage2 = !confident`). A row still
+    /// bound for Stage-2 has another verdict coming and must not notify from
+    /// this one.
+    pub needs_stage2: bool,
+    pub deadline: Option<DateTime<Utc>>,
+}
+
 /// One message whose scheduled re-evaluation has come due. Carries the PRIOR
 /// verdict, because the re-classification's whole job is to answer "does this
 /// still hold?" and it cannot do that without knowing what it is revising.
@@ -1586,6 +1603,15 @@ pub trait Store: Send + Sync {
         stage1_model_used: &str,
     ) -> Result<()>;
 
+    /// The row's CURRENT verdict as the heuristic seed left it, for the Stage-1
+    /// fallback's notification decision. `None` when the row is missing or
+    /// sealed. Read on the fallback path only, which is rare by construction.
+    fn triage_seed_verdict(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<SeedVerdict>>;
+
     // ---- REVISITS (see `crate::triage::revisit`) --------------------------
 
     /// Replace a message's PENDING scheduled re-evaluations with `requests`.
@@ -1600,8 +1626,8 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
 
     /// Up to `limit` revisits that have come due, oldest first. Excludes sealed
-    /// rows, sent mail, rows at or past `max_lifetime` re-evaluations, and any
-    /// message the account owner has corrected by hand.
+    /// rows, sent mail, already-resolved rows, rows at or past `max_lifetime`
+    /// re-evaluations, and any message the account owner has corrected by hand.
     fn revisit_queue(
         &self,
         account_id: AccountId,
@@ -1620,9 +1646,10 @@ pub trait Store: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<()>;
 
-    /// Message ids in the standing band, older than `older_than`, not done, with
-    /// no revisit pending and no human correction: the automatic staleness
-    /// sweep's candidates.
+    /// Message ids in the standing band, not done, with no human correction and
+    /// nothing that has looked at them since `older_than` — no pending revisit
+    /// and none FIRED inside that window, which is what stops the sweep from
+    /// re-asking every sync tick: the automatic staleness sweep's candidates.
     fn revisit_stale_standing(
         &self,
         account_id: AccountId,

@@ -143,6 +143,21 @@ pub enum Stage1Verdict {
     StaleSkipped,
 }
 
+/// What one row's trip through the RE-EVALUATION pass produced.
+///
+/// Its own axis rather than a share of Stage-1's, even though a revisit is
+/// literally a Stage-1 call: `stage1_ok` is the answer to "how much NEW mail did
+/// we classify today", and folding re-evaluations into it makes that number
+/// unreadable exactly when the staleness sweep is busiest — which is the moment
+/// someone would be looking. The spend ledger already separates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisitVerdict {
+    /// A re-evaluated verdict landed on the row.
+    Ok,
+    /// Refusal or permanent failure: the prior verdict stands.
+    Fallback,
+}
+
 /// What one row's trip through the Stage-2 escalation pass produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage2Verdict {
@@ -180,6 +195,9 @@ pub struct SyncMetrics {
     stage1_ok: AtomicU64,
     stage1_fallback: AtomicU64,
     stage1_stale_skipped: AtomicU64,
+
+    revisit_ok: AtomicU64,
+    revisit_fallback: AtomicU64,
 
     stage2_ok: AtomicU64,
     stage2_refused: AtomicU64,
@@ -247,6 +265,14 @@ impl SyncMetrics {
             Stage1Verdict::Ok => &self.stage1_ok,
             Stage1Verdict::Fallback => &self.stage1_fallback,
             Stage1Verdict::StaleSkipped => &self.stage1_stale_skipped,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_revisit(&self, verdict: RevisitVerdict) {
+        let slot = match verdict {
+            RevisitVerdict::Ok => &self.revisit_ok,
+            RevisitVerdict::Fallback => &self.revisit_fallback,
         };
         slot.fetch_add(1, Ordering::Relaxed);
     }
@@ -586,6 +612,16 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         e.sample(
             "squelchd_triage_verdicts_total",
             &[("stage", "stage1"), ("outcome", outcome)],
+            metrics.get(slot),
+        );
+    }
+    for (outcome, slot) in [
+        ("ok", &metrics.revisit_ok),
+        ("fallback", &metrics.revisit_fallback),
+    ] {
+        e.sample(
+            "squelchd_triage_verdicts_total",
+            &[("stage", "revisit"), ("outcome", outcome)],
             metrics.get(slot),
         );
     }
