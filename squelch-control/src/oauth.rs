@@ -133,15 +133,13 @@ fn bad_url(what: &'static str) -> impl Fn(url::ParseError) -> OAuthError {
 }
 
 fn client(e: &GoogleEndpoints<'_>) -> Result<GoogleClient, OAuthError> {
-    Ok(
-        BasicClient::new(ClientId::new(e.client_id.to_string()))
-            .set_client_secret(ClientSecret::new(e.client_secret.to_string()))
-            .set_auth_uri(AuthUrl::new(e.auth_url.to_string()).map_err(bad_url("auth url"))?)
-            .set_token_uri(TokenUrl::new(e.token_url.to_string()).map_err(bad_url("token url"))?)
-            .set_redirect_uri(
-                RedirectUrl::new(e.redirect_uri.to_string()).map_err(bad_url("redirect uri"))?,
-            ),
-    )
+    Ok(BasicClient::new(ClientId::new(e.client_id.to_string()))
+        .set_client_secret(ClientSecret::new(e.client_secret.to_string()))
+        .set_auth_uri(AuthUrl::new(e.auth_url.to_string()).map_err(bad_url("auth url"))?)
+        .set_token_uri(TokenUrl::new(e.token_url.to_string()).map_err(bad_url("token url"))?)
+        .set_redirect_uri(
+            RedirectUrl::new(e.redirect_uri.to_string()).map_err(bad_url("redirect uri"))?,
+        ))
 }
 
 /// The http client both calls share.
@@ -202,7 +200,10 @@ fn requested_scopes(flow: Flow) -> Vec<&'static str> {
 fn required_scopes(flow: Flow) -> Vec<Vec<&'static str>> {
     match flow {
         // Every Gmail scope, spelled one way, exactly as before.
-        Flow::Signup => requested_scopes(flow).into_iter().map(|s| vec![s]).collect(),
+        Flow::Signup => requested_scopes(flow)
+            .into_iter()
+            .map(|s| vec![s])
+            .collect(),
         Flow::Console => vec![vec![OPENID_SCOPE], vec![EMAIL_SCOPE, EMAIL_SCOPE_URL]],
     }
 }
@@ -290,8 +291,13 @@ pub async fn exchange_code(
 
     // Gmail's profile endpoint, which does not carry `email_verified`: the
     // mailbox is named by the grant this user just approved.
-    let account_email =
-        fetch_profile_email(&http, e.profile_url, &access_token, Verification::NotClaimed).await?;
+    let account_email = fetch_profile_email(
+        &http,
+        e.profile_url,
+        &access_token,
+        Verification::NotClaimed,
+    )
+    .await?;
 
     Ok(ExchangedGrant {
         token: StoredToken::from_response(access_token, refresh_token, response.expires_in()),
@@ -334,13 +340,7 @@ pub async fn verify_identity(
     // `Required`, because the address it answers with is the ONLY evidence this
     // flow has about who is signing in.
     let access_token = response.access_token().secret().to_string();
-    fetch_profile_email(
-        &http,
-        e.userinfo_url,
-        &access_token,
-        Verification::Required,
-    )
-    .await
+    fetch_profile_email(&http, e.userinfo_url, &access_token, Verification::Required).await
 }
 
 /// Hold the granted scopes against what the flow asked for: every requirement in
@@ -465,10 +465,7 @@ fn email_from_answer(body: &[u8], verification: Verification) -> Result<String, 
         (Verification::NotClaimed, Some(false)) => return Err(OAuthError::Profile),
         (Verification::NotClaimed, _) => {}
     }
-    let email = profile
-        .email_address
-        .or(profile.email)
-        .unwrap_or_default();
+    let email = profile.email_address.or(profile.email).unwrap_or_default();
     let email = email.trim();
     // Shape, not validity: this string becomes a database key, an env-file
     // value in a tenant's pod, and a line on a page. Anything with a control
@@ -532,7 +529,10 @@ mod tests {
         assert!(scope.contains("gmail.send"), "{scope}");
         assert_eq!(q.get("state").map(String::as_str), Some("the-state"));
         assert_eq!(c.state, "the-state");
-        assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
         assert_eq!(q.get("access_type").map(String::as_str), Some("offline"));
         assert_eq!(q.get("prompt").map(String::as_str), Some("consent"));
         assert_eq!(
@@ -562,12 +562,18 @@ mod tests {
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
 
         let scope = q.get("scope").map(String::as_str).unwrap_or_default();
-        assert_eq!(scope.split(' ').collect::<Vec<_>>(), vec!["openid", "email"]);
+        assert_eq!(
+            scope.split(' ').collect::<Vec<_>>(),
+            vec!["openid", "email"]
+        );
         assert!(!scope.contains("gmail"), "{scope}");
         assert_eq!(q.get("access_type"), None, "{scope}");
         assert_eq!(q.get("prompt").map(String::as_str), Some("select_account"));
         assert_eq!(q.get("state").map(String::as_str), Some("the-state"));
-        assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
         assert!(!c.url.contains(&c.pkce_verifier));
     }
 

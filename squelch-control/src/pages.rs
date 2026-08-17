@@ -593,13 +593,7 @@ mod tests {
     use axum::body::to_bytes;
 
     async fn body_of(r: Response) -> String {
-        String::from_utf8(
-            to_bytes(r.into_body(), 1 << 20)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap()
+        String::from_utf8(to_bytes(r.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
     }
 
     #[test]
@@ -669,7 +663,11 @@ mod tests {
         let html = body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await;
         assert!(html.contains("ABCD-EFGH"));
         assert!(html.contains("https://ada.passband.email"));
-        assert!(html.contains("passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH"));
+        assert!(
+            html.contains(
+                "passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH"
+            )
+        );
         assert!(html.contains("passband.app"));
         assert!(!html.contains("<script"));
     }
@@ -761,7 +759,10 @@ mod tests {
         assert!(!sent.contains("email not sent"), "{sent}");
 
         let failed = body_of(admin_page(&[], &[row(1, "ada@example.com", false)], None)).await;
-        assert!(failed.contains(r#"<span class="stop">email not sent</span>"#), "{failed}");
+        assert!(
+            failed.contains(r#"<span class="stop">email not sent</span>"#),
+            "{failed}"
+        );
         assert!(failed.contains("Send new invite"), "{failed}");
 
         let waiting = body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await;
@@ -791,10 +792,21 @@ mod tests {
     #[tokio::test]
     async fn no_em_dashes_in_user_facing_copy() {
         for html in [
-            body_of(signup_form("passband.email", "ada", "ABCD-EFGH", Some("no"))).await,
+            body_of(signup_form(
+                "passband.email",
+                "ada",
+                "ABCD-EFGH",
+                Some("no"),
+            ))
+            .await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
-            body_of(console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
+            body_of(console_problem(
+                StatusCode::BAD_REQUEST,
+                "Nope",
+                "Try again.",
+            ))
+            .await,
             body_of(admin_login(Some("no"))).await,
             body_of(admin_page(
                 &[row(1, "ada@example.com", false)],

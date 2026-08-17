@@ -474,8 +474,11 @@ impl Warden {
             .get_secret(&name.llm_secret())
             .await
             .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
-        let api_key =
-            api_key.or_else(|| existing.as_ref().and_then(|s| secret_value(s, objects::LLM_API_KEY_KEY)));
+        let api_key = api_key.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|s| secret_value(s, objects::LLM_API_KEY_KEY))
+        });
         let assistant_api_key = assistant_api_key.or_else(|| {
             existing
                 .as_ref()
@@ -1591,7 +1594,11 @@ mod tests {
             .await
             .unwrap();
         let first = llm_annotation(&h).expect("the rotation did not reach the pod");
-        assert_eq!(pod_annotation(&h), credential, "the seed hash must not move");
+        assert_eq!(
+            pod_annotation(&h),
+            credential,
+            "the seed hash must not move"
+        );
 
         h.warden
             .set_llm_key("alice", Some("sk-vk-second"), None)
@@ -1609,9 +1616,7 @@ mod tests {
             crate::provision::secret_value(&stored, objects::LLM_API_KEY_KEY).unwrap(),
             "sk-vk-second"
         );
-        assert!(
-            crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).is_none()
-        );
+        assert!(crate::provision::secret_value(&stored, objects::ASSISTANT_API_KEY_KEY).is_none());
     }
 
     /// Rotating ONLY the assistant key must roll the pod: the combined hash is
@@ -1662,7 +1667,11 @@ mod tests {
             llm_annotation(&h).unwrap(),
             objects::llm_keys_hash(Some("sk-vk-triage"), Some("sk-vk-assistant-2"))
         );
-        assert_eq!(pod_annotation(&h), credential, "the seed hash must not move");
+        assert_eq!(
+            pod_annotation(&h),
+            credential,
+            "the seed hash must not move"
+        );
 
         // Both keys in the Secret, verbatim.
         let stored = h.cluster.secret("alice-llm").unwrap();
@@ -1904,16 +1913,11 @@ mod tests {
         assert!(h.cluster.secret("alice-identity").is_some());
         assert!(h.cluster.secret("alice-credential").is_some());
         assert!(h.cluster.exists(Kind::Pvc, "alice-data"));
-        assert!(
-            h.cluster
-                .deleted()
-                .iter()
-                .all(|(kind, name)| match kind {
-                    Kind::Pvc => false,
-                    Kind::Secret => name == "alice-llm",
-                    _ => true,
-                })
-        );
+        assert!(h.cluster.deleted().iter().all(|(kind, name)| match kind {
+            Kind::Pvc => false,
+            Kind::Secret => name == "alice-llm",
+            _ => true,
+        }));
 
         assert_eq!(
             h.warden.status("alice").await.unwrap(),

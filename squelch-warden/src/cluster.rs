@@ -743,11 +743,17 @@ mod tests {
         // What a Role without `pods/exec` produces, and what an h2 connection
         // or a stray reverse proxy would produce: an answer that was not 101.
         assert_eq!(
-            upgrade(UpgradeConnectionError::ProtocolSwitch(StatusCode::FORBIDDEN)).summary(),
+            upgrade(UpgradeConnectionError::ProtocolSwitch(
+                StatusCode::FORBIDDEN
+            ))
+            .summary(),
             "api(exec): transport(upgrade) http 403"
         );
         assert_eq!(
-            upgrade(UpgradeConnectionError::ProtocolSwitch(StatusCode::NOT_FOUND)).summary(),
+            upgrade(UpgradeConnectionError::ProtocolSwitch(
+                StatusCode::NOT_FOUND
+            ))
+            .summary(),
             "api(exec): transport(upgrade) http 404"
         );
 
@@ -777,7 +783,8 @@ mod tests {
     fn an_object_knows_its_own_kind_and_name() {
         let config = test_config();
         let name = TenantName::parse("alice").unwrap();
-        let object = Object::Deployment(Box::new(objects::deployment(&config, &name, "hash", None)));
+        let object =
+            Object::Deployment(Box::new(objects::deployment(&config, &name, "hash", None)));
         assert_eq!(object.kind(), Kind::Deployment);
         assert_eq!(object.name(), "alice");
     }

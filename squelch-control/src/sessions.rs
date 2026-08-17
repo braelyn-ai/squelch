@@ -225,7 +225,10 @@ impl SessionStore {
     /// Live LOGIN sessions of either kind, which is what
     /// [`MAX_IDENTITY_SESSIONS`] bounds.
     pub fn identity_len(&self) -> usize {
-        self.sessions.values().filter(|s| s.kind.is_identity()).count()
+        self.sessions
+            .values()
+            .filter(|s| s.kind.is_identity())
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -369,7 +372,11 @@ mod tests {
         for i in 0..MAX_IDENTITY_SESSIONS {
             // Alternating, so the shared ceiling is what stops this and not one
             // kind's own.
-            let kind = if i % 2 == 0 { SessionKind::Console } else { SessionKind::App };
+            let kind = if i % 2 == 0 {
+                SessionKind::Console
+            } else {
+                SessionKind::App
+            };
             insert_login(&mut s, kind, &format!("login{i}"), now).unwrap();
         }
         assert_eq!(s.identity_len(), MAX_IDENTITY_SESSIONS);

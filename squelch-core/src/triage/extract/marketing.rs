@@ -189,6 +189,7 @@ pub async fn classify_at(
         system: build_system_prompt(),
         user: &user,
         schema: output_schema(),
+        effort: cfg.effort.as_deref(),
     };
     // No post-parse validation here: every field is bounded and shape-checked in
     // [`apply_result`], so the parsed record IS the outcome.

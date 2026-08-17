@@ -352,11 +352,8 @@ const REPLACEMENT: char = '\u{fffd}';
 pub trait Warden: Send + Sync {
     /// Call 1: record the tenant and learn the recipient to seal to. Idempotent
     /// for a pending label with the same `account_email`.
-    async fn create_tenant(
-        &self,
-        label: &str,
-        account_email: &str,
-    ) -> Result<Created, WardenError>;
+    async fn create_tenant(&self, label: &str, account_email: &str)
+    -> Result<Created, WardenError>;
 
     /// Call 2: install the sealed credential and provision. `cred_read_ciphertext`
     /// MUST be age armor.
@@ -863,7 +860,8 @@ mod tests {
             );
             assert!(
                 matches!(
-                    w.put_llm_key(bad, Some("sk-bf-key"), Some("sk-bf-key-a")).await,
+                    w.put_llm_key(bad, Some("sk-bf-key"), Some("sk-bf-key-a"))
+                        .await,
                     Err(WardenError::LabelRefused)
                 ),
                 "{bad:?}"
@@ -956,10 +954,8 @@ mod tests {
                         seen.lock().unwrap().push((bearer, parsed));
                         match label.as_str() {
                             "okay" => (StatusCode::OK, Json(json!({}))).into_response(),
-                            "ghost" => {
-                                (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"})))
-                                    .into_response()
-                            }
+                            "ghost" => (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"})))
+                                .into_response(),
                             "nollm" => (
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 Json(json!({"error":"llm_not_configured"})),
@@ -988,22 +984,38 @@ mod tests {
         )
         .unwrap();
 
-        w.put_llm_key("okay", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
-            .await
-            .unwrap();
+        w.put_llm_key(
+            "okay",
+            Some("sk-bf-THE-KEY"),
+            Some("sk-bf-THE-ASSISTANT-KEY"),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            w.put_llm_key("ghost", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
-                .await,
+            w.put_llm_key(
+                "ghost",
+                Some("sk-bf-THE-KEY"),
+                Some("sk-bf-THE-ASSISTANT-KEY")
+            )
+            .await,
             Err(WardenError::UnknownTenant)
         ));
         assert!(matches!(
-            w.put_llm_key("nollm", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
-                .await,
+            w.put_llm_key(
+                "nollm",
+                Some("sk-bf-THE-KEY"),
+                Some("sk-bf-THE-ASSISTANT-KEY")
+            )
+            .await,
             Err(WardenError::LlmNotConfigured)
         ));
         assert!(matches!(
-            w.put_llm_key("other", Some("sk-bf-THE-KEY"), Some("sk-bf-THE-ASSISTANT-KEY"))
-                .await,
+            w.put_llm_key(
+                "other",
+                Some("sk-bf-THE-KEY"),
+                Some("sk-bf-THE-ASSISTANT-KEY")
+            )
+            .await,
             Err(WardenError::Failed)
         ));
 
@@ -1023,14 +1035,22 @@ mod tests {
         w.put_llm_key("okay", None, Some("sk-bf-THE-ASSISTANT-KEY"))
             .await
             .unwrap();
-        w.put_llm_key("okay", Some("sk-bf-THE-KEY"), None).await.unwrap();
+        w.put_llm_key("okay", Some("sk-bf-THE-KEY"), None)
+            .await
+            .unwrap();
         let seen = seen.lock().unwrap();
         let (_, assistant_only) = &seen[4];
         assert!(assistant_only.get("api_key").is_none(), "{assistant_only}");
-        assert_eq!(assistant_only["assistant_api_key"], "sk-bf-THE-ASSISTANT-KEY");
+        assert_eq!(
+            assistant_only["assistant_api_key"],
+            "sk-bf-THE-ASSISTANT-KEY"
+        );
         let (_, triage_only) = &seen[5];
         assert_eq!(triage_only["api_key"], "sk-bf-THE-KEY");
-        assert!(triage_only.get("assistant_api_key").is_none(), "{triage_only}");
+        assert!(
+            triage_only.get("assistant_api_key").is_none(),
+            "{triage_only}"
+        );
     }
 
     /// The pairing route answers with the same shape call 2 does, and it is held
@@ -1078,10 +1098,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(w.pair("good").await.unwrap().pair_code, "ABCD-EFGH");
-        assert!(matches!(
-            w.pair("bad").await,
-            Err(WardenError::BadPairing)
-        ));
+        assert!(matches!(w.pair("bad").await, Err(WardenError::BadPairing)));
         assert!(matches!(
             w.pair("gone").await,
             Err(WardenError::UnknownTenant)

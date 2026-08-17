@@ -39,7 +39,10 @@ fn shipment_policy() -> squelch_core::config::ShipmentListPolicy {
 /// Build the server object, so tests can construct it without binding a transport.
 fn build_server() -> anyhow::Result<SquelchServer> {
     let store = Arc::new(SqliteStore::open(squelch_core::config::resolve_db_path())?);
-    Ok(SquelchServer::new(store, &squelch_core::config::account_email())?.with_shipment_policy(shipment_policy()))
+    Ok(
+        SquelchServer::new(store, &squelch_core::config::account_email())?
+            .with_shipment_policy(shipment_policy()),
+    )
 }
 
 /// Decide the transport from CLI args and env: `--http [addr]` or
@@ -58,9 +61,7 @@ fn select_transport() -> anyhow::Result<Transport> {
                 // Optional inline address: `--http 127.0.0.1:9000`.
                 if let Some(next) = args.next() {
                     if next.starts_with('-') {
-                        return Err(anyhow::anyhow!(
-                            "unexpected argument `{next}` after --http"
-                        ));
+                        return Err(anyhow::anyhow!("unexpected argument `{next}` after --http"));
                     }
                     flag_addr = Some(next);
                 }

@@ -38,7 +38,7 @@ const INFER_BUDGET: Duration = Duration::from_secs(8);
 /// Per-request timeout. The real ceiling on the save path is [`INFER_BUDGET`],
 /// which wraps the whole retry ladder; this only bounds a single attempt for
 /// direct [`classify_at`] callers.
-const INFER_TIMEOUT: Duration = Duration::from_secs(20);
+const INFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Connect timeout for the same call.
 const INFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -246,6 +246,10 @@ pub async fn classify_at(
         system: build_system_prompt(),
         user: &user,
         schema: output_schema(),
+        // Hardcoded, not config-driven: this call reads ONE sentence the account
+        // owner just typed and picks one enum value. There is nothing here for a
+        // reasoning budget to buy.
+        effort: Some("low"),
     };
     llm::classify_into(
         http,

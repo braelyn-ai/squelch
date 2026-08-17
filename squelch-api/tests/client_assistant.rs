@@ -46,11 +46,10 @@ async fn spawn_upstream(
             let capture = capture.clone();
             async move {
                 capture.lock().unwrap().push((headers, body));
-                let stream = tokio_stream::iter(
-                    frames
-                        .iter()
-                        .map(|f| Ok::<_, std::convert::Infallible>(Bytes::from_static(f.as_bytes()))),
-                );
+                let stream =
+                    tokio_stream::iter(frames.iter().map(|f| {
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(f.as_bytes()))
+                    }));
                 let mut builder = Response::builder()
                     .status(status)
                     .header(header::CONTENT_TYPE, content_type);
@@ -136,7 +135,10 @@ async fn relay_streams_upstream_bytes_verbatim_and_audits() {
     let (headers, body) = &seen[0];
     assert_eq!(headers.get("x-api-key").unwrap(), "sk-bf-test");
     assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
-    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "application/json");
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
     assert_eq!(headers.get(header::ACCEPT).unwrap(), "text/event-stream");
     assert!(headers.get(header::AUTHORIZATION).is_none());
     assert_eq!(body, REQUEST_BODY.as_bytes());

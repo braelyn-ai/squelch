@@ -67,12 +67,8 @@ impl LabelError {
             LabelError::TooLong => {
                 format!("That address is too long. Use at most {MAX_LABEL_LEN} characters.")
             }
-            LabelError::Charset => {
-                "Use lowercase letters, numbers, and hyphens only.".to_string()
-            }
-            LabelError::HyphenEdge => {
-                "An address cannot start or end with a hyphen.".to_string()
-            }
+            LabelError::Charset => "Use lowercase letters, numbers, and hyphens only.".to_string(),
+            LabelError::HyphenEdge => "An address cannot start or end with a hyphen.".to_string(),
             LabelError::Reserved => "That address is reserved. Pick another one.".to_string(),
         }
     }

@@ -188,7 +188,8 @@ impl Harness {
         if let Some(c) = cookie {
             req = req.header(header::COOKIE, c);
         }
-        self.send(req.body(axum::body::Body::empty()).unwrap()).await
+        self.send(req.body(axum::body::Body::empty()).unwrap())
+            .await
     }
 
     async fn post_form(
@@ -454,7 +455,11 @@ async fn the_admin_page_opens_only_to_the_token() {
 async fn the_dashboard_escapes_what_a_stranger_typed() {
     let h = Harness::new().await;
     let (status, _, _) = h.join(r#""><script>alert(1)</script>@evil.test"#).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "brackets never reach a row");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "brackets never reach a row"
+    );
 
     let hostile = "a&'b@evil.test";
     let (status, _, _) = h.join(hostile).await;
@@ -484,7 +489,10 @@ async fn approving_mails_a_code_that_redeems() {
     let (row_status, invite_id, notified) = h.row_state(id);
     assert_eq!(row_status, "approved");
     assert!(notified, "the provider accepted it, so the row is stamped");
-    assert_eq!(h.invite_ids(), vec![invite_id.expect("an invite was minted")]);
+    assert_eq!(
+        h.invite_ids(),
+        vec![invite_id.expect("an invite was minted")]
+    );
 
     let sends = h.sends();
     assert_eq!(sends.len(), 1);
@@ -536,7 +544,11 @@ async fn a_replayed_approval_mints_nothing() {
     let (status, _, body) = h
         .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
-    assert_eq!(status, StatusCode::OK, "the replay renders, it does not act");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the replay renders, it does not act"
+    );
     assert!(body.contains("already approved"), "{body}");
     assert_eq!(h.invite_ids(), after_first, "no second code");
     assert_eq!(h.sends().len(), 1, "no second email");
@@ -621,7 +633,11 @@ async fn a_spent_invite_is_not_replaced() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("already been used"), "{body}");
     assert_eq!(h.sends().len(), 1, "no second email");
-    assert_eq!(h.invite_ids(), vec![invite_id], "the spent row is untouched");
+    assert_eq!(
+        h.invite_ids(),
+        vec![invite_id],
+        "the spent row is untouched"
+    );
 }
 
 /// A code an operator revoked from the CLI is a row pointing at nothing, not a

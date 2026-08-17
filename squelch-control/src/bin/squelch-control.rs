@@ -126,7 +126,8 @@ const MAX_TTL_DAYS: i64 = 365;
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_env("SQUELCH_CONTROL_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_env("SQUELCH_CONTROL_LOG")
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -241,7 +242,8 @@ fn stamp(t: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 fn llm(command: LlmCommand) -> anyhow::Result<()> {
-    let Some(llm) = BifrostConfig::from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?
+    let Some(llm) =
+        BifrostConfig::from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?
     else {
         anyhow::bail!(
             "the LLM gateway is not configured: set SQUELCH_CONTROL_BIFROST_URL and \
@@ -331,7 +333,10 @@ async fn llm_mint(
             assistant.id
         );
     }
-    if let Err(e) = warden.put_llm_key(label, Some(&vk.value), Some(&assistant.value)).await {
+    if let Err(e) = warden
+        .put_llm_key(label, Some(&vk.value), Some(&assistant.value))
+        .await
+    {
         for (kind, old) in [("triage", &old), ("assistant", &old_assistant)] {
             if let Some(old) = old {
                 // The rotation half-failed: the cluster still runs on the OLD
@@ -356,7 +361,10 @@ async fn llm_mint(
         "squelch-control: virtual keys {} (triage) and {} (assistant) minted and installed for {label}.",
         vk.id, assistant.id
     );
-    for (kind, old, new) in [("triage", old, &vk.id), ("assistant", old_assistant, &assistant.id)] {
+    for (kind, old, new) in [
+        ("triage", old, &vk.id),
+        ("assistant", old_assistant, &assistant.id),
+    ] {
         if let Some(old) = old.filter(|old| old != new) {
             eprintln!(
                 "squelch-control: the PREVIOUS {kind} virtual key {old} is still live in Bifrost; \
@@ -393,7 +401,9 @@ async fn llm_revoke(
                 // Cleared only AFTER Bifrost confirms: a revoke that failed
                 // must leave the pointer in place for the retry.
                 store.clear_tenant_vk(label)?;
-                eprintln!("squelch-control: triage virtual key {id} revoked and forgotten for {label}.");
+                eprintln!(
+                    "squelch-control: triage virtual key {id} revoked and forgotten for {label}."
+                );
             }
             Err(e) => failed.push(format!("triage key {id}: {e}")),
         }

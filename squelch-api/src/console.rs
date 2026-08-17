@@ -109,7 +109,9 @@ const PAIRING_CODE_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// not.
 fn code_shaped(normalized: &str) -> bool {
     normalized.len() == PAIRING_CODE_LEN
-        && normalized.chars().all(|c| PAIRING_CODE_ALPHABET.contains(c))
+        && normalized
+            .chars()
+            .all(|c| PAIRING_CODE_ALPHABET.contains(c))
 }
 
 /// Ceiling on a presented cookie, before it costs a hash and a store lookup. An
@@ -1189,10 +1191,7 @@ mod tests {
         let (_store, _acct, app) = fixture();
         let resp = app.oneshot(get("/", None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            resp.headers().get(header::LOCATION).unwrap(),
-            "/console"
-        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/console");
     }
 
     /// Line noise must never reach the store, because a store miss charges the

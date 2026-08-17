@@ -39,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
     // `with_graceful_shutdown` waiting forever on Ctrl-C.
     let event_tx = attach_event_channel(&store)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
+    let state = state
+        .with_event_notifier(event_tx)
+        .with_shutdown(shutdown_rx);
 
     let app = router(state);
 

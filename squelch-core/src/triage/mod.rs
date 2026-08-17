@@ -1,8 +1,14 @@
 //! Triage pipeline. The [`seal`] detector runs first at ingest, so sealed auth
 //! mail never reaches [`stage1`] — the deterministic, LLM-free classifier here
-//! that gives every non-sealed message a [`Tier`], importance, and one-liner.
-//! Its rungs are first-match-wins and bills are checked first by design.
-//! `confident == false` is the only thing that queues a row for Stage-2.
+//! that gives every non-sealed message a provisional [`Tier`], importance, and
+//! one-liner. Its rungs are first-match-wins and bills are checked first.
+//!
+//! [`stage1`] is a SEED and a WITNESS, not a verdict. Every row it seeds goes on
+//! to [`stage1_llm`] for a real classification, and these rungs stand as the
+//! stored answer only when the model is unreachable. What they still decide is
+//! nothing — what they contribute is testimony: [`router`] reads the same
+//! detectors back and treats a model verdict that contradicts them as grounds
+//! for a harder look.
 
 pub mod calendar;
 pub mod deadline;
@@ -11,6 +17,8 @@ pub mod extract;
 pub mod llm;
 pub mod receipt;
 pub mod receipt_match;
+pub mod revisit;
+pub mod router;
 pub mod rule_infer;
 pub mod rules;
 pub mod seal;
@@ -975,6 +983,9 @@ mod tests {
             received_at: Utc::now(),
             is_known_contact: false,
             rule_want_text: None,
+            escalation_reason: None,
+            sender_history: Default::default(),
+            thread: Vec::new(),
             sensitivity,
         }
     }
@@ -1002,6 +1013,7 @@ mod tests {
             body: "b".into(),
             received_at: Utc::now(),
             is_known_contact: false,
+            sender_corrected: false,
             sensitivity,
         }
     }
