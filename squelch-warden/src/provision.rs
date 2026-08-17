@@ -524,11 +524,23 @@ impl Warden {
         let Some(identity) = self.identity(&name).await? else {
             return Err(WardenError::NotFound);
         };
+        let reopening = is_cancelled(&identity);
         // "Already provisioned" means SERVING, not merely "some objects exist".
         // A phase two that died waiting for a pod left objects behind, and the
         // control plane's retry has to be able to converge on them rather than
         // bounce off a 409 forever.
-        if self.status_of(&name).await? == TenantStatus::Active {
+        //
+        // A CANCELLED account is exempt from it, and that exemption is what
+        // keeps this route from having a state with no exit. `delete` stops at
+        // its first error, so a teardown that failed on the Ingress leaves a
+        // closed account whose Deployment is still up and still serving - which
+        // this check would read as "already provisioned" and refuse, while
+        // `reconcile` and the roll refuse it for being cancelled. Nothing could
+        // move it. Of the two readings of that tenant, "the account holder is
+        // re-consenting" has somewhere to go and "somebody is claiming a
+        // running mailbox" does not: the mailbox is running on a credential its
+        // owner already cancelled, and replacing it is the repair.
+        if !reopening && self.status_of(&name).await? == TenantStatus::Active {
             return Err(WardenError::Conflict);
         }
 
@@ -541,7 +553,7 @@ impl Warden {
         // finish. Cleared last, it would leave a running mailbox still filed as
         // a cancelled account, which every reader here refuses to touch and no
         // roll would ever converge again.
-        if is_cancelled(&identity) {
+        if reopening {
             self.cluster
                 .annotate_secret(&name.identity_secret(), objects::CANCELLED_AT_ANNOTATION, None)
                 .await
@@ -3430,6 +3442,42 @@ mod tests {
         age_the_render(&h, "alice").await;
         let rolled = h.warden.roll(false).await.unwrap();
         assert_eq!(rolled.rolled, vec!["alice"]);
+    }
+
+    /// The state with no exit, and the exemption that gives it one.
+    ///
+    /// A teardown that failed on its FIRST delete leaves a closed account whose
+    /// Deployment is still up. `reconcile` refuses it for being cancelled and
+    /// the roll skips it for the same reason, so if the reopen path also
+    /// refused it - `status` reads `active`, which normally means "already
+    /// provisioned" - nothing in the service could move that tenant, and the
+    /// mailbox would go on serving on a credential its owner had cancelled.
+    #[tokio::test]
+    async fn a_cancelled_account_can_be_reopened_even_while_its_pod_is_still_up() {
+        let h = Harness::new();
+        serving_tenant(&h, "alice").await;
+        h.cluster.fail_delete_of(Kind::Ingress);
+        assert!(h.warden.delete("alice").await.is_err());
+
+        // Closed, and serving: the two readings this exemption is between.
+        assert!(is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+
+        h.warden
+            .set_credentials("alice", &armored("alice-again"))
+            .await
+            .unwrap();
+        assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+
+        // And an ACTIVE tenant nobody cancelled still gets the 409, which is
+        // the guard this exemption had to leave standing.
+        assert_eq!(
+            h.warden
+                .set_credentials("alice", &armored("again-again"))
+                .await
+                .unwrap_err(),
+            WardenError::Conflict
+        );
     }
 
     /// A CANCELLED tenant stays refused, which is the distinction

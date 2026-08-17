@@ -322,6 +322,17 @@ An empty answer means nobody cancelled this tenant and a `reconcile` will finish
 the job. `set_credentials` — reopening the account — is the only thing that
 clears it.
 
+**A tenant that is marked cancelled AND still serving means its teardown failed
+partway.** `DELETE` removes four objects one at a time and stops at its first
+error, so a failure on the Ingress leaves the mailbox up, on a credential its
+owner has already cancelled. `reconcile` and the roller both refuse it, and
+correctly — it is a closed account, not a shape to repair. **Run `DELETE`
+again**: the marker is already there, the call is idempotent, and it finishes
+the teardown from wherever it stopped. (Reopening it also works and is not a
+workaround: `PUT .../credentials` is exempt from the usual "already provisioned"
+409 for exactly this tenant, so the account holder is never locked out by a
+teardown that half-failed.)
+
 **One narrow race survives that**, and it is worth knowing before you cancel an
 account while a roll is in flight: a reconcile reads the tenant's Deployment and
 then applies it, and a `DELETE` landing between those two calls is not seen by

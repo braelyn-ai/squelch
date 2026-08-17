@@ -5,9 +5,11 @@
 //! ServiceAccount, and answer the control plane's calls. That is what the
 //! Deployment in `deploy/hosted/20-warden.yaml` runs.
 //!
-//! `roll` walks the whole fleet instead and puts every tenant that has fallen
-//! behind today's render back onto it, one at a time; then the process exits
-//! with a code that says whether the fleet converged. That is what the CronJob
+//! `roll` reads the whole fleet instead and puts ONE tenant that has fallen
+//! behind today's render back onto it; then the process exits with a code that
+//! says whether the fleet converged, and how far off it is. One per run, so the
+//! gap between ticks is a real daemon serving real mail before the next mailbox
+//! is touched - see [`squelch_warden::Warden::roll`]. That is what the CronJob
 //! in `deploy/hosted/90-warden-roller.yaml` runs, on the same image, the same
 //! ServiceAccount and the same environment as the serving pod - one ConfigMap
 //! (`deploy/hosted/15-warden-config.yaml`) behind both pods' `envFrom`, because
@@ -46,7 +48,7 @@ enum Command {
 const USAGE: &str = "\
 usage:
   squelch-warden                   serve the control plane's API (what the Deployment runs)
-  squelch-warden roll              converge every tenant onto today's render, one at a time
+  squelch-warden roll              read the fleet, converge one tenant onto today's render
   squelch-warden roll --dry-run    report what a roll would change, and change nothing
 
 `roll` rolls AT MOST ONE tenant per run: the next tick takes the next one, so a
@@ -63,10 +65,10 @@ unreadable label), 3 it rolled a tenant and more are queued behind it.
 /// nothing to do is this; a run that would have had something to do is not.
 const EXIT_CONVERGED: u8 = 0;
 /// The fleet is NOT converged, in any of the four ways that can be true: the
-/// roll halted on a tenant that did not come back, it stopped on a casualty of
-/// an earlier run, it never started at all (a refused config, an API server it
-/// could not reach), or it found a tenant with no workload behind a live
-/// Service. A dry run that would roll anything is here too - it has just
+/// roll halted on the tenant it took, it stopped on a casualty of an earlier
+/// run, it never started at all (a refused config, an API server it could not
+/// reach), or it found a tenant with no workload and no cancellation on record.
+/// A dry run that would roll anything is here too - it has just
 /// reported that the fleet is behind, and reporting that as converged is the
 /// one answer that would make `--dry-run` worse than useless.
 ///
@@ -97,7 +99,7 @@ const EXIT_SKIPPED: u8 = 2;
 /// alert should tell it from the real thing.
 const EXIT_PROGRESSING: u8 = 3;
 /// The argument list was none of the three this binary accepts (`EX_USAGE`).
-/// Deliberately outside the 0-2 range: a mistyped CronJob argument must not
+/// Deliberately outside the 0-3 range: a mistyped CronJob argument must not
 /// read as a verdict on the fleet.
 const EXIT_USAGE: u8 = 64;
 

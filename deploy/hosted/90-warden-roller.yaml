@@ -167,6 +167,12 @@ spec:
   # (a status, a drift report - and a drift report's apply is `dryRun=All`, which
   # the API server merges and throws away). If you want it sooner than the next
   # tick, use the `create job --from=cronjob` line in the header.
+  #
+  # It also bounds how long a bump takes, because a run converges one tenant:
+  # a fleet with N behind needs N ticks, so fifteen minutes is also "a quarter
+  # hour per tenant". Shortening it converges faster and gives a bad render
+  # less time to be noticed in before the next mailbox takes it; that trade is
+  # the whole content of this number.
   schedule: "*/15 * * * *"
   # Two rollers walking one fleet is two writers on one mailbox. Forbid means a
   # run that overruns its schedule skips the next tick rather than doubling up.
