@@ -1,7 +1,12 @@
 // THE MINIMAP — a slim rail down the LEFT edge of the reader that answers one
 // question: where in this conversation am I? The thread drawn to scale, one nub
-// per message, tinted by who wrote it, with the screenful you are looking at
-// drawn over them. Click or drag it to jump.
+// per message, coloured by who wrote it, with the screenful you are looking at
+// drawn over them.
+//
+// IT IS A READOUT, NOT A CONTROL. Clicking it to jump was tried and pulled: a
+// rail is a poor 26-point target for picking one message out of forty, and j/k
+// already move the selection precisely. Nothing here takes a gesture, so nothing
+// here can compete with the scroll for one.
 //
 // IT IS NOT A FULL-HEIGHT SCROLL BAR, and that is the point. A scroll bar
 // stretches to fill whatever space it is given, so two short emails and two
@@ -10,10 +15,13 @@
 // just a couple of nubs and a long thread really does run down the window. Only
 // a thread longer than the rail can hold gets squashed to fit.
 //
-// The heights it is drawn from are the cards' own measured heights (see
-// MinimapGeometry for why heights and not the scroll's own numbers), which is
-// also what keeps the highlight still: one screenful is one screenful wherever
-// you are, so the window mark never changes size as you scroll.
+// NOTHING HERE MOVES BECAUSE YOU SCROLLED. The nubs are drawn from the messages'
+// own text (see MinimapGeometry) and not from anything the layout measures, so
+// the drawing is settled before the first frame and stays put for as long as the
+// thread is open. The map hangs from the TOP of the rail rather than being
+// centred in it, so its start is nailed down too. The only thing a scroll tick
+// may change is where the window mark sits — and not its size: one screenful is
+// one screenful wherever you are.
 //
 // It is drawn in a Canvas because it redraws on every scroll tick: one draw pass
 // costs nothing, a view tree per frame does. For the same reason its input lives
@@ -23,15 +31,12 @@
 
 import SwiftUI
 
-/// What the reader has measured of its own mail. Written by ThreadViewer's
-/// geometry readers, read only here.
+/// WHERE THE READER'S CARDS ARE, right now. Written by ThreadViewer's geometry
+/// readers, read only here, and deliberately nothing else: heights are not kept,
+/// because a map that learned from them would redraw itself while you read.
 @MainActor
 @Observable
 final class ThreadMap {
-    /// Display index -> that card's height. STICKY: a height is a fact about the
-    /// message, so once measured it is kept even when the lazy stack recycles the
-    /// row. This is what the map is drawn from.
-    private(set) var heights: [Int: CGFloat] = [:]
     /// Display index -> that card's frame relative to the visible area, so y = 0
     /// is the top of the window. LIVE, and only for mounted cards: it answers
     /// "where is the window", which is a question about right now.
@@ -47,19 +52,16 @@ final class ThreadMap {
             return
         }
         frames[index] = frame
-        heights[index] = frame.height
     }
 
     /// A card the stack has recycled stops reporting, and a POSITION nobody is
-    /// updating is a lie the window mark would be placed by. Its height stays:
-    /// that one is still true.
+    /// updating is a lie the window mark would be placed by.
     func drop(_ index: Int) {
         frames[index] = nil
     }
 
     /// A different thread is a different map.
     func forget() {
-        heights.removeAll()
         frames.removeAll()
     }
 }
@@ -74,17 +76,17 @@ struct ThreadMinimap: View {
     /// The reader's visible height — one of these is what the window mark is
     /// worth, and it sets the drawing scale.
     let viewport: CGFloat
-    let onSelect: (Int) -> Void
 
-    /// What a nub is drawn as: its sender's colour, or its tier's when the
-    /// message is an obligation — the one case worth seeing from anywhere in the
-    /// thread, so it is drawn wider too.
+    /// What a nub is drawn as. COLOUR IS THE SENDER, always and only: a rail
+    /// where the tint means two different things depending on the message is a
+    /// rail you have to decode. An obligation is said with WIDTH instead, which
+    /// is a channel nothing else is using.
     struct Mark: Equatable {
         var attention: Bool
         var tint: Color
+        /// What this message is worth on the map, from its own text.
+        var estimate: CGFloat
     }
-
-    @State private var hovering = false
 
     /// The rail's footprint. Reserved whether or not there is a map to draw, so
     /// a second message arriving does not shove the mail sideways.
@@ -94,6 +96,9 @@ struct ThreadMinimap: View {
     /// — it is what makes a two-email exchange read as two nubs instead of as a
     /// full-height bar that says nothing.
     private static let railPerScreen: CGFloat = 46
+    /// Air above and below the map, so the first and last nubs are not welded to
+    /// the window edges.
+    private static let inset: CGFloat = 12
     /// Nub widths: a plain message, an obligation, the selected one.
     private static let barWidth: CGFloat = 3
     private static let attentionWidth: CGFloat = 4.5
@@ -110,61 +115,48 @@ struct ThreadMinimap: View {
         // answer, so the rail stays out of the way entirely.
         let layout =
             marks.count >= 2
-            ? MinimapGeometry.layout(
-                heights: map.heights, frames: map.frames, count: marks.count) : nil
+            ? MinimapGeometry.layout(estimates: marks.map(\.estimate), frames: map.frames) : nil
 
-        Color.clear
-            .frame(width: Self.width)
-            .overlay {
-                if let layout, viewport > 0 {
-                    GeometryReader { geo in
-                        let scale = scale(total: layout.total, rail: geo.size.height)
-                        let origin = (geo.size.height - layout.total * scale) / 2
-                        canvas(layout: layout, scale: scale, origin: origin)
-                            .contentShape(Rectangle())
-                            .gesture(
-                                DragGesture(minimumDistance: 0)
-                                    .onChanged { value in
-                                        jump(
-                                            to: value.location.y, layout: layout, scale: scale,
-                                            origin: origin)
-                                    }
-                            )
-                    }
-                    .padding(.vertical, 12)
-                    .transition(.opacity)
-                }
+        GeometryReader { geo in
+            if let layout, viewport > 0 {
+                canvas(
+                    layout: layout,
+                    scale: scale(total: layout.total, rail: geo.size.height - Self.inset * 2)
+                )
+                .transition(.opacity)
             }
-            // At rest the rail is a whisper beside the mail; under the pointer it
-            // firms up into something you can aim at.
-            .opacity(hovering ? 1 : 0.78)
-            .animation(.easeOut(duration: 0.16), value: hovering)
-            .animation(.easeOut(duration: 0.22), value: layout == nil)
-            .onHover { hovering = $0 }
-            .help("where you are in the thread — click or drag to jump")
+        }
+        .frame(width: Self.width)
+        // A whisper beside the mail. Static: there is nothing to aim at here, so
+        // there is nothing for the pointer arriving to promise.
+        .opacity(0.85)
+        // The rail takes no input at all, and a decorative layer that eats a
+        // click meant for the mail beside it is a bug waiting to be filed.
+        .allowsHitTesting(false)
+        .animation(.easeOut(duration: 0.22), value: layout == nil)
+        .help("where you are in the thread")
     }
 
-    /// Rail points per mail point: the fixed scale, until the thread outgrows the
+    /// Rail points per map point: the fixed scale, until the thread outgrows the
     /// rail and has to be squashed to fit.
     private func scale(total: CGFloat, rail: CGFloat) -> CGFloat {
-        min(rail / max(total, 1), Self.railPerScreen / max(viewport, 1))
+        min(max(rail, 1) / max(total, 1), Self.railPerScreen / max(viewport, 1))
     }
 
-    private func canvas(layout: MinimapGeometry.Layout, scale: CGFloat, origin: CGFloat)
-        -> some View
-    {
+    private func canvas(layout: MinimapGeometry.Layout, scale: CGFloat) -> some View {
         Canvas(rendersAsynchronously: false) { ctx, size in
             let length = layout.total * scale
+            let top = Self.inset
 
             // 1. THE SCREENFUL YOU ARE LOOKING AT, behind the nubs so they stay
             // legible inside it. Its height is the viewport's own, to scale —
             // which is why it never changes size while you scroll.
             if let offset = layout.offset {
                 let height = max(Self.minMark, min(length, viewport * scale))
-                let top = min(max(origin + offset * scale, origin), origin + length - height)
+                let y = min(max(top + offset * scale, top), top + max(0, length - height))
                 let mark = Path(
                     roundedRect: CGRect(
-                        x: (size.width - Self.markWidth) / 2, y: top, width: Self.markWidth,
+                        x: (size.width - Self.markWidth) / 2, y: y, width: Self.markWidth,
                         height: height),
                     cornerRadius: 4, style: .continuous)
                 ctx.fill(mark, with: .color(Palette.ink.opacity(0.07)))
@@ -177,24 +169,24 @@ struct ThreadMinimap: View {
             ctx.fill(
                 Path(
                     roundedRect: CGRect(
-                        x: (size.width - 1.5) / 2, y: origin, width: 1.5, height: length),
+                        x: (size.width - 1.5) / 2, y: top, width: 1.5, height: length),
                     cornerRadius: 0.75),
                 with: .color(Palette.hairline))
 
             // 3. The messages. The selected nub draws LAST so a long thread's
             // crowding can never bury the one you are on.
             for i in marks.indices where i != selected {
-                nub(ctx, size: size, index: i, layout: layout, scale: scale, origin: origin)
+                nub(ctx, size: size, index: i, layout: layout, scale: scale)
             }
             if marks.indices.contains(selected) {
-                nub(ctx, size: size, index: selected, layout: layout, scale: scale, origin: origin)
+                nub(ctx, size: size, index: selected, layout: layout, scale: scale)
             }
         }
     }
 
     private func nub(
         _ ctx: GraphicsContext, size: CGSize, index: Int, layout: MinimapGeometry.Layout,
-        scale: CGFloat, origin: CGFloat
+        scale: CGFloat
     ) {
         let mark = marks[index]
         let isSelected = index == selected
@@ -202,25 +194,16 @@ struct ThreadMinimap: View {
             isSelected
             ? Self.selectedWidth : (mark.attention ? Self.attentionWidth : Self.barWidth)
         let height = max(Self.minBar, layout.heights[index] * scale - Self.barGap)
-        let top = origin + layout.tops[index] * scale + Self.barGap / 2
-        let color = isSelected ? Palette.accent : mark.tint.opacity(mark.attention ? 0.95 : 0.6)
+        let top = Self.inset + layout.tops[index] * scale + Self.barGap / 2
+        // ALWAYS the sender's colour. Being the selected message is said by width
+        // and by full strength, never by repainting it in the accent — the whole
+        // point of the rail is that a colour means a person.
+        let color = mark.tint.opacity(isSelected ? 1 : (mark.attention ? 0.9 : 0.5))
         ctx.fill(
             Path(
                 roundedRect: CGRect(
                     x: (size.width - width) / 2, y: top, width: width, height: height),
                 cornerRadius: width / 2, style: .continuous),
             with: .color(color))
-    }
-
-    /// Rail point -> message. Selecting is all it does: the reader's own index
-    /// watcher owns the scroll, so a jump from here lands exactly where a `j`
-    /// would have.
-    private func jump(
-        to y: CGFloat, layout: MinimapGeometry.Layout, scale: CGFloat, origin: CGFloat
-    ) {
-        guard scale > 0 else { return }
-        let hit = MinimapGeometry.index(
-            atMailY: (y - origin) / scale, tops: layout.tops, heights: layout.heights)
-        if hit != selected { onSelect(hit) }
     }
 }

@@ -58,6 +58,10 @@ struct ThreadViewer: View {
     @State private var viewportHeight: CGFloat = 0
     /// The newest message card's laid-out height, the other half of `tailSpace`.
     @State private var newestHeight: CGFloat = 0
+    /// Whether the opening landing has been taken for this thread. Until it has,
+    /// the reader is wherever the initial anchor dropped it, which is not a
+    /// position anybody chose.
+    @State private var landed = false
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -394,9 +398,10 @@ struct ThreadViewer: View {
             ScrollViewReader { proxy in
                 HStack(spacing: 0) {
                     #if os(macOS)
+                        // Read-only: it draws where you are, and j/k move you.
                         ThreadMinimap(
                             map: map, marks: minimapMarks, selected: index,
-                            viewport: viewportHeight, onSelect: { index = $0 })
+                            viewport: viewportHeight)
                     #endif
 
                     ScrollView {
@@ -464,8 +469,18 @@ struct ThreadViewer: View {
                         viewportHeight = $0
                     }
                 }
-                .onChange(of: index) { _, i in
-                    withAnimation(.easeOut(duration: 0.14)) { proxy.scrollTo(i, anchor: .top) }
+                // A STEP animates, A JUMP DOES NOT. j/k moves to the neighbouring
+                // card, which is already laid out and reads as the mail sliding
+                // under the cursor. A jump from the rail can be forty messages
+                // away, and an animated scroll to a row a LAZY stack has never
+                // instantiated is the one SwiftUI reliably declines to perform:
+                // it has nothing to animate from, so it does nothing at all.
+                .onChange(of: index) { was, now in
+                    if abs(now - was) == 1 {
+                        withAnimation(Motion.scrollFollow) { proxy.scrollTo(now, anchor: .top) }
+                    } else {
+                        settle(on: now, proxy: proxy)
+                    }
                 }
                 // A refetch that APPENDED a message — a sent reply's own echo —
                 // has to land on it, and so does a switch to another thread, where
@@ -477,19 +492,25 @@ struct ThreadViewer: View {
                 // on the message that was on screen, and a hardcoded landing here
                 // would fire on that same update and undo the position it just
                 // preserved.
-                // THE ROOM UNDER THE LAST MESSAGE ARRIVES A BEAT AFTER THE MAIL
-                // DOES: `tailSpace` needs the newest card measured, and a web
-                // frame measures itself after the layout that placed it. Until
-                // then there is nowhere to scroll to, so the landing lands short
-                // and has to be taken again.
+                // THE LANDING: the top of the newest message at the top of the
+                // window. The bottom anchor above only gets us to the END of the
+                // scroll, which is a different place — for a message taller than
+                // the window it is that message's BOTTOM edge — so the real
+                // landing is taken here, once the newest card has a height.
                 //
-                // Only for a reader who is still parked on the newest and can
-                // see it — that is the just-opened state, and the window having
-                // been resized under them. Somebody who has scrolled back into
-                // the history is not holding a position this may correct.
-                .onChange(of: tailSpace) { _, _ in
-                    guard index == newestIndex, visibleIndices.contains(newestIndex) else { return }
-                    proxy.scrollTo(index, anchor: .top)
+                // It watches the measurements and not `tailSpace`, which was the
+                // bug: a newest message taller than the window leaves no room to
+                // reserve, so tailSpace stays 0, never changes, and a watcher on
+                // it never fires. The two numbers it is made of do change.
+                .onChange(of: [newestHeight, viewportHeight]) { was, now in
+                    guard newestHeight > 0, index == newestIndex else { return }
+                    // Land once per thread, then only while the reader is still
+                    // parked on the newest — a resize, or the card growing as its
+                    // images arrive. Somebody who has scrolled back into the
+                    // history is not holding a position this may correct.
+                    guard !landed || parkedOnNewest || was.last != now.last else { return }
+                    proxy.scrollTo(newestIndex, anchor: .top)
+                    landed = true
                 }
                 .onChange(of: messages.last?.id) { _, _ in
                     proxy.scrollTo(index, anchor: .top)
@@ -510,22 +531,69 @@ struct ThreadViewer: View {
     /// back into, so dead space below would be dead space for its own sake. And
     /// nothing until both halves are measured, which keeps the very first layout
     /// from opening on a screenful of nothing.
+    /// A JUMP, TAKEN UNTIL IT LANDS. One `scrollTo` into a LAZY stack is a guess:
+    /// the rows between here and there have never been laid out, so the scroll
+    /// aims with estimated heights, and the real ones — a web frame measuring
+    /// itself a beat after it is placed — move the target out from under the
+    /// landing. That is why a click on the rail took you near the right message
+    /// rather than to it.
+    ///
+    /// The card's own live frame is the feedback: while its top edge is not the
+    /// top of the window, aim again. Bounded, because a thread whose heights
+    /// never settle must cost a fifth of a second and not a spin, and abandoned
+    /// the moment the selection moves — somebody who has moved on owns the scroll.
+    private func settle(on target: Int, proxy: ScrollViewProxy) {
+        proxy.scrollTo(target, anchor: .top)
+        Task { @MainActor in
+            for _ in 0..<8 {
+                try? await Task.sleep(for: .milliseconds(25))
+                guard index == target else { return }
+                if let frame = map.frames[target], abs(frame.minY) < 2 { return }
+                proxy.scrollTo(target, anchor: .top)
+            }
+        }
+    }
+
+    /// Whether the newest message's top edge is still sitting at the top of the
+    /// window — that is, whether the reader is where the landing put them. Read
+    /// off the card's own live frame rather than from a visibility fraction: a
+    /// message ten screenfuls tall is barely "visible" by area and is still
+    /// exactly the thing being read.
+    private var parkedOnNewest: Bool {
+        guard let frame = map.frames[newestIndex] else { return false }
+        return abs(frame.minY) < 24
+    }
+
     private var tailSpace: CGFloat {
         guard messages.count > 1, viewportHeight > 0, newestHeight > 0 else { return 0 }
         return max(0, viewportHeight - newestHeight - 24)
     }
 
-    /// One mark per message for the rail LEFT of the mail: the colour it is
-    /// drawn in, and whether it is an obligation (which the rail draws wider, so
-    /// a deadline three messages up is visible from anywhere in the thread).
+    /// One mark per message for the rail LEFT of the mail: WHO WROTE IT, which is
+    /// the whole colour code and the same colour their avatar carries in the
+    /// bands; whether it is an obligation (said with width, so a deadline three
+    /// messages up is visible from anywhere in the thread); and how long the
+    /// message is about to be, which is what holds the map still for the mail the
+    /// lazy stack has not laid out yet.
     private var minimapMarks: [ThreadMinimap.Mark] {
         messages.map { m in
             ThreadMinimap.Mark(
                 attention: m.needsAttention,
-                tint: m.needsAttention
-                    ? Palette.tierColor(m.tier ?? .deadline)
-                    : Palette.avatarColors(for: m.senderString).fg)
+                tint: Palette.avatarColors(for: m.senderString).fg,
+                estimate: mapEstimate(m))
         }
+    }
+
+    /// WHAT THIS MESSAGE IS WORTH ON THE RAIL, from its own text and nothing
+    /// else. Deliberately NOT the height the web frame measured for it, even
+    /// though the reader keeps those (FrameHeights, for painting a reopened
+    /// message at its final size): a map that mixes measured cards with guessed
+    /// ones redraws itself as the measurements land, which is a rail that crawls
+    /// while you read it. A map that is uniformly approximate holds still, and
+    /// holding still is the whole job.
+    private func mapEstimate(_ m: ClientMessage) -> CGFloat {
+        MinimapGeometry.estimate(
+            text: m.content, html: m.html, attachments: m.attachmentList.count)
     }
 
     /// The mail's measure. The dismissible gutter is defined as the complement
@@ -959,6 +1027,7 @@ struct ThreadViewer: View {
         visibleIndices.removeAll()
         map.forget()
         newestHeight = 0
+        landed = false
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
