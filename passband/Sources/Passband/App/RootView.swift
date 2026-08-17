@@ -24,6 +24,15 @@ struct RootView: View {
                 ConnectView()
             }
         }
+        // THE APP DRAWS FROM THE WINDOW'S TOP EDGE. SwiftUI insets a window's
+        // content below the titlebar strip macOS keeps clear for the traffic
+        // lights, which left every page carrying an empty band above its own
+        // header. Giving the strip back puts each page's TOP BAR up there, level
+        // with the buttons; the rail is what makes room for them, starting at
+        // `TopBar.height` instead of at the window's edge. Applied once, here,
+        // so a surface only has to know the bar's height and not also how the
+        // window is inset.
+        .ignoresSafeArea(edges: .top)
         // ADD ACCOUNT — the same form as the gate, over a working app. Hung on
         // the whole shell rather than on any one surface: it is raised from
         // Settings, from the rail's account menu, from the Accounts menu, and
@@ -339,7 +348,10 @@ struct RoutedHeader<Trailing: View>: View {
             trailing
         }
         .padding(.horizontal, 22)
-        .padding(.vertical, 14)
+        // THE BAR'S HEIGHT, not this header's own padding: it sits in the window
+        // strip beside the traffic lights, and the rail's top edge is cut to the
+        // same line. A header that set its own height would break that join.
+        .frame(height: TopBar.height)
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .bottom) { Hairline() }
     }

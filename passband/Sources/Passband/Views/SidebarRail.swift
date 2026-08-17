@@ -33,13 +33,6 @@ struct SidebarRail: View {
     private static let restTint: Double = 0.26
     private static let travelTint: Double = 0.16
 
-    /// Height of the strip the traffic lights live in, left unpainted by the
-    /// rail's material below. Measured from the TRUE window top (the material
-    /// ignores the top safe area): the dots bottom out ~20pt down, so this
-    /// stops just under them, with a little air so the dots don't sit tight
-    /// against the material's edge.
-    static let titleBarHeight: CGFloat = 28
-
     var body: some View {
         railStack
             .coordinateSpace(.named(railSpace))
@@ -95,10 +88,11 @@ struct SidebarRail: View {
 
     private var railStack: some View {
             VStack(spacing: 6) {
-                // NO TOP SPACER: the first icon sits on the SAME LINE as the
-                // "passband" wordmark beside it, which is what makes the rail read
-                // as part of the page header. The traffic lights end ~19pt above
-                // where it starts, so no extra clearance is needed.
+                // NO TOP SPACER: the clearance is the top bar's, applied to the
+                // whole stack below. The first icon starts UNDER the page header
+                // beside it rather than on its line — the rail is what the bar
+                // runs above, so an icon level with the title would be an icon
+                // sitting in the bar.
                 ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { index, view in
                     RailButton(
                         view: view, keyNumber: index + 1, active: store.activeView == view,
@@ -120,9 +114,14 @@ struct SidebarRail: View {
 
                 accountBadge
             }
-            .padding(.vertical, 10)
+            // The app draws from the window's true top edge now, so this is the
+            // rail's whole clearance for the title strip — not a nudge on top of
+            // a safe area that no longer applies.
+            .padding(.top, TopBar.height + 10)
+            .padding(.bottom, 10)
             .frame(width: Self.railWidth)
             .frame(maxHeight: .infinity)
+            .ignoresSafeArea(edges: .top)
     }
 
     /// WHICH MAILBOX YOU ARE IN, at the foot of the rail — and the fastest way
@@ -175,19 +174,19 @@ struct SidebarRail: View {
     private var railMaterial: some View {
             // The most translucent surface in the window, but not arbitrarily
             // thin: it must hold its value over any wallpaper or its icons stop
-            // being legible. It runs up INTO the top safe area and stops just
-            // below the traffic lights — material running up BEHIND them reads
-            // as the dots clipping the rail. The strip above stays UNPAINTED
-            // rather than take a second copy of the backdrop: that gradient is
-            // relative to its own frame, so a small box compresses it and the
-            // seam shows.
+            // being legible. It runs up into the top safe area and stops under
+            // the TOP BAR — the same line the page's own header ends on, so the
+            // rail's top edge and that header's rule read as one rule across the
+            // window. Above it is the strip the traffic lights live in, left
+            // unpainted: material running up BEHIND the dots reads as the dots
+            // clipping the rail.
             Rectangle()
                 .fill(.thinMaterial)
                 .overlay(Palette.glassTint.opacity(0.5))
                 .overlay(alignment: .trailing) {
                     Rectangle().fill(Palette.hairline).frame(width: 0.5)
                 }
-                .padding(.top, Self.titleBarHeight)
+                .padding(.top, TopBar.height)
                 .ignoresSafeArea(edges: [.top, .bottom])
     }
 }

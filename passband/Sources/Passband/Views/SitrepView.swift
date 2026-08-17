@@ -261,8 +261,11 @@ struct SitrepView: View {
             SyncLabel()
         }
         .padding(.horizontal, 24)
-        .padding(.top, 16)
-        .padding(.bottom, 12)
+        // THE TOP BAR. The wordmark sits on the traffic lights' line rather than
+        // under it, which is why this is a fixed height and not padding: the
+        // rail beside it starts at the same line, and the two only read as one
+        // bar if neither can drift.
+        .frame(height: TopBar.height)
     }
 
     /// Obligations that are overdue or due by end of today — the "need you" set.

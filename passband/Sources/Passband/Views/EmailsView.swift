@@ -358,11 +358,10 @@ struct EmailsView: View {
             ) { store.shortcutsOpen = true }
             ThemeToggle()
         }
-        // These metrics must match the sitrep masthead's: the rail icon beside
-        // this header is aligned to that wordmark's line.
+        // These metrics must match the sitrep masthead's: every page's bar ends
+        // on the line the rail's top edge is cut to.
         .padding(.horizontal, 24)
-        .padding(.top, 16)
-        .padding(.bottom, 12)
+        .frame(height: TopBar.height)
         .overlay(alignment: .bottom) { Hairline() }
     }
     #endif

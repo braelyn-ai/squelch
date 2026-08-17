@@ -236,6 +236,12 @@ struct ThreadViewer: View {
                 .buttonStyle(.textAction)
             }
             .padding(.horizontal, 22)
+            // PADDING, not the shared `TopBar.height`, and the one header in the
+            // app that keeps its own: a subject can wrap to two lines and carries
+            // a participant line under it, so a fixed bar height would either
+            // squash it or hold empty air for the threads that don't wrap. The
+            // subject still lands on the window buttons' line, which is what the
+            // bar was for.
             .padding(.vertical, 13)
             .overlay(alignment: .bottom) { Hairline() }
         #else
