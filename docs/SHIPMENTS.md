@@ -497,7 +497,7 @@ message, so a false negative cannot destroy a real `1Z…` package.
 
 - **One model call per email carrying a shipping signal.** Not per package, and
   not per email overall.
-- **On the Stage-1 model** (default `claude-haiku-4-5`), with a 3000-character
+- **On the Stage-1 model** (default `claude-opus-5`), with a 3000-character
   body budget spent on the regions of the mail that actually carry numbers.
 - **Against the shared Stage-1 daily cap.** `stage1.global_daily_cap` (default
   1000) is one counter, shared by Stage-1 triage itself and by all three

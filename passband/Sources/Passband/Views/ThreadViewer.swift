@@ -1,8 +1,15 @@
 // FULLSCREEN THREAD VIEWER. Fetches GET /client/thread/{id} and stacks every
-// message NEWEST-FIRST; j/k move the selection (j = older). HTML renders in the
-// hard-sandboxed EmailWebView, plain text in a selectable card. The outer column
-// is the ONE scroll surface — message frames size to their content and never
-// scroll internally. Esc, or a gutter click, closes back onto the surface below.
+// message IN ORDER — oldest at the top, newest at the bottom, the way the
+// conversation happened — and OPENS ON THE NEWEST, parked at the top of the
+// window with the history above it to scroll back into. j/k and the arrows move
+// the selection, which always comes to rest at the top of the window (see
+// `tailSpace` for the one trick that makes that possible for the last message).
+//
+// HTML renders in the hard-sandboxed EmailWebView, plain text in a selectable
+// card. The outer column is the ONE scroll surface — message frames size to
+// their content and never scroll internally. Esc, or a gutter click, closes back
+// onto the surface below, and a minimap rail down the left edge says where in
+// the conversation you are.
 //
 // It is also where you REPLY: `r` (or an `r` pressed on a list row, handed over
 // as `pendingReplyMessageId`) pins InlineReply under the stack, still inside this
@@ -39,27 +46,42 @@ struct ThreadViewer: View {
     /// treat a wheel reader as "at the newest" just because they never pressed
     /// `j` — see `anchorId`.
     @State private var visibleIndices: Set<Int> = []
+    /// WHERE THE MESSAGE CARDS ARE IN THE WINDOW, which is what the minimap
+    /// draws. Kept in an object rather than in `@State` on purpose: it is
+    /// rewritten on every scroll tick, and this view's body must not be
+    /// invalidated at that rate — a re-render here walks every message card and
+    /// every sandboxed web frame. Only the minimap reads it, so only the minimap
+    /// redraws.
+    @State private var map = ThreadMap()
+    /// The scroll viewport's height. Changes when the WINDOW does, not when the
+    /// mail moves, so it is cheap to keep here — and `tailSpace` needs it.
+    @State private var viewportHeight: CGFloat = 0
+    /// The newest message card's laid-out height, the other half of `tailSpace`.
+    @State private var newestHeight: CGFloat = 0
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
-    /// Server order is chronological; display order is newest-first.
-    private var messages: [ClientMessage] { (thread?.messages ?? []).reversed() }
+    /// Server order IS display order: chronological, oldest first. The reader
+    /// opens parked on the last one.
+    private var messages: [ClientMessage] { thread?.messages ?? [] }
+    /// Display index of the newest message — the landing spot, and the floor
+    /// `anchorId` measures "still at the bottom" against.
+    private var newestIndex: Int { max(0, messages.count - 1) }
     /// The NEWEST message is what `u` acts on (the server derives the sender
     /// from it) and whose from_addr keys the record lookup.
-    private var newest: ClientMessage? { messages.first }
+    private var newest: ClientMessage? { messages.last }
     /// trim().lowercased() mirrors the server's canonical `sender`.
     private var newestSender: String? {
         newest.map { $0.from_addr.trimmingCharacters(in: .whitespaces).lowercased() }
     }
     private var senderName: String { newest.map { SenderCache.resolved($0.senderString).displayName } ?? "" }
 
-    /// EVERY participant, in first-appearance order, deduped by canonical address.
-    /// Reads `thread.messages` (chronological), not the newest-first display order,
+    /// EVERY participant, in first-appearance order, deduped by canonical address,
     /// so the list starts with whoever started the thread.
     private var participants: [String] {
         var seen = Set<String>()
         var names: [String] = []
-        for m in thread?.messages ?? [] {
+        for m in messages {
             let key = m.from_addr.trimmingCharacters(in: .whitespaces).lowercased()
             guard seen.insert(key).inserted else { continue }
             names.append(SenderCache.resolved(m.senderString).displayName)
@@ -75,10 +97,10 @@ struct ThreadViewer: View {
         return names.prefix(3).joined(separator: ", ") + " +\(names.count - 3)"
     }
 
-    /// Display index of the first message needing attention (newest-first order,
-    /// so ties go to the most recent obligation), or nil for a calm thread.
+    /// Display index of the message needing attention — the LAST one, so a thread
+    /// with two obligations points at the most recent. nil for a calm thread.
     private var attentionIndex: Int? {
-        messages.firstIndex(where: \.needsAttention)
+        messages.lastIndex(where: \.needsAttention)
     }
 
     /// The jump chip's copy: the deadline chip text when a date exists
@@ -298,8 +320,14 @@ struct ThreadViewer: View {
             if let target = attentionIndex, target != index {
                 Button { index = target } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: "arrow.down.to.line.compact")
-                            .font(.system(size: 10, weight: .semibold))
+                        // The thread reads in order and opens at the END of it,
+                        // so the obligation is usually BEHIND you. The arrow has
+                        // to say which way it is, not always point down.
+                        Image(
+                            systemName: target > index
+                                ? "arrow.down.to.line.compact" : "arrow.up.to.line.compact"
+                        )
+                        .font(.system(size: 10, weight: .semibold))
                         Text(attentionJumpLabel).font(Typo.micro)
                     }
                 }
@@ -364,55 +392,139 @@ struct ThreadViewer: View {
             centeredNote("no messages in this thread.")
         } else {
             ScrollViewReader { proxy in
-                ScrollView {
-                    // spacing 0: each message owns its vertical rhythm, so the
-                    // hairline between two lands mid-gap instead of hugging one.
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
-                            MessageCard(
-                                message: m, selected: i == index, ruled: i > 0,
-                                opens: opens[m.id] ?? []
-                            ) {
-                                index = i
-                            }
-                            .id(i)
-                            .onScrollVisibilityChange(threshold: 0.1) { visible in
-                                if visible {
-                                    visibleIndices.insert(i)
-                                } else {
-                                    visibleIndices.remove(i)
+                HStack(spacing: 0) {
+                    #if os(macOS)
+                        ThreadMinimap(
+                            map: map, marks: minimapMarks, selected: index,
+                            viewport: viewportHeight, onSelect: { index = $0 })
+                    #endif
+
+                    ScrollView {
+                        // spacing 0: each message owns its vertical rhythm, so the
+                        // hairline between two lands mid-gap instead of hugging one.
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
+                                MessageCard(
+                                    message: m, selected: i == index, ruled: i > 0,
+                                    opens: opens[m.id] ?? []
+                                ) {
+                                    index = i
                                 }
+                                .id(i)
+                                .onScrollVisibilityChange(threshold: 0.1) { visible in
+                                    if visible {
+                                        visibleIndices.insert(i)
+                                    } else {
+                                        visibleIndices.remove(i)
+                                    }
+                                }
+                                // WHERE THIS MESSAGE IS IN THE WINDOW, which is
+                                // the minimap's whole input — measured against
+                                // the viewport rather than the document because
+                                // a lazy stack does not have a document to
+                                // measure against (see ThreadMinimap). Lands on
+                                // the map object, not on `@State`, so scrolling
+                                // does not re-render the reader.
+                                .onGeometryChange(for: CGRect.self) {
+                                    $0.frame(in: .scrollView)
+                                } action: { frame in
+                                    map.note(i, frame: frame)
+                                    if i == newestIndex { newestHeight = frame.height }
+                                }
+                                .onDisappear { map.drop(i) }
                             }
+
+                            Color.clear.frame(height: tailSpace)
                         }
+                        .padding(.horizontal, Self.columnPadding)
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: Self.columnWidth)
+                        .frame(maxWidth: .infinity)
+                        // INSIDE the scroll content deliberately: an overlay on the
+                        // ScrollView itself would sit above it and eat the wheel
+                        // wherever it covers, and the pointer parks in the gutter.
+                        .overlay { gutterDismiss }
                     }
-                    .padding(.horizontal, Self.columnPadding)
-                    .padding(.vertical, 4)
-                    .frame(maxWidth: Self.columnWidth)
-                    .frame(maxWidth: .infinity)
-                    // INSIDE the scroll content deliberately: an overlay on the
-                    // ScrollView itself would sit above it and eat the wheel
-                    // wherever it covers, and the pointer parks in the gutter.
-                    .overlay { gutterDismiss }
+                    // THE READER OPENS AT THE END: the newest message is the one
+                    // you came for, and with `tailSpace` under it the end of the
+                    // scroll IS that message at the top of the window.
+                    //
+                    // `.initialOffset` and NOT the whole anchor: a bottom anchor
+                    // that also governed size changes would keep the bottom edge
+                    // pinned forever, and every web frame that measured itself
+                    // late — anywhere in the thread — would shove the paragraph
+                    // somebody is reading. Landing is a starting position, not a
+                    // standing rule.
+                    .defaultScrollAnchor(.bottom, for: .initialOffset)
+                    // The minimap draws the whole thread, so the reader's own
+                    // scroll bar would be a second, worse answer to the same
+                    // question sitting right beside it.
+                    .scrollIndicators(.hidden)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                        viewportHeight = $0
+                    }
                 }
                 .onChange(of: index) { _, i in
                     withAnimation(.easeOut(duration: 0.14)) { proxy.scrollTo(i, anchor: .top) }
                 }
-                // A refetch that PREPENDED a message — a sent reply's own echo —
-                // has to land on it, and the watcher above cannot do that job:
-                // `adopt` sets index to 0, which it already was, so it sees no
-                // change. Unanimated because on the initial load and on a thread
-                // switch this is the starting position, not a movement.
+                // A refetch that APPENDED a message — a sent reply's own echo —
+                // has to land on it, and so does a switch to another thread, where
+                // this view stays mounted and only its content changes. Unanimated:
+                // both are a starting position, not a movement.
                 //
-                // It scrolls to the SELECTION, not to zero, because the two are
-                // no longer the same thing: `refreshInPlace` puts the selection
-                // back on the message that was on screen, and a hardcoded 0 here
-                // would fire on the same update and undo exactly the position it
-                // just preserved. Every other path into this watcher is sitting
-                // on 0 already.
-                .onChange(of: messages.first?.id) { _, _ in
+                // It scrolls to the SELECTION, not to the last row, because the two
+                // are not always the same: `refreshInPlace` puts the selection back
+                // on the message that was on screen, and a hardcoded landing here
+                // would fire on that same update and undo the position it just
+                // preserved.
+                // THE ROOM UNDER THE LAST MESSAGE ARRIVES A BEAT AFTER THE MAIL
+                // DOES: `tailSpace` needs the newest card measured, and a web
+                // frame measures itself after the layout that placed it. Until
+                // then there is nowhere to scroll to, so the landing lands short
+                // and has to be taken again.
+                //
+                // Only for a reader who is still parked on the newest and can
+                // see it — that is the just-opened state, and the window having
+                // been resized under them. Somebody who has scrolled back into
+                // the history is not holding a position this may correct.
+                .onChange(of: tailSpace) { _, _ in
+                    guard index == newestIndex, visibleIndices.contains(newestIndex) else { return }
+                    proxy.scrollTo(index, anchor: .top)
+                }
+                .onChange(of: messages.last?.id) { _, _ in
                     proxy.scrollTo(index, anchor: .top)
                 }
             }
+        }
+    }
+
+    /// EMPTY ROOM UNDER THE LAST MESSAGE, and it is the whole reason the newest
+    /// email can sit at the TOP of the window instead of the bottom of it: a
+    /// scroll cannot travel past its own content, so with nothing below it the
+    /// last message comes to rest against the bottom edge no matter what it is
+    /// asked to do. The room is exactly what the viewport has left over once that
+    /// message is in it, so the scroll ends the instant the message is at the top
+    /// — never a pixel of slack beyond that.
+    ///
+    /// Nothing for a one-message thread: there is no history above it to scroll
+    /// back into, so dead space below would be dead space for its own sake. And
+    /// nothing until both halves are measured, which keeps the very first layout
+    /// from opening on a screenful of nothing.
+    private var tailSpace: CGFloat {
+        guard messages.count > 1, viewportHeight > 0, newestHeight > 0 else { return 0 }
+        return max(0, viewportHeight - newestHeight - 24)
+    }
+
+    /// One mark per message for the rail LEFT of the mail: the colour it is
+    /// drawn in, and whether it is an obligation (which the rail draws wider, so
+    /// a deadline three messages up is visible from anywhere in the thread).
+    private var minimapMarks: [ThreadMinimap.Mark] {
+        messages.map { m in
+            ThreadMinimap.Mark(
+                attention: m.needsAttention,
+                tint: m.needsAttention
+                    ? Palette.tierColor(m.tier ?? .deadline)
+                    : Palette.avatarColors(for: m.senderString).fg)
         }
     }
 
@@ -564,8 +676,15 @@ struct ThreadViewer: View {
             KeyBinding("l", "next email") { stepQueue(1) },
             KeyBinding("ArrowLeft", "prev email") { stepQueue(-1) },
             KeyBinding("ArrowRight", "next email") { stepQueue(1) },
-            KeyBinding("j", "older message") { index = min(messages.count - 1, index + 1) },
-            KeyBinding("k", "newer message") { index = max(0, index - 1) },
+            // DOWN THE STACK IS FORWARD IN TIME now that the thread reads in
+            // order, so j and the down arrow move to the NEWER message — the
+            // same direction the eye travels. The selection always comes to
+            // rest at the top of the window (see `tailSpace`), so a step is
+            // "put the next message in front of me", not "nudge the scroll".
+            KeyBinding("j", "newer message") { stepMessage(1) },
+            KeyBinding("k", "older message") { stepMessage(-1) },
+            KeyBinding("ArrowDown", "newer message") { stepMessage(1) },
+            KeyBinding("ArrowUp", "older message") { stepMessage(-1) },
             // The reading surface is where a miscategorized email is most
             // obvious, so correcting it should not require going back.
             KeyBinding("v", "fix triage") {
@@ -619,6 +738,13 @@ struct ThreadViewer: View {
             // input-suppressed and types a letter instead.
             KeyBinding("c", "new message") { store.openComposeNew() },
         ]
+    }
+
+    /// Move the selection by one message, clamped at both ends. The scroll
+    /// follows from the selection, never the other way round.
+    private func stepMessage(_ delta: Int) {
+        guard !messages.isEmpty else { return }
+        index = min(newestIndex, max(0, index + delta))
     }
 
     /// The rule composer for THIS thread's sender — the same request shape `t`
@@ -709,12 +835,12 @@ struct ThreadViewer: View {
     /// keys or the wheel. A moved selection wins; failing that, the topmost
     /// VISIBLE row stands in, because a wheel scroll moves what is on screen
     /// without ever touching the selection — preserving the selection alone
-    /// would let a background refresh yank a wheel reader back to the top. nil
-    /// means the reader really is sitting on the newest, which is the one case
-    /// a refresh may move them: onto the reply they are waiting for.
+    /// would let a background refresh yank a wheel reader back to the newest.
+    /// nil means the reader really is sitting on the newest, which is the one
+    /// case a refresh may move them: onto the reply they are waiting for.
     private var anchorId: Int? {
-        if index != 0 { return messages[safe: index]?.id }
-        guard let top = visibleIndices.min(), top > 0 else { return nil }
+        if index != newestIndex { return messages[safe: index]?.id }
+        guard let top = visibleIndices.min(), top < newestIndex else { return nil }
         return messages[safe: top]?.id
     }
 
@@ -734,43 +860,105 @@ struct ThreadViewer: View {
     /// e/d — "done + next": mark the current thread's update done (keeping its
     /// 5s undo), then advance to the NEXT queued update in place; if none
     /// remain, close the viewer.
+    ///
+    /// AND IT IS A MOTION, not a swap. The email you finished flies up and out,
+    /// and then the next one comes in from below — the difference between "that
+    /// one is dealt with, here is the next" and a screen that blinked. More mail
+    /// from the SAME sender comes in from the RIGHT instead: a second newsletter
+    /// off the same list is the next item in a pile, not the next subject, and
+    /// the motion should say which of the two you are getting.
+    ///
+    /// TWO BEATS, EXPLICITLY TIMED, and driven by offsets rather than by a
+    /// SwiftUI transition: a transition is the framework's to choose at the
+    /// moment a view is inserted or removed, and when it declines to use yours it
+    /// substitutes a crossfade. The departure runs concurrently with the round
+    /// trip — the email is going either way — and only the leftover of its
+    /// 220ms is ever waited on.
     private func doneAndNext() async {
         let queue = store.threadQueue
         guard let cur = queue.firstIndex(where: { $0.thread_id == threadId }) else {
             // Not opened from a queue (search, a right-rail record): `e` still
-            // means done — resolve the newest message directly and close.
-            if let newestChrono = thread?.messages.last {
+            // means done — resolve the newest message directly and close. It
+            // still leaves the same way; there is simply nothing behind it.
+            let liftedAt = liftOff()
+            if let newest {
                 do {
-                    try await APIClient.shared.setStatus(newestChrono.id, .done)
+                    try await APIClient.shared.setStatus(newest.id, .done)
                     // Same unpin as Actions.done — this path resolves the
                     // message without going through it.
-                    await ImageStore.shared.release(messageId: newestChrono.id)
+                    await ImageStore.shared.release(messageId: newest.id)
                     // And the same optimistic drop: the surface underneath is
                     // still mounted, so without this the reader closes back
                     // onto a row for mail that is already done.
-                    store.noteResolved(newestChrono.id)
+                    store.noteResolved(newest.id)
                     store.pushToast("done", .info)
                 } catch {
                     store.pushToast(errText(error, "done failed"), .error)
                 }
             }
+            await flightOut(since: liftedAt)
             store.closeThread()
             return
         }
+
+        let next = queue[safe: cur + 1]
+        let liftedAt = liftOff()
         await Actions.done(queue[cur])
-        if let next = queue[safe: cur + 1] {
-            store.openThread(next.thread_id, queue: queue)
-        } else {
+        await flightOut(since: liftedAt)
+
+        // The reader can be closed while the email is still leaving — Esc, or
+        // another surface taking the screen. A done+next that outlived its own
+        // reader must not haul the next thread back onto a page nobody is on.
+        guard store.threadId == threadId else { return }
+
+        guard let next else {
+            // Nothing behind it: the queue is finished, and the reader leaves
+            // with the email rather than snapping back to show an empty one.
             store.closeThread()
+            return
         }
+        let edge: AppStore.ThreadEdge = sameSender(next, queue[cur]) ? .trailing : .bottom
+        // Mounted OFF SCREEN, unanimated, and walked in on the next frame. The
+        // sleep is the whole reason this works: an offset that is set and
+        // cleared inside one update has never been drawn, so there is nothing
+        // for the animation to move away from.
+        store.openThread(next.thread_id, queue: queue, entering: edge)
+        try? await Task.sleep(for: .milliseconds(30))
+        withAnimation(Motion.deckCard) { store.threadFlight = .settled }
+    }
+
+    /// Beat one: lift the finished email out through the top of the window, and
+    /// hand back when it started so the wait can be the REMAINDER of the flight
+    /// rather than the whole of it on top of the round trip.
+    private func liftOff() -> ContinuousClock.Instant {
+        withAnimation(Motion.depart) { store.threadFlight = .departing }
+        return .now
+    }
+
+    /// Wait out whatever is left of the departure. Zero when the daemon took
+    /// longer to answer than the email took to leave, which is the common case.
+    private func flightOut(since start: ContinuousClock.Instant) async {
+        let flown = ContinuousClock.now - start
+        guard flown < Motion.departTime else { return }
+        try? await Task.sleep(for: Motion.departTime - flown)
+    }
+
+    /// Same correspondent, by canonical address — the newsletter case, where
+    /// "next" means another one off the same pile.
+    private func sameSender(_ a: AttentionUpdate, _ b: AttentionUpdate) -> Bool {
+        let canon = { (s: String) in s.trimmingCharacters(in: .whitespaces).lowercased() }
+        return canon(a.sender) == canon(b.sender)
     }
 
     // MARK: - data
 
     private func load() async {
         // A fresh thread mounts fresh rows; what was visible of the LAST one
-        // must not anchor this one.
+        // must not anchor this one, and its shape must not be what the minimap
+        // draws for a thread this one knows nothing about yet.
         visibleIndices.removeAll()
+        map.forget()
+        newestHeight = 0
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
@@ -794,7 +982,10 @@ struct ThreadViewer: View {
     /// Take a loaded thread and derive its reader state.
     private func adopt(_ view: ClientThreadView) {
         thread = view
-        index = 0  // newest renders first — land on it
+        // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
+        // what lets the scroll put it at the top of the window rather than the
+        // bottom.
+        index = max(0, view.messages.count - 1)
         // What the ⌘K agent is told it is looking at. Lifted into the store
         // because the ask bar is a modal above this view and cannot see its
         // state, and written HERE because this is the one place a thread lands
@@ -882,11 +1073,11 @@ struct ThreadViewer: View {
     }
 
     private func retriageThis() async {
-        guard let newestChrono = thread?.messages.last, !retriaging else { return }
+        guard let newest, !retriaging else { return }
         retriaging = true
         defer { retriaging = false }
         do {
-            let result = try await APIClient.shared.retriage(.message(newestChrono.id))
+            let result = try await APIClient.shared.retriage(.message(newest.id))
             store.pushToast(
                 result.reset > 0 ? "re-triaging this email…" : "nothing to re-triage here", .info)
         } catch {
@@ -895,9 +1086,9 @@ struct ThreadViewer: View {
     }
 
     private func openDebug() async {
-        guard let newestChrono = thread?.messages.last else { return }
+        guard let newest else { return }
         do {
-            debugInfo = try await APIClient.shared.getTriageDebug(newestChrono.id)
+            debugInfo = try await APIClient.shared.getTriageDebug(newest.id)
         } catch {
             store.pushToast(errText(error, "debug fetch failed"), .error)
         }

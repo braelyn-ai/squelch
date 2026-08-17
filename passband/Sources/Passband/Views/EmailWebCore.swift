@@ -62,7 +62,6 @@ struct EmailWebView: View {
         var trackers: Int
         var trackersAllowed: Bool
         var hasRemoteCandidates: Bool
-        var links: [EmailLink]
         /// The ORIGINAL http(s) urls behind this body's proxied references, in
         /// document order, capped (ImageProxy.maxWarmURLs) — what the launch
         /// warmer pre-fetches and pins, not the full uncapped render set.
@@ -70,7 +69,7 @@ struct EmailWebView: View {
 
         static let empty = Prepared(
             sourceHash: 0, html: "", trackers: 0, trackersAllowed: false,
-            hasRemoteCandidates: false, links: [], imageURLs: [])
+            hasRemoteCandidates: false, imageURLs: [])
 
         static func make(from html: String, allowTrackers: Bool = false) -> Prepared
         {
@@ -92,8 +91,7 @@ struct EmailWebView: View {
             // repeats has nothing left to fetch, so it must not offer the
             // "load remote images" bar.
             let hasRemoteCandidates = Trackers.hasNetworkImages(deduped)
-            let links = Trackers.extractLinks(deduped)
-            // LAST, after the two reads above: the rewrite replaces every http(s)
+            // LAST, after the read above: the rewrite replaces every http(s)
             // image reference with a `passband-img:` one, which those scans would
             // no longer recognise as remote.
             let proxied = ImageProxy.rewrite(deduped)
@@ -103,7 +101,6 @@ struct EmailWebView: View {
                 trackers: stripped.blocked,
                 trackersAllowed: allowTrackers,
                 hasRemoteCandidates: hasRemoteCandidates,
-                links: links,
                 imageURLs: proxied.urls)
         }
 
@@ -118,7 +115,6 @@ struct EmailWebView: View {
     }
 
     private var allowRemote: Bool { prefs.loadRemoteImages || optedIn }
-    private static let maxLinks = 8
 
     /// Spin WebKit up BEFORE the first email is opened: the FIRST WKWebView in a
     /// process pays for launching the content process, and that landed on the
@@ -188,8 +184,6 @@ struct EmailWebView: View {
                 .buttonStyle(.textAction)
                 .help("the quoted reply chain below this message")
             }
-
-            linkRow
         }
         .onAppear {
             if let cacheKey, let remembered = FrameHeights.shared.get(cacheKey) {
@@ -282,40 +276,6 @@ struct EmailWebView: View {
         }
     }
 
-    @ViewBuilder
-    private var linkRow: some View {
-        let shown = Array(prepared.links.prefix(Self.maxLinks))
-        if !shown.isEmpty {
-            VStack(alignment: .leading, spacing: 5) {
-                Text("links open externally")
-                    .font(Typo.micro)
-                    .foregroundStyle(Palette.inkFaintest)
-                FlowLayout(spacing: 6) {
-                    ForEach(shown) { link in
-                        Button {
-                            Opener.open(link.href)
-                        } label: {
-                            Text(Newsletters.truncate(link.text, 42))
-                                .font(Typo.micro)
-                                .lineLimit(1)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                        }
-                        .buttonStyle(.glass)
-                        .foregroundStyle(Palette.accent)
-                        .help(link.href)
-                    }
-                    if prepared.links.count > shown.count {
-                        Text("+\(prepared.links.count - shown.count) more")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaintest)
-                            .padding(.vertical, 4)
-                    }
-                }
-            }
-            .padding(.top, 2)
-        }
-    }
 }
 
 // MARK: - the frame, before a view system touches it

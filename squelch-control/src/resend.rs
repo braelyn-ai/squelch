@@ -119,10 +119,11 @@ impl ResendClient {
 
     /// Mail one invite code to one address.
     ///
-    /// `signup_url` is where the code is redeemed; it is rendered as a plain
-    /// link and the code is NOT put in it. A code in a query string is a code
-    /// in an edge log, a referrer header, and a browser history, which is the
-    /// one place this crate promises it never goes.
+    /// `signup_url` is where the code is redeemed. The message carries it BOTH
+    /// ways: a one-click link with the code in a query string (see
+    /// [`invite_link`], which is where that trade is written down), and the bare
+    /// URL beside the bare code, for a client that mangles the link or a person
+    /// finishing on another device.
     ///
     /// Returns `Ok(())` once the provider has ACCEPTED the message. That is not
     /// delivery, and the caller's stamp says exactly that much.
@@ -180,40 +181,90 @@ fn is_recipient(to: &str) -> bool {
         && to.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// The one-click link: the signup page with the code already in the field.
+///
+/// THE CODE IS IN A QUERY STRING, which this crate's first draft refused to do.
+/// Every reason it gave still holds: the edge's access log, the recipient's
+/// history, and any proxy between them each keep a live code until it is
+/// redeemed or lapses. It is a recorded trade for the click, made 2026-08-14,
+/// and the code being single use is what bounds it. See
+/// [`crate::handlers::signup_form`], which reads the parameter back.
+///
+/// Percent encoded even though a code is only ever Crockford base32 and dashes:
+/// "only ever, today" is the assumption that breaks quietly later.
+fn invite_link(code: &str, signup_url: &str) -> String {
+    format!(
+        "{}/?invite={}",
+        signup_url.trim_end_matches('/'),
+        crate::pages::percent_encode(code)
+    )
+}
+
 /// The plain-text part. The code sits on its own line so that every mail client
-/// in the world lets someone select it.
+/// in the world lets someone select it, because the link above it is the fast
+/// path and not the only one: a client that mangles long URLs, a forwarded
+/// message, and a code typed on a different device all land on the same field.
 fn text_body(code: &str, signup_url: &str) -> String {
     format!(
-        "you're in.
+        "open this and your invite code will already be filled in:
 
-here is your Passband invite code:
+{link}
+
+or go to {signup_url} and paste it in yourself:
 
 {code}
-
-paste it at {signup_url} to set up your hosted mailbox.
 
 the code works once and expires in {ttl} days. if it lapses, just ask again and
 we will send a fresh one.
 ",
+        link = invite_link(code, signup_url),
         ttl = crate::invites::DEFAULT_TTL_DAYS,
     )
 }
 
+/// Where the mark is served from. Hardcoded to the project's own site rather
+/// than derived from the deployment's origin, because that is the only host
+/// `brand/build.sh` publishes to; a self-hoster's own origin would 404. The
+/// tradeoff is that a self-hoster's recipients fetch an image from us, which is
+/// part of why the wordmark beside it is live text — see [`html_body`].
+///
+/// The groundless mark, not the icon: a mail body is white, so a tile would put
+/// a light rectangle on a light page. The 512px asset is deliberately larger
+/// than the 56px it renders at, because mail reaches retina screens.
+const MARK_URL: &str = "https://passband.app/mark.png";
+
 /// The HTML part. Everything interpolated is escaped, including values this
 /// crate produced itself: "this one was checked already" is how the exception
 /// becomes the rule.
+///
+/// The mark is a remote image, so assume it will not load: mail clients block
+/// remote content by default, and the ones that do not may proxy and pre-fetch
+/// it. The wordmark beside it is live text rather than part of the image, so a
+/// blocked mark leaves the name standing on its own instead of leaving a hole
+/// where the branding was. Its `alt` is empty for the same reason — with the
+/// name already in text, alt text would render it twice.
+///
+/// Laid out as a table because that is the only horizontal alignment Outlook
+/// honours; float and inline-block both collapse there.
 fn html_body(code: &str, signup_url: &str) -> String {
+    let link = escape_html(&invite_link(code, signup_url));
     let code = escape_html(code);
     let url = escape_html(signup_url);
     format!(
         r#"<div style="font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a;">
-<p>you're in.</p>
-<p>here is your Passband invite code:</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin: 0 0 24px;"><tr>
+<td style="padding-right: 12px;"><img src="{mark}" alt="" width="56" height="30" style="display: block; border: 0;"></td>
+<td style="font: 21px/1 Georgia, 'Times New Roman', serif; color: #1a1a1a; vertical-align: middle;">Passband</td>
+</tr></table>
+<p>Passband runs a mailbox daemon for you. This link opens the signup page with
+your invite code already filled in:</p>
+<p><a href="{link}" style="display: inline-block; background: #1a1a1a; color: #fbfaf8; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 500;">Set up your mailbox</a></p>
+<p style="color: #6b6b6b;">or go to <a href="{url}">{url}</a> and paste the code in yourself:</p>
 <p style="font: 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; background: #f3f1ed; border-radius: 8px; padding: 14px 16px; display: inline-block;">{code}</p>
-<p>paste it at <a href="{url}">{url}</a> to set up your hosted mailbox.</p>
 <p style="color: #6b6b6b;">the code works once and expires in {ttl} days. if it lapses, just ask again and we will send a fresh one.</p>
 </div>
 "#,
+        mark = MARK_URL,
         ttl = crate::invites::DEFAULT_TTL_DAYS,
     )
 }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::error::{CoreError, Result};
+use crate::text::truncate_chars;
 
 mod fastembed_impl;
 
@@ -40,9 +41,7 @@ pub struct EmbedSettings {
     pub cache_dir: PathBuf,
 }
 
-/// Flatten a message into embed text: subject, blank line, body, truncated to
-/// `max_chars` on a char boundary. MUST be the identical shaping at ingest and at
-/// query time, or the vector space is inconsistent.
+/// Flatten a message into the canonical text used at both ingest and query time.
 pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String {
     let mut s = String::with_capacity(subject.len() + body.len() + 2);
     s.push_str(subject.trim());
@@ -51,14 +50,6 @@ pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String
         s.push_str(body.trim());
     }
     truncate_chars(&s, max_chars)
-}
-
-/// Truncate to at most `max_chars` characters without splitting a UTF-8 char.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    match s.char_indices().nth(max_chars) {
-        Some((byte_idx, _)) => s[..byte_idx].to_string(),
-        None => s.to_string(),
-    }
 }
 
 /// Default number of characters of `subject + body` fed to the embedder.

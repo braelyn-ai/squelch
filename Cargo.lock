@@ -4707,6 +4707,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "squelch-ratelimit",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -4805,6 +4806,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "squelch-ratelimit"
+version = "0.0.1"
+dependencies = [
+ "http",
+]
+
+[[package]]
 name = "squelch-relay"
 version = "0.0.1"
 dependencies = [
@@ -4817,6 +4825,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squelch-httpauth",
+ "squelch-ratelimit",
  "thiserror 2.0.18",
  "tokio",
  "tower",

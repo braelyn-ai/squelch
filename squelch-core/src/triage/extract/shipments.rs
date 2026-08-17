@@ -19,13 +19,18 @@
 //!   2. `item_name` is a SHOPPER'S name for the goods, never boilerplate and
 //!      never the subject line copied back — [`sanitize_item_name`] rejects
 //!      both, so the client falls back to its own label instead of showing
-//!      "your package".
+//!      "your package". It runs the answer through the REGEX path's own
+//!      laundering on top of that, so a model that echoes status prose, a
+//!      tracking number, a link or a right-to-left override gets no more trust
+//!      than the same text lifted out of a subject line.
 
 use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::ExtractQueued;
 use crate::triage::extract::{ExtractContext, build_extract_user_message};
 use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, classify_entrypoint};
-use crate::triage::shipment::{ShipmentStatus, is_ambiguous_tracking_shape};
+use crate::triage::shipment::{
+    ShipmentStatus, clean_item_phrase, extract_item_name, is_ambiguous_tracking_shape,
+};
 use crate::triage::text::{rx, truncate_trimmed};
 use crate::types::AccountId;
 use chrono::{DateTime, Utc};
@@ -263,22 +268,51 @@ fn echoes_subject(item: &str, subject: &str) -> bool {
     subj.contains(&name) && name_len * 10 >= subj_len * 9
 }
 
-/// Reduce a model-emitted item name to a storable phrase, or `None`: trimmed,
-/// capped at 120 chars, boilerplate and subject echoes refused.
+/// Reduce a model-emitted item name to a SAFE display name, or `None`. UNTRUSTED
+/// model text derived from email content, so it is laundered exactly as hard as
+/// a phrase lifted out of a subject, and then some:
+///   * non-whitespace CONTROL characters and BIDI controls are removed — a
+///     U+202E answer would render the whole shipment card right-to-left, and a
+///     C0 escape could smuggle terminal control into logs and the two doors;
+///   * a SUBJECT ECHO is refused (checked FIRST, on the raw answer: the strip
+///     below would reduce an echoed subject to an innocent-looking fragment and
+///     launder the echo away);
+///   * [`clean_item_phrase`] strips tracking numbers, long digit runs, URLs and
+///     carrier names, collapses whitespace and caps length;
+///   * a SCHEMELESS HOST LURE ("bit.ly/claim") is refused outright — the URL
+///     strip only catches `http(s)://` forms, and a dot-then-slash token reads
+///     as a clickable destination rather than a product;
+///   * [`extract_item_name`] applies the regex path's own boilerplate strip and
+///     its generic/filler refusal, so a model echoing status prose ("Package is
+///     on its way") is no stickier than the same subject would have been.
 pub fn sanitize_item_name(raw: Option<&str>, subject: &str) -> Option<String> {
-    let name = raw?.trim();
-    if name.is_empty()
-        || crate::triage::shipment::is_generic_item(name)
-        || echoes_subject(name, subject)
+    let plain: String = raw?
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .collect();
+    let plain = plain.trim();
+    if plain.is_empty() || echoes_subject(plain, subject) {
+        return None;
+    }
+    let cleaned = clean_item_phrase(plain);
+    // A dot-then-slash inside one token reads as a clickable destination, not a
+    // product ("bit.ly/x", "evil.example/claim") — refuse rather than display.
+    // A dot ALONE is still a plausible name ("Dr. Martens 1460").
+    static HOST_LURE: OnceLock<Regex> = OnceLock::new();
+    if HOST_LURE
+        .get_or_init(|| rx(r"\b\S+\.\S+/\S+"))
+        .is_match(&cleaned)
     {
         return None;
     }
-    let capped = truncate_trimmed(name, 120);
-    if capped.is_empty() {
-        None
-    } else {
-        Some(capped)
-    }
+    let name = extract_item_name(&cleaned);
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Map a model-emitted carrier onto the stored slug vocabulary. "other", null,
@@ -441,6 +475,7 @@ pub async fn classify_at(
         system: build_system_prompt(),
         user: &user,
         schema: output_schema(),
+        effort: cfg.effort.as_deref(),
     };
     // No post-parse validation here: every field is bounded and shape-checked in
     // [`apply_result`], so the parsed record IS the outcome.
@@ -739,12 +774,109 @@ mod tests {
                 .as_deref(),
             Some("Double Take mirror")
         );
+        // CHANGED from a 120-char cap: the answer now goes through
+        // `clean_item_phrase`, the regex path's own laundering, whose cap is 60.
+        // One cap for both paths beats two, and no real product name is 60 chars.
         assert_eq!(
             sanitize_item_name(Some(&"x".repeat(500)), subject)
                 .unwrap()
                 .chars()
                 .count(),
-            120
+            60
+        );
+    }
+
+    #[test]
+    fn status_prose_answers_are_laundered_like_subjects() {
+        // The model echoing status boilerplate must not become a sticky 'llm'
+        // name: the SAME phrase-level strip the regex path applies to subjects
+        // runs here, so these all reduce to None.
+        let subject = "Your UPS delivery";
+        for raw in [
+            "Package is on its way",
+            "Your order has shipped",
+            "Shipped!",
+            "Your package is with its carrier",
+            "package now with its carrier!",
+            "arriving soon",
+        ] {
+            assert_eq!(
+                sanitize_item_name(Some(raw), subject),
+                None,
+                "{raw:?} must drop"
+            );
+        }
+        // And a real name wrapped in boilerplate keeps only the name.
+        assert_eq!(
+            sanitize_item_name(Some("Your Espresso Machine is on its way"), subject).as_deref(),
+            Some("Espresso Machine")
+        );
+    }
+
+    #[test]
+    fn control_and_bidi_characters_are_stripped() {
+        // A U+202E (RLO) answer would render the shipment card right-to-left;
+        // C0 controls could smuggle terminal escapes into logs/UI.
+        let subject = "Your UPS delivery";
+        assert_eq!(
+            sanitize_item_name(
+                Some("Allbirds\u{202E} Wool\u{0007} Runners\u{200F}"),
+                subject
+            )
+            .as_deref(),
+            Some("Allbirds Wool Runners")
+        );
+        assert_eq!(
+            sanitize_item_name(Some("\u{2066}\u{202D}\u{202E}"), subject),
+            None,
+            "an answer that is ONLY direction controls drops"
+        );
+    }
+
+    #[test]
+    fn schemeless_host_lures_are_refused() {
+        // clean_item_phrase strips http(s) URLs; a bare host/path lure has no
+        // scheme to strip, so the whole answer is refused instead.
+        let subject = "Your UPS delivery";
+        for raw in [
+            "bit.ly/claim",
+            "Claim your prize at bit.ly/x",
+            "evil.example/track",
+        ] {
+            assert_eq!(
+                sanitize_item_name(Some(raw), subject),
+                None,
+                "{raw:?} must drop"
+            );
+        }
+        // A dot alone (no path) is still a plausible product name, and a hyphen
+        // inside a word survives the separator strip.
+        assert_eq!(
+            sanitize_item_name(Some("Dr. Martens 1460"), subject).as_deref(),
+            Some("Dr. Martens 1460")
+        );
+        assert_eq!(
+            sanitize_item_name(Some("Anker USB-C charger"), subject).as_deref(),
+            Some("Anker USB-C charger")
+        );
+    }
+
+    #[test]
+    fn tracking_numbers_and_urls_are_laundered_out_of_the_name() {
+        // A steered model emitting a tracking number or link as the "name" is
+        // stripped by the shared laundering; a number-only answer drops to None.
+        let subject = "Your UPS delivery";
+        assert_eq!(
+            sanitize_item_name(Some("1Z999AA10123456784"), subject),
+            None
+        );
+        assert_eq!(
+            sanitize_item_name(Some("https://evil.example/claim"), subject),
+            None
+        );
+        assert_eq!(
+            sanitize_item_name(Some("Espresso Machine 1Z999AA10123456784"), subject).as_deref(),
+            Some("Espresso Machine")
         );
     }
 

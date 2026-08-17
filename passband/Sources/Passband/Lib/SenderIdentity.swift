@@ -259,7 +259,7 @@ enum SenderID {
             if !local.isEmpty { return local }
         }
         if isRobot(sender), let base = baseLabel(sender) {
-            return base.prefix(1).uppercased() + base.dropFirst()
+            return Fmt.capitalizingFirst(base)
         }
         return p.addr
     }

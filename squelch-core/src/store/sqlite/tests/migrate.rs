@@ -679,6 +679,19 @@ fn migrate_adds_shipment_provenance_and_backfills_it_from_the_pointer() {
         )
         .unwrap()
     };
+    // `item_name_source` lands on the same seam with NO backfill: every
+    // historical name came from the ingest detector, so 'regex' is the truth and
+    // the extractor is free to replace any of them.
+    let source = |id: i64| -> String {
+        conn.query_row(
+            "SELECT item_name_source FROM shipments WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(source(1), "regex");
+    assert_eq!(source(2), "regex");
     assert_eq!(
         row(1),
         (Some(7), Some(7), Some("shopa.com".to_string())),

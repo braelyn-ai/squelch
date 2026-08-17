@@ -69,7 +69,12 @@ fn extract_bump_usage_records_its_own_ledger_category() {
             acct,
             "2026-07-23",
             "extract_banking",
-            UsageTokens { input: 500, output: 20, cache_creation: 700, cache_read: 3000 },
+            UsageTokens {
+                input: 500,
+                output: 20,
+                cache_creation: 700,
+                cache_read: 3000,
+            },
         )
         .unwrap();
     store
@@ -77,7 +82,12 @@ fn extract_bump_usage_records_its_own_ledger_category() {
             acct,
             "2026-07-23",
             "extract_banking",
-            UsageTokens { input: 300, output: 10, cache_creation: 300, cache_read: 1000 },
+            UsageTokens {
+                input: 300,
+                output: 10,
+                cache_creation: 300,
+                cache_read: 1000,
+            },
         )
         .unwrap();
     let conn = store.lock().unwrap();
@@ -98,20 +108,27 @@ fn extract_bump_usage_records_its_own_ledger_category() {
 }
 
 #[test]
-fn stage1_queue_selects_normal_unrefined_excludes_rule_and_sealed() {
+fn stage1_queue_takes_every_normal_row_including_rule_decided_ones() {
     let (store, acct) = store();
 
     // Normal, non-rule row -> enters the Stage-1 LLM queue.
     let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
-    // Explicit rule (confident) -> decided; NO Stage-1 model spend.
-    triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
-    // Sealed -> never queued for any LLM.
+    // A Squelch/Surface rule row ALSO enters it. The rule settles what the user
+    // sees; it does not settle the category, the deadline, or the revisit
+    // schedule, and those are worth having on a row nobody looks at.
+    let ruled = triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
+    // Sealed -> never queued for any LLM, rule or no rule.
     triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed).ingest(&store);
 
     let q = store.stage1_queue(acct, 10).unwrap();
-    assert_eq!(q.len(), 1, "only the normal, non-rule row needs Stage-1");
-    assert_eq!(q[0].message_id, normal);
-    assert_eq!(q[0].sensitivity, Sensitivity::Normal);
+    let ids: Vec<i64> = q.iter().map(|r| r.message_id).collect();
+    assert_eq!(q.len(), 2, "both normal rows need Stage-1: {ids:?}");
+    assert!(ids.contains(&normal));
+    assert!(
+        ids.contains(&ruled),
+        "a rule row is not a reason to skip a model"
+    );
+    assert!(q.iter().all(|r| r.sensitivity == Sensitivity::Normal));
 }
 
 // ---- the SHIPMENTS extractor's own queue --------------------------------
@@ -328,10 +345,12 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
     let donor = triaged_row(acct, "g-donor", "t1", None, false, Sensitivity::Normal)
         .ship_extract(true)
         .ingest(&store);
-    // The FEEDER is rule-decided, so it never resets — which is the whole point:
-    // the rows below survive the reset and must still lose the donated text.
+    // The FEEDER carries a FILTERED rule, which is the marker that still sits
+    // outside the reset scope ('rule'), so it never resets — which is the whole
+    // point: the rows below survive the reset and must still lose the donated
+    // text.
     let feeder =
-        triaged_row(acct, "g-feeder", "t2", Some(7), true, Sensitivity::Normal).ingest(&store);
+        triaged_row(acct, "g-feeder", "t2", Some(7), false, Sensitivity::Normal).ingest(&store);
 
     let sid = store
         .upsert_shipment(
@@ -351,7 +370,9 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
         let conn = store.lock().unwrap();
         // The donation: the donor's extraction named a package another mail feeds.
         conn.execute(
-            "UPDATE shipments SET item_name='Anker charger', item_name_msg=?2 WHERE id=?1",
+            "UPDATE shipments SET item_name='Anker charger', item_name_msg=?2,
+                 item_name_source='llm'
+             WHERE id=?1",
             params![sid, donor],
         )
         .unwrap();
@@ -375,14 +396,19 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
     assert_eq!(listed[0].item_name, "", "the donated name is gone");
 
     let conn = store.lock().unwrap();
-    let ship_prov: Option<i64> = conn
+    let (ship_prov, ship_source): (Option<i64>, String) = conn
         .query_row(
-            "SELECT item_name_msg FROM shipments WHERE id=?1",
+            "SELECT item_name_msg, item_name_source FROM shipments WHERE id=?1",
             params![sid],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(ship_prov, None, "and so is its provenance");
+    assert_eq!(
+        ship_source, "regex",
+        "BOTH halves of the provenance reset: an 'llm' marker with no name left \
+         would lock the row out of taking a regex name on re-extraction"
+    );
     let (order_name, order_prov): (String, Option<i64>) = conn
         .query_row(
             "SELECT item_name, item_name_msg FROM shipment_orders WHERE account_id=?1",
@@ -398,11 +424,15 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
 }
 
 #[test]
-fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
+fn retriage_reset_requeues_llm_rows_but_never_filtered_or_sealed() {
     let (store, acct) = store();
 
     let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
-    triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
+    // A FILTERED rule row keeps the 'rule' marker (its verdict is pending a
+    // Stage-2 want_text read) and stays outside the reset scope. A
+    // Squelch/Surface row no longer does: it is an ordinary model-classified row
+    // whose rule simply reapplies on the way back through.
+    triaged_row(acct, "g-f", "t-f", Some(7), false, Sensitivity::Normal).ingest(&store);
     triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed).ingest(&store);
 
     // Simulate the LLM having classified the normal row (leaves the queue).
@@ -420,7 +450,7 @@ fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
 
     // Window re-triage: only the LLM-classified normal row resets.
     let n = store.retriage_reset(acct, None, 7).unwrap();
-    assert_eq!(n, 1, "rule + sealed rows must never reset");
+    assert_eq!(n, 1, "filtered + sealed rows must never reset");
     let q = store.stage1_queue(acct, 10).unwrap();
     assert_eq!(q.len(), 1);
     assert_eq!(q[0].message_id, normal);
@@ -443,13 +473,32 @@ fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
     assert_eq!(sealed_reset, 0);
 }
 
+/// A Squelch/Surface rule still classifies, but it does NOT escalate: the row
+/// enters Stage-1 and stops there, because a second opinion cannot change a
+/// visibility the account owner has already settled.
 #[test]
-fn explicit_rule_row_skips_both_llm_queues() {
+fn explicit_rule_row_classifies_once_and_never_escalates() {
     let (store, acct) = store();
-    // A Squelch/Surface rule row is final: not in Stage-1, not in Stage-2.
-    triaged_row(acct, "g-r", "t-r", Some(9), true, Sensitivity::Normal).ingest(&store);
-    assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
-    assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    let id = triaged_row(acct, "g-r", "t-r", Some(9), true, Sensitivity::Normal).ingest(&store);
+    assert_eq!(
+        store.stage1_queue(acct, 10).unwrap().len(),
+        1,
+        "the rule row gets its model verdict"
+    );
+    assert!(
+        store.stage2_queue(acct, 10).unwrap().is_empty(),
+        "a rule row is seeded un-escalated"
+    );
+    let needs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT needs_stage2 FROM triage WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(needs, 0);
 }
 
 #[test]
@@ -481,13 +530,14 @@ fn stage1_apply_confident_false_escalates_true_does_not() {
         one_line: "refined".into(),
         reason: "stage-1".into(),
         field_reasons: crate::types::FieldReasons::default(),
-        stage1_model_used: "claude-haiku-4-5".into(),
+        stage1_model_used: "claude-opus-5".into(),
         needs_stage2,
+        escalation_reason: needs_stage2.then_some("boundary"),
         deadline: None,
         category: Some("general".into()),
     };
-    store.stage1_apply(&applied(a, false)).unwrap(); // confident -> final
-    store.stage1_apply(&applied(b, true)).unwrap(); // not confident -> escalate
+    store.stage1_apply(&applied(a, false)).unwrap(); // router found nothing -> final
+    store.stage1_apply(&applied(b, true)).unwrap(); // router escalated
 
     // Both left the Stage-1 queue.
     assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
@@ -524,10 +574,27 @@ fn stage1_mark_processed_preserves_needs_stage2_seed() {
 fn stage1_usage_ledger_is_a_separate_category() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 20, cache_creation: 40, cache_read: 900 })
+        .stage1_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 100,
+                output: 20,
+                cache_creation: 40,
+                cache_read: 900,
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 500, output: 90, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 500,
+                output: 90,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let s1 = store.stage1_usage_since(acct, "2026-07-01").unwrap();
@@ -555,10 +622,26 @@ fn stage1_usage_ledger_is_a_separate_category() {
 fn list_usage_by_category_surfaces_extractors_nobody_named() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 20, ..Default::default() })
+        .stage1_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 100,
+                output: 20,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 500, output: 90, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 500,
+                output: 90,
+                ..Default::default()
+            },
+        )
         .unwrap();
     // An extractor category, and a category invented right here: the point of
     // enumerating is that a ledger writer added LATER still reports, without
@@ -568,7 +651,11 @@ fn list_usage_by_category_surfaces_extractors_nobody_named() {
             acct,
             "2026-07-09",
             "extract_banking",
-            UsageTokens { input: 40, output: 8, ..Default::default() },
+            UsageTokens {
+                input: 40,
+                output: 8,
+                ..Default::default()
+            },
         )
         .unwrap();
     store
@@ -576,7 +663,11 @@ fn list_usage_by_category_surfaces_extractors_nobody_named() {
             acct,
             "2026-07-10",
             "extract_something_new",
-            UsageTokens { input: 7, output: 3, ..Default::default() },
+            UsageTokens {
+                input: 7,
+                output: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -903,10 +994,28 @@ fn stage2_usage_ledger_bumps_and_reads() {
     assert_eq!(z, Stage2Usage::default());
 
     store
-        .stage2_bump_usage(acct, day, UsageTokens { input: 1200, output: 60, cache_creation: 500, cache_read: 4000 })
+        .stage2_bump_usage(
+            acct,
+            day,
+            UsageTokens {
+                input: 1200,
+                output: 60,
+                cache_creation: 500,
+                cache_read: 4000,
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, day, UsageTokens { input: 800, output: 40, cache_creation: 100, cache_read: 2000 })
+        .stage2_bump_usage(
+            acct,
+            day,
+            UsageTokens {
+                input: 800,
+                output: 40,
+                cache_creation: 100,
+                cache_read: 2000,
+            },
+        )
         .unwrap();
     let u = store.stage2_usage_today(acct, day).unwrap();
     assert_eq!(u.calls, 2);
@@ -930,16 +1039,48 @@ fn list_usage_returns_recent_days_newest_first() {
     assert!(store.list_usage(acct, 30).unwrap().is_empty());
 
     store
-        .stage2_bump_usage(acct, "2026-07-07", UsageTokens { input: 100, output: 10, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-07",
+            UsageTokens {
+                input: 100,
+                output: 10,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 200, output: 20, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-08",
+            UsageTokens {
+                input: 200,
+                output: 20,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 300, output: 30, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 300,
+                output: 30,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 10, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 100,
+                output: 10,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Newest-first, sparse (only days with a row).
@@ -1090,13 +1231,37 @@ fn stage2_usage_since_sums_window_inclusively() {
     );
 
     store
-        .stage2_bump_usage(acct, "2026-07-05", UsageTokens { input: 100, output: 10, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-05",
+            UsageTokens {
+                input: 100,
+                output: 10,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 200, output: 20, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-08",
+            UsageTokens {
+                input: 200,
+                output: 20,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 300, output: 30, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-08",
+            UsageTokens {
+                input: 300,
+                output: 30,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // since_day <= earliest => everything summed (2 days, 3 calls).
@@ -1373,6 +1538,7 @@ fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
         field_reasons: crate::types::FieldReasons::default(),
         stage1_model_used: "claude-haiku-4-5".into(),
         needs_stage2: false,
+        escalation_reason: None,
         deadline: Some(DeadlineHit {
             kind: "bill".into(),
             amount: Some(10.0),
@@ -1414,4 +1580,340 @@ fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
         store.stage1_apply(&ok).unwrap(),
         "normal row: apply reports true"
     );
+}
+
+// ---- SCHEDULED RE-EVALUATION -------------------------------------------
+
+use crate::triage::revisit::{RevisitRequest, RevisitSource};
+
+fn req(at: DateTime<Utc>, why: &str, source: RevisitSource) -> RevisitRequest {
+    RevisitRequest {
+        at,
+        why: why.into(),
+        source,
+    }
+}
+
+#[test]
+fn a_revisit_is_invisible_until_its_date_then_comes_due() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    let due = now + chrono::Duration::days(3);
+
+    store
+        .revisits_schedule(
+            acct,
+            id,
+            &[req(due, "dinner has passed", RevisitSource::Model)],
+            now,
+        )
+        .unwrap();
+
+    // Before the date: nothing to do.
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "a future revisit must not fire early"
+    );
+
+    // After it: due, carrying the PRIOR verdict so the re-score has something
+    // to revise.
+    let q = store
+        .revisit_queue(acct, due + chrono::Duration::minutes(1), 6, 10)
+        .unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].message_id, id);
+    assert_eq!(q[0].reason, "dinner has passed");
+    assert_eq!(q[0].source, "model");
+    assert_eq!(q[0].prior_importance, 40);
+    assert_eq!(q[0].prior_one_line, "ambiguous");
+}
+
+/// Firing is once-only and charges the lifetime counter, so a message cannot be
+/// re-evaluated forever.
+#[test]
+fn firing_is_idempotent_and_spends_the_lifetime_budget() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "now", RevisitSource::Model)], now)
+        .unwrap();
+
+    let q = store.revisit_queue(acct, now, 6, 10).unwrap();
+    let rid = q[0].revisit_id;
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+    // Double-fire must not double-charge.
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "a fired revisit never comes due again"
+    );
+
+    let count: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT revisit_count FROM triage WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "fired twice, charged once");
+}
+
+/// The termination guarantee: past the lifetime cap, a message stops being
+/// re-evaluated even if something keeps scheduling it.
+#[test]
+fn the_lifetime_cap_ends_the_loop() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET revisit_count = 6 WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+    store
+        .revisits_schedule(acct, id, &[req(now, "again", RevisitSource::Model)], now)
+        .unwrap();
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "at the cap, a scheduled revisit must not fire"
+    );
+}
+
+/// THE INVARIANT THAT MATTERS MOST: a verdict the account owner fixed by hand is
+/// never overwritten by a machine, however the schedule was arrived at. Enforced
+/// twice on purpose — the queue will not hand the row out, and the apply refuses
+/// it even if something else does.
+#[test]
+fn a_human_corrected_row_is_never_re_evaluated() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "check", RevisitSource::Model)], now)
+        .unwrap();
+    assert_eq!(store.revisit_queue(acct, now, 6, 10).unwrap().len(), 1);
+
+    store
+        .correct_triage(acct, id, TriageAxis::Tier, "signal", None, now)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "the queue must not hand out a hand-corrected row"
+    );
+
+    // ...and the apply refuses it directly, too.
+    let applied = Stage1Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 5,
+        tier: Tier::Noise,
+        one_line: "machine says noise".into(),
+        reason: "re-evaluated".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        stage1_model_used: "claude-opus-5".into(),
+        needs_stage2: false,
+        escalation_reason: None,
+        deadline: None,
+        category: Some("general".into()),
+    };
+    assert!(
+        !store.revisit_apply(&applied).unwrap(),
+        "revisit_apply must refuse a hand-corrected row"
+    );
+}
+
+/// Sealed mail never gets scheduled, because firing one would put it back in
+/// front of a model.
+#[test]
+fn a_sealed_row_stores_no_schedule() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-s", "t-s", Sensitivity::Sealed);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "check", RevisitSource::Model)], now)
+        .unwrap();
+    assert!(store.revisit_queue(acct, now, 6, 10).unwrap().is_empty());
+    let n: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM triage_revisits WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "nothing is stored for sealed mail at all");
+}
+
+/// Re-scheduling replaces what is PENDING but keeps what already fired: the
+/// schedule doubles as the record of why a verdict changed.
+#[test]
+fn rescheduling_replaces_pending_and_keeps_history() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "first", RevisitSource::Model)], now)
+        .unwrap();
+    let rid = store.revisit_queue(acct, now, 6, 10).unwrap()[0].revisit_id;
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+
+    // A second pending one, then a reschedule that supersedes it.
+    let later = now + chrono::Duration::days(5);
+    store
+        .revisits_schedule(acct, id, &[req(later, "second", RevisitSource::Model)], now)
+        .unwrap();
+    store
+        .revisits_schedule(
+            acct,
+            id,
+            &[req(later, "third", RevisitSource::Deadline)],
+            now,
+        )
+        .unwrap();
+
+    let conn = store.lock().unwrap();
+    let fired: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM triage_revisits
+             WHERE account_id=?1 AND message_id=?2 AND fired_at IS NOT NULL",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM triage_revisits
+             WHERE account_id=?1 AND message_id=?2 AND fired_at IS NULL",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fired, 1, "history survives a reschedule");
+    assert_eq!(pending, 1, "only the newest pending schedule stands");
+}
+
+/// A re-evaluation clears the Stage-2 marker, so a newly escalated verdict can
+/// actually reach Stage-2 instead of being stranded behind the old one.
+#[test]
+fn a_revisit_that_escalates_can_reenter_stage2() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    // Pretend the row already completed both stages.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', model_used='claude-opus-5'
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+    assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+
+    let applied = Stage1Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 55,
+        tier: Tier::Signal,
+        one_line: "still relevant".into(),
+        reason: "re-evaluated".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        stage1_model_used: "claude-opus-5".into(),
+        needs_stage2: true,
+        escalation_reason: Some("boundary"),
+        deadline: None,
+        category: Some("general".into()),
+    };
+    assert!(store.revisit_apply(&applied).unwrap());
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q.len(), 1, "the re-escalated row must reach Stage-2");
+    assert_eq!(q[0].message_id, id);
+}
+
+// ---- WHAT AN ESCALATION BUYS -------------------------------------------
+
+/// THE SEAL INVARIANT, one level removed: a sealed sibling's subject is exactly
+/// as forbidden to a model as its body. "It was only context for another row" is
+/// not an exception, and this is the test that says so.
+#[test]
+fn thread_context_never_carries_a_sealed_sibling() {
+    let (store, acct) = store();
+    let escalated =
+        triaged_row(acct, "g-esc", "t-shared", None, false, Sensitivity::Normal).ingest(&store);
+    let normal_sib =
+        triaged_row(acct, "g-sib", "t-shared", None, false, Sensitivity::Normal).ingest(&store);
+    let sealed_sib =
+        triaged_row(acct, "g-seal", "t-shared", None, false, Sensitivity::Sealed).ingest(&store);
+
+    // Put the escalated row in the Stage-2 queue.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, escalated],
+        )
+        .unwrap();
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q.len(), 1);
+    let ids: Vec<String> = q[0].thread.iter().map(|s| s.subject.clone()).collect();
+    assert_eq!(q[0].thread.len(), 1, "only the non-sealed sibling: {ids:?}");
+    assert_ne!(escalated, normal_sib);
+    assert_ne!(escalated, sealed_sib);
+}
+
+/// An escalated row arrives knowing WHY it was escalated and what this sender's
+/// verdicts have historically been worth.
+#[test]
+fn an_escalated_row_carries_its_reason_and_the_senders_record() {
+    let (store, acct) = store();
+    let id = triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1,
+                    escalation_reason='buried_bill'
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q[0].escalation_reason.as_deref(), Some("buried_bill"));
+    // The row under judgement is NOT its own history: reporting "1 previous
+    // message" for a first-time sender says the opposite of the truth.
+    assert_eq!(
+        q[0].sender_history.total, 0,
+        "a first message from a sender has no history"
+    );
+
+    // A second message from the same sender DOES see the first.
+    let second = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, second],
+        )
+        .unwrap();
+    let q = store.stage2_queue(acct, 10).unwrap();
+    let row = q.iter().find(|r| r.message_id == second).unwrap();
+    assert_eq!(row.sender_history.total, 1);
 }

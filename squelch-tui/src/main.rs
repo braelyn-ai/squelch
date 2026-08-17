@@ -9,7 +9,6 @@ mod input;
 mod ui;
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -33,31 +32,19 @@ const DEFAULT_MIN_IMPORTANCE: u8 = 50;
 /// Live-refresh cadence.
 const TICK: StdDuration = StdDuration::from_secs(2);
 
-/// Account this viewer operates on. Goes through core config's resolver so
-/// every binary points at the same account.
-fn account_email() -> String {
-    squelch_core::config::resolve_account_email("me@localhost")
-}
-
-/// SQLite path from core config, so the TUI, MCP server, and daemon all open
-/// the same db.
-fn db_path() -> PathBuf {
-    squelch_core::config::resolve_db_path()
-}
-
 fn main() -> Result<()> {
     let demo = std::env::args().any(|a| a == "--demo");
 
     let store = if demo {
         let store = SqliteStore::open_in_memory()?;
-        let account = store.ensure_account(&account_email())?;
+        let account = store.ensure_account(&squelch_core::config::account_email())?;
         seed_fake_data(&store, account)?;
         Arc::new(store)
     } else {
-        Arc::new(SqliteStore::open(db_path())?)
+        Arc::new(SqliteStore::open(squelch_core::config::resolve_db_path())?)
     };
 
-    let account = store.ensure_account(&account_email())?;
+    let account = store.ensure_account(&squelch_core::config::account_email())?;
     let mut app = App::new(store, account, DEFAULT_MIN_IMPORTANCE)?;
 
     let mut terminal = init_terminal()?;
@@ -87,18 +74,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Truncate to a display width, appending an ellipsis when cut.
-pub fn truncate(mut s: String, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if s.chars().count() > width {
-        s = s.chars().take(width.saturating_sub(1)).collect();
-        s.push('\u{2026}');
-    }
-    s
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

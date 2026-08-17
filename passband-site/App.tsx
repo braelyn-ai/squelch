@@ -264,6 +264,12 @@ function FakeInbox() {
 // instrument in a dark room.
 const BRASS = "240, 204, 128";
 
+// The passband's half-width when the filter is fully open. Everything narrower
+// is this times the opening, which is what keeps the hump one shape instead of
+// a stretching blob. Module scope because the pointer handler sizes its travel
+// limit from it and the draw loop sizes the curve from it.
+const FULL_W = 0.19;
+
 const DOWNLOAD_CSS = `
 .pb-dl {
   position: relative;
@@ -350,6 +356,10 @@ function DownloadButton() {
   // Hover lives in a ref, not state: the rAF loop reads it every frame and CSS
   // already owns the chrome, so a re-render would buy nothing.
   const hovered = useRef(false);
+  // Where the passband is tuned to and how far it is opened, both 0..1 and both
+  // driven by the pointer: x slides the band along the button, y opens it up.
+  // Same reasoning as above: a ref, read per frame, never re-rendering.
+  const tuned = useRef({ x: 0.5, lift: 1 });
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -363,16 +373,32 @@ function DownloadButton() {
     const phase = Array.from({ length: POOL }, () => Math.random() * Math.PI * 2);
     const speed = Array.from({ length: POOL }, () => 0.7 + Math.random() * 1.9);
 
-    // The filter's frequency response: flat across the middle third, steep
-    // skirts either side. This curve is the passband the product is named for.
-    const band = (x: number) => Math.exp(-Math.pow(Math.abs(x - 0.5) / 0.19, 4));
+    // The filter's frequency response: flat across the top, steep skirts either
+    // side. This curve is the passband the product is named for. `c` is where it
+    // is tuned to and `w` how wide it is opened.
+    const band = (x: number, c: number, w: number) =>
+      Math.exp(-Math.pow(Math.abs(x - c) / w, 4));
 
     let width = 0;
     let height = 0;
     let gate = 0; // 0 = wide open (noise), 1 = filtered down to the passband
+    // The drawn centre and opening, chasing `tuned`. Eased rather than assigned
+    // so a fast cursor pulls the band along instead of teleporting it, and so
+    // leaving the button glides it home rather than snapping.
+    let centre = 0.5;
+    // Named `aperture`, not `open`: the bar loop below already has its own
+    // local `open` for a bar's unfiltered height, and reading an outer `open`
+    // earlier in that same block lands in the temporal dead zone and throws
+    // on every frame. Syntax checks do not catch it; the canvas just stays
+    // blank.
+    let aperture = 1;
 
     const render = (t: number) => {
       ctx.clearRect(0, 0, width, height);
+      // Width tracks height, so raising the cursor grows the hump rather than
+      // stretching it: the skirts spread at the same rate the peak climbs and
+      // the silhouette stays the same shape at every size.
+      const bandW = FULL_W * aperture;
       const bars = Math.max(16, Math.min(POOL, Math.round(width / 5.5)));
       const step = width / bars;
       const barW = Math.max(1.5, step - 2);
@@ -382,7 +408,7 @@ function DownloadButton() {
       // as the cause of the collapse rather than as decoration.
       if (gate > 0.01) {
         const top = (x: number) =>
-          height - (0.06 + 0.94 * band(x / width)) * maxH;
+          height - (0.06 + 0.94 * aperture * band(x / width, centre, bandW)) * maxH;
         ctx.beginPath();
         ctx.moveTo(0, height);
         for (let x = 0; x <= width; x += 2) ctx.lineTo(x, top(x));
@@ -403,7 +429,7 @@ function DownloadButton() {
 
       for (let i = 0; i < bars; i++) {
         const x = bars > 1 ? i / (bars - 1) : 0.5;
-        const response = band(x);
+        const response = aperture * band(x, centre, bandW);
         // Two incommensurate beats per bar: busy, but never repeating.
         const noise =
           0.5 +
@@ -449,6 +475,10 @@ function DownloadButton() {
       last = now;
       // Exponential approach, so the ease is the same at 60Hz and 120Hz.
       gate += ((hovered.current ? 1 : 0) - gate) * (1 - Math.exp(-dt * 9));
+      // Tuning tracks faster than the filter opens: the band should feel
+      // attached to the cursor, while the collapse into it stays a beat behind.
+      centre += (tuned.current.x - centre) * (1 - Math.exp(-dt * 16));
+      aperture += (tuned.current.lift - aperture) * (1 - Math.exp(-dt * 16));
       render(now / 1000);
       raf = requestAnimationFrame(loop);
     };
@@ -477,7 +507,36 @@ function DownloadButton() {
         className="pb-dl"
         href="/download/latest"
         onPointerEnter={() => (hovered.current = true)}
-        onPointerLeave={() => (hovered.current = false)}
+        onPointerMove={(event) => {
+          const box = event.currentTarget.getBoundingClientRect();
+          const x = (event.clientX - box.left) / (box.width || 1);
+          // Screen y grows downward and the hump grows upward, so invert: the
+          // top of the button is the filter wide open.
+          const lift = 1 - (event.clientY - box.top) / (box.height || 1);
+          // Never fully shut: at zero the hump has no height and no width, so
+          // the bars all die and the button looks broken rather than tuned. The
+          // top of the travel goes past 1, which is the meter's nominal full
+          // height, so the peak reaches up behind the label instead of stopping
+          // politely beneath it.
+          const aperture = 0.38 + 0.8 * Math.min(1, Math.max(0, lift));
+          // Clamped by the skirts' real width, not a fixed margin: a wide hump
+          // needs more room to keep both shoulders on the button than a narrow
+          // one, so the travel opens up exactly as the filter closes down. The
+          // quartic is down to a percent of peak by 1.5 half-widths, so 0.72 is
+          // where the shoulder has visually landed.
+          const edge = 0.72 * FULL_W * aperture;
+          tuned.current = {
+            x: Math.min(1 - edge, Math.max(edge, x)),
+            lift: aperture,
+          };
+        }}
+        onPointerLeave={() => {
+          hovered.current = false;
+          // Home, so the next hover starts centred and open rather than
+          // wherever the last one happened to end.
+          tuned.current = { x: 0.5, lift: 1 };
+        }}
+        // Keyboard focus has no cursor to follow, so it gets the centred band.
         onFocus={() => (hovered.current = true)}
         onBlur={() => (hovered.current = false)}
       >

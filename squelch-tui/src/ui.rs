@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use squelch_core::types::{Disposition, Tier};
 
-use crate::app::{App, Mode, RuleField, Row};
+use crate::app::{App, Mode, Row, RuleField};
 
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -40,12 +40,20 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(vec![
         Span::styled(
             " squelch ",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
         ),
         Span::raw("  "),
-        Span::styled(format!("signal {signal}"), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("signal {signal}"),
+            Style::default().fg(Color::Green),
+        ),
         Span::raw(" / "),
-        Span::styled(format!("noise {noise}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("noise {noise}"),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw("   "),
         Span::styled(
             format!("sealed {}", app.sealed.len()),
@@ -54,7 +62,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("   "),
         Span::styled(
             format!("[squelch: {}]", app.min_importance),
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
     let p = Paragraph::new(line).block(
@@ -147,7 +157,10 @@ fn render_row(
                 "{cursor}{glyph} [{:>3}] {} — {}",
                 u.importance, u.sender, u.one_line
             );
-            Line::from(Span::styled(crate::truncate(text, width), style))
+            Line::from(Span::styled(
+                squelch_core::text::truncate_ellipsis(&text, width),
+                style,
+            ))
         }
         Row::Sealed(s) => {
             let kind = s.sealed_kind.as_deref().unwrap_or("sealed");
@@ -164,23 +177,35 @@ fn render_row(
                 style = style.add_modifier(Modifier::REVERSED);
             }
             let rel = crate::app::relative_time(s.received_at, now);
-            let text = format!("{cursor}\u{1f512} {} [{}] {} ({rel})", s.from_addr, kind, body);
-            Line::from(Span::styled(crate::truncate(text, width), style))
+            let text = format!(
+                "{cursor}\u{1f512} {} [{}] {} ({rel})",
+                s.from_addr, kind, body
+            );
+            Line::from(Span::styled(
+                squelch_core::text::truncate_ellipsis(&text, width),
+                style,
+            ))
         }
         Row::SquelchLine => {
             let dashes = "\u{2500}".repeat(width.saturating_sub(15).max(3));
             Line::from(Span::styled(
                 format!("  \u{2500}\u{2500} squelch {dashes}"),
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
             ))
         }
         Row::NoiseSummary(n) => Line::from(Span::styled(
             format!("  \u{00b7} {n} below the line (press s to show)"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
         )),
         Row::Header(h) => Line::from(Span::styled(
             format!("  {h}"),
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         )),
     }
 }
@@ -239,7 +264,11 @@ fn render_detail(f: &mut Frame, view: Option<&squelch_core::types::ThreadView>, 
     }
 
     let p = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(" thread detail "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" thread detail "),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
@@ -256,7 +285,11 @@ fn render_rule_editor(f: &mut Frame, app: &App) {
         let val = input.value();
         let mut spans = vec![Span::styled(
             format!("{label:>9}: "),
-            Style::default().fg(if active { Color::Yellow } else { Color::DarkGray }),
+            Style::default().fg(if active {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
         )];
         if active {
             // Render a simple block cursor by splitting the value at the cursor.
@@ -299,7 +332,11 @@ fn render_rule_editor(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled(
                 "   disp: ",
-                Style::default().fg(if disp_active { Color::Yellow } else { Color::DarkGray }),
+                Style::default().fg(if disp_active {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
             ),
             Span::styled(
                 format!("[{disp_str}]"),
@@ -309,7 +346,10 @@ fn render_rule_editor(f: &mut Frame, app: &App) {
                     Style::default()
                 },
             ),
-            Span::styled("  (Tab to focus, Tab again cycles)", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "  (Tab to focus, Tab again cycles)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -326,7 +366,11 @@ fn render_rule_editor(f: &mut Frame, app: &App) {
     }
 
     let p = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(" rule editor "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" rule editor "),
+        )
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }

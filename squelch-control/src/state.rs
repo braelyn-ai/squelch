@@ -176,7 +176,10 @@ impl ControlState {
     /// an `.expect()` would brick every later signup while `/healthz` kept
     /// answering 200.
     pub fn sessions(&self) -> MutexGuard<'_, SessionStore> {
-        self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Drop every expired session. Called by the background sweep.

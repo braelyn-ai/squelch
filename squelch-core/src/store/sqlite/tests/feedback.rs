@@ -509,18 +509,62 @@ fn sealing_clears_an_item_name_donated_to_another_messages_row() {
 
     // The human seals the DONOR, not the feeder.
     store
-        .correct_triage(acct, donor, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            donor,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
 
     let listed = store
         .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
         .unwrap();
-    assert_eq!(listed.len(), 1, "the package itself is not the donor's to delete");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the package itself is not the donor's to delete"
+    );
     assert_eq!(
         shipment_name(&store, acct),
         (String::new(), None),
         "sealed-derived text leaves the row it was donated to"
+    );
+    // AND ITS SOURCE MARKER: a row still stamped 'llm' with no name left would
+    // be locked out of ever taking a regex-extracted name from a later email.
+    let source: String = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT item_name_source FROM shipments WHERE account_id=?1",
+            params![acct],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, "regex", "the scrub resets the provenance too");
+
+    // Proof it is not merely cosmetic: the next email's regex name lands.
+    let later = ship_msg(&store, acct, "g-later", "t-solo", "ship@ups.com");
+    store
+        .upsert_shipment(
+            acct,
+            later,
+            &crate::triage::ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: "Cat bed".into(),
+                status: crate::triage::ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        shipment_name(&store, acct),
+        ("Cat bed".to_string(), Some(later))
     );
 }
 
@@ -558,7 +602,14 @@ fn promotion_carries_the_staged_messages_provenance_so_sealing_it_still_scrubs()
     // Sealing the ORDER mail leaves the package (the ship notice feeds it) but
     // takes back the words the order mail contributed.
     store
-        .correct_triage(acct, order, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            order,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -595,7 +646,14 @@ fn sealing_scrubs_a_name_donated_to_a_staged_order_another_message_feeds() {
         .unwrap();
 
     store
-        .correct_triage(acct, namer, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            namer,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
 

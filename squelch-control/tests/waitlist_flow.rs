@@ -188,7 +188,8 @@ impl Harness {
         if let Some(c) = cookie {
             req = req.header(header::COOKIE, c);
         }
-        self.send(req.body(axum::body::Body::empty()).unwrap()).await
+        self.send(req.body(axum::body::Body::empty()).unwrap())
+            .await
     }
 
     async fn post_form(
@@ -299,6 +300,18 @@ impl Harness {
 
 fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// Invite an address that never joined, the way the dashboard's form does.
+async fn invite_directly(h: &Harness, cookie: &str, email: &str) -> (StatusCode, String) {
+    let (status, _, body) = h
+        .post_form(
+            "/admin/invite",
+            format!("email={}", urlencode(email)),
+            Some(cookie),
+        )
+        .await;
+    (status, body)
 }
 
 /// The code out of a captured message, from the line it sits on by itself.
@@ -442,7 +455,11 @@ async fn the_admin_page_opens_only_to_the_token() {
 async fn the_dashboard_escapes_what_a_stranger_typed() {
     let h = Harness::new().await;
     let (status, _, _) = h.join(r#""><script>alert(1)</script>@evil.test"#).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "brackets never reach a row");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "brackets never reach a row"
+    );
 
     let hostile = "a&'b@evil.test";
     let (status, _, _) = h.join(hostile).await;
@@ -472,7 +489,10 @@ async fn approving_mails_a_code_that_redeems() {
     let (row_status, invite_id, notified) = h.row_state(id);
     assert_eq!(row_status, "approved");
     assert!(notified, "the provider accepted it, so the row is stamped");
-    assert_eq!(h.invite_ids(), vec![invite_id.expect("an invite was minted")]);
+    assert_eq!(
+        h.invite_ids(),
+        vec![invite_id.expect("an invite was minted")]
+    );
 
     let sends = h.sends();
     assert_eq!(sends.len(), 1);
@@ -490,8 +510,17 @@ async fn approving_mails_a_code_that_redeems() {
         body["html"].as_str().unwrap().contains(&code),
         "both parts carry it"
     );
-    // ...and the link in it is a plain one. No code in a URL, ever.
-    assert!(!body["html"].as_str().unwrap().contains(&format!("={code}")));
+    // ...and the one-click link carries it, which is the 2026-08-14 reversal of
+    // this crate's "no code in a URL, ever" rule. BOTH parts have to have it:
+    // the button is the fast path, and the text part is what a client that
+    // strips HTML leaves the person with.
+    let link = format!("https://signup.passband.test/?invite={code}");
+    for part in ["text", "html"] {
+        assert!(
+            body[part].as_str().unwrap().contains(&link),
+            "the {part} part must carry the prefilled link"
+        );
+    }
 
     // The dashboard never shows the code back, because nothing kept it.
     let (_, _, page) = h.get("/admin", Some(&cookie)).await;
@@ -515,7 +544,11 @@ async fn a_replayed_approval_mints_nothing() {
     let (status, _, body) = h
         .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
-    assert_eq!(status, StatusCode::OK, "the replay renders, it does not act");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the replay renders, it does not act"
+    );
     assert!(body.contains("already approved"), "{body}");
     assert_eq!(h.invite_ids(), after_first, "no second code");
     assert_eq!(h.sends().len(), 1, "no second email");
@@ -600,7 +633,11 @@ async fn a_spent_invite_is_not_replaced() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("already been used"), "{body}");
     assert_eq!(h.sends().len(), 1, "no second email");
-    assert_eq!(h.invite_ids(), vec![invite_id], "the spent row is untouched");
+    assert_eq!(
+        h.invite_ids(),
+        vec![invite_id],
+        "the spent row is untouched"
+    );
 }
 
 /// A code an operator revoked from the CLI is a row pointing at nothing, not a
@@ -667,6 +704,7 @@ async fn a_signup_cookie_is_not_an_admin_cookie() {
             sid: "s".repeat(43),
             label: "ada".into(),
             invite: Some(1),
+            app: false,
             iat: chrono::Utc::now().timestamp(),
         },
     );
@@ -848,6 +886,123 @@ async fn a_held_invite_is_left_alone() {
     assert_eq!(h.row_state(id).1, Some(invite_id), "the hold survived");
     assert_eq!(h.invite_ids(), vec![invite_id], "and nothing was minted");
     assert_eq!(h.sends().len(), 1, "and nothing extra was mailed");
+}
+
+/// The other direction: an address the operator types, which never joined.
+///
+/// It has to land on the SAME ledger as an approved applicant, because the
+/// re-send button, the "email not sent" badge, and the history all read that
+/// one table.
+#[tokio::test]
+async fn an_address_that_never_joined_can_be_invited_directly() {
+    let h = Harness::new().await;
+    let cookie = h.sign_in().await;
+
+    let (status, body) = invite_directly(&h, &cookie, "grace@example.com").await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+
+    let id = h.only_row_id();
+    let (row_status, invite_id, notified) = h.row_state(id);
+    assert_eq!(row_status, "approved", "it skips the waiting half entirely");
+    assert!(notified, "and the invite went out");
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].1["to"][0], "grace@example.com");
+
+    let code = code_in(&sends[0].1);
+    assert!(h.code_is_available(&code), "the mailed code must redeem");
+    assert_eq!(h.invite_ids(), vec![invite_id.expect("one was minted")]);
+
+    // And the row is on the page with the same button as everybody else.
+    let (_, _, page) = h.get("/admin", Some(&cookie)).await;
+    assert!(page.contains("grace@example.com"), "{page}");
+    assert!(page.contains("Send fresh invite"), "{page}");
+}
+
+/// Typing an address that is already waiting APPROVES that row rather than
+/// failing on the UNIQUE column or minting a second code for one person.
+#[tokio::test]
+async fn inviting_someone_already_waiting_approves_the_row_they_have() {
+    let h = Harness::new().await;
+    h.join(APPLICANT).await;
+    let id = h.only_row_id();
+    let cookie = h.sign_in().await;
+
+    let (status, body) = invite_directly(&h, &cookie, APPLICANT).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(h.row_state(id).0, "approved");
+    assert_eq!(h.sends().len(), 1, "one person, one invite");
+    assert_eq!(h.invite_ids().len(), 1);
+
+    // Twice is not twice. The second press says so and mints nothing, which is
+    // the same guard a double-clicked Approve meets.
+    let (status, body) = invite_directly(&h, &cookie, APPLICANT).await;
+    assert_eq!(status, StatusCode::OK, "a banner, not a redirect");
+    assert!(body.contains("already been invited"), "{body}");
+    assert_eq!(h.sends().len(), 1, "and nothing extra was mailed");
+    assert_eq!(h.invite_ids().len(), 1);
+}
+
+/// A direct invite is an admin action, so it meets every guard the buttons do.
+#[tokio::test]
+async fn a_direct_invite_takes_a_session_a_same_origin_and_an_address() {
+    let h = Harness::new().await;
+
+    // No cookie: the door, and nothing sent.
+    let (status, _) = invite_directly(&h, "", "grace@example.com").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let cookie = h.sign_in().await;
+
+    // Somebody else's page, holding a real cookie.
+    let (status, _, _) = h
+        .post_from(
+            "/admin/invite",
+            "email=grace%40example.com".into(),
+            Some(&cookie),
+            Some("https://passband.test"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The operator's own typo.
+    let (status, body) = invite_directly(&h, &cookie, "not-an-address").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("not an email address"), "{body}");
+
+    assert!(h.sends().is_empty(), "none of that mailed anything");
+    assert!(h.invite_ids().is_empty(), "and none of it minted anything");
+}
+
+/// The emailed link lands on a form with the code already in the field, and a
+/// URL carrying anything else lands on an EMPTY one.
+#[tokio::test]
+async fn the_signup_form_fills_itself_in_from_the_link() {
+    let h = Harness::new().await;
+    let cookie = h.sign_in().await;
+    invite_directly(&h, &cookie, "grace@example.com").await;
+    let code = code_in(&h.sends()[0].1);
+
+    let (status, _, page) = h.get(&format!("/?invite={code}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains(&format!(r#"name="invite" value="{code}""#)),
+        "{page}"
+    );
+
+    // Not a code: the field is empty rather than repeating a stranger's string
+    // back to whoever was sent the link.
+    for junk in ["<script>alert(1)</script>", "nope", ""] {
+        let (_, _, page) = h.get(&format!("/?invite={}", urlencode(junk)), None).await;
+        assert!(page.contains(r#"name="invite" value=""#), "{page}");
+        assert!(!page.contains("<script>alert"), "{page}");
+    }
+
+    // And a link with no parameter at all is the plain form.
+    let (status, _, page) = h.get("/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains(r#"name="invite" value=""#), "{page}");
 }
 
 /// The throttle's refusal is the one a browser is most likely to meet, so it

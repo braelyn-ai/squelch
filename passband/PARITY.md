@@ -48,7 +48,7 @@ material is AppKit's own.
 | `.tint(_:)` | brand + tier tints on glass | Carries passband blue **into** the material instead of painting a blue box on a grey one; semantic surfaces tint with their tier color |
 | `.interactive()` | rail item, buttons, toasts | Material responds to press/hover |
 | `GlassEffectContainer` | toast stack, ⌘K bar, triage palette | Adjacent glass **merges and separates fluidly** — the signature behavior with no web equivalent. Deliberately NOT around lists or the rail: a container re-coordinates every descendant whenever one changes, which made a hovered row relayout the page |
-| `.glassEffectID(_:in:)` + `@Namespace` | ask bar, triage palette | Matched-geometry glass: the bar **stretches** into its answer, the palette **stretches** as its list narrows. List selection and the rail indicator used to be here and are not any more — selection is a plain tinted fill (`selectionFill`), and the rail indicator moves by **geometry**, because both cost more as glass than they were worth |
+| `.glassEffectID(_:in:)` + `@Namespace` | ask bar, triage palette | Matched-geometry glass stretches each surface as its content changes |
 | `.buttonStyle(.glass)` / `.glassProminent` | every control in the app | No hand-rolled button backgrounds anywhere |
 | `NSVisualEffectView` (`.underWindowBackground`) | `WindowBackdrop` | The layer the whole language sits on; window is non-opaque so glass has real content to refract |
 

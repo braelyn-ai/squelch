@@ -66,10 +66,6 @@ pub fn build_system_prompt() -> &'static str {
     SYSTEM_PROMPT
 }
 
-// ===========================================================================
-// Output schema + parsed struct.
-// ===========================================================================
-
 /// The JSON schema constraining this extractor's output: closed, with an
 /// explicit `required` list.
 pub fn output_schema() -> serde_json::Value {
@@ -95,10 +91,6 @@ pub struct BankingOutput {
     pub account_hint: Option<String>,
 }
 
-// ===========================================================================
-// account_hint post-validation.
-// ===========================================================================
-
 /// Reduce a model-emitted account hint to a SAFE masked last-4 tail, or `None` —
 /// the enforcement half of the prompt's instruction, so a fuller account number
 /// is never stored. Deliberately strict: accepted only when the value's digits
@@ -123,10 +115,6 @@ pub fn kind_for_category(category: &str) -> &'static str {
         _ => "statement",
     }
 }
-
-// ===========================================================================
-// classify() — delegates transport to [`crate::triage::llm`].
-// ===========================================================================
 
 /// The outcome of a single banking [`classify`] call: parsed, schema-valid
 /// output + usage, or a refusal / permanent (non-retryable) failure — on either
@@ -168,15 +156,12 @@ pub async fn classify_at(
         system: build_system_prompt(),
         user: &user,
         schema: output_schema(),
+        effort: cfg.effort.as_deref(),
     };
     // No post-parse validation here: `account_hint` and the text fields are
     // sanitized in [`apply_result`], so the parsed record IS the outcome.
     llm::classify_into(http, url, api_key, provider, &req, Ok::<BankingOutput, _>).await
 }
-
-// ===========================================================================
-// apply_result() — map parsed output onto the store update. Pure (no I/O).
-// ===========================================================================
 
 /// Map a parsed [`BankingOutput`] onto a [`BankingApplied`]. Pure. The stored
 /// `kind` comes from the row's CATEGORY, never the model; `account_hint` is

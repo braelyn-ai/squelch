@@ -93,9 +93,29 @@ pub struct SessionClaim {
     /// mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite: Option<i64>,
+    /// Whether this is an APP login rather than a console one. The two are
+    /// otherwise indistinguishable from the cookie alone: both spend no invite,
+    /// so `invite.is_none()` names neither on its own.
+    ///
+    /// ONLY THE REFUSAL COPY TURNS ON IT. Where the server-side session survives
+    /// it is the authority for which flow this is, as everywhere else here; this
+    /// field is read exactly when the session is GONE (expired, replayed) and
+    /// the page still has to be written in the words of the flow the person was
+    /// in. A forged `true` therefore buys a stranger a differently worded
+    /// refusal and nothing else.
+    ///
+    /// Skipped when false, so a signup's and a console login's payload bytes are
+    /// exactly what they were before app logins existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub app: bool,
     /// Issued-at, unix seconds. The TTL is enforced on the server, so this is
     /// signed rather than trusted.
     pub iat: i64,
+}
+
+/// `skip_serializing_if` for a plain `bool`, so the default rides as an absence.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// What the admin cookie asserts: that whoever holds it presented the admin
@@ -194,12 +214,7 @@ pub fn verify(key: &[u8], value: &str, now_unix: i64) -> Option<SessionClaim> {
 /// and it is inside [`ADMIN_COOKIE_TTL_SECS`]. The `aud` check is what makes a
 /// signup cookie's payload, signed with this very key, useless here; the
 /// fingerprint check is what makes rotating the token sign everybody out.
-pub fn verify_admin(
-    key: &[u8],
-    token: &str,
-    value: &str,
-    now_unix: i64,
-) -> Option<AdminClaim> {
+pub fn verify_admin(key: &[u8], token: &str, value: &str, now_unix: i64) -> Option<AdminClaim> {
     let payload = authentic_payload(key, value)?;
     let claim: AdminClaim = serde_json::from_slice(&payload).ok()?;
     if claim.aud != ADMIN_AUD || claim.tfp != token_fingerprint(token) {
@@ -321,6 +336,7 @@ mod tests {
             sid: "s".repeat(43),
             label: "ada".into(),
             invite: Some(7),
+            app: false,
             iat: 1_000_000,
         }
     }
@@ -359,6 +375,41 @@ mod tests {
         )
         .unwrap();
         assert!(signup.contains(r#""invite":7"#), "{signup}");
+    }
+
+    /// The app marker rides only on an app login, and the two flows that predate
+    /// it serialize byte for byte what they did before: `app` is absent, not
+    /// `false`, on a signup and on a console claim.
+    #[test]
+    fn only_an_app_claim_carries_the_app_marker() {
+        let payload = |c: &SessionClaim| {
+            String::from_utf8(
+                URL_SAFE_NO_PAD
+                    .decode(sign(KEY, c).split_once('.').unwrap().0)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        assert!(!payload(&claim()).contains("app"), "signup");
+        let console = SessionClaim {
+            invite: None,
+            ..claim()
+        };
+        assert!(!payload(&console).contains("app"), "console");
+
+        // An app login names no tenant, so its label is empty going out and
+        // comes back the same.
+        let app = SessionClaim {
+            label: String::new(),
+            invite: None,
+            app: true,
+            ..claim()
+        };
+        let json = payload(&app);
+        assert!(json.contains(r#""app":true"#), "{json}");
+        let v = sign(KEY, &app);
+        assert_eq!(verify(KEY, &v, app.iat).unwrap(), app);
     }
 
     /// The label and the invite id are what the callback acts on, so flipping
@@ -447,7 +498,12 @@ mod tests {
         let v = sign_admin(KEY, &AdminClaim::new(TOKEN, 1_000_000));
         assert!(verify_admin(KEY, TOKEN, &v, 1_000_000).is_some());
         assert_eq!(
-            verify_admin(KEY, "a different token, just as long as the other", &v, 1_000_000),
+            verify_admin(
+                KEY,
+                "a different token, just as long as the other",
+                &v,
+                1_000_000
+            ),
             None
         );
     }

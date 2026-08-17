@@ -67,16 +67,20 @@ fn message_merchant(conn: &Connection, account_id: AccountId, message_id: i64) -
 /// Upsert a shipment keyed by `(account_id, tracking_number)` in the caller's
 /// transaction. A repeat applies the no-regress status state machine
 /// ([`crate::triage::ShipmentStatus::merge`]) — a delivered shipment is never
-/// walked back — and adopts a more informative `item_name` or a carrier more
-/// specific than "unknown". `last_update`/`last_message_id` advance only when
-/// the merge accepts the incoming status, so a stale duplicate never becomes
-/// the row's click target.
+/// walked back — and adopts a more informative `item_name` (never over one the
+/// EXTRACTOR wrote; see `item_name_source`) or a carrier more specific than
+/// "unknown". `last_update`/`last_message_id` advance only when the merge
+/// accepts the incoming status, so a stale duplicate never becomes the row's
+/// click target.
 ///
 /// PROVENANCE. `created_by_message_id` is written ONCE, on the INSERT, and never
 /// updated: it is the only column that answers "which mail minted this row",
 /// which the phantom reaping keys on. `item_name_msg` follows the name — it
 /// moves to `message_id` exactly when this message's name is adopted — so
 /// sealing a message can scrub the text it contributed wherever that landed.
+/// `item_name_source` records the MECHANISM instead, and this path never writes
+/// it: an insert takes the column's 'regex' default, and an update keeps
+/// whatever is there.
 ///
 /// AN ACCEPTED UPDATE UN-RETIRES THE ROW: `poll_failures` goes back to 0
 /// alongside `last_message_id`. A carrier answering "no such number" retires a
@@ -104,9 +108,9 @@ pub(super) fn upsert_shipment_conn(
     let ts = seen_at.to_rfc3339();
 
     // Read any existing row so the merge runs in Rust rather than a SQL CASE.
-    let existing: Option<(i64, String, String, String)> = conn
+    let existing: Option<(i64, String, String, String, String)> = conn
         .query_row(
-            "SELECT id, status, item_name, carrier FROM shipments
+            "SELECT id, status, item_name, item_name_source, carrier FROM shipments
              WHERE account_id=?1 AND tracking_number=?2",
             params![account_id, s.tracking_number],
             |r| {
@@ -115,6 +119,7 @@ pub(super) fn upsert_shipment_conn(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             },
         )
@@ -147,21 +152,41 @@ pub(super) fn upsert_shipment_conn(
             )?;
             Ok(id)
         }
-        Some((id, cur_status_s, cur_item, cur_carrier)) => {
+        Some((id, cur_status_s, cur_item, cur_item_source, cur_carrier)) => {
             let cur_status =
                 ShipmentStatus::parse(&cur_status_s).unwrap_or(ShipmentStatus::Shipped);
             let merged = ShipmentStatus::merge(cur_status, s.status);
 
-            // Prefer a more informative item name. `adopt_name` also carries the
-            // name's PROVENANCE across: the stored name is this message's only
-            // when this message's name won.
-            let adopt_name = !s.item_name.is_empty()
-                && (cur_item.is_empty() || s.item_name.len() > cur_item.len());
+            // ITEM NAME, by PROVENANCE. This is the REGEX path, so it never
+            // touches a name the extractor wrote — longer-wins exists to pick
+            // between two regex guesses, and against a model's "Anker USB-C
+            // charger" it would keep subject junk purely for being longer. It
+            // also never CHANGES `item_name_source`: a kept llm name stays 'llm',
+            // an adoption here stays 'regex'.
+            //
+            // HEALING: a stored name that TODAY's stricter strip refuses (the
+            // live "package now with its carrier!" rows, written before the
+            // filler patterns existed) is worth less than nothing — the client's
+            // own "Package via <carrier>" fallback beats it. So it yields to a
+            // shorter real name, and an EMPTY extraction is allowed to clear it,
+            // which is the only way those rows ever get better.
+            let llm_owned = cur_item_source == "llm";
+            let cur_is_junk = crate::triage::shipment::is_junk_item_name(&cur_item);
+            let adopt_name = !llm_owned
+                && if s.item_name.is_empty() {
+                    cur_is_junk
+                } else {
+                    cur_item.is_empty() || cur_is_junk || s.item_name.len() > cur_item.len()
+                };
             let item_name = if adopt_name {
                 s.item_name.clone()
             } else {
                 cur_item
             };
+            // The name's PROVENANCE follows the name: this message's only when
+            // this message's name won, and NULL when the adoption was a heal to
+            // empty — nobody donated the absence of a name.
+            let item_name_msg = (!item_name.is_empty()).then_some(message_id);
             // Prefer a concrete carrier over a prior "unknown".
             let (carrier, tracking_url) = if cur_carrier == "unknown" && s.carrier != "unknown" {
                 (s.carrier.clone(), s.tracking_url.clone())
@@ -185,7 +210,7 @@ pub(super) fn upsert_shipment_conn(
                          last_update     = CASE WHEN ?5 THEN ?7 ELSE last_update END,
                          poll_failures   = CASE WHEN ?5 THEN 0 ELSE poll_failures END,
                          delivered_at    = COALESCE(delivered_at, ?9),
-                         item_name_msg   = CASE WHEN ?10 THEN ?6 ELSE item_name_msg END
+                         item_name_msg   = CASE WHEN ?10 THEN ?11 ELSE item_name_msg END
                      WHERE id=?8",
                     params![
                         merged.as_str(),
@@ -198,6 +223,7 @@ pub(super) fn upsert_shipment_conn(
                         id,
                         delivered_ts(merged, &ts),
                         adopt_name,
+                        item_name_msg,
                     ],
                 )?;
             } else {
@@ -208,7 +234,7 @@ pub(super) fn upsert_shipment_conn(
                          last_update     = CASE WHEN ?3 THEN ?5 ELSE last_update END,
                          poll_failures   = CASE WHEN ?3 THEN 0 ELSE poll_failures END,
                          delivered_at    = COALESCE(delivered_at, ?7),
-                         item_name_msg   = CASE WHEN ?8 THEN ?4 ELSE item_name_msg END
+                         item_name_msg   = CASE WHEN ?8 THEN ?9 ELSE item_name_msg END
                      WHERE id=?6",
                     params![
                         merged.as_str(),
@@ -219,6 +245,7 @@ pub(super) fn upsert_shipment_conn(
                         id,
                         delivered_ts(merged, &ts),
                         adopt_name,
+                        item_name_msg,
                     ],
                 )?;
             }
@@ -520,7 +547,11 @@ fn shipment_item_name(conn: &Connection, shipment_id: i64) -> Result<String> {
     Ok(name)
 }
 
-/// Write an item name AND the message whose extraction supplied it.
+/// Write an item name the EXTRACTOR produced, with both halves of its
+/// provenance: `item_name_msg` (which message) and `item_name_source='llm'`
+/// (which mechanism). Every caller is on the extractor's apply path, so the
+/// source is a constant rather than an argument — a `'regex'` name is only ever
+/// written by [`upsert_shipment_conn`], which does not go through here.
 ///
 /// `name_msg` is NOT always the message being applied: a promoted staged order
 /// donates a name the ORDER CONFIRMATION wrote, and sealing that confirmation
@@ -534,10 +565,35 @@ fn set_shipment_item_name(
     name_msg: Option<i64>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE shipments SET item_name = ?2, item_name_msg = ?3 WHERE id = ?1",
+        "UPDATE shipments SET item_name = ?2, item_name_msg = ?3,
+             item_name_source = 'llm'
+         WHERE id = ?1",
         params![shipment_id, name, name_msg],
     )?;
     Ok(())
+}
+
+/// The extractor's name write onto a row that may already carry one, applying
+/// the PROVENANCE rule: an llm name replaces a regex name outright (a model that
+/// read the body beats a phrase lifted out of a subject), while an existing llm
+/// name only yields to a MORE INFORMATIVE llm name — the same longer-wins tie
+/// break the regex path uses within its own source. Returns whether it wrote.
+fn adopt_llm_item_name(
+    conn: &Connection,
+    shipment_id: i64,
+    name: &str,
+    name_msg: Option<i64>,
+) -> Result<bool> {
+    let (cur_name, cur_source): (String, String) = conn.query_row(
+        "SELECT item_name, item_name_source FROM shipments WHERE id = ?1",
+        params![shipment_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if cur_source == "llm" && !cur_name.is_empty() && name.len() <= cur_name.len() {
+        return Ok(false);
+    }
+    set_shipment_item_name(conn, shipment_id, name, name_msg)?;
+    Ok(true)
 }
 
 /// The shipments carrying `(merchant, order_ref)`, capped at TWO — the caller
@@ -673,12 +729,13 @@ impl SqliteStore {
             let ship_id =
                 upsert_shipment_conn(&tx, a.account_id, a.message_id, &info, a.received_at)?;
 
-            // EXTRACTOR WINS over the upsert's longer-name-wins heuristic: that
-            // rule exists to pick between two REGEX guesses, and it otherwise
-            // keeps junk like "package now with its carrier!" over the model's
-            // "Anker USB-C charger" purely because it is longer.
+            // EXTRACTOR BEATS THE REGEX NAME, by provenance rather than by
+            // length: the upsert's longer-name-wins rule exists to pick between
+            // two REGEX guesses, and it otherwise keeps junk like "package now
+            // with its carrier!" over the model's "Anker USB-C charger" purely
+            // for being longer. Against ANOTHER llm name, longer still wins.
             if let Some(name) = a.item_name.as_deref() {
-                set_shipment_item_name(&tx, ship_id, name, Some(a.message_id))?;
+                adopt_llm_item_name(&tx, ship_id, name, Some(a.message_id))?;
             }
 
             if let Some(oref) = a.order_ref.as_deref() {
@@ -688,7 +745,9 @@ impl SqliteStore {
                 )?;
                 // PROMOTION: the order confirmation that arrived days earlier
                 // staged a row under this reference. Donate its name if we have
-                // none, then delete it — the purchase now has a real identity.
+                // none WORTH KEEPING — a stored name today's strip refuses is no
+                // better than none — then delete it: the purchase now has a real
+                // identity.
                 // The staged row's own name PROVENANCE rides along: the donated
                 // text belongs to the mail that wrote it, not to this ship
                 // notice, and sealing that mail must still scrub it.
@@ -702,7 +761,8 @@ impl SqliteStore {
                     )
                     .optional()?;
                 if let Some((staged_id, staged_name, staged_name_msg)) = staged {
-                    if shipment_item_name(&tx, ship_id)?.trim().is_empty()
+                    let cur = shipment_item_name(&tx, ship_id)?;
+                    if (cur.trim().is_empty() || crate::triage::shipment::is_junk_item_name(&cur))
                         && !staged_name.trim().is_empty()
                     {
                         set_shipment_item_name(&tx, ship_id, &staged_name, staged_name_msg)?;

@@ -15,10 +15,13 @@ pub const API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 /// Pinned Anthropic API version header value.
 const API_VERSION: &str = "2023-06-01";
-/// Default max_tokens; a compact JSON object fits comfortably. A `max_tokens`
-/// truncation is retried once at this doubled value.
-pub const MAX_TOKENS: u32 = 400;
-pub const MAX_TOKENS_RETRY: u32 = 800;
+/// Default max_tokens. The verdict itself is a compact JSON object, but on a
+/// reasoning model THINKING TOKENS BILL AGAINST THIS CEILING TOO, and thinking
+/// runs before the first output byte: a budget sized for the JSON alone
+/// truncates every call before the verdict is ever written. A `max_tokens`
+/// truncation is retried once at the doubled value.
+pub const MAX_TOKENS: u32 = 8_000;
+pub const MAX_TOKENS_RETRY: u32 = 16_000;
 /// Retry policy for retryable statuses (429 / 5xx / 529).
 const MAX_TRIES: u32 = 3;
 pub const BACKOFF_CAP: Duration = Duration::from_secs(60);
@@ -40,6 +43,12 @@ pub struct LlmRequest<'a> {
     pub system: &'a str,
     pub user: &'a str,
     pub schema: serde_json::Value,
+    /// Reasoning depth, sent as `output_config.effort` on the Anthropic wire.
+    /// This is the ONLY axis separating the two stages now that both run the
+    /// same model: Stage-1 thinks briefly over a compact row, Stage-2 thinks
+    /// hard over a fully contextualized one. `None` omits the field entirely,
+    /// which is what a model without effort support requires.
+    pub effort: Option<&'a str>,
 }
 
 /// The outcome of a single LLM call, generic over the verdict `T`. Every stage
@@ -151,17 +160,13 @@ macro_rules! classify_entrypoint {
 }
 pub(crate) use classify_entrypoint;
 
-// ===========================================================================
-// Anthropic Messages API wire types.
-// ===========================================================================
-
 #[derive(Debug, Serialize)]
 struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     system: Vec<SystemBlock<'a>>,
     messages: Vec<RequestMessage<'a>>,
-    output_config: OutputConfig,
+    output_config: OutputConfig<'a>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,8 +191,12 @@ struct RequestMessage<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct OutputConfig {
+struct OutputConfig<'a> {
     format: OutputFormat,
+    /// Omitted when the configured model has no effort support; sending it to
+    /// such a model is a 400, so absence has to stay expressible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,10 +328,6 @@ impl From<Usage> for crate::store::UsageTokens {
     }
 }
 
-// ===========================================================================
-// Provider paths.
-// ===========================================================================
-
 async fn classify_anthropic(
     http: &reqwest::Client,
     url: &str,
@@ -350,6 +355,7 @@ async fn classify_anthropic(
                     kind: "json_schema",
                     schema: req.schema.clone(),
                 },
+                effort: req.effort,
             },
         };
 

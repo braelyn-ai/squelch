@@ -88,6 +88,18 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // (NULL == still needs Stage-1), `needs_stage2` is the escalation flag.
     let added_stage1 = add_column_if_missing(conn, "triage", "stage1_model_used", "TEXT")?;
     add_column_if_missing(conn, "triage", "needs_stage2", "INTEGER NOT NULL DEFAULT 0")?;
+    // WHICH router arm set `needs_stage2` (see `crate::triage::router`). NULL
+    // means "did not escalate", and also covers every historical row, which
+    // escalated under the old self-report rule and cannot be attributed now.
+    add_column_if_missing(conn, "triage", "escalation_reason", "TEXT")?;
+    // Re-evaluation counter (see `crate::triage::revisit`). Historical rows
+    // start at 0, which is honest: they have never been revisited.
+    add_column_if_missing(
+        conn,
+        "triage",
+        "revisit_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     // stage2_usage grew `category` INSIDE ITS PRIMARY KEY. ALTER ADD COLUMN
     // cannot change a PK, and the bump upsert's ON CONFLICT(account_id, day,
@@ -191,6 +203,17 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // `item_name_source` — which MECHANISM supplied the name, the sibling of
+    // `item_name_msg`'s which MESSAGE. 'regex' is correct history and needs no
+    // backfill: every pre-existing name came from the ingest detector, so the
+    // shipments extractor may replace any of them, and the detector's own
+    // longer-wins heuristic still applies among them.
+    add_column_if_missing(
+        conn,
+        "shipments",
+        "item_name_source",
+        "TEXT NOT NULL DEFAULT 'regex'",
+    )?;
     // `order_merchant` — the namespace `order_ref` was always missing. Backfilled
     // in Rust below (it needs the registrable-domain rule, not a SQL expression);
     // a row left NULL simply matches no future order mail, which is the safe

@@ -61,6 +61,10 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+            // Outside the ScrollView and outside the section switch, so it sits
+            // still in the corner on every tab instead of scrolling away with
+            // whichever one is showing.
+            .overlay(alignment: .bottomTrailing) { versionStamp }
         }
         // Escape is exempt from the dispatcher's input guard precisely so a
         // surface this full of text fields can still be left.
@@ -68,6 +72,25 @@ struct SettingsView: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
         ])
+    }
+
+    /// Which build this is, in the corner of every settings tab.
+    ///
+    /// Selectable on purpose: the first thing anybody is asked for in a bug
+    /// report is the version, and a number you can only retype is a number that
+    /// arrives wrong. Read from the bundle rather than a constant, so it is
+    /// whatever this copy actually is and cannot drift from what shipped.
+    private var versionStamp: some View {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return Text("Passband \(version) (\(build))")
+            .font(.system(size: 10))
+            .foregroundStyle(Palette.inkFaintest)
+            .textSelection(.enabled)
+            .padding(.trailing, 14)
+            .padding(.bottom, 10)
+            .accessibilityLabel("Passband version \(version), build \(build)")
     }
 
     private var nav: some View {

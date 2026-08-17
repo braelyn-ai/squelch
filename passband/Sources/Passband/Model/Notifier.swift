@@ -163,14 +163,12 @@ final class Notifier {
     }
 
     /// Collapse to one line and cap the length: notification text is a small
-    /// fixed box, and the system's own truncation lands mid-word with no
-    /// ellipsis to say so.
+    /// fixed box.
     private static func flatten(_ s: String, max: Int) -> String {
         let flat = s.split(whereSeparator: { $0.isNewline || $0 == "\t" })
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard flat.count > max else { return flat }
-        return String(flat.prefix(max - 1)).trimmingCharacters(in: .whitespaces) + "…"
+        return Fmt.truncate(flat, max)
     }
 
     // MARK: - posting

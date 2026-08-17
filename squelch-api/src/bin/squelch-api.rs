@@ -19,16 +19,6 @@ use squelch_core::store::SqliteStore;
 /// Loopback default. A reverse proxy fronts this; never widen it silently.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8849";
 
-/// Canonical `SQUELCH_DB_PATH` > legacy `SQUELCH_DB` > shared XDG default.
-fn db_path() -> std::path::PathBuf {
-    squelch_core::config::resolve_db_path()
-}
-
-/// Canonical `SQUELCH_ACCOUNT_EMAIL` > legacy `SQUELCH_ACCOUNT` > default.
-fn account_email() -> String {
-    squelch_core::config::resolve_account_email("me@localhost")
-}
-
 fn bind_addr() -> anyhow::Result<SocketAddr> {
     let s = std::env::var("SQUELCH_API_HTTP").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     s.parse()
@@ -37,8 +27,8 @@ fn bind_addr() -> anyhow::Result<SocketAddr> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let store = Arc::new(SqliteStore::open(db_path())?);
-    let email = account_email();
+    let store = Arc::new(SqliteStore::open(squelch_core::config::resolve_db_path())?);
+    let email = squelch_core::config::account_email();
     let (cfg, cap_sources) = Config::load_with_cap_sources();
     // The shared config->state wiring (prices, model labels, caps, Stage-1, and
     // the write credential).
@@ -49,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
     // `with_graceful_shutdown` waiting forever on Ctrl-C.
     let event_tx = attach_event_channel(&store)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = state.with_event_notifier(event_tx).with_shutdown(shutdown_rx);
+    let state = state
+        .with_event_notifier(event_tx)
+        .with_shutdown(shutdown_rx);
 
     let app = router(state);
 

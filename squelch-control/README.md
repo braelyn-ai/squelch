@@ -17,25 +17,40 @@ Where the code comes from, when the waitlist is configured (the trio in the
 table below; unset, none of it is mounted and both URLs are a 404):
 
 ```
-browser  ── GET  /  ──────────► "No invite code yet? Join the waitlist",
+browser  ── GET  /  ──────────► "No invite code? Join the waitlist",
                                 linking to <WAITLIST_ORIGIN>/waitlist
 site     ── POST /waitlist ──► one row per address, same 200 for a duplicate
 operator ── GET  /admin ──────► token login, then the list
          ── POST /admin/approve ──► mint an invite, email it through Resend
+         ── POST /admin/invite ───► the same, for an address that never joined
          ── POST /admin/send ─────► revoke that code, mint and mail a fresh one
 ```
 
-That link closes the one loop the signup form used to leave open: a person
-with no code could not get one from the page that demands it. It is built from
-`SQUELCH_CONTROL_WAITLIST_ORIGIN` (the same origin the CORS answer names, so
-the link and the form it leads to cannot drift apart) and is rendered on every
-signup page, refused or not, so its presence never answers whether a code that
-was just typed exists. With the waitlist unconfigured the form links nowhere.
+A direct invite is recorded as a waitlist row that starts out approved, so one
+table answers "have we invited them" however they arrived and the re-send button
+works on both. Typing an address that is already waiting approves the row it has
+rather than making a second one.
+
+The emailed link is `/?invite=CODE`, and `GET /` fills the form in from it. That
+reverses this crate's first rule, which was that a code never appears in a URL:
+the query string reaches the edge's access log, the recipient's history, and any
+proxy between them, and a live code sits in all three until it is redeemed or
+lapses. It is a deliberate trade for the click, taken 2026-08-14, bounded by the
+code being single use. A parameter not shaped like a code renders an empty field.
+
+The "join the waitlist" link closes the loop from the other end: a person with
+no code could not get one from the page that demands it. It is built from
+`SQUELCH_CONTROL_WAITLIST_ORIGIN` (the same origin the CORS answer names, so the
+link and the form it leads to cannot drift apart) and is rendered on every signup
+page: prefilled or not, refused or not. Making it conditional on either would
+turn its presence into an answer about the code in the URL. With the waitlist
+unconfigured the form links nowhere.
 
 The admin POSTs take a `SameSite=Strict` session cookie AND a same-origin
 `Origin`/`Sec-Fetch-Site`, because "same site" includes every sibling
 `passband.app` name and a page on one of those could otherwise press these
-buttons.
+buttons. An `Origin` of `null` names nothing, so it is decided by
+`Sec-Fetch-Site`, which no page can write.
 
 ## Provisioning is two calls
 
@@ -151,6 +166,9 @@ squelch-control invite revoke <id>        # revoke an unused code
 squelch-control tenants                   # what has been provisioned
 squelch-control llm mint <label>          # mint + install a Bifrost virtual key (also rotates)
 squelch-control llm revoke <label>        # revoke the recorded key and forget it
+squelch-control drift                     # what has been changed on every tenant's workload
+squelch-control drift <label>             # ...on one. Exits 1 when anything has drifted
+squelch-control reconcile <label>         # converge ONE tenant back onto the warden's render
 ```
 
 Invite codes are Crockford `XXXX-XXXX-XXXX-XXXX` (80 bits), stored only as a
@@ -171,6 +189,26 @@ a retry does not have to wait it out.
 The invite commands talk to the store directly and need none of the serving
 configuration, so codes can be minted on a box with no OAuth client in its
 environment.
+
+`drift` and `reconcile` need the **warden pair** and, for a fleet-wide `drift`,
+the store; no Bifrost trio, no OAuth client, no cookie key.
+
+The warden writes every tenant object by server-side apply, which owns **fields,
+not objects**. A `kubectl set env` against a tenant therefore takes ownership of
+that field, and no apply the warden makes afterwards will report it or take it
+back — it converges around the edit forever, and the edit detonates whenever
+something unrelated makes it fatal. `drift` is how that gets seen first: it asks
+the warden which other field managers own part of a tenant's Deployment and what
+an apply of today's render would move. The report is data on **stdout**; the
+exit code is the finding (`0` clean, `1` drifted), so a periodic run needs
+nobody to read it.
+
+`reconcile` is the repair, and it takes exactly one label on purpose. Taking a
+field back from another manager means deleting the Deployment and applying it
+fresh, so it rolls that tenant's pod and their mailbox is offline until it
+returns. Converge one, verify it, then walk the list; a command that swept the
+fleet would turn one bad render into a fleet-wide outage at the speed an
+operator can press return.
 
 The `llm` commands need the Bifrost trio, the warden pair, and the store — but
 still no OAuth client or cookie key. `llm mint` backfills a tenant that signed

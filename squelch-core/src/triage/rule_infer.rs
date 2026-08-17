@@ -38,7 +38,7 @@ const INFER_BUDGET: Duration = Duration::from_secs(8);
 /// Per-request timeout. The real ceiling on the save path is [`INFER_BUDGET`],
 /// which wraps the whole retry ladder; this only bounds a single attempt for
 /// direct [`classify_at`] callers.
-const INFER_TIMEOUT: Duration = Duration::from_secs(20);
+const INFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Connect timeout for the same call.
 const INFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -123,10 +123,6 @@ pub fn build_user_message(want_text: &str) -> String {
     out
 }
 
-// ===========================================================================
-// Output schema + parsed struct.
-// ===========================================================================
-
 /// The JSON schema constraining the model's output: one closed enum, so parsing
 /// is a lookup and a rogue value is a `Failed` (hence `Filtered`), never a guess.
 pub fn output_schema() -> serde_json::Value {
@@ -151,10 +147,6 @@ pub struct RuleInferOutput {
 
 /// The outcome of one [`classify_at`] call.
 pub type InferOutcome = LlmOutcome<Disposition>;
-
-// ===========================================================================
-// The client handle.
-// ===========================================================================
 
 /// Everything one inference call needs: the shared reqwest client, the resolved
 /// key + provider, and the model id. Built once at startup and cloned into the
@@ -236,10 +228,6 @@ impl RuleInferClient {
     }
 }
 
-// ===========================================================================
-// Inference.
-// ===========================================================================
-
 /// Classify one `want_text` against an explicit endpoint. The raw form: it
 /// distinguishes a refusal from a failure so tests can assert both. Callers on
 /// the save path want [`infer_disposition`], which collapses every non-answer to
@@ -258,6 +246,10 @@ pub async fn classify_at(
         system: build_system_prompt(),
         user: &user,
         schema: output_schema(),
+        // Hardcoded, not config-driven: this call reads ONE sentence the account
+        // owner just typed and picks one enum value. There is nothing here for a
+        // reasoning budget to buy.
+        effort: Some("low"),
     };
     llm::classify_into(
         http,
@@ -579,10 +571,7 @@ mod tests {
         assert_eq!(d, Disposition::Filtered);
     }
 
-    // ---- the wall-clock budget ---------------------------------------------
-
-    /// A server that accepts the connection and then says NOTHING, forever: the
-    /// shape that used to park the save behind the full retry ladder.
+    /// A server that accepts connections without responding.
     async fn mock_stalls_forever() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

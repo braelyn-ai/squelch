@@ -556,6 +556,7 @@ async fn retriage_route_exists_resets_and_audits() {
                 field_reasons: Default::default(),
                 stage1_model_used: "claude-x".into(),
                 needs_stage2: false,
+                escalation_reason: None,
                 deadline: None,
                 category: Some("general".into()),
             })
@@ -3959,7 +3960,7 @@ async fn failed_rule_mutations_write_no_audit_row() {
 
 #[tokio::test]
 async fn stats_expose_stage2_usage_and_cost() {
-    // Cost comes from the default Stage-2 per-MTok prices (3.0 in / 15.0 out),
+    // Cost comes from the default Stage-2 per-MTok prices (5.0 in / 25.0 out),
     // with cache writes at 1.25x and reads at 0.1x of the input price.
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let Harness { app, .. } = harness(move |store, acct| {
@@ -3969,11 +3970,24 @@ async fn stats_expose_stage2_usage_and_cost() {
             .stage2_bump_usage(
                 acct,
                 &day,
-                UsageTokens { input: 600_000, output: 100_000, cache_creation: 200_000, cache_read: 1_000_000 },
+                UsageTokens {
+                    input: 600_000,
+                    output: 100_000,
+                    cache_creation: 200_000,
+                    cache_read: 1_000_000,
+                },
             )
             .unwrap();
         store
-            .stage2_bump_usage(acct, &day, UsageTokens { input: 400_000, output: 100_000, ..Default::default() })
+            .stage2_bump_usage(
+                acct,
+                &day,
+                UsageTokens {
+                    input: 400_000,
+                    output: 100_000,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     });
 
@@ -3986,10 +4000,10 @@ async fn stats_expose_stage2_usage_and_cost() {
     assert_eq!(s2["output_tokens_today"], 200_000);
     assert_eq!(s2["cache_creation_tokens_today"], 200_000);
     assert_eq!(s2["cache_read_tokens_today"], 1_000_000);
-    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6)
-    //      + 3.0*1.25*(0.2e6/1e6) + 3.0*0.1*(1e6/1e6) = 3.0 + 3.0 + 0.75 + 0.3
+    // cost = 5.0*(1e6/1e6) + 25.0*(0.2e6/1e6)
+    //      + 5.0*1.25*(0.2e6/1e6) + 5.0*0.1*(1e6/1e6) = 5.0 + 5.0 + 1.25 + 0.5
     let cost = s2["est_cost_usd_today"].as_f64().unwrap();
-    assert!((cost - 7.05).abs() < 1e-9, "expected 7.05, got {cost}");
+    assert!((cost - 11.75).abs() < 1e-9, "expected 11.75, got {cost}");
 }
 
 #[tokio::test]
@@ -4041,13 +4055,26 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     // (cache writes at 1.25x, reads at 0.1x of the input price).
     let Harness { app, .. } = harness(|store, acct| {
         store
-            .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 400_000, output: 100_000, ..Default::default() })
+            .stage2_bump_usage(
+                acct,
+                "2026-07-08",
+                UsageTokens {
+                    input: 400_000,
+                    output: 100_000,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
             .stage2_bump_usage(
                 acct,
                 "2026-07-09",
-                UsageTokens { input: 600_000, output: 100_000, cache_creation: 400_000, cache_read: 2_000_000 },
+                UsageTokens {
+                    input: 600_000,
+                    output: 100_000,
+                    cache_creation: 400_000,
+                    cache_read: 2_000_000,
+                },
             )
             .unwrap();
     });
@@ -4075,15 +4102,15 @@ async fn usage_returns_rows_totals_and_is_bearer_gated() {
     assert_eq!(totals["output_tokens"], 200_000);
     assert_eq!(totals["cache_creation_tokens"], 400_000);
     assert_eq!(totals["cache_read_tokens"], 2_000_000);
-    // cost = 3.0*(1e6/1e6) + 15.0*(0.2e6/1e6)
-    //      + 3.0*1.25*(0.4e6/1e6) + 3.0*0.1*(2e6/1e6) = 3.0 + 3.0 + 1.5 + 0.6
+    // cost = 5.0*(1e6/1e6) + 25.0*(0.2e6/1e6)
+    //      + 5.0*1.25*(0.4e6/1e6) + 5.0*0.1*(2e6/1e6) = 5.0 + 5.0 + 2.5 + 1.0
     let cost = totals["est_cost_usd"].as_f64().unwrap();
-    assert!((cost - 8.1).abs() < 1e-9, "expected 8.1, got {cost}");
+    assert!((cost - 13.5).abs() < 1e-9, "expected 13.5, got {cost}");
 
     // Stage-1 and Stage-2 appear as separate usage categories.
-    assert_eq!(json["model"], "claude-sonnet-5");
-    assert_eq!(json["categories"]["stage2"]["model"], "claude-sonnet-5");
-    assert_eq!(json["categories"]["stage1"]["model"], "claude-haiku-4-5");
+    assert_eq!(json["model"], "claude-opus-5");
+    assert_eq!(json["categories"]["stage2"]["model"], "claude-opus-5");
+    assert_eq!(json["categories"]["stage1"]["model"], "claude-opus-5");
 
     // Bearer-gated: no token => 401.
     let req = Request::builder()
@@ -4356,11 +4383,9 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
 async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
     // Blocking a sender from an email marks that email done; a surface rule is
     // tuning, not a verdict, and must leave its source open.
-    // Ids captured from the seeder, not inferred from a search ordering. They
-    // used to be taken as max/min, which had them BACKWARDS — spam is seeded
-    // first and therefore holds the LOWER id. Nothing caught it while the
-    // handler resolved whatever message id it was handed; resolving by sender
-    // reads the from_addr, so the mix-up became visible immediately.
+    // Ids captured from the seeder, not inferred from a search ordering: spam
+    // is seeded first and therefore holds the LOWER id, so max/min would have
+    // them backwards.
     let seeded = std::cell::RefCell::new(Vec::<i64>::new());
     let Harness { app, store, acct } = harness(|store, acct| {
         seeded.borrow_mut().push(seed_unsub_msg(
@@ -4871,13 +4896,14 @@ async fn triage_config_get_default_shape() {
     assert!(json["price_in_per_mtok"].is_number());
     assert!(json["price_out_per_mtok"].is_number());
 
-    // Stage-2 escalation model label.
-    assert_eq!(json["stage2_model"], "claude-sonnet-5");
+    // Stage-2 escalation model label. SAME model as Stage-1: escalation buys
+    // context and reasoning depth, not a different reader.
+    assert_eq!(json["stage2_model"], "claude-opus-5");
 
-    // Stage-1 block: default small model, GLOBAL-only cap (default 1000),
-    // "default" source, null tokens/call (empty ledger), and prices.
+    // Stage-1 block: GLOBAL-only cap (default 1000), "default" source, null
+    // tokens/call (empty ledger), and prices.
     let s1 = &json["stage1"];
-    assert_eq!(s1["model"], "claude-haiku-4-5");
+    assert_eq!(s1["model"], "claude-opus-5");
     assert_eq!(s1["global_daily_cap"], 1000);
     assert_eq!(s1["source"], "default");
     assert_eq!(s1["avg_calls_per_day"], 0.0);
@@ -4941,10 +4967,26 @@ async fn triage_config_get_computes_trailing_averages() {
         // One day with 2 calls, 1000 in / 200 out tokens.
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         store
-            .stage2_bump_usage(acct, &day, UsageTokens { input: 600, output: 120, ..Default::default() })
+            .stage2_bump_usage(
+                acct,
+                &day,
+                UsageTokens {
+                    input: 600,
+                    output: 120,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
-            .stage2_bump_usage(acct, &day, UsageTokens { input: 400, output: 80, ..Default::default() })
+            .stage2_bump_usage(
+                acct,
+                &day,
+                UsageTokens {
+                    input: 400,
+                    output: 80,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     });
 

@@ -1,11 +1,10 @@
 //! GET /client/usage — the spend report.
 //!
 //! THE CONTRACT UNDER TEST is that the endpoint ENUMERATES the usage ledger
-//! rather than naming the categories it knows. It used to name `stage1` and
-//! `stage2` in a literal map, and `extract_banking` — written by an extractor
-//! added later — accrued for ten days without ever reaching the cost tab. So
-//! the load-bearing case here is a category this file invents: if that reports,
-//! an extractor added next year reports too, with no edit to the endpoint.
+//! rather than naming the categories it knows. A literal map of known
+//! categories silently drops whatever an extractor added later accrues. So the
+//! load-bearing case here is a category this file invents: if that reports, an
+//! extractor added next year reports too, with no edit to the endpoint.
 
 mod common;
 
@@ -49,17 +48,37 @@ async fn get_usage(app: axum::Router) -> Value {
 async fn categories_include_ledger_writers_the_endpoint_never_heard_of() {
     let app = priced_harness(|store, acct| {
         store
-            .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 1_000, output: 100, ..Default::default() })
+            .stage1_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens {
+                    input: 1_000,
+                    output: 100,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
-            .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 2_000, output: 200, ..Default::default() })
+            .stage2_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens {
+                    input: 2_000,
+                    output: 200,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
             .extract_bump_usage(
                 acct,
                 "2026-07-09",
                 "extract_banking",
-                UsageTokens { input: 4_000, output: 400, ..Default::default() },
+                UsageTokens {
+                    input: 4_000,
+                    output: 400,
+                    ..Default::default()
+                },
             )
             .unwrap();
         store
@@ -67,7 +86,11 @@ async fn categories_include_ledger_writers_the_endpoint_never_heard_of() {
                 acct,
                 "2026-07-09",
                 "extract_fictional",
-                UsageTokens { input: 8_000, output: 800, ..Default::default() },
+                UsageTokens {
+                    input: 8_000,
+                    output: 800,
+                    ..Default::default()
+                },
             )
             .unwrap();
     })
@@ -101,14 +124,22 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
             .stage1_bump_usage(
                 acct,
                 "2026-07-09",
-                UsageTokens { input: 1_000_000, output: 1_000_000, ..Default::default() },
+                UsageTokens {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    ..Default::default()
+                },
             )
             .unwrap();
         store
             .stage2_bump_usage(
                 acct,
                 "2026-07-09",
-                UsageTokens { input: 1_000_000, output: 1_000_000, ..Default::default() },
+                UsageTokens {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    ..Default::default()
+                },
             )
             .unwrap();
         store
@@ -116,7 +147,11 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
                 acct,
                 "2026-07-09",
                 "extract_banking",
-                UsageTokens { input: 1_000_000, output: 1_000_000, ..Default::default() },
+                UsageTokens {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    ..Default::default()
+                },
             )
             .unwrap();
     })
@@ -148,13 +183,25 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
 async fn top_level_fields_stay_stage2_for_older_clients() {
     let app = priced_harness(|store, acct| {
         store
-            .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 1_000, output: 100, ..Default::default() })
+            .stage1_bump_usage(
+                acct,
+                "2026-07-09",
+                UsageTokens {
+                    input: 1_000,
+                    output: 100,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         store
             .stage2_bump_usage(
                 acct,
                 "2026-07-09",
-                UsageTokens { input: 1_000_000, output: 1_000_000, ..Default::default() },
+                UsageTokens {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    ..Default::default()
+                },
             )
             .unwrap();
         store
@@ -162,7 +209,11 @@ async fn top_level_fields_stay_stage2_for_older_clients() {
                 acct,
                 "2026-07-09",
                 "extract_banking",
-                UsageTokens { input: 9_999, output: 9_999, ..Default::default() },
+                UsageTokens {
+                    input: 9_999,
+                    output: 9_999,
+                    ..Default::default()
+                },
             )
             .unwrap();
     })

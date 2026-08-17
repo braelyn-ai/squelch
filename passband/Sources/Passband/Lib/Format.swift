@@ -253,6 +253,21 @@ enum Fmt {
     static func todayStamp(now: Date = Date()) -> String {
         now.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
     }
+
+    /// Truncate into a copy budget of `n` characters, the ellipsis included, so
+    /// a cut announces itself rather than landing mid-word the way the system's
+    /// own truncation does.
+    static func truncate(_ s: String, _ n: Int) -> String {
+        guard n > 0 else { return "" }
+        guard s.count > n else { return s }
+        return String(s.prefix(n - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// Uppercase the first character, leaving the rest alone — for text that
+    /// starts a sentence after a leading label was stripped off it.
+    static func capitalizingFirst(_ s: String) -> String {
+        s.prefix(1).uppercased() + s.dropFirst()
+    }
 }
 
 /// The first "$1,234.56"-shaped run in a one-liner. Hand-rolled and memoized on

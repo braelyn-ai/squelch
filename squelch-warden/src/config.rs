@@ -514,8 +514,14 @@ impl Config {
         // what their tenants run, so it is a refusal to boot instead.
         if llm_base_url.is_none() {
             for (name, set) in [
-                ("SQUELCH_WARDEN_LLM_STAGE1_MODEL", llm_stage1_model.is_some()),
-                ("SQUELCH_WARDEN_LLM_STAGE2_MODEL", llm_stage2_model.is_some()),
+                (
+                    "SQUELCH_WARDEN_LLM_STAGE1_MODEL",
+                    llm_stage1_model.is_some(),
+                ),
+                (
+                    "SQUELCH_WARDEN_LLM_STAGE2_MODEL",
+                    llm_stage2_model.is_some(),
+                ),
                 (
                     "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP",
                     llm_stage1_daily_cap.is_some(),

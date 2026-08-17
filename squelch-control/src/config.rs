@@ -538,7 +538,11 @@ fn bifrost_from(
              expires and does not belong here",
         ));
     }
-    let budget_usd = parse_budget("SQUELCH_CONTROL_LLM_BUDGET_USD", budget, DEFAULT_LLM_BUDGET_USD)?;
+    let budget_usd = parse_budget(
+        "SQUELCH_CONTROL_LLM_BUDGET_USD",
+        budget,
+        DEFAULT_LLM_BUDGET_USD,
+    )?;
     let models = parse_models(
         "SQUELCH_CONTROL_LLM_MODELS",
         &models.unwrap_or_else(|| DEFAULT_LLM_MODELS.to_string()),
@@ -879,7 +883,10 @@ mod tests {
 
     #[test]
     fn validates_the_base_domain() {
-        assert_eq!(canonical_domain("Passband.Email").unwrap(), "passband.email");
+        assert_eq!(
+            canonical_domain("Passband.Email").unwrap(),
+            "passband.email"
+        );
         assert_eq!(
             canonical_domain("passband.email.").unwrap(),
             "passband.email"
@@ -950,13 +957,22 @@ mod tests {
         let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
 
         assert!(
-            bifrost_from(None, None, None, None, None, None).unwrap().is_none(),
+            bifrost_from(None, None, None, None, None, None)
+                .unwrap()
+                .is_none(),
             "off"
         );
 
-        let on = bifrost_from(some("https://bifrost.example"), some(&token), None, None, None, None)
-            .unwrap()
-            .expect("url + credential switches the feature on");
+        let on = bifrost_from(
+            some("https://bifrost.example"),
+            some(&token),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("url + credential switches the feature on");
         assert_eq!(on.url, "https://bifrost.example");
         assert_eq!(on.budget_usd, DEFAULT_LLM_BUDGET_USD);
         // The default model lists are the product's, and never empty.
@@ -964,7 +980,10 @@ mod tests {
         // The assistant key gets its own defaults: a bigger budget and a
         // frontier model where triage runs a cheap one.
         assert_eq!(on.assistant_budget_usd, DEFAULT_ASSISTANT_BUDGET_USD);
-        assert_eq!(on.assistant_models, vec!["claude-haiku-4-5", "claude-opus-4-8"]);
+        assert_eq!(
+            on.assistant_models,
+            vec!["claude-haiku-4-5", "claude-opus-4-8"]
+        );
 
         let on = bifrost_from(
             some("https://bifrost.example"),
@@ -982,14 +1001,42 @@ mod tests {
         assert_eq!(on.assistant_models, vec!["claude-opus-4-8"]);
 
         // Every partial combination refuses.
-        assert!(bifrost_from(some("https://bifrost.example"), None, None, None, None, None).is_err());
+        assert!(
+            bifrost_from(
+                some("https://bifrost.example"),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
         assert!(bifrost_from(None, some(&token), None, None, None, None).is_err());
         assert!(bifrost_from(None, None, some("5"), None, None, None).is_err());
         assert!(bifrost_from(None, None, None, some("claude-haiku-4-5"), None, None).is_err());
-        assert!(bifrost_from(some("https://bifrost.example"), None, some("5"), None, None, None).is_err());
+        assert!(
+            bifrost_from(
+                some("https://bifrost.example"),
+                None,
+                some("5"),
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
         assert!(bifrost_from(None, some(&token), some("5"), None, None, None).is_err());
         assert!(
-            bifrost_from(None, some(&token), None, some("claude-haiku-4-5"), None, None).is_err(),
+            bifrost_from(
+                None,
+                some(&token),
+                None,
+                some("claude-haiku-4-5"),
+                None,
+                None
+            )
+            .is_err(),
             "models without the url is still a half-configured feature"
         );
         // The assistant knobs are held to the same unit: alone, each is a
@@ -1006,35 +1053,76 @@ mod tests {
         let some = |s: &str| Some(s.to_string());
         let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
 
-        assert!(bifrost_from(some("http://bifrost.example"), some(&token), None, None, None, None).is_err());
+        assert!(
+            bifrost_from(
+                some("http://bifrost.example"),
+                some(&token),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
         assert!(bifrost_from(some("not a url"), some(&token), None, None, None, None).is_err());
         let short = format!("a:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN - 3));
-        assert!(bifrost_from(some("https://bifrost.example"), some(&short), None, None, None, None).is_err());
+        assert!(
+            bifrost_from(
+                some("https://bifrost.example"),
+                some(&short),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
         // The credential is Basic material: `username:password`, exactly one
         // colon, both halves nonempty. A pasted session bearer (no colon)
         // must fail at boot, not as a 401 weeks later.
         for bad in [
-            "b".repeat(MIN_BIFROST_TOKEN_LEN),                    // no colon: a bearer
-            format!(":{}", "b".repeat(MIN_BIFROST_TOKEN_LEN)),    // empty username
-            format!("{}:", "b".repeat(MIN_BIFROST_TOKEN_LEN)),    // empty password
+            "b".repeat(MIN_BIFROST_TOKEN_LEN), // no colon: a bearer
+            format!(":{}", "b".repeat(MIN_BIFROST_TOKEN_LEN)), // empty username
+            format!("{}:", "b".repeat(MIN_BIFROST_TOKEN_LEN)), // empty password
             format!("a:b:{}", "c".repeat(MIN_BIFROST_TOKEN_LEN)), // two colons
         ] {
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&bad), None, None, None, None)
-                    .is_err(),
+                bifrost_from(
+                    some("https://bifrost.example"),
+                    some(&bad),
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .is_err(),
                 "{bad:?}"
             );
         }
         // Both budgets are held to the same money-not-a-typo bar.
         for bad in ["nonsense", "0", "-5", "NaN", "inf", "1000000"] {
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&token), some(bad), None, None, None)
-                    .is_err(),
+                bifrost_from(
+                    some("https://bifrost.example"),
+                    some(&token),
+                    some(bad),
+                    None,
+                    None,
+                    None
+                )
+                .is_err(),
                 "{bad:?}"
             );
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&token), None, None, some(bad), None)
-                    .is_err(),
+                bifrost_from(
+                    some("https://bifrost.example"),
+                    some(&token),
+                    None,
+                    None,
+                    some(bad),
+                    None
+                )
+                .is_err(),
                 "assistant: {bad:?}"
             );
         }
@@ -1042,13 +1130,27 @@ mod tests {
         // could restructure a request, refuses to boot — either list.
         for bad in ["", " , ,", "claude haiku", "claude/../x", "mod\"el"] {
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&token), None, some(bad), None, None)
-                    .is_err(),
+                bifrost_from(
+                    some("https://bifrost.example"),
+                    some(&token),
+                    None,
+                    some(bad),
+                    None,
+                    None
+                )
+                .is_err(),
                 "{bad:?}"
             );
             assert!(
-                bifrost_from(some("https://bifrost.example"), some(&token), None, None, None, some(bad))
-                    .is_err(),
+                bifrost_from(
+                    some("https://bifrost.example"),
+                    some(&token),
+                    None,
+                    None,
+                    None,
+                    some(bad)
+                )
+                .is_err(),
                 "assistant: {bad:?}"
             );
         }

@@ -205,7 +205,7 @@ ul, ol {{ margin: 0 0 1.25rem; padding-left: 1.2rem; }}
 li {{ margin: 0 0 0.5rem; }}
 a {{ color: var(--brand); text-underline-offset: 0.15em; }}
 label {{ display: block; font-weight: 600; margin: 0 0 0.35rem; }}
-input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
+input[type=text], input[type=password], input[type=email] {{ width: 100%; box-sizing: border-box; padding: 0.6rem 0.7rem;
   margin: 0 0 1.25rem;
   border: 1px solid #cdc7bd; border-radius: 6px; background: #fff; color: inherit; font: inherit; }}
 button {{ padding: 0.65rem 1.15rem; border: 0; border-radius: 6px; background: #1a1a1a; color: #fbfaf8;
@@ -269,7 +269,7 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   body {{ background: #0f0f10; color: #f5f5f7; }}
   .muted, .suffix, .hint, th {{ color: #a0a0a7; }}
   code, .code {{ background: rgba(255, 255, 255, 0.07); }}
-  input[type=text], input[type=password] {{ background: rgba(255, 255, 255, 0.04);
+  input[type=text], input[type=password], input[type=email] {{ background: rgba(255, 255, 255, 0.04);
     border-color: rgba(255, 255, 255, 0.14); }}
   button, a.button {{ background: #f5f5f7; color: #0f0f10; }}
   button.quiet {{ background: none; color: #f5f5f7; border-color: rgba(255, 255, 255, 0.14); }}
@@ -442,15 +442,66 @@ device in.</p>"#,
     )
 }
 
-/// The console login's own problem page: the same shell as [`problem`] with NO
-/// link out.
+/// Where an app login ends: signed in, and one press from a connected app.
+///
+/// THE DEEP LINK IS THE PAGE. Everything else on it exists for the cases the
+/// link cannot cover: a browser that will not hand a custom scheme to the OS, a
+/// sign in finished on a phone for a Mac, an app that is not installed yet. So
+/// the code and the server are on it as `user-select: all` text too, exactly as
+/// they are on [`success`], and for the same reason: the link is the fast path
+/// and typing is the path that always works.
+///
+/// NO AUTOMATIC REDIRECT, and that is deliberate rather than unfinished. This
+/// page carries a live pairing code, and a redirect that fires on load would
+/// hand it to whatever claims `passband://` the moment the browser renders,
+/// before the person reading has agreed to anything. A press is one act more and
+/// it is the act that says which device this code is for.
+///
+/// The mailbox is named on it because this is the one screen that can say it: an
+/// app login never asked who the person was, so "signed in as" is the only
+/// confirmation they get that Google picked the account they meant.
+pub fn app_signed_in(
+    account_email: &str,
+    tenant_url: &str,
+    pair_code: &str,
+    minutes: i64,
+) -> Response {
+    let link = deep_link(tenant_url, pair_code);
+    page(
+        StatusCode::OK,
+        "Signed in",
+        &format!(
+            r#"<h1>Signed in as {email}</h1>
+<p>Your mailbox is at <code>{url}</code>. One press connects Passband to it.</p>
+<p><a class="button" href="{link}">Open Passband</a></p>
+<h2>If that button does nothing</h2>
+<p>Passband may not be installed on this device, or your browser may not open
+app links. Open Passband yourself, choose hosted, and enter these:</p>
+<p><code>{url}</code></p>
+<p><span class="code">{code}</span></p>
+<p class="muted">The code is good for {minutes} minutes and works once. If it
+expires before you get to it, come back here and sign in again.</p>
+<p class="muted">Keep the code to yourself while it is live. It is what lets a
+device in.</p>"#,
+            email = escape_html(account_email),
+            url = escape_html(tenant_url),
+            code = escape_html(pair_code),
+            link = escape_html(&link),
+            minutes = minutes,
+        ),
+    )
+}
+
+/// The page BOTH logins get when they are refused: the same shell as [`problem`]
+/// with NO link out.
 ///
 /// Two reasons it is not [`problem`]. The link there goes to the signup form,
 /// which is the wrong place to send somebody who already has a mailbox and was
 /// trying to sign in to it. And the only honest link back would be built from
 /// the label this request named, which on a uniform refusal is a label that may
 /// not exist: rendering it would answer, in an `href`, the question the refusal
-/// exists to leave unanswered.
+/// exists to leave unanswered. An app login has it worse still: it never named a
+/// label at all, so there is not even a wrong link to render.
 pub fn console_problem(status: StatusCode, heading: &str, detail: &str) -> Response {
     page(
         status,
@@ -626,6 +677,15 @@ pub fn admin_page(
 {error_html}
 <h2>Waiting ({waiting_count})</h2>
 {waiting_table}
+<h2>Invite someone directly</h2>
+<form method="post" action="/admin/invite">
+<label for="email">Email address</label>
+<input type="email" id="email" name="email" placeholder="them@example.com"
+  autocomplete="off" autocapitalize="off" spellcheck="false" required>
+<button type="submit">Mint and email an invite</button>
+</form>
+<p class="muted">They do not have to be on the list. The address lands under
+Approved below, with the same re-send button as everybody else.</p>
 <h2>Approved recently</h2>
 {history_table}
 <p class="muted">Approving mints one invite code and emails it. The code works
@@ -716,13 +776,7 @@ mod tests {
     use axum::body::to_bytes;
 
     async fn body_of(r: Response) -> String {
-        String::from_utf8(
-            to_bytes(r.into_body(), 1 << 20)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap()
+        String::from_utf8(to_bytes(r.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
     }
 
     #[test]
@@ -850,7 +904,11 @@ mod tests {
         let html = body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await;
         assert!(html.contains("ABCD-EFGH"));
         assert!(html.contains("https://ada.passband.email"));
-        assert!(html.contains("passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH"));
+        assert!(
+            html.contains(
+                "passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH"
+            )
+        );
         assert!(html.contains("passband.app"));
         assert!(!html.contains("<script"));
     }
@@ -917,6 +975,21 @@ mod tests {
         assert!(html.contains("&quot;&gt;"), "{html}");
     }
 
+    /// The direct-invite form is ON the dashboard, and it is styled: the shared
+    /// stylesheet named two input types by hand, so an `email` input rendered as
+    /// an unstyled browser default next to the ones that are not.
+    #[tokio::test]
+    async fn the_dashboard_carries_a_styled_form_for_inviting_directly() {
+        let page = body_of(admin_page(&[], &[], None)).await;
+        assert!(page.contains(r#"action="/admin/invite""#), "{page}");
+        assert!(page.contains(r#"name="email""#), "{page}");
+        assert!(page.contains("Mint and email an invite"), "{page}");
+        assert!(page.contains("input[type=email]"), "{page}");
+        // Both palettes, or it is an unstyled box in one of them.
+        assert_eq!(page.matches("input[type=email]").count(), 2, "{page}");
+        assert!(!page.contains("<script"), "{page}");
+    }
+
     /// Which button a row gets is the whole state machine the operator sees: a
     /// stamped row is quiet, an unstamped one is loud and asks to be pressed.
     #[tokio::test]
@@ -927,7 +1000,10 @@ mod tests {
         assert!(!sent.contains("email not sent"), "{sent}");
 
         let failed = body_of(admin_page(&[], &[row(1, "ada@example.com", false)], None)).await;
-        assert!(failed.contains(r#"<span class="stop">email not sent</span>"#), "{failed}");
+        assert!(
+            failed.contains(r#"<span class="stop">email not sent</span>"#),
+            "{failed}"
+        );
         assert!(failed.contains("Send new invite"), "{failed}");
 
         let waiting = body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await;
@@ -967,7 +1043,12 @@ mod tests {
             .await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
-            body_of(console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
+            body_of(console_problem(
+                StatusCode::BAD_REQUEST,
+                "Nope",
+                "Try again.",
+            ))
+            .await,
             body_of(admin_login(Some("no"))).await,
             body_of(admin_page(
                 &[row(1, "ada@example.com", false)],
@@ -990,6 +1071,13 @@ mod tests {
         for html in [
             body_of(signup_form("passband.email", None, "", "", None)).await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+            ))
+            .await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(
                 StatusCode::BAD_REQUEST,

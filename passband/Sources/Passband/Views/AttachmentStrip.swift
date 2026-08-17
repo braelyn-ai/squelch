@@ -1,7 +1,10 @@
-// Attachment strip for the thread viewer — one card per attachment: image
-// thumbnail, PDF page 1, or a file card. svg is scriptable so it ALWAYS lands in
+// Attachments for the thread viewer, in two registers. IMAGES RENDER INLINE at
+// column width, because "see photo attached" means the photo IS the message and
+// every other mail client shows it — a 38pt chip is a filing cabinet, not a
+// reading surface. Everything then gets a card in the strip below: image
+// thumbnail, PDF page 1, or a file glyph. svg is scriptable so it ALWAYS lands in
 // the file bucket, and the SERVER decides Content-Type, so a mislabeled
-// attachment stays inert. Tiles resolve through AttachmentThumbs (a card in a
+// attachment stays inert. Art resolves through AttachmentThumbs (a card in a
 // LazyVStack would re-download on recycle), authenticated through APIClient.
 //
 // THE CARDS ARE SHARED; THE TWO VERBS ARE NOT. Saving is a save panel on one
@@ -30,38 +33,38 @@ struct AttachmentStrip: View {
         @State private var opening: Int?
     #endif
 
-    /// Images above this show the glyph card instead — a 10MB photo for a 120px
-    /// thumb is silly bandwidth.
-    private static let thumbMaxBytes = 2 * 1024 * 1024
-    /// PDFs get more headroom than photos: page 1 rasterizes as cheaply for a
-    /// 3MB invoice as for a 30KB one, and receipts/tickets — the attachments
-    /// worth recognizing at a glance — routinely sit above the photo cap.
-    private static let pdfThumbMaxBytes = 4 * 1024 * 1024
-
-    static func isThumbnailable(_ mime: String, _ size: Int) -> Bool {
-        mime.hasPrefix("image/") && mime != "image/svg+xml" && size <= thumbMaxBytes
-    }
-    static func isPDF(_ mime: String) -> Bool { mime == "application/pdf" }
-
-    /// Which rasterizer a card's tile uses, or nil for the glyph. The ONE place
-    /// the mime buckets are decided — svg lands in the glyph bucket here and
-    /// nowhere reconsiders it.
+    /// Which rasterizer a card's tile uses, or nil for the glyph. The buckets
+    /// themselves live in AttachmentKinds; this is only the mapping from a bucket
+    /// to the renderer that draws it.
     static func tileSource(_ att: Attachment) -> AttachmentThumbs.Source? {
         guard att.downloadable else { return nil }
-        if isThumbnailable(att.mime, att.size) { return .image }
-        if isPDF(att.mime), att.size <= pdfThumbMaxBytes { return .pdf }
+        if AttachmentKinds.isThumbnailable(att.mime, att.size) { return .image }
+        if AttachmentKinds.isPDF(att.mime), att.size <= AttachmentKinds.pdfThumbMaxBytes {
+            return .pdf
+        }
         return nil
     }
 
+    /// The attachments that also render in the column. Order is the server's, so
+    /// two photos arrive in the order they were attached.
+    private var inlineImages: [Attachment] { attachments.filter(AttachmentKinds.isInline) }
+
     var body: some View {
         if !attachments.isEmpty {
-            FlowLayout(spacing: 8) {
-                ForEach(attachments) { att in
-                    AttachmentCard(
-                        attachment: att,
-                        onDownload: { Task { await download(att) } },
-                        onPreview: Self.isPDF(att.mime) && att.downloadable
-                            ? { openPreview(att) } : nil)
+            VStack(alignment: .leading, spacing: 10) {
+                // The picture first, the filing second. A message that says "see
+                // photo attached" is answered by the photo, and the card below is
+                // then just where its name and its download live.
+                ForEach(inlineImages) { att in
+                    InlineImage(attachment: att, onOpen: { openPreview(att) })
+                }
+                FlowLayout(spacing: 8) {
+                    ForEach(attachments) { att in
+                        AttachmentCard(
+                            attachment: att,
+                            onDownload: { Task { await download(att) } },
+                            onPreview: AttachmentKinds.isPreviewable(att) ? { openPreview(att) } : nil)
+                    }
                 }
             }
             .padding(.top, 4)
@@ -71,10 +74,20 @@ struct AttachmentStrip: View {
             // window edge and scrolls away with the content.
             #if os(macOS)
                 .sheet(item: $preview) { att in
-                    PDFPreview(
-                        attachment: att,
-                        onDownload: { Task { await download(att) } },
-                        onClose: { preview = nil })
+                    // Two rasterizers, one card: the scrim, the size and the keys
+                    // are the sheet's, and only the middle of it knows a PDF from
+                    // a photo.
+                    if AttachmentKinds.isPDF(att.mime) {
+                        PDFPreview(
+                            attachment: att,
+                            onDownload: { Task { await download(att) } },
+                            onClose: { preview = nil })
+                    } else {
+                        ImagePreview(
+                            attachment: att,
+                            onDownload: { Task { await download(att) } },
+                            onClose: { preview = nil })
+                    }
                 }
             #else
                 .sheet(item: $staged) { file in
@@ -168,7 +181,7 @@ private struct AttachmentCard: View {
     @State private var hovering = false
 
     private var stored: Bool { attachment.downloadable }
-    private var pdf: Bool { stored && AttachmentStrip.isPDF(attachment.mime) }
+    private var pdf: Bool { stored && AttachmentKinds.isPDF(attachment.mime) }
     private var glyph: String { pdf ? "doc.richtext" : "doc" }
 
     var body: some View {
@@ -257,6 +270,62 @@ private struct ThumbTile: View {
             }
         }
         .task { resolved = await AttachmentThumbs.shared.resolve(attachment, as: source) }
+    }
+}
+
+/// One image attachment, rendered in the message column at the size it was sent
+/// to be looked at. Cross-platform on purpose: this is the reading surface, and
+/// the two platforms disagree only about what a TAP opens, never about this.
+private struct InlineImage: View {
+    let attachment: Attachment
+    let onOpen: () -> Void
+
+    @State private var resolved: AttachmentThumbs.Tile?
+    @State private var hovering = false
+
+    /// Aspect is kept and the height is CAPPED: a portrait photo scaled to the
+    /// column's full width would push the rest of the thread off the screen, and
+    /// a thread is a conversation before it is a gallery. The tap opens the whole
+    /// thing at full size.
+    private static let maxHeight: CGFloat = 460
+    /// What the placeholder reserves while the bytes are in flight, so the body
+    /// above it does not jump when the picture lands.
+    private static let placeholderHeight: CGFloat = 160
+
+    var body: some View {
+        // Read the cache on the way INTO body for the same reason the tile does:
+        // a message scrolled out and back must paint from what we hold.
+        let tile = resolved ?? AttachmentThumbs.shared.cachedInline(attachment.id)
+        Group {
+            switch tile {
+            case .art(let image)?:
+                Image(platformImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: Self.maxHeight, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Palette.hairline, lineWidth: 1)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onOpen)
+                    .onHover { hovering = $0 }
+                    .opacity(hovering ? 0.93 : 1)
+                    .help("\(attachment.filename) — click to open")
+                    .accessibilityLabel(attachment.filename)
+            // A decode we already know fails is NOT a hole in the column: the
+            // card below still names the file and still downloads it.
+            case .blank?:
+                EmptyView()
+            case nil:
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Palette.hairline.opacity(0.4))
+                    .frame(height: Self.placeholderHeight)
+                    .overlay(ProgressView().controlSize(.small))
+            }
+        }
+        .task { resolved = await AttachmentThumbs.shared.resolveInline(attachment) }
     }
 }
 
@@ -384,4 +453,104 @@ private struct PDFKitView: NSViewRepresentable {
     }
 }
 
-#endif  // os(macOS) — PDFPreview + PDFKitView
+/// Image preview — the PDF sheet's twin, sharing its scrim, its clamped card and
+/// its Esc. Rasterized through the same ImageIO path everything else here uses
+/// rather than handed to `NSImage(data:)`: a 4000px photo decoded at full size to
+/// fill an 820pt card is 30MB of bitmap nobody looks at.
+private struct ImagePreview: View {
+    let attachment: Attachment
+    let onDownload: () -> Void
+    let onClose: () -> Void
+
+    @State private var image: PlatformImage?
+    @State private var error: String?
+
+    private static let scrimSize = CGSize(width: 940, height: 620)
+    private static let cardSize = CGSize(width: 820, height: 520)
+    /// The card's long edge at 2x. ImageIO does not upscale, so a small logo
+    /// opened here is shown at its own size rather than stretched into mush.
+    private nonisolated static let maxPixel = 1640
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.black.opacity(0.14))
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onClose)
+            card
+        }
+        .frame(width: Self.scrimSize.width, height: Self.scrimSize.height)
+        .presentationBackground(.clear)
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "close preview", allowInInput: true) { onClose() }
+        ])
+        .task {
+            do {
+                let fetched = try await APIClient.shared.fetchAttachment(
+                    attachment.id, fallbackName: attachment.filename)
+                let bytes = fetched.bytes
+                let png = await Task.detached(priority: .userInitiated) { () -> Data? in
+                    guard let art = Raster.thumbnail(bytes, maxPixel: Self.maxPixel) else {
+                        return nil
+                    }
+                    return Raster.png(art)
+                }.value
+                guard let png, let decoded = PlatformImage(data: png) else {
+                    error = "could not read that image"
+                    return
+                }
+                image = decoded
+            } catch {
+                self.error = errText(error, "preview failed")
+            }
+        }
+    }
+
+    private var card: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text(attachment.filename)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                ChromeChip(
+                    text: "download", icon: "arrow.down.circle", tone: Palette.accent,
+                    action: onDownload)
+                Button(action: onClose) {
+                    HStack(spacing: 4) {
+                        Kbd("esc")
+                        Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+
+            Divider().overlay(Palette.hairline)
+
+            Group {
+                if let error {
+                    Text(error).font(Typo.rowSub).foregroundStyle(Palette.danger)
+                } else if let image {
+                    Image(platformImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding(12)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(width: Self.cardSize.width, height: Self.cardSize.height)
+        .passbandGlass(.pane, cornerRadius: 13, tint: Palette.glassTint)
+        .shadow(color: .black.opacity(0.3), radius: 40, y: 16)
+        .contentShape(Rectangle())
+        .onTapGesture {}
+    }
+}
+
+#endif  // os(macOS) — PDFPreview + ImagePreview + PDFKitView

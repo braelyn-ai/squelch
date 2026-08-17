@@ -641,6 +641,43 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
+    /// Put an address straight onto the approved half, whether or not it ever
+    /// asked. `Some(id)` is the row this call approved and is the caller's to
+    /// mint for; `None` means it was approved already and there is nothing new
+    /// to send.
+    ///
+    /// ONE STATEMENT, because the operator typing an address and the operator
+    /// clicking Approve on that same address are the same race
+    /// [`approve_waitlist`] guards, and it has to hold across an INSERT the
+    /// second one turns into an UPDATE. The upsert's `WHERE` is the guard: it
+    /// promotes a pending row and refuses an approved one, so two presses mint
+    /// exactly one invite between them, and `RETURNING` hands back the winner's
+    /// id without a second lookup that another writer could invalidate.
+    ///
+    /// A direct invite is recorded as a waitlist row on purpose. The alternative
+    /// is a second ledger with the same columns, and then two places to look for
+    /// "did we already invite them", two things to page, and one of them
+    /// silently missing the re-send button.
+    pub fn invite_directly(&self, email: &str, now: DateTime<Utc>) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "INSERT INTO waitlist(email, created_at, status, approved_at)
+                      VALUES(?1, ?2, ?3, ?2)
+                 ON CONFLICT(email) DO UPDATE SET status = ?3, approved_at = ?2
+                      WHERE waitlist.status = ?4
+                 RETURNING id",
+                params![
+                    normalize_email(email),
+                    stamp(now),
+                    WAITLIST_APPROVED,
+                    WAITLIST_PENDING
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// The admin page's listing: EVERY row still waiting, oldest first, then
     /// the most recently approved as history.
     ///
@@ -1021,7 +1058,10 @@ mod tests {
         let now = now();
         let id = s.insert_invite(&m.code_hash, now + days(30)).unwrap();
 
-        assert_eq!(s.find_available_invite(&m.code_hash, now).unwrap(), Some(id));
+        assert_eq!(
+            s.find_available_invite(&m.code_hash, now).unwrap(),
+            Some(id)
+        );
         let after = now + days(31);
         assert_eq!(s.find_available_invite(&m.code_hash, after).unwrap(), None);
         assert_eq!(
@@ -1217,7 +1257,11 @@ mod tests {
         assert!(s.set_tenant_vk("ada", "vk-t1").unwrap());
         assert!(s.clear_tenant_assistant_vk("ada").unwrap());
         assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
-        assert_eq!(assistant_vk_minted_at(&s, "ada"), None, "cleared with the id");
+        assert_eq!(
+            assistant_vk_minted_at(&s, "ada"),
+            None,
+            "cleared with the id"
+        );
         assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-t1".to_string()));
         assert!(!s.clear_tenant_assistant_vk("ada").unwrap());
         assert!(s.clear_tenant_vk("ada").unwrap());
@@ -1286,7 +1330,11 @@ mod tests {
         .unwrap();
 
         let s = ControlStore::init(conn).unwrap();
-        assert_eq!(s.tenant_vk("ada").unwrap(), Some("vk-old".to_string()), "kept");
+        assert_eq!(
+            s.tenant_vk("ada").unwrap(),
+            Some("vk-old".to_string()),
+            "kept"
+        );
         assert_eq!(s.tenant_assistant_vk("ada").unwrap(), None);
         assert!(s.set_tenant_assistant_vk("ada", "vk-a1").unwrap());
         assert_eq!(
@@ -1495,6 +1543,9 @@ mod tests {
             s.insert_tenant("grace", "ADA@example.com"),
             Err(StoreError::AccountTaken)
         ));
-        assert_eq!(s.active_tenant_for_email("other@example.com").unwrap(), None);
+        assert_eq!(
+            s.active_tenant_for_email("other@example.com").unwrap(),
+            None
+        );
     }
 }
