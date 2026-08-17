@@ -67,8 +67,7 @@ const SIGNED_OUT: &str = "Your admin session has ended. Sign in again.";
 /// The approval guard, reported. Covers a double-clicked button, a refreshed
 /// POST, and an id that names no row, because the one statement that decides
 /// this cannot tell them apart and none of the three minted anything.
-const ALREADY_APPROVED: &str =
-    "That row is not waiting any more. It was already approved, or there is no row with that id, \
+const ALREADY_APPROVED: &str = "That row is not waiting any more. It was already approved, or there is no row with that id, \
      and nothing was minted or sent.";
 
 const NO_SUCH_ROW: &str = "There is no waitlist row with that id.";
@@ -79,8 +78,7 @@ const NOT_APPROVED: &str = "Approve that row first.";
 /// The one thing a re-send will not do. A spent code means somebody set a
 /// mailbox up with it, and quietly minting a second is an extra tenant nobody
 /// approved.
-const INVITE_SPENT: &str =
-    "That invite has already been used, so nothing was sent. If they need another mailbox, \
+const INVITE_SPENT: &str = "That invite has already been used, so nothing was sent. If they need another mailbox, \
      issue a code with the CLI.";
 
 const STORE_TROUBLE: &str = "The store did not answer. Nothing changed, so try again.";
@@ -92,8 +90,7 @@ const INVALID_ADDRESS: &str = "That is not an email address. Nothing was sent.";
 
 /// A direct invite for somebody already approved. The row is on the page below
 /// the banner, with the button that replaces a lost code.
-const ALREADY_INVITED: &str =
-    "That address has already been invited, so nothing extra was sent. Its row is below, and \
+const ALREADY_INVITED: &str = "That address has already been invited, so nothing extra was sent. Its row is below, and \
      \"Send fresh invite\" replaces a code that never arrived.";
 
 /// The compare-and-swap in [`mint_and_send`], reported. Two presses of the same
@@ -204,11 +201,7 @@ pub async fn page(State(state): State<ControlState>, headers: HeaderMap) -> Resp
 }
 
 /// `POST /admin/login` — present the token, get a twelve-hour session.
-pub async fn login(
-    State(state): State<ControlState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+pub async fn login(State(state): State<ControlState>, headers: HeaderMap, body: Bytes) -> Response {
     let config = state.config();
     let Some(waitlist) = config.waitlist.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -250,7 +243,11 @@ pub async fn login(
 /// address. It lands on the SAME ledger as an approved waitlist row, so the
 /// history, the "email not sent" badge, and the re-send button all work on it
 /// without knowing which door it came in by.
-pub async fn invite(State(state): State<ControlState>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn invite(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if !is_admin(&state, &headers) {
         return signed_out(&state);
     }
@@ -370,7 +367,11 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
                 // A store that will not answer counts as held, which is the
                 // closed direction: refusing costs a click, and guessing wrong
                 // the other way costs somebody their signup.
-                if state.store().invite_is_held(old, Utc::now()).unwrap_or(true) {
+                if state
+                    .store()
+                    .invite_is_held(old, Utc::now())
+                    .unwrap_or(true)
+                {
                     return dashboard(&state, Some(INVITE_HELD));
                 }
                 // SPENT is a refusal: somebody set a mailbox up with that code,
@@ -422,7 +423,10 @@ async fn mint_and_send(
     let row = match state.store().waitlist_entry(id) {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::warn!(id, "the waitlist row went away before its invite was minted");
+            tracing::warn!(
+                id,
+                "the waitlist row went away before its invite was minted"
+            );
             return Some(NO_SUCH_ROW);
         }
         Err(e) => {

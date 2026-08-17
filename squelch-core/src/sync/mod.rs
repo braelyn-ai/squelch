@@ -1486,6 +1486,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         &out,
                         &cfg.model,
                         cfg.known_contact_importance,
+                        &self.config.router(),
                         Utc::now(),
                     );
                     match self.store.stage1_apply(&applied) {
@@ -2710,6 +2711,7 @@ mod tests {
             field_reasons: crate::types::FieldReasons::default(),
             stage1_model_used: "claude-haiku-4-5".into(),
             needs_stage2: false,
+            escalation_reason: None,
             deadline: None,
             category: None,
         };

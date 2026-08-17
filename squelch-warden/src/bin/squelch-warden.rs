@@ -131,10 +131,10 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-        .with_graceful_shutdown(async {
-            shutdown_signal().await;
-            tracing::info!("squelch-warden: shutting down");
-        })
-        .await?;
+    .with_graceful_shutdown(async {
+        shutdown_signal().await;
+        tracing::info!("squelch-warden: shutting down");
+    })
+    .await?;
     Ok(())
 }

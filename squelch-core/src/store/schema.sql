@@ -109,9 +109,16 @@ CREATE TABLE IF NOT EXISTS triage (
     -- 'rule' when a sender rule already decided the row (no model spend), or
     -- 'heuristic-only' when the pass fell back to the seed.
     stage1_model_used TEXT,
-    -- Set to 1 by the Stage-1 pass (confident=false), or at ingest for a Filtered
-    -- rule needing want_text evaluation, to mark the row for Stage-2 escalation.
+    -- Set to 1 by `triage::router::should_escalate` over the Stage-1 verdict, or
+    -- at ingest for a Filtered rule needing want_text evaluation, to mark the row
+    -- for Stage-2 escalation.
     needs_stage2    INTEGER NOT NULL DEFAULT 0,
+    -- WHICH router arm escalated the row ('buried_bill' | 'unverified_urgency' |
+    -- 'scam_shape' | 'exception' | 'invoice' | 'sender_corrected' | 'boundary' |
+    -- 'model_unsure'). NULL when the row did not escalate. Stored so the
+    -- escalation MIX can be inspected: the arms are the design, and tuning them
+    -- blind to which one fires is guesswork.
+    escalation_reason TEXT,
     -- STAGE-2 LLM marker. NULL = not yet Stage-2 processed. The Stage-2 queue
     -- predicate is `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
     -- model_used IS NULL AND sensitivity='normal'`.

@@ -233,7 +233,11 @@ pub async fn set_llm_key(
     };
     match state
         .warden()
-        .set_llm_key(&label, req.api_key.as_deref(), req.assistant_api_key.as_deref())
+        .set_llm_key(
+            &label,
+            req.api_key.as_deref(),
+            req.assistant_api_key.as_deref(),
+        )
         .await
     {
         // Nothing to hand back: the keys came in, and they never go out.

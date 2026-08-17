@@ -467,6 +467,11 @@ pub struct Stage1Queued {
     /// `true` if the sender is a Sent-derived contact. Feeds the TRUSTED CONTEXT
     /// block and gates the unknown-sender deadline cap.
     pub is_known_contact: bool,
+    /// `true` if the account owner has ever corrected a triage verdict for this
+    /// sender address. Feeds [`crate::triage::router::EscalationReason::SenderCorrected`]:
+    /// a human override is the strongest evidence in the system that a sender is
+    /// one we get wrong, so their next message earns the harder look.
+    pub sender_corrected: bool,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
 }
@@ -487,9 +492,13 @@ pub struct Stage1Applied {
     pub field_reasons: FieldReasons,
     /// The Stage-1 model id to stamp `stage1_model_used` with.
     pub stage1_model_used: String,
-    /// `true` when the model was not confident: sets `needs_stage2=1` so the
-    /// Stage-2 queue predicate picks the row up.
+    /// `true` when [`crate::triage::router::should_escalate`] found a reason:
+    /// sets `needs_stage2=1` so the Stage-2 queue predicate picks the row up.
     pub needs_stage2: bool,
+    /// The routing reason's slug, stored so the escalation MIX is inspectable
+    /// after the fact. Tuning the router without knowing which arm is firing is
+    /// guesswork, and the arms are the whole design.
+    pub escalation_reason: Option<&'static str>,
     /// A deadline to (re)write for this message, if the model extracted one.
     pub deadline: Option<DeadlineHit>,
     /// Routing category (`general` | `invoice` | `banking_statement` |

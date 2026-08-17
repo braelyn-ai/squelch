@@ -555,8 +555,13 @@ mod tests {
 
     async fn client_for(rec: &Shared) -> BifrostClient {
         let url = spawn_gateway(rec.clone()).await;
-        BifrostClient::new(url, ADMIN_TOKEN.into(), test_models(), Duration::from_secs(5))
-            .unwrap()
+        BifrostClient::new(
+            url,
+            ADMIN_TOKEN.into(),
+            test_models(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
     }
 
     /// The happy path: the key listing is fetched and the mint carries Basic
@@ -592,7 +597,10 @@ mod tests {
         assert_eq!(pc["provider"], "anthropic");
         assert_eq!(pc["weight"], 1);
         assert_eq!(pc["key_ids"], json!(["ANTHROPIC_API_KEY_auto_detected"]));
-        assert_eq!(pc["allowed_models"], json!(["claude-haiku-4-5", "claude-sonnet-5"]));
+        assert_eq!(
+            pc["allowed_models"],
+            json!(["claude-haiku-4-5", "claude-sonnet-5"])
+        );
     }
 
     /// The assistant mint rides the same wire with its OWN name, models, and
@@ -657,7 +665,10 @@ mod tests {
             rec.lock().unwrap().mint_response = Some((200, bad.clone()));
             let c = client_for(&rec).await;
             assert!(
-                matches!(c.mint_virtual_key("ada", 5.0).await, Err(BifrostError::BadKey)),
+                matches!(
+                    c.mint_virtual_key("ada", 5.0).await,
+                    Err(BifrostError::BadKey)
+                ),
                 "{bad:?}"
             );
         }
@@ -733,8 +744,10 @@ mod tests {
     #[tokio::test]
     async fn refuses_an_oversized_answer() {
         let rec: Shared = Arc::new(Mutex::new(Recorder::default()));
-        rec.lock().unwrap().mint_response =
-            Some((200, format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_RESPONSE_BODY))));
+        rec.lock().unwrap().mint_response = Some((
+            200,
+            format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_RESPONSE_BODY)),
+        ));
         let c = client_for(&rec).await;
         assert!(matches!(
             c.mint_virtual_key("ada", 5.0).await,
@@ -796,7 +809,10 @@ mod tests {
         rec.lock().unwrap().revoke_status = Some(404);
         let c = client_for(&rec).await;
         c.revoke_virtual_key("vk-stale").await.unwrap();
-        assert_eq!(rec.lock().unwrap().revoked_ids, vec!["vk-stale".to_string()]);
+        assert_eq!(
+            rec.lock().unwrap().revoked_ids,
+            vec!["vk-stale".to_string()]
+        );
     }
 
     /// The label reaches the gateway's key listing verbatim; one this crate

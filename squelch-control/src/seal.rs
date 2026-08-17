@@ -176,8 +176,7 @@ mod tests {
     #[test]
     fn seals_a_credential_only_that_tenants_identity_can_open() {
         let identity = age::x25519::Identity::generate();
-        let armor =
-            seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
+        let armor = seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
 
         assert!(armor.starts_with(ARMOR_HEADER), "{armor}");
         assert!(armor.contains("-----END AGE ENCRYPTED FILE-----"));
@@ -201,8 +200,7 @@ mod tests {
     #[test]
     fn seals_the_grant_into_both_the_read_and_the_write_slot() {
         let identity = age::x25519::Identity::generate();
-        let armor =
-            seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
+        let armor = seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
 
         let plaintext = open(&armor, &identity);
         let parsed: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
@@ -252,7 +250,10 @@ mod tests {
             seal_credentials(&b.to_public().to_string(), "grace@example.com", &token()).unwrap();
         assert_ne!(armor_a, armor_b);
         let opened: serde_json::Value = serde_json::from_str(&open(&armor_b, &b)).unwrap();
-        assert_eq!(opened["slots"]["grace@example.com"]["refresh_token"], REFRESH);
+        assert_eq!(
+            opened["slots"]["grace@example.com"]["refresh_token"],
+            REFRESH
+        );
     }
 
     /// A recipient this process will not parse never gets a token encrypted to
@@ -260,7 +261,13 @@ mod tests {
     /// "the warden's answer is untrusted input" true rather than aspirational.
     #[test]
     fn refuses_to_seal_to_something_that_is_not_a_recipient() {
-        for bad in ["", "age1", "not-a-key", "<script>", "age1verylongbutnotakey"] {
+        for bad in [
+            "",
+            "age1",
+            "not-a-key",
+            "<script>",
+            "age1verylongbutnotakey",
+        ] {
             assert!(
                 matches!(
                     seal_credentials(bad, MAILBOX, &token()),
@@ -277,8 +284,7 @@ mod tests {
     #[test]
     fn the_armor_is_plain_text_lines() {
         let identity = age::x25519::Identity::generate();
-        let armor =
-            seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
+        let armor = seal_credentials(&identity.to_public().to_string(), MAILBOX, &token()).unwrap();
         assert!(armor.lines().count() >= 3, "{armor}");
         assert!(armor.is_ascii());
     }

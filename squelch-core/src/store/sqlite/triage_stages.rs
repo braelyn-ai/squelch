@@ -356,7 +356,12 @@ impl SqliteStore {
                         WHERE c.account_id = m.account_id
                           AND c.addr = m.from_addr COLLATE NOCASE
                           AND c.sent_count > 0
-                    ) AS is_known
+                    ) AS is_known,
+                    EXISTS(
+                        SELECT 1 FROM triage_feedback f
+                        WHERE f.account_id = m.account_id
+                          AND f.sender = m.from_addr COLLATE NOCASE
+                    ) AS sender_corrected
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
@@ -378,6 +383,7 @@ impl SqliteStore {
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(5)?),
                     received_at: dt(r, 6)?,
                     is_known_contact: r.get::<_, i64>(7)? != 0,
+                    sender_corrected: r.get::<_, i64>(8)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -406,7 +412,8 @@ impl SqliteStore {
                  stage1_model_used = ?8,
                  needs_stage2 = ?9,
                  field_reasons = ?10,
-                 category = COALESCE(?11, category)
+                 category = COALESCE(?11, category),
+                 escalation_reason = ?12
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
             params![
                 applied.message_id,
@@ -420,6 +427,7 @@ impl SqliteStore {
                 applied.needs_stage2 as i64,
                 field_reasons_json,
                 applied.category,
+                applied.escalation_reason,
             ],
         )?;
         // TOCTOU: a row sealed by hand between the queue SELECT and this apply

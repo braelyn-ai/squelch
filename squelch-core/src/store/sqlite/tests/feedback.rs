@@ -509,14 +509,25 @@ fn sealing_clears_an_item_name_donated_to_another_messages_row() {
 
     // The human seals the DONOR, not the feeder.
     store
-        .correct_triage(acct, donor, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            donor,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
 
     let listed = store
         .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
         .unwrap();
-    assert_eq!(listed.len(), 1, "the package itself is not the donor's to delete");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the package itself is not the donor's to delete"
+    );
     assert_eq!(
         shipment_name(&store, acct),
         (String::new(), None),
@@ -591,7 +602,14 @@ fn promotion_carries_the_staged_messages_provenance_so_sealing_it_still_scrubs()
     // Sealing the ORDER mail leaves the package (the ship notice feeds it) but
     // takes back the words the order mail contributed.
     store
-        .correct_triage(acct, order, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            order,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -628,7 +646,14 @@ fn sealing_scrubs_a_name_donated_to_a_staged_order_another_message_feeds() {
         .unwrap();
 
     store
-        .correct_triage(acct, namer, TriageAxis::Sensitivity, "sealed", None, Utc::now())
+        .correct_triage(
+            acct,
+            namer,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
         .unwrap()
         .unwrap();
 

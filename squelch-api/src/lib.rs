@@ -63,9 +63,7 @@ pub fn router(state: ApiState) -> Router {
         // EXACT match so this stays the only extra path a vhost serves.
         .route(
             "/",
-            axum::routing::get(|| async {
-                axum::response::Redirect::temporary("/console")
-            }),
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/console") }),
         )
 }
 
@@ -118,10 +116,7 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/drafts/{id}", delete(handlers::delete_draft))
         // The composer/signature preview: the send path's own markdown render,
         // exposed so the client never grows a second, drifting renderer.
-        .route(
-            "/client/markdown/preview",
-            post(handlers::markdown_preview),
-        )
+        .route("/client/markdown/preview", post(handlers::markdown_preview))
         // Recipient autocomplete over Sent-derived contacts. Human door only —
         // the agent door must never see who the user writes to.
         .route("/client/contacts", get(handlers::get_contacts))

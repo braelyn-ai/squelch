@@ -69,7 +69,12 @@ fn extract_bump_usage_records_its_own_ledger_category() {
             acct,
             "2026-07-23",
             "extract_banking",
-            UsageTokens { input: 500, output: 20, cache_creation: 700, cache_read: 3000 },
+            UsageTokens {
+                input: 500,
+                output: 20,
+                cache_creation: 700,
+                cache_read: 3000,
+            },
         )
         .unwrap();
     store
@@ -77,7 +82,12 @@ fn extract_bump_usage_records_its_own_ledger_category() {
             acct,
             "2026-07-23",
             "extract_banking",
-            UsageTokens { input: 300, output: 10, cache_creation: 300, cache_read: 1000 },
+            UsageTokens {
+                input: 300,
+                output: 10,
+                cache_creation: 300,
+                cache_read: 1000,
+            },
         )
         .unwrap();
     let conn = store.lock().unwrap();
@@ -488,13 +498,14 @@ fn stage1_apply_confident_false_escalates_true_does_not() {
         one_line: "refined".into(),
         reason: "stage-1".into(),
         field_reasons: crate::types::FieldReasons::default(),
-        stage1_model_used: "claude-haiku-4-5".into(),
+        stage1_model_used: "claude-opus-5".into(),
         needs_stage2,
+        escalation_reason: needs_stage2.then_some("boundary"),
         deadline: None,
         category: Some("general".into()),
     };
-    store.stage1_apply(&applied(a, false)).unwrap(); // confident -> final
-    store.stage1_apply(&applied(b, true)).unwrap(); // not confident -> escalate
+    store.stage1_apply(&applied(a, false)).unwrap(); // router found nothing -> final
+    store.stage1_apply(&applied(b, true)).unwrap(); // router escalated
 
     // Both left the Stage-1 queue.
     assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
@@ -531,10 +542,27 @@ fn stage1_mark_processed_preserves_needs_stage2_seed() {
 fn stage1_usage_ledger_is_a_separate_category() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 20, cache_creation: 40, cache_read: 900 })
+        .stage1_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 100,
+                output: 20,
+                cache_creation: 40,
+                cache_read: 900,
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 500, output: 90, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 500,
+                output: 90,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let s1 = store.stage1_usage_since(acct, "2026-07-01").unwrap();
@@ -562,10 +590,26 @@ fn stage1_usage_ledger_is_a_separate_category() {
 fn list_usage_by_category_surfaces_extractors_nobody_named() {
     let (store, acct) = store();
     store
-        .stage1_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 20, ..Default::default() })
+        .stage1_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 100,
+                output: 20,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 500, output: 90, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 500,
+                output: 90,
+                ..Default::default()
+            },
+        )
         .unwrap();
     // An extractor category, and a category invented right here: the point of
     // enumerating is that a ledger writer added LATER still reports, without
@@ -575,7 +619,11 @@ fn list_usage_by_category_surfaces_extractors_nobody_named() {
             acct,
             "2026-07-09",
             "extract_banking",
-            UsageTokens { input: 40, output: 8, ..Default::default() },
+            UsageTokens {
+                input: 40,
+                output: 8,
+                ..Default::default()
+            },
         )
         .unwrap();
     store
@@ -583,7 +631,11 @@ fn list_usage_by_category_surfaces_extractors_nobody_named() {
             acct,
             "2026-07-10",
             "extract_something_new",
-            UsageTokens { input: 7, output: 3, ..Default::default() },
+            UsageTokens {
+                input: 7,
+                output: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -910,10 +962,28 @@ fn stage2_usage_ledger_bumps_and_reads() {
     assert_eq!(z, Stage2Usage::default());
 
     store
-        .stage2_bump_usage(acct, day, UsageTokens { input: 1200, output: 60, cache_creation: 500, cache_read: 4000 })
+        .stage2_bump_usage(
+            acct,
+            day,
+            UsageTokens {
+                input: 1200,
+                output: 60,
+                cache_creation: 500,
+                cache_read: 4000,
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, day, UsageTokens { input: 800, output: 40, cache_creation: 100, cache_read: 2000 })
+        .stage2_bump_usage(
+            acct,
+            day,
+            UsageTokens {
+                input: 800,
+                output: 40,
+                cache_creation: 100,
+                cache_read: 2000,
+            },
+        )
         .unwrap();
     let u = store.stage2_usage_today(acct, day).unwrap();
     assert_eq!(u.calls, 2);
@@ -937,16 +1007,48 @@ fn list_usage_returns_recent_days_newest_first() {
     assert!(store.list_usage(acct, 30).unwrap().is_empty());
 
     store
-        .stage2_bump_usage(acct, "2026-07-07", UsageTokens { input: 100, output: 10, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-07",
+            UsageTokens {
+                input: 100,
+                output: 10,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 200, output: 20, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-08",
+            UsageTokens {
+                input: 200,
+                output: 20,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 300, output: 30, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 300,
+                output: 30,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-09", UsageTokens { input: 100, output: 10, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-09",
+            UsageTokens {
+                input: 100,
+                output: 10,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Newest-first, sparse (only days with a row).
@@ -1097,13 +1199,37 @@ fn stage2_usage_since_sums_window_inclusively() {
     );
 
     store
-        .stage2_bump_usage(acct, "2026-07-05", UsageTokens { input: 100, output: 10, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-05",
+            UsageTokens {
+                input: 100,
+                output: 10,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 200, output: 20, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-08",
+            UsageTokens {
+                input: 200,
+                output: 20,
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
-        .stage2_bump_usage(acct, "2026-07-08", UsageTokens { input: 300, output: 30, ..Default::default() })
+        .stage2_bump_usage(
+            acct,
+            "2026-07-08",
+            UsageTokens {
+                input: 300,
+                output: 30,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // since_day <= earliest => everything summed (2 days, 3 calls).
@@ -1380,6 +1506,7 @@ fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
         field_reasons: crate::types::FieldReasons::default(),
         stage1_model_used: "claude-haiku-4-5".into(),
         needs_stage2: false,
+        escalation_reason: None,
         deadline: Some(DeadlineHit {
             kind: "bill".into(),
             amount: Some(10.0),

@@ -427,7 +427,10 @@ async fn a_console_login_ends_at_the_tenants_own_console_with_a_pairing_code() {
     // IDENTITY ONLY. No Gmail scope of any kind, and no offline access: this is
     // a login, so Google is never asked for a credential that outlives it.
     let scope = query_param(&consent, "scope");
-    assert_eq!(scope.split(' ').collect::<Vec<_>>(), vec!["openid", "email"]);
+    assert_eq!(
+        scope.split(' ').collect::<Vec<_>>(),
+        vec!["openid", "email"]
+    );
     assert!(!scope.contains("gmail"), "{scope}");
     assert!(!consent.contains("access_type"), "{consent}");
     assert_eq!(query_param(&consent, "code_challenge_method"), "S256");
@@ -498,7 +501,8 @@ async fn a_console_login_ends_at_the_tenants_own_console_with_a_pairing_code() {
 async fn an_unknown_tenant_is_sent_to_google_exactly_like_a_real_one() {
     let h = Harness::new().await;
 
-    let (real_status, real_headers, _) = h.get(&format!("/console/auth?tenant={LABEL}"), None).await;
+    let (real_status, real_headers, _) =
+        h.get(&format!("/console/auth?tenant={LABEL}"), None).await;
     let (unknown_status, unknown_headers, _) =
         h.get("/console/auth?tenant=nosuchtenant", None).await;
 
@@ -514,7 +518,11 @@ async fn an_unknown_tenant_is_sent_to_google_exactly_like_a_real_one() {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         pairs.sort();
-        (url.origin().ascii_serialization(), url.path().to_string(), pairs)
+        (
+            url.origin().ascii_serialization(),
+            url.path().to_string(),
+            pairs,
+        )
     };
     assert_eq!(shape(&real_headers), shape(&unknown_headers));
 
@@ -705,7 +713,10 @@ async fn the_console_consent_asks_google_to_pick_an_account_and_nothing_more() {
         "{consent}"
     );
     let scope = query_param(&consent, "scope");
-    assert_eq!(scope.split(' ').collect::<Vec<_>>(), vec!["openid", "email"]);
+    assert_eq!(
+        scope.split(' ').collect::<Vec<_>>(),
+        vec!["openid", "email"]
+    );
     assert!(!scope.contains("gmail"), "{scope}");
 }
 
@@ -950,7 +961,10 @@ async fn no_console_refusal_offers_the_signup_form() {
         ("replayed callback", &replayed),
         ("wrong account", &wrong_account),
     ] {
-        assert!(!body.contains(r#"href="/""#), "{name} links to signup: {body}");
+        assert!(
+            !body.contains(r#"href="/""#),
+            "{name} links to signup: {body}"
+        );
         assert!(!body.contains("Start again"), "{name}: {body}");
         assert!(!body.contains("invite"), "{name}: {body}");
         assert!(!body.contains("signup"), "{name}: {body}");
@@ -1015,7 +1029,10 @@ async fn an_app_login_ends_at_a_deep_link_for_the_mailboxs_own_tenant() {
     // offline access. Connecting an app is not a reason to hold a second key to
     // somebody's mail, and the daemon already holds the first.
     let scope = query_param(&consent, "scope");
-    assert_eq!(scope.split(' ').collect::<Vec<_>>(), vec!["openid", "email"]);
+    assert_eq!(
+        scope.split(' ').collect::<Vec<_>>(),
+        vec!["openid", "email"]
+    );
     assert!(!scope.contains("gmail"), "{scope}");
     assert!(!consent.contains("access_type"), "{consent}");
     assert_eq!(query_param(&consent, "code_challenge_method"), "S256");
@@ -1027,9 +1044,8 @@ async fn an_app_login_ends_at_a_deep_link_for_the_mailboxs_own_tenant() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // THE CENTRAL ASSERTION.
-    let link = format!(
-        "passband://pair?url=https%3A%2F%2F{LABEL}.passband.test&amp;code={PAIR_CODE}"
-    );
+    let link =
+        format!("passband://pair?url=https%3A%2F%2F{LABEL}.passband.test&amp;code={PAIR_CODE}");
     assert!(body.contains(&link), "{body}");
     // The mailbox is named, because this is the one screen that can confirm
     // Google picked the account the person meant.
@@ -1091,7 +1107,10 @@ async fn an_app_login_with_no_mailbox_here_says_so_and_mints_nothing() {
     // No code, no link, nothing minted.
     assert!(!body.contains(PAIR_CODE), "{body}");
     assert!(!body.contains("passband://"), "{body}");
-    assert!(h.rec.lock().unwrap().pair_calls.is_empty(), "warden touched");
+    assert!(
+        h.rec.lock().unwrap().pair_calls.is_empty(),
+        "warden touched"
+    );
 }
 
 /// An address Google will not VOUCH for is not an identity, so it is not an app
@@ -1136,15 +1155,7 @@ async fn a_cookie_cannot_change_which_login_a_session_is() {
     let (consent, cookie) = h.start_app_login().await;
 
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(
-            cookie
-                .split_once('=')
-                .unwrap()
-                .1
-                .split_once('.')
-                .unwrap()
-                .0,
-        )
+        .decode(cookie.split_once('=').unwrap().1.split_once('.').unwrap().0)
         .unwrap();
     let real: Value = serde_json::from_slice(&payload).unwrap();
     assert_eq!(real["app"], Value::Bool(true), "{real}");
@@ -1173,7 +1184,10 @@ async fn a_cookie_cannot_change_which_login_a_session_is() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(!body.contains("passband://"), "{body}");
-    assert!(h.rec.lock().unwrap().pair_calls.is_empty(), "warden touched");
+    assert!(
+        h.rec.lock().unwrap().pair_calls.is_empty(),
+        "warden touched"
+    );
 }
 
 /// ONE BUDGET FOR BOTH HOPS. They are the same errand through the same consent,

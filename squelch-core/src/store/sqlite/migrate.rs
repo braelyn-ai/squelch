@@ -88,6 +88,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // (NULL == still needs Stage-1), `needs_stage2` is the escalation flag.
     let added_stage1 = add_column_if_missing(conn, "triage", "stage1_model_used", "TEXT")?;
     add_column_if_missing(conn, "triage", "needs_stage2", "INTEGER NOT NULL DEFAULT 0")?;
+    // WHICH router arm set `needs_stage2` (see `crate::triage::router`). NULL
+    // means "did not escalate", and also covers every historical row, which
+    // escalated under the old self-report rule and cannot be attributed now.
+    add_column_if_missing(conn, "triage", "escalation_reason", "TEXT")?;
 
     // stage2_usage grew `category` INSIDE ITS PRIMARY KEY. ALTER ADD COLUMN
     // cannot change a PK, and the bump upsert's ON CONFLICT(account_id, day,

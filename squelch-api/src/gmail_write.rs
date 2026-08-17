@@ -33,7 +33,9 @@ impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WriteError::MissingCredential(m) => write!(f, "{m}"),
-            WriteError::Api { status, message } => write!(f, "gmail api status {status}: {message}"),
+            WriteError::Api { status, message } => {
+                write!(f, "gmail api status {status}: {message}")
+            }
             WriteError::Transport(m) => write!(f, "{m}"),
             WriteError::Invalid(m) => write!(f, "{m}"),
         }
@@ -247,7 +249,10 @@ pub fn reply_subject(original: &str) -> String {
 
 /// The `References` chain for a reply: the parent `Message-ID` appended to any
 /// pre-existing references, or `None` when there is nothing to chain.
-pub fn build_references(parent_message_id: Option<&str>, parent_references: Option<&str>) -> Option<String> {
+pub fn build_references(
+    parent_message_id: Option<&str>,
+    parent_references: Option<&str>,
+) -> Option<String> {
     match (parent_references, parent_message_id) {
         (Some(refs), Some(mid)) => Some(format!("{refs} {mid}")),
         (Some(refs), None) => Some(refs.to_string()),
@@ -619,7 +624,8 @@ impl GmailWriteClient {
 
     /// Archive: remove the INBOX label.
     pub async fn archive(&self, gmail_msg_id: &str) -> Result<(), WriteError> {
-        self.modify(gmail_msg_id, &[], &[LABEL_INBOX.to_string()]).await
+        self.modify(gmail_msg_id, &[], &[LABEL_INBOX.to_string()])
+            .await
     }
 
     /// Move a message to Gmail's Trash — `/trash`, NEVER `messages.delete`.
@@ -628,7 +634,9 @@ impl GmailWriteClient {
     /// the blast radius is capped by the OAuth scope, not by our restraint.
     pub async fn trash(&self, gmail_msg_id: &str) -> Result<(), WriteError> {
         let url = format!("{}/messages/{gmail_msg_id}/trash", self.base);
-        self.post_json(&url, &serde_json::json!({})).await.map(|_| ())
+        self.post_json(&url, &serde_json::json!({}))
+            .await
+            .map(|_| ())
     }
 
     /// Read the parent's threading AND recipient headers with the WRITE token
@@ -768,8 +776,14 @@ mod tests {
             build_references(Some("<b@x>"), Some("<a@x> <ab@x>")),
             Some("<a@x> <ab@x> <b@x>".to_string())
         );
-        assert_eq!(build_references(Some("<b@x>"), None), Some("<b@x>".to_string()));
-        assert_eq!(build_references(None, Some("<a@x>")), Some("<a@x>".to_string()));
+        assert_eq!(
+            build_references(Some("<b@x>"), None),
+            Some("<b@x>".to_string())
+        );
+        assert_eq!(
+            build_references(None, Some("<a@x>")),
+            Some("<a@x>".to_string())
+        );
         assert_eq!(build_references(None, None), None);
     }
 
@@ -1091,9 +1105,9 @@ mod tests {
             pixel_url: None,
         };
         let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
-        assert!(s.contains(
-            "Content-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n"
-        ));
+        assert!(
+            s.contains("Content-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n")
+        );
         // Plain part FIRST and verbatim — the raw markdown source, stars and all.
         let plain = s.find("Content-Type: text/plain").unwrap();
         let html = s.find("Content-Type: text/html").unwrap();
@@ -1340,15 +1354,17 @@ mod tests {
         let req = handle.await.unwrap();
         assert!(req.starts_with("POST "), "must be a POST");
         assert!(req.contains("/messages/gmail-123/modify"), "modify path");
-        assert!(req.contains("authorization: Bearer WRITE-TOKEN") || req.contains("Authorization: Bearer WRITE-TOKEN"));
+        assert!(
+            req.contains("authorization: Bearer WRITE-TOKEN")
+                || req.contains("Authorization: Bearer WRITE-TOKEN")
+        );
         assert!(req.contains("\"removeLabelIds\":[\"INBOX\"]"));
         assert!(req.contains("\"addLabelIds\":[]"));
     }
 
     #[tokio::test]
     async fn send_posts_raw_and_threadid_and_returns_ids() {
-        let (base, handle) =
-            mock_once(200, "{\"id\":\"sent-1\",\"threadId\":\"thread-9\"}").await;
+        let (base, handle) = mock_once(200, "{\"id\":\"sent-1\",\"threadId\":\"thread-9\"}").await;
         let c = client(base);
         let raw = b"To: a@b.com\r\nSubject: hi\r\n\r\nbody";
         let sent = c.send(raw, Some("thread-9")).await.unwrap();

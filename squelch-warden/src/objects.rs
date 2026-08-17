@@ -1410,7 +1410,12 @@ mod tests {
             .find(|e| e.name == "SQUELCH_ASSISTANT_API_KEY")
             .unwrap();
         assert!(assistant.value.is_none());
-        let from = assistant.value_from.clone().unwrap().secret_key_ref.unwrap();
+        let from = assistant
+            .value_from
+            .clone()
+            .unwrap()
+            .secret_key_ref
+            .unwrap();
         assert_eq!(from.name, "alice-llm");
         assert_eq!(from.key, "assistant-api-key");
         assert_eq!(from.optional, Some(true));
@@ -1423,7 +1428,10 @@ mod tests {
             "SQUELCH_STAGE1_GLOBAL_DAILY_CAP",
             "SQUELCH_STAGE2_GLOBAL_DAILY_CAP",
         ] {
-            assert!(env.iter().all(|e| e.name != tuned), "{tuned} appeared unset");
+            assert!(
+                env.iter().all(|e| e.name != tuned),
+                "{tuned} appeared unset"
+            );
         }
 
         // "No tenant ever holds a real provider key" has to hold in BOTH
@@ -1904,7 +1912,11 @@ mod tests {
             // "/" is Exact and everything else is Prefix: an Exact root
             // matches one path in the universe, a Prefix root would match all
             // of them.
-            let expected = if path.path.as_deref() == Some("/") { "Exact" } else { "Prefix" };
+            let expected = if path.path.as_deref() == Some("/") {
+                "Exact"
+            } else {
+                "Prefix"
+            };
             assert_eq!(path.path_type, expected, "{:?}", path.path);
             assert_eq!(
                 path.backend.service.as_ref().unwrap().name,

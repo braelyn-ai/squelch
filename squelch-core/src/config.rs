@@ -712,6 +712,11 @@ pub struct Stage1Config {
     /// a harder look. Set to `None` when pointing `model` at one that rejects
     /// the field (Haiku 4.5, Sonnet 4.5). Env: `SQUELCH_STAGE1_EFFORT`.
     pub effort: Option<String>,
+    /// How close to the surface threshold counts as a boundary row for
+    /// [`crate::triage::router::EscalationReason::Boundary`]. Widening this
+    /// escalates more mail near the line, which is where a scoring error flips
+    /// visibility. Env: `SQUELCH_STAGE1_BOUNDARY_MARGIN`.
+    pub escalation_boundary_margin: u8,
     /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
     /// Env: `SQUELCH_STAGE1_MAX_BODY_CHARS`.
     pub max_body_chars: usize,
@@ -745,6 +750,7 @@ impl Default for Stage1Config {
             // Stage-1 LLM defaults.
             model: "claude-opus-5".to_string(),
             effort: Some("low".to_string()),
+            escalation_boundary_margin: 10,
             // 6000, not 1500: the old cap was sized for a 200K-context small
             // model and routinely cut the body before the part that decides the
             // verdict (the amount, the date, the ask). The model reading this
@@ -1259,6 +1265,18 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The escalation router's tunables, assembled HERE and nowhere else so the
+    /// surface threshold cannot fork: the router's idea of "the line" is the
+    /// same [`NotifyConfig::min_importance`] that decides whether a row earns a
+    /// notification, because a row on the boundary of being seen at all is
+    /// exactly the row worth a second look.
+    pub fn router(&self) -> crate::triage::router::RouterConfig {
+        crate::triage::router::RouterConfig {
+            surface_threshold: self.notify.min_importance,
+            boundary_margin: self.stage1.escalation_boundary_margin,
+        }
+    }
+
     /// Default config path: `~/.config/squelch/config.toml`.
     pub fn default_path() -> Option<PathBuf> {
         std::env::var_os("HOME")
@@ -1425,6 +1443,10 @@ impl Config {
         // ---- Stage-1 LLM overrides -----------------------------------------
         env_override("SQUELCH_STAGE1_MODEL", &mut self.stage1.model);
         env_override_effort("SQUELCH_STAGE1_EFFORT", &mut self.stage1.effort);
+        env_override(
+            "SQUELCH_STAGE1_BOUNDARY_MARGIN",
+            &mut self.stage1.escalation_boundary_margin,
+        );
         env_override(
             "SQUELCH_STAGE1_MAX_BODY_CHARS",
             &mut self.stage1.max_body_chars,

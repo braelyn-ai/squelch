@@ -1,12 +1,16 @@
-//! Stage-1 LLM triage: the small-model pass that refines the heuristic seed
-//! values ingest wrote. Sealed mail never reaches here (SQL predicate plus
-//! [`super::stage1_sealed_guard`]), nor does a row an explicit `Squelch`/`Surface`
-//! rule already decided; a `Filtered` rule escalates straight to Stage-2.
-//! `confident == false` escalates; an API failure keeps the seed values.
+//! Stage-1 LLM triage: the pass that gives every non-sealed row its real
+//! verdict, replacing the heuristic seed values ingest wrote. Sealed mail never
+//! reaches here (SQL predicate plus [`super::stage1_sealed_guard`]); an API
+//! failure is the ONLY thing that leaves the deterministic seed standing.
+//!
+//! It runs the same model as Stage-2 at lower effort over less context, so what
+//! escalation buys is a harder look, not a better reader. Whether a row escalates
+//! is [`super::router`]'s call, never this model's opinion of itself.
 
 use crate::config::{Stage1Config, Stage2Provider};
 use crate::store::{Stage1Applied, Stage1Queued};
 use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, classify_entrypoint};
+use crate::triage::router::{self, RouterConfig};
 use crate::triage::stage2::{
     DeadlineInput, RowContext, build_user_message, check_importance, derive_deadline_and_tier,
     truncate_field_reason, truncate_one_line, truncate_reason,
@@ -23,8 +27,9 @@ pub const HEURISTIC_ONLY: &str = "heuristic-only";
 // System prompt (static — SAME BYTES every call for prompt caching).
 // ===========================================================================
 
-/// The static Stage-1 triage system prompt. `confident` is the escalation signal:
-/// `false` hands the row to the more capable Stage-2 model.
+/// The static Stage-1 triage system prompt. `confident` is a CALIBRATION signal
+/// the router weighs alongside structural evidence, never the escalation lever
+/// on its own — see [`super::router`].
 pub const SYSTEM_PROMPT: &str = "\
 You are the Stage-1 email triage classifier for a personal inbox assistant. You \
 see nearly every inbound email first and give each a fast, calibrated score. \
@@ -62,10 +67,14 @@ the past, you picked the wrong year. \
 If no concrete date is present but a bill clearly exists, still set \
 has_deadline=true with deadline_iso=null.
 
-CONFIDENT: set confident=true when you are sure of this classification and no \
-second look is needed. Set confident=false when the email is genuinely \
-ambiguous, or when it claims a bill/urgency from an UNKNOWN sender that you \
-cannot verify — those cases are escalated to a more capable model.
+CONFIDENT: report your ACTUAL certainty about this classification: true when \
+the email is unambiguous, false when it is genuinely open to more than one \
+reading. This is a calibration signal, not a routing decision - a separate \
+router decides what gets a second look, using structural facts you cannot see \
+(what the deterministic detectors found, whether this sender has been corrected \
+before, where the score fell relative to the surface threshold). Rows escalate \
+over a confident=true, so do not inflate or deflate this to steer the outcome: \
+just say what you actually believe.
 
 ONE_LINE: a single terse line (<=120 chars), no leading label, describing what \
 this email is and why it matters. NEVER use an em dash or en dash in any \
@@ -336,13 +345,17 @@ pub async fn classify_at(
 
 /// Map a parsed [`Stage1Output`] onto a [`Stage1Applied`] update. Pure: `now` is
 /// injected for deterministic deadline math. The deadline sanity bounds and the
-/// unknown-sender trust cap come from the shared [`derive_deadline_and_tier`];
-/// `confident == false` sets `needs_stage2` so the row escalates.
+/// unknown-sender trust cap come from the shared [`derive_deadline_and_tier`].
+///
+/// Escalation is decided by [`crate::triage::router::should_escalate`] over the
+/// SETTLED verdict, not by the model's `confident` flag: the flag is one input
+/// among several and the router is free to escalate over the model's objection.
 pub fn apply_result(
     queued: &Stage1Queued,
     out: &Stage1Output,
     model: &str,
     known_contact_floor: u8,
+    router_cfg: &RouterConfig,
     now: DateTime<Utc>,
 ) -> Stage1Applied {
     let importance = out.importance.clamp(0, 100) as u8;
@@ -406,20 +419,47 @@ pub fn apply_result(
         "stage-1",
     );
 
+    // ROUTE over the settled verdict — the tier and importance the user would
+    // actually see, after every floor and clamp — rather than over what the
+    // model proposed. Routing on the proposal would let a value the apply path
+    // is about to overrule decide whether anyone looks at the row again.
+    let escalation = router::should_escalate(
+        &router::EscalationInput {
+            importance,
+            tier,
+            category: &category,
+            exception: out.exception,
+            model_says_unsure: !out.confident,
+            has_deadline: deadline.is_some(),
+            subject: &queued.subject,
+            body: &queued.body,
+            is_known_contact: queued.is_known_contact,
+            sender_corrected: queued.sender_corrected,
+        },
+        router_cfg,
+        now,
+    );
+
+    let reason = match escalation {
+        Some(r) => format!("{reason}; escalating: {}", r.detail()),
+        None => reason,
+    };
+
     Stage1Applied {
         message_id: queued.message_id,
         account_id: queued.account_id,
         importance,
         tier,
         one_line: truncate_one_line(&out.one_line),
-        reason,
+        reason: truncate_reason(&reason),
         field_reasons: FieldReasons {
             importance: Some(importance_reason),
             deadline: deadline_reason,
             tier: Some(tier_reason),
         },
         stage1_model_used: model.to_string(),
-        needs_stage2: !out.confident,
+        needs_stage2: escalation.is_some(),
+        escalation_reason: escalation.map(|r| r.as_str()),
         deadline,
         category: Some(category),
     }
@@ -445,6 +485,7 @@ mod tests {
             body: "hello".into(),
             received_at: now(),
             is_known_contact: known,
+            sender_corrected: false,
             sensitivity: Sensitivity::Normal,
         }
     }
@@ -500,33 +541,89 @@ mod tests {
     fn category_is_normalized_on_apply_and_unknown_falls_back_to_general() {
         let mut o = out(60, true);
         o.category = "banking_statement".into();
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.category.as_deref(), Some("banking_statement"));
 
         o.category = "wat".into();
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.category.as_deref(), Some("general"), "unknown -> general");
     }
 
+    /// A settled verdict, clear of the surface line and of every structural
+    /// arm, stands on its own.
     #[test]
-    fn confident_true_does_not_escalate() {
-        let a = apply_result(&queued(true), &out(75, true), "m", 70, now());
-        assert!(!a.needs_stage2, "confident=true must not escalate");
+    fn a_settled_verdict_does_not_escalate() {
+        let a = apply_result(
+            &queued(true),
+            &out(75, true),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
+        assert!(!a.needs_stage2);
+        assert_eq!(a.escalation_reason, None);
         assert_eq!(a.tier, Tier::Signal);
     }
 
+    /// Self-reported doubt still buys a second look, and is ATTRIBUTED to the
+    /// model_unsure arm. Importance 75 is deliberately clear of the boundary
+    /// window, so this asserts the arm it names rather than passing by accident
+    /// on a score that happened to sit on the line.
     #[test]
-    fn confident_false_escalates_to_stage2() {
-        let a = apply_result(&queued(false), &out(40, false), "m", 70, now());
-        assert!(a.needs_stage2, "confident=false must escalate");
+    fn model_doubt_escalates_and_says_so() {
+        let a = apply_result(
+            &queued(true),
+            &out(75, false),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
+        assert!(a.needs_stage2);
+        assert_eq!(a.escalation_reason, Some("model_unsure"));
+    }
+
+    /// The redesign's load-bearing claim, asserted at the apply layer rather
+    /// than only in the router's own tests: a model that swears it is certain
+    /// cannot keep an unknown sender's urgency claim from being checked.
+    #[test]
+    fn a_confident_verdict_still_escalates_on_structural_grounds() {
+        let mut o = out(95, true);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-07-20T00:00:00Z".into());
+        o.deadline_kind = Some("payment_due".into());
+        // UNKNOWN sender claiming a dated obligation.
+        let a = apply_result(&queued(false), &o, "m", 70, &RouterConfig::default(), now());
+        assert!(a.needs_stage2, "a confident model must not suppress this");
+        assert_eq!(a.escalation_reason, Some("unverified_urgency"));
+        assert!(
+            a.reason.contains("escalating:"),
+            "the stored reason should say a second look is coming: {}",
+            a.reason
+        );
     }
 
     #[test]
     fn importance_is_clamped() {
-        let hi = apply_result(&queued(true), &out(250, true), "m", 70, now());
+        let hi = apply_result(
+            &queued(true),
+            &out(250, true),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert_eq!(hi.importance, 100);
         // Low clamp checked on an UNKNOWN sender — a known contact would floor.
-        let lo = apply_result(&queued(false), &out(-5, true), "m", 70, now());
+        let lo = apply_result(
+            &queued(false),
+            &out(-5, true),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert_eq!(lo.importance, 0);
     }
 
@@ -534,7 +631,14 @@ mod tests {
     fn known_contact_floors_at_signal_and_says_so() {
         // The model demoting a known contact ("casual reply, no action needed")
         // must not bury it: rung 3's surface promise survives the async pass.
-        let a = apply_result(&queued(true), &out(55, true), "m", 70, now());
+        let a = apply_result(
+            &queued(true),
+            &out(55, true),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert_eq!(a.importance, 70);
         assert_eq!(a.tier, Tier::Signal);
         assert!(
@@ -547,7 +651,14 @@ mod tests {
         );
 
         // Above the floor the model's score stands untouched.
-        let b = apply_result(&queued(true), &out(84, true), "m", 70, now());
+        let b = apply_result(
+            &queued(true),
+            &out(84, true),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert_eq!(b.importance, 84);
         assert!(
             !b.field_reasons
@@ -558,7 +669,14 @@ mod tests {
         );
 
         // Unknown senders are the model's call alone.
-        let c = apply_result(&queued(false), &out(55, true), "m", 70, now());
+        let c = apply_result(
+            &queued(false),
+            &out(55, true),
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert_eq!(c.importance, 55);
         assert_eq!(c.tier, Tier::Noise);
 
@@ -566,7 +684,14 @@ mod tests {
         // who sent it, and the record clamp can't demote a floored Signal.
         let mut rec = out(30, true);
         rec.category = "transaction_alert".into();
-        let d = apply_result(&queued(true), &rec, "m", 70, now());
+        let d = apply_result(
+            &queued(true),
+            &rec,
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert_eq!(d.importance, 30);
         assert_eq!(d.tier, Tier::Noise);
     }
@@ -576,7 +701,7 @@ mod tests {
         let mut o = out(90, true);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.tier, Tier::PastDue);
         assert!(a.deadline.unwrap().past_due);
     }
@@ -586,7 +711,7 @@ mod tests {
         let mut o = out(90, false);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past (within the 45d bound)
-        let a = apply_result(&queued(false), &o, "m", 70, now());
+        let a = apply_result(&queued(false), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(
             a.tier,
             Tier::Deadline,
@@ -610,7 +735,7 @@ mod tests {
         o.category = "banking_statement".into();
         o.has_deadline = true;
         o.deadline_iso = Some("2026-07-20T00:00:00Z".into());
-        let a = apply_result(&q, &o, "m", 70, now());
+        let a = apply_result(&q, &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.tier, Tier::Noise, "record categories never reach FYE");
         assert!(a.deadline.is_none(), "no deadline row for a record");
         let tr = a.field_reasons.tier.as_deref().unwrap_or("");
@@ -629,7 +754,7 @@ mod tests {
         o.exception = true;
         o.has_deadline = true;
         o.deadline_iso = None; // no concrete date stated -> deadline tier
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.tier, Tier::Deadline, "failure alerts reach FYE");
         assert_eq!(a.category.as_deref(), Some("transaction_alert"));
     }
@@ -643,7 +768,7 @@ mod tests {
             let mut o = out(importance, true);
             o.category = "general".into();
             o.exception = true;
-            let a = apply_result(&queued(true), &o, "m", 70, now());
+            let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
             assert_eq!(a.tier, Tier::Deadline, "importance {importance}");
             let tr = a.field_reasons.tier.as_deref().unwrap();
             assert!(tr.contains("exception"), "reason names the exception: {tr}");
@@ -659,7 +784,7 @@ mod tests {
         o.exception = true;
         o.has_deadline = true;
         o.deadline_iso = Some("2026-06-20T00:00:00Z".into()); // past
-        let a = apply_result(&queued(false), &o, "m", 70, now());
+        let a = apply_result(&queued(false), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(
             a.tier,
             Tier::Deadline,
@@ -673,7 +798,7 @@ mod tests {
         // on importance alone; the record-shaped score keeps it out of FYE.
         let mut o = out(30, true);
         o.category = "transaction_alert".into();
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.tier, Tier::Noise);
         assert_eq!(a.category.as_deref(), Some("transaction_alert"));
     }
@@ -683,7 +808,7 @@ mod tests {
         // Same 160-char cap as Stage-2 (shared helper), applied at Stage-1's site.
         let mut o = out(60, true);
         o.one_line = "y".repeat(500);
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(
             a.one_line.chars().count(),
             160,
@@ -693,7 +818,14 @@ mod tests {
 
     #[test]
     fn field_reasons_use_stage1_label() {
-        let a = apply_result(&queued(true), &out(80, true), "claude-haiku-4-5", 70, now());
+        let a = apply_result(
+            &queued(true),
+            &out(80, true),
+            "claude-haiku-4-5",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
         assert!(
             a.field_reasons
                 .importance
@@ -709,7 +841,7 @@ mod tests {
         let mut o = out(90, true);
         o.has_deadline = true;
         o.deadline_iso = Some("2026-08-01T00:00:00Z".into());
-        let a = apply_result(&queued(true), &o, "m", 70, now());
+        let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
         assert_eq!(a.deadline.unwrap().source, "stage1");
     }
 
