@@ -8,21 +8,34 @@
 // LazyVStack would re-download on recycle), authenticated through APIClient.
 //
 // THE CARDS ARE SHARED; THE TWO VERBS ARE NOT. Saving is a save panel on one
-// platform and a document picker on the other, and previewing is a PDFView in a
-// modal card here and QuickLook there — different objects, not a different
-// spelling of one, so each is fenced and neither pretends to be the other. See
-// Sources/PassbandiOS/Views/AttachmentPreviewiOS.swift for the phone's half.
+// platform and a document picker on the other. Previewing is Quick Look on both
+// — the same renderer, in the shape each platform presents it: a sheet holding a
+// QLPreviewController on the phone, and on the Mac the system's own floating
+// panel, driven through the responder chain. See
+// Sources/PassbandiOS/Views/AttachmentPreviewiOS.swift for the phone's half and
+// Views/QuickLookPanel.swift for the Mac's.
+//
+// Nothing in this file draws a preview any more. Two hand-rolled sheets used to
+// live at the bottom of it, one per renderable type, and the gate above them had
+// to name every type they could draw; the OS renders all of them and more.
 
-import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
+
+/// The strip's own coordinate space. FILE-SCOPE so the cards can read it from
+/// inside `onGeometryChange`'s Sendable closure; one name serves every strip,
+/// since a lookup resolves the nearest ancestor that declares it.
+private let stripSpace = "attachment-strip"
 
 struct AttachmentStrip: View {
     let attachments: [Attachment]
 
     @Environment(AppStore.self) private var store
     #if os(macOS)
-        @State private var preview: Attachment?
+        /// The handle onto the system's Quick Look panel, and where each
+        /// attachment's clickable rect sits so the panel can zoom out of it.
+        @State private var quickLook = QuickLookLauncher()
+        @State private var sourceFrames: [Int: CGRect] = [:]
     #else
         /// The bytes staged on disk for QuickLook, and the export the document
         /// picker is holding. Both are one-at-a-time by construction: a phone
@@ -51,74 +64,96 @@ struct AttachmentStrip: View {
 
     var body: some View {
         if !attachments.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                // The picture first, the filing second. A message that says "see
-                // photo attached" is answered by the photo, and the card below is
-                // then just where its name and its download live.
-                ForEach(inlineImages) { att in
-                    InlineImage(attachment: att, onOpen: { openPreview(att) })
-                }
-                FlowLayout(spacing: 8) {
-                    ForEach(attachments) { att in
-                        AttachmentCard(
-                            attachment: att,
-                            onDownload: { Task { await download(att) } },
-                            onPreview: AttachmentKinds.isPreviewable(att) ? { openPreview(att) } : nil)
+            strip
+                .padding(.top, 4)
+                .accessibilityLabel("attachments")
+                #if !os(macOS)
+                    // A SHEET, not an overlay: an overlay is laid out against the
+                    // strip's 38pt frame deep inside the thread's ScrollView, so
+                    // it hangs off the window edge and scrolls away with the
+                    // content. The Mac needs none of this — its panel is a window.
+                    .sheet(item: $staged) { file in
+                        QuickLookPreview(url: file.url)
+                            .ignoresSafeArea()
+                            // The bytes leave the disk with the sheet — nothing an
+                            // attachment contained outlives looking at it.
+                            .onDisappear { file.cleanUp() }
                     }
+                    .fileExporter(
+                        isPresented: Binding(
+                            get: { exporting != nil }, set: { if !$0 { exporting = nil } }),
+                        document: exporting,
+                        contentType: .data,
+                        defaultFilename: exportName
+                    ) { result in
+                        switch result {
+                        case .success:
+                            store.pushToast("saved \(exportName)", .success)
+                        case .failure(let error):
+                            store.pushToast(errText(error, "save failed"), .error)
+                        }
+                    }
+                #endif
+        }
+    }
+
+    /// The strip itself, plus — on the Mac — the invisible view behind it that
+    /// owns the Quick Look panel. Both the coordinate space and that view are
+    /// pinned to THIS frame, before the padding, so a rect measured in one is a
+    /// rect in the other's bounds and the panel's zoom lands on the card.
+    private var strip: some View {
+        let content = VStack(alignment: .leading, spacing: 10) {
+            // The picture first, the filing second. A message that says "see
+            // photo attached" is answered by the photo, and the card below is
+            // then just where its name and its download live.
+            ForEach(inlineImages) { att in
+                InlineImage(attachment: att, onOpen: { openPreview(att) })
+                    #if os(macOS)
+                        .previewSource(att.id, into: $sourceFrames)
+                    #endif
+            }
+            FlowLayout(spacing: 8) {
+                ForEach(attachments) { att in
+                    AttachmentCard(
+                        attachment: att,
+                        onDownload: { Task { await download(att) } },
+                        onPreview: AttachmentKinds.isPreviewable(att) ? { openPreview(att) } : nil
+                    )
+                    #if os(macOS)
+                        // An attachment already shown inline registers the
+                        // PICTURE as what the panel flies out of, not the chip
+                        // beneath it, so there is exactly one source rect per id
+                        // and it is the one the human actually clicked.
+                        .previewSource(
+                            AttachmentKinds.isInline(att) ? nil : att.id, into: $sourceFrames)
+                    #endif
                 }
             }
-            .padding(.top, 4)
-            .accessibilityLabel("attachments")
-            // A SHEET, not an overlay: an overlay is laid out against the strip's
-            // 38pt frame deep inside the thread's ScrollView, so it hangs off the
-            // window edge and scrolls away with the content.
-            #if os(macOS)
-                .sheet(item: $preview) { att in
-                    // Two rasterizers, one card: the scrim, the size and the keys
-                    // are the sheet's, and only the middle of it knows a PDF from
-                    // a photo.
-                    if AttachmentKinds.isPDF(att.mime) {
-                        PDFPreview(
-                            attachment: att,
-                            onDownload: { Task { await download(att) } },
-                            onClose: { preview = nil })
-                    } else {
-                        ImagePreview(
-                            attachment: att,
-                            onDownload: { Task { await download(att) } },
-                            onClose: { preview = nil })
-                    }
-                }
-            #else
-                .sheet(item: $staged) { file in
-                    QuickLookPreview(url: file.url)
-                        .ignoresSafeArea()
-                        // The bytes leave the disk with the sheet — nothing an
-                        // attachment contained outlives looking at it.
-                        .onDisappear { file.cleanUp() }
-                }
-                .fileExporter(
-                    isPresented: Binding(
-                        get: { exporting != nil }, set: { if !$0 { exporting = nil } }),
-                    document: exporting,
-                    contentType: .data,
-                    defaultFilename: exportName
-                ) { result in
-                    switch result {
-                    case .success:
-                        store.pushToast("saved \(exportName)", .success)
-                    case .failure(let error):
-                        store.pushToast(errText(error, "save failed"), .error)
-                    }
-                }
-            #endif
         }
+        .coordinateSpace(.named(stripSpace))
+
+        #if os(macOS)
+            // Nothing is drawn here. QLPreviewPanel is a process-wide singleton
+            // that asks the FIRST RESPONDER who is driving it, and SwiftUI has no
+            // responder to offer — so the strip plants one behind its own cards.
+            return content.background {
+                QuickLookHost(
+                    attachments: attachments.filter(AttachmentKinds.isPreviewable),
+                    sourceFrames: sourceFrames,
+                    launcher: quickLook,
+                    onError: { store.pushToast($0, .error) })
+            }
+        #else
+            return content
+        #endif
     }
 
     // MARK: - preview
 
     #if os(macOS)
-        private func openPreview(_ att: Attachment) { preview = att }
+        /// Straight to the system panel. Fetching, staging and the teardown of
+        /// both belong to the host view, which is what the panel talks to.
+        private func openPreview(_ att: Attachment) { quickLook.open(att) }
     #else
         /// QuickLook reads a FILE, so the bytes are fetched and staged before the
         /// sheet opens rather than behind a spinner inside it. The staging
@@ -329,228 +364,24 @@ private struct InlineImage: View {
     }
 }
 
-// THE MAC'S PREVIEW, and only the Mac's. A scrim, a fixed card sized to fit
-// macOS's sheet clamp, key hints, and a PDFView representable inside it: four
-// desktop shapes in one view. The phone's answer to the same tap is QuickLook,
-// which brings its own everything — so this stays here rather than growing a
-// second layout it would only ever draw on one platform.
 #if os(macOS)
-
-/// PDF preview. Own "modal" KeyContext so Esc closes it without leaking to the
-/// thread keys underneath. Native PDFKit — no webview, no blob URL.
-private struct PDFPreview: View {
-    let attachment: Attachment
-    let onDownload: () -> Void
-    let onClose: () -> Void
-
-    @State private var document: PDFDocument?
-    @State private var error: String?
-
-    /// The scrim and the card inside it; the gap between them IS the click-off
-    /// target, so it must stay wide enough to hit without aiming. Both are FIXED
-    /// rather than window-sized because macOS clamps sheets (~980x640), so these
-    /// are sized to sit inside that clamp.
-    private static let scrimSize = CGSize(width: 940, height: 620)
-    private static let cardSize = CGSize(width: 820, height: 520)
-
-    var body: some View {
-        ZStack {
-            // A sheet brings no scrim of its own, so "click off to close" needs
-            // a real view to click.
-            Rectangle()
-                .fill(.black.opacity(0.14))
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onClose)
-            card
-        }
-        .frame(width: Self.scrimSize.width, height: Self.scrimSize.height)
-        // Without this the sheet's own backing paints an opaque slab, flattening
-        // the glass and hiding the window the scrim is dimming.
-        .presentationBackground(.clear)
-        .keyContext(.modal)
-        .keyBindings(.modal, [
-            KeyBinding("Escape", "close preview", allowInInput: true) { onClose() }
-        ])
-        .task {
-            do {
-                let fetched = try await APIClient.shared.fetchAttachment(
-                    attachment.id, fallbackName: attachment.filename)
-                document = PDFDocument(data: fetched.bytes)
-                if document == nil { error = "could not read that PDF" }
-            } catch {
-                self.error = errText(error, "preview failed")
+    extension View {
+        /// Record where this view sits in the strip's space, so Quick Look's panel
+        /// can fly out of the thing that was clicked rather than the corner of the
+        /// window. `nil` opts a view out: two writers for one id would race, and
+        /// the loser would aim the animation at the wrong rectangle.
+        ///
+        /// Mac-only, because the zoom is. The phone previews into a sheet, and a
+        /// sheet has nowhere to fly from.
+        fileprivate func previewSource(
+            _ id: Int?, into frames: Binding<[Int: CGRect]>
+        ) -> some View {
+            onGeometryChange(for: CGRect.self) {
+                $0.frame(in: .named(stripSpace))
+            } action: { rect in
+                if let id { frames.wrappedValue[id] = rect }
             }
         }
     }
+#endif
 
-    private var card: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Text(attachment.filename)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                ChromeChip(
-                    text: "download", icon: "arrow.down.circle", tone: Palette.accent,
-                    action: onDownload)
-                // The Esc hint has to be a real button too, or the keyboard is
-                // the only exit.
-                Button(action: onClose) {
-                    HStack(spacing: 4) {
-                        Kbd("esc")
-                        Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-
-            Divider().overlay(Palette.hairline)
-
-            Group {
-                if let error {
-                    Text(error).font(Typo.rowSub).foregroundStyle(Palette.danger)
-                } else if let document {
-                    PDFKitView(document: document)
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(width: Self.cardSize.width, height: Self.cardSize.height)
-        .passbandGlass(.pane, cornerRadius: 13, tint: Palette.glassTint)
-        .shadow(color: .black.opacity(0.3), radius: 40, y: 16)
-        // The card swallows clicks so they never reach the dismiss scrim under it
-        // — otherwise selecting text in the PDF would close the preview.
-        .contentShape(Rectangle())
-        .onTapGesture {}
-    }
-}
-
-/// The PDFView host. No UIKit twin, deliberately: the phone previews through
-/// QLPreviewController, which renders PDFs (and everything else) with a page
-/// scrubber, pinch zoom and a share sheet already attached. A hand-built
-/// UIViewRepresentable around PDFView would be a strictly worse version of a
-/// control the OS ships, and it would exist only to keep this one name
-/// cross-platform.
-private struct PDFKitView: NSViewRepresentable {
-    let document: PDFDocument
-
-    func makeNSView(context: Context) -> PDFView {
-        let view = PDFView()
-        view.autoScales = true
-        view.displayMode = .singlePageContinuous
-        view.backgroundColor = .clear
-        view.document = document
-        return view
-    }
-
-    func updateNSView(_ nsView: PDFView, context: Context) {
-        if nsView.document !== document { nsView.document = document }
-    }
-}
-
-/// Image preview — the PDF sheet's twin, sharing its scrim, its clamped card and
-/// its Esc. Rasterized through the same ImageIO path everything else here uses
-/// rather than handed to `NSImage(data:)`: a 4000px photo decoded at full size to
-/// fill an 820pt card is 30MB of bitmap nobody looks at.
-private struct ImagePreview: View {
-    let attachment: Attachment
-    let onDownload: () -> Void
-    let onClose: () -> Void
-
-    @State private var image: PlatformImage?
-    @State private var error: String?
-
-    private static let scrimSize = CGSize(width: 940, height: 620)
-    private static let cardSize = CGSize(width: 820, height: 520)
-    /// The card's long edge at 2x. ImageIO does not upscale, so a small logo
-    /// opened here is shown at its own size rather than stretched into mush.
-    private nonisolated static let maxPixel = 1640
-
-    var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(.black.opacity(0.14))
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onClose)
-            card
-        }
-        .frame(width: Self.scrimSize.width, height: Self.scrimSize.height)
-        .presentationBackground(.clear)
-        .keyContext(.modal)
-        .keyBindings(.modal, [
-            KeyBinding("Escape", "close preview", allowInInput: true) { onClose() }
-        ])
-        .task {
-            do {
-                let fetched = try await APIClient.shared.fetchAttachment(
-                    attachment.id, fallbackName: attachment.filename)
-                let bytes = fetched.bytes
-                let png = await Task.detached(priority: .userInitiated) { () -> Data? in
-                    guard let art = Raster.thumbnail(bytes, maxPixel: Self.maxPixel) else {
-                        return nil
-                    }
-                    return Raster.png(art)
-                }.value
-                guard let png, let decoded = PlatformImage(data: png) else {
-                    error = "could not read that image"
-                    return
-                }
-                image = decoded
-            } catch {
-                self.error = errText(error, "preview failed")
-            }
-        }
-    }
-
-    private var card: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Text(attachment.filename)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                ChromeChip(
-                    text: "download", icon: "arrow.down.circle", tone: Palette.accent,
-                    action: onDownload)
-                Button(action: onClose) {
-                    HStack(spacing: 4) {
-                        Kbd("esc")
-                        Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-
-            Divider().overlay(Palette.hairline)
-
-            Group {
-                if let error {
-                    Text(error).font(Typo.rowSub).foregroundStyle(Palette.danger)
-                } else if let image {
-                    Image(platformImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .padding(12)
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(width: Self.cardSize.width, height: Self.cardSize.height)
-        .passbandGlass(.pane, cornerRadius: 13, tint: Palette.glassTint)
-        .shadow(color: .black.opacity(0.3), radius: 40, y: 16)
-        .contentShape(Rectangle())
-        .onTapGesture {}
-    }
-}
-
-#endif  // os(macOS) — PDFPreview + ImagePreview + PDFKitView

@@ -28,16 +28,41 @@ enum AttachmentKinds {
     /// thumbnail cap routinely and must still render.
     static let inlineMaxBytes = 12 * 1024 * 1024
 
-    /// Image mimes this app will rasterize. Matched on the bare type with any
-    /// `; charset=…` trimmed, so a parameterized header cannot smuggle a subtype
-    /// past the svg refusal by not being string-equal to it.
-    static func isRenderableImage(_ mime: String) -> Bool {
-        let base =
-            mime.split(separator: ";").first?
+    /// The bare type, lowercased, with any `; charset=…` trimmed. Every rule
+    /// below is written against this, so a parameterized header cannot smuggle a
+    /// subtype past a refusal by not being string-equal to it.
+    static func base(_ mime: String) -> String {
+        mime.split(separator: ";").first?
             .trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+    }
+
+    /// Image mimes this app will rasterize.
+    static func isRenderableImage(_ mime: String) -> Bool {
+        let base = base(mime)
         guard base.hasPrefix("image/") else { return false }
         let sub = base.dropFirst("image/".count)
         return !sub.isEmpty && !sub.contains("svg") && !sub.contains("xml")
+    }
+
+    /// Types whose renderer is a BROWSER ENGINE. Quick Look draws svg, html,
+    /// xhtml and webarchives through WebKit, and a stranger's attachment is the
+    /// one thing that must not reach it. The svg rule above is this same refusal
+    /// wearing an image mime; this is the rest of it. Nothing here is hidden —
+    /// the card, the name and the download button all stay. Only the
+    /// click-to-open is withheld.
+    static func isScriptable(_ mime: String) -> Bool {
+        let base = base(mime)
+        if base.hasPrefix("image/") {
+            let sub = base.dropFirst("image/".count)
+            return sub.contains("svg") || sub.contains("xml")
+        }
+        let sub = base.split(separator: "/").dropFirst().first.map(String.init) ?? ""
+        // `+xml` is the structured syntax SUFFIX and is the only place the letters
+        // mean the payload really is xml. Searching for them anywhere refuses a
+        // .docx, whose mime is `…vnd.openxmlformats-officedocument…` — a vendor's
+        // word that happens to contain them.
+        return sub == "html" || sub == "xhtml" || sub == "xml" || sub.hasSuffix("+xml")
+            || sub.contains("webarchive")
     }
 
     static func isPDF(_ mime: String) -> Bool { mime == "application/pdf" }
@@ -51,10 +76,12 @@ enum AttachmentKinds {
         att.downloadable && isRenderableImage(att.mime) && att.size <= inlineMaxBytes
     }
 
-    /// What a click OPENS. Both platforms have a real viewer for images, so this
-    /// is no longer "is it a PDF" — that gate is what left every photo in the
-    /// mailbox with a tap target that did nothing.
+    /// What a click OPENS. Both platforms preview through Quick Look, which
+    /// renders whatever the OS has a generator for, so this stopped being a list
+    /// of the types this app can draw and became the REFUSAL list: a word doc, a
+    /// spreadsheet, a text file and a movie all open, and bytes stay shut only
+    /// when there are none stored or when their renderer would be a browser.
     static func isPreviewable(_ att: Attachment) -> Bool {
-        att.downloadable && (isPDF(att.mime) || isRenderableImage(att.mime))
+        att.downloadable && !isScriptable(att.mime)
     }
 }

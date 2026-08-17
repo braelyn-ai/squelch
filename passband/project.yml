@@ -61,6 +61,9 @@ targets:
       - sdk: WebKit.framework
       - sdk: Security.framework
       - sdk: UserNotifications.framework
+      # The attachment preview IS the system's Quick Look panel; see
+      # Sources/Passband/Views/QuickLookPanel.swift.
+      - sdk: QuickLookUI.framework
       # Vendored prebuilt Sparkle — run vendor/fetch-sparkle.sh once before
       # `xcodegen generate` on a fresh clone. Xcode re-signs on embed.
       - framework: vendor/Sparkle/Sparkle.framework

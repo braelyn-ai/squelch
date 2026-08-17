@@ -46,7 +46,7 @@ SWIFT_FLAGS=(
   -framework WebKit
   -framework Security
   -framework UniformTypeIdentifiers
-  -framework PDFKit
+  -framework QuickLookUI
   -framework UserNotifications
   -F "$SPARKLE_DIR"
   -framework Sparkle

@@ -4,8 +4,12 @@
 // neon sign rendered as a 38pt chip under a message that said "see photo
 // attached". Both answers are asserted here rather than left to a view.
 //
-// The other half is svg: any svg/xml-ish subtype is scriptable and must fall out
-// of EVERY renderable bucket, so the refusal is checked in each one.
+// The other half is the browser-engine refusal. svg, html, xhtml and webarchives
+// all render through WebKit, and Quick Look will draw every one of them on ask —
+// so now that previewing is "whatever the OS has a generator for", the ONLY thing
+// standing between a stranger's attachment and a script engine is
+// `isScriptable`. It is asserted from both directions: the spellings that must be
+// caught, and the near-misses that must not be.
 
 import Foundation
 
@@ -18,6 +22,7 @@ struct AttachmentKindsTests {
     static func main() {
         photosAreInlineAndPreviewable()
         svgIsNeverRenderable()
+        scriptableNeverOpens()
         nonImagesStayFiled()
         sizeCeilings()
         undownloadableIsInert()
@@ -85,11 +90,43 @@ struct AttachmentKindsTests {
             let a = att(mime: mime, size: 1000)
             equal(AttachmentKinds.isInline(a), false, "\(mime) does not render inline")
         }
-        // A .docx is downloadable and named, but nothing here rasterizes it.
-        let doc = att(
-            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            size: 20_000)
-        equal(AttachmentKinds.isPreviewable(doc), false, "a word doc is download-only")
+        // Filed in the strip, but Quick Look still opens them: previewing stopped
+        // being "types this app can draw" when the panel became the system's.
+        for mime in [
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/zip", "text/plain", "video/quicktime", "application/octet-stream",
+        ] {
+            let a = att(mime: mime, size: 20_000)
+            equal(AttachmentKinds.isInline(a), false, "\(mime) is filed, not pasted inline")
+            equal(AttachmentKinds.isPreviewable(a), true, "\(mime) still opens in Quick Look")
+        }
+    }
+
+    // MARK: - the browser-engine refusal
+
+    private static func scriptableNeverOpens() {
+        // Quick Look renders each of these through WebKit. A stranger's
+        // attachment does not get to run script, so the click is withheld even
+        // though the panel would happily draw it.
+        for mime in [
+            "text/html", "TEXT/HTML", "text/html; charset=utf-8", "application/xhtml+xml",
+            "application/xml", "text/xml", "application/x-webarchive", "image/svg+xml",
+        ] {
+            equal(AttachmentKinds.isScriptable(mime), true, "\(mime) is a browser-engine type")
+            let a = att(mime: mime, size: 4_000)
+            equal(AttachmentKinds.isPreviewable(a), false, "\(mime) does not open")
+        }
+        // And the near-misses that must NOT be swept up with them. The .docx is
+        // the one that matters: its mime carries "openxmlformats", so a rule that
+        // searches for the letters anywhere refuses every Word document anyone
+        // has ever been sent.
+        for mime in [
+            "text/plain", "application/pdf", "image/png", "application/json",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ] {
+            equal(AttachmentKinds.isScriptable(mime), false, "\(mime) is not a browser type")
+        }
     }
 
     private static func sizeCeilings() {
