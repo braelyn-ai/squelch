@@ -1164,11 +1164,21 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             return Ok(None);
         }
         let id = self.store.ingest_message(&triaged)?;
-        // Notify on a CONFIDENT heuristic seed only; a guess waits for the
-        // Stage-1/Stage-2 apply sites. ACCEPTED TRADEOFF: Stage-1 may later
-        // DOWNGRADE the seed, but the push has already fired and
-        // UNIQUE(message_id) means no second, corrected event.
-        if origin == IngestOrigin::Incremental && triaged.confident {
+        // NOTIFY ONLY FROM A MODEL VERDICT, unless there is no model to wait for.
+        //
+        // This used to push on a confident heuristic seed and accept that
+        // Stage-1 might silently downgrade it afterwards — but `UNIQUE(message_id)`
+        // means the correction can never be delivered, so the user's phone was
+        // being buzzed by a regex whose verdict nothing could retract. A pushed
+        // notification is the loudest thing this product does; a pattern match is
+        // the weakest evidence it has.
+        //
+        // The wait costs one classify call, because the Stage-1 pass runs later in
+        // this same cycle and emits from its own apply site. With NO API key the
+        // heuristics are all there is and are authoritative, so they notify: that
+        // is the "unless we have no model access" case, and the only one.
+        let llm_available = self.stage2_llm.is_some();
+        if origin == IngestOrigin::Incremental && triaged.confident && !llm_available {
             self.emit_event(&events::ingest_context(&triaged, id, rules), now);
         }
         // STRUCTURAL EXCLUSION: sealed mail is never embedded.
@@ -1723,11 +1733,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             eprintln!("squelch: stage-1 usage ledger bump failed ({e})");
                         }
                     }
-                    let applied = stage1_llm::apply_result(
+                    // The rule as it stands NOW, not as it stood at ingest: a
+                    // rule the user added since must still be honored, and one
+                    // they deleted must stop being.
+                    let applied = stage1_llm::apply_result_with_rule(
                         row,
                         &out,
                         &cfg.model,
                         cfg.known_contact_importance,
+                        self.current_rule(&row.from_addr),
                         &self.config.router(),
                         Utc::now(),
                     );

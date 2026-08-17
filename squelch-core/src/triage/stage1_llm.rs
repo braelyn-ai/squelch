@@ -460,6 +460,34 @@ pub fn apply_result(
     router_cfg: &RouterConfig,
     now: DateTime<Utc>,
 ) -> Stage1Applied {
+    apply_result_with_rule(
+        queued,
+        out,
+        model,
+        known_contact_floor,
+        None,
+        router_cfg,
+        now,
+    )
+}
+
+/// [`apply_result`] with the sender rule that currently covers this address.
+///
+/// The rule is an OVERRIDE, applied after the model has had its say, and it only
+/// ever moves the visibility axis. That split is the whole point: the account
+/// owner's standing instruction about a sender is not a classification the model
+/// gets to revisit, but everything else the model produced — the category that
+/// routes extraction, the deadline, the one-liner, the revisit schedule — is
+/// real work that a squelched row used to go without.
+pub fn apply_result_with_rule(
+    queued: &Stage1Queued,
+    out: &Stage1Output,
+    model: &str,
+    known_contact_floor: u8,
+    rule: Option<crate::types::Disposition>,
+    router_cfg: &RouterConfig,
+    now: DateTime<Utc>,
+) -> Stage1Applied {
     let importance = out.importance.clamp(0, 100) as u8;
     let category = normalize_category(&out.category);
     // Rung 3 of the ingest-time engine promises mail from a KNOWN CONTACT
@@ -521,26 +549,65 @@ pub fn apply_result(
         "stage-1",
     );
 
+    // ---- THE OWNER'S RULE, applied over the model's verdict ----------------
+    // Visibility only. A Squelch rule buries the row whatever the model made of
+    // it; a Surface rule floors it into the attention bands. Neither touches the
+    // category, the deadline, or the revisit schedule, all of which the model
+    // just produced and all of which stay useful on a row the user never sees:
+    // a squelched vendor's shipping notice still belongs in the shipments rail.
+    //
+    // A deadline the model found SURVIVES a squelch rather than being dropped.
+    // "Stop showing me this sender" is not "stop tracking what I owe them", and
+    // conflating the two is how a real bill goes missing.
+    let (importance, tier, tier_reason, importance_reason) = match rule {
+        Some(crate::types::Disposition::Squelch) => (
+            0,
+            crate::types::Tier::Noise,
+            "the account owner's squelch rule for this sender -> noise".to_string(),
+            "squelched by the account owner's own rule for this sender".to_string(),
+        ),
+        Some(crate::types::Disposition::Surface) if tier == crate::types::Tier::Noise => (
+            importance.max(known_contact_floor),
+            crate::types::Tier::Signal,
+            "the account owner's surface rule for this sender -> signal".to_string(),
+            format!(
+                "surfaced by the account owner's own rule for this sender -> importance {}",
+                importance.max(known_contact_floor)
+            ),
+        ),
+        _ => (importance, tier, tier_reason, importance_reason),
+    };
+
     // ROUTE over the settled verdict — the tier and importance the user would
     // actually see, after every floor and clamp — rather than over what the
     // model proposed. Routing on the proposal would let a value the apply path
     // is about to overrule decide whether anyone looks at the row again.
-    let escalation = router::should_escalate(
-        &router::EscalationInput {
-            importance,
-            tier,
-            category: &category,
-            exception: out.exception,
-            model_says_unsure: !out.confident,
-            has_deadline: deadline.is_some(),
-            subject: &queued.subject,
-            body: &queued.body,
-            is_known_contact: queued.is_known_contact,
-            sender_corrected: queued.sender_corrected,
-        },
-        router_cfg,
-        now,
-    );
+    //
+    // A SQUELCH RULE ENDS THE ROUTING. Escalation exists to get a verdict right,
+    // and on a squelched row the visible verdict is already settled by the owner
+    // — a second, more expensive opinion cannot change what they see. Any
+    // deadline the model found is stored regardless, so the one thing that could
+    // still matter is not riding on this call.
+    let escalation = if rule == Some(crate::types::Disposition::Squelch) {
+        None
+    } else {
+        router::should_escalate(
+            &router::EscalationInput {
+                importance,
+                tier,
+                category: &category,
+                exception: out.exception,
+                model_says_unsure: !out.confident,
+                has_deadline: deadline.is_some(),
+                subject: &queued.subject,
+                body: &queued.body,
+                is_known_contact: queued.is_known_contact,
+                sender_corrected: queued.sender_corrected,
+            },
+            router_cfg,
+            now,
+        )
+    };
 
     let reason = match escalation {
         Some(r) => format!("{reason}; escalating: {}", r.detail()),
@@ -570,7 +637,7 @@ pub fn apply_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Sensitivity, Tier};
+    use crate::types::{Disposition, Sensitivity, Tier};
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
@@ -1015,5 +1082,121 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // ---- THE OWNER'S RULE OVER THE MODEL'S VERDICT ------------------------
+
+    /// A squelch rule buries the row whatever the model thought of it...
+    #[test]
+    fn a_squelch_rule_buries_whatever_the_model_said() {
+        let mut o = out(95, true);
+        o.category = "invoice".into();
+        let a = apply_result_with_rule(
+            &queued(true),
+            &o,
+            "m",
+            70,
+            Some(Disposition::Squelch),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(a.tier, Tier::Noise);
+        assert_eq!(a.importance, 0);
+    }
+
+    /// ...but the row is still CLASSIFIED, which is the point of running the
+    /// model on it at all: the category still routes extraction, so a squelched
+    /// vendor's shipping notice still reaches the shipments rail.
+    #[test]
+    fn a_squelched_row_still_gets_its_category() {
+        let mut o = out(20, true);
+        o.category = "transaction_alert".into();
+        let a = apply_result_with_rule(
+            &queued(false),
+            &o,
+            "m",
+            70,
+            Some(Disposition::Squelch),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(a.category.as_deref(), Some("transaction_alert"));
+    }
+
+    /// "Stop showing me this sender" is not "stop tracking what I owe them": a
+    /// deadline the model found survives the squelch.
+    #[test]
+    fn a_squelch_rule_does_not_discard_a_deadline() {
+        let mut o = out(80, true);
+        o.has_deadline = true;
+        o.deadline_iso = Some("2026-07-20T00:00:00Z".into());
+        o.deadline_kind = Some("payment_due".into());
+        let a = apply_result_with_rule(
+            &queued(true),
+            &o,
+            "m",
+            70,
+            Some(Disposition::Squelch),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert!(
+            a.deadline.is_some(),
+            "the obligation outlives the visibility rule"
+        );
+        assert_eq!(a.tier, Tier::Noise, "but it is still not shown");
+    }
+
+    /// A squelched row never escalates: a second, costlier opinion cannot change
+    /// a visibility the owner already settled.
+    #[test]
+    fn a_squelch_rule_ends_the_routing() {
+        let mut o = out(50, false);
+        o.category = "invoice".into();
+        o.exception = true;
+        let a = apply_result_with_rule(
+            &queued(false),
+            &o,
+            "m",
+            70,
+            Some(Disposition::Squelch),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert!(!a.needs_stage2);
+        assert_eq!(a.escalation_reason, None);
+    }
+
+    /// A surface rule lifts a row the model buried, without pretending the model
+    /// said something it did not.
+    #[test]
+    fn a_surface_rule_lifts_a_buried_row() {
+        let a = apply_result_with_rule(
+            &queued(false),
+            &out(5, true),
+            "m",
+            70,
+            Some(Disposition::Surface),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(a.tier, Tier::Signal);
+        assert!(a.importance >= 70);
+    }
+
+    /// With no rule, nothing is overridden.
+    #[test]
+    fn no_rule_leaves_the_model_verdict_alone() {
+        let a = apply_result_with_rule(
+            &queued(false),
+            &out(30, true),
+            "m",
+            70,
+            None,
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(a.importance, 30);
+        assert_eq!(a.tier, Tier::Noise);
     }
 }

@@ -530,18 +530,29 @@ impl SqliteStore {
         };
         // STAGE-1/STAGE-2 QUEUE MARKERS: `stage1_model_used` decides whether the
         // Stage-1 pass looks at this row, `needs_stage2` is the escalation seed.
-        //   * Sealed / Sent: never queued for any LLM ('n/a').
-        //   * Explicit Squelch/Surface rule: the user already ruled on this
-        //     sender, so no model spend at all ('rule', needs_stage2=0).
-        //   * Filtered rule: skip Stage-1, straight to Stage-2 for the want_text
-        //     ('rule', needs_stage2=1).
-        //   * Everything else: enter the Stage-1 queue (NULL), seeding
-        //     `needs_stage2` from heuristic confidence.
+        //   * Sealed / Sent: never queued for any LLM ('n/a'). Sealed mail
+        //     reaching a model is the one thing this system must never do.
+        //   * Filtered rule: skip Stage-1 and go straight to Stage-2, which is
+        //     the only stage that evaluates `want_text` ('rule', needs_stage2=1).
+        //   * EVERYTHING ELSE, rule-decided included: enter the Stage-1 queue
+        //     (NULL), seeding `needs_stage2` from heuristic confidence.
+        //
+        // A Squelch/Surface rule USED TO stop here with 'rule' and never see a
+        // model. It no longer does. The rule still wins — the user's own ruling
+        // on a sender is not something a classifier gets to overturn — but it
+        // decides ONE axis, and a row that skipped the model had no category, no
+        // extraction, no deadline, and no revisit schedule either. Honoring an
+        // instruction about visibility was quietly costing every other thing
+        // triage knows how to produce.
+        //
+        // Filtered is told apart from Squelch/Surface by `confident`: the Filtered
+        // rung parks NOT-confident precisely because its verdict is pending an
+        // LLM read of `want_text` (see `triage::stage1`).
         let (stage1_model_used, needs_stage2): (Option<&str>, i64) =
             if triaged.sensitivity != Sensitivity::Normal || triaged.message.is_sent {
                 (Some("n/a"), 0)
-            } else if triaged.matched_rule.is_some() {
-                (Some("rule"), if triaged.confident { 0 } else { 1 })
+            } else if triaged.matched_rule.is_some() && !triaged.confident {
+                (Some("rule"), 1)
             } else {
                 (None, if triaged.confident { 0 } else { 1 })
             };

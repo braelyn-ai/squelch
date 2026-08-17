@@ -108,20 +108,27 @@ fn extract_bump_usage_records_its_own_ledger_category() {
 }
 
 #[test]
-fn stage1_queue_selects_normal_unrefined_excludes_rule_and_sealed() {
+fn stage1_queue_takes_every_normal_row_including_rule_decided_ones() {
     let (store, acct) = store();
 
     // Normal, non-rule row -> enters the Stage-1 LLM queue.
     let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
-    // Explicit rule (confident) -> decided; NO Stage-1 model spend.
-    triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
-    // Sealed -> never queued for any LLM.
+    // A Squelch/Surface rule row ALSO enters it. The rule settles what the user
+    // sees; it does not settle the category, the deadline, or the revisit
+    // schedule, and those are worth having on a row nobody looks at.
+    let ruled = triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
+    // Sealed -> never queued for any LLM, rule or no rule.
     triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed).ingest(&store);
 
     let q = store.stage1_queue(acct, 10).unwrap();
-    assert_eq!(q.len(), 1, "only the normal, non-rule row needs Stage-1");
-    assert_eq!(q[0].message_id, normal);
-    assert_eq!(q[0].sensitivity, Sensitivity::Normal);
+    let ids: Vec<i64> = q.iter().map(|r| r.message_id).collect();
+    assert_eq!(q.len(), 2, "both normal rows need Stage-1: {ids:?}");
+    assert!(ids.contains(&normal));
+    assert!(
+        ids.contains(&ruled),
+        "a rule row is not a reason to skip a model"
+    );
+    assert!(q.iter().all(|r| r.sensitivity == Sensitivity::Normal));
 }
 
 // ---- the SHIPMENTS extractor's own queue --------------------------------
@@ -338,10 +345,12 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
     let donor = triaged_row(acct, "g-donor", "t1", None, false, Sensitivity::Normal)
         .ship_extract(true)
         .ingest(&store);
-    // The FEEDER is rule-decided, so it never resets — which is the whole point:
-    // the rows below survive the reset and must still lose the donated text.
+    // The FEEDER carries a FILTERED rule, which is the marker that still sits
+    // outside the reset scope ('rule'), so it never resets — which is the whole
+    // point: the rows below survive the reset and must still lose the donated
+    // text.
     let feeder =
-        triaged_row(acct, "g-feeder", "t2", Some(7), true, Sensitivity::Normal).ingest(&store);
+        triaged_row(acct, "g-feeder", "t2", Some(7), false, Sensitivity::Normal).ingest(&store);
 
     let sid = store
         .upsert_shipment(
@@ -415,11 +424,15 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
 }
 
 #[test]
-fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
+fn retriage_reset_requeues_llm_rows_but_never_filtered_or_sealed() {
     let (store, acct) = store();
 
     let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
-    triaged_row(acct, "g-r", "t-r", Some(7), true, Sensitivity::Normal).ingest(&store);
+    // A FILTERED rule row keeps the 'rule' marker (its verdict is pending a
+    // Stage-2 want_text read) and stays outside the reset scope. A
+    // Squelch/Surface row no longer does: it is an ordinary model-classified row
+    // whose rule simply reapplies on the way back through.
+    triaged_row(acct, "g-f", "t-f", Some(7), false, Sensitivity::Normal).ingest(&store);
     triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed).ingest(&store);
 
     // Simulate the LLM having classified the normal row (leaves the queue).
@@ -437,7 +450,7 @@ fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
 
     // Window re-triage: only the LLM-classified normal row resets.
     let n = store.retriage_reset(acct, None, 7).unwrap();
-    assert_eq!(n, 1, "rule + sealed rows must never reset");
+    assert_eq!(n, 1, "filtered + sealed rows must never reset");
     let q = store.stage1_queue(acct, 10).unwrap();
     assert_eq!(q.len(), 1);
     assert_eq!(q[0].message_id, normal);
@@ -460,13 +473,32 @@ fn retriage_reset_requeues_llm_rows_but_never_rule_or_sealed() {
     assert_eq!(sealed_reset, 0);
 }
 
+/// A Squelch/Surface rule still classifies, but it does NOT escalate: the row
+/// enters Stage-1 and stops there, because a second opinion cannot change a
+/// visibility the account owner has already settled.
 #[test]
-fn explicit_rule_row_skips_both_llm_queues() {
+fn explicit_rule_row_classifies_once_and_never_escalates() {
     let (store, acct) = store();
-    // A Squelch/Surface rule row is final: not in Stage-1, not in Stage-2.
-    triaged_row(acct, "g-r", "t-r", Some(9), true, Sensitivity::Normal).ingest(&store);
-    assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
-    assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    let id = triaged_row(acct, "g-r", "t-r", Some(9), true, Sensitivity::Normal).ingest(&store);
+    assert_eq!(
+        store.stage1_queue(acct, 10).unwrap().len(),
+        1,
+        "the rule row gets its model verdict"
+    );
+    assert!(
+        store.stage2_queue(acct, 10).unwrap().is_empty(),
+        "a rule row is seeded un-escalated"
+    );
+    let needs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT needs_stage2 FROM triage WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(needs, 0);
 }
 
 #[test]
