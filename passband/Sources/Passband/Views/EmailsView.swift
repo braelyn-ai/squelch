@@ -300,16 +300,15 @@ struct EmailsView: View {
         let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
 
         return HStack(spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Text("passband")
-                    .font(Typo.serif(19, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                // The page you are on, not the tab's name.
-                Text(mode.label)
-                    .font(Typo.micro)
-                    .foregroundStyle(Palette.inkFaintest)
-                    .textCase(.uppercase)
-            }
+            // NO MODE LABEL BESIDE THE WORDMARK. It said what the segmented
+            // control an inch to its right already says, and it said it in a
+            // string whose width changed with the answer — so every switch
+            // between all mail / noise / sent shoved the control and the whole
+            // run of chrome after it sideways. The one thing in this bar that
+            // moved was the one thing that was repeating itself.
+            Text("passband")
+                .font(Typo.serif(19, weight: .medium))
+                .foregroundStyle(Palette.ink)
             GlassSegmented(
                 options: MailMode.allCases.map { ($0, $0.label) },
                 selection: $store.mailMode)
