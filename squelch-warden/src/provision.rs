@@ -57,6 +57,11 @@
 //!   armor check in [`crate::validate::validate_ciphertext`].
 //! - `squelchd pair` prints a LIVE pairing code. No exec output is logged at
 //!   any level, which is the only rule that keeps that true.
+//! - [`Warden::drift`] and [`Warden::reconcile`] recover the stored ciphertext
+//!   and the stored LLM key to re-render a Deployment, and both leave those
+//!   functions only as a SHA-256 in a pod-template annotation. What a drift
+//!   report quotes is a Deployment spec: field names, images, mount points, and
+//!   Secret references by name.
 //! - The tenant's mailbox address never reaches a log line or a response body.
 //!   The label does: it is a public subdomain and it is in the ingress
 //!   controller's access log already, and an operator with no identifier cannot
@@ -69,6 +74,7 @@ use k8s_openapi::api::core::v1::Secret;
 
 use crate::cluster::{Cluster, ClusterError, Kind, Object};
 use crate::config::Config;
+use crate::drift::{self, DriftReport};
 use crate::identity::TenantIdentity;
 use crate::objects;
 use crate::pair::{self, Pairing};
@@ -110,6 +116,31 @@ pub struct Created {
     pub recipient: String,
 }
 
+/// The answer to a reconcile: what it took to put the tenant back on today's
+/// render.
+///
+/// Two words, both fixed vocabulary, and nothing about the tenant. The report
+/// of what was WRONG is [`DriftReport`]'s job; this says what was done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Reconciled {
+    /// `created`, `converged` or `recreated`. The last one means the Deployment
+    /// was deleted and applied fresh because another field manager owned part
+    /// of it; see [`Warden::reconcile`] for why nothing gentler works.
+    pub deployment: &'static str,
+    /// Always `active`. A reconcile that returns at all has waited for a ready
+    /// pod, which is the same thing the status route reads to say the word.
+    pub status: &'static str,
+}
+
+impl Reconciled {
+    fn new(deployment: &'static str) -> Self {
+        Self {
+            deployment,
+            status: TenantStatus::Active.as_str(),
+        }
+    }
+}
+
 /// Why an operation failed.
 ///
 /// The `Cluster` variant carries a MACHINE REASON and nothing else: it goes on
@@ -141,6 +172,11 @@ pub enum WardenError {
     /// fleet for nothing.
     #[error("llm gateway not configured")]
     LlmNotConfigured,
+    /// There is no workload to converge: the tenant is pending or stopped, and
+    /// both of those transitions belong to somebody else. See
+    /// [`Warden::reconcile`].
+    #[error("nothing to reconcile")]
+    NotReconcilable,
     #[error("{reason}")]
     Cluster { reason: &'static str },
 }
@@ -342,26 +378,7 @@ impl Warden {
         // rotation would find nothing to differ from. The Secret can only
         // exist if `llm_base_url` was configured when `set_llm_key` accepted
         // it, so this pickup cannot stamp the annotation with the feature off.
-        let llm_hash = self
-            .cluster
-            .get_secret(&name.llm_secret())
-            .await
-            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
-            .as_ref()
-            .and_then(|secret| {
-                // Both data keys, through the same combined hash `set_llm_key`
-                // stamps ([`objects::llm_keys_hash`]): a pickup that hashed
-                // only the triage key would differ from every hash a keyed
-                // rotation writes, and the first rotation after provisioning
-                // would roll the pod for nothing — or worse, a real rotation
-                // would land on a pod already carrying its hash and not roll.
-                // Either slot alone is enough: a half-failed mint can leave a
-                // Secret holding only one of the two.
-                let api_key = secret_value(secret, objects::LLM_API_KEY_KEY);
-                let assistant = secret_value(secret, objects::ASSISTANT_API_KEY_KEY);
-                (api_key.is_some() || assistant.is_some())
-                    .then(|| objects::llm_keys_hash(api_key.as_deref(), assistant.as_deref()))
-            });
+        let llm_hash = self.llm_hash(&name).await?;
         // The hash of what was just stored, not of what is running: this is the
         // whole mechanism by which a re-consent reaches the daemon.
         self.apply(
@@ -554,6 +571,336 @@ impl Warden {
         self.status_of(&name).await
     }
 
+    /// What is on this tenant's Deployment that the warden did not put there,
+    /// and what an apply of today's render would change.
+    ///
+    /// Read-only. The one write it makes is a `dryRun=All` apply, which the API
+    /// server merges, defaults and then discards; nothing is stored, nothing is
+    /// rolled, and a tenant is exactly as it was when this returns. See
+    /// [`crate::drift`] for why the two halves of the answer are two separate
+    /// questions.
+    ///
+    /// A tenant with no Deployment - pending, or stopped - reports its status
+    /// with both arrays empty. There is no object to have drifted, and
+    /// rendering one to diff against would be inventing a finding.
+    ///
+    /// The render has to be the render this tenant would GET, which means the
+    /// same two hashes phase two stamped on it: the credential ciphertext's,
+    /// recovered byte-exact from the stored Secret, and the LLM key's when one
+    /// exists. A render with either one wrong would report a pod-template
+    /// annotation as drift on every single tenant.
+    pub async fn drift(&self, raw_label: &str) -> Result<DriftReport, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        if self.identity(&name).await?.is_none() {
+            return Err(WardenError::NotFound);
+        }
+        // Two reads of the same object rather than one shared one:
+        // `status_of` is the single definition of what the four words mean,
+        // and a diagnostic route can afford the second GET.
+        let status = self.status_of(&name).await?;
+        let live = self
+            .cluster
+            .get_deployment(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        let Some(live) = live else {
+            return Ok(DriftReport {
+                status: status.as_str(),
+                deployment_present: false,
+                foreign: Vec::new(),
+                changes: Vec::new(),
+            });
+        };
+
+        let ciphertext = self
+            .cluster
+            .get_secret(&name.credential_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| secret_value(secret, objects::CREDENTIAL_KEY));
+        let Some(ciphertext) = ciphertext else {
+            // The same state `set_llm_key` refuses to render against: a
+            // workload whose sealed credential is gone. There is no honest
+            // render to compare the live object with.
+            tracing::error!(
+                tenant = %name,
+                reason = "credential_missing",
+                "a workload exists but its credential Secret does not"
+            );
+            return Err(WardenError::cluster("credential_missing"));
+        };
+        let llm_hash = self.llm_hash(&name).await?;
+
+        let rendered = objects::deployment(
+            &self.config,
+            &name,
+            &objects::credential_hash(&ciphertext),
+            llm_hash.as_deref(),
+        );
+        let merged = self
+            .cluster
+            .apply_deployment_dry_run(rendered)
+            .await
+            // A dry run the API server REFUSES is a finding, not an outage: it
+            // means today's render can no longer be applied to this tenant at
+            // all - an immutable field the render moved, an admission webhook
+            // that rejects it - and "the cluster is unavailable" would send the
+            // operator looking at the wrong thing entirely. A 4xx is the API
+            // server answering; anything else is it failing to.
+            .map_err(|e| {
+                let reason = match &e {
+                    ClusterError::Api { source, .. } => match source.as_ref() {
+                        kube::Error::Api(response) if (400..500).contains(&response.code) => {
+                            "render_rejected"
+                        }
+                        _ => "cluster_unavailable",
+                    },
+                    _ => "cluster_unavailable",
+                };
+                fail(name.as_str(), reason, &e)
+            })?;
+
+        let foreign = drift::foreign_managers(&live);
+        let changes = drift::diff_spec(
+            &serde_json::to_value(&live.spec).unwrap_or(serde_json::Value::Null),
+            &serde_json::to_value(&merged.spec).unwrap_or(serde_json::Value::Null),
+        );
+        Ok(DriftReport {
+            status: status.as_str(),
+            deployment_present: true,
+            foreign,
+            changes,
+        })
+    }
+
+    /// Put a running tenant back onto today's render, and purge anything
+    /// another field manager has taken ownership of.
+    ///
+    /// [`Warden::drift`] answers "what is wrong with this tenant"; this is the
+    /// fix, and it is the only path in the service that repairs an object
+    /// rather than converging one.
+    ///
+    /// ## Why a re-apply is not enough, and a delete is
+    ///
+    /// Server-side apply owns FIELDS. Every apply the warden makes declares the
+    /// fields in [`objects::deployment`] and forces them; a field the warden
+    /// does NOT declare belongs to whichever manager wrote it, and an apply
+    /// neither reports it nor removes it, no matter how many times it runs.
+    /// The incident this route exists for is exactly that shape: a
+    /// `kubectl set env` stamped a Secret reference onto the seed container,
+    /// the warden's applies converged around it for weeks, and it detonated as
+    /// `Init:CreateContainerConfigError` the day the referenced Secret went
+    /// away. There is no forced apply that takes that field back. Deleting the
+    /// Deployment and applying a fresh one is the only honest purge: the new
+    /// object's ownership ledger starts empty and carries exactly what the
+    /// warden declares.
+    ///
+    /// So the delete happens only when [`drift::foreign_managers`] finds
+    /// somebody, because a delete costs the tenant its pod and an ordinary
+    /// re-apply does not.
+    ///
+    /// ## Why the wait between them
+    ///
+    /// The data volume is `ReadWriteOnce` and the daemon is one SQLite file.
+    /// Within one Deployment the `Recreate` strategy guarantees the old pod is
+    /// gone before the new one starts; across a delete and a re-create there is
+    /// no controller holding that promise, so [`Cluster::pods_gone`] holds it
+    /// here. Nothing is applied until the old pod is off the volume, and a
+    /// timeout there is a refusal rather than a second writer.
+    ///
+    /// That refusal has a cost, and [`Warden::interrupted`] is what keeps it
+    /// from becoming a trap: between the delete and the apply there is no
+    /// Deployment, so a reconcile that dies in the window leaves a tenant
+    /// reading [`TenantStatus::Stopped`], and a route that refused every
+    /// stopped tenant would refuse to finish the job its own failure started.
+    ///
+    /// ## What it will and will not act on
+    ///
+    /// [`TenantStatus::Active`] and [`TenantStatus::Failed`] both proceed.
+    /// Failed is precisely the incident state - a pod stuck on a foreign secret
+    /// reference has no ready replica - and refusing it would make this route
+    /// useless in the one case it was built for.
+    ///
+    /// [`TenantStatus::Pending`] is [`WardenError::NotReconcilable`]: it has
+    /// never had a workload, and bringing one up is a signup to finish with
+    /// [`Warden::set_credentials`], not a shape to converge.
+    ///
+    /// [`TenantStatus::Stopped`] depends on WHY it stopped, which the status
+    /// word cannot say and [`Warden::interrupted`] can. A cancelled account and
+    /// an interrupted reconcile look identical from the Deployment alone; the
+    /// Service tells them apart, and starting a cancelled tenant back up would
+    /// be a resurrection nobody asked for.
+    ///
+    /// Secrets are never rewritten. This converges SHAPE; identities,
+    /// credentials and keys are what they were when it started, and the two
+    /// hashes on the pod template are recovered from the stored Secrets so the
+    /// render is the one this tenant is entitled to rather than a new one.
+    pub async fn reconcile(&self, raw_label: &str) -> Result<Reconciled, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        if self.identity(&name).await?.is_none() {
+            return Err(WardenError::NotFound);
+        }
+        match self.status_of(&name).await? {
+            TenantStatus::Active | TenantStatus::Failed => {}
+            // Stopped by an interrupted reconcile, not by a cancellation: the
+            // objects around the missing Deployment are still standing, and
+            // finishing is the whole point of the route.
+            TenantStatus::Stopped if self.interrupted(&name).await? => {
+                tracing::info!(
+                    tenant = %name,
+                    "resuming a reconcile that did not finish; the workload is still routed"
+                );
+            }
+            TenantStatus::Pending | TenantStatus::Stopped => {
+                return Err(WardenError::NotReconcilable);
+            }
+        }
+
+        // Recovered before anything is written, so a tenant this warden cannot
+        // render honestly costs the cluster nothing but reads.
+        let ciphertext = self
+            .cluster
+            .get_secret(&name.credential_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| secret_value(secret, objects::CREDENTIAL_KEY));
+        let Some(ciphertext) = ciphertext else {
+            // The same state `set_llm_key` and `drift` refuse: a workload whose
+            // sealed credential is gone. Rendering against a hash of nothing
+            // would roll the pod onto a credential that never existed.
+            tracing::error!(
+                tenant = %name,
+                reason = "credential_missing",
+                "a workload exists but its credential Secret does not"
+            );
+            return Err(WardenError::cluster("credential_missing"));
+        };
+        let llm_hash = self.llm_hash(&name).await?;
+
+        // The same order phase two applies in, for the same reasons: the volume
+        // exists before anything wants it, the NetworkPolicy before the pod it
+        // polices, and the Ingress last so the hostname answers only once there
+        // is something behind it. That ordering matters more here than there,
+        // because the pod in the middle of it may be about to be deleted.
+        self.apply(
+            &name,
+            Object::Pvc(Box::new(objects::data_pvc(&self.config, &name))),
+            "volume_failed",
+        )
+        .await?;
+        self.apply(
+            &name,
+            Object::NetworkPolicy(Box::new(objects::network_policy(&self.config, &name))),
+            "network_policy_failed",
+        )
+        .await?;
+        self.apply(
+            &name,
+            Object::Service(Box::new(objects::service(&self.config, &name))),
+            "service_failed",
+        )
+        .await?;
+
+        let rendered = objects::deployment(
+            &self.config,
+            &name,
+            &objects::credential_hash(&ciphertext),
+            llm_hash.as_deref(),
+        );
+        let live = self
+            .cluster
+            .get_deployment(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        let outcome = match live.as_ref().map(drift::foreign_managers) {
+            // The Deployment was there when the status was read and is gone
+            // now, so something deleted it while this ran - and the only thing
+            // that deletes a live tenant's workload is a cancellation. Re-check
+            // before rebuilding it: `delete` takes the Service first, so a
+            // Service that has also gone means this is a teardown in progress
+            // and applying would race a cancellation back onto the internet.
+            None => {
+                if !self.interrupted(&name).await? {
+                    tracing::warn!(
+                        tenant = %name,
+                        "the workload was deleted while reconciling; refusing to rebuild it"
+                    );
+                    return Err(WardenError::NotReconcilable);
+                }
+                "created"
+            }
+            Some(foreign) if !foreign.is_empty() => {
+                // COUNT, not names. A `fieldManager` is chosen by whoever wrote
+                // the field, it may carry a newline, and this formatter writes
+                // one line per event - so a name here would let the owner of
+                // the drift forge log lines about it. The names are in the
+                // drift report, which is structured and escaped.
+                tracing::warn!(
+                    tenant = %name,
+                    managers = foreign.len(),
+                    "recreating a Deployment other field managers own fields on"
+                );
+                self.cluster
+                    .delete(Kind::Deployment, name.as_str())
+                    .await
+                    .map_err(|e| fail(name.as_str(), "workload_delete_failed", &e))?;
+                // Nothing is applied until the old pod is off the volume.
+                self.cluster
+                    .pods_gone(&objects::pod_selector(&name), self.config.ready_timeout)
+                    .await
+                    .map_err(|e| fail(name.as_str(), "pods_not_gone", &e))?;
+                // The delete is Background, so the name is free the moment the
+                // API server answers. A Deployment still standing here is one
+                // somebody else's finalizer is holding, and applying onto an
+                // object mid-deletion would write a spec the collector is about
+                // to throw away - leaving the tenant with no workload and this
+                // route reporting success.
+                if self
+                    .cluster
+                    .get_deployment(name.as_str())
+                    .await
+                    .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+                    .is_some()
+                {
+                    tracing::error!(
+                        tenant = %name,
+                        reason = "workload_still_deleting",
+                        "the Deployment outlived its own delete; a finalizer is holding it"
+                    );
+                    return Err(WardenError::cluster("workload_still_deleting"));
+                }
+                "recreated"
+            }
+            Some(_) => "converged",
+        };
+        self.apply(
+            &name,
+            Object::Deployment(Box::new(rendered)),
+            "workload_failed",
+        )
+        .await?;
+        self.apply(
+            &name,
+            Object::Ingress(Box::new(objects::ingress(&self.config, &name))),
+            "ingress_failed",
+        )
+        .await?;
+
+        // Everything is applied by the time this runs, so a timeout here says
+        // the pod did not come back rather than that the reconcile did not
+        // happen - the same thing a failed phase two says, and the operator
+        // reads it the same way.
+        self.cluster
+            .ready_pod(&objects::pod_selector(&name), self.config.ready_timeout)
+            .await
+            .map_err(|e| fail(name.as_str(), "not_ready", &e))?;
+
+        tracing::info!(tenant = %name, deployment = outcome, "tenant reconciled");
+        Ok(Reconciled::new(outcome))
+    }
+
     /// Stop a tenant: the workload, the route and the policy go; the DATA
     /// STAYS.
     ///
@@ -571,10 +918,23 @@ impl Warden {
         // Ingress first: no new requests get routed at a pod that is about to
         // go. NetworkPolicy last: the pod stays policed for the whole of its
         // termination.
+        //
+        // The Service goes BEFORE the Deployment, and that order is load
+        // bearing rather than cosmetic. This loop bails on its first error, so
+        // whichever object is deleted first may be the only one deleted at all,
+        // and [`Warden::interrupted`] reads a surviving Service as proof that a
+        // reconcile died mid-purge and should be resumed. Taking the Deployment
+        // first would let a half-finished cancellation - Deployment gone,
+        // Service left behind by a failed call - look exactly like that, and
+        // the next reconcile would put a cancelled mailbox back on the
+        // internet. With this order, no state that has lost its Deployment can
+        // still have its Service, so the signal cannot be forged by a failure
+        // here. It also drains the endpoint before the pod goes, which is the
+        // same direction the Ingress rule above is reasoning in.
         for (kind, reason) in [
             (Kind::Ingress, "ingress_delete_failed"),
-            (Kind::Deployment, "workload_delete_failed"),
             (Kind::Service, "service_delete_failed"),
+            (Kind::Deployment, "workload_delete_failed"),
             (Kind::NetworkPolicy, "network_policy_delete_failed"),
         ] {
             self.cluster
@@ -700,6 +1060,63 @@ impl Warden {
             // whatever the first one sealed.
             _ => Err(WardenError::Conflict),
         }
+    }
+
+    /// The pod-template hash for whatever LLM keys this tenant currently holds,
+    /// or `None` for a tenant holding neither.
+    ///
+    /// Every path that RE-RENDERS an existing tenant's Deployment has to derive
+    /// this the same way [`Warden::set_llm_key`] stamps it, and "the same way"
+    /// means over BOTH slots through [`objects::llm_keys_hash`]. A caller that
+    /// hashed only the triage key would produce a value no rotation ever
+    /// writes, which makes every keyed tenant read as permanently drifted and
+    /// makes a reconcile roll the pod onto a hash the next rotation disagrees
+    /// with. Either slot alone is enough to have a hash: a half-failed mint
+    /// leaves a Secret holding one of the two.
+    ///
+    /// It lives here rather than inline because it is the third caller that
+    /// made the first two disagree.
+    async fn llm_hash(&self, name: &TenantName) -> Result<Option<String>, WardenError> {
+        Ok(self
+            .cluster
+            .get_secret(&name.llm_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| {
+                let api_key = secret_value(secret, objects::LLM_API_KEY_KEY);
+                let assistant = secret_value(secret, objects::ASSISTANT_API_KEY_KEY);
+                (api_key.is_some() || assistant.is_some())
+                    .then(|| objects::llm_keys_hash(api_key.as_deref(), assistant.as_deref()))
+            }))
+    }
+
+    /// Whether a [`TenantStatus::Stopped`] tenant was stopped by an
+    /// INTERRUPTED RECONCILE rather than by a cancellation.
+    ///
+    /// Both states are "no Deployment, credential still sealed", so the status
+    /// word cannot tell them apart and the surviving objects have to. The two
+    /// paths that reach here leave different wreckage:
+    ///
+    /// - [`Warden::delete`] takes the Ingress, the Deployment, the Service and
+    ///   the NetworkPolicy down together. A cancelled tenant has no Service.
+    /// - [`Warden::reconcile`] applies the Service BEFORE it touches the
+    ///   Deployment, so a reconcile that died in the delete-recreate window
+    ///   left the Service exactly where it was.
+    ///
+    /// So a surviving Service means the workload is still routed and only the
+    /// Deployment is missing, which is a job to finish rather than an account
+    /// to reopen. The check is deliberately the Service and not the Ingress:
+    /// the Ingress is the object an operator is most likely to have applied by
+    /// hand during the era this route replaces, and a hand-applied Ingress must
+    /// not read as consent to restart a cancelled mailbox.
+    async fn interrupted(&self, name: &TenantName) -> Result<bool, WardenError> {
+        Ok(self
+            .cluster
+            .get_service(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .is_some())
     }
 
     /// Derive the status from what exists. See [`TenantStatus`].
@@ -1471,8 +1888,12 @@ mod tests {
             h.cluster.deleted(),
             vec![
                 (Kind::Ingress, "alice".to_string()),
-                (Kind::Deployment, "alice".to_string()),
+                // Before the Deployment, and this test is where that is
+                // pinned: `interrupted` reads a Service that outlived its
+                // Deployment as a reconcile to resume, so a cancellation must
+                // never be able to produce one. See delete().
                 (Kind::Service, "alice".to_string()),
+                (Kind::Deployment, "alice".to_string()),
                 (Kind::NetworkPolicy, "alice".to_string()),
                 // The gateway credential goes with the workload; see delete().
                 (Kind::Secret, "alice-llm".to_string()),
@@ -1710,6 +2131,649 @@ mod tests {
 
         assert_eq!(h.warden.sweep_pending().await.unwrap(), 0);
         assert!(h.cluster.secret("alice-identity").is_some());
+    }
+
+    /// The stored Deployment, edited the way `kubectl set env` edits one: a
+    /// variable with a secret reference on the seed container, and a
+    /// managedFields entry saying somebody else owns it now.
+    ///
+    /// Both halves matter and neither implies the other. Without the ledger
+    /// entry this is a field the warden would take back on the next apply;
+    /// with it, the warden's applies converge around the field forever.
+    async fn hand_edit_the_deployment(h: &Harness) {
+        use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
+
+        let Some(Object::Deployment(mut deployment)) = h.cluster.object(Kind::Deployment, "alice")
+        else {
+            panic!("no deployment");
+        };
+        let seed = &mut deployment
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .init_containers
+            .as_mut()
+            .unwrap()[0];
+        seed.env = Some(vec![EnvVar {
+            name: "SQUELCH_ANTHROPIC_API_KEY".to_string(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: "squelch-anthropic".to_string(),
+                    key: "ANTHROPIC_API_KEY".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        deployment.metadata.managed_fields = Some(vec![
+            ManagedFieldsEntry {
+                manager: Some(crate::cluster::FIELD_MANAGER.to_string()),
+                operation: Some("Apply".to_string()),
+                fields_v1: Some(FieldsV1(serde_json::json!({
+                    "f:spec": { "f:template": { "f:spec": {
+                        "f:initContainers": {
+                            "k:{\"name\":\"seed\"}": { ".": {}, "f:image": {} }
+                        }
+                    }}}
+                }))),
+                ..Default::default()
+            },
+            ManagedFieldsEntry {
+                manager: Some("kubectl-set".to_string()),
+                operation: Some("Update".to_string()),
+                fields_v1: Some(FieldsV1(serde_json::json!({
+                    "f:spec": { "f:template": { "f:spec": {
+                        "f:initContainers": {
+                            "k:{\"name\":\"seed\"}": {
+                                "f:env": {
+                                    "k:{\"name\":\"SQUELCH_ANTHROPIC_API_KEY\"}": {
+                                        ".": {},
+                                        "f:name": {},
+                                        "f:valueFrom": {
+                                            "f:secretKeyRef": { ".": {}, "f:key": {}, "f:name": {} }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }}}
+                }))),
+                ..Default::default()
+            },
+        ]);
+        h.cluster
+            .apply(Object::Deployment(deployment))
+            .await
+            .unwrap();
+    }
+
+    /// The incident, end to end. A tenant the warden has never stopped
+    /// converging carries a field the warden does not declare, and the only
+    /// thing that can see it is this report.
+    #[tokio::test]
+    async fn drift_finds_a_hand_edit_the_warden_would_never_see() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        // Freshly provisioned: nobody else owns anything, and an apply would
+        // move nothing.
+        let clean = h.warden.drift("alice").await.unwrap();
+        assert_eq!(clean.status, "active");
+        assert!(clean.deployment_present);
+        assert_eq!(clean.foreign, Vec::new());
+        assert_eq!(clean.changes, Vec::new());
+
+        hand_edit_the_deployment(&h).await;
+        let applied = h.cluster.applied().len();
+        let report = h.warden.drift("alice").await.unwrap();
+
+        // The ledger names the editor and everything it took.
+        assert_eq!(report.foreign.len(), 1);
+        assert_eq!(report.foreign[0].manager, "kubectl-set");
+        assert_eq!(report.foreign[0].operation, "Update");
+        assert_eq!(
+            report.foreign[0].paths,
+            vec![
+                "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].name",
+                "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].valueFrom.secretKeyRef.key",
+                "spec.template.spec.initContainers[seed].env[SQUELCH_ANTHROPIC_API_KEY].valueFrom.secretKeyRef.name",
+            ]
+        );
+        // The ledger is the ONLY place this finding is guaranteed to appear,
+        // and that is the whole reason `foreign_managers` exists.
+        //
+        // Nothing is asserted about `changes` here, deliberately. A real API
+        // server answers a dry-run apply with a MERGE, and a field the warden
+        // does not declare survives that merge exactly as it survives a real
+        // one - so on a cluster this env var is identical on both sides and
+        // cancels out of the diff entirely. `MockCluster` answers with the bare
+        // render instead, so it would show up here as a change against `null`;
+        // asserting on that would be pinning the mock's simplification and
+        // teaching the next reader that the diff catches foreign fields, which
+        // is the one thing it cannot do. `diff_spec` is held to its real
+        // contract by its own unit tests in `drift`.
+
+        // Read-only: the dry run is not an apply and not a store.
+        assert_eq!(h.cluster.applied().len(), applied);
+        assert!(h.cluster.deleted().is_empty());
+    }
+
+    /// A tenant with no workload has nothing to have drifted, in both of the
+    /// ways that happens.
+    #[tokio::test]
+    async fn drift_on_a_tenant_with_no_workload_is_an_empty_report() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        let pending = h.warden.drift("alice").await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert!(!pending.deployment_present);
+        assert_eq!(pending.foreign, Vec::new());
+        assert_eq!(pending.changes, Vec::new());
+
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        let stopped = h.warden.drift("alice").await.unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert!(!stopped.deployment_present);
+        assert_eq!(stopped.changes, Vec::new());
+    }
+
+    /// The render has to carry the hashes the running pod was rolled for, and
+    /// the credential Secret is the only source of the first one. Without it
+    /// there is no honest render, and reporting one anyway would call every
+    /// pod-template annotation drift.
+    #[tokio::test]
+    async fn drift_refuses_a_workload_whose_credential_is_gone() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.cluster
+            .delete(Kind::Secret, "alice-credential")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            h.warden.drift("alice").await.unwrap_err(),
+            WardenError::cluster("credential_missing")
+        );
+    }
+
+    /// A keyed tenant's render must pick the key's hash back up, or the
+    /// annotation that rolls a rotation would look like drift on every keyed
+    /// tenant in the fleet.
+    #[tokio::test]
+    async fn drift_is_clean_for_a_tenant_that_carries_an_llm_key() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.set_llm_key("alice", Some("sk-vk-first"), None).await.unwrap();
+
+        let report = h.warden.drift("alice").await.unwrap();
+        assert_eq!(report.changes, Vec::new());
+        assert_eq!(report.foreign, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn drift_refuses_a_label_nobody_minted() {
+        let h = Harness::new();
+        assert_eq!(
+            h.warden.drift("nobody").await.unwrap_err(),
+            WardenError::NotFound
+        );
+        assert!(matches!(
+            h.warden.drift("-nope-").await.unwrap_err(),
+            WardenError::InvalidLabel(_)
+        ));
+    }
+
+    /// The five workload objects a reconcile re-applies, in order. Not a
+    /// Secret among them: a reconcile converges shape and never touches an
+    /// identity, a credential or a key.
+    fn workload_applies() -> Vec<(Kind, String)> {
+        vec![
+            (Kind::Pvc, "alice-data".to_string()),
+            (Kind::NetworkPolicy, "alice".to_string()),
+            (Kind::Service, "alice".to_string()),
+            (Kind::Deployment, "alice".to_string()),
+            (Kind::Ingress, "alice".to_string()),
+        ]
+    }
+
+    /// A tenant nobody has touched. Everything is re-applied in phase two's
+    /// order, nothing is deleted, and the pod rolls only if the render moved -
+    /// which here it has not.
+    #[tokio::test]
+    async fn reconcile_converges_a_clean_tenant() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        let before = h.cluster.applied().len();
+
+        let reconciled = h.warden.reconcile("alice").await.unwrap();
+        assert_eq!(reconciled.deployment, "converged");
+        assert_eq!(reconciled.status, "active");
+
+        assert_eq!(h.cluster.applied()[before..].to_vec(), workload_applies());
+        assert!(h.cluster.deleted().is_empty());
+    }
+
+    /// The incident state is the one this route exists for: a pod that will
+    /// not come up because somebody stamped a secret reference onto it has no
+    /// ready replica, so the tenant reads `failed`, and refusing to act on
+    /// `failed` would be refusing exactly when it matters.
+    #[tokio::test]
+    async fn reconcile_acts_on_a_tenant_that_is_not_serving() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.cluster.never_ready();
+        assert!(
+            h.warden
+                .set_credentials("alice", &armored("alice"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Failed
+        );
+
+        h.cluster.becomes_ready();
+        let reconciled = h.warden.reconcile("alice").await.unwrap();
+        assert_eq!(reconciled.deployment, "converged");
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
+    }
+
+    /// The purge. A field the warden does not declare survives every forced
+    /// apply, so the Deployment is deleted and applied fresh, and what comes
+    /// back carries the render and an ownership ledger that starts empty.
+    #[tokio::test]
+    async fn reconcile_recreates_a_deployment_another_manager_owns() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        hand_edit_the_deployment(&h).await;
+        let before = h.cluster.applied().len();
+
+        let reconciled = h.warden.reconcile("alice").await.unwrap();
+        assert_eq!(reconciled.deployment, "recreated");
+
+        // The Deployment, and only the Deployment. The volume, the Secrets and
+        // the route are not what was owned.
+        assert_eq!(
+            h.cluster.deleted(),
+            vec![(Kind::Deployment, "alice".to_string())]
+        );
+        assert_eq!(h.cluster.applied()[before..].to_vec(), workload_applies());
+
+        // And the thing no apply could ever have removed is gone.
+        let Some(Object::Deployment(deployment)) = h.cluster.object(Kind::Deployment, "alice")
+        else {
+            panic!("no deployment");
+        };
+        // No foreign owner survived. The mock stores what it is handed, so an
+        // absent ledger is what a fresh object looks like here; on a cluster
+        // the same assertion is "exactly one entry, and it is the warden".
+        assert!(drift::foreign_managers(&deployment).is_empty());
+        let seed = &deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .init_containers
+            .unwrap()[0];
+        assert_eq!(seed.name, "seed");
+        assert!(seed.env.is_none(), "the foreign env survived the recreate");
+
+        // A second pass has nothing foreign left to find.
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap().deployment,
+            "converged"
+        );
+    }
+
+    /// The rule that keeps two daemons off one `ReadWriteOnce` volume: if the
+    /// old pod will not go, the new Deployment is not applied at all. A
+    /// reconcile that failed loudly is recoverable; a second writer on a
+    /// SQLite file is not.
+    #[tokio::test]
+    async fn reconcile_will_not_apply_while_the_old_pod_holds_the_volume() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        hand_edit_the_deployment(&h).await;
+        let before = h.cluster.applied().len();
+        h.cluster.pods_linger();
+
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::cluster("pods_not_gone")
+        );
+        // The delete happened, and nothing was applied after it.
+        assert_eq!(
+            h.cluster.deleted(),
+            vec![(Kind::Deployment, "alice".to_string())]
+        );
+        assert!(!h.cluster.exists(Kind::Deployment, "alice"));
+        assert_eq!(
+            h.cluster.applied()[before..].to_vec(),
+            vec![
+                (Kind::Pvc, "alice-data".to_string()),
+                (Kind::NetworkPolicy, "alice".to_string()),
+                (Kind::Service, "alice".to_string()),
+            ]
+        );
+    }
+
+    /// The other half of the rule above: a reconcile that died in the
+    /// delete-recreate window must be finishable by running it again.
+    ///
+    /// The tenant reads `stopped` at that point, exactly as a cancelled account
+    /// does, and a route that refused on the status word alone would refuse to
+    /// clean up after its own failure - leaving the long way round (re-consent)
+    /// as the only exit from a state this route created. The surviving Service
+    /// is what tells the two aparts.
+    #[tokio::test]
+    async fn reconcile_finishes_what_an_interrupted_reconcile_started() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        hand_edit_the_deployment(&h).await;
+        h.cluster.pods_linger();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::cluster("pods_not_gone")
+        );
+
+        // The wreckage: no Deployment, so the status word says `stopped`, but
+        // the Service the reconcile applied on its way in is still standing.
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Stopped
+        );
+        assert!(!h.cluster.exists(Kind::Deployment, "alice"));
+        assert!(h.cluster.exists(Kind::Service, "alice"));
+
+        // The pod lets go and the operator runs it again. Nothing foreign
+        // survived the delete, so this is a plain apply rather than a purge.
+        h.cluster.pods_release();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap().deployment,
+            "created"
+        );
+        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        let live = match h.cluster.object(Kind::Deployment, "alice").unwrap() {
+            Object::Deployment(d) => *d,
+            other => panic!("not a Deployment: {:?}", other.kind()),
+        };
+        assert!(drift::foreign_managers(&live).is_empty());
+    }
+
+    /// The invariant [`Warden::interrupted`] rests on, held against a teardown
+    /// that dies anywhere in the middle.
+    ///
+    /// `delete` stops at its first failure, so a cancellation can leave a
+    /// tenant in any prefix of its teardown. NONE of those prefixes may be a
+    /// Service that outlived its Deployment, because that is the exact shape
+    /// `interrupted` reads as "a reconcile died here, finish it" - and
+    /// finishing it would put a cancelled mailbox back on the internet.
+    #[tokio::test]
+    async fn no_half_finished_cancellation_looks_like_an_interrupted_reconcile() {
+        for failing in [
+            Kind::Ingress,
+            Kind::Service,
+            Kind::Deployment,
+            Kind::NetworkPolicy,
+        ] {
+            let h = Harness::new();
+            h.warden
+                .create_tenant("alice", "alice@example.com")
+                .await
+                .unwrap();
+            h.warden
+                .set_credentials("alice", &armored("alice"))
+                .await
+                .unwrap();
+
+            h.cluster.fail_delete_of(failing);
+            assert!(
+                h.warden.delete("alice").await.is_err(),
+                "{failing:?} was supposed to fail the teardown"
+            );
+
+            let service = h.cluster.exists(Kind::Service, "alice");
+            let deployment = h.cluster.exists(Kind::Deployment, "alice");
+            // "A Service implies its Deployment", which is the invariant
+            // `interrupted` reads backwards.
+            assert!(
+                !service || deployment,
+                "a teardown that died on {failing:?} left a Service with no Deployment, \
+                 which reconcile would read as a job to finish"
+            );
+        }
+    }
+
+    /// A CANCELLED tenant stays refused, which is the distinction
+    /// [`Warden::interrupted`] exists to draw: `delete` took the Service down
+    /// with the Deployment, so nothing here reads as a job to finish.
+    #[tokio::test]
+    async fn reconcile_will_not_resurrect_a_cancelled_tenant() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        assert!(!h.cluster.exists(Kind::Service, "alice"));
+
+        let stopped = h.cluster.applied().len();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::NotReconcilable
+        );
+        assert_eq!(h.cluster.applied().len(), stopped);
+    }
+
+    /// Neither tenant without a workload is reconcilable, and the refusal
+    /// costs the cluster no writes. Bringing either one up is a different call
+    /// with a different meaning: finish the signup, or re-consent.
+    #[tokio::test]
+    async fn reconcile_refuses_a_tenant_with_no_workload() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        let pending = h.cluster.applied().len();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::NotReconcilable
+        );
+        assert_eq!(h.cluster.applied().len(), pending);
+
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Stopped
+        );
+        // A tenant with a sealed credential and no Deployment is `stopped`, so
+        // this is also the proof that `created` names a race rather than a
+        // state: the only way to reach that branch is a DELETE landing between
+        // the status read and the get.
+        let stopped = h.cluster.applied().len();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::NotReconcilable
+        );
+        assert_eq!(h.cluster.applied().len(), stopped);
+    }
+
+    /// A workload whose sealed credential is gone has no honest render behind
+    /// it, and the refusal lands before anything is written.
+    #[tokio::test]
+    async fn reconcile_refuses_a_workload_whose_credential_is_gone() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.cluster
+            .delete(Kind::Secret, "alice-credential")
+            .await
+            .unwrap();
+        let before = h.cluster.applied().len();
+
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::cluster("credential_missing")
+        );
+        assert_eq!(h.cluster.applied().len(), before);
+    }
+
+    /// A keyed tenant keeps its key across a recreate: the hash is recovered
+    /// from the stored Secret, so the pod that comes back is the pod the
+    /// tenant is entitled to rather than an unkeyed one.
+    #[tokio::test]
+    async fn reconcile_keeps_the_llm_key_hash_on_the_rebuilt_pod() {
+        let h = Harness::with_config(llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-first"), None)
+            .await
+            .unwrap();
+        let credential = pod_annotation(&h);
+        // Whatever `set_llm_key` stamped, rather than a hash spelled out here:
+        // a reconcile must reproduce the keyed pod EXACTLY, and a test that
+        // recomputed the hash its own way would keep passing while the two
+        // drifted apart. That is the bug this assertion exists to catch.
+        let keyed = llm_annotation(&h).unwrap();
+
+        hand_edit_the_deployment(&h).await;
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap().deployment,
+            "recreated"
+        );
+        assert_eq!(llm_annotation(&h).unwrap(), keyed);
+        assert_eq!(pod_annotation(&h), credential);
+    }
+
+    /// The pod not coming back is the operator's problem to see, and it is the
+    /// same machine reason a failed phase two gives: the objects are applied,
+    /// and what is missing is a replica.
+    #[tokio::test]
+    async fn a_reconcile_whose_pod_never_returns_is_a_terse_500() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.cluster.never_ready();
+
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::cluster("not_ready")
+        );
+        // Applied anyway: the reconcile happened, the replica did not.
+        assert!(h.cluster.exists(Kind::Deployment, "alice"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_a_label_nobody_minted() {
+        let h = Harness::new();
+        assert_eq!(
+            h.warden.reconcile("nobody").await.unwrap_err(),
+            WardenError::NotFound
+        );
+        assert!(matches!(
+            h.warden.reconcile("-nope-").await.unwrap_err(),
+            WardenError::InvalidLabel(_)
+        ));
+        assert!(h.cluster.applied().is_empty());
     }
 
     #[test]

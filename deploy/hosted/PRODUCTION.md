@@ -122,11 +122,23 @@ Install procedure: `SETUP.md` → "LLM triage through the gateway".
 > while the bridge existed still carries the `ANTHROPIC_API_KEY` env from its
 > old rendered spec, and with the gateway base URL alongside it the daemon
 > resolves that raw key and every Stage-2 call 401s against the gateway —
-> failing, not idle. `squelch-control llm mint <label>` converges a legacy
-> tenant: it re-applies the whole Deployment via server-side apply, which
-> installs the virtual key and strips the legacy env in one roll. Once
-> `kubectl -n tenants get deploy -o yaml | grep -c ANTHROPIC_API_KEY` says 0,
-> finish the job by deleting the Secret itself:
+> failing, not idle.
+>
+> **Which command clears it depends on who owns the field, and the two answers
+> are not interchangeable.** `squelch-control llm mint <label>` re-applies the
+> whole Deployment from today's render, so it strips a legacy env that the
+> WARDEN put there — that field is one the warden used to declare and has
+> stopped declaring, which is exactly what a server-side apply removes. It does
+> nothing at all to an env that was HAND-PATCHED on with `kubectl set env`:
+> that field belongs to `kubectl`'s field manager, and an apply never removes a
+> field it does not declare, no matter how many times it runs. For that one the
+> command is `squelch-control reconcile <label>`, which deletes and recreates
+> the Deployment when a foreign manager owns anything on it.
+>
+> `squelch-control drift <label>` tells you which case you are in before you
+> pick, and confirms afterwards. Then
+> `kubectl -n tenants get deploy -o yaml | grep -c ANTHROPIC_API_KEY` should say
+> 0, and the job finishes by deleting the Secret itself:
 > `kubectl -n tenants delete secret anthropic-api-key`.
 
 ## DNS
@@ -197,44 +209,83 @@ turning binfmt back on.
 The squelchd and warden tags are both pinned in `20-warden.yaml`, at
 `daemon-*` tags. The warden refuses to start with an untagged tenant image.
 
-## Shipping a tenant-shape change (there is no reconcile)
+## Shipping a tenant-shape change
 
 **Rolling out a new warden does not change tenants that already exist.** Each
 tenant's Ingress, NetworkPolicy, Service and Deployment are written once, at
-provision time, and the warden never looks at them again. Kube reconciles a
-tenant's pod against those objects; nothing reconciles those objects against the
-warden's current code.
+provision time, and the warden is not a controller: kube reconciles a tenant's
+pod against those objects, and nothing reconciles those objects against the
+warden's current code until somebody asks it to.
 
 So anything that changes the SHAPE of a tenant — a new Ingress path prefix, a new
 environment variable in the pod (`SQUELCH_CONSOLE_SSO_URL` and the LLM gateway
 block — `SQUELCH_ANTHROPIC_BASE_URL`, `SQUELCH_STAGE2_PROVIDER`,
 `SQUELCH_STAGE2_API_KEY`, the pod-side names the warden's `SQUELCH_WARDEN_LLM_*`
-config renders to — are both this), a changed NetworkPolicy peer, new
-resource bounds — lands on new
-signups and on nobody else, silently. Check what a live tenant actually has
-before assuming a deploy reached it:
+config renders to — are both this), a changed NetworkPolicy peer, new resource
+bounds — lands on new signups and on nobody else, silently. Asking is two
+commands, run where the tenant list is:
 
 ```sh
-kubectl -n tenants get ingress alice -o yaml
-kubectl -n tenants get deploy alice -o jsonpath='{.spec.template.spec.containers[0].env}'
+railway ssh --service control
+squelch-control drift                 # every tenant; exit 1 if anything has drifted
+squelch-control drift alice           # one tenant, in full
+squelch-control reconcile alice       # put that tenant back on today's render
 ```
 
-Two ways to catch an existing tenant up, both manual, and `squelch-warden/README.md`
-("What does not reconcile") has the full Ingress body to apply:
+`drift` is read-only. Per tenant it asks the warden two independent questions —
+which OTHER field managers own part of that Deployment, and what an apply of
+today's render would change — and the second one is a `dryRun` apply the API
+server merges and throws away. Nothing rolls, nothing is stored.
 
-1. **`kubectl apply` the one object**, for an Ingress or a NetworkPolicy, which
-   needs no restart. It means hand-writing YAML with a tenant label in it, which
-   the warden itself is forbidden to do; on an operator's terminal, for a label
-   that is already provisioned, that is the accepted workaround.
-2. **`DELETE` then `PUT` the credential again** through the warden API, for
-   anything that touches the pod. `DELETE /v1/tenants/{label}` keeps both Secrets
-   and the volume, and the `PUT` rebuilds every object from today's code. It
-   recycles the pod, so that mailbox is down for the length of a provision, and
-   the control plane has to still hold the sealed blob to re-send.
+`reconcile` is the fix: it re-applies that tenant's PVC, NetworkPolicy, Service,
+Deployment and Ingress from current code, in provision order, and does not answer
+until a pod is Ready again. What it costs depends on what it finds. An Ingress or
+NetworkPolicy change lands with nothing restarting. A pod-shape change (env,
+image, resources) rolls the pod the way any Deployment update does. And if a
+foreign field manager owns anything on the Deployment, it deletes the Deployment,
+waits for the old pod to let go of the `ReadWriteOnce` volume, and applies a
+fresh one — that mailbox is down for the window, and it is the only way those
+fields ever go away (see the open item below for why).
 
-Until the reconcile route below exists, a tenant-shape change is a manual pass
-over the tenant list, and it is worth doing at the moment it ships rather than
-discovering months later that half the fleet is a shape nobody remembers.
+**One tenant first. Always.** Reconcile the least important label, watch the pod
+come back, run `drift` on it again, and only then walk the list. There is
+deliberately no fleet reconcile: a loop that re-applies to every tenant is a loop
+that can take every mailbox down on one bad render, and fleet `drift` already
+tells you how long the list is without touching anything.
+
+**A reconcile that died in its own delete/apply window** leaves the tenant
+reading `stopped`, because for that moment it has no Deployment. Wait for the
+old pod to finish terminating and run the same `reconcile` again: a surviving
+Service is how the warden tells an interrupted reconcile from a cancelled
+account, so it resumes rather than refusing. Nothing was lost — the volume, the
+identity and the sealed credential never moved.
+
+**The fallback, for what reconcile refuses.** A `pending` tenant, and a
+`stopped` one that was genuinely cancelled (its Service is gone too), come back
+as `409 not_reconcilable`; starting either back up is a different transition,
+not a shape repair.
+
+Reopening one is **re-consent, not a re-`PUT`**. Nothing outside the tenant's
+own Secret holds a copy of that ciphertext: `squelch-control`'s schema carries
+no tokens and no ciphertext by design, and the refresh token it seals exists in
+memory for the length of one signup request. So the person signs in again, the
+control plane seals a fresh credential to the recipient the warden still holds,
+and `PUT /v1/tenants/{label}/credentials` rebuilds every object from today's
+code. The volume, the identity and the old sealed blob were never touched; the
+mailbox is down for the length of a provision.
+
+> **Standing rule: no hand edits on a tenant Deployment. Ever.** Not
+> `kubectl set env`, not `kubectl edit`, not a client-side `kubectl apply`. An
+> env change is a warden config or manifest change, a warden release, and then
+> `reconcile` per tenant. The reason is that server-side apply owns FIELDS: a
+> field the warden does not declare belongs to whoever wrote it, and every
+> warden apply afterwards converges politely around it forever. In 2026-08 a
+> `set env` put a Secret reference on the seed init container of a live tenant;
+> it survived weeks of applies invisibly and then detonated as
+> `Init:CreateContainerConfigError` on an unrelated rollout, once the Secret it
+> named was gone. That state is exactly what the `foreign` half of a drift
+> report exists to surface, and the delete-and-recreate is the only thing that
+> clears it.
 
 ## Cluster secrets
 
@@ -413,21 +464,22 @@ would happily stream over the real history.
 - **Cut a `daemon-*` tag that publishes the warden** — the release workflow now
   has the job (see "Images"), but this node still runs the hand-built image. The
   item closes when `20-warden.yaml` points at a tag GHCR actually holds.
-- **Tenant reconcile: `POST /v1/tenants/{label}/reconcile`.** The warden
-  re-applies the typed objects for one already-provisioned tenant, on demand,
-  from its current code — the same server-side applies phase two runs, minus the
-  identity mint and the credential seal, reading the sealed blob from the Secret
-  it already holds rather than taking one on the wire. On demand and per label,
-  not a controller: a loop that re-applies to every tenant is a loop that can
-  take the whole fleet down on one bad deploy, whereas a route the operator
-  drives can be run against one tenant, verified, and then walked across the
-  list. It needs the same 404/409 shape the other routes have, an answer for the
-  case where the change rolls the pod (an env or image change does, an Ingress or
-  NetworkPolicy change does not), and it should refuse a tenant that is not
-  `active`. **Needed the first time any tenant-shape change ships after tenants
-  exist** — which is now: `SQUELCH_CONSOLE_SSO_URL` and the LLM gateway env
-  block both reach new tenants only, and "Shipping a tenant-shape change"
-  above is the manual stand-in.
+- **Nobody runs `squelch-control drift` on a schedule.** The route and the
+  fleet command exist (see "Shipping a tenant-shape change"), and drift found
+  the day it happens is a `reconcile`, while drift found months later is an
+  archaeology exercise on somebody's live mailbox. It exits 1 when any tenant
+  has drifted, so it wants a cron entry and an alert, not a habit.
+
+  Two facts about that route worth keeping written down, because the shape of
+  the fix is not the obvious one. **Re-running phase two's server-side applies
+  does NOT purge a foreign-owned field.** SSA removes only fields the applier
+  itself declares and has stopped declaring; a field belonging to another
+  manager is never in that set, so `--force-conflicts` and twenty repeat applies
+  leave it exactly where it is. The only honest purge is deleting the Deployment
+  and applying a fresh one, whose ownership ledger starts empty — which is what
+  `reconcile` does when, and only when, a foreign manager is found, and it is
+  why that path rolls the pod (and waits for the old one to release the RWO
+  volume first) when an ordinary converge would not have.
 - **`/mcp` bearer auth** — the hosted MVP routes around it (tenant Ingresses
   publish `/client`, `/console` and `/t` only). Real auth is required before the
   agent door is ever served from the internet, and until then the console's MCP

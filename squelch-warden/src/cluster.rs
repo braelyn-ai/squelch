@@ -7,8 +7,8 @@
 //! how the suite runs with no cluster, no kubeconfig, and no network.
 //!
 //! The trait is deliberately narrow. It is not a Kubernetes client: it is the
-//! eight verbs a tenant lifecycle needs, over the six kinds a tenant is made
-//! of. Anything wider would be surface the warden's RBAC does not grant anyway.
+//! few verbs a tenant lifecycle needs, over the six kinds a tenant is made of.
+//! Anything wider would be surface the warden's RBAC does not grant anyway.
 //!
 //! ## The second gate
 //!
@@ -26,7 +26,9 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams, PropagationPolicy,
+};
 use kube::client::UpgradeConnectionError;
 use kube::{Api, Client, Resource};
 use tokio::io::AsyncReadExt;
@@ -179,6 +181,29 @@ pub trait Cluster: Send + Sync {
     /// Server-side apply: create or update, idempotently.
     async fn apply(&self, object: Object) -> Result<(), ClusterError>;
 
+    /// The same apply as [`Cluster::apply`], with `dryRun=All`: the API server
+    /// merges and defaults the object and answers with what it WOULD have
+    /// stored, having stored nothing.
+    ///
+    /// This exists so a drift report can be honest. Diffing a render against a
+    /// live object directly compares a hand-written spec with a defaulted one,
+    /// and the answer is dozens of fields nobody set: `terminationMessagePath`,
+    /// `dnsPolicy`, a `protocol` on every port, a `creationTimestamp` on the
+    /// pod template. Diffing the API server's own answer against the live
+    /// object removes every one of them, because both sides went through the
+    /// same defaulting, and what is left is exactly what a real apply would
+    /// move.
+    ///
+    /// It says nothing about fields the warden does not declare. Server-side
+    /// apply never removes those - they belong to whichever manager wrote them
+    /// and they survive on both sides of this diff - so finding them is
+    /// [`crate::drift::foreign_managers`]' job, reading the API server's
+    /// ownership ledger, and not this one's.
+    async fn apply_deployment_dry_run(
+        &self,
+        deployment: Deployment,
+    ) -> Result<Deployment, ClusterError>;
+
     /// Create, failing with [`ClusterError::AlreadyExists`] if the name is
     /// taken. Used for the identity Secret, where "already there" is a decision
     /// point rather than something to overwrite.
@@ -192,6 +217,16 @@ pub trait Cluster: Send + Sync {
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError>;
 
+    /// The tenant's Service, if one exists.
+    ///
+    /// One caller, and it is asking a question the status word cannot answer.
+    /// A tenant with no Deployment reads [`crate::TenantStatus::Stopped`]
+    /// whether its workload was cancelled or merely interrupted, and those two
+    /// want opposite treatment. [`crate::Warden::delete`] takes the Service down
+    /// with the Deployment, so a surviving Service means nobody cancelled this
+    /// tenant and the missing Deployment is a job somebody did not finish.
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError>;
+
     /// Delete by name. A missing object is success: every caller is either
     /// tearing down or retrying a teardown.
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError>;
@@ -199,6 +234,24 @@ pub trait Cluster: Send + Sync {
     /// Block until a pod matching `selector` reports Ready, and return its
     /// name. [`ClusterError::Timeout`] after `within`.
     async fn ready_pod(&self, selector: &str, within: Duration) -> Result<String, ClusterError>;
+
+    /// Block until NO pod matches `selector`. [`ClusterError::Timeout`] after
+    /// `within`.
+    ///
+    /// The tenant's data volume is `ReadWriteOnce` and the daemon behind it is
+    /// one SQLite file, so exactly one pod may hold it at a time. Inside a
+    /// single Deployment the `Recreate` strategy is what guarantees that: the
+    /// old pod is gone before the new one is scheduled. Deleting a Deployment
+    /// and applying a fresh one steps outside that guarantee, because the two
+    /// objects are two rollouts and neither controller waits for the other.
+    /// This is the same promise, made by hand across that boundary, and the
+    /// [`crate::provision::Warden::reconcile`] path is not allowed to apply
+    /// until it holds.
+    ///
+    /// "Gone" means the list is EMPTY, not that nothing in it is Ready: a pod
+    /// in Terminating still has the volume mounted, and a second writer
+    /// starting against it is the corruption this waits out.
+    async fn pods_gone(&self, selector: &str, within: Duration) -> Result<(), ClusterError>;
 
     /// Run `argv` inside `pod` and collect both streams.
     async fn exec(&self, pod: &str, argv: &[String]) -> Result<ExecOutput, ClusterError>;
@@ -276,8 +329,15 @@ impl KubeCluster {
 /// A free function rather than a method so it can be tested without a client:
 /// what it checks is the object, and the client has nothing to do with it.
 fn guard(namespace: &str, object: &Object) -> Result<(), ClusterError> {
-    let name = object.name();
-    let target = object.metadata().namespace.clone().unwrap_or_default();
+    guard_meta(namespace, object.metadata())
+}
+
+/// [`guard`] for a caller that holds a typed object rather than an [`Object`].
+/// The check is the metadata's, and wrapping a value in an enum only to unwrap
+/// it again would say otherwise.
+fn guard_meta(namespace: &str, metadata: &ObjectMeta) -> Result<(), ClusterError> {
+    let name = metadata.name.as_deref().unwrap_or_default();
+    let target = metadata.namespace.clone().unwrap_or_default();
     let name_ok = !name.is_empty() && name.len() <= 63 && crate::config::is_dns_label(name);
     if name_ok && target == namespace {
         return Ok(());
@@ -334,6 +394,25 @@ impl Cluster for KubeCluster {
         }
     }
 
+    async fn apply_deployment_dry_run(
+        &self,
+        deployment: Deployment,
+    ) -> Result<Deployment, ClusterError> {
+        guard_meta(&self.namespace, &deployment.metadata)?;
+        let name = deployment.metadata.name.clone().unwrap_or_default();
+        // The same manager and the same force as the real apply, so the answer
+        // is the answer to "what would `apply` do", and `dryRun=All`, so it
+        // does none of it.
+        let params = PatchParams::apply(FIELD_MANAGER).force().dry_run();
+        self.api::<Deployment>()
+            .patch(&name, &params, &Patch::Apply(&deployment))
+            .await
+            .map_err(|source| ClusterError::Api {
+                op: "dry run apply",
+                source: Box::new(source),
+            })
+    }
+
     async fn create(&self, object: Object) -> Result<(), ClusterError> {
         self.guard(&object)?;
         let params = PostParams {
@@ -383,8 +462,31 @@ impl Cluster for KubeCluster {
         optional(self.api::<Deployment>().get(name).await, "get deployment")
     }
 
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
+        optional(self.api::<Service>().get(name).await, "get service")
+    }
+
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
-        let params = DeleteParams::default();
+        // BACKGROUND, explicitly, and the Deployment is why.
+        //
+        // With no `propagationPolicy` on the wire the API server falls back to
+        // the resource's own default, and `apps/v1` Deployment's default is
+        // foreground: the DELETE returns at once, but the object STAYS, wearing
+        // a `deletionTimestamp` and a `foregroundDeletion` finalizer, until the
+        // ReplicaSet and the pods behind it have been collected. An update to
+        // an object in that state is still accepted, so
+        // [`crate::Warden::reconcile`] could re-apply onto the corpse, watch
+        // the collector finish a moment later, and be left with no Deployment
+        // at all and a purge that purged nothing.
+        //
+        // Background deletion removes the object immediately and collects the
+        // dependents behind it, so a name that answered a DELETE is a name the
+        // next apply creates fresh, with an ownership ledger that starts empty.
+        // That is the entire point of the recreate path.
+        let params = DeleteParams {
+            propagation_policy: Some(PropagationPolicy::Background),
+            ..Default::default()
+        };
         let op = "delete";
         macro_rules! delete {
             ($api:expr) => {{ optional($api.delete(name, &params).await, op).map(|_| ()) }};
@@ -421,6 +523,30 @@ impl Cluster for KubeCluster {
                 .and_then(|p| p.metadata.name.clone())
             {
                 return Ok(name);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClusterError::Timeout(within));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn pods_gone(&self, selector: &str, within: Duration) -> Result<(), ClusterError> {
+        let pods: Api<Pod> = self.api();
+        let params = ListParams::default().labels(selector);
+        // Polled on the same cadence as `ready_pod`, and for the same reason:
+        // this runs once, bounded, and the question is a list length.
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let list = pods
+                .list(&params)
+                .await
+                .map_err(|source| ClusterError::Api {
+                    op: "list pods",
+                    source: Box::new(source),
+                })?;
+            if list.items.is_empty() {
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClusterError::Timeout(within));

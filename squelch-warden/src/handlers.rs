@@ -1,10 +1,12 @@
-//! The control-plane wire: six routes and a health check.
+//! The control-plane wire: eight routes and a health check.
 //!
 //! ```text
 //! POST   /v1/tenants                     -> 201 { recipient }
 //! PUT    /v1/tenants/{label}/credentials -> 200 { pair_code, pair_url, deep_link }
 //! PUT    /v1/tenants/{label}/llm-key     -> 200 {}
 //! GET    /v1/tenants/{label}             -> 200 { status } | 404
+//! GET    /v1/tenants/{label}/drift       -> 200 { status, deployment_present, foreign, changes }
+//! POST   /v1/tenants/{label}/reconcile   -> 200 { deployment, status } | 409
 //! POST   /v1/tenants/{label}/pair        -> 200 { pair_code, pair_url, deep_link }
 //! DELETE /v1/tenants/{label}             -> 204
 //! GET    /healthz                        -> 200 ok
@@ -18,6 +20,12 @@
 //! carries an identity, a path, an API error, a mailbox address, or the
 //! ciphertext that came in. A 500 is a machine reason and nothing else; the
 //! detail behind it is in this pod's log.
+//!
+//! The drift report is the one body that quotes cluster state back, and what
+//! it quotes is a Deployment spec: field paths, image tags, mount points, and
+//! Secret references BY NAME. A Deployment spec holds no secret material - the
+//! kubelet is what resolves a reference into a value - and it names no
+//! mailbox. Anything that would carry more than a spec does not belong in it.
 
 use axum::{
     Json,
@@ -75,6 +83,10 @@ fn error_response(e: &WardenError) -> Response {
         WardenError::NoKeys => (StatusCode::UNPROCESSABLE_ENTITY, "no_keys", None),
         WardenError::Conflict => (StatusCode::CONFLICT, "label_exists", None),
         WardenError::NotFound => (StatusCode::NOT_FOUND, "not_found", None),
+        // 409 rather than 404: the tenant is real, and it is its state that
+        // has no workload to converge. The control plane's answer is a
+        // different call (finish the signup, or re-consent), not a retry.
+        WardenError::NotReconcilable => (StatusCode::CONFLICT, "not_reconcilable", None),
         // 503, not 422: the request was fine, this deployment is what lacks
         // the LLM gateway. The control plane should not be calling here at all.
         WardenError::LlmNotConfigured => {
@@ -252,6 +264,29 @@ pub async fn get_tenant(State(state): State<WardenState>, Path(label): Path<Stri
             }),
         )
             .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /v1/tenants/{label}/drift` - who else owns part of this tenant's
+/// Deployment, and what an apply of today's render would change. Read-only:
+/// the apply it makes is a dry run.
+pub async fn get_drift(State(state): State<WardenState>, Path(label): Path<String>) -> Response {
+    match state.warden().drift(&label).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /v1/tenants/{label}/reconcile` - put a running tenant back onto
+/// today's render, deleting and recreating its Deployment if another field
+/// manager owns part of it. No body: the tenant is the whole request.
+pub async fn reconcile_tenant(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+) -> Response {
+    match state.warden().reconcile(&label).await {
+        Ok(reconciled) => (StatusCode::OK, Json(reconciled)).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -550,10 +585,190 @@ mod tests {
         assert!(h.cluster.secret("alice-llm").is_none());
     }
 
+    /// Edit the stored Deployment the way a person with kubectl does: a field
+    /// the render disagrees with, and a ledger entry saying somebody else owns
+    /// part of the object now. The two findings are independent, which is why
+    /// this stamps both.
+    async fn hand_edit_the_deployment(h: &Harness) {
+        use crate::cluster::{Cluster, Kind, Object};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
+
+        let Some(Object::Deployment(mut deployment)) = h.cluster.object(Kind::Deployment, "alice")
+        else {
+            panic!("no deployment");
+        };
+        deployment
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .containers[0]
+            .image = Some("ghcr.io/braelyn-ai/squelchd:hand-edited".to_string());
+        deployment.metadata.managed_fields = Some(vec![ManagedFieldsEntry {
+            manager: Some("kubectl-set".to_string()),
+            operation: Some("Update".to_string()),
+            fields_v1: Some(FieldsV1(serde_json::json!({
+                "f:spec": { "f:template": { "f:spec": { "f:containers": {
+                    "k:{\"name\":\"squelchd\"}": { "f:env": {} }
+                }}}}
+            }))),
+            ..Default::default()
+        }]);
+        h.cluster
+            .apply(Object::Deployment(deployment))
+            .await
+            .unwrap();
+    }
+
+    /// The drift route on the wire: a clean tenant, then the same tenant after
+    /// somebody edited it by hand.
+    #[tokio::test]
+    async fn the_drift_route_reports_a_hand_edited_tenant() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/drift", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "active");
+        assert_eq!(body["deployment_present"], true);
+        assert_eq!(body["foreign"], serde_json::json!([]));
+        assert_eq!(body["changes"], serde_json::json!([]));
+
+        hand_edit_the_deployment(&h).await;
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/drift", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["foreign"][0]["manager"], "kubectl-set");
+        assert_eq!(body["foreign"][0]["operation"], "Update");
+        assert_eq!(
+            body["foreign"][0]["paths"][0],
+            "spec.template.spec.containers[squelchd].env"
+        );
+        assert_eq!(
+            body["changes"][0]["path"],
+            "spec.template.spec.containers[squelchd].image"
+        );
+        assert_eq!(
+            body["changes"][0]["live"],
+            "ghcr.io/braelyn-ai/squelchd:hand-edited"
+        );
+        // From the config rather than spelled out: what this asserts is that
+        // the render's image is what a re-apply would restore, not which tag
+        // this deployment happens to pin.
+        assert_eq!(body["changes"][0]["rendered"], h.config.image);
+        // A spec is field names and references by name. Nothing about this
+        // tenant's person, and nothing that came in on a request.
+        let rendered = body.to_string();
+        assert!(!rendered.contains("example.com"));
+        assert!(!rendered.contains("AGE ENCRYPTED"));
+    }
+
+    /// A tenant with no workload answers 200 with an honest empty report,
+    /// rather than a 404 that would read as "no such tenant".
+    #[tokio::test]
+    async fn the_drift_route_answers_for_a_tenant_that_is_not_running() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/drift", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["deployment_present"], false);
+        assert_eq!(body["foreign"], serde_json::json!([]));
+        assert_eq!(body["changes"], serde_json::json!([]));
+
+        // And a label that is not a label never reaches the cluster.
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/-nope-/drift", "")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "invalid_label");
+    }
+
+    /// The reconcile route on the wire: the two words the control plane reads,
+    /// and the recreate that a hand edit forces.
+    #[tokio::test]
+    async fn the_reconcile_route_converges_and_then_recreates() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({ "deployment": "converged", "status": "active" })
+        );
+        assert!(h.cluster.deleted().is_empty());
+
+        hand_edit_the_deployment(&h).await;
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deployment"], "recreated");
+        assert_eq!(body["status"], "active");
+        // The body is two fixed words. Nothing about this tenant's person, and
+        // nothing about this cluster.
+        assert!(!body.to_string().contains("example.com"));
+    }
+
+    /// A tenant with no workload is a 409, not a 404: the tenant is real, and
+    /// what it needs is a different call.
+    #[tokio::test]
+    async fn the_reconcile_route_refuses_a_tenant_with_nothing_running() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({ "error": "not_reconcilable" }));
+
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+        call(&h, authed("DELETE", "/v1/tenants/alice", "")).await;
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_reconcilable");
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/-nope-/reconcile", "")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "invalid_label");
+    }
+
     #[tokio::test]
     async fn unknown_tenants_404_except_on_delete() {
         let h = Harness::new();
         let (status, body) = call(&h, authed("GET", "/v1/tenants/nobody", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/nobody/drift", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+
+        let (status, body) = call(&h, authed("POST", "/v1/tenants/nobody/reconcile", "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
 
@@ -627,6 +842,8 @@ mod tests {
             ("PUT", "/v1/tenants/alice/credentials"),
             ("PUT", "/v1/tenants/alice/llm-key"),
             ("GET", "/v1/tenants/alice"),
+            ("GET", "/v1/tenants/alice/drift"),
+            ("POST", "/v1/tenants/alice/reconcile"),
             ("DELETE", "/v1/tenants/alice"),
             ("POST", "/v1/tenants/alice/pair"),
         ];

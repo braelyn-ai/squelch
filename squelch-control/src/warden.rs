@@ -3,8 +3,8 @@
 //! The warden is the only thing that touches the cluster: it mints the tenant's
 //! age identity, writes it into that tenant's Secret, renders the typed k8s
 //! objects, waits for the pod, and execs `squelchd pair` inside it. This module
-//! knows none of that. It knows three routes, one bearer, and the shapes that
-//! come back.
+//! knows none of that. It knows a handful of routes, one bearer, and the shapes
+//! that come back.
 //!
 //! PROVISIONING IS TWO CALLS, and the split is the whole point of v2:
 //!
@@ -32,6 +32,20 @@
 //! into a page and its `deep_link` would become an `href`, so both are
 //! shape-checked here and the URL the page shows is recomputed from this
 //! deployment's own base domain rather than echoed.
+//!
+//! THE OPERATOR ROUTES ARE A SEPARATE SURFACE. `GET /v1/tenants/{label}/drift`
+//! and `POST /v1/tenants/{label}/reconcile` answer a human at a shell, never a
+//! signup: nothing in the serving path calls them, so they hang off
+//! [`HttpWarden`] itself rather than the [`Warden`] trait, whose implementors
+//! are otherwise standing in for a cluster in a test. Their answers get the same
+//! treatment with a different destination in mind: a drift report quotes cluster
+//! state back, some of it written by whoever caused the drift, and it lands in a
+//! terminal that OBEYS what it is sent. Every string is [`declaw`]ed on arrival
+//! and every value is printed as JSON.
+//!
+//! A Deployment spec holds no secret material — Secrets reach a tenant pod as
+//! references by name — so quoting spec fields at an operator is safe. Nothing
+//! here may be pointed at a Secret's contents.
 
 use std::time::Duration;
 
@@ -40,6 +54,19 @@ use serde::{Deserialize, Serialize};
 /// Ceiling on a warden response body. Every answer in the contract is a few
 /// hundred bytes; the credential ciphertext travels the other way.
 const MAX_RESPONSE_BODY: usize = 64 * 1024;
+
+/// Ceiling on a drift report, which is the one answer whose size is decided by
+/// the tenant's own object rather than by this contract.
+///
+/// It has to sit ABOVE what a Deployment can hold, and deliberately so. The
+/// report grows with the number of foreign-owned fields, and the principal who
+/// can add those is the principal this whole feature exists to catch: a cap
+/// that a padded object could cross would let them push their own tenant's
+/// report over it and have the answer come back as "the warden is
+/// unreachable", which reads as a network problem and not as a finding. A
+/// Kubernetes object cannot exceed roughly 1.5 MB, so nothing that fits in the
+/// cluster can fail to fit here.
+const MAX_DRIFT_BODY: usize = 8 * 1024 * 1024;
 
 /// Bounds on the pairing code the warden reports. Crockford `XXXX-XXXX`, which
 /// is what `squelchd pair` prints.
@@ -98,6 +125,15 @@ pub enum WardenError {
     /// key. A bug on our side, caught before the socket is opened.
     #[error("refusing to send an unusable API key")]
     BadApiKey,
+    /// 409 on reconcile: the tenant exists but has no workload to converge,
+    /// because it is pending or stopped. Worth its own variant because the
+    /// remedy is a different operation entirely — finish the signup, or start
+    /// the tenant back up — and a retry will never do it.
+    ///
+    /// Its message is written for an OPERATOR, unlike the variants a signup page
+    /// renders: this one is reachable from a shell and nowhere else.
+    #[error("that tenant has no workload to reconcile: it is pending or stopped")]
+    NotReconcilable,
 }
 
 /// `POST /v1/tenants` request body. NO CREDENTIAL: at this point in the flow the
@@ -176,6 +212,138 @@ impl TenantStatus {
         self.status == STATUS_PENDING
     }
 }
+
+/// `GET /v1/tenants/{label}/drift` 200 body: what is on a tenant's workload
+/// that the warden did not put there, and what an apply of today's render would
+/// change.
+///
+/// The two arrays answer INDEPENDENT questions and neither implies the other.
+/// `foreign` comes from the API server's own record of which field manager owns
+/// which field, and it is the one that catches a hand edit: server-side apply
+/// owns fields, not objects, so a field the warden never declares is invisible
+/// to every apply it will ever make. `changes` is what a re-apply would move,
+/// which covers the fields the warden does declare.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DriftReport {
+    /// `pending` | `active` | `failed` | `stopped`.
+    pub status: String,
+    /// Whether a Deployment exists at all. False for a tenant that never
+    /// provisioned and for one that was stopped; both arrays are empty there,
+    /// because there is no object to have drifted.
+    pub deployment_present: bool,
+    /// Field managers other than the warden that own part of the workload.
+    #[serde(default)]
+    pub foreign: Vec<ForeignManager>,
+    /// Fields an apply of today's render would move.
+    #[serde(default)]
+    pub changes: Vec<FieldChange>,
+}
+
+/// One other writer on a tenant's workload, and what it owns.
+///
+/// The presence of an entry IS the finding: any surviving path means somebody
+/// took ownership of part of a tenant's Deployment, and the warden will
+/// converge around that field forever rather than over it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForeignManager {
+    /// The `fieldManager` string the API server recorded (`kubectl-set`,
+    /// `kubectl-edit`, a controller's name). Chosen by whoever wrote the field.
+    pub manager: String,
+    /// `Apply` or `Update`.
+    pub operation: String,
+    /// Dotted paths into the object, as the warden spelled them.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// One field an apply would move, with both sides of it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FieldChange {
+    /// Dotted, rooted at `spec`, keyed list items in brackets:
+    /// `spec.template.spec.containers[squelchd].image`.
+    pub path: String,
+    /// What the object carries now. `null` when the field exists only in the
+    /// render.
+    #[serde(default)]
+    pub live: serde_json::Value,
+    /// What an apply would leave. `null` when the field exists only live.
+    #[serde(default)]
+    pub rendered: serde_json::Value,
+}
+
+impl DriftReport {
+    /// Whether the tenant is still exactly what the warden rendered. A tenant
+    /// with no Deployment is clean by this measure: there is nothing there to
+    /// have drifted, and its status is the thing to read instead.
+    pub fn is_clean(&self) -> bool {
+        self.foreign.is_empty() && self.changes.is_empty()
+    }
+
+    /// Hold every string in the report to what a terminal will merely print.
+    fn declaw(&mut self) {
+        self.status = declaw(&self.status);
+        for f in &mut self.foreign {
+            f.manager = declaw(&f.manager);
+            f.operation = declaw(&f.operation);
+            for path in &mut f.paths {
+                *path = declaw(path);
+            }
+        }
+        for c in &mut self.changes {
+            c.path = declaw(&c.path);
+        }
+    }
+}
+
+/// `POST /v1/tenants/{label}/reconcile` 200 body: what the warden had to do to
+/// put the tenant back onto its render.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Reconciled {
+    /// `created`, `converged`, or `recreated`. The last means the Deployment
+    /// was deleted and applied fresh, because another field manager owned part
+    /// of it and no apply can take a field back.
+    pub deployment: String,
+    /// `active`. A reconcile that answers at all has waited for a ready pod.
+    pub status: String,
+}
+
+impl Reconciled {
+    fn declaw(&mut self) {
+        self.deployment = declaw(&self.deployment);
+        self.status = declaw(&self.status);
+    }
+}
+
+/// Neutralize a string that came off the wire and is headed for a terminal.
+///
+/// A `fieldManager` is named by whoever wrote the field, and a path can name a
+/// container or an environment variable somebody else created — which is the
+/// exact case a drift report exists to surface. A terminal OBEYS ESC sequences,
+/// so a name carrying one could repaint the run, erase the finding above it, or
+/// park the cursor somewhere else entirely; bidirectional overrides can reorder
+/// a path so it reads as one thing and says another. Both classes are replaced
+/// rather than dropped, so the operator sees that something was there.
+///
+/// The `live` and `rendered` values need no such pass: they are printed as JSON,
+/// and JSON escaping is exactly this guarantee.
+fn declaw(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            c if c.is_control() => REPLACEMENT,
+            // The trojan-source set: bidi marks, embeddings, overrides, and
+            // isolates. Printable by the letter of Unicode, and a lie by the
+            // time a terminal has laid them out.
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                REPLACEMENT
+            }
+            c => c,
+        })
+        .collect()
+}
+
+/// What a declawed character becomes. U+FFFD, because "something unprintable
+/// was here" is information the operator wants.
+const REPLACEMENT: char = '\u{fffd}';
 
 /// A warden the control plane can talk to. A trait so a test can stand one up
 /// without a cluster, and so a later provisioning backend slots in without
@@ -452,6 +620,92 @@ impl Warden for HttpWarden {
     }
 }
 
+/// The operator surface: the two routes a human runs at a shell.
+///
+/// INHERENT, not on the [`Warden`] trait, and deliberately. The serving path
+/// never asks whether a tenant has drifted — signup provisions, the console
+/// pairs — so putting these on the trait would oblige every stand-in for a
+/// cluster to answer a question no request will ask. The commands that do ask
+/// hold a real [`HttpWarden`] and nothing else.
+impl HttpWarden {
+    /// What is on this tenant's workload that the warden did not put there.
+    ///
+    /// Read-only on both sides: the warden's own apply for the comparison is a
+    /// dry run. A tenant with nothing running answers 200 with
+    /// `deployment_present: false` and empty arrays, which is why this is safe
+    /// to walk over a whole fleet without deciding anything first.
+    pub async fn drift(&self, label: &str) -> Result<DriftReport, WardenError> {
+        // Into a URL path, so validated here, for the reason the provisioning
+        // routes give: "somebody upstream checked it" is how a `../` reaches a
+        // path. Here the caller upstream is a shell.
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/tenants/{label}/drift")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| WardenError::Unreachable)?;
+
+        match resp.status().as_u16() {
+            200 => {
+                // The drift cap, not the contract's: a report is as big as the
+                // drift it found, and the tenant that drifted most must not be
+                // the one that comes back unreadable. See [`MAX_DRIFT_BODY`].
+                let body = read_capped_to(resp, MAX_DRIFT_BODY).await?;
+                let mut report: DriftReport =
+                    serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
+                report.declaw();
+                Ok(report)
+            }
+            401 | 403 => Err(WardenError::Unauthorized),
+            404 => Err(WardenError::UnknownTenant),
+            422 => Err(WardenError::LabelRefused),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
+    /// Put this tenant's workload back onto the warden's render, deleting and
+    /// recreating the Deployment if another field manager owns part of it.
+    ///
+    /// WRITES, and rolls a pod: the answer arrives only after a ready one is
+    /// back, so a slow node reads as a failure with the workload already
+    /// replaced. That is the shape the caller must be built for, and it is why
+    /// this is one tenant per invocation.
+    pub async fn reconcile(&self, label: &str) -> Result<Reconciled, WardenError> {
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+
+        // NO BODY. The tenant is the whole request.
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/tenants/{label}/reconcile")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| WardenError::Unreachable)?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let body = read_capped(resp).await?;
+                let mut reconciled: Reconciled =
+                    serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
+                reconciled.declaw();
+                Ok(reconciled)
+            }
+            401 | 403 => Err(WardenError::Unauthorized),
+            404 => Err(WardenError::UnknownTenant),
+            // The tenant is real and has no workload: pending or stopped.
+            409 => Err(WardenError::NotReconcilable),
+            422 => Err(WardenError::LabelRefused),
+            // Everything else, `not_ready` included: the workload may well have
+            // been replaced, and the operator's next move is to look rather
+            // than to hammer this call.
+            _ => Err(WardenError::Failed),
+        }
+    }
+}
+
 /// Hold the warden's pairing answer to the shape the success page can render.
 ///
 /// The `deep_link` is checked but NOT used: [`crate::pages`] rebuilds it from
@@ -467,10 +721,17 @@ fn validate_pairing(p: &Pairing) -> Result<(), WardenError> {
     Ok(())
 }
 
-async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, WardenError> {
+async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, WardenError> {
+    read_capped_to(resp, MAX_RESPONSE_BODY).await
+}
+
+async fn read_capped_to(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, WardenError> {
     let mut out = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|_| WardenError::Unreachable)? {
-        if out.len() + chunk.len() > MAX_RESPONSE_BODY {
+        if out.len() + chunk.len() > cap {
             return Err(WardenError::Unreachable);
         }
         out.extend_from_slice(&chunk);
@@ -613,6 +874,14 @@ mod tests {
             );
             assert!(
                 matches!(w.pair(bad).await, Err(WardenError::LabelRefused)),
+                "{bad:?}"
+            );
+            assert!(
+                matches!(w.drift(bad).await, Err(WardenError::LabelRefused)),
+                "{bad:?}"
+            );
+            assert!(
+                matches!(w.reconcile(bad).await, Err(WardenError::LabelRefused)),
                 "{bad:?}"
             );
         }
@@ -817,5 +1086,317 @@ mod tests {
             w.pair("gone").await,
             Err(WardenError::UnknownTenant)
         ));
+    }
+
+    /// Stand up a mock warden that answers by label and record the bearer of
+    /// every request it takes. The operator routes are `GET`/`POST` with no
+    /// body, so the label and the bearer are the whole wire.
+    async fn mock_warden(app: axum::Router) -> HttpWarden {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        HttpWarden::new(
+            format!("http://{addr}"),
+            "token".into(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    /// The `Authorization` header of each request the mock took.
+    type Bearers = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn record_bearer(seen: &Bearers, headers: &axum::http::HeaderMap) {
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        seen.lock().unwrap().push(bearer);
+    }
+
+    /// The drift route on the wire: a tenant somebody hand-edited, a tenant that
+    /// still matches its render, a tenant with nothing running (whose arrays the
+    /// warden may leave out entirely), and each refusal.
+    #[tokio::test]
+    async fn drift_reports_foreign_owners_and_pending_changes() {
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+        };
+        use serde_json::json;
+
+        let seen: Bearers = Bearers::default();
+        let app = Router::new()
+            .route(
+                "/v1/tenants/{label}/drift",
+                get(
+                    |State(seen): State<Bearers>,
+                     Path(label): Path<String>,
+                     headers: HeaderMap| async move {
+                        record_bearer(&seen, &headers);
+                        match label.as_str() {
+                            "drifted" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "status": "active",
+                                    "deployment_present": true,
+                                    "foreign": [{
+                                        "manager": "kubectl-set",
+                                        "operation": "Update",
+                                        "paths": [
+                                            "spec.template.spec.initContainers[seed].env",
+                                        ],
+                                    }],
+                                    "changes": [{
+                                        "path": "spec.template.spec.containers[squelchd].image",
+                                        "live": "squelchd:daemon-0.0.1",
+                                        "rendered": "squelchd:daemon-0.0.2",
+                                    }, {
+                                        "path": "spec.template.spec.replicas",
+                                        "live": 2,
+                                        "rendered": null,
+                                    }],
+                                })),
+                            )
+                                .into_response(),
+                            "settled" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "status": "active",
+                                    "deployment_present": true,
+                                    "foreign": [],
+                                    "changes": [],
+                                })),
+                            )
+                                .into_response(),
+                            // Arrays omitted, not empty: a tenant with no
+                            // workload has nothing to say about one.
+                            "halfway" => (
+                                StatusCode::OK,
+                                Json(json!({"status": "pending", "deployment_present": false})),
+                            )
+                                .into_response(),
+                            "refused" => (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                Json(json!({"error": "invalid_label"})),
+                            )
+                                .into_response(),
+                            "broken" => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": "cluster_unavailable"})),
+                            )
+                                .into_response(),
+                            _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
+                                .into_response(),
+                        }
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let w = mock_warden(app).await;
+
+        let report = w.drift("drifted").await.unwrap();
+        assert_eq!(report.status, "active");
+        assert!(report.deployment_present);
+        assert!(!report.is_clean());
+        assert_eq!(report.foreign.len(), 1);
+        assert_eq!(report.foreign[0].manager, "kubectl-set");
+        assert_eq!(report.foreign[0].operation, "Update");
+        assert_eq!(
+            report.foreign[0].paths,
+            ["spec.template.spec.initContainers[seed].env"]
+        );
+        assert_eq!(report.changes.len(), 2);
+        assert_eq!(
+            report.changes[0].path,
+            "spec.template.spec.containers[squelchd].image"
+        );
+        assert_eq!(report.changes[0].live, "squelchd:daemon-0.0.1");
+        assert_eq!(report.changes[0].rendered, "squelchd:daemon-0.0.2");
+        // A field that exists only live: `null` on the other side, not absent.
+        assert!(report.changes[1].rendered.is_null());
+
+        let settled = w.drift("settled").await.unwrap();
+        assert!(settled.is_clean());
+        assert!(settled.deployment_present);
+
+        let halfway = w.drift("halfway").await.unwrap();
+        assert_eq!(halfway.status, "pending");
+        assert!(!halfway.deployment_present);
+        assert!(halfway.is_clean());
+
+        assert!(matches!(
+            w.drift("refused").await,
+            Err(WardenError::LabelRefused)
+        ));
+        assert!(matches!(w.drift("broken").await, Err(WardenError::Failed)));
+        assert!(matches!(
+            w.drift("nobody").await,
+            Err(WardenError::UnknownTenant)
+        ));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        assert!(seen.iter().all(|b| b == "Bearer token"));
+    }
+
+    /// The reconcile route on the wire: the outcome words an operator reads,
+    /// and the 409 that means "this tenant has no workload to converge" — a
+    /// different operation, never a retry.
+    #[tokio::test]
+    async fn reconcile_reports_its_outcome_and_maps_its_refusals() {
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::post,
+        };
+        use serde_json::json;
+
+        let seen: Bearers = Bearers::default();
+        let app = Router::new()
+            .route(
+                "/v1/tenants/{label}/reconcile",
+                post(
+                    |State(seen): State<Bearers>,
+                     Path(label): Path<String>,
+                     headers: HeaderMap| async move {
+                        record_bearer(&seen, &headers);
+                        match label.as_str() {
+                            "settled" => (
+                                StatusCode::OK,
+                                Json(json!({"deployment": "converged", "status": "active"})),
+                            )
+                                .into_response(),
+                            "drifted" => (
+                                StatusCode::OK,
+                                Json(json!({"deployment": "recreated", "status": "active"})),
+                            )
+                                .into_response(),
+                            "halfway" => (
+                                StatusCode::CONFLICT,
+                                Json(json!({"error": "not_reconcilable"})),
+                            )
+                                .into_response(),
+                            "unauthed" => (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({"error": "unauthorized"})),
+                            )
+                                .into_response(),
+                            "stalled" => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": "not_ready"})),
+                            )
+                                .into_response(),
+                            _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
+                                .into_response(),
+                        }
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let w = mock_warden(app).await;
+
+        let converged = w.reconcile("settled").await.unwrap();
+        assert_eq!(converged.deployment, "converged");
+        assert_eq!(converged.status, "active");
+        assert_eq!(
+            w.reconcile("drifted").await.unwrap().deployment,
+            "recreated"
+        );
+
+        assert!(matches!(
+            w.reconcile("halfway").await,
+            Err(WardenError::NotReconcilable)
+        ));
+        assert!(matches!(
+            w.reconcile("unauthed").await,
+            Err(WardenError::Unauthorized)
+        ));
+        // `not_ready` is a rolled pod that did not come back. Generic on
+        // purpose: the next move is to look, not to call again.
+        assert!(matches!(
+            w.reconcile("stalled").await,
+            Err(WardenError::Failed)
+        ));
+        assert!(matches!(
+            w.reconcile("nobody").await,
+            Err(WardenError::UnknownTenant)
+        ));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        assert!(seen.iter().all(|b| b == "Bearer token"));
+    }
+
+    /// A field manager is named by whoever wrote the field, and this report is
+    /// read in a terminal. Escape sequences and bidi overrides do not survive
+    /// the trip, so the worst a hand edit can do to the run that finds it is
+    /// look ugly.
+    #[tokio::test]
+    async fn a_drift_report_cannot_repaint_the_operators_terminal() {
+        use axum::{Json, Router, routing::get};
+        use serde_json::json;
+
+        let app = Router::new().route(
+            "/v1/tenants/drifted/drift",
+            get(|| async {
+                Json(json!({
+                    "status": "act\u{1b}[2Jive",
+                    "deployment_present": true,
+                    "foreign": [{
+                        "manager": "kubectl-\u{1b}[31mset",
+                        "operation": "Up\u{7}date",
+                        "paths": ["spec.\u{202e}tnemyolped"],
+                    }],
+                    "changes": [{
+                        "path": "spec.template.spec.containers[squelchd]\u{0}.image",
+                        "live": "a",
+                        "rendered": "b",
+                    }],
+                }))
+            }),
+        );
+        let w = mock_warden(app).await;
+
+        let report = w.drift("drifted").await.unwrap();
+        let printed = format!(
+            "{}{}{}{}{}",
+            report.status,
+            report.foreign[0].manager,
+            report.foreign[0].operation,
+            report.foreign[0].paths[0],
+            report.changes[0].path
+        );
+        assert!(!printed.chars().any(|c| c.is_control()), "{printed:?}");
+        assert!(!printed.contains('\u{202e}'), "{printed:?}");
+        // Declawed, not swallowed: the operator still reads a manager name.
+        assert!(report.foreign[0].manager.contains("kubectl-"));
+        assert!(report.foreign[0].manager.contains("set"));
+    }
+
+    /// The values are printed as JSON, so their escaping is serde's and the
+    /// characters survive to be seen. What must not survive is a string that
+    /// reaches the terminal raw.
+    #[test]
+    fn declaw_replaces_what_a_terminal_would_obey() {
+        assert_eq!(declaw("kubectl-set"), "kubectl-set");
+        assert_eq!(declaw("spec.replicas"), "spec.replicas");
+        for hostile in [
+            '\u{1b}', '\u{7}', '\n', '\r', '\u{202e}', '\u{2066}', '\u{200f}',
+        ] {
+            let out = declaw(&format!("a{hostile}b"));
+            assert_eq!(out, format!("a{REPLACEMENT}b"), "{hostile:?}");
+        }
+        // The ESC is what a terminal obeys; the rest of the sequence is
+        // ordinary text and stays, so the operator sees the shape of it.
+        assert_eq!(declaw("a\u{1b}[2Jb"), format!("a{REPLACEMENT}[2Jb"));
     }
 }

@@ -55,9 +55,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "patch"]
+  # `get` is what tells a cancelled tenant from an interrupted reconcile: both
+  # read `stopped`, and only the cancelled one had its Service deleted too.
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "patch", "delete"]
+    verbs: ["get", "create", "patch", "delete"]
   # Read only, and by label selector. The warden never creates a pod directly;
   # the Deployment does. This is the readiness wait during a provision.
   - apiGroups: [""]
