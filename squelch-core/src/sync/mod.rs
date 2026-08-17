@@ -409,8 +409,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // (Gmail bearer token, LLM x-api-key) and reqwest re-sends custom
         // headers cross-host on a redirect. Gmail's API does not redirect, so
         // this matches the repo's other Google-facing clients.
+        // 180s, not 60: the long pole on this client is now a reasoning-model
+        // triage call at high effort, which legitimately thinks for minutes on a
+        // hard row. A Gmail fetch that runs that long is already wedged, and
+        // this timeout only exists to unwedge it.
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(180))
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .build()

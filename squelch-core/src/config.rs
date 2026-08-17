@@ -696,13 +696,22 @@ pub struct Stage1Config {
     /// Default $50,000 — a real household bill essentially never exceeds this.
     pub bill_absurd_amount_threshold: f64,
 
-    // ---- Stage-1 LLM pass (the small model run on every non-rule email) ----
-    // The heuristic fields above are its seed/fallback. Key, provider, and
+    // ---- Stage-1 LLM pass (the model run on every non-sealed email) --------
+    // The heuristic fields above are its WITNESS and its offline fallback, never
+    // an alternative verdict: see [`crate::triage::router`]. Key, provider, and
     // endpoint come from [`Stage2Config::resolve_llm`]; only the fields below
     // are Stage-1's own.
-    /// The Stage-1 model id string. Default `claude-haiku-4-5` (a small, cheap
-    /// model — it sees nearly every email). Env: `SQUELCH_STAGE1_MODEL`.
+    /// The Stage-1 model id string. Default `claude-opus-5`: triage is the
+    /// product, so the pass that sees every email runs the best model there is,
+    /// and the two stages differ by `effort` and context rather than by model.
+    /// Env: `SQUELCH_STAGE1_MODEL`.
     pub model: String,
+    /// Reasoning depth for Stage-1 (`low`/`medium`/`high`/`xhigh`/`max`), sent
+    /// as `output_config.effort`. `low` is deliberate: Stage-1 reads a compact
+    /// row and the router, not the model's own thinking, decides what deserves
+    /// a harder look. Set to `None` when pointing `model` at one that rejects
+    /// the field (Haiku 4.5, Sonnet 4.5). Env: `SQUELCH_STAGE1_EFFORT`.
+    pub effort: Option<String>,
     /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
     /// Env: `SQUELCH_STAGE1_MAX_BODY_CHARS`.
     pub max_body_chars: usize,
@@ -712,11 +721,11 @@ pub struct Stage1Config {
     /// Global per-account-per-day call cap — the only cap Stage-1 has, since it
     /// must see every email. Env: `SQUELCH_STAGE1_GLOBAL_DAILY_CAP`.
     pub global_daily_cap: u32,
-    /// Per-million-input-token price (USD) for the Stage-1 model. Default 1.0
-    /// (claude-haiku-4-5). Env: `SQUELCH_STAGE1_PRICE_IN_PER_MTOK`.
+    /// Per-million-input-token price (USD) for the Stage-1 model. Default 5.0
+    /// (claude-opus-5). Env: `SQUELCH_STAGE1_PRICE_IN_PER_MTOK`.
     pub price_in_per_mtok: f64,
-    /// Per-million-output-token price (USD) for the Stage-1 model. Default 5.0
-    /// (claude-haiku-4-5). Env: `SQUELCH_STAGE1_PRICE_OUT_PER_MTOK`.
+    /// Per-million-output-token price (USD) for the Stage-1 model. Default 25.0
+    /// (claude-opus-5). Env: `SQUELCH_STAGE1_PRICE_OUT_PER_MTOK`.
     pub price_out_per_mtok: f64,
 }
 
@@ -734,12 +743,17 @@ impl Default for Stage1Config {
             bill_unknown_sender_importance: 55,
             bill_absurd_amount_threshold: 50_000.0,
             // Stage-1 LLM defaults.
-            model: "claude-haiku-4-5".to_string(),
-            max_body_chars: 1500,
+            model: "claude-opus-5".to_string(),
+            effort: Some("low".to_string()),
+            // 6000, not 1500: the old cap was sized for a 200K-context small
+            // model and routinely cut the body before the part that decides the
+            // verdict (the amount, the date, the ask). The model reading this
+            // now has a 1M window.
+            max_body_chars: 6000,
             batch_per_cycle: 10,
             global_daily_cap: 1000,
-            price_in_per_mtok: 1.0,
-            price_out_per_mtok: 5.0,
+            price_in_per_mtok: 5.0,
+            price_out_per_mtok: 25.0,
         }
     }
 }
@@ -778,8 +792,14 @@ pub struct Stage2Config {
     /// as absent. Env: `SQUELCH_ANTHROPIC_BASE_URL`.
     pub anthropic_base_url: Option<String>,
     /// Model id, written verbatim into the request's `model` field and stored as
-    /// `model_used` on applied rows.
+    /// `model_used` on applied rows. Defaults to the SAME model as Stage-1:
+    /// escalation buys more context and more thinking, not a bigger brain.
     pub model: String,
+    /// Reasoning depth for Stage-2, sent as `output_config.effort`. `xhigh`
+    /// against Stage-1's `low` is one of the two things escalation actually
+    /// buys (the other is [`Stage2Queued`](crate::store::Stage2Queued)'s
+    /// thread/sender/neighbour context). Env: `SQUELCH_STAGE2_EFFORT`.
+    pub effort: Option<String>,
     /// Cap on the flattened email body (chars) fed into the UNTRUSTED block.
     /// The body is truncated to this and the truncation is noted in-band.
     pub max_body_chars: usize,
@@ -816,17 +836,21 @@ impl Default for Stage2Config {
             anthropic_api_key: None,
             stage2_provider: None,
             anthropic_base_url: None,
-            // Stage-2 is the ESCALATION pass on a MORE CAPABLE model.
-            model: "claude-sonnet-5".to_string(),
-            max_body_chars: 1500,
+            // Stage-2 is the ESCALATION pass: same model as Stage-1, more
+            // context and more thinking.
+            model: "claude-opus-5".to_string(),
+            effort: Some("xhigh".to_string()),
+            // Roomier than Stage-1's: an escalated row is one where the detail
+            // that settles it may be deep in the body.
+            max_body_chars: 12_000,
             batch_per_cycle: 10,
             thread_daily_cap: 3,
             global_daily_cap: 200,
             sender_daily_cap: 5,
             max_age_days: 7,
-            // claude-sonnet-5 per-MTok (input / output).
-            price_in_per_mtok: 3.0,
-            price_out_per_mtok: 15.0,
+            // claude-opus-5 per-MTok (input / output).
+            price_in_per_mtok: 5.0,
+            price_out_per_mtok: 25.0,
         }
     }
 }
@@ -1016,6 +1040,25 @@ fn env_override_opt<T: std::str::FromStr>(name: &str, slot: &mut Option<T>) {
         && let Ok(parsed) = v.parse::<T>()
     {
         *slot = Some(parsed);
+    }
+}
+
+/// [`env_override_opt`] for the reasoning-effort slots, where CLEARING the value
+/// has to be expressible: an operator who repoints a stage at a model with no
+/// effort support (Haiku 4.5, Sonnet 4.5) must be able to drop the field, since
+/// sending it to such a model is a 400 on every call. `none`/`off` clear it;
+/// anything else sets it verbatim (the API, not this parser, is the authority on
+/// which level names are valid).
+fn env_override_effort(name: &str, slot: &mut Option<String>) {
+    if let Ok(v) = std::env::var(name) {
+        let v = v.trim();
+        if v.is_empty() {
+            return;
+        }
+        *slot = match v.to_ascii_lowercase().as_str() {
+            "none" | "off" => None,
+            _ => Some(v.to_string()),
+        };
     }
 }
 
@@ -1348,6 +1391,7 @@ impl Config {
             &mut self.stage2.anthropic_base_url,
         );
         env_override("SQUELCH_MODEL", &mut self.stage2.model);
+        env_override_effort("SQUELCH_STAGE2_EFFORT", &mut self.stage2.effort);
         env_override(
             "SQUELCH_STAGE2_MAX_BODY_CHARS",
             &mut self.stage2.max_body_chars,
@@ -1380,6 +1424,7 @@ impl Config {
 
         // ---- Stage-1 LLM overrides -----------------------------------------
         env_override("SQUELCH_STAGE1_MODEL", &mut self.stage1.model);
+        env_override_effort("SQUELCH_STAGE1_EFFORT", &mut self.stage1.effort);
         env_override(
             "SQUELCH_STAGE1_MAX_BODY_CHARS",
             &mut self.stage1.max_body_chars,
@@ -2058,26 +2103,69 @@ backfill_days = 90
     #[test]
     fn stage2_defaults_are_sane() {
         let c = Stage2Config::default();
-        assert_eq!(c.model, "claude-sonnet-5");
-        assert_eq!(c.max_body_chars, 1500);
+        assert_eq!(c.model, "claude-opus-5");
+        assert_eq!(c.effort.as_deref(), Some("xhigh"));
+        assert_eq!(c.max_body_chars, 12_000);
         assert_eq!(c.batch_per_cycle, 10);
         assert_eq!(c.thread_daily_cap, 3);
         assert_eq!(c.global_daily_cap, 200);
         assert_eq!(c.sender_daily_cap, 5);
         assert_eq!(c.max_age_days, 7);
-        assert_eq!(c.price_in_per_mtok, 3.0);
-        assert_eq!(c.price_out_per_mtok, 15.0);
+        assert_eq!(c.price_in_per_mtok, 5.0);
+        assert_eq!(c.price_out_per_mtok, 25.0);
     }
 
     #[test]
     fn stage1_llm_defaults_are_sane() {
         let c = Stage1Config::default();
-        assert_eq!(c.model, "claude-haiku-4-5");
+        assert_eq!(c.model, "claude-opus-5");
+        assert_eq!(c.effort.as_deref(), Some("low"));
         assert_eq!(c.global_daily_cap, 1000);
         assert_eq!(c.batch_per_cycle, 10);
-        assert_eq!(c.max_body_chars, 1500);
-        assert_eq!(c.price_in_per_mtok, 1.0);
-        assert_eq!(c.price_out_per_mtok, 5.0);
+        assert_eq!(c.max_body_chars, 6000);
+        assert_eq!(c.price_in_per_mtok, 5.0);
+        assert_eq!(c.price_out_per_mtok, 25.0);
+    }
+
+    /// Both stages run the SAME model on purpose: escalation buys context and
+    /// reasoning depth, not a bigger model. If these two ever diverge by
+    /// default, the escalation story has quietly changed and the prompts and
+    /// docs that describe it need to change with it.
+    #[test]
+    fn both_stages_default_to_one_model_differing_only_in_effort() {
+        let s1 = Stage1Config::default();
+        let s2 = Stage2Config::default();
+        assert_eq!(s1.model, s2.model);
+        assert_eq!(s1.price_in_per_mtok, s2.price_in_per_mtok);
+        assert_eq!(s1.price_out_per_mtok, s2.price_out_per_mtok);
+        assert_ne!(s1.effort, s2.effort);
+    }
+
+    /// An operator repointing a stage at a model with no effort support must be
+    /// able to DROP the field: sending it to such a model is a 400 on every
+    /// call, so "unset" has to be reachable from the environment.
+    #[test]
+    fn effort_can_be_cleared_from_the_environment() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut slot = Some("xhigh".to_string());
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("SQUELCH_TEST_EFFORT", "none") };
+        env_override_effort("SQUELCH_TEST_EFFORT", &mut slot);
+        assert_eq!(slot, None);
+
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("SQUELCH_TEST_EFFORT", "medium") };
+        env_override_effort("SQUELCH_TEST_EFFORT", &mut slot);
+        assert_eq!(slot.as_deref(), Some("medium"));
+
+        // Blank means "unset", which must not clobber a configured value.
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("SQUELCH_TEST_EFFORT", "") };
+        env_override_effort("SQUELCH_TEST_EFFORT", &mut slot);
+        assert_eq!(slot.as_deref(), Some("medium"));
+
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("SQUELCH_TEST_EFFORT") };
     }
 
     #[test]

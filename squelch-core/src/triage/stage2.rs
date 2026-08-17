@@ -367,6 +367,7 @@ pub async fn classify_at(
         system: build_system_prompt(),
         user: &user,
         schema: output_schema(),
+        effort: cfg.effort.as_deref(),
     };
     llm::classify_into(http, url, api_key, provider, &req, |out: Stage2Output| {
         check_importance(out.importance).map(|()| out)
