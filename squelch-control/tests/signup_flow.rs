@@ -159,7 +159,10 @@ async fn spawn_google(rec: Shared) -> String {
                         Some(expected) => &s256(&verifier) == expected,
                     };
                     if get("grant_type") != "authorization_code" || !challenge_ok {
-                        return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"})))
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":"invalid_grant"})),
+                        )
                             .into_response();
                     }
                     Json(json!({
@@ -273,7 +276,9 @@ async fn spawn_warden(rec: Shared) -> String {
                     }
                     match r.tenants.get_mut(&label) {
                         None => json_status(StatusCode::NOT_FOUND, "unknown"),
-                        Some(t) if t.provisioned => json_status(StatusCode::CONFLICT, "provisioned"),
+                        Some(t) if t.provisioned => {
+                            json_status(StatusCode::CONFLICT, "provisioned")
+                        }
                         Some(t) => {
                             t.provisioned = true;
                             Json(json!({
@@ -320,7 +325,9 @@ async fn spawn_warden(rec: Shared) -> String {
                         return Json(json!({"status":"active"})).into_response();
                     }
                     match r.tenants.get(&label) {
-                        Some(t) if t.provisioned => Json(json!({"status":"active"})).into_response(),
+                        Some(t) if t.provisioned => {
+                            Json(json!({"status":"active"})).into_response()
+                        }
                         Some(_) => Json(json!({"status":"pending"})).into_response(),
                         None => json_status(StatusCode::NOT_FOUND, "unknown"),
                     }
@@ -592,7 +599,8 @@ impl Harness {
         if let Some(c) = cookie {
             req = req.header(header::COOKIE, c);
         }
-        self.send(req.body(axum::body::Body::empty()).unwrap()).await
+        self.send(req.body(axum::body::Body::empty()).unwrap())
+            .await
     }
 
     async fn post_form(
@@ -616,8 +624,8 @@ impl Harness {
         let resp = self.app.clone().oneshot(req).await.unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body =
-            String::from_utf8_lossy(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).to_string();
+        let body = String::from_utf8_lossy(&to_bytes(resp.into_body(), 1 << 20).await.unwrap())
+            .to_string();
         (status, headers, body)
     }
 
@@ -647,7 +655,10 @@ impl Harness {
         let (consent, cookie) = self.start_signup_with(label, invite).await;
         let (status, _, body) = self
             .get(
-                &format!("/oauth/callback?code=the-auth-code&state={}", state_param(&consent)),
+                &format!(
+                    "/oauth/callback?code=the-auth-code&state={}",
+                    state_param(&consent)
+                ),
                 Some(&cookie),
             )
             .await;
@@ -797,15 +808,20 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
         "{plaintext}"
     );
     for slot in [MAILBOX, write_slot.as_str()] {
-        assert_eq!(parsed["slots"][slot]["refresh_token"], REFRESH_TOKEN, "{slot}");
-        assert_eq!(parsed["slots"][slot]["access_token"], ACCESS_TOKEN, "{slot}");
+        assert_eq!(
+            parsed["slots"][slot]["refresh_token"], REFRESH_TOKEN,
+            "{slot}"
+        );
+        assert_eq!(
+            parsed["slots"][slot]["access_token"], ACCESS_TOKEN,
+            "{slot}"
+        );
     }
     assert!(parsed.get("refresh_token").is_none(), "{plaintext}");
 
     // ...and it is sealed to EXACTLY that recipient: another key opens nothing.
     let stranger = age::x25519::Identity::generate();
-    let decryptor =
-        age::Decryptor::new(age::armor::ArmoredReader::new(armor.as_bytes())).unwrap();
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(armor.as_bytes())).unwrap();
     assert!(
         decryptor
             .decrypt(std::iter::once(&stranger as &dyn age::Identity))
@@ -816,7 +832,9 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
     // consent.
     assert!(!rec.warden_bearers.is_empty());
     assert!(
-        rec.warden_bearers.iter().all(|b| b == "Bearer warden-bearer"),
+        rec.warden_bearers
+            .iter()
+            .all(|b| b == "Bearer warden-bearer"),
         "{:?}",
         rec.warden_bearers
     );
@@ -847,7 +865,10 @@ async fn a_failed_credential_install_leaves_a_retriable_signup() {
     // held until the session would have expired ten minutes from now. The page
     // above tells this person to start again with the same code; this is what
     // makes that sentence true.
-    assert!(h.invite_is_available(), "the failed signup released its hold");
+    assert!(
+        h.invite_is_available(),
+        "the failed signup released its hold"
+    );
     {
         let rec = h.rec.lock().unwrap();
         assert_eq!(rec.create_bodies.len(), 1);
@@ -903,7 +924,10 @@ async fn one_code_opens_one_signup_at_a_time() {
 
     // Tab two posts the same code. One message, the same one a wrong code gets.
     let (status, _, body) = h
-        .post_form("/signup", format!("invite={}&label=grace", urlencode(&invite)))
+        .post_form(
+            "/signup",
+            format!("invite={}&label=grace", urlencode(&invite)),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "the form re-renders");
     assert!(body.contains("not usable"), "{body}");
@@ -938,7 +962,12 @@ async fn a_lapsed_hold_does_not_strand_the_code() {
     let then = chrono::Utc::now() - chrono::Duration::minutes(20);
     h.state
         .store()
-        .reserve_invite(&hash, "an-abandoned-session", then, then + chrono::Duration::minutes(10))
+        .reserve_invite(
+            &hash,
+            "an-abandoned-session",
+            then,
+            then + chrono::Duration::minutes(10),
+        )
         .unwrap()
         .expect("the abandoned signup held it");
     assert!(h.invite_is_available(), "and the hold has since lapsed");
@@ -957,7 +986,10 @@ async fn an_expired_code_is_refused_like_any_other() {
     let expired = h.issue_invite_expiring(chrono::Utc::now() - chrono::Duration::seconds(1));
 
     let (status, _, body) = h
-        .post_form("/signup", format!("invite={}&label=ada", urlencode(&expired)))
+        .post_form(
+            "/signup",
+            format!("invite={}&label=ada", urlencode(&expired)),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "the form re-renders");
     assert!(body.contains("not usable"), "{body}");
@@ -982,7 +1014,10 @@ async fn a_minted_code_signs_up_in_the_shape_it_is_printed() {
     // Same credential, and it is spent.
     let sloppy = format!(" {} ", invite.replace('-', "").to_lowercase());
     let (status, _, page) = h
-        .post_form("/signup", format!("invite={}&label=grace", urlencode(&sloppy)))
+        .post_form(
+            "/signup",
+            format!("invite={}&label=grace", urlencode(&sloppy)),
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("not usable"), "{page}");
@@ -1055,7 +1090,10 @@ async fn an_invite_code_works_once() {
     assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
 
     let (status, _, body) = h
-        .post_form("/signup", format!("invite={}&label=grace", urlencode(&invite)))
+        .post_form(
+            "/signup",
+            format!("invite={}&label=grace", urlencode(&invite)),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "the form re-renders");
     assert!(body.contains("not usable"), "{body}");
@@ -1334,7 +1372,10 @@ async fn signup_mints_and_installs_a_tenant_llm_key() {
     let mint = &rec.bifrost_mint_bodies[1];
     assert_eq!(mint["name"], "tenant-ada-assistant");
     assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
-    assert_eq!(mint["budgets"][0]["max_limit"], DEFAULT_ASSISTANT_BUDGET_USD);
+    assert_eq!(
+        mint["budgets"][0]["max_limit"],
+        DEFAULT_ASSISTANT_BUDGET_USD
+    );
     assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
     let pc = &mint["provider_configs"][0];
     assert_eq!(pc["provider"], "anthropic");
@@ -1348,7 +1389,10 @@ async fn signup_mints_and_installs_a_tenant_llm_key() {
     let (label, put) = &rec.llm_key_puts[0];
     assert_eq!(label, "ada");
     assert_eq!(put["api_key"], vk_value_for("tenant-ada"));
-    assert_eq!(put["assistant_api_key"], vk_value_for("tenant-ada-assistant"));
+    assert_eq!(
+        put["assistant_api_key"],
+        vk_value_for("tenant-ada-assistant")
+    );
     drop(rec);
     // The store kept the IDS, and only the IDS.
     assert_eq!(
@@ -1383,7 +1427,11 @@ async fn a_failed_key_install_still_records_the_vk_id() {
         let rec = h.rec.lock().unwrap();
         assert_eq!(rec.bifrost_mint_bodies.len(), 2, "both mints happened");
         assert_eq!(rec.llm_key_puts.len(), 1, "the install was attempted");
-        assert_eq!(rec.credential_puts.len(), 1, "the mailbox still provisioned");
+        assert_eq!(
+            rec.credential_puts.len(),
+            1,
+            "the mailbox still provisioned"
+        );
     }
     // The ids are on the row for the manual `llm revoke` or `llm mint` the log
     // line points the operator at.
@@ -1411,7 +1459,11 @@ async fn a_bifrost_outage_does_not_refuse_a_signup() {
 
     let rec = h.rec.lock().unwrap();
     assert!(rec.llm_key_puts.is_empty(), "no key existed to install");
-    assert_eq!(rec.credential_puts.len(), 1, "the mailbox still provisioned");
+    assert_eq!(
+        rec.credential_puts.len(),
+        1,
+        "the mailbox still provisioned"
+    );
     drop(rec);
     // Nothing was minted, so nothing is recorded: both pointers stay empty
     // rather than naming keys that do not exist.
@@ -1442,7 +1494,11 @@ async fn an_assistant_mint_failure_still_installs_the_triage_key() {
 
     {
         let rec = h.rec.lock().unwrap();
-        assert_eq!(rec.bifrost_mint_bodies.len(), 2, "both mints were attempted");
+        assert_eq!(
+            rec.bifrost_mint_bodies.len(),
+            2,
+            "both mints were attempted"
+        );
         assert_eq!(rec.llm_key_puts.len(), 1, "one PUT, with what succeeded");
         let (label, put) = &rec.llm_key_puts[0];
         assert_eq!(label, "ada");
@@ -1478,7 +1534,11 @@ async fn a_triage_mint_failure_still_installs_the_assistant_key() {
 
     {
         let rec = h.rec.lock().unwrap();
-        assert_eq!(rec.bifrost_mint_bodies.len(), 2, "both mints were attempted");
+        assert_eq!(
+            rec.bifrost_mint_bodies.len(),
+            2,
+            "both mints were attempted"
+        );
         assert_eq!(rec.llm_key_puts.len(), 1, "one PUT, with what succeeded");
         let (label, put) = &rec.llm_key_puts[0];
         assert_eq!(label, "ada");
@@ -1486,7 +1546,10 @@ async fn a_triage_mint_failure_still_installs_the_assistant_key() {
             put.get("api_key").is_none(),
             "the missing key must be absent, not null: {put}"
         );
-        assert_eq!(put["assistant_api_key"], vk_value_for("tenant-ada-assistant"));
+        assert_eq!(
+            put["assistant_api_key"],
+            vk_value_for("tenant-ada-assistant")
+        );
     }
     assert_eq!(h.state.store().tenant_vk("ada").unwrap(), None);
     assert_eq!(

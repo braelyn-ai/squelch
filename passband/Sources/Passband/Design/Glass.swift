@@ -431,6 +431,7 @@ extension ButtonStyle where Self == TextActionStyle {
         /// and key/main/occlusion observers catch rebuilds for the window's life.
         static func hideTitlebarDecoration(in window: NSWindow) {
             hideDecoration(in: window)
+            alignTrafficLights(in: window)
             for delay in [0.25, 0.75, 2.0] {
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                     MainActor.assumeIsolated { hideAllDecorations() }
@@ -447,6 +448,57 @@ extension ButtonStyle where Self == TextActionStyle {
                     MainActor.assumeIsolated { hideAllDecorations() }
                 }
             }
+            // The BUTTONS ONLY on these, not the decoration walk with them: a
+            // live resize fires continuously, and re-walking the frame view on
+            // every frame of a drag to hide a view that is already hidden is a
+            // cost for nothing. AppKit re-lays the titlebar out on both, which
+            // is what puts the buttons back where it wants them.
+            for name in [
+                NSWindow.didResizeNotification,
+                NSWindow.didEnterFullScreenNotification,
+                NSWindow.didExitFullScreenNotification,
+            ] {
+                NotificationCenter.default.addObserver(
+                    forName: name, object: window, queue: .main
+                ) { _ in
+                    MainActor.assumeIsolated {
+                        for window in NSApp.windows { alignTrafficLights(in: window) }
+                    }
+                }
+            }
+        }
+
+        /// Drop the traffic lights onto the top bar's line.
+        ///
+        /// AppKit centres them in the titlebar strip, which is shorter than the
+        /// bar every page's header now sits in — so left alone the buttons ride
+        /// a few points above the title beside them, and the top of the window
+        /// reads as two rows of chrome that nearly line up rather than one that
+        /// does. Only the origin moves: the buttons keep their own size, spacing
+        /// and hit targets, so nothing about how they behave changes.
+        ///
+        /// IDEMPOTENT BY MEASUREMENT, not by a flag — it re-runs on every resize
+        /// and focus change, and a nudge that applied a delta each time would
+        /// walk the buttons off the bottom of the window.
+        @MainActor
+        private static func alignTrafficLights(in window: NSWindow) {
+            // Fullscreen hands the buttons to the menu-bar overlay, which is the
+            // system's bar at the system's height. Ours is not on screen to line
+            // up with, and moving them there would only misalign them.
+            guard !window.styleMask.contains(.fullScreen) else { return }
+            for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                guard let button = window.standardWindowButton(type),
+                    let container = button.superview
+                else { continue }
+                // The titlebar view is flush with the window's top edge, so a
+                // depth measured against ITS top is a depth into the window. Its
+                // coordinates are bottom-up, hence the subtraction both ways.
+                let depth = container.bounds.maxY - button.frame.midY
+                let drop = TopBar.height / 2 - depth
+                guard abs(drop) > 0.5 else { continue }
+                button.setFrameOrigin(
+                    NSPoint(x: button.frame.minX, y: button.frame.minY - drop))
+            }
         }
 
         /// Re-walk every window. NOTHING IS CAPTURED, deliberately: these closures
@@ -456,7 +508,10 @@ extension ButtonStyle where Self == TextActionStyle {
         /// two windows and this runs only on focus/occlusion changes.
         @MainActor
         private static func hideAllDecorations() {
-            for window in NSApp.windows { hideDecoration(in: window) }
+            for window in NSApp.windows {
+                hideDecoration(in: window)
+                alignTrafficLights(in: window)
+            }
         }
 
         /// One walk of the frame view, hiding any decoration view it finds.

@@ -23,15 +23,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, Service};
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object};
 use crate::config::{
-    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST,
-    DEFAULT_EPHEMERAL_LIMIT, DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS,
-    DEFAULT_INGRESS_NAMESPACE, DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST,
-    DEFAULT_OAUTH_SECRET_NAME, DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS,
-    DEFAULT_STORAGE_SIZE, DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
+    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST, DEFAULT_EPHEMERAL_LIMIT,
+    DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS, DEFAULT_INGRESS_NAMESPACE,
+    DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_OAUTH_SECRET_NAME,
+    DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS, DEFAULT_STORAGE_SIZE,
+    DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
 };
 use crate::provision::Warden;
 
@@ -130,10 +130,14 @@ struct MockInner {
     exec_ok: bool,
     /// Whether an applied Deployment comes up.
     ready: bool,
+    /// Whether a deleted Deployment's pods hang around holding the volume.
+    pods_linger: bool,
     /// Whether reads answer at all.
     reads_ok: bool,
     /// Whether the next `create` loses a race with a concurrent one.
     create_loses_race: bool,
+    /// A kind whose deletes all fail, for the partial-teardown paths.
+    fail_delete: Option<Kind>,
 }
 
 /// A cluster that records instead of connecting.
@@ -181,6 +185,28 @@ impl MockCluster {
     /// Every read fails, as a partitioned API server would.
     pub fn break_reads(&self) {
         self.lock().reads_ok = false;
+    }
+
+    /// A deleted Deployment's pod never goes: `pods_gone` times out, the way a
+    /// pod wedged in Terminating on a stuck unmount does. The state that must
+    /// stop a recreate dead, because the volume is `ReadWriteOnce` and the pod
+    /// still has it.
+    pub fn pods_linger(&self) {
+        self.lock().pods_linger = true;
+    }
+
+    /// The stuck pod finally goes. What an operator waits out before running
+    /// the reconcile again.
+    pub fn pods_release(&self) {
+        self.lock().pods_linger = false;
+    }
+
+    /// Every delete of `kind` fails, the way one call in a teardown does when
+    /// the API server is having a bad minute. What makes a PARTIAL teardown
+    /// reachable in a test: the loop in `delete` stops at the first error, so
+    /// this decides how far it got.
+    pub fn fail_delete_of(&self, kind: Kind) {
+        self.lock().fail_delete = Some(kind);
     }
 
     /// The next `create` loses a race, the way a second signup for one label
@@ -283,6 +309,27 @@ impl Cluster for MockCluster {
         Ok(())
     }
 
+    /// A dry run stores nothing and records nothing: the tests that assert an
+    /// exact list of applies must not see a drift report in it.
+    ///
+    /// The answer is the render itself, put through [`persist`] so it comes
+    /// back shaped the way a stored one would be. A real API server would also
+    /// default and merge it, which is the whole reason the drift path asks the
+    /// server rather than diffing the render directly - so a clean tenant's
+    /// diff here is a diff of two renders, and the merge semantics are held to
+    /// [`crate::drift::diff_spec`]'s own tests instead.
+    async fn apply_deployment_dry_run(
+        &self,
+        deployment: Deployment,
+    ) -> Result<Deployment, ClusterError> {
+        let ready = self.lock().ready;
+        let Object::Deployment(deployment) = persist(Object::Deployment(Box::new(deployment)), ready)
+        else {
+            unreachable!("persist does not change an object's kind")
+        };
+        Ok(*deployment)
+    }
+
     async fn create(&self, object: Object) -> Result<(), ClusterError> {
         if self.lock().create_loses_race || self.exists(object.kind(), object.name()) {
             return Err(ClusterError::AlreadyExists);
@@ -334,8 +381,21 @@ impl Cluster for MockCluster {
         })
     }
 
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
+        if !self.lock().reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        Ok(match self.object(Kind::Service, name) {
+            Some(Object::Service(service)) => Some(*service),
+            _ => None,
+        })
+    }
+
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
         let mut inner = self.lock();
+        if inner.fail_delete == Some(kind) {
+            return Err(ClusterError::NoPod);
+        }
         inner.deleted.push((kind, name.to_string()));
         inner.objects.remove(&(kind, name.to_string()));
         Ok(())
@@ -352,6 +412,16 @@ impl Cluster for MockCluster {
             .find_map(|part| part.strip_prefix("app.kubernetes.io/instance="))
             .ok_or(ClusterError::NoPod)?;
         Ok(format!("{instance}-abc123"))
+    }
+
+    /// The mock keeps no pods, so a deleted Deployment has taken its pod with
+    /// it by the time anyone asks: the ordinary case, answered immediately.
+    /// [`MockCluster::pods_linger`] is the other one.
+    async fn pods_gone(&self, _selector: &str, within: Duration) -> Result<(), ClusterError> {
+        if self.lock().pods_linger {
+            return Err(ClusterError::Timeout(within));
+        }
+        Ok(())
     }
 
     async fn exec(&self, pod: &str, argv: &[String]) -> Result<ExecOutput, ClusterError> {

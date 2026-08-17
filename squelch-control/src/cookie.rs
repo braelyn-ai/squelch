@@ -214,12 +214,7 @@ pub fn verify(key: &[u8], value: &str, now_unix: i64) -> Option<SessionClaim> {
 /// and it is inside [`ADMIN_COOKIE_TTL_SECS`]. The `aud` check is what makes a
 /// signup cookie's payload, signed with this very key, useless here; the
 /// fingerprint check is what makes rotating the token sign everybody out.
-pub fn verify_admin(
-    key: &[u8],
-    token: &str,
-    value: &str,
-    now_unix: i64,
-) -> Option<AdminClaim> {
+pub fn verify_admin(key: &[u8], token: &str, value: &str, now_unix: i64) -> Option<AdminClaim> {
     let payload = authentic_payload(key, value)?;
     let claim: AdminClaim = serde_json::from_slice(&payload).ok()?;
     if claim.aud != ADMIN_AUD || claim.tfp != token_fingerprint(token) {
@@ -503,7 +498,12 @@ mod tests {
         let v = sign_admin(KEY, &AdminClaim::new(TOKEN, 1_000_000));
         assert!(verify_admin(KEY, TOKEN, &v, 1_000_000).is_some());
         assert_eq!(
-            verify_admin(KEY, "a different token, just as long as the other", &v, 1_000_000),
+            verify_admin(
+                KEY,
+                "a different token, just as long as the other",
+                &v,
+                1_000_000
+            ),
             None
         );
     }

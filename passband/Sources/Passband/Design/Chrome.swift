@@ -8,6 +8,28 @@
 
 import SwiftUI
 
+// MARK: - the top bar
+
+/// The strip a page's own header occupies, measured from the TRUE top of the
+/// window.
+///
+/// macOS keeps roughly the first 32pt of a window clear for the traffic lights
+/// and SwiftUI insets the whole app below it, which used to leave every page
+/// wearing a band of empty backdrop above its own title. The header goes up
+/// there instead — level with the buttons, the way a browser puts its tab strip
+/// — and the RAIL is what yields: it starts at this line rather than at the
+/// window's edge, so nothing but the dots is ever in the strip.
+///
+/// ONE height for every page, because the rail's top edge is cut to it: a page
+/// whose header ran taller or shorter would leave the rail's edge hanging in
+/// mid-air beside that page's rule instead of continuing it.
+enum TopBar {
+    /// Deep enough for the wordmark line the sitrep sets in 19pt serif, and
+    /// close enough to the buttons' own centre (y 16) that a title beside them
+    /// reads as being ON their line rather than under it.
+    static let height: CGFloat = 40
+}
+
 // MARK: - rules
 
 /// The 0.5pt rule dividing a header from what it heads. Ink-side (see

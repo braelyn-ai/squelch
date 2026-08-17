@@ -5,12 +5,7 @@
 //! response, never in a URL path (hence unregister POSTs it in a body).
 //! Registration is IDEMPOTENT — iOS hands the app its token on every launch.
 
-use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use squelch_core::store::{Device, Store};

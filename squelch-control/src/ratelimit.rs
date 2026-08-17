@@ -386,7 +386,10 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         assert_eq!(client_ip(&h, ip(1), 0), ip(1));
-        assert_eq!(client_ip(&h, ip(1), 1), "1.2.3.4".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            client_ip(&h, ip(1), 1),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
     }
 
     /// With one trusted hop, entries the caller stuffed to the LEFT shift
@@ -398,8 +401,14 @@ mod tests {
             "x-forwarded-for",
             "9.9.9.9, 8.8.8.8, 1.2.3.4".parse().unwrap(),
         );
-        assert_eq!(client_ip(&h, ip(1), 1), "1.2.3.4".parse::<IpAddr>().unwrap());
-        assert_eq!(client_ip(&h, ip(1), 2), "8.8.8.8".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            client_ip(&h, ip(1), 1),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(&h, ip(1), 2),
+            "8.8.8.8".parse::<IpAddr>().unwrap()
+        );
         // More hops asserted than entries present: fall back to the peer rather
         // than reading something the caller wrote.
         assert_eq!(client_ip(&h, ip(1), 4), ip(1));
@@ -408,7 +417,10 @@ mod tests {
     #[test]
     fn parses_the_forwarded_forms_proxies_actually_write() {
         assert_eq!(parse_entry("1.2.3.4"), Some("1.2.3.4".parse().unwrap()));
-        assert_eq!(parse_entry("1.2.3.4:5678"), Some("1.2.3.4".parse().unwrap()));
+        assert_eq!(
+            parse_entry("1.2.3.4:5678"),
+            Some("1.2.3.4".parse().unwrap())
+        );
         assert_eq!(parse_entry("[::1]"), Some("::1".parse().unwrap()));
         assert_eq!(parse_entry("[::1]:80"), Some("::1".parse().unwrap()));
         assert_eq!(parse_entry("unknown"), None);

@@ -139,12 +139,15 @@ Two things about tenant pods that are by design and will surprise you anyway:
 
 - **Existing tenants do not move on their own.** The warden is not a
   controller; it writes objects at provision time only. Changing
-  `SQUELCH_WARDEN_IMAGE` affects NEW tenants. Rolling an existing tenant is
-  per tenant: `PUT /v1/tenants/<label>/credentials` converges a `failed` or
-  `stopped` tenant; an `active` tenant returns 409 and needs
-  `DELETE` + re-provision (SETUP.md "Operating notes", upgrade section). This
-  also means object-shape changes (new env vars, ports, NetworkPolicy rules,
-  Ingress prefixes) reach existing tenants only on re-apply. Budget for it.
+  `SQUELCH_WARDEN_IMAGE`, or any object-shape change (new env vars, ports,
+  NetworkPolicy rules, Ingress prefixes), affects NEW tenants until somebody
+  asks for the rest. Asking is per tenant, from the control service:
+  `squelch-control drift` lists who is behind and `squelch-control reconcile
+  <label>` re-applies one label from today's code, waiting for a ready pod
+  before it answers. It takes `active` and `failed`; `pending` and `stopped`
+  come back `409` and still want `PUT /v1/tenants/<label>/credentials`
+  (SETUP.md "Operating notes", upgrade section). Budget one pass over the
+  tenant list per release that changes tenant shape.
 - **`imagePullPolicy: IfNotPresent` + a tag the node has seen = no pull.**
   Roll forward with a new tag, not by moving an old one.
 
@@ -169,6 +172,36 @@ Post-rollout verification, per tenant:
   `kubectl -n tenants get pod <label>-... -o jsonpath='{..image}'`, or scrape
   `squelchd_build_info` off port 9464 from the monitoring namespace.
 - `curl -sS https://<tenant-host>/client/stats` with a bearer -> 200.
+- `squelch-control drift <label>` comes back with nothing in either list. A
+  Ready pod only proves something started; this proves it is the thing this
+  release renders.
+
+**The first time `drift` is ever run against this cluster, treat its output as
+unproven.** Its whole test suite runs against a mock with no server-side-apply
+merge in it, so four things are only assertions until a real API server has
+answered them. Check them once, on one tenant, and then trust the command:
+
+1. **A freshly provisioned tenant reports zero changes.** Both sides of the
+   diff come back from the API server, so defaulting should cancel out — but
+   `Quantity` canonicalization (`1Gi` vs `1073741824`), `creationTimestamp:
+   null` on the pod template, and defaulted `protocol` / `dnsPolicy` /
+   `schedulerName` are the candidates for a permanent false positive. If one
+   shows up on every tenant, that field wants filtering, not reconciling.
+2. **A hand edit lands in `foreign` and NOT in `changes`.** `kubectl set env`
+   something harmless onto a scratch tenant. The field survives the dry-run
+   merge on both sides, so the ledger is the only half that should see it. If
+   it shows up in `changes` instead, the dry run is not merging and the whole
+   two-detector split needs rethinking.
+3. **An overwrite of a field the warden DOES declare lands in `changes`.**
+   `kubectl set image` on the same scratch tenant: expect `live` = the hand-set
+   tag, `rendered` = `SQUELCH_WARDEN_IMAGE`, and no `409` out of the dry run.
+4. **A recreate really does empty the ledger.** After a `reconcile` that
+   answers `recreated`, `kubectl -n tenants get deploy <label> --show-managed-
+   fields -o yaml` should carry exactly one manager entry, `squelch-warden`.
+   That is the claim the entire route rests on.
+
+Then delete the scratch tenant. Doing this on a tenant with real mail in it is
+how a verification becomes an incident.
 
 ## Surface 3: Passband for Mac (`passband-mac-*` tag)
 
@@ -286,5 +319,9 @@ roll the carrier promptly.
    publish it. Do not delete it from containerd until a `daemon-*` tag is cut
    and `20-warden.yaml` is repointed at a tag the registry actually holds
    (PRODUCTION.md, registry-gap note).
-5. There is no fleet-upgrade lever for tenants; every daemon rollout is
-   O(tenants) manual re-applies until a reconcile loop exists.
+5. There is no fleet-upgrade lever for tenants, and there is not going to be
+   one: a daemon rollout is `squelch-control drift` to see who is behind, then
+   `squelch-control reconcile <label>` per tenant, one at a time, verified as
+   you go. O(tenants) by design — a loop that re-applies to the whole fleet is
+   a loop that takes every mailbox down on one bad render. What is genuinely
+   missing is anything that RUNS the fleet drift check on a schedule.

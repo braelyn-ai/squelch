@@ -490,6 +490,7 @@ fn reingest_preserves_llm_classification_but_refreshes_heuristic_rows() {
             field_reasons: crate::types::FieldReasons::default(),
             stage1_model_used: "claude-haiku-4-5".into(),
             needs_stage2: false,
+            escalation_reason: None,
             deadline: None,
             category: Some("general".into()),
         })

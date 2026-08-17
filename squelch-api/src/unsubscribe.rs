@@ -95,11 +95,19 @@ fn anchors(html: &str) -> Vec<(String, String)> {
             i = tag_start + 2;
             continue;
         }
-        let Some(rel_gt) = lower[tag_start..].find('>') else { break };
+        let Some(rel_gt) = lower[tag_start..].find('>') else {
+            break;
+        };
         let tag_end = tag_start + rel_gt;
-        let href = attr_value(&html[tag_start..tag_end], &lower[tag_start..tag_end], "href");
+        let href = attr_value(
+            &html[tag_start..tag_end],
+            &lower[tag_start..tag_end],
+            "href",
+        );
         // Unclosed anchors are skipped rather than run to end-of-document.
-        let Some(rel_close) = lower[tag_end..].find("</a") else { break };
+        let Some(rel_close) = lower[tag_end..].find("</a") else {
+            break;
+        };
         let close = tag_end + rel_close;
         if let Some(href) = href {
             out.push((href, strip_tags(&html[tag_end + 1..close])));
@@ -117,7 +125,10 @@ fn attr_value(raw: &str, lower: &str, name: &str) -> Option<String> {
         let at = from + rel;
         // Must be preceded by whitespace, so "data-href" never matches "href".
         let ok_before = at == 0
-            || matches!(lower.as_bytes()[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'');
+            || matches!(
+                lower.as_bytes()[at - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\''
+            );
         let rest = lower[at + name.len()..].trim_start();
         if ok_before && rest.starts_with('=') {
             let eq = lower[at + name.len()..].find('=')? + at + name.len();
@@ -193,7 +204,9 @@ mod tests {
         let h = "<mailto:u@x.com>, <https://x.com/u/1>";
         assert_eq!(
             classify_unsubscribe(Some(h)),
-            UnsubPlan::Browser { url: "https://x.com/u/1".into() }
+            UnsubPlan::Browser {
+                url: "https://x.com/u/1".into()
+            }
         );
     }
 
@@ -202,7 +215,9 @@ mod tests {
         let h = "<http://x.com/u/1>";
         assert_eq!(
             classify_unsubscribe(Some(h)),
-            UnsubPlan::Browser { url: "http://x.com/u/1".into() }
+            UnsubPlan::Browser {
+                url: "http://x.com/u/1".into()
+            }
         );
     }
 
@@ -211,7 +226,9 @@ mod tests {
         let h = "<https://a.com/1>, <https://b.com/2>";
         assert_eq!(
             classify_unsubscribe(Some(h)),
-            UnsubPlan::Browser { url: "https://a.com/1".into() }
+            UnsubPlan::Browser {
+                url: "https://a.com/1".into()
+            }
         );
     }
 
@@ -325,8 +342,10 @@ mod tests {
     #[test]
     fn absent_body_and_absurd_urls_are_none() {
         assert_eq!(classify_unsubscribe_body(None), UnsubPlan::None);
-        let long = format!(r#"<a href="https://x.com/{}">unsubscribe</a>"#, "a".repeat(5000));
+        let long = format!(
+            r#"<a href="https://x.com/{}">unsubscribe</a>"#,
+            "a".repeat(5000)
+        );
         assert_eq!(classify_unsubscribe_body(Some(&long)), UnsubPlan::None);
     }
-
 }

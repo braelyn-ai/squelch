@@ -109,9 +109,21 @@ CREATE TABLE IF NOT EXISTS triage (
     -- 'rule' when a sender rule already decided the row (no model spend), or
     -- 'heuristic-only' when the pass fell back to the seed.
     stage1_model_used TEXT,
-    -- Set to 1 by the Stage-1 pass (confident=false), or at ingest for a Filtered
-    -- rule needing want_text evaluation, to mark the row for Stage-2 escalation.
+    -- Set to 1 by `triage::router::should_escalate` over the Stage-1 verdict, or
+    -- at ingest for a Filtered rule needing want_text evaluation, to mark the row
+    -- for Stage-2 escalation.
     needs_stage2    INTEGER NOT NULL DEFAULT 0,
+    -- How many times this row has been RE-EVALUATED (see `triage_revisits`).
+    -- Bounded by `RevisitConfig::max_per_message_lifetime` so a verdict that
+    -- keeps answering "check again tomorrow" terminates instead of billing
+    -- forever.
+    revisit_count   INTEGER NOT NULL DEFAULT 0,
+    -- WHICH router arm escalated the row ('buried_bill' | 'unverified_urgency' |
+    -- 'scam_shape' | 'exception' | 'invoice' | 'sender_corrected' | 'boundary' |
+    -- 'model_unsure'). NULL when the row did not escalate. Stored so the
+    -- escalation MIX can be inspected: the arms are the design, and tuning them
+    -- blind to which one fires is guesswork.
+    escalation_reason TEXT,
     -- STAGE-2 LLM marker. NULL = not yet Stage-2 processed. The Stage-2 queue
     -- predicate is `stage1_model_used IS NOT NULL AND needs_stage2=1 AND
     -- model_used IS NULL AND sensitivity='normal'`.
@@ -488,6 +500,37 @@ CREATE TABLE IF NOT EXISTS triage_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_triage_feedback_at
     ON triage_feedback(account_id, corrected_at);
+
+-- SCHEDULED RE-EVALUATIONS. A verdict is true as of a moment, and some mail
+-- stops mattering when a date passes (see `crate::triage::revisit`). Each row is
+-- one future point at which a message should be scored again.
+--
+-- Rows are APPEND-ONLY and fired at most once: `fired_at` moves NULL -> a
+-- timestamp and the row is never deleted, so the schedule doubles as the audit
+-- trail of why a message's verdict changed after the fact. The pass reads
+-- `fired_at IS NULL AND revisit_at <= now`, which is exactly the index below.
+CREATE TABLE IF NOT EXISTS triage_revisits (
+    id         INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    -- When to look again (RFC3339 UTC).
+    revisit_at TEXT NOT NULL,
+    -- Short reason, shown back to the model on re-evaluation. MODEL-AUTHORED for
+    -- source='model', therefore untrusted text: neutralized before it renders
+    -- inside any prompt.
+    reason     TEXT NOT NULL,
+    -- 'model' (the classifier named the date) | 'deadline' | 'fye_stale' (both
+    -- automatic; see `crate::triage::revisit::RevisitSource`).
+    source     TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    -- NULL while pending; stamped when the revisit pass consumes the row.
+    fired_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_triage_revisits_due
+    ON triage_revisits(account_id, fired_at, revisit_at);
+CREATE INDEX IF NOT EXISTS idx_triage_revisits_msg
+    ON triage_revisits(account_id, message_id);
 
 -- Gmail sync cursor, keyed by a logical mailbox string. Exactly one row is
 -- stored, keyed mailbox='history': uidvalidity is unused (0) and last_uid holds

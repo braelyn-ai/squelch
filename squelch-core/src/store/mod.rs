@@ -421,8 +421,52 @@ pub struct Stage2Queued {
     /// The matched Filtered rule's `want_text`, presented in the TRUSTED CONTEXT
     /// block as the account owner's standing instruction for this sender.
     pub rule_want_text: Option<String>,
+    /// WHY the router escalated this row
+    /// ([`crate::triage::router::EscalationReason::as_str`]). Shown to the
+    /// model, because "look harder" without saying at what is a worse question
+    /// than the one Stage-1 already answered.
+    pub escalation_reason: Option<String>,
+    /// What this sender's mail has historically been worth to the account owner.
+    pub sender_history: SenderHistory,
+    /// Other messages in the same thread, oldest first. SEALED SIBLINGS ARE
+    /// EXCLUDED IN SQL: a sealed message's subject must never reach a model,
+    /// including as another row's context.
+    pub thread: Vec<ThreadSibling>,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
+}
+
+/// How the account owner has treated this sender before. Aggregates, not
+/// content: a count of prior mail, how much of it surfaced, and how often they
+/// overrode the verdict — the cheapest honest answer to "is this sender someone
+/// we get right?"
+#[derive(Debug, Clone, Default)]
+pub struct SenderHistory {
+    /// Prior non-sealed, inbound messages from this address.
+    pub total: i64,
+    /// How many landed at signal or in the standing band.
+    pub surfaced: i64,
+    /// How many the account owner corrected by hand.
+    pub corrected: i64,
+}
+
+/// One other message in the escalated row's thread. Verdict and envelope only,
+/// never a body: the point is whether the owner is IN this conversation, which
+/// the metadata answers without a second body's worth of tokens or a second
+/// body's worth of injection surface.
+#[derive(Debug, Clone)]
+pub struct ThreadSibling {
+    pub from_addr: String,
+    pub subject: String,
+    /// UNTRUSTED: model-authored from email content, neutralized before it
+    /// renders in a prompt.
+    pub one_line: String,
+    pub tier: Tier,
+    pub received_at: DateTime<Utc>,
+    /// `true` when this sibling is the account owner's own message — the single
+    /// most useful bit in the thread, since a conversation the owner has replied
+    /// in is one they have already voted for.
+    pub is_sent: bool,
 }
 
 /// The store-facing outcome of applying a parsed Stage-2 result onto a triage
@@ -467,6 +511,45 @@ pub struct Stage1Queued {
     /// `true` if the sender is a Sent-derived contact. Feeds the TRUSTED CONTEXT
     /// block and gates the unknown-sender deadline cap.
     pub is_known_contact: bool,
+    /// `true` if the account owner has ever corrected a triage verdict for this
+    /// sender address. Feeds [`crate::triage::router::EscalationReason::SenderCorrected`]:
+    /// a human override is the strongest evidence in the system that a sender is
+    /// one we get wrong, so their next message earns the harder look.
+    pub sender_corrected: bool,
+    /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
+    pub sensitivity: Sensitivity,
+}
+
+/// One message whose scheduled re-evaluation has come due. Carries the PRIOR
+/// verdict, because the re-classification's whole job is to answer "does this
+/// still hold?" and it cannot do that without knowing what it is revising.
+///
+/// The queue predicate excludes sealed rows, sent mail, rows past their revisit
+/// budget, and — critically — rows the account owner has corrected by hand.
+#[derive(Debug, Clone)]
+pub struct RevisitQueued {
+    /// The `triage_revisits` row id, stamped fired when this is consumed.
+    pub revisit_id: i64,
+    pub message_id: i64,
+    pub account_id: AccountId,
+    pub thread_id: String,
+    pub from_addr: String,
+    pub subject: String,
+    pub body: String,
+    pub received_at: DateTime<Utc>,
+    /// When this revisit was scheduled for (not when it fired).
+    pub revisit_at: DateTime<Utc>,
+    /// Why it was scheduled. UNTRUSTED for `source == "model"`.
+    pub reason: String,
+    /// `model` | `deadline` | `fye_stale`.
+    pub source: String,
+    pub prior_tier: Tier,
+    pub prior_importance: u8,
+    /// The prior one-liner. Model-authored from untrusted email; neutralized
+    /// before it renders in a prompt.
+    pub prior_one_line: String,
+    pub is_known_contact: bool,
+    pub sender_corrected: bool,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
 }
@@ -487,9 +570,13 @@ pub struct Stage1Applied {
     pub field_reasons: FieldReasons,
     /// The Stage-1 model id to stamp `stage1_model_used` with.
     pub stage1_model_used: String,
-    /// `true` when the model was not confident: sets `needs_stage2=1` so the
-    /// Stage-2 queue predicate picks the row up.
+    /// `true` when [`crate::triage::router::should_escalate`] found a reason:
+    /// sets `needs_stage2=1` so the Stage-2 queue predicate picks the row up.
     pub needs_stage2: bool,
+    /// The routing reason's slug, stored so the escalation MIX is inspectable
+    /// after the fact. Tuning the router without knowing which arm is firing is
+    /// guesswork, and the arms are the whole design.
+    pub escalation_reason: Option<&'static str>,
     /// A deadline to (re)write for this message, if the model extracted one.
     pub deadline: Option<DeadlineHit>,
     /// Routing category (`general` | `invoice` | `banking_statement` |
@@ -1498,6 +1585,60 @@ pub trait Store: Send + Sync {
         message_id: i64,
         stage1_model_used: &str,
     ) -> Result<()>;
+
+    // ---- REVISITS (see `crate::triage::revisit`) --------------------------
+
+    /// Replace a message's PENDING scheduled re-evaluations with `requests`.
+    /// Already-fired rows are left as history. A sealed row stores nothing:
+    /// firing a revisit would put sealed mail back in front of a model.
+    fn revisits_schedule(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        requests: &[crate::triage::revisit::RevisitRequest],
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Up to `limit` revisits that have come due, oldest first. Excludes sealed
+    /// rows, sent mail, rows at or past `max_lifetime` re-evaluations, and any
+    /// message the account owner has corrected by hand.
+    fn revisit_queue(
+        &self,
+        account_id: AccountId,
+        now: DateTime<Utc>,
+        max_lifetime: u32,
+        limit: usize,
+    ) -> Result<Vec<RevisitQueued>>;
+
+    /// Stamp a revisit fired and charge the message's lifetime counter. Called
+    /// even when the re-classification failed, so a broken row cannot be retried
+    /// every cycle forever. Idempotent: guarded on `fired_at IS NULL`.
+    fn revisit_mark_fired(
+        &self,
+        account_id: AccountId,
+        revisit_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Message ids in the standing band, older than `older_than`, not done, with
+    /// no revisit pending and no human correction: the automatic staleness
+    /// sweep's candidates.
+    fn revisit_stale_standing(
+        &self,
+        account_id: AccountId,
+        older_than: DateTime<Utc>,
+        max_lifetime: u32,
+        limit: usize,
+    ) -> Result<Vec<i64>>;
+
+    /// Apply a re-evaluated verdict: [`Store::stage1_apply`]'s write, plus
+    /// clearing `model_used` so a newly escalated row can re-enter the Stage-2
+    /// queue, and refusing any row carrying a human correction.
+    ///
+    /// `false` means the guarded UPDATE matched nothing — the row was sealed or
+    /// corrected between the queue read and the apply — and the caller must
+    /// treat the verdict as NOT landed.
+    fn revisit_apply(&self, applied: &Stage1Applied) -> Result<bool>;
 
     /// Bump the Stage-1 usage ledger for `(account_id, day)`: +1 call plus the
     /// response's token counts. Kept separate from Stage-2's ledger.

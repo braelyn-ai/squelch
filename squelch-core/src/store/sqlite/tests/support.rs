@@ -324,8 +324,9 @@ pub(super) fn apply_category(
             one_line: "categorized".into(),
             reason: "stage-1".into(),
             field_reasons: crate::types::FieldReasons::default(),
-            stage1_model_used: "claude-haiku-4-5".into(),
+            stage1_model_used: "claude-opus-5".into(),
             needs_stage2,
+            escalation_reason: needs_stage2.then_some("boundary"),
             deadline: None,
             category: Some(category.into()),
         })

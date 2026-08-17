@@ -39,6 +39,96 @@ fn bump_usage_category(
     Ok(())
 }
 
+/// How many thread siblings an escalated row carries into the prompt. Bounded
+/// because a 200-message mailing-list thread is not context, it is a bill.
+const STAGE2_THREAD_CONTEXT_LIMIT: usize = 8;
+
+/// Aggregate this sender's track record: how much of their mail has surfaced,
+/// and how often the account owner overruled the verdict. Counts only — no
+/// subject, no body, nothing that could carry an instruction.
+fn sender_history_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    from_addr: &str,
+    exclude_message_id: i64,
+) -> Result<SenderHistory> {
+    // The row under judgement is excluded. Counting it would report "1 previous
+    // message" for a sender who has never written before, which is the opposite
+    // of the fact this field exists to convey.
+    let (total, surfaced): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN t.tier IN ('signal','deadline','past_due')
+                                  THEN 1 ELSE 0 END), 0)
+         FROM messages m
+         JOIN triage t ON t.message_id = m.id
+         WHERE m.account_id = ?1
+           AND m.from_addr = ?2 COLLATE NOCASE
+           AND m.id != ?3
+           AND m.is_sent = 0
+           AND t.sensitivity = 'normal'",
+        params![account_id, from_addr, exclude_message_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let corrected: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM triage_feedback
+         WHERE account_id = ?1 AND sender = ?2 COLLATE NOCASE",
+        params![account_id, from_addr],
+        |r| r.get(0),
+    )?;
+    Ok(SenderHistory {
+        total,
+        surfaced,
+        corrected,
+    })
+}
+
+/// The rest of a thread, oldest first, verdict and envelope only.
+///
+/// SEALED SIBLINGS ARE EXCLUDED IN SQL. A sealed message's subject is exactly as
+/// forbidden to a model as its body, and "it was only context for another row"
+/// is not an exception — see docs/SECURITY.md. Sent siblings ARE included, and
+/// are the most valuable rows here: a thread the owner has replied in is one
+/// they have already voted for.
+fn thread_siblings_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    thread_id: &str,
+    exclude_message_id: i64,
+    limit: usize,
+) -> Result<Vec<ThreadSibling>> {
+    if thread_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT m.from_addr, m.subject, COALESCE(t.one_line, ''), COALESCE(t.tier, 'noise'),
+                m.received_at, m.is_sent
+         FROM messages m
+         JOIN triage t ON t.message_id = m.id
+         WHERE m.account_id = ?1
+           AND m.thread_id = ?2
+           AND m.id != ?3
+           AND t.sensitivity = 'normal'
+         ORDER BY m.received_at ASC
+         LIMIT ?4",
+    )?;
+    let out = stmt
+        .query_map(
+            params![account_id, thread_id, exclude_message_id, limit as i64],
+            |r| {
+                Ok(ThreadSibling {
+                    from_addr: r.get(0)?,
+                    subject: r.get(1)?,
+                    one_line: r.get(2)?,
+                    tier: Tier::parse(&r.get::<_, String>(3)?).unwrap_or(Tier::Noise),
+                    received_at: dt(r, 4)?,
+                    is_sent: r.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(out)
+}
+
 /// Sum the ledger for `(account, category)` over every day `>= since_day`.
 fn usage_since_category(
     conn: &Connection,
@@ -356,7 +446,12 @@ impl SqliteStore {
                         WHERE c.account_id = m.account_id
                           AND c.addr = m.from_addr COLLATE NOCASE
                           AND c.sent_count > 0
-                    ) AS is_known
+                    ) AS is_known,
+                    EXISTS(
+                        SELECT 1 FROM triage_feedback f
+                        WHERE f.account_id = m.account_id
+                          AND f.sender = m.from_addr COLLATE NOCASE
+                    ) AS sender_corrected
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
@@ -378,6 +473,7 @@ impl SqliteStore {
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(5)?),
                     received_at: dt(r, 6)?,
                     is_known_contact: r.get::<_, i64>(7)? != 0,
+                    sender_corrected: r.get::<_, i64>(8)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -406,7 +502,8 @@ impl SqliteStore {
                  stage1_model_used = ?8,
                  needs_stage2 = ?9,
                  field_reasons = ?10,
-                 category = COALESCE(?11, category)
+                 category = COALESCE(?11, category),
+                 escalation_reason = ?12
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
             params![
                 applied.message_id,
@@ -420,12 +517,292 @@ impl SqliteStore {
                 applied.needs_stage2 as i64,
                 field_reasons_json,
                 applied.category,
+                applied.escalation_reason,
             ],
         )?;
         // TOCTOU: a row sealed by hand between the queue SELECT and this apply
         // makes the guard match nothing. The verdict did NOT land, so skip the
         // deadlines rewrite too — a sealed message must not grow a fresh deadline
         // row — and report `false` so the caller emits no event.
+        if n > 0 {
+            rewrite_deadline_conn(
+                &tx,
+                applied.account_id,
+                applied.message_id,
+                applied.deadline.as_ref(),
+            )?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    // ---- REVISITS ---------------------------------------------------------
+
+    /// Store a message's planned re-evaluations, replacing any still-PENDING
+    /// ones. Replacing rather than appending is what keeps a re-triaged row from
+    /// accumulating a backlog of stale schedules from every prior verdict; rows
+    /// already FIRED are left alone, because those are history.
+    pub(super) fn revisits_schedule(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        requests: &[crate::triage::revisit::RevisitRequest],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM triage_revisits
+             WHERE account_id = ?1 AND message_id = ?2 AND fired_at IS NULL",
+            params![account_id, message_id],
+        )?;
+        // A SEALED row must never carry a schedule: firing one would put the
+        // message back in front of a model. The guard lives here rather than at
+        // the call site so no future caller can route around it.
+        let sealed: bool = tx
+            .query_row(
+                "SELECT sensitivity != 'normal' FROM triage
+                 WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v != 0)
+            .unwrap_or(true);
+        if !sealed {
+            for r in requests {
+                tx.execute(
+                    "INSERT INTO triage_revisits
+                         (account_id, message_id, revisit_at, reason, source, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        account_id,
+                        message_id,
+                        r.at.to_rfc3339(),
+                        r.why,
+                        r.source.as_str(),
+                        now.to_rfc3339(),
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Revisits that have come due: pending, past their date, on a NON-SEALED
+    /// row that has not exhausted its lifetime budget and that the account owner
+    /// has not corrected by hand.
+    ///
+    /// The human-correction exclusion is the important one. A revisit rewrites a
+    /// verdict, and a verdict the owner personally fixed is the one thing in
+    /// this system a model may never overwrite.
+    pub(super) fn revisit_queue(
+        &self,
+        account_id: AccountId,
+        now: DateTime<Utc>,
+        max_lifetime: u32,
+        limit: usize,
+    ) -> Result<Vec<RevisitQueued>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT v.id, m.id, m.thread_id, m.from_addr, m.subject, m.body,
+                    t.sensitivity, m.received_at, v.revisit_at, v.reason, v.source,
+                    t.tier, t.importance, t.one_line,
+                    EXISTS(
+                        SELECT 1 FROM contacts c
+                        WHERE c.account_id = m.account_id
+                          AND c.addr = m.from_addr COLLATE NOCASE
+                          AND c.sent_count > 0
+                    ) AS is_known,
+                    EXISTS(
+                        SELECT 1 FROM triage_feedback f
+                        WHERE f.account_id = m.account_id
+                          AND f.sender = m.from_addr COLLATE NOCASE
+                    ) AS sender_corrected
+             FROM triage_revisits v
+             JOIN triage t   ON t.message_id = v.message_id AND t.account_id = v.account_id
+             JOIN messages m ON m.id = v.message_id
+             WHERE v.account_id = ?1
+               AND v.fired_at IS NULL
+               AND v.revisit_at <= ?2
+               AND t.sensitivity = 'normal'
+               AND t.revisit_count < ?3
+               AND m.is_sent = 0
+               AND NOT EXISTS(
+                   SELECT 1 FROM triage_feedback f2
+                   WHERE f2.account_id = v.account_id AND f2.message_id = v.message_id
+               )
+             ORDER BY v.revisit_at ASC
+             LIMIT ?4",
+        )?;
+        let out = stmt
+            .query_map(
+                params![
+                    account_id,
+                    now.to_rfc3339(),
+                    max_lifetime as i64,
+                    limit as i64
+                ],
+                |r| {
+                    Ok(RevisitQueued {
+                        revisit_id: r.get(0)?,
+                        message_id: r.get(1)?,
+                        account_id,
+                        thread_id: r.get(2)?,
+                        from_addr: r.get(3)?,
+                        subject: r.get(4)?,
+                        body: r.get(5)?,
+                        sensitivity: Sensitivity::parse(&r.get::<_, String>(6)?),
+                        received_at: dt(r, 7)?,
+                        revisit_at: dt(r, 8)?,
+                        reason: r.get(9)?,
+                        source: r.get(10)?,
+                        // An unparseable stored tier reads as Noise: the revisit
+                        // is about to overwrite it anyway, and a nonsense value
+                        // must not abort the whole queue read.
+                        prior_tier: Tier::parse(&r.get::<_, String>(11)?).unwrap_or(Tier::Noise),
+                        prior_importance: r.get::<_, i64>(12)?.clamp(0, 100) as u8,
+                        prior_one_line: r.get(13)?,
+                        is_known_contact: r.get::<_, i64>(14)? != 0,
+                        sender_corrected: r.get::<_, i64>(15)? != 0,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// Stamp a revisit as fired and charge it against the message's lifetime
+    /// budget. Called whether or not the re-classification produced a new
+    /// verdict: a revisit that failed still happened, and leaving it pending
+    /// would retry it every cycle forever.
+    pub(super) fn revisit_mark_fired(
+        &self,
+        account_id: AccountId,
+        revisit_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        // Guarded on `fired_at IS NULL` so a double-fire cannot double-charge
+        // the lifetime counter.
+        let n = tx.execute(
+            "UPDATE triage_revisits SET fired_at = ?3
+             WHERE id = ?2 AND account_id = ?1 AND fired_at IS NULL",
+            params![account_id, revisit_id, now.to_rfc3339()],
+        )?;
+        if n > 0 {
+            tx.execute(
+                "UPDATE triage SET revisit_count = revisit_count + 1
+                 WHERE account_id = ?1
+                   AND message_id = (SELECT message_id FROM triage_revisits WHERE id = ?2)",
+                params![account_id, revisit_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rows sitting in the standing band with nothing pending and no action
+    /// taken: after long enough, a row is either misfiled or finished, and both
+    /// deserve another look. Returns message ids to schedule an immediate
+    /// [`RevisitSource::FyeStale`](crate::triage::revisit::RevisitSource::FyeStale)
+    /// revisit for.
+    pub(super) fn revisit_stale_standing(
+        &self,
+        account_id: AccountId,
+        older_than: DateTime<Utc>,
+        max_lifetime: u32,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.message_id
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1
+               AND t.sensitivity = 'normal'
+               AND t.tier IN ('past_due', 'deadline')
+               AND t.status != 'done'
+               AND t.stage1_model_used IS NOT NULL
+               AND t.revisit_count < ?3
+               AND m.is_sent = 0
+               AND m.received_at <= ?2
+               AND NOT EXISTS(
+                   SELECT 1 FROM triage_revisits v
+                   WHERE v.account_id = t.account_id
+                     AND v.message_id = t.message_id
+                     AND v.fired_at IS NULL
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM triage_feedback f
+                   WHERE f.account_id = t.account_id AND f.message_id = t.message_id
+               )
+             ORDER BY m.received_at ASC
+             LIMIT ?4",
+        )?;
+        let out = stmt
+            .query_map(
+                params![
+                    account_id,
+                    older_than.to_rfc3339(),
+                    max_lifetime as i64,
+                    limit as i64
+                ],
+                |r| r.get::<_, i64>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// Apply a re-evaluated verdict. Same write as [`Self::stage1_apply`] plus
+    /// two things only a revisit needs: `model_used` is CLEARED so a newly
+    /// escalated row can re-enter the Stage-2 queue (its old Stage-2 marker
+    /// describes a verdict that no longer exists), and the guard also refuses a
+    /// row the owner has corrected by hand.
+    pub(super) fn revisit_apply(&self, applied: &Stage1Applied) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
+        let field_reasons_json = if applied.field_reasons.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&applied.field_reasons).ok()
+        };
+        let n = tx.execute(
+            "UPDATE triage SET
+                 importance = ?3,
+                 tier = ?4,
+                 one_line = ?5,
+                 reason = ?6,
+                 deadline = ?7,
+                 stage1_model_used = ?8,
+                 needs_stage2 = ?9,
+                 field_reasons = ?10,
+                 category = COALESCE(?11, category),
+                 escalation_reason = ?12,
+                 model_used = NULL
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'
+               AND NOT EXISTS(
+                   SELECT 1 FROM triage_feedback f
+                   WHERE f.account_id = ?2 AND f.message_id = ?1
+               )",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.importance as i64,
+                applied.tier.as_str(),
+                applied.one_line,
+                applied.reason,
+                deadline_dt,
+                applied.stage1_model_used,
+                applied.needs_stage2 as i64,
+                field_reasons_json,
+                applied.category,
+                applied.escalation_reason,
+            ],
+        )?;
         if n > 0 {
             rewrite_deadline_conn(
                 &tx,
@@ -541,7 +918,8 @@ impl SqliteStore {
                         WHERE c.account_id = m.account_id
                           AND c.addr = m.from_addr COLLATE NOCASE
                           AND c.sent_count > 0
-                    ) AS is_known
+                    ) AS is_known,
+                    t.escalation_reason
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              LEFT JOIN sender_rules sr ON sr.id = t.matched_rule_id
@@ -554,7 +932,7 @@ impl SqliteStore {
              ORDER BY m.received_at DESC
              LIMIT ?2",
         )?;
-        let out = stmt
+        let mut out = stmt
             .query_map(params![account_id, limit as i64], |r| {
                 Ok(Stage2Queued {
                     message_id: r.get(0)?,
@@ -567,9 +945,27 @@ impl SqliteStore {
                     rule_want_text: r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
                     received_at: dt(r, 7)?,
                     is_known_contact: r.get::<_, i64>(8)? != 0,
+                    escalation_reason: r.get::<_, Option<String>>(9)?,
+                    // Filled per row below; both need the row's own identifiers,
+                    // and the batch is `batch_per_cycle` rows, not a table scan.
+                    sender_history: SenderHistory::default(),
+                    thread: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // ---- The context an escalation is actually buying --------------------
+        for row in &mut out {
+            row.sender_history =
+                sender_history_conn(&conn, account_id, &row.from_addr, row.message_id)?;
+            row.thread = thread_siblings_conn(
+                &conn,
+                account_id,
+                &row.thread_id,
+                row.message_id,
+                STAGE2_THREAD_CONTEXT_LIMIT,
+            )?;
+        }
         Ok(out)
     }
 
