@@ -476,6 +476,40 @@ pub struct Stage1Queued {
     pub sensitivity: Sensitivity,
 }
 
+/// One message whose scheduled re-evaluation has come due. Carries the PRIOR
+/// verdict, because the re-classification's whole job is to answer "does this
+/// still hold?" and it cannot do that without knowing what it is revising.
+///
+/// The queue predicate excludes sealed rows, sent mail, rows past their revisit
+/// budget, and — critically — rows the account owner has corrected by hand.
+#[derive(Debug, Clone)]
+pub struct RevisitQueued {
+    /// The `triage_revisits` row id, stamped fired when this is consumed.
+    pub revisit_id: i64,
+    pub message_id: i64,
+    pub account_id: AccountId,
+    pub thread_id: String,
+    pub from_addr: String,
+    pub subject: String,
+    pub body: String,
+    pub received_at: DateTime<Utc>,
+    /// When this revisit was scheduled for (not when it fired).
+    pub revisit_at: DateTime<Utc>,
+    /// Why it was scheduled. UNTRUSTED for `source == "model"`.
+    pub reason: String,
+    /// `model` | `deadline` | `fye_stale`.
+    pub source: String,
+    pub prior_tier: Tier,
+    pub prior_importance: u8,
+    /// The prior one-liner. Model-authored from untrusted email; neutralized
+    /// before it renders in a prompt.
+    pub prior_one_line: String,
+    pub is_known_contact: bool,
+    pub sender_corrected: bool,
+    /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
+    pub sensitivity: Sensitivity,
+}
+
 /// The store-facing outcome of applying a parsed Stage-1 LLM result onto a
 /// triage row: stamps `stage1_model_used` (leaving the Stage-1 queue) and sets
 /// `needs_stage2` (whether the row escalates).
@@ -1507,6 +1541,60 @@ pub trait Store: Send + Sync {
         message_id: i64,
         stage1_model_used: &str,
     ) -> Result<()>;
+
+    // ---- REVISITS (see `crate::triage::revisit`) --------------------------
+
+    /// Replace a message's PENDING scheduled re-evaluations with `requests`.
+    /// Already-fired rows are left as history. A sealed row stores nothing:
+    /// firing a revisit would put sealed mail back in front of a model.
+    fn revisits_schedule(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        requests: &[crate::triage::revisit::RevisitRequest],
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Up to `limit` revisits that have come due, oldest first. Excludes sealed
+    /// rows, sent mail, rows at or past `max_lifetime` re-evaluations, and any
+    /// message the account owner has corrected by hand.
+    fn revisit_queue(
+        &self,
+        account_id: AccountId,
+        now: DateTime<Utc>,
+        max_lifetime: u32,
+        limit: usize,
+    ) -> Result<Vec<RevisitQueued>>;
+
+    /// Stamp a revisit fired and charge the message's lifetime counter. Called
+    /// even when the re-classification failed, so a broken row cannot be retried
+    /// every cycle forever. Idempotent: guarded on `fired_at IS NULL`.
+    fn revisit_mark_fired(
+        &self,
+        account_id: AccountId,
+        revisit_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Message ids in the standing band, older than `older_than`, not done, with
+    /// no revisit pending and no human correction: the automatic staleness
+    /// sweep's candidates.
+    fn revisit_stale_standing(
+        &self,
+        account_id: AccountId,
+        older_than: DateTime<Utc>,
+        max_lifetime: u32,
+        limit: usize,
+    ) -> Result<Vec<i64>>;
+
+    /// Apply a re-evaluated verdict: [`Store::stage1_apply`]'s write, plus
+    /// clearing `model_used` so a newly escalated row can re-enter the Stage-2
+    /// queue, and refusing any row carrying a human correction.
+    ///
+    /// `false` means the guarded UPDATE matched nothing — the row was sealed or
+    /// corrected between the queue read and the apply — and the caller must
+    /// treat the verdict as NOT landed.
+    fn revisit_apply(&self, applied: &Stage1Applied) -> Result<bool>;
 
     /// Bump the Stage-1 usage ledger for `(account_id, day)`: +1 call plus the
     /// response's token counts. Kept separate from Stage-2's ledger.

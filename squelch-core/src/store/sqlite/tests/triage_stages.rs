@@ -1549,3 +1549,263 @@ fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
         "normal row: apply reports true"
     );
 }
+
+// ---- SCHEDULED RE-EVALUATION -------------------------------------------
+
+use crate::triage::revisit::{RevisitRequest, RevisitSource};
+
+fn req(at: DateTime<Utc>, why: &str, source: RevisitSource) -> RevisitRequest {
+    RevisitRequest {
+        at,
+        why: why.into(),
+        source,
+    }
+}
+
+#[test]
+fn a_revisit_is_invisible_until_its_date_then_comes_due() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    let due = now + chrono::Duration::days(3);
+
+    store
+        .revisits_schedule(
+            acct,
+            id,
+            &[req(due, "dinner has passed", RevisitSource::Model)],
+            now,
+        )
+        .unwrap();
+
+    // Before the date: nothing to do.
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "a future revisit must not fire early"
+    );
+
+    // After it: due, carrying the PRIOR verdict so the re-score has something
+    // to revise.
+    let q = store
+        .revisit_queue(acct, due + chrono::Duration::minutes(1), 6, 10)
+        .unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].message_id, id);
+    assert_eq!(q[0].reason, "dinner has passed");
+    assert_eq!(q[0].source, "model");
+    assert_eq!(q[0].prior_importance, 40);
+    assert_eq!(q[0].prior_one_line, "ambiguous");
+}
+
+/// Firing is once-only and charges the lifetime counter, so a message cannot be
+/// re-evaluated forever.
+#[test]
+fn firing_is_idempotent_and_spends_the_lifetime_budget() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "now", RevisitSource::Model)], now)
+        .unwrap();
+
+    let q = store.revisit_queue(acct, now, 6, 10).unwrap();
+    let rid = q[0].revisit_id;
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+    // Double-fire must not double-charge.
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "a fired revisit never comes due again"
+    );
+
+    let count: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT revisit_count FROM triage WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "fired twice, charged once");
+}
+
+/// The termination guarantee: past the lifetime cap, a message stops being
+/// re-evaluated even if something keeps scheduling it.
+#[test]
+fn the_lifetime_cap_ends_the_loop() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET revisit_count = 6 WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+    store
+        .revisits_schedule(acct, id, &[req(now, "again", RevisitSource::Model)], now)
+        .unwrap();
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "at the cap, a scheduled revisit must not fire"
+    );
+}
+
+/// THE INVARIANT THAT MATTERS MOST: a verdict the account owner fixed by hand is
+/// never overwritten by a machine, however the schedule was arrived at. Enforced
+/// twice on purpose — the queue will not hand the row out, and the apply refuses
+/// it even if something else does.
+#[test]
+fn a_human_corrected_row_is_never_re_evaluated() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "check", RevisitSource::Model)], now)
+        .unwrap();
+    assert_eq!(store.revisit_queue(acct, now, 6, 10).unwrap().len(), 1);
+
+    store
+        .correct_triage(acct, id, TriageAxis::Tier, "signal", None, now)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "the queue must not hand out a hand-corrected row"
+    );
+
+    // ...and the apply refuses it directly, too.
+    let applied = Stage1Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 5,
+        tier: Tier::Noise,
+        one_line: "machine says noise".into(),
+        reason: "re-evaluated".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        stage1_model_used: "claude-opus-5".into(),
+        needs_stage2: false,
+        escalation_reason: None,
+        deadline: None,
+        category: Some("general".into()),
+    };
+    assert!(
+        !store.revisit_apply(&applied).unwrap(),
+        "revisit_apply must refuse a hand-corrected row"
+    );
+}
+
+/// Sealed mail never gets scheduled, because firing one would put it back in
+/// front of a model.
+#[test]
+fn a_sealed_row_stores_no_schedule() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-s", "t-s", Sensitivity::Sealed);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "check", RevisitSource::Model)], now)
+        .unwrap();
+    assert!(store.revisit_queue(acct, now, 6, 10).unwrap().is_empty());
+    let n: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM triage_revisits WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "nothing is stored for sealed mail at all");
+}
+
+/// Re-scheduling replaces what is PENDING but keeps what already fired: the
+/// schedule doubles as the record of why a verdict changed.
+#[test]
+fn rescheduling_replaces_pending_and_keeps_history() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "first", RevisitSource::Model)], now)
+        .unwrap();
+    let rid = store.revisit_queue(acct, now, 6, 10).unwrap()[0].revisit_id;
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+
+    // A second pending one, then a reschedule that supersedes it.
+    let later = now + chrono::Duration::days(5);
+    store
+        .revisits_schedule(acct, id, &[req(later, "second", RevisitSource::Model)], now)
+        .unwrap();
+    store
+        .revisits_schedule(
+            acct,
+            id,
+            &[req(later, "third", RevisitSource::Deadline)],
+            now,
+        )
+        .unwrap();
+
+    let conn = store.lock().unwrap();
+    let fired: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM triage_revisits
+             WHERE account_id=?1 AND message_id=?2 AND fired_at IS NOT NULL",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM triage_revisits
+             WHERE account_id=?1 AND message_id=?2 AND fired_at IS NULL",
+            params![acct, id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fired, 1, "history survives a reschedule");
+    assert_eq!(pending, 1, "only the newest pending schedule stands");
+}
+
+/// A re-evaluation clears the Stage-2 marker, so a newly escalated verdict can
+/// actually reach Stage-2 instead of being stranded behind the old one.
+#[test]
+fn a_revisit_that_escalates_can_reenter_stage2() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    // Pretend the row already completed both stages.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', model_used='claude-opus-5'
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+    assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+
+    let applied = Stage1Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 55,
+        tier: Tier::Signal,
+        one_line: "still relevant".into(),
+        reason: "re-evaluated".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        stage1_model_used: "claude-opus-5".into(),
+        needs_stage2: true,
+        escalation_reason: Some("boundary"),
+        deadline: None,
+        category: Some("general".into()),
+    };
+    assert!(store.revisit_apply(&applied).unwrap());
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q.len(), 1, "the re-escalated row must reach Stage-2");
+    assert_eq!(q[0].message_id, id);
+}

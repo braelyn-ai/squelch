@@ -17,6 +17,7 @@ pub mod extract;
 pub mod llm;
 pub mod receipt;
 pub mod receipt_match;
+pub mod revisit;
 pub mod router;
 pub mod rule_infer;
 pub mod rules;

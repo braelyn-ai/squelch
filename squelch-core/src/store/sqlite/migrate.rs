@@ -92,6 +92,14 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // means "did not escalate", and also covers every historical row, which
     // escalated under the old self-report rule and cannot be attributed now.
     add_column_if_missing(conn, "triage", "escalation_reason", "TEXT")?;
+    // Re-evaluation counter (see `crate::triage::revisit`). Historical rows
+    // start at 0, which is honest: they have never been revisited.
+    add_column_if_missing(
+        conn,
+        "triage",
+        "revisit_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     // stage2_usage grew `category` INSIDE ITS PRIMARY KEY. ALTER ADD COLUMN
     // cannot change a PK, and the bump upsert's ON CONFLICT(account_id, day,

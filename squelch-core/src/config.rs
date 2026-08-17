@@ -236,6 +236,80 @@ impl Default for NotifyConfig {
     }
 }
 
+/// Scheduled re-evaluation tunables. The serde-facing shape of
+/// [`crate::triage::revisit::RevisitConfig`], in plain numbers rather than
+/// `chrono::Duration`s, so it round-trips through TOML and env vars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RevisitPassConfig {
+    /// Master switch. Off means verdicts are never revisited and mail whose
+    /// moment has passed stays where it was filed. Env: `SQUELCH_REVISIT_ENABLED`.
+    pub enabled: bool,
+    /// Re-evaluations attempted per sync cycle. Env:
+    /// `SQUELCH_REVISIT_BATCH_PER_CYCLE`.
+    pub batch_per_cycle: usize,
+    /// Per-account-per-day cap on re-evaluation calls, counted in the same
+    /// `wake_budget` ledger as the stages. Env: `SQUELCH_REVISIT_DAILY_CAP`.
+    pub daily_cap: u32,
+    /// Revisits stored per message per pass. Env: `SQUELCH_REVISIT_MAX_PER_MESSAGE`.
+    pub max_per_message: usize,
+    /// Total re-evaluations one message may ever receive: the termination
+    /// guarantee for a verdict that keeps asking to be looked at again. Env:
+    /// `SQUELCH_REVISIT_MAX_LIFETIME`.
+    pub max_per_message_lifetime: u32,
+    /// Nearest a revisit may be scheduled (hours). Env: `SQUELCH_REVISIT_MIN_LEAD_HOURS`.
+    pub min_lead_hours: i64,
+    /// Furthest out a revisit may be scheduled (days); beyond this it is dropped
+    /// as a hallucinated date. Env: `SQUELCH_REVISIT_MAX_HORIZON_DAYS`.
+    pub max_horizon_days: i64,
+    /// How long after a deadline to re-evaluate automatically (hours). Env:
+    /// `SQUELCH_REVISIT_DEADLINE_GRACE_HOURS`.
+    pub deadline_grace_hours: i64,
+    /// Revisits closer together than this are one revisit (hours). Env:
+    /// `SQUELCH_REVISIT_DEDUPE_HOURS`.
+    pub dedupe_window_hours: i64,
+    /// Days a row may sit in the standing band, untouched and with nothing
+    /// scheduled, before the staleness sweep re-evaluates it anyway. 0 disables
+    /// the sweep. Env: `SQUELCH_REVISIT_FYE_STALE_DAYS`.
+    pub fye_stale_days: i64,
+}
+
+impl Default for RevisitPassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            batch_per_cycle: 10,
+            daily_cap: 100,
+            max_per_message: 4,
+            max_per_message_lifetime: 6,
+            min_lead_hours: 1,
+            max_horizon_days: 400,
+            deadline_grace_hours: 24,
+            dedupe_window_hours: 12,
+            // 14 days: long enough that a real obligation still in play is not
+            // churned, short enough that a row nobody has touched in a fortnight
+            // gets questioned.
+            fye_stale_days: 14,
+        }
+    }
+}
+
+impl RevisitPassConfig {
+    /// The planner's view of these settings.
+    pub fn planner(&self) -> crate::triage::revisit::RevisitConfig {
+        use chrono::Duration;
+        crate::triage::revisit::RevisitConfig {
+            max_per_message: self.max_per_message,
+            min_lead: Duration::hours(self.min_lead_hours.max(0)),
+            max_horizon: Duration::days(self.max_horizon_days.max(1)),
+            deadline_grace: Duration::hours(self.deadline_grace_hours.max(0)),
+            dedupe_window: Duration::hours(self.dedupe_window_hours.max(0)),
+            max_per_message_lifetime: self.max_per_message_lifetime,
+            max_why_chars: 120,
+        }
+    }
+}
+
 /// APNs pusher config; see [`crate::push`] for the task itself.
 ///
 /// `relay_url` IS THE FEATURE FLAG: absent (the default), the pusher is never
@@ -1223,6 +1297,8 @@ pub struct Config {
     pub embed: EmbedConfig,
     /// Notification-event emission policy (threshold + the freshness storm guard).
     pub notify: NotifyConfig,
+    /// Scheduled re-evaluation: how often triage looks at its own past verdicts.
+    pub revisit: RevisitPassConfig,
     /// APNs pusher: the blind relay's URL + bearer. Absent `relay_url` means the
     /// task is never spawned.
     pub pusher: PusherConfig,
@@ -1255,6 +1331,7 @@ impl Default for Config {
             sync: SyncConfig::default(),
             embed: EmbedConfig::default(),
             notify: NotifyConfig::default(),
+            revisit: RevisitPassConfig::default(),
             pusher: PusherConfig::default(),
             tracking: TrackingConfig::default(),
             metrics: MetricsConfig::default(),
@@ -1441,6 +1518,42 @@ impl Config {
         );
 
         // ---- Stage-1 LLM overrides -----------------------------------------
+        // ---- Revisit overrides ----------------------------------------------
+        env_override("SQUELCH_REVISIT_ENABLED", &mut self.revisit.enabled);
+        env_override(
+            "SQUELCH_REVISIT_BATCH_PER_CYCLE",
+            &mut self.revisit.batch_per_cycle,
+        );
+        env_override("SQUELCH_REVISIT_DAILY_CAP", &mut self.revisit.daily_cap);
+        env_override(
+            "SQUELCH_REVISIT_MAX_PER_MESSAGE",
+            &mut self.revisit.max_per_message,
+        );
+        env_override(
+            "SQUELCH_REVISIT_MAX_LIFETIME",
+            &mut self.revisit.max_per_message_lifetime,
+        );
+        env_override(
+            "SQUELCH_REVISIT_MIN_LEAD_HOURS",
+            &mut self.revisit.min_lead_hours,
+        );
+        env_override(
+            "SQUELCH_REVISIT_MAX_HORIZON_DAYS",
+            &mut self.revisit.max_horizon_days,
+        );
+        env_override(
+            "SQUELCH_REVISIT_DEADLINE_GRACE_HOURS",
+            &mut self.revisit.deadline_grace_hours,
+        );
+        env_override(
+            "SQUELCH_REVISIT_DEDUPE_HOURS",
+            &mut self.revisit.dedupe_window_hours,
+        );
+        env_override(
+            "SQUELCH_REVISIT_FYE_STALE_DAYS",
+            &mut self.revisit.fye_stale_days,
+        );
+
         env_override("SQUELCH_STAGE1_MODEL", &mut self.stage1.model);
         env_override_effort("SQUELCH_STAGE1_EFFORT", &mut self.stage1.effort);
         env_override(

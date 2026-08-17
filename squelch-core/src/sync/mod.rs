@@ -72,6 +72,13 @@ const SENDER_BUDGET_PREFIX: &str = "sender:";
 /// see every email, so a global cap is its only scope; the key is distinct from
 /// the Stage-2 sentinel so the two stages' daily counts never collide.
 const STAGE1_GLOBAL_BUDGET_KEY: &str = "__stage1_global__";
+/// The `wake_budget` sentinel for scheduled re-evaluations. Its OWN key, not
+/// Stage-1's: a revisit backlog must not be able to eat the budget that classifies
+/// mail arriving today.
+const REVISIT_BUDGET_KEY: &str = "__revisit_global__";
+/// The usage-ledger category re-evaluation spend books under, so the cost of
+/// keeping verdicts fresh is separable from the cost of forming them.
+const REVISIT_USAGE_CATEGORY: &str = "revisit";
 
 /// Which sync path an ingest batch is on. Decides ONE thing: whether a
 /// notification-worthy verdict may append an `events` row. Backfill never
@@ -321,6 +328,7 @@ enum CapKind {
     Sender,
     Global,
     Stage1Global,
+    Revisit,
 }
 
 /// The preamble every LLM pass shares: resolved credentials, runtime cap
@@ -355,6 +363,7 @@ struct WarnDays {
     sender: Option<String>,
     global: Option<String>,
     stage1_global: Option<String>,
+    revisit: Option<String>,
 }
 
 /// Everything the sync loop needs, resolved once at startup.
@@ -635,6 +644,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // AFTER both stages, so it sees each row's FINAL category (Stage-2
             // may have overwritten Stage-1's).
             self.extract_pass().await;
+            // LAST, and over OLD rows rather than the ones just ingested: a
+            // re-evaluation competes with nothing this cycle, and a row it
+            // re-escalates is picked up by the next cycle's Stage-2.
+            self.revisit_pass().await;
 
             // Per-tick, so an embedder attached after startup catches up on rows
             // ingested before it was ready, no restart needed.
@@ -1312,6 +1325,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             CapKind::Sender => &mut guard.sender,
             CapKind::Global => &mut guard.global,
             CapKind::Stage1Global => &mut guard.stage1_global,
+            CapKind::Revisit => &mut guard.revisit,
         };
         if slot.as_deref() == Some(day) {
             false
@@ -1368,15 +1382,33 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         label: &str,
         tail: &str,
     ) -> BudgetGate {
-        match self
-            .store
-            .stage2_budget_used(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, day)
-        {
+        self.gate_budget(
+            STAGE1_GLOBAL_BUDGET_KEY,
+            day,
+            cap,
+            CapKind::Stage1Global,
+            label,
+            tail,
+        )
+    }
+
+    /// An account-scoped daily budget gate over one `wake_budget` sentinel key.
+    /// INCREMENT-BEFORE-CALL, so a retry storm cannot exceed the cap: a call
+    /// that is about to be made is charged whether or not it comes back.
+    fn gate_budget(
+        &self,
+        key: &str,
+        day: &str,
+        cap: u32,
+        kind: CapKind,
+        label: &str,
+        tail: &str,
+    ) -> BudgetGate {
+        match self.store.stage2_budget_used(self.account_id, key, day) {
             Ok(used) if used >= cap => {
-                if self.warn_once_per_day(CapKind::Stage1Global, day) {
+                if self.warn_once_per_day(kind, day) {
                     eprintln!(
-                        "squelch: stage-1 global daily budget exhausted \
-                         ({used}/{cap}); {tail} stay queued"
+                        "squelch: {label} daily budget exhausted ({used}/{cap}); {tail} stay queued"
                     );
                 }
                 return BudgetGate::Exhausted;
@@ -1387,14 +1419,224 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 return BudgetGate::SkipRow;
             }
         }
-        if let Err(e) =
-            self.store
-                .stage2_increment_budget(self.account_id, STAGE1_GLOBAL_BUDGET_KEY, day)
+        if let Err(e) = self
+            .store
+            .stage2_increment_budget(self.account_id, key, day)
         {
             eprintln!("squelch: {label} budget increment failed ({e}); skipping row");
             return BudgetGate::SkipRow;
         }
         BudgetGate::Proceed
+    }
+
+    /// Plan and store a message's scheduled re-evaluations from a verdict that
+    /// just landed. Failures are logged and swallowed: a missing revisit is a
+    /// row that ages badly, never a reason to fail the verdict that produced it.
+    fn schedule_revisits(
+        &self,
+        message_id: i64,
+        model_revisits: &[crate::triage::revisit::RevisitOut],
+        deadline: Option<&crate::triage::DeadlineHit>,
+        now: DateTime<Utc>,
+    ) {
+        if !self.config.revisit.enabled {
+            return;
+        }
+        let planned = crate::triage::revisit::plan(
+            model_revisits,
+            deadline,
+            &self.config.revisit.planner(),
+            now,
+        );
+        if let Err(e) = self
+            .store
+            .revisits_schedule(self.account_id, message_id, &planned, now)
+        {
+            eprintln!("squelch: revisit scheduling failed ({e}); the row will not be re-evaluated");
+        }
+    }
+
+    /// Re-evaluate verdicts whose moment has passed.
+    ///
+    /// Two things feed this pass. Messages whose classifier named a date, and
+    /// messages that have simply sat in the standing band too long — the sweep
+    /// exists because the failure being fixed is a model not thinking about
+    /// tomorrow, so a design that only re-checks what the model remembered to
+    /// flag would inherit the bug it is meant to fix.
+    ///
+    /// A revisit is an ordinary Stage-1 call with the prior verdict attached, so
+    /// it re-enters the normal pipeline: the router can escalate the new verdict,
+    /// and the extractors see the new category. Rows the account owner has
+    /// corrected by hand are excluded in SQL and again in the apply's guard.
+    async fn revisit_pass(&self) {
+        let rcfg = &self.config.revisit;
+        if !rcfg.enabled {
+            return;
+        }
+        let Some(PassSetup {
+            api_key,
+            provider,
+            url,
+            day,
+            ..
+        }) = self.pass_setup()
+        else {
+            return;
+        };
+        let cfg = &self.config.stage1;
+        let now = Utc::now();
+
+        // ---- The staleness sweep --------------------------------------------
+        // Rows in the standing band that nobody has acted on and nothing has
+        // scheduled. After long enough, such a row is either misfiled or
+        // finished; either way the user is looking at something they should not
+        // be. Scheduled at `now`, so it is picked up by the read just below.
+        if rcfg.fye_stale_days > 0 {
+            let older_than = now - ChronoDuration::days(rcfg.fye_stale_days);
+            match self.store.revisit_stale_standing(
+                self.account_id,
+                older_than,
+                rcfg.max_per_message_lifetime,
+                rcfg.batch_per_cycle,
+            ) {
+                Ok(ids) => {
+                    for message_id in ids {
+                        let req = [crate::triage::revisit::RevisitRequest {
+                            at: now,
+                            why: format!(
+                                "no action taken in {} days; check whether this still matters",
+                                rcfg.fye_stale_days
+                            ),
+                            source: crate::triage::revisit::RevisitSource::FyeStale,
+                        }];
+                        if let Err(e) =
+                            self.store
+                                .revisits_schedule(self.account_id, message_id, &req, now)
+                        {
+                            eprintln!("squelch: staleness sweep could not schedule ({e})");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("squelch: staleness sweep query failed ({e}); skipping"),
+            }
+        }
+
+        // ---- Due re-evaluations ---------------------------------------------
+        let queued = Self::read_queue(
+            self.store.revisit_queue(
+                self.account_id,
+                now,
+                rcfg.max_per_message_lifetime,
+                rcfg.batch_per_cycle,
+            ),
+            "revisit",
+        );
+        if queued.is_empty() {
+            return;
+        }
+
+        let mut rescored = 0usize;
+        for row in &queued {
+            // SEALED GUARD: the queue excludes sealed rows in SQL; re-check
+            // before every classify call (docs/SECURITY.md).
+            if row.sensitivity != Sensitivity::Normal {
+                eprintln!("squelch: revisit sealed guard tripped; skipping row");
+                continue;
+            }
+
+            match self.gate_budget(
+                REVISIT_BUDGET_KEY,
+                &day,
+                rcfg.daily_cap,
+                CapKind::Revisit,
+                "revisit",
+                "remaining re-evaluations",
+            ) {
+                BudgetGate::Exhausted => break,
+                BudgetGate::SkipRow => continue,
+                BudgetGate::Proceed => {}
+            }
+
+            let outcome =
+                stage1_llm::classify_revisit_at(&self.http, url, api_key, cfg, provider, row, now)
+                    .await;
+
+            // FIRE-ONCE: stamped whatever happened below. A revisit that failed
+            // still consumed its turn, and leaving it pending would retry the
+            // same failing row every cycle for as long as the daemon runs.
+            let fire = |label: &str| {
+                if let Err(e) =
+                    self.store
+                        .revisit_mark_fired(self.account_id, row.revisit_id, Utc::now())
+                {
+                    eprintln!("squelch: revisit mark-fired failed after {label} ({e})");
+                }
+            };
+
+            match outcome {
+                Ok(stage1_llm::ClassifyOutcome::Ok(out, usage)) => {
+                    if let Some(u) = usage {
+                        let _ = self.store.extract_bump_usage(
+                            self.account_id,
+                            &day,
+                            REVISIT_USAGE_CATEGORY,
+                            u.into(),
+                        );
+                    }
+                    let applied = stage1_llm::apply_revisit_result(
+                        row,
+                        &out,
+                        &cfg.model,
+                        cfg.known_contact_importance,
+                        &self.config.router(),
+                        Utc::now(),
+                    );
+                    match self.store.revisit_apply(&applied) {
+                        Err(e) => eprintln!("squelch: revisit apply failed ({e})"),
+                        // The row was sealed or hand-corrected between the queue
+                        // read and the apply. Nothing landed, and the schedule
+                        // must not be rebuilt from a verdict that did not stick.
+                        Ok(false) => {}
+                        Ok(true) => {
+                            rescored += 1;
+                            self.metrics.record_stage1(Stage1Verdict::Ok);
+                            self.schedule_revisits(
+                                row.message_id,
+                                &out.revisit,
+                                applied.deadline.as_ref(),
+                                Utc::now(),
+                            );
+                        }
+                    }
+                    fire("apply");
+                }
+                Ok(stage1_llm::ClassifyOutcome::Failed(kind))
+                    if crate::triage::llm::is_auth_failure(&kind) =>
+                {
+                    // A bad credential is a config problem shared by every row,
+                    // not a verdict about this one: leave the revisit PENDING
+                    // (no `fire`) so it is retried once the key is fixed.
+                    eprintln!(
+                        "squelch: revisit auth failure ({kind}); re-evaluations stay scheduled"
+                    );
+                    break;
+                }
+                Ok(stage1_llm::ClassifyOutcome::Refused)
+                | Ok(stage1_llm::ClassifyOutcome::Failed(_)) => {
+                    self.metrics.record_stage1(Stage1Verdict::Fallback);
+                    fire("refusal/permanent failure");
+                }
+                Err(e) => {
+                    // Retryable class exhausted / transport error: leave it
+                    // pending for a later cycle.
+                    eprintln!("squelch: revisit classify failed ({e}); still scheduled");
+                }
+            }
+        }
+
+        if rescored > 0 {
+            eprintln!("squelch: re-evaluated {rescored} message(s) whose moment had passed");
+        }
     }
 
     /// Run one Stage-1 LLM refine pass over rows still carrying their ingest
@@ -1501,6 +1743,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         Ok(true) => {
                             refined += 1;
                             self.metrics.record_stage1(Stage1Verdict::Ok);
+                            self.schedule_revisits(
+                                row.message_id,
+                                &out.revisit,
+                                applied.deadline.as_ref(),
+                                Utc::now(),
+                            );
                             // The refined verdict is final, so it emits whatever
                             // the seed thought; the freshness window is what stops
                             // this pass storming a fresh install's backlog.
@@ -2128,6 +2376,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         Ok(true) => {
                             processed += 1;
                             self.metrics.record_stage2(Stage2Verdict::Ok);
+                            // Stage-2's schedule REPLACES Stage-1's pending one:
+                            // this is the verdict that stands, so its idea of
+                            // when to look again is the one that should.
+                            self.schedule_revisits(
+                                row.message_id,
+                                &out.revisit,
+                                applied.deadline.as_ref(),
+                                Utc::now(),
+                            );
                             self.emit_event(
                                 &events::EventContext {
                                     account_id: self.account_id,
