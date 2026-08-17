@@ -1300,10 +1300,12 @@ daemon's documented behaviour: one live pairing code per account.
 `15-warden-config.yaml`, apply it, and restart the warden — one value, in the one
 object both renderers read. Existing tenants do NOT move on the warden's
 rollout, by design: it writes a tenant's objects at provision time and never
-revisits them. The roller is what moves them, one tenant at a time, each rollout
-finished before the next is touched, halting on the first tenant that does not
-come back — never all at once, because an upgrade that touches every mailbox in
-one pass is an outage waiting for a bad release. It moves them onto a new
+revisits them. The roller is what moves them: ONE tenant per tick, that rollout
+finished before the run exits, and the next tick re-reads the whole fleet before
+picking the next one — never all at once, because an upgrade that touches every
+mailbox in one pass is an outage waiting for a bad release. A fleet with ten
+tenants behind takes ten ticks, and the run says how many are left. It moves them
+onto a new
 DEPLOYMENT only: a change that lands on a tenant's Service, Ingress,
 NetworkPolicy or PVC is invisible to it and wants `squelch-control reconcile`
 per tenant. Exit codes and the levers: `PRODUCTION.md`, "Rolling the daemon

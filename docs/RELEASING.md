@@ -152,13 +152,23 @@ never revisits them, so a new `SQUELCH_WARDEN_IMAGE` changes what the next
 signup gets and nothing about the tenants already running. What closes the gap
 is the roller — the CronJob in `90-warden-roller.yaml`, which runs the warden's
 own binary as `squelch-warden roll` every 15 minutes under the warden's
-ServiceAccount, reconciles each drifted tenant onto today's render, waits for
-that rollout to finish before touching the next one, and halts at the first
-tenant that does not come back. Each tenant blips for one pod restart; the fleet
-is never down; no mail is lost, because Gmail is the source of truth and the
-daemon resumes syncing on its next tick.
+ServiceAccount. Each run reads the whole fleet, converges ONE drifted tenant onto
+today's render, waits for that rollout to finish, and exits. Each tenant blips
+for one pod restart; the fleet is never down; no mail is lost, because Gmail is
+the source of truth and the daemon resumes syncing on its next tick.
 
-Four things about it that will surprise you anyway:
+Five things about it that will surprise you anyway:
+
+- **A bump takes one tick per tenant.** Ten tenants behind is ten runs, two and
+  a half hours on the default schedule, and the run says how many are left
+  (`still behind, one per run: N more`). The gap between ticks is the safety
+  model, not a scheduling accident: a finished rollout only means the API server
+  saw a ready replica, and squelchd binds its socket before it finishes starting,
+  so what actually clears a render is fifteen minutes of a real daemon serving
+  real mail followed by a read pass that refuses to roll anything if that mailbox
+  is carrying today's render and not up. **Every tick but the last exits 3 and
+  marks its Job failed**, which is by design and is why an alert on failed Jobs
+  alone is the wrong alert — see PRODUCTION.md.
 
 - **The serving warden does not see a ConfigMap change until it restarts.**
   `envFrom` is read at pod start. The roller is a fresh pod every 15 minutes and
@@ -177,8 +187,8 @@ Four things about it that will surprise you anyway:
   get one), because the only repair is deleting it — a real outage window for
   that mailbox, and not a timer's decision. That is exit code 2, and it wants
   `squelch-control drift <label>` then `squelch-control reconcile <label>` from
-  a person. `pending` and `stopped` tenants are skipped too, and still want
-  `PUT /v1/tenants/<label>/credentials` (SETUP.md "Operating notes").
+  a person. `pending` tenants and cancelled accounts are skipped too, and still
+  want `PUT /v1/tenants/<label>/credentials` (SETUP.md "Operating notes").
 - **`imagePullPolicy: IfNotPresent` + a tag the node has seen = no pull.**
   Roll forward with a new tag, not by moving an old one.
 
@@ -199,11 +209,14 @@ PRODUCTION.md.
 Exit 0 is a converged fleet (nothing to do counts, and so does a clean
 `--dry-run`); 1 is not converged in any of its five forms — halted on a tenant,
 stopped before applying anything because a tenant carries today's render and is
-not serving it, a tenant DOWN with no workload behind a live Service, never
-started, or a `--dry-run` that found work; 2 is converged with tenants skipped
-for foreign drift; 64 is a bad argument list. Anything but 0 marks the Job failed
-on purpose. PRODUCTION.md, "Rolling the daemon image", has the full table and
-what to do about each.
+not serving it, a tenant DOWN with no workload and no cancellation on record,
+never started, or a `--dry-run` that found work; 2 is everything it could
+converge converged with something left that no run ever will (foreign drift, or
+an identity Secret whose label does not validate); 3 is a tenant rolled with more
+queued behind it, which is every tick of a normal bump; 64 is a bad argument
+list. Anything but 0 marks the Job failed on purpose, so 3 marks it failed too.
+PRODUCTION.md, "Rolling the daemon image", has the full table and what to do
+about each, and "Alerting on this, without alerting on normal" has the query.
 
 If the release touched monitoring (scrape config, dashboards):
 
@@ -233,7 +246,7 @@ every tenant it moved and every one it could not; then, per tenant:
 
 **The first time `drift` is ever run against this cluster, treat its output as
 unproven.** Its whole test suite runs against a mock with no server-side-apply
-merge in it, so four things are only assertions until a real API server has
+merge in it, so five things are only assertions until a real API server has
 answered them. Check them once, on one tenant, and then trust the command:
 
 1. **A freshly provisioned tenant reports zero changes.** Both sides of the
@@ -254,6 +267,20 @@ answered them. Check them once, on one tenant, and then trust the command:
    answers `recreated`, `kubectl -n tenants get deploy <label> --show-managed-
    fields -o yaml` should carry exactly one manager entry, `squelch-warden`.
    That is the claim the entire route rests on.
+5. **The cancellation marker lands, and it lands as a MERGE PATCH.** `DELETE`
+   the scratch tenant, then read its identity Secret back:
+
+   ```sh
+   kubectl -n tenants get secret <label>-identity -o yaml
+   ```
+
+   The annotation `passband.email/cancelled-at` must be there, **and every key
+   under `data:` must still be there with it** — that Secret holds the age key
+   every credential the tenant ever had was sealed to, and a patch that arrived
+   as a server-side apply would have taken it. This is the one write in the
+   service that is not an apply, and this is the check that it stayed that way.
+   Then `PUT` credentials back and confirm the annotation is gone: reopening is
+   the only thing that clears it.
 
 Then delete the scratch tenant. Doing this on a tenant with real mail in it is
 how a verification becomes an incident.

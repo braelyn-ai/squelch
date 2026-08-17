@@ -28,6 +28,12 @@
 # tenant is pending, only past the TTL, and never a credential Secret) rather
 # than about RBAC. Credential Secrets and volumes are still beyond it entirely.
 #
+# What was here and is gone: `get` on services. It existed to tell a cancelled
+# tenant from an interrupted reconcile, which a marker on the identity Secret
+# does now. APPLY THIS WITH THE IMAGE THAT STOPPED NEEDING IT, not before - a
+# warden still on an older image calls `get` on a Service during a reconcile's
+# resume path, and a Role without the verb turns that into a 403.
+#
 # The other half of the bound on this token is Pod Security Admission on the
 # `tenants` namespace (see 00-namespaces.yaml). Holding it lets you create a
 # workload here; PSA decides what KIND of workload, and at `restricted` that is
@@ -45,9 +51,15 @@ metadata:
   name: squelch-warden
   namespace: tenants
 rules:
-  # Identity and credential Secrets. `get` for the status derivation, `list` for
-  # the pending sweep, `create`/`patch` for the two writes, `delete` for the
-  # sweep alone: see the header.
+  # Identity and credential Secrets. `get` for the status derivation and the
+  # cancellation marker, `list` for the pending sweep, `create`/`patch` for the
+  # writes, `delete` for the sweep alone: see the header.
+  #
+  # `patch` covers two different writes now. One is the ordinary server-side
+  # apply of a Secret. The other is a JSON merge patch of a single annotation -
+  # `passband.email/cancelled-at`, which `delete` stamps on the identity Secret
+  # before it removes anything - and it is a merge patch precisely because an
+  # apply would declare the whole object and take that Secret's age key with it.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "create", "patch", "delete"]
@@ -55,11 +67,14 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "patch"]
-  # `get` is what tells a cancelled tenant from an interrupted reconcile: both
-  # read `stopped`, and only the cancelled one had its Service deleted too.
+  # Applied with the rest of a tenant's objects, deleted with them, and never
+  # read back: `get` was here to tell a cancelled tenant from an interrupted
+  # reconcile, and a marker on the identity Secret does that now. Dropped rather
+  # than kept as slack, because a verb nothing calls is a verb a later mistake
+  # can reach for.
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "create", "patch", "delete"]
+    verbs: ["create", "patch", "delete"]
   # Read only, and by label selector. The warden never creates a pod directly;
   # the Deployment does. This is the readiness wait during a provision.
   - apiGroups: [""]

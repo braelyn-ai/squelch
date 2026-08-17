@@ -4,9 +4,13 @@
 # revisits them. So bumping `SQUELCH_WARDEN_IMAGE` in `15-warden-config.yaml`
 # changes what the NEXT signup gets and nothing at all about the tenants already
 # running. This CronJob is what closes that gap: it runs the warden's own binary
-# as `squelch-warden roll`, which walks every tenant in the cluster, reconciles
-# the ones whose live DEPLOYMENT no longer matches the render, and waits for
-# each rollout to finish before it touches the next one.
+# as `squelch-warden roll`, which reads every tenant in the cluster, converges
+# ONE whose live DEPLOYMENT no longer matches the render, waits for that rollout
+# to finish, and exits.
+#
+# One per tick, so a fleet with ten tenants behind takes ten ticks - two and a
+# half hours on the schedule below. That is the deliberate price and not an
+# accident of the loop; see "One tenant per tick" further down.
 #
 # The Deployment and nothing else, which is the limit worth knowing before this
 # timer is trusted with a shape change: a drift report renders and diffs a
@@ -35,14 +39,39 @@
 # cluster to trigger a roll, and the control plane's bearer token buys no part
 # of one.
 #
-# ## Sequential, one tenant at a time
+# ## One tenant per tick, and the tick is the check
 #
 # Zero downtime for a single tenant is not on offer - the strategy is
 # `Recreate`, the volume is `ReadWriteOnce`, and the store is one SQLite file,
 # so two daemons on one mailbox would corrupt it. What IS on offer is that the
-# FLEET is never down: one tenant, a verified rollout, then the next, and the
-# first tenant that does not come back ends the run. A bad render costs exactly
-# one tenant.
+# FLEET is never down, and the thing that buys it is the SCHEDULE rather than
+# any check inside a run.
+#
+# A run that rolled the whole fleet would have to decide, in the seconds after
+# each apply, whether the mailbox it had just rolled was healthy - and nothing
+# available in those seconds answers that. A finished rollout means the API
+# server saw a ready replica; by default a tenant's readiness probe is a TCP
+# accept on the daemon's door, and squelchd binds that socket before it builds
+# its embedder, on purpose. A pod reports Ready and then dies. A pass that
+# trusted the answer would hand the same render to every mailbox in the cluster
+# at machine speed and exit converged.
+#
+# So the run does not try to know. It converges one tenant and leaves, and what
+# stands between a bad render and the second mailbox is fifteen minutes of a
+# real daemon doing real work - plus the read pass on the next tick, which finds
+# a tenant carrying today's render and not serving it, calls it a casualty, and
+# refuses to roll anything at all.
+#
+# Two consequences worth reading before this is trusted:
+#
+#   - **A fleet mid-roll leaves FAILED Jobs in its history, by design.** Exit 3
+#     means "rolled one, more queued", and Kubernetes knows zero and non-zero
+#     and nothing else. Nine tenants behind is nine failed Jobs and then a
+#     green one. An alert that pages on `kube_job_status_failed` alone will fire
+#     on every ordinary image bump; see PRODUCTION.md for what to alert on.
+#   - **Convergence time is the schedule times the fleet.** Raising the schedule
+#     below is the lever, and it trades directly against how long a bad render
+#     has to be noticed in. Fifteen minutes was chosen when the fleet was small.
 #
 # ## Levers, and what each one does not do
 #
@@ -56,13 +85,14 @@
 # that overruns its own schedule - and neither lever is that case:
 #
 #   - **`suspend: true` stops the NEXT tick. It does not stop the run in
-#     flight.** A roll that is halfway through the fleet keeps going, keeps
-#     applying, and keeps taking one mailbox down at a time. Suspending is the
-#     right first move on a halt you do not understand, and it is not a stop
-#     button. To stop a run that is already going, delete its Job
-#     (`kubectl -n warden delete job <name>`), which takes its pod with it: the
-#     tenants already rolled stay rolled, the rest are picked up by the next run,
-#     and the fleet is split-version until then.
+#     flight.** The run in flight can still take one mailbox down and bring it
+#     back on the render you are suspending because of - which is the whole
+#     reason suspend is the right FIRST move and not the only one: it caps the
+#     damage at the one tenant already in progress rather than at the fleet. To
+#     stop a run that is already going, delete its Job (`kubectl -n warden
+#     delete job <name>`), which takes its pod with it: the tenants already
+#     rolled stay rolled, the rest wait for whenever this is unsuspended, and
+#     the fleet is split-version until then.
 #   - **`create job --from=cronjob` is not counted by Forbid.** That command
 #     makes a STANDALONE Job with no owner reference back to this CronJob, and
 #     the controller counts only the Jobs it owns as active. So a manual run and
@@ -98,7 +128,11 @@
 #   - A tenant whose APPLY was rejected received nothing, so it is still drifted,
 #     so it is first in the queue again on the next tick and is rejected again.
 #     ~96 failed Jobs a day and not one tenant converged in any of them, at the
-#     same label every time.
+#     same label every time. Under one-per-tick pacing this is a FLEET STALL and
+#     not just a noisy tenant: the run spends its single attempt on the same
+#     label every quarter hour, so nothing behind it in fleet order ever moves.
+#     The summary's `still behind, one per run: N more` line staying at the same
+#     N across runs is the signature.
 #
 # A reconcile applies a tenant's PVC, NetworkPolicy and Service before its
 # Deployment, so the refusal is often not about the thing that queued the tenant.
@@ -187,11 +221,13 @@ spec:
           serviceAccountName: squelch-warden
           # It talks to the API server, so it needs the token, exactly as the
           # serving pod does. It needs NO new RBAC: `roll` calls `list`/`get` on
-          # Secrets, `get` on Services and Deployments, and server-side applies
-          # (including the drift report's dry run) on the five tenant objects -
-          # every one of them a verb already in `10-warden-rbac.yaml`. It never
-          # execs and it never deletes a Deployment, because it skips the
-          # tenants where a repair would mean deleting one.
+          # Secrets, `get` on Deployments, and server-side applies (including
+          # the drift report's dry run) on the five tenant objects - every one of
+          # them a verb already in `10-warden-rbac.yaml`. It never execs, it
+          # never patches a Secret (the cancellation marker is `delete`'s write,
+          # and this job never cancels anything), and it never deletes a
+          # Deployment, because it skips the tenants where a repair would mean
+          # deleting one.
           automountServiceAccountToken: true
           securityContext:
             runAsNonRoot: true

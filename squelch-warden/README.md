@@ -429,26 +429,35 @@ would make the route useless in the case it exists for. `pending` is
 `409 not_reconcilable`: it has never had a workload, and bringing one up is a
 signup to finish, not a shape to converge.
 
-`stopped` depends on why it stopped, and the status word cannot say. `DELETE`
-takes the Ingress, the Deployment, the Service and the NetworkPolicy down
-together, while a reconcile applies the Service before it touches the
-Deployment — so a surviving Service means the workload is still routed and only
-the Deployment is missing. That is a job to finish, and it proceeds. No Service
-means somebody cancelled this account, and it stays `409`: starting a cancelled
-mailbox back up would be a resurrection nobody asked for. The check is the
-Service and not the Ingress deliberately, because the Ingress is the object an
-operator was most likely to have applied by hand during the era this route
-replaces, and a hand-applied Ingress must not read as consent to restart.
+A tenant carrying `passband.email/cancelled-at` on its identity Secret is
+`409 not_reconcilable` **whatever its status word and whatever objects are still
+standing**, because that annotation is the account holder's decision written
+down and no shape repair overrides one. Reopening is `set_credentials`, which
+clears it.
+
+`stopped` WITHOUT the marker is a job nobody finished — a reconcile that died in
+its own delete/recreate window leaves exactly that — and it proceeds: the
+credential and the volume are where they were, and only the workload is missing.
+
+The marker is why this is a lookup and not a deduction. `DELETE` removes four
+objects one at a time and stops at its first error, so a cancellation can leave
+ANY prefix of that teardown standing, up to and including a Deployment still
+serving mail with its Ingress already gone. Nothing about the surviving objects
+distinguishes that from ordinary drift, and an earlier version of this route
+read the wreckage and would have force-applied a cancelled mailbox back onto the
+internet. So `DELETE` stamps the annotation **before** it removes anything — on
+the identity Secret, the one object it deliberately keeps — and every reader
+here asks the annotation.
 
 Secrets are never rewritten. A reconcile converges SHAPE; the sealed credential
 and the LLM key are read back only to re-derive the two SHA-256 annotations on
 the pod template, so the render is the one that tenant is entitled to rather
 than a new one, and a re-render on its own does not roll the pod.
 
-#### The roller: the whole fleet, one tenant at a time
+#### The roller: read the whole fleet, converge one tenant
 
 ```sh
-squelch-warden roll             # converge every tenant onto today's render
+squelch-warden roll             # read the fleet, converge ONE tenant, exit
 squelch-warden roll --dry-run   # every read, no writes: what a roll would move
 ```
 
@@ -461,17 +470,37 @@ rewriting it. Not a route and not a bearer-authed call: a converging pass over
 every tenant is the most powerful thing this service can do, so it stays inside
 the cluster, where no credential and no CI job can reach it.
 
-**What it converges.** Every tenant the CLUSTER holds — the identity Secrets
+**What it reads.** Every tenant the CLUSTER holds — the identity Secrets
 carrying `MANAGED_SELECTOR`, sorted, so two runs are comparable and a tenant with
-no row in the control plane's table is still seen. For each: the status, then a
-drift report, then, only if the report has changes, `reconcile`. One tenant at a
-time, and the next one is not touched until this one's ROLLOUT has finished
-(`Cluster::rollout_complete`, not a ready pod — under `Recreate` the pod being
-replaced stays Ready while it terminates, and a roller trusting that would march
-through the fleet on false greens). Finished means AVAILABLE, not merely ready:
-the replica has to have stayed up for `SQUELCH_WARDEN_MIN_READY_SECS`, so a
-daemon that comes up and dies cannot buy the run a green. A tenant blips for one
-pod restart; the fleet is never down.
+no row in the control plane's table is still seen. For each: the cancellation
+marker, then the status, then a drift report. An identity Secret whose label will
+not parse is a tenant this warden can never address; those are COUNTED (never
+named — the name is the string that failed validation) and the count reaches the
+exit code, because a cluster holding one used to exit green.
+
+**What it converges: one tenant.** The read pass covers the whole fleet, the
+write pass takes the first tenant that is behind, waits for its ROLLOUT to
+finish, and the process exits. Not a batch, and not "keep going until something
+fails". `Rolled::remaining` says how many are queued behind it, and the next tick
+re-reads the entire fleet before picking the next one.
+
+That pacing IS the safety model, and it is deliberately not a check. A pass that
+walked the fleet would have to decide, in the seconds after each apply, whether
+the mailbox it just rolled was healthy — and nothing available in those seconds
+answers that. `Cluster::rollout_complete` is the strongest signal on offer and it
+says the controller observed this spec with a replica that stayed Ready for
+`SQUELCH_WARDEN_MIN_READY_SECS`; by default a tenant's readiness probe is a TCP
+accept on the daemon's door, and squelchd binds that socket before it builds its
+embedder, on purpose. A pod reports Ready and then dies. So the run does not try
+to know: it converges one mailbox and leaves, and what stands between a bad
+render and the second one is a scheduling interval of a real daemon doing real
+work, plus the casualty rule on the next tick.
+
+The cost is the schedule times the fleet — ten tenants behind is ten ticks — and
+`Rolled::remaining` is what makes that visible rather than a surprise.
+`SQUELCH_WARDEN_HTTP_READINESS` puts `/healthz` behind the probe and makes each
+individual step stronger; it changes none of the above, and it cannot be turned
+on until the whole fleet is already on a daemon that serves the route.
 
 **The Deployment, and only the Deployment.** What decides whether a tenant is
 rolled is the drift report, and a drift report renders and diffs that tenant's
@@ -486,19 +515,30 @@ purges a foreign field the only way SSA allows, by deleting the Deployment and
 applying a fresh one, which is a defensible call for an operator reading one
 drift report and an indefensible one for a timer walking a fleet: it takes a live
 mailbox down to remove a field a person put there on purpose. Foreign drift is a
-page for a human. `pending` and `stopped` tenants are skipped for the reason
-`reconcile` refuses them — a signup to finish and an account to reopen are not
-shapes to converge — which leaves `active` and `failed`, and `failed` is
-deliberate, because a tenant a previous render broke is the one a new render is
-most likely to fix.
+page for a human. A tenant carrying the cancellation marker is skipped whatever
+its status word, and `pending` is skipped for the reason `reconcile` refuses it —
+a signup to finish and an account to reopen are not shapes to converge. The
+marker is asked FIRST, ahead of the status word, because a teardown that failed
+on its first delete leaves a closed account that is still `active` and still
+drifting: it would be queued like any other tenant, refused by the write pass,
+and halt the run — first in the queue every tick, forever, with nothing else in
+the fleet ever converging.
 
-**Halting is the safety property.** The first tenant that does not converge ends
-the run: it is named in the summary, and every tenant after it in fleet order is
-left exactly as it was. A render that cannot come up therefore costs exactly one
-tenant, which is what makes running this unattended defensible at all. A read
-that fails halts it too — a tenant this warden could not even inspect is not one
-it may step past, because the next tenant would be rolled on the strength of a
-cluster that has just stopped answering.
+That leaves `active` and `failed`, and `failed` is deliberate, because a tenant a
+previous render broke is the one a new render is most likely to fix. A `stopped`
+tenant with NO marker is the third case: a job nobody finished, which is a
+mailbox that is DOWN. The roll does not repair one — finishing somebody's
+half-done recreate unattended is the same judgement call foreign drift is — but
+it names it, and it is a reason the run refuses to call the fleet converged.
+
+**Halting is the safety property.** The tenant this run took either converges or
+ends the run without one: it is named in the summary and goes back on the queue.
+A render that cannot come up therefore costs exactly one tenant, which is what
+makes running this unattended defensible at all. A read that fails halts it too,
+before the write pass — a tenant this warden could not even inspect is not one it
+may step past, because the tenant it would roll instead would be rolled on the
+strength of a cluster that has just stopped answering. Every read happens before
+any write, so a failed read costs the run and not a half-rolled fleet.
 
 The exit code is the whole interface for whatever scheduled it, and anything
 other than `0` marks the Job failed on purpose:
@@ -506,14 +546,23 @@ other than `0` marks the Job failed on purpose:
 | Exit | The run | What it wants |
 |---|---|---|
 | `0` | The fleet is on today's render and serving it. A run with nothing to do is this, and so is a `--dry-run` over a fleet that needs nothing. | Nothing. |
-| `1` | Not converged, in any of its five forms. | Read the log for the named label, and suspend the CronJob while you work: everything after that tenant in label order was not touched. **Halted** — the tenant did not come back; look at that pod. **Casualty** (`HALTED before applying anything`) — the tenant already carries today's render and is not serving it, so nothing was applied anywhere; the render is the suspect, not the tenant. **DOWN** — no workload behind a live Service, an unfinished reconcile; `squelch-control reconcile <label>` finishes it. **Never started** — a refused config value or an API server it could not reach; the log line is the sentence. **`--dry-run` found work** — this is the flag doing its job; read what it would roll. |
-| `2` | Converged, and at least one tenant was left alone because another field manager owns part of its Deployment. | `squelch-control drift <label>` to see who owns what, then `squelch-control reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. Until then every run reports it again. |
-| `64` | The argument list was none of the three this binary accepts. | Fix `args:` on the CronJob. Deliberately outside the 0–2 range: a mistyped argument is not a verdict on the fleet. |
+| `1` | Not converged, in any of its five forms. | Read the log for the named label, and suspend the CronJob while you work: at most the one named tenant was written. **Halted** — the tenant did not come back; look at that pod. It goes back on the queue. **Casualty** (`HALTED before applying anything`) — the tenant already carries today's render and is not serving it, so nothing was applied anywhere; the render is the suspect, not the tenant. **DOWN** — no workload and no cancellation on record, a job that did not finish; `squelch-control reconcile <label>` finishes it. **Never started** — a refused config value or an API server it could not reach; the log line is the sentence. **`--dry-run` found work** — this is the flag doing its job; read what it would roll, and its length is how many ticks the real roll takes. |
+| `2` | Everything this run could converge did, and something is left that no run will ever converge: another field manager owns part of a tenant's Deployment, or an identity Secret's label does not validate. | For foreign drift, `squelch-control drift <label>` to see who owns what, then `reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. For an unreadable label, `PRODUCTION.md` has the recipe for finding it. Until then every run reports it again. |
+| `3` | It rolled a tenant and more are queued behind it. This is what every tick of a fleet mid-roll looks like. | Nothing. The next tick takes the next one. Its own code because it is the one outcome that is both "not on today's render" and "no human should do anything": `0` would make `roll` unable to say when a bump has landed, and `1` would spend the alarm on the normal case. |
+| `64` | The argument list was none of the three this binary accepts. | Fix `args:` on the CronJob. Deliberately outside the 0–3 range: a mistyped argument is not a verdict on the fleet. |
+
+Anything other than `0` marks the Job failed, because Kubernetes knows zero and
+non-zero and nothing else — so **a fleet mid-roll leaves failed Jobs in its
+history by design**. `PRODUCTION.md`, "Alerting on this, without alerting on
+normal", is what to page on instead.
 
 A run that halts on the SAME label every tick is a render the cluster refuses
 rather than a flaky tenant — the apply was rejected, so nothing was written, so
 that tenant is still drifted and first in the queue again fifteen minutes later.
-`deploy/hosted/90-warden-roller.yaml` has the signature and the fix, and
+Under one-per-tick pacing that is a fleet STALL and not just a noisy tenant: the
+run spends its single attempt on the same label every time, and nothing behind it
+in fleet order moves. A `still behind` count that does not fall across runs is
+the signature. `deploy/hosted/90-warden-roller.yaml` has the fix, and
 `deploy/hosted/PRODUCTION.md`, "Rolling the daemon image", is the operator's end
 of all of it.
 
@@ -538,22 +587,23 @@ five objects in provision order; a tenant being rolled for some Deployment-visib
 reason picks the rest up as a side effect of that, which is luck rather than
 coverage.
 
-**`reconcile`'s anti-resurrection guard has a narrow race, and the roller enters
-it once per active tenant per tick.** A tenant with no Deployment is either a
-cancelled account or a reconcile that died mid-repair, and the two are told apart
-by whether the Service is still standing (`Warden::interrupted`) — `DELETE`
-removes the Service before the Deployment, so a surviving Service means nobody
-cancelled this account. The check is sound at the top of the route, where nothing
-has been written yet. The second one is not: `reconcile` re-applies the Service
-before it reads the Deployment, so a `DELETE` that lands in the window between
-those two writes has its Service put back **by this reconcile**, and the
-deployment-gone branch then reads that Service as consent and rebuilds a mailbox
-somebody just cancelled. The window is a few API calls wide and needs a
-cancellation landing inside it. What the roller changes is the frequency: the
-window opens once per active tenant per run, every 15 minutes, rather than when a
-person types a command. Cancelling an account while a roll is walking the fleet is
-therefore worth doing deliberately — suspend the CronJob, or confirm the tenant
-is gone afterwards.
+**`reconcile`'s anti-resurrection guard still has one narrow race, and it is
+much narrower than it was.** The guard asks `passband.email/cancelled-at`, which
+`DELETE` writes before it removes anything, and it asks twice: once at the top
+of the route before anything is written, and again if the Deployment turns out
+to have vanished mid-run. A cancellation that starts before either read is
+refused, and that covers every version of this race that used to matter — the
+old guard deduced intent from a surviving Service, which `reconcile` itself
+re-applies on its way in, so a `DELETE` landing between two of its own writes
+had its evidence manufactured for it.
+
+What survives is the window between reading the Deployment and applying it: a
+`DELETE` landing in there is seen by neither read, and the apply puts a cancelled
+mailbox back. It is a few API calls wide and needs a cancellation inside it. The
+roller's pacing bounds the exposure at one tenant per tick rather than every
+active tenant per tick. Cancelling an account while a roll is in flight is still
+worth doing deliberately — suspend the CronJob, or confirm the tenant is gone
+afterwards.
 
 **`status: active` in a reconcile's answer is weaker than it sounds.** It means
 a pod matching the tenant's selector reported Ready, not that the pod running
