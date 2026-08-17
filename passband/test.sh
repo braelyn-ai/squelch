@@ -43,6 +43,13 @@ run_suite subject-text \
   Sources/Passband/Model/SubjectText.swift \
   Tests/SubjectTextTests.swift
 
+# The attachment buckets against the wire type they bucket. WireTypes is pure
+# Codable structs, so the pair builds with no app and no daemon.
+run_suite attachment-kinds \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/AttachmentKinds.swift \
+  Tests/AttachmentKindsTests.swift
+
 run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
   Tests/EmailImagesTests.swift

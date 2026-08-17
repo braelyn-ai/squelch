@@ -66,6 +66,7 @@
 		4D885CFF844970680B6C93DA /* EmailWebViewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DD489E941E602E585098D3F /* EmailWebViewiOS.swift */; };
 		4DF190F34838471A99C7213B /* Chrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0E547B2A7CA1DA951D255C /* Chrome.swift */; };
 		4E260638B2736F4A91E83841 /* EmailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D358053F47CDAD2D0B7EAB5 /* EmailsView.swift */; };
+		4E721B91AEB73F8E8B0AAFE8 /* AttachmentKinds.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */; };
 		513F475DB3A83BED4F68A57D /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
 		51B35B5F4D9B0D7D61BC44B9 /* BackgroundAuthWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */; };
 		553D7088D2A4B65FCAA59E61 /* ImageWarmer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 582A0094F147273BA003C4B6 /* ImageWarmer.swift */; };
@@ -201,6 +202,7 @@
 		F3193F08328E9F5CC6BFCE27 /* RecipientField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 327BC236C39F192198AFEF7D /* RecipientField.swift */; };
 		F364D1469A2AA0C9E4B38DED /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78527CBD27E00907F26B9E79 /* Security.framework */; };
 		F38B78086DC5EBF798FFE3A1 /* Assistant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EC7EBBF801C0364D402F94D /* Assistant.swift */; };
+		F4D434105490FF1F19B89986 /* AttachmentKinds.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */; };
 		F6CCF6C021CD68BA6BED3944 /* HeroCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20CA62DECFED05021D0C9964 /* HeroCache.swift */; };
 		F9571C6567D29994CCF6DBB2 /* MarkdownStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A77BC580144CC1AF7B5B8AEF /* MarkdownStyle.swift */; };
 		FA53DECE01289F91363AC331 /* UpdateRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92398A24BE2068AEBF3FA312 /* UpdateRow.swift */; };
@@ -293,6 +295,7 @@
 		83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-italic-var.ttf"; sourceTree = "<group>"; };
 		8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
 		89A44DCD12D99794B8DF43B0 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
+		8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentKinds.swift; sourceTree = "<group>"; };
 		92398A24BE2068AEBF3FA312 /* UpdateRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateRow.swift; sourceTree = "<group>"; };
 		992EA99CCF93A2EA929D6E3B /* SidePanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePanel.swift; sourceTree = "<group>"; };
 		9B11AE47A064BB58DD81A6DB /* ActionLayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActionLayer.swift; sourceTree = "<group>"; };
@@ -417,6 +420,7 @@
 			children = (
 				2A46105028AEB554882E2D72 /* Analytics.swift */,
 				AA0089253391F9BC0AE4818B /* AsyncMemo.swift */,
+				8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */,
 				BB5FEFF987265DA1E7F85007 /* AuthCode.swift */,
 				E1C033DDA02DD344F437F943 /* Concurrency.swift */,
 				5883BA424612265657845246 /* Format.swift */,
@@ -745,6 +749,7 @@
 				67346BF359F4EC51B15E6C27 /* AskBar.swift in Sources */,
 				F38B78086DC5EBF798FFE3A1 /* Assistant.swift in Sources */,
 				D5DB123B615F58369EAE3B7F /* AsyncMemo.swift in Sources */,
+				F4D434105490FF1F19B89986 /* AttachmentKinds.swift in Sources */,
 				22E02ADE42C027FF43AC6665 /* AttachmentStrip.swift in Sources */,
 				B5D62B99FA378656F0BCF7DD /* AttachmentThumbs.swift in Sources */,
 				98449AA2FEF0989C76FA6503 /* AuditView.swift in Sources */,
@@ -843,6 +848,7 @@
 				0C61CFFF1751AC0250DBE8C8 /* AppStore.swift in Sources */,
 				41353103B9D24E161228B692 /* Assistant.swift in Sources */,
 				DD6D172FDE2BDF162F554498 /* AsyncMemo.swift in Sources */,
+				4E721B91AEB73F8E8B0AAFE8 /* AttachmentKinds.swift in Sources */,
 				5A8A0E6E45A1AF07A426F4A1 /* AttachmentPreviewiOS.swift in Sources */,
 				AA1FDE44601AF70AA151D912 /* AttachmentStrip.swift in Sources */,
 				3E86ED3B31C4CFD8E08695DF /* AttachmentThumbs.swift in Sources */,
