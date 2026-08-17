@@ -335,6 +335,7 @@ fn row_context<'a>(q: &'a Stage1Queued, max_body_chars: usize) -> RowContext<'a>
         body: &q.body,
         is_known_contact: q.is_known_contact,
         rule_want_text: None,
+        escalation: None,
         revisit: None,
         max_body_chars,
     }
@@ -361,6 +362,7 @@ pub async fn classify_revisit_at(
         body: &q.body,
         is_known_contact: q.is_known_contact,
         rule_want_text: None,
+        escalation: None,
         revisit: Some(PriorVerdict {
             tier: q.prior_tier,
             importance: q.prior_importance,

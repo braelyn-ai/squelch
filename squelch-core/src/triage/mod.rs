@@ -983,6 +983,9 @@ mod tests {
             received_at: Utc::now(),
             is_known_contact: false,
             rule_want_text: None,
+            escalation_reason: None,
+            sender_history: Default::default(),
+            thread: Vec::new(),
             sensitivity,
         }
     }

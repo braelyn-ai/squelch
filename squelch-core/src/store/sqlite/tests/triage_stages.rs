@@ -1841,3 +1841,62 @@ fn a_revisit_that_escalates_can_reenter_stage2() {
     assert_eq!(q.len(), 1, "the re-escalated row must reach Stage-2");
     assert_eq!(q[0].message_id, id);
 }
+
+// ---- WHAT AN ESCALATION BUYS -------------------------------------------
+
+/// THE SEAL INVARIANT, one level removed: a sealed sibling's subject is exactly
+/// as forbidden to a model as its body. "It was only context for another row" is
+/// not an exception, and this is the test that says so.
+#[test]
+fn thread_context_never_carries_a_sealed_sibling() {
+    let (store, acct) = store();
+    let escalated =
+        triaged_row(acct, "g-esc", "t-shared", None, false, Sensitivity::Normal).ingest(&store);
+    let normal_sib =
+        triaged_row(acct, "g-sib", "t-shared", None, false, Sensitivity::Normal).ingest(&store);
+    let sealed_sib =
+        triaged_row(acct, "g-seal", "t-shared", None, false, Sensitivity::Sealed).ingest(&store);
+
+    // Put the escalated row in the Stage-2 queue.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, escalated],
+        )
+        .unwrap();
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q.len(), 1);
+    let ids: Vec<String> = q[0].thread.iter().map(|s| s.subject.clone()).collect();
+    assert_eq!(q[0].thread.len(), 1, "only the non-sealed sibling: {ids:?}");
+    assert_ne!(escalated, normal_sib);
+    assert_ne!(escalated, sealed_sib);
+}
+
+/// An escalated row arrives knowing WHY it was escalated and what this sender's
+/// verdicts have historically been worth.
+#[test]
+fn an_escalated_row_carries_its_reason_and_the_senders_record() {
+    let (store, acct) = store();
+    let id = triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1,
+                    escalation_reason='buried_bill'
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q[0].escalation_reason.as_deref(), Some("buried_bill"));
+    assert!(
+        q[0].sender_history.total >= 1,
+        "the sender's own prior mail counts toward their record"
+    );
+}

@@ -39,6 +39,91 @@ fn bump_usage_category(
     Ok(())
 }
 
+/// How many thread siblings an escalated row carries into the prompt. Bounded
+/// because a 200-message mailing-list thread is not context, it is a bill.
+const STAGE2_THREAD_CONTEXT_LIMIT: usize = 8;
+
+/// Aggregate this sender's track record: how much of their mail has surfaced,
+/// and how often the account owner overruled the verdict. Counts only — no
+/// subject, no body, nothing that could carry an instruction.
+fn sender_history_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    from_addr: &str,
+) -> Result<SenderHistory> {
+    let (total, surfaced): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN t.tier IN ('signal','deadline','past_due')
+                                  THEN 1 ELSE 0 END), 0)
+         FROM messages m
+         JOIN triage t ON t.message_id = m.id
+         WHERE m.account_id = ?1
+           AND m.from_addr = ?2 COLLATE NOCASE
+           AND m.is_sent = 0
+           AND t.sensitivity = 'normal'",
+        params![account_id, from_addr],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let corrected: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM triage_feedback
+         WHERE account_id = ?1 AND sender = ?2 COLLATE NOCASE",
+        params![account_id, from_addr],
+        |r| r.get(0),
+    )?;
+    Ok(SenderHistory {
+        total,
+        surfaced,
+        corrected,
+    })
+}
+
+/// The rest of a thread, oldest first, verdict and envelope only.
+///
+/// SEALED SIBLINGS ARE EXCLUDED IN SQL. A sealed message's subject is exactly as
+/// forbidden to a model as its body, and "it was only context for another row"
+/// is not an exception — see docs/SECURITY.md. Sent siblings ARE included, and
+/// are the most valuable rows here: a thread the owner has replied in is one
+/// they have already voted for.
+fn thread_siblings_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    thread_id: &str,
+    exclude_message_id: i64,
+    limit: usize,
+) -> Result<Vec<ThreadSibling>> {
+    if thread_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT m.from_addr, m.subject, COALESCE(t.one_line, ''), COALESCE(t.tier, 'noise'),
+                m.received_at, m.is_sent
+         FROM messages m
+         JOIN triage t ON t.message_id = m.id
+         WHERE m.account_id = ?1
+           AND m.thread_id = ?2
+           AND m.id != ?3
+           AND t.sensitivity = 'normal'
+         ORDER BY m.received_at ASC
+         LIMIT ?4",
+    )?;
+    let out = stmt
+        .query_map(
+            params![account_id, thread_id, exclude_message_id, limit as i64],
+            |r| {
+                Ok(ThreadSibling {
+                    from_addr: r.get(0)?,
+                    subject: r.get(1)?,
+                    one_line: r.get(2)?,
+                    tier: Tier::parse(&r.get::<_, String>(3)?).unwrap_or(Tier::Noise),
+                    received_at: dt(r, 4)?,
+                    is_sent: r.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(out)
+}
+
 /// Sum the ledger for `(account, category)` over every day `>= since_day`.
 fn usage_since_category(
     conn: &Connection,
@@ -828,7 +913,8 @@ impl SqliteStore {
                         WHERE c.account_id = m.account_id
                           AND c.addr = m.from_addr COLLATE NOCASE
                           AND c.sent_count > 0
-                    ) AS is_known
+                    ) AS is_known,
+                    t.escalation_reason
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              LEFT JOIN sender_rules sr ON sr.id = t.matched_rule_id
@@ -841,7 +927,7 @@ impl SqliteStore {
              ORDER BY m.received_at DESC
              LIMIT ?2",
         )?;
-        let out = stmt
+        let mut out = stmt
             .query_map(params![account_id, limit as i64], |r| {
                 Ok(Stage2Queued {
                     message_id: r.get(0)?,
@@ -854,9 +940,26 @@ impl SqliteStore {
                     rule_want_text: r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
                     received_at: dt(r, 7)?,
                     is_known_contact: r.get::<_, i64>(8)? != 0,
+                    escalation_reason: r.get::<_, Option<String>>(9)?,
+                    // Filled per row below; both need the row's own identifiers,
+                    // and the batch is `batch_per_cycle` rows, not a table scan.
+                    sender_history: SenderHistory::default(),
+                    thread: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // ---- The context an escalation is actually buying --------------------
+        for row in &mut out {
+            row.sender_history = sender_history_conn(&conn, account_id, &row.from_addr)?;
+            row.thread = thread_siblings_conn(
+                &conn,
+                account_id,
+                &row.thread_id,
+                row.message_id,
+                STAGE2_THREAD_CONTEXT_LIMIT,
+            )?;
+        }
         Ok(out)
     }
 

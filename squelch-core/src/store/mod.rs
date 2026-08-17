@@ -421,8 +421,52 @@ pub struct Stage2Queued {
     /// The matched Filtered rule's `want_text`, presented in the TRUSTED CONTEXT
     /// block as the account owner's standing instruction for this sender.
     pub rule_want_text: Option<String>,
+    /// WHY the router escalated this row
+    /// ([`crate::triage::router::EscalationReason::as_str`]). Shown to the
+    /// model, because "look harder" without saying at what is a worse question
+    /// than the one Stage-1 already answered.
+    pub escalation_reason: Option<String>,
+    /// What this sender's mail has historically been worth to the account owner.
+    pub sender_history: SenderHistory,
+    /// Other messages in the same thread, oldest first. SEALED SIBLINGS ARE
+    /// EXCLUDED IN SQL: a sealed message's subject must never reach a model,
+    /// including as another row's context.
+    pub thread: Vec<ThreadSibling>,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
+}
+
+/// How the account owner has treated this sender before. Aggregates, not
+/// content: a count of prior mail, how much of it surfaced, and how often they
+/// overrode the verdict — the cheapest honest answer to "is this sender someone
+/// we get right?"
+#[derive(Debug, Clone, Default)]
+pub struct SenderHistory {
+    /// Prior non-sealed, inbound messages from this address.
+    pub total: i64,
+    /// How many landed at signal or in the standing band.
+    pub surfaced: i64,
+    /// How many the account owner corrected by hand.
+    pub corrected: i64,
+}
+
+/// One other message in the escalated row's thread. Verdict and envelope only,
+/// never a body: the point is whether the owner is IN this conversation, which
+/// the metadata answers without a second body's worth of tokens or a second
+/// body's worth of injection surface.
+#[derive(Debug, Clone)]
+pub struct ThreadSibling {
+    pub from_addr: String,
+    pub subject: String,
+    /// UNTRUSTED: model-authored from email content, neutralized before it
+    /// renders in a prompt.
+    pub one_line: String,
+    pub tier: Tier,
+    pub received_at: DateTime<Utc>,
+    /// `true` when this sibling is the account owner's own message — the single
+    /// most useful bit in the thread, since a conversation the owner has replied
+    /// in is one they have already voted for.
+    pub is_sent: bool,
 }
 
 /// The store-facing outcome of applying a parsed Stage-2 result onto a triage
