@@ -54,6 +54,9 @@ Anything else, deal with it now:
   a split-version fleet.
 - **`needs a person (identity Secrets whose label does not validate)`** — same,
   permanently. See PRODUCTION.md for how to find them.
+- **`needs a person (a workload whose sealed credential Secret is gone…)`** —
+  also permanent, and it means that mailbox's owner has to re-consent before
+  anything can render them.
 - **`DOWN`** or **`HALTED`** — fix before you bump anything.
 
 Suspend the timer while you work, so a scheduled tick does not start mid-edit:
@@ -113,15 +116,30 @@ clean the whole time. One ConfigMap, both pods.
 
 ```sh
 ssh carrier
-# only when the release changed it — check `git diff` on the file first
+# FIRST when this release adds a verb, LAST when it drops one — see below.
+# Skip entirely when the file has not changed.
 kubectl apply -f deploy/hosted/10-warden-rbac.yaml
 kubectl apply -f deploy/hosted/15-warden-config.yaml
 kubectl apply -f deploy/hosted/20-warden.yaml
 kubectl apply -f deploy/hosted/90-warden-roller.yaml
 ```
 
-RBAC goes **with** the image that needs it, never ahead of it: a warden on an
-older image can be calling a verb a newer Role has dropped.
+**RBAC ordering depends on which way the verbs move, and getting it backwards
+is a 403 in production.** Diff `10-warden-rbac.yaml` against what is live and
+ask which of the two this release is:
+
+- **The Role GAINS a verb** (the new image calls something the old one did
+  not): apply the Role **first, before the image**. A warden that reaches for a
+  verb its Role does not carry gets a 403 and halts.
+- **The Role DROPS a verb** (the new image stopped calling it): apply the Role
+  **last, after the image**. A Role trimmed while the old pod is still serving
+  takes the verb out from under a caller that still uses it.
+
+The upgrade this page was written for is the first kind: `get` on services
+returns to the Role as a migration bridge for tenants cancelled before the
+cancellation marker existed, so **the Role goes on before the warden image**.
+That bridge, its RBAC verb and `Cluster::get_service` are deleted together once
+no unmarked cancelled tenant is left; that removal will be the second kind.
 
 ## 5. Restart the serving warden, in the same minute
 
@@ -209,6 +227,7 @@ copy of the manifest.)
 | `HALTED before applying anything` | 1 | **Casualty.** A tenant carries the new render and is not serving it, so the render is the suspect. Nothing was applied to anyone. | Suspend immediately. Look at that pod. This is the roller telling you the release is bad. |
 | `HALTED on <label>` | 1 | That tenant's rollout did not finish. It is the only one written to, and it goes back on the queue. | `kubectl -n tenants logs deploy/<label>` and `describe pod -l app.kubernetes.io/instance=<label>`. |
 | `DOWN (no workload, and nothing recorded a cancellation)` | 1 | A job nobody finished left a mailbox with no pod. The roller will not repair one unattended. | `squelch-control reconcile <label>`. |
+| `needs a person (a workload whose sealed credential Secret is gone…)` | 1 | That tenant cannot be rendered at all, so no run will ever converge it. The walk continues past it rather than halting, but the fleet is not converged while it is there. | The credential is unrecoverable from here: the owner re-consents, and `PUT /v1/tenants/<label>/credentials` puts them back. |
 | `needs a person (another field manager…)` | 2 | Somebody's `kubectl` owns part of that Deployment. It is out of every roll until repaired. | `squelch-control drift <label>`, then `reconcile <label>` when you can afford that mailbox to blip. |
 | Nothing at all in the log, one sentence | 1 | It never started: a refused config value, or an API server it could not reach. | Check `15-warden-config.yaml` against `squelch-warden/README.md`'s env table. |
 
